@@ -27,38 +27,82 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
     let header = &input[..header_end];
 
     let mut parts = header.split(|byte| *byte == b' ');
-
     let command = parts.next().ok_or(ParseError::InvalidCommand)?;
-    let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
-    if parts.next().is_some() {
-        return Err(ParseError::InvalidLength);
+    match command {
+        b"GET" | b"DEL" => {
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let key_length = parse_length(key_length)?;
+
+            let key_start = header_end + 2;
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < key_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let key = input[key_start..key_end].to_vec();
+
+            let command = match command {
+                b"GET" => Command::Get { key },
+                b"DEL" => Command::Delete { key },
+                _ => unreachable!(),
+            };
+
+            Ok((command, key_end))
+        }
+
+        b"SET" => {
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let ttl = parts.next();
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let key_length = parse_length(key_length)?;
+            let value_length = parse_length(value_length)?;
+
+            let ttl = match ttl {
+                Some(ttl) => {
+                    let seconds = parse_length(ttl)?;
+                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
+
+                    Some(Duration::from_secs(seconds))
+                }
+                None => None,
+            };
+
+            let key_start = header_end + 2;
+
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            let value_end = key_end
+                .checked_add(value_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < value_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let key = input[key_start..key_end].to_vec();
+            let value = input[key_end..value_end].to_vec();
+
+            Ok((Command::Set { key, value, ttl }, value_end))
+        }
+
+        _ => Err(ParseError::InvalidCommand),
     }
-
-    if command != b"GET" && command != b"DEL" {
-        return Err(ParseError::InvalidCommand);
-    }
-
-    let key_length = parse_length(key_length)?;
-
-    let key_start = header_end + 2;
-    let key_end = key_start
-        .checked_add(key_length)
-        .ok_or(ParseError::InvalidLength)?;
-
-    if input.len() < key_end {
-        return Err(ParseError::Incomplete);
-    }
-
-    let key = input[key_start..key_end].to_vec();
-
-    let command = match command {
-        b"GET" => Command::Get { key },
-        b"DEL" => Command::Delete { key },
-        _ => unreachable!(),
-    };
-
-    Ok((command, key_end))
 }
 
 fn find_crlf(input: &[u8]) -> Option<usize> {
@@ -95,6 +139,36 @@ mod tests {
                     key: b"name".to_vec(),
                 },
                 11,
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_set_command_without_ttl() {
+        assert_eq!(
+            parse(b"SET 4 5\r\nnameAlice"),
+            Ok((
+                Command::Set {
+                    key: b"name".to_vec(),
+                    value: b"Alice".to_vec(),
+                    ttl: None,
+                },
+                18,
+            ))
+        );
+    }
+
+    #[test]
+    fn parses_set_command_with_ttl() {
+        assert_eq!(
+            parse(b"SET 4 5 10\r\nnameAlice"),
+            Ok((
+                Command::Set {
+                    key: b"name".to_vec(),
+                    value: b"Alice".to_vec(),
+                    ttl: Some(Duration::from_secs(10)),
+                },
+                21,
             ))
         );
     }
