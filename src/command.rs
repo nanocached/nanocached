@@ -197,6 +197,11 @@ mod tests {
     }
 
     #[test]
+    fn returns_incomplete_when_set_value_is_incomplete() {
+        assert_eq!(parse(b"SET 4 5\r\nnameAli"), Err(ParseError::Incomplete));
+    }
+
+    #[test]
     fn rejects_non_numeric_key_length() {
         assert_eq!(parse(b"GET abc\r\nname"), Err(ParseError::InvalidLength));
     }
