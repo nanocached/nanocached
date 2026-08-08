@@ -1,3 +1,5 @@
+use crate::cache::Cache;
+use crate::response::Response;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13,6 +15,32 @@ pub enum Command {
     Delete {
         key: Vec<u8>,
     },
+}
+
+impl Command {
+    pub fn execute(self, cache: &mut Cache) -> Response {
+        match self {
+            Self::Get { key } => match cache.get(&key) {
+                Some(value) => Response::Value(value.to_vec()),
+                None => Response::NotFound,
+            },
+            Self::Set { key, value, ttl } => {
+                match ttl {
+                    Some(ttl) => cache.set_with_ttl(key, value, ttl),
+                    None => cache.set(key, value),
+                }
+                Response::Stored
+            }
+
+            Self::Delete { key } => {
+                if cache.delete(&key) {
+                    Response::Deleted
+                } else {
+                    Response::NotFound
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -236,5 +264,83 @@ mod tests {
                 10,
             ))
         );
+    }
+
+    #[test]
+    fn get_returns_value_for_existing_key() {
+        let mut cache = Cache::new();
+        cache.set(b"name".to_vec(), b"Alice".to_vec());
+
+        let command = Command::Get {
+            key: b"name".to_vec(),
+        };
+
+        assert_eq!(
+            command.execute(&mut cache),
+            Response::Value(b"Alice".to_vec()),
+        );
+    }
+
+    #[test]
+    fn get_returns_not_found_for_missing_key() {
+        let mut cache = Cache::new();
+
+        let command = Command::Get {
+            key: b"name".to_vec(),
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::NotFound);
+    }
+
+    #[test]
+    fn set_stores_value() {
+        let mut cache = Cache::new();
+
+        let command = Command::Set {
+            key: b"name".to_vec(),
+            value: b"Alice".to_vec(),
+            ttl: None,
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::Stored);
+        assert_eq!(cache.get(b"name"), Some(b"Alice".as_slice()));
+    }
+
+    #[test]
+    fn set_with_zero_ttl_expires_immediately() {
+        let mut cache = Cache::new();
+
+        let command = Command::Set {
+            key: b"name".to_vec(),
+            value: b"Alice".to_vec(),
+            ttl: Some(Duration::ZERO),
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::Stored);
+
+        assert_eq!(cache.get(b"name"), None);
+    }
+
+    #[test]
+    fn delete_returns_deleted_for_existing_key() {
+        let mut cache = Cache::new();
+        cache.set(b"name".to_vec(), b"Alice".to_vec());
+
+        let command = Command::Delete {
+            key: b"name".to_vec(),
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::Deleted);
+    }
+
+    #[test]
+    fn delete_returns_not_found_for_missing_key() {
+        let mut cache = Cache::new();
+
+        let command = Command::Delete {
+            key: b"name".to_vec(),
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::NotFound);
     }
 }
