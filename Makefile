@@ -1,7 +1,7 @@
 .PHONY: test mutants mutants-diff check
 
 MUTANTS_BASE ?= HEAD
-MUTANTS_JOBS ?= 2
+MUTANTS_JOBS ?= 4
 MUTANTS_FILE_ARG = $(if $(strip $(FILE)),--file "$(FILE)",)
 
 test:
