@@ -20,7 +20,7 @@ async fn main() -> io::Result<()> {
 
         tokio::spawn(async move {
             if let Err(error) = handle_connection(stream).await {
-                eprintln!("connection error: {error}");
+                eprintln!("connection error from {address}: {error}");
             }
         });
     }
@@ -34,7 +34,8 @@ async fn handle_connection(mut stream: TcpStream) -> io::Result<()> {
         match parse(&received) {
             Ok((_command, consumed)) => {
                 stream.write_all(&received[..consumed]).await?;
-                return Ok(());
+                received.drain(..consumed);
+                continue;
             }
             Err(ParseError::Incomplete) => {}
             Err(error) => {
