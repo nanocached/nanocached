@@ -160,6 +160,8 @@ mod tests {
             .await
             .unwrap();
 
+        client.shutdown().await.unwrap();
+
         let expected = b"STORED\r\nVALUE 5\r\nAlice";
         let mut response = vec![0_u8; expected.len()];
 
