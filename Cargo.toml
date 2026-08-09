@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.96"
 
 [dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt"] }
 
 [lints.clippy]
 all = "deny"
