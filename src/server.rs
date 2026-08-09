@@ -2,13 +2,17 @@ use crate::cache::Cache;
 use crate::command::{Command, ParseError, parse};
 use crate::response::Response;
 use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+const MAX_CONNECTIONS: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn request_is_too_large(size: usize) -> bool {
@@ -24,21 +28,55 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
     let (request_tx, request_rx) = mpsc::channel(1024);
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     tokio::spawn(run_cache(request_rx));
 
     loop {
         let (stream, address) = listener.accept().await?;
-        let request_tx = request_tx.clone();
 
-        println!("accepted connection from {address}");
-
-        tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, request_tx, IDLE_TIMEOUT).await {
-                eprintln!("connection error from {address}: {error}");
-            }
-        });
+        drop(
+            dispatch_connection(
+                stream,
+                address,
+                request_tx.clone(),
+                Arc::clone(&connection_limit),
+                IDLE_TIMEOUT,
+            )
+            .await,
+        );
     }
+}
+
+async fn dispatch_connection(
+    mut stream: TcpStream,
+    address: SocketAddr,
+    request_tx: mpsc::Sender<CacheRequest>,
+    connection_limit: Arc<Semaphore>,
+    idle_timeout: Duration,
+) -> Option<JoinHandle<()>> {
+    let permit = match connection_limit.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let busy = Response::Busy.encode();
+
+            if let Err(error) = stream.write_all(&busy).await {
+                eprintln!("failed to send busy response to {address}: {error}");
+            }
+
+            return None;
+        }
+    };
+
+    println!("accepted connection from {address}");
+
+    Some(tokio::spawn(async move {
+        let _connection_permit = permit;
+
+        if let Err(error) = handle_connection(stream, request_tx, idle_timeout).await {
+            eprintln!("connection error from {address}: {error}");
+        }
+    }))
 }
 
 async fn handle_connection(
@@ -243,6 +281,53 @@ mod tests {
     #[test]
     fn request_size_above_limit_is_rejected() {
         assert!(request_is_too_large(MAX_REQUEST_SIZE + 1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_connection_when_connection_limit_is_reached() {
+        let connection_limit = Arc::new(Semaphore::new(1));
+        let (request_tx, _request_rx) = mpsc::channel(1);
+
+        let (_first_client, first_server) = tcp_pair().await;
+        let first_address = first_server.peer_addr().unwrap();
+
+        let first_connection = dispatch_connection(
+            first_server,
+            first_address,
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            IDLE_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(connection_limit.available_permits(), 0);
+
+        let (mut second_client, second_server) = tcp_pair().await;
+        let second_address = second_server.peer_addr().unwrap();
+
+        let second_connection = dispatch_connection(
+            second_server,
+            second_address,
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            IDLE_TIMEOUT,
+        )
+        .await;
+
+        assert!(second_connection.is_none());
+
+        let mut response = Vec::new();
+        second_client.read_to_end(&mut response).await.unwrap();
+
+        assert_eq!(response, b"BUSY\r\n");
+
+        first_connection.abort();
+
+        let join_error = first_connection.await.unwrap_err();
+
+        assert!(join_error.is_cancelled());
+        assert_eq!(connection_limit.available_permits(), 1);
     }
 
     async fn send_command(request_tx: &mpsc::Sender<CacheRequest>, command: Command) -> Response {

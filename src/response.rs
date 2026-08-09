@@ -4,6 +4,7 @@ pub enum Response {
     Stored,
     Deleted,
     NotFound,
+    Busy,
 }
 
 impl Response {
@@ -12,6 +13,7 @@ impl Response {
             Self::Stored => b"STORED\r\n".to_vec(),
             Self::Deleted => b"DELETED\r\n".to_vec(),
             Self::NotFound => b"NOT_FOUND\r\n".to_vec(),
+            Self::Busy => b"BUSY\r\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -46,6 +48,11 @@ mod tests {
     #[test]
     fn encodes_not_found_response() {
         assert_eq!(Response::NotFound.encode(), b"NOT_FOUND\r\n");
+    }
+
+    #[test]
+    fn encodes_busy_response() {
+        assert_eq!(Response::Busy.encode(), b"BUSY\r\n");
     }
 
     #[test]
