@@ -6,7 +6,13 @@ rust-version = "1.96"
 
 [dependencies]
 mutants = "0.0.4"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio = {
+  version = "1",
+  features = ["io-util", "macros", "net", "rt", "sync", "time"]
+}
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]
 all = "deny"

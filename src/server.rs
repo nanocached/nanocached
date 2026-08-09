@@ -2,11 +2,14 @@ use crate::cache::Cache;
 use crate::command::{Command, ParseError, parse};
 use crate::response::Response;
 use std::io;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -31,7 +34,7 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
         println!("accepted connection from {address}");
 
         tokio::spawn(async move {
-            if let Err(error) = handle_connection(stream, request_tx).await {
+            if let Err(error) = handle_connection(stream, request_tx, IDLE_TIMEOUT).await {
                 eprintln!("connection error from {address}: {error}");
             }
         });
@@ -41,6 +44,7 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
 async fn handle_connection(
     mut stream: TcpStream,
     request_tx: mpsc::Sender<CacheRequest>,
+    idle_timeout: Duration,
 ) -> io::Result<()> {
     let mut received = Vec::new();
     let mut chunk = [0_u8; 1024];
@@ -76,7 +80,9 @@ async fn handle_connection(
             }
         }
 
-        let bytes_read = stream.read(&mut chunk).await?;
+        let bytes_read = timeout(idle_timeout, stream.read(&mut chunk))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout"))??;
 
         if bytes_read == 0 {
             if received.is_empty() {
@@ -153,7 +159,8 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(1);
 
         let cache_task = tokio::spawn(run_cache(request_rx));
-        let connection_task = tokio::spawn(handle_connection(server, request_tx.clone()));
+        let connection_task =
+            tokio::spawn(handle_connection(server, request_tx.clone(), IDLE_TIMEOUT));
 
         client
             .write_all(b"SET 4 5\r\nnameAliceGET 4\r\nname")
@@ -181,7 +188,7 @@ mod tests {
 
         let (request_tx, _request_rx) = mpsc::channel(1);
 
-        let connection_task = tokio::spawn(handle_connection(server, request_tx));
+        let connection_task = tokio::spawn(handle_connection(server, request_tx, IDLE_TIMEOUT));
 
         client.write_all(b"SET 4 5\r\nnameAli").await.unwrap();
 
@@ -200,6 +207,22 @@ mod tests {
         let error = run(&address).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn handle_connection_times_out_when_client_is_idle() {
+        let (_client, server) = tcp_pair().await;
+
+        let (request_tx, _request_rx) = mpsc::channel(1);
+
+        let connection_task = tokio::spawn(handle_connection(server, request_tx, IDLE_TIMEOUT));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(IDLE_TIMEOUT).await;
+
+        let error = connection_task.await.unwrap().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
