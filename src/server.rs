@@ -169,8 +169,6 @@ mod tests {
 
         assert_eq!(response, expected);
 
-        client.shutdown().await.unwrap();
-
         connection_task.await.unwrap().unwrap();
 
         drop(request_tx);
