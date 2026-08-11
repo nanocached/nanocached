@@ -24,6 +24,25 @@ struct CacheRequest {
     response_tx: oneshot::Sender<Response>,
 }
 
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 pub(crate) async fn run(address: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
@@ -32,20 +51,35 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
 
     tokio::spawn(run_cache(request_rx));
 
-    loop {
-        let (stream, address) = listener.accept().await?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
-        drop(
-            dispatch_connection(
-                stream,
-                address,
-                request_tx.clone(),
-                Arc::clone(&connection_limit),
-                IDLE_TIMEOUT,
-            )
-            .await,
-        );
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, address) = result?;
+
+                drop(
+                    dispatch_connection(
+                        stream,
+                        address,
+                        request_tx.clone(),
+                        Arc::clone(&connection_limit),
+                        IDLE_TIMEOUT,
+                    )
+                    .await,
+                );
+            }
+
+            result = &mut shutdown => {
+                result?;
+                println!("shutdown signal received");
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 async fn dispatch_connection(
