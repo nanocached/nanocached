@@ -27,11 +27,31 @@ toolchain and installs the Clippy and rustfmt components automatically.
 
 ## Running the server
 
+### Cargo
+
 ```sh
 cargo run
 ```
 
 Kvelo listens on `0.0.0.0:8356`.
+
+### Docker
+
+Use the included `Dockerfile` to build and run the Alpine-based container
+image:
+
+```sh
+docker build --tag kvelo .
+docker run --rm --publish 8356:8356 kvelo
+```
+
+The latest image built from the `main` branch is also available from GitHub
+Container Registry:
+
+```sh
+docker pull ghcr.io/t0k0sh1/kvelo:latest
+docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/kvelo:latest
+```
 
 For example, store and retrieve the value `Alice` under the key `name`:
 
