@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
@@ -48,6 +48,7 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
 
     let (request_tx, request_rx) = mpsc::channel(1024);
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut connection_tasks = JoinSet::new();
 
     tokio::spawn(run_cache(request_rx));
 
@@ -64,19 +65,24 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
                 break;
             }
 
+            result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("connection task failed: {error}");
+                }
+            }
+
             result = listener.accept() => {
                 let (stream, address) = result?;
 
-                drop(
-                    dispatch_connection(
-                        stream,
-                        address,
-                        request_tx.clone(),
-                        Arc::clone(&connection_limit),
-                        IDLE_TIMEOUT,
-                    )
-                    .await,
-                );
+                dispatch_connection(
+                    stream,
+                    address,
+                    request_tx.clone(),
+                    Arc::clone(&connection_limit),
+                    IDLE_TIMEOUT,
+                    &mut connection_tasks,
+                )
+                .await;
             }
         }
     }
@@ -90,7 +96,8 @@ async fn dispatch_connection(
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
     idle_timeout: Duration,
-) -> Option<JoinHandle<()>> {
+    connection_tasks: &mut JoinSet<()>,
+) -> bool {
     let permit = match connection_limit.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -100,19 +107,21 @@ async fn dispatch_connection(
                 eprintln!("failed to send busy response to {address}: {error}");
             }
 
-            return None;
+            return false;
         }
     };
 
     println!("accepted connection from {address}");
 
-    Some(tokio::spawn(async move {
+    connection_tasks.spawn(async move {
         let _connection_permit = permit;
 
         if let Err(error) = handle_connection(stream, request_tx, idle_timeout).await {
             eprintln!("connection error from {address}: {error}");
         }
-    }))
+    });
+
+    true
 }
 
 async fn handle_connection(
@@ -327,16 +336,19 @@ mod tests {
         let (_first_client, first_server) = tcp_pair().await;
         let first_address = first_server.peer_addr().unwrap();
 
+        let mut connection_tasks = JoinSet::new();
+
         let first_connection = dispatch_connection(
             first_server,
             first_address,
             request_tx.clone(),
             Arc::clone(&connection_limit),
             IDLE_TIMEOUT,
+            &mut connection_tasks,
         )
-        .await
-        .unwrap();
+        .await;
 
+        assert!(first_connection);
         assert_eq!(connection_limit.available_permits(), 0);
 
         let (mut second_client, second_server) = tcp_pair().await;
@@ -348,21 +360,23 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             IDLE_TIMEOUT,
+            &mut connection_tasks,
         )
         .await;
 
-        assert!(second_connection.is_none());
+        assert!(!second_connection);
 
         let mut response = Vec::new();
         second_client.read_to_end(&mut response).await.unwrap();
 
         assert_eq!(response, b"BUSY\r\n");
 
-        first_connection.abort();
+        connection_tasks.abort_all();
 
-        let join_error = first_connection.await.unwrap_err();
+        let join_error = connection_tasks.join_next().await.unwrap().unwrap_err();
 
         assert!(join_error.is_cancelled());
+        assert!(connection_tasks.is_empty());
         assert_eq!(connection_limit.available_permits(), 1);
     }
 
