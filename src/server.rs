@@ -56,6 +56,14 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
 
     loop {
         tokio::select! {
+            biased;
+
+            result = &mut shutdown => {
+                result?;
+                println!("shutdown signal received");
+                break;
+            }
+
             result = listener.accept() => {
                 let (stream, address) = result?;
 
@@ -69,12 +77,6 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
                     )
                     .await,
                 );
-            }
-
-            result = &mut shutdown => {
-                result?;
-                println!("shutdown signal received");
-                break;
             }
         }
     }
