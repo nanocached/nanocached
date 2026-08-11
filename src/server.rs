@@ -52,7 +52,7 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    tokio::spawn(run_cache(request_rx));
+    let cache_task = tokio::spawn(run_cache(request_rx));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -107,6 +107,12 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
 
         while connection_tasks.join_next().await.is_some() {}
     }
+
+    drop(request_tx);
+
+    cache_task
+        .await
+        .map_err(|error| io::Error::other(format!("cache task failed: {error}")))?;
 
     Ok(())
 }
