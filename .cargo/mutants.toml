@@ -1,1 +1,9 @@
 test_tool = "nextest"
+
+exclude_re = [
+  # OS signals are verified through container-level tests.
+  "replace shutdown_signal ->",
+
+  # The executable entry point contains no business logic.
+  "replace main ->",
+]

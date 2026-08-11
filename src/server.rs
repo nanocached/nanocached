@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -49,6 +50,7 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
     let (request_tx, request_rx) = mpsc::channel(1024);
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connection_tasks = JoinSet::new();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(run_cache(request_rx));
 
@@ -62,6 +64,7 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
             result = &mut shutdown => {
                 result?;
                 println!("shutdown signal received");
+                shutdown_tx.send_replace(true);
                 break;
             }
 
@@ -80,11 +83,29 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
                     request_tx.clone(),
                     Arc::clone(&connection_limit),
                     IDLE_TIMEOUT,
+                    shutdown_rx.clone(),
                     &mut connection_tasks,
                 )
                 .await;
             }
+
         }
+    }
+
+    let connections_finished = timeout(SHUTDOWN_TIMEOUT, async {
+        while let Some(result) = connection_tasks.join_next().await {
+            if let Err(error) = result {
+                eprintln!("connection task failed: {error}");
+            }
+        }
+    })
+    .await;
+
+    if connections_finished.is_err() {
+        eprintln!("shutdown timeout reached");
+        connection_tasks.abort_all();
+
+        while connection_tasks.join_next().await.is_some() {}
     }
 
     Ok(())
@@ -96,6 +117,7 @@ async fn dispatch_connection(
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
     idle_timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
 ) -> bool {
     let permit = match connection_limit.try_acquire_owned() {
@@ -116,7 +138,7 @@ async fn dispatch_connection(
     connection_tasks.spawn(async move {
         let _connection_permit = permit;
 
-        if let Err(error) = handle_connection(stream, request_tx, idle_timeout).await {
+        if let Err(error) = handle_connection(stream, request_tx, idle_timeout, shutdown_rx).await {
             eprintln!("connection error from {address}: {error}");
         }
     });
@@ -128,11 +150,16 @@ async fn handle_connection(
     mut stream: TcpStream,
     request_tx: mpsc::Sender<CacheRequest>,
     idle_timeout: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut received = Vec::new();
     let mut chunk = [0_u8; 1024];
 
     loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
         match parse(&received) {
             Ok((command, consumed)) => {
                 let (response_tx, response_rx) = oneshot::channel();
@@ -163,9 +190,18 @@ async fn handle_connection(
             }
         }
 
-        let bytes_read = timeout(idle_timeout, stream.read(&mut chunk))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout"))??;
+        let bytes_read = tokio::select! {
+            _ = shutdown_rx.changed() => return Ok(()),
+
+            result = timeout(idle_timeout, stream.read(&mut chunk)) => {
+                result.map_err(|_| {
+                    io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "connection idle timeout",
+                )
+                })??
+            }
+        };
 
         if bytes_read == 0 {
             if received.is_empty() {
@@ -240,10 +276,15 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
 
         let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let cache_task = tokio::spawn(run_cache(request_rx));
-        let connection_task =
-            tokio::spawn(handle_connection(server, request_tx.clone(), IDLE_TIMEOUT));
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx.clone(),
+            IDLE_TIMEOUT,
+            shutdown_rx,
+        ));
 
         client
             .write_all(b"SET 4 5\r\nnameAliceGET 4\r\nname")
@@ -270,8 +311,14 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
 
         let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let connection_task = tokio::spawn(handle_connection(server, request_tx, IDLE_TIMEOUT));
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx,
+            IDLE_TIMEOUT,
+            shutdown_rx,
+        ));
 
         client.write_all(b"SET 4 5\r\nnameAli").await.unwrap();
 
@@ -297,8 +344,14 @@ mod tests {
         let (_client, server) = tcp_pair().await;
 
         let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let connection_task = tokio::spawn(handle_connection(server, request_tx, IDLE_TIMEOUT));
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx,
+            IDLE_TIMEOUT,
+            shutdown_rx,
+        ));
 
         tokio::task::yield_now().await;
         tokio::time::advance(IDLE_TIMEOUT).await;
@@ -337,6 +390,7 @@ mod tests {
         let first_address = first_server.peer_addr().unwrap();
 
         let mut connection_tasks = JoinSet::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let first_connection = dispatch_connection(
             first_server,
@@ -344,6 +398,7 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             IDLE_TIMEOUT,
+            shutdown_rx.clone(),
             &mut connection_tasks,
         )
         .await;
@@ -360,6 +415,7 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             IDLE_TIMEOUT,
+            shutdown_rx,
             &mut connection_tasks,
         )
         .await;
@@ -378,6 +434,25 @@ mod tests {
         assert!(join_error.is_cancelled());
         assert!(connection_tasks.is_empty());
         assert_eq!(connection_limit.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_stops_when_shutdown_is_requested() {
+        let (_client, server) = tcp_pair().await;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx,
+            IDLE_TIMEOUT,
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        shutdown_tx.send_replace(true);
+
+        connection_task.await.unwrap().unwrap();
     }
 
     async fn send_command(request_tx: &mpsc::Sender<CacheRequest>, command: Command) -> Response {
