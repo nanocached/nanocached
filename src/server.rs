@@ -461,6 +461,47 @@ mod tests {
         connection_task.await.unwrap().unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_finishes_in_flight_request_during_shutdown() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx,
+            IDLE_TIMEOUT,
+            shutdown_rx,
+        ));
+
+        client.write_all(b"GET 4\r\nname").await.unwrap();
+
+        let request = request_rx.recv().await.unwrap();
+
+        assert_eq!(
+            request.command,
+            Command::Get {
+                key: b"name".to_vec(),
+            },
+        );
+
+        shutdown_tx.send_replace(true);
+
+        request
+            .response_tx
+            .send(Response::Value(b"Alice".to_vec()))
+            .unwrap();
+
+        let expected = b"VALUE 5\r\nAlice";
+        let mut response = vec![0_u8; expected.len()];
+
+        client.read_exact(&mut response).await.unwrap();
+
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+    }
+
     async fn send_command(request_tx: &mpsc::Sender<CacheRequest>, command: Command) -> Response {
         let (response_tx, response_rx) = oneshot::channel();
 
