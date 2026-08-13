@@ -293,13 +293,13 @@ mod tests {
         ));
 
         client
-            .write_all(b"SET 4 5\r\nnameAliceGET 4\r\nname")
+            .write_all(b"S 4 5\nnameAliceG 4\nname")
             .await
             .unwrap();
 
         client.shutdown().await.unwrap();
 
-        let expected = b"STORED\r\nVALUE 5\r\nAlice";
+        let expected = b"S\nV 5\nAlice";
         let mut response = vec![0_u8; expected.len()];
 
         client.read_exact(&mut response).await.unwrap();
@@ -326,7 +326,7 @@ mod tests {
             shutdown_rx,
         ));
 
-        client.write_all(b"SET 4 5\r\nnameAli").await.unwrap();
+        client.write_all(b"S 4 5\nnameAli").await.unwrap();
 
         client.shutdown().await.unwrap();
 
@@ -431,7 +431,7 @@ mod tests {
         let mut response = Vec::new();
         second_client.read_to_end(&mut response).await.unwrap();
 
-        assert_eq!(response, b"BUSY\r\n");
+        assert_eq!(response, b"B\n");
 
         connection_tasks.abort_all();
 
@@ -474,7 +474,7 @@ mod tests {
             shutdown_rx,
         ));
 
-        client.write_all(b"GET 4\r\nname").await.unwrap();
+        client.write_all(b"G 4\nname").await.unwrap();
 
         let request = request_rx.recv().await.unwrap();
 
@@ -492,7 +492,7 @@ mod tests {
             .send(Response::Value(b"Alice".to_vec()))
             .unwrap();
 
-        let expected = b"VALUE 5\r\nAlice";
+        let expected = b"V 5\nAlice";
         let mut response = vec![0_u8; expected.len()];
 
         client.read_exact(&mut response).await.unwrap();

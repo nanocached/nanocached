@@ -9,7 +9,7 @@ small, binary-safe TCP protocol and supports optional time-to-live (TTL) values.
 ## Features
 
 - In-memory storage for binary keys and values
-- `GET`, `SET`, and `DEL` commands
+- `G`, `S`, and `D` commands
 - Optional TTL for stored values
 - Multiple requests per TCP connection
 - Pipelined requests
@@ -56,84 +56,85 @@ docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/kvelo:latest
 For example, store and retrieve the value `Alice` under the key `name`:
 
 ```sh
-printf 'SET 4 5\r\nnameAliceGET 4\r\nname' | nc 127.0.0.1 8356
+printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356
 ```
 
 The server responds with:
 
 ```text
-STORED
-VALUE 5
+S
+V 5
 Alice
 ```
 
 ## Protocol
 
-Each request starts with an ASCII header terminated by `\r\n`. The key and
+Each request starts with an ASCII header terminated by `\n`. The key and
 value bodies immediately follow the header and are read according to their byte
 lengths. Bodies are not terminated by a delimiter and may contain arbitrary
-bytes.
+bytes. One-byte command and status identifiers minimize protocol overhead while
+keeping frames readable during development.
 
-### GET
+### G (get)
 
 ```text
-GET <key-length>\r\n<key>
+G <key-length>\n<key>
 ```
 
 Responses:
 
 ```text
-VALUE <value-length>\r\n<value>
+V <value-length>\n<value>
 ```
 
 or:
 
 ```text
-NOT_FOUND\r\n
+N\n
 ```
 
-### SET
+### S (set)
 
 Without a TTL:
 
 ```text
-SET <key-length> <value-length>\r\n<key><value>
+S <key-length> <value-length>\n<key><value>
 ```
 
 With a TTL in seconds:
 
 ```text
-SET <key-length> <value-length> <ttl-seconds>\r\n<key><value>
+S <key-length> <value-length> <ttl-seconds>\n<key><value>
 ```
 
 Response:
 
 ```text
-STORED\r\n
+S\n
 ```
 
-### DEL
+### D (delete)
 
 ```text
-DEL <key-length>\r\n<key>
+D <key-length>\n<key>
 ```
 
 Responses:
 
 ```text
-DELETED\r\n
+D\n
 ```
 
 or:
 
 ```text
-NOT_FOUND\r\n
+N\n
 ```
 
 When the connection limit has been reached, the server responds with:
 
 ```text
-BUSY\r\n
+B\n
 ```
 
 ## Development

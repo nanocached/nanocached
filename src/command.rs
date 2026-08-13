@@ -51,14 +51,14 @@ pub enum ParseError {
 }
 
 pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
-    let header_end = find_crlf(input).ok_or(ParseError::Incomplete)?;
+    let header_end = find_lf(input).ok_or(ParseError::Incomplete)?;
     let header = &input[..header_end];
 
     let mut parts = header.split(|byte| *byte == b' ');
     let command = parts.next().ok_or(ParseError::InvalidCommand)?;
 
     match command {
-        b"GET" | b"DEL" => {
+        b"G" | b"D" => {
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
@@ -67,7 +67,7 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
 
             let key_length = parse_length(key_length)?;
 
-            let key_start = header_end + 2;
+            let key_start = header_end + 1;
             let key_end = key_start
                 .checked_add(key_length)
                 .ok_or(ParseError::InvalidLength)?;
@@ -79,15 +79,15 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
             let key = input[key_start..key_end].to_vec();
 
             let command = match command {
-                b"GET" => Command::Get { key },
-                b"DEL" => Command::Delete { key },
+                b"G" => Command::Get { key },
+                b"D" => Command::Delete { key },
                 _ => unreachable!(),
             };
 
             Ok((command, key_end))
         }
 
-        b"SET" => {
+        b"S" => {
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let ttl = parts.next();
@@ -109,7 +109,7 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
                 None => None,
             };
 
-            let key_start = header_end + 2;
+            let key_start = header_end + 1;
 
             let key_end = key_start
                 .checked_add(key_length)
@@ -133,8 +133,8 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
     }
 }
 
-fn find_crlf(input: &[u8]) -> Option<usize> {
-    input.windows(2).position(|window| window == b"\r\n")
+fn find_lf(input: &[u8]) -> Option<usize> {
+    input.iter().position(|byte| *byte == b'\n')
 }
 
 fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
@@ -161,12 +161,12 @@ mod tests {
     #[test]
     fn parses_get_command() {
         assert_eq!(
-            parse(b"GET 4\r\nname"),
+            parse(b"G 4\nname"),
             Ok((
                 Command::Get {
                     key: b"name".to_vec(),
                 },
-                11,
+                8,
             ))
         );
     }
@@ -174,14 +174,14 @@ mod tests {
     #[test]
     fn parses_set_command_without_ttl() {
         assert_eq!(
-            parse(b"SET 4 5\r\nnameAlice"),
+            parse(b"S 4 5\nnameAlice"),
             Ok((
                 Command::Set {
                     key: b"name".to_vec(),
                     value: b"Alice".to_vec(),
                     ttl: None,
                 },
-                18,
+                15,
             ))
         );
     }
@@ -189,14 +189,14 @@ mod tests {
     #[test]
     fn parses_set_command_with_ttl() {
         assert_eq!(
-            parse(b"SET 4 5 10\r\nnameAlice"),
+            parse(b"S 4 5 10\nnameAlice"),
             Ok((
                 Command::Set {
                     key: b"name".to_vec(),
                     value: b"Alice".to_vec(),
                     ttl: Some(Duration::from_secs(10)),
                 },
-                21,
+                18,
             ))
         );
     }
@@ -204,64 +204,64 @@ mod tests {
     #[test]
     fn parses_delete_command() {
         assert_eq!(
-            parse(b"DEL 4\r\nname"),
+            parse(b"D 4\nname"),
             Ok((
                 Command::Delete {
                     key: b"name".to_vec(),
                 },
-                11,
+                8,
             ))
         );
     }
 
     #[test]
     fn returns_incomplete_when_header_is_incomplete() {
-        assert_eq!(parse(b"GET 4\r"), Err(ParseError::Incomplete));
+        assert_eq!(parse(b"G 4"), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn returns_incomplete_when_key_is_incomplete() {
-        assert_eq!(parse(b"GET 4\r\nna"), Err(ParseError::Incomplete));
+        assert_eq!(parse(b"G 4\nna"), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn returns_incomplete_when_set_value_is_incomplete() {
-        assert_eq!(parse(b"SET 4 5\r\nnameAli"), Err(ParseError::Incomplete));
+        assert_eq!(parse(b"S 4 5\nnameAli"), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn rejects_non_numeric_key_length() {
-        assert_eq!(parse(b"GET abc\r\nname"), Err(ParseError::InvalidLength));
+        assert_eq!(parse(b"G abc\nname"), Err(ParseError::InvalidLength));
     }
 
     #[test]
     fn rejects_unknown_command() {
-        assert_eq!(parse(b"UNKNOWN 4\r\nname"), Err(ParseError::InvalidCommand));
+        assert_eq!(parse(b"UNKNOWN 4\nname"), Err(ParseError::InvalidCommand));
     }
 
     #[test]
     fn rejects_unknown_command_without_waiting_for_body() {
-        assert_eq!(parse(b"UNKNOWN 100\r\n"), Err(ParseError::InvalidCommand));
+        assert_eq!(parse(b"UNKNOWN 100\n"), Err(ParseError::InvalidCommand));
     }
 
     #[test]
     fn reports_consumed_bytes() {
-        let input = b"GET 4\r\nnameGET 3\r\nage";
+        let input = b"G 4\nnameG 3\nage";
 
         let (_, consumed) = parse(input).unwrap();
 
-        assert_eq!(&input[consumed..], b"GET 3\r\nage");
+        assert_eq!(&input[consumed..], b"G 3\nage");
     }
 
     #[test]
     fn parses_binary_key() {
         assert_eq!(
-            parse(b"GET 3\r\n\xff\x00a"),
+            parse(b"G 3\n\xff\x00a"),
             Ok((
                 Command::Get {
                     key: vec![0xff, 0x00, b'a'],
                 },
-                10,
+                7,
             ))
         );
     }
