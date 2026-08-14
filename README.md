@@ -178,11 +178,7 @@ make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
 ### Benchmarking
 
 `src/bin/bench.rs` is an async, multi-threaded load client for kvelo's
-protocol. `tools/kvelo_bench.py` also exists, but it's a single-process,
-thread-based Python client: the GIL keeps it from generating enough
-concurrent I/O to saturate the server, so it's only reliable for relative
-before/after comparisons at a fixed, sufficiently deep pipeline depth — not
-for finding kvelo's actual ceiling. Use the Rust client for that:
+protocol:
 
 ```sh
 cargo run --release --bin bench -- --help
