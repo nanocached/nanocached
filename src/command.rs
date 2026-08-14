@@ -55,6 +55,7 @@ impl Command {
 pub enum ParseError {
     InvalidCommand,
     InvalidLength,
+    EmptyKey,
     Incomplete,
 }
 
@@ -78,6 +79,10 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             }
 
             let key_length = parse_length(key_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
 
             let key_start = header_end + 1;
             let key_end = key_start
@@ -115,6 +120,10 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
 
             let key_length = parse_length(key_length)?;
             let value_length = parse_length(value_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
 
             let ttl = match ttl {
                 Some(ttl) => {
@@ -265,6 +274,48 @@ mod tests {
         let mut input = buf(b"G abc\nname");
 
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn rejects_empty_key_for_get() {
+        let mut input = buf(b"G 0\n");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn rejects_empty_key_for_delete() {
+        let mut input = buf(b"D 0\n");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn rejects_empty_key_for_set() {
+        let mut input = buf(b"S 0 5\nAlice");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn rejects_empty_key_without_waiting_for_body() {
+        let mut input = buf(b"S 0 1000000\n");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn parses_set_command_with_empty_value() {
+        let mut input = buf(b"S 4 0\nname");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::new(),
+                ttl: None,
+            })
+        );
     }
 
     #[test]

@@ -76,6 +76,9 @@ lengths. Bodies are not terminated by a delimiter and may contain arbitrary
 bytes. One-byte command and status identifiers minimize protocol overhead while
 keeping frames readable during development.
 
+A `<key-length>` of `0` is rejected for every command. There is no dedicated
+maximum key or value length beyond the overall request-size limit below.
+
 ### G (get)
 
 ```text
