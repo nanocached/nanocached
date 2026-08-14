@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 
 struct Entry {
@@ -7,7 +7,7 @@ struct Entry {
 }
 
 pub struct Cache {
-    entries: HashMap<Vec<u8>, Entry>,
+    entries: FxHashMap<Vec<u8>, Entry>,
 }
 
 impl Entry {
@@ -19,7 +19,7 @@ impl Entry {
 impl Cache {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 
