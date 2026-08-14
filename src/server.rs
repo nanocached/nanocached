@@ -129,6 +129,10 @@ async fn dispatch_connection(
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
 ) -> bool {
+    // Every request/response is small; without this, the kernel may delay
+    // small writes waiting to coalesce with more data (Nagle's algorithm).
+    let _ = stream.set_nodelay(true);
+
     let permit = match connection_limit.try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
