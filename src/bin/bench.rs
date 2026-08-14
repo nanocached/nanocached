@@ -3,6 +3,13 @@
 //! `tools/kvelo_bench.py` is GIL-bound and cannot drive enough concurrent
 //! I/O to saturate the server; this binary exists to find kvelo's actual
 //! ceiling.
+//!
+//! There is deliberately no pipelining option. kvelo's target workload is
+//! one lookup per client request (e.g. a web request checking a session or
+//! a cached record), which cannot be pipelined because the caller doesn't
+//! know the next key before seeing the current result. A pipeline flag
+//! invites optimizing for a throughput number the real workload doesn't
+//! produce.
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::process::ExitCode;
@@ -25,7 +32,6 @@ struct Args {
     port: u16,
     requests: u64,
     connections: u64,
-    pipeline: u64,
     workload: Workload,
     get_ratio: f64,
     keys: u64,
@@ -41,7 +47,6 @@ impl Default for Args {
             port: 8356,
             requests: 100_000,
             connections: 16,
-            pipeline: 1,
             workload: Workload::Mixed,
             get_ratio: 0.8,
             keys: 10_000,
@@ -64,7 +69,6 @@ fn parse_args() -> Result<Args, String> {
             "--port" => args.port = parse_value(&value()?, "--port")?,
             "-n" | "--requests" => args.requests = parse_value(&value()?, "--requests")?,
             "-c" | "--connections" => args.connections = parse_value(&value()?, "--connections")?,
-            "-p" | "--pipeline" => args.pipeline = parse_value(&value()?, "--pipeline")?,
             "--workload" => {
                 args.workload = match value()?.as_str() {
                     "get" => Workload::Get,
@@ -83,8 +87,8 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    if args.requests == 0 || args.connections == 0 || args.pipeline == 0 || args.keys == 0 {
-        return Err("requests, connections, pipeline, and keys must be positive".to_string());
+    if args.requests == 0 || args.connections == 0 || args.keys == 0 {
+        return Err("requests, connections, and keys must be positive".to_string());
     }
     if !(0.0..=1.0).contains(&args.get_ratio) {
         return Err("get-ratio must be between 0 and 1".to_string());
@@ -106,7 +110,6 @@ Usage: bench [options]
   --port <port>          server port (default 8356)
   -n, --requests <n>     total requests (default 100000)
   -c, --connections <n>  concurrent connections (default 16)
-  -p, --pipeline <n>     requests per round trip (default 1)
   --workload <kind>      get | set | mixed (default mixed)
   --get-ratio <f>        GET fraction for mixed workload (default 0.8)
   --keys <n>             distinct key count (default 10000)
@@ -241,24 +244,18 @@ async fn worker(id: u64, args: Arc<Args>, barrier: Arc<Barrier>) -> WorkerResult
     }
 
     while remaining > 0 {
-        let batch = remaining.min(args.pipeline);
+        let key = format!("kvelo:{}", rng.below(args.keys));
+        let is_get = match args.workload {
+            Workload::Get => true,
+            Workload::Set => false,
+            Workload::Mixed => rng.unit() < args.get_ratio,
+        };
 
         send_buf.clear();
-        let mut expect_get = Vec::with_capacity(batch as usize);
-        for _ in 0..batch {
-            let key = format!("kvelo:{}", rng.below(args.keys));
-            let use_get = match args.workload {
-                Workload::Get => true,
-                Workload::Set => false,
-                Workload::Mixed => rng.unit() < args.get_ratio,
-            };
-
-            if use_get {
-                write_get_request(key.as_bytes(), &mut send_buf);
-            } else {
-                write_set_request(key.as_bytes(), &value, args.ttl, &mut send_buf);
-            }
-            expect_get.push(use_get);
+        if is_get {
+            write_get_request(key.as_bytes(), &mut send_buf);
+        } else {
+            write_set_request(key.as_bytes(), &value, args.ttl, &mut send_buf);
         }
 
         let started = Instant::now();
@@ -269,41 +266,31 @@ async fn worker(id: u64, args: Arc<Args>, barrier: Arc<Barrier>) -> WorkerResult
         }
         result.bytes_sent += send_buf.len() as u64;
 
-        let mut broke = false;
-        for &is_get in &expect_get {
-            match read_response(&mut stream, &mut recv_buf).await {
-                Ok((kind, len)) => {
-                    result.bytes_received += len as u64;
-                    let valid = if is_get {
-                        kind == b'V' || kind == b'N'
-                    } else {
-                        kind == b'S'
-                    };
-                    if !valid {
-                        result.error = Some(format!("unexpected response byte: {kind:#x}"));
-                        broke = true;
-                        break;
-                    }
-                }
-                Err(error) => {
-                    result.error = Some(format!("read: {error}"));
-                    broke = true;
+        match read_response(&mut stream, &mut recv_buf).await {
+            Ok((kind, len)) => {
+                result.bytes_received += len as u64;
+                let valid = if is_get {
+                    kind == b'V' || kind == b'N'
+                } else {
+                    kind == b'S'
+                };
+                if !valid {
+                    result.error = Some(format!("unexpected response byte: {kind:#x}"));
                     break;
                 }
             }
-        }
-        if broke {
-            break;
+            Err(error) => {
+                result.error = Some(format!("read: {error}"));
+                break;
+            }
         }
 
-        let elapsed_ns = started.elapsed().as_nanos() as u64;
-        let per_request_ns = elapsed_ns / batch;
         result
             .latencies_ns
-            .extend(std::iter::repeat_n(per_request_ns, batch as usize));
+            .push(started.elapsed().as_nanos() as u64);
 
-        result.completed += batch;
-        remaining -= batch;
+        result.completed += 1;
+        remaining -= 1;
     }
 
     result

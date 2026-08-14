@@ -182,7 +182,7 @@ protocol:
 
 ```sh
 cargo run --release --bin bench -- --help
-cargo run --release --bin bench -- -c 64 -p 16 --workload mixed
+cargo run --release --bin bench -- -c 64 --workload mixed
 ```
 
 ## Current limits
