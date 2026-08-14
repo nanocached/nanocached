@@ -15,6 +15,7 @@ small, binary-safe TCP protocol and supports optional time-to-live (TTL) values.
 - Pipelined requests
 - Idle connection timeout
 - Request-size and connection-count limits
+- Memory-bounded cache with least-recently-used (LRU) eviction
 
 ## Requirements
 
@@ -175,4 +176,6 @@ make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
 
 - Maximum request size: 1 MiB
 - Maximum concurrent connections: 1,024
+- Maximum cache memory usage: 256 MiB (approximate: sum of stored key and
+  value bytes), least-recently-used entries evicted first
 - Idle connection timeout: 30 seconds

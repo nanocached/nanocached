@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn get_returns_value_for_existing_key() {
-        let mut cache = Cache::new();
+        let mut cache = Cache::new(usize::MAX);
         cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
         let command = Command::Get {
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn get_returns_not_found_for_missing_key() {
-        let mut cache = Cache::new();
+        let mut cache = Cache::new(usize::MAX);
 
         let command = Command::Get {
             key: Bytes::from_static(b"name"),
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn set_stores_value() {
-        let mut cache = Cache::new();
+        let mut cache = Cache::new(usize::MAX);
 
         let command = Command::Set {
             key: Bytes::from_static(b"name"),
@@ -344,7 +344,7 @@ mod tests {
 
     #[test]
     fn set_with_zero_ttl_expires_immediately() {
-        let mut cache = Cache::new();
+        let mut cache = Cache::new(usize::MAX);
 
         let command = Command::Set {
             key: Bytes::from_static(b"name"),
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn delete_returns_deleted_for_existing_key() {
-        let mut cache = Cache::new();
+        let mut cache = Cache::new(usize::MAX);
         cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
         let command = Command::Delete {
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn delete_returns_not_found_for_missing_key() {
-        let mut cache = Cache::new();
+        let mut cache = Cache::new(usize::MAX);
 
         let command = Command::Delete {
             key: Bytes::from_static(b"name"),

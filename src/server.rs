@@ -14,6 +14,7 @@ use tokio::time::timeout;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
+const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK_SIZE: usize = 1024;
@@ -232,7 +233,7 @@ async fn handle_connection(
 }
 
 async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>) {
-    let mut cache = Cache::new();
+    let mut cache = Cache::new(MAX_CACHE_MEMORY_BYTES);
 
     while let Some(request) = request_rx.recv().await {
         let response = request.command.execute(&mut cache);
