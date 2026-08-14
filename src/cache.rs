@@ -1,13 +1,14 @@
+use bytes::Bytes;
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 
 struct Entry {
-    value: Vec<u8>,
+    value: Bytes,
     expires_at: Option<Instant>,
 }
 
 pub struct Cache {
-    entries: FxHashMap<Vec<u8>, Entry>,
+    entries: FxHashMap<Bytes, Entry>,
 }
 
 impl Entry {
@@ -23,7 +24,7 @@ impl Cache {
         }
     }
 
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn set(&mut self, key: Bytes, value: Bytes) {
         let entry = Entry {
             value,
             expires_at: None,
@@ -31,7 +32,7 @@ impl Cache {
         self.entries.insert(key, entry);
     }
 
-    pub fn set_with_ttl(&mut self, key: Vec<u8>, value: Vec<u8>, ttl: Duration) {
+    pub fn set_with_ttl(&mut self, key: Bytes, value: Bytes, ttl: Duration) {
         let expires_at = Instant::now() + ttl;
         let entry = Entry {
             value,
@@ -40,7 +41,7 @@ impl Cache {
         self.entries.insert(key, entry);
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Option<&[u8]> {
+    pub fn get(&mut self, key: &[u8]) -> Option<Bytes> {
         self.get_at(key, Instant::now())
     }
 
@@ -48,7 +49,7 @@ impl Cache {
         self.delete_at(key, Instant::now())
     }
 
-    fn get_at(&mut self, key: &[u8], now: Instant) -> Option<&[u8]> {
+    fn get_at(&mut self, key: &[u8], now: Instant) -> Option<Bytes> {
         let expired = self
             .entries
             .get(key)
@@ -59,7 +60,7 @@ impl Cache {
             return None;
         }
 
-        self.entries.get(key).map(|entry| entry.value.as_slice())
+        self.entries.get(key).map(|entry| entry.value.clone())
     }
 
     fn delete_at(&mut self, key: &[u8], now: Instant) -> bool {
@@ -85,9 +86,9 @@ mod tests {
     fn gets_a_previously_set_value() {
         let mut cache = Cache::new();
 
-        cache.set(b"name".to_vec(), b"Alice".to_vec());
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
-        assert_eq!(cache.get(b"name"), Some(b"Alice".as_slice()));
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]
@@ -101,7 +102,7 @@ mod tests {
     fn delete_returns_true_for_existing_key() {
         let mut cache = Cache::new();
 
-        cache.set(b"name".to_vec(), b"Alice".to_vec());
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
         assert!(cache.delete(b"name"));
     }
@@ -117,17 +118,17 @@ mod tests {
     fn set_overwrites_existing_value() {
         let mut cache = Cache::new();
 
-        cache.set(b"name".to_vec(), b"Alice".to_vec());
-        cache.set(b"name".to_vec(), b"Bob".to_vec());
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Bob"));
 
-        assert_eq!(cache.get(b"name"), Some(b"Bob".as_slice()));
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Bob")));
     }
 
     #[test]
     fn deleted_value_can_no_longer_be_retrieved() {
         let mut cache = Cache::new();
 
-        cache.set(b"name".to_vec(), b"Alice".to_vec());
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
         cache.delete(b"name");
 
         assert_eq!(cache.get(b"name"), None);
@@ -137,16 +138,24 @@ mod tests {
     fn gets_a_previously_set_value_with_ttl() {
         let mut cache = Cache::new();
 
-        cache.set_with_ttl(b"name".to_vec(), b"Alice".to_vec(), Duration::from_secs(5));
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
 
-        assert_eq!(cache.get(b"name"), Some(b"Alice".as_slice()));
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]
     fn delete_returns_true_before_expiration() {
         let mut cache = Cache::new();
 
-        cache.set_with_ttl(b"name".to_vec(), b"Alice".to_vec(), Duration::from_secs(5));
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
 
         assert!(cache.delete(b"name"));
     }
@@ -155,18 +164,29 @@ mod tests {
     fn get_returns_value_before_expiration() {
         let mut cache = Cache::new();
 
-        cache.set_with_ttl(b"name".to_vec(), b"Alice".to_vec(), Duration::from_secs(5));
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
 
         let future = Instant::now() + Duration::from_secs(4);
 
-        assert_eq!(cache.get_at(b"name", future), Some(b"Alice".as_slice()));
+        assert_eq!(
+            cache.get_at(b"name", future),
+            Some(Bytes::from_static(b"Alice"))
+        );
     }
 
     #[test]
     fn get_returns_none_after_expiration() {
         let mut cache = Cache::new();
 
-        cache.set_with_ttl(b"name".to_vec(), b"Alice".to_vec(), Duration::from_secs(5));
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
 
         let future = Instant::now() + Duration::from_secs(6);
 
@@ -177,7 +197,11 @@ mod tests {
     fn get_removes_expired_entry() {
         let mut cache = Cache::new();
 
-        cache.set_with_ttl(b"name".to_vec(), b"Alice".to_vec(), Duration::from_secs(5));
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
 
         let future = Instant::now() + Duration::from_secs(6);
 
@@ -190,7 +214,11 @@ mod tests {
     fn delete_returns_false_after_expiration() {
         let mut cache = Cache::new();
 
-        cache.set_with_ttl(b"name".to_vec(), b"Alice".to_vec(), Duration::from_secs(5));
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
 
         let future = Instant::now() + Duration::from_secs(6);
 

@@ -1,6 +1,8 @@
+use bytes::Bytes;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
-    Value(Vec<u8>),
+    Value(Bytes),
     Stored,
     Deleted,
     NotFound,
@@ -57,14 +59,14 @@ mod tests {
 
     #[test]
     fn encodes_value_response() {
-        let response = Response::Value(b"Alice".to_vec());
+        let response = Response::Value(Bytes::from_static(b"Alice"));
 
         assert_eq!(response.encode(), b"V 5\nAlice");
     }
 
     #[test]
     fn encodes_binary_value_response() {
-        let response = Response::Value(vec![0xff, 0x00, b'\r', b'\n']);
+        let response = Response::Value(Bytes::from(vec![0xff, 0x00, b'\r', b'\n']));
 
         assert_eq!(response.encode(), b"V 4\n\xff\x00\r\n",);
     }

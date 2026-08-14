@@ -1,19 +1,20 @@
 use crate::cache::Cache;
 use crate::response::Response;
+use bytes::{Bytes, BytesMut};
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Get {
-        key: Vec<u8>,
+        key: Bytes,
     },
     Set {
-        key: Vec<u8>,
-        value: Vec<u8>,
+        key: Bytes,
+        value: Bytes,
         ttl: Option<Duration>,
     },
     Delete {
-        key: Vec<u8>,
+        key: Bytes,
     },
 }
 
@@ -21,10 +22,17 @@ impl Command {
     pub fn execute(self, cache: &mut Cache) -> Response {
         match self {
             Self::Get { key } => match cache.get(&key) {
-                Some(value) => Response::Value(value.to_vec()),
+                Some(value) => Response::Value(value),
                 None => Response::NotFound,
             },
             Self::Set { key, value, ttl } => {
+                // Stored entries must not keep a shared receive-buffer chunk
+                // (which may span an entire pipelined batch) alive just to
+                // retain a few bytes of it, so re-copy into right-sized
+                // allocations before inserting into the cache.
+                let key = Bytes::copy_from_slice(&key);
+                let value = Bytes::copy_from_slice(&value);
+
                 match ttl {
                     Some(ttl) => cache.set_with_ttl(key, value, ttl),
                     None => cache.set(key, value),
@@ -50,8 +58,12 @@ pub enum ParseError {
     Incomplete,
 }
 
-pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
-    let header_end = find_lf(input).ok_or(ParseError::Incomplete)?;
+/// Parses one request from the front of `input`. On success, the consumed
+/// bytes are removed from `input` via `BytesMut::split_to`, and the
+/// returned command's key/value share that removed chunk's allocation
+/// (no copy). On `Incomplete`, `input` is left untouched.
+pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
+    let header_end = find_lf(&input[..]).ok_or(ParseError::Incomplete)?;
     let header = &input[..header_end];
 
     let mut parts = header.split(|byte| *byte == b' ');
@@ -76,15 +88,20 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
                 return Err(ParseError::Incomplete);
             }
 
-            let key = input[key_start..key_end].to_vec();
-
-            let command = match command {
-                b"G" => Command::Get { key },
-                b"D" => Command::Delete { key },
+            let is_get = match command {
+                b"G" => true,
+                b"D" => false,
                 _ => unreachable!(),
             };
 
-            Ok((command, key_end))
+            let frame = input.split_to(key_end).freeze();
+            let key = frame.slice(key_start..key_end);
+
+            Ok(if is_get {
+                Command::Get { key }
+            } else {
+                Command::Delete { key }
+            })
         }
 
         b"S" => {
@@ -123,10 +140,11 @@ pub fn parse(input: &[u8]) -> Result<(Command, usize), ParseError> {
                 return Err(ParseError::Incomplete);
             }
 
-            let key = input[key_start..key_end].to_vec();
-            let value = input[key_end..value_end].to_vec();
+            let frame = input.split_to(value_end).freeze();
+            let key = frame.slice(key_start..key_end);
+            let value = frame.slice(key_end..value_end);
 
-            Ok((Command::Set { key, value, ttl }, value_end))
+            Ok(Command::Set { key, value, ttl })
         }
 
         _ => Err(ParseError::InvalidCommand),
@@ -158,126 +176,144 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
 mod tests {
     use super::*;
 
+    fn buf(bytes: &[u8]) -> BytesMut {
+        BytesMut::from(bytes)
+    }
+
     #[test]
     fn parses_get_command() {
+        let mut input = buf(b"G 4\nname");
+
         assert_eq!(
-            parse(b"G 4\nname"),
-            Ok((
-                Command::Get {
-                    key: b"name".to_vec(),
-                },
-                8,
-            ))
+            parse(&mut input),
+            Ok(Command::Get {
+                key: Bytes::from_static(b"name"),
+            })
         );
+        assert!(input.is_empty());
     }
 
     #[test]
     fn parses_set_command_without_ttl() {
+        let mut input = buf(b"S 4 5\nnameAlice");
+
         assert_eq!(
-            parse(b"S 4 5\nnameAlice"),
-            Ok((
-                Command::Set {
-                    key: b"name".to_vec(),
-                    value: b"Alice".to_vec(),
-                    ttl: None,
-                },
-                15,
-            ))
+            parse(&mut input),
+            Ok(Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            })
         );
+        assert!(input.is_empty());
     }
 
     #[test]
     fn parses_set_command_with_ttl() {
+        let mut input = buf(b"S 4 5 10\nnameAlice");
+
         assert_eq!(
-            parse(b"S 4 5 10\nnameAlice"),
-            Ok((
-                Command::Set {
-                    key: b"name".to_vec(),
-                    value: b"Alice".to_vec(),
-                    ttl: Some(Duration::from_secs(10)),
-                },
-                18,
-            ))
+            parse(&mut input),
+            Ok(Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: Some(Duration::from_secs(10)),
+            })
         );
+        assert!(input.is_empty());
     }
 
     #[test]
     fn parses_delete_command() {
+        let mut input = buf(b"D 4\nname");
+
         assert_eq!(
-            parse(b"D 4\nname"),
-            Ok((
-                Command::Delete {
-                    key: b"name".to_vec(),
-                },
-                8,
-            ))
+            parse(&mut input),
+            Ok(Command::Delete {
+                key: Bytes::from_static(b"name"),
+            })
         );
+        assert!(input.is_empty());
     }
 
     #[test]
     fn returns_incomplete_when_header_is_incomplete() {
-        assert_eq!(parse(b"G 4"), Err(ParseError::Incomplete));
+        let mut input = buf(b"G 4");
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], b"G 4");
     }
 
     #[test]
     fn returns_incomplete_when_key_is_incomplete() {
-        assert_eq!(parse(b"G 4\nna"), Err(ParseError::Incomplete));
+        let mut input = buf(b"G 4\nna");
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], b"G 4\nna");
     }
 
     #[test]
     fn returns_incomplete_when_set_value_is_incomplete() {
-        assert_eq!(parse(b"S 4 5\nnameAli"), Err(ParseError::Incomplete));
+        let mut input = buf(b"S 4 5\nnameAli");
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], b"S 4 5\nnameAli");
     }
 
     #[test]
     fn rejects_non_numeric_key_length() {
-        assert_eq!(parse(b"G abc\nname"), Err(ParseError::InvalidLength));
+        let mut input = buf(b"G abc\nname");
+
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
     fn rejects_unknown_command() {
-        assert_eq!(parse(b"UNKNOWN 4\nname"), Err(ParseError::InvalidCommand));
+        let mut input = buf(b"UNKNOWN 4\nname");
+
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
     }
 
     #[test]
     fn rejects_unknown_command_without_waiting_for_body() {
-        assert_eq!(parse(b"UNKNOWN 100\n"), Err(ParseError::InvalidCommand));
+        let mut input = buf(b"UNKNOWN 100\n");
+
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
     }
 
     #[test]
-    fn reports_consumed_bytes() {
-        let input = b"G 4\nnameG 3\nage";
+    fn leaves_the_next_request_untouched() {
+        let mut input = buf(b"G 4\nnameG 3\nage");
 
-        let (_, consumed) = parse(input).unwrap();
+        parse(&mut input).unwrap();
 
-        assert_eq!(&input[consumed..], b"G 3\nage");
+        assert_eq!(&input[..], b"G 3\nage");
     }
 
     #[test]
     fn parses_binary_key() {
+        let mut input = buf(b"G 3\n\xff\x00a");
+
         assert_eq!(
-            parse(b"G 3\n\xff\x00a"),
-            Ok((
-                Command::Get {
-                    key: vec![0xff, 0x00, b'a'],
-                },
-                7,
-            ))
+            parse(&mut input),
+            Ok(Command::Get {
+                key: Bytes::from(vec![0xff, 0x00, b'a']),
+            })
         );
     }
 
     #[test]
     fn get_returns_value_for_existing_key() {
         let mut cache = Cache::new();
-        cache.set(b"name".to_vec(), b"Alice".to_vec());
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
         let command = Command::Get {
-            key: b"name".to_vec(),
+            key: Bytes::from_static(b"name"),
         };
 
         assert_eq!(
             command.execute(&mut cache),
-            Response::Value(b"Alice".to_vec()),
+            Response::Value(Bytes::from_static(b"Alice")),
         );
     }
 
@@ -286,7 +322,7 @@ mod tests {
         let mut cache = Cache::new();
 
         let command = Command::Get {
-            key: b"name".to_vec(),
+            key: Bytes::from_static(b"name"),
         };
 
         assert_eq!(command.execute(&mut cache), Response::NotFound);
@@ -297,13 +333,13 @@ mod tests {
         let mut cache = Cache::new();
 
         let command = Command::Set {
-            key: b"name".to_vec(),
-            value: b"Alice".to_vec(),
+            key: Bytes::from_static(b"name"),
+            value: Bytes::from_static(b"Alice"),
             ttl: None,
         };
 
         assert_eq!(command.execute(&mut cache), Response::Stored);
-        assert_eq!(cache.get(b"name"), Some(b"Alice".as_slice()));
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]
@@ -311,8 +347,8 @@ mod tests {
         let mut cache = Cache::new();
 
         let command = Command::Set {
-            key: b"name".to_vec(),
-            value: b"Alice".to_vec(),
+            key: Bytes::from_static(b"name"),
+            value: Bytes::from_static(b"Alice"),
             ttl: Some(Duration::ZERO),
         };
 
@@ -324,10 +360,10 @@ mod tests {
     #[test]
     fn delete_returns_deleted_for_existing_key() {
         let mut cache = Cache::new();
-        cache.set(b"name".to_vec(), b"Alice".to_vec());
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
         let command = Command::Delete {
-            key: b"name".to_vec(),
+            key: Bytes::from_static(b"name"),
         };
 
         assert_eq!(command.execute(&mut cache), Response::Deleted);
@@ -338,7 +374,7 @@ mod tests {
         let mut cache = Cache::new();
 
         let command = Command::Delete {
-            key: b"name".to_vec(),
+            key: Bytes::from_static(b"name"),
         };
 
         assert_eq!(command.execute(&mut cache), Response::NotFound);

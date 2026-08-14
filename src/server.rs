@@ -1,6 +1,7 @@
 use crate::cache::Cache;
 use crate::command::{Command, ParseError, parse};
 use crate::response::Response;
+use bytes::BytesMut;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_CHUNK_SIZE: usize = 1024;
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -158,16 +160,15 @@ async fn handle_connection(
     idle_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let mut received = Vec::new();
-    let mut chunk = [0_u8; 1024];
+    let mut received = BytesMut::new();
 
     loop {
         if *shutdown_rx.borrow() {
             return Ok(());
         }
 
-        match parse(&received) {
-            Ok((command, consumed)) => {
+        match parse(&mut received) {
+            Ok(command) => {
                 let (response_tx, response_rx) = oneshot::channel();
 
                 request_tx
@@ -184,7 +185,6 @@ async fn handle_connection(
 
                 stream.write_all(&response.encode()).await?;
 
-                received.drain(..consumed);
                 continue;
             }
             Err(ParseError::Incomplete) => {}
@@ -196,10 +196,12 @@ async fn handle_connection(
             }
         }
 
+        received.reserve(READ_CHUNK_SIZE);
+
         let bytes_read = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
 
-            result = timeout(idle_timeout, stream.read(&mut chunk)) => {
+            result = timeout(idle_timeout, stream.read_buf(&mut received)) => {
                 result.map_err(|_| {
                     io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -219,8 +221,6 @@ async fn handle_connection(
                 "connection closed before request was complete",
             ));
         }
-
-        received.extend_from_slice(&chunk[..bytes_read]);
 
         if request_is_too_large(received.len()) {
             return Err(io::Error::new(
@@ -244,6 +244,7 @@ async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[tokio::test(flavor = "current_thread")]
     async fn run_cache_stores_and_retrieves_a_value() {
@@ -254,8 +255,8 @@ mod tests {
         let set_response = send_command(
             &request_tx,
             Command::Set {
-                key: b"name".to_vec(),
-                value: b"Alice".to_vec(),
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
         )
@@ -266,12 +267,12 @@ mod tests {
         let get_response = send_command(
             &request_tx,
             Command::Get {
-                key: b"name".to_vec(),
+                key: Bytes::from_static(b"name"),
             },
         )
         .await;
 
-        assert_eq!(get_response, Response::Value(b"Alice".to_vec()));
+        assert_eq!(get_response, Response::Value(Bytes::from_static(b"Alice")));
 
         drop(request_tx);
         cache_task.await.unwrap();
@@ -481,7 +482,7 @@ mod tests {
         assert_eq!(
             request.command,
             Command::Get {
-                key: b"name".to_vec(),
+                key: Bytes::from_static(b"name"),
             },
         );
 
@@ -489,7 +490,7 @@ mod tests {
 
         request
             .response_tx
-            .send(Response::Value(b"Alice".to_vec()))
+            .send(Response::Value(Bytes::from_static(b"Alice")))
             .unwrap();
 
         let expected = b"V 5\nAlice";

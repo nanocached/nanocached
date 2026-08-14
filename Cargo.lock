@@ -22,6 +22,7 @@ dependencies = [
 name = "kvelo"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "rustc-hash",
  "tokio",
 ]
