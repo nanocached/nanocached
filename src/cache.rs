@@ -47,6 +47,13 @@ impl Cache {
     }
 
     fn insert(&mut self, key: Bytes, value: Bytes, expires_at: Option<Instant>) {
+        // Entries stored long-term must not keep a shared receive-buffer
+        // chunk (which may span an entire pipelined batch) alive just to
+        // retain a few bytes of it, so re-copy into right-sized allocations
+        // here, where the invariant is actually enforced for every caller.
+        let key = Bytes::copy_from_slice(&key);
+        let value = Bytes::copy_from_slice(&value);
+
         let key_len = key.len();
         let value_len = value.len();
         let entry = Entry { value, expires_at };
@@ -61,32 +68,30 @@ impl Cache {
         // always the most-recently-used one, so `pop_lru` would only reach
         // it once nothing else is left.
         while self.used_bytes > self.max_memory_bytes && self.entries.len() > 1 {
-            let Some((evicted_key, evicted_entry)) = self.entries.pop_lru() else {
-                break;
-            };
+            let (evicted_key, evicted_entry) = self
+                .entries
+                .pop_lru()
+                .expect("len() > 1 guarantees an entry to evict");
 
             self.used_bytes -= evicted_key.len() + evicted_entry.value.len();
         }
     }
 
     fn get_at(&mut self, key: &[u8], now: Instant) -> Option<Bytes> {
-        let expired = self
-            .entries
-            .get(key)
-            .is_some_and(|entry| entry.is_expired_at(now));
+        let entry = self.entries.get(key)?;
 
-        if expired {
+        if entry.is_expired_at(now) {
             self.remove_entry(key);
             return None;
         }
 
-        self.entries.get(key).map(|entry| entry.value.clone())
+        Some(entry.value.clone())
     }
 
     fn delete_at(&mut self, key: &[u8], now: Instant) -> bool {
         let expired = self
             .entries
-            .get(key)
+            .peek(key)
             .is_some_and(|entry| entry.is_expired_at(now));
 
         if expired {
@@ -293,6 +298,61 @@ mod tests {
 
         assert_eq!(cache.get(b"k1"), Some(Bytes::from_static(b"vvvv")));
         assert_eq!(cache.get(b"k2"), Some(Bytes::from_static(b"vvvv")));
+    }
+
+    #[test]
+    fn overwrite_accounts_for_a_shrinking_value_precisely() {
+        let mut cache = Cache::new(10);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4, used 4
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XXX")); // size 4, used 8
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"Z")); // shrinks to size 2, used 6
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"WWWWW")); // size 6, used 12 > 10: evicts LRU "b"
+
+        assert_eq!(cache.get(b"b"), None);
+        assert_eq!(cache.get(b"a"), Some(Bytes::from_static(b"Z")));
+        assert_eq!(cache.get(b"c"), Some(Bytes::from_static(b"WWWWW")));
+    }
+
+    #[test]
+    fn eviction_loop_accounts_for_freed_bytes_precisely() {
+        let mut cache = Cache::new(7);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"X")); // size 2, used 2
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"X")); // size 2, used 4
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"X")); // size 2, used 6
+        cache.set(Bytes::from_static(b"d"), Bytes::from_static(b"WWW")); // size 4, used 10 > 7: evicts "a" then "b"
+
+        assert_eq!(cache.get(b"a"), None);
+        assert_eq!(cache.get(b"b"), None);
+        assert_eq!(cache.get(b"c"), Some(Bytes::from_static(b"X")));
+        assert_eq!(cache.get(b"d"), Some(Bytes::from_static(b"WWW")));
+    }
+
+    #[test]
+    fn delete_frees_the_deleted_entrys_exact_byte_count() {
+        let mut cache = Cache::new(10);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XXX")); // size 4, used 8
+        cache.delete(b"a"); // used 4
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"XXX")); // size 4, used 8, fits
+
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"XXX")));
+        assert_eq!(cache.get(b"c"), Some(Bytes::from_static(b"XXX")));
+    }
+
+    #[test]
+    fn delete_does_not_under_report_freed_bytes() {
+        let mut cache = Cache::new(6);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"X")); // size 2, used 6
+        cache.delete(b"a"); // used 2
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"WWWW")); // size 5, used 7 > 6: evicts "b"
+
+        assert_eq!(cache.get(b"b"), None);
+        assert_eq!(cache.get(b"c"), Some(Bytes::from_static(b"WWWW")));
     }
 
     #[test]

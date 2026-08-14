@@ -26,13 +26,6 @@ impl Command {
                 None => Response::NotFound,
             },
             Self::Set { key, value, ttl } => {
-                // Stored entries must not keep a shared receive-buffer chunk
-                // (which may span an entire pipelined batch) alive just to
-                // retain a few bytes of it, so re-copy into right-sized
-                // allocations before inserting into the cache.
-                let key = Bytes::copy_from_slice(&key);
-                let value = Bytes::copy_from_slice(&value);
-
                 match ttl {
                     Some(ttl) => cache.set_with_ttl(key, value, ttl),
                     None => cache.set(key, value),
@@ -93,11 +86,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
                 return Err(ParseError::Incomplete);
             }
 
-            let is_get = match command {
-                b"G" => true,
-                b"D" => false,
-                _ => unreachable!(),
-            };
+            let is_get = command == b"G";
 
             let frame = input.split_to(key_end).freeze();
             let key = frame.slice(key_start..key_end);

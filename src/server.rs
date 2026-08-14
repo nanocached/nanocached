@@ -375,6 +375,11 @@ mod tests {
     }
 
     #[test]
+    fn maximum_cache_memory_is_256_mebibytes() {
+        assert_eq!(MAX_CACHE_MEMORY_BYTES, 268_435_456);
+    }
+
+    #[test]
     fn request_size_below_limit_is_allowed() {
         assert!(!request_is_too_large(MAX_REQUEST_SIZE - 1));
     }
