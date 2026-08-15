@@ -6,6 +6,8 @@ Date: 2026-08-15
 
 Accepted
 
+Amended by [4. Split the Docker image into separate node and discovery images](0004-split-the-docker-image-into-separate-node-and-discovery-images.md)
+
 ## Context
 
 The project was named `kvelo`, and its binaries (`kvelo`, `bench`,

@@ -32,8 +32,10 @@ toolchain and installs the Clippy and rustfmt components automatically.
 Building the project produces four binaries:
 
 - `ncd` — a thin dispatcher: `ncd node start [options]` runs the cache node,
-  `ncd discovery start [options]` runs the discovery server. This is the
-  intended entry point for running a built binary or container.
+  `ncd discovery start [options]` runs the discovery server. Convenient for
+  running a bare-metal build; Docker images run their binary directly
+  instead (see [Docker](#docker) below) so each image only contains what
+  its role needs.
 - `nanocached-node` — the cache server itself.
 - `nanocached-discovery` — the standalone cluster-membership registry (see
   [Discovery server](#discovery-server) below).
@@ -66,27 +68,29 @@ cargo build --release
 
 ### Docker
 
-Use the included `Dockerfile` to build and run the Alpine-based container
-image:
+The included `Dockerfile` builds two separate, minimal Alpine-based images
+via multi-stage targets — each contains only its own binary, not `ncd` and
+not the other role's binary:
 
 ```sh
-docker build --tag nanocached .
-docker run --rm --publish 8356:8356 nanocached
+docker build --target node --tag nanocached-node .
+docker run --rm --publish 8356:8356 nanocached-node
+
+docker build --target discovery --tag nanocached-discovery .
+docker run --rm --publish 8357:8357 nanocached-discovery
 ```
 
-The image's `ENTRYPOINT` is `ncd`, defaulting to `node start --host
-0.0.0.0`; override the command to run the discovery server instead:
+`--target` is required; the Dockerfile has no default final stage.
+
+The latest images built from the `main` branch are also available from
+GitHub Container Registry:
 
 ```sh
-docker run --rm --publish 8357:8357 nanocached discovery start --host 0.0.0.0
-```
+docker pull ghcr.io/t0k0sh1/kvelo-node:latest
+docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/kvelo-node:latest
 
-The latest image built from the `main` branch is also available from GitHub
-Container Registry:
-
-```sh
-docker pull ghcr.io/t0k0sh1/kvelo:latest
-docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/kvelo:latest
+docker pull ghcr.io/t0k0sh1/kvelo-discovery:latest
+docker run --rm --publish 8357:8357 ghcr.io/t0k0sh1/kvelo-discovery:latest
 ```
 
 For example, store and retrieve the value `Alice` under the key `name`:
