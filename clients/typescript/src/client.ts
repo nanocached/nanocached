@@ -1,10 +1,20 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
+import { Connection } from "./connection.js";
 import { connectAndIdentify } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import type { NanocachedTlsOptions } from "./socket.js";
 
 export type { NanocachedTlsOptions } from "./socket.js";
+
+/** Thrown by get/set/delete when called after close(). Not thrown by
+ * close() itself, which is idempotent (see NanocachedClient.close). */
+export class AlreadyClosedError extends Error {
+  constructor() {
+    super("nanocached: this client is closed");
+    this.name = "AlreadyClosedError";
+  }
+}
 
 export interface NanocachedClientOptions {
   host: string;
@@ -39,8 +49,8 @@ function splitHostPort(address: string): { host: string; port: number } {
 }
 
 type Target =
-  | { kind: "single"; socket: Socket | TLSSocket }
-  | { kind: "cluster"; ring: HashRing; sockets: ReadonlyMap<string, Socket | TLSSocket> };
+  | { kind: "single"; connection: Connection }
+  | { kind: "cluster"; ring: HashRing; connections: ReadonlyMap<string, Connection> };
 
 function targetKey(options: { host: string; port: number }): string {
   return `${options.host}:${options.port}`;
@@ -79,11 +89,12 @@ function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void 
  * (see doc/adr/0007-*.md). Callers never need to know or care which
  * they're talking to.
  *
- * This only establishes the connection(s) and routing table; it
- * deliberately doesn't yet expose `get`/`set`/`delete`/`close` — those are
- * a separate, not-yet-authorized piece of work.
+ * This establishes the connection(s) and routing table, and exposes
+ * `get`/`set`/`delete`/`close`.
  */
 export class NanocachedClient {
+  private closed = false;
+
   private constructor(private readonly target: Target) {}
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
@@ -98,7 +109,7 @@ export class NanocachedClient {
 
     if (identified.kind === "node") {
       trackOpenTarget(key, [identified.socket]);
-      return new NanocachedClient({ kind: "single", socket: identified.socket });
+      return new NanocachedClient({ kind: "single", connection: new Connection(identified.socket) });
     }
 
     if (identified.nodes.length === 0) {
@@ -125,10 +136,67 @@ export class NanocachedClient {
 
     trackOpenTarget(key, [...sockets.values()]);
 
+    const connections = new Map<string, Connection>();
+    for (const [nodeAddress, socket] of sockets) connections.set(nodeAddress, new Connection(socket));
+
     return new NanocachedClient({
       kind: "cluster",
       ring: new HashRing(identified.nodes),
-      sockets,
+      connections,
     });
+  }
+
+  /** Whether close() has already been called on this instance. */
+  isClosed(): boolean {
+    return this.closed;
+  }
+
+  close(): void {
+    // Still idempotent (not an error, matching how socket.destroy() itself
+    // behaves on an already-destroyed socket) — but a second close() is
+    // usually a sign the caller lost track of this instance's lifecycle,
+    // so flag it the same way connect() flags a forgotten close().
+    if (this.closed) {
+      console.warn("nanocached: close() called again on an already-closed client");
+      return;
+    }
+    this.closed = true;
+
+    if (this.target.kind === "single") {
+      this.target.connection.close();
+      return;
+    }
+
+    for (const connection of this.target.connections.values()) connection.close();
+  }
+
+  async get(key: string | Uint8Array): Promise<Buffer | null> {
+    if (this.closed) throw new AlreadyClosedError();
+    return this.route(key).get(key);
+  }
+
+  async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
+    if (this.closed) throw new AlreadyClosedError();
+    return this.route(key).set(key, value, options);
+  }
+
+  /** Returns whether the key existed before this call. */
+  async delete(key: string | Uint8Array): Promise<boolean> {
+    if (this.closed) throw new AlreadyClosedError();
+    return this.route(key).delete(key);
+  }
+
+  private route(key: string | Uint8Array): Connection {
+    if (this.target.kind === "single") return this.target.connection;
+
+    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    const node = this.target.ring.route(keyBytes);
+
+    const connection = this.target.connections.get(node);
+    if (!connection) {
+      throw new Error(`nanocached: ring routed to ${node}, which has no open connection`);
+    }
+
+    return connection;
   }
 }
