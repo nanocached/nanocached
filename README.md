@@ -292,6 +292,11 @@ When the connection limit has been reached, the server responds with:
 B\n
 ```
 
+## Clients
+
+- [`clients/typescript`](clients/typescript/README.md) — a TypeScript/
+  Node.js client (`get`/`set`/`delete`, authentication, TLS).
+
 ## Development
 
 Run formatting and static checks:
