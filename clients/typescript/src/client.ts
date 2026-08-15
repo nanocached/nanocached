@@ -42,6 +42,35 @@ type Target =
   | { kind: "single"; socket: Socket | TLSSocket }
   | { kind: "cluster"; ring: HashRing; sockets: ReadonlyMap<string, Socket | TLSSocket> };
 
+function targetKey(options: { host: string; port: number }): string {
+  return `${options.host}:${options.port}`;
+}
+
+// Tracks, per connect() target (not per instance — there's no `close()` yet
+// to hook into), how many live sockets are still open for it. Purely a
+// programming-error guard: catches "connect() called again for the same
+// target before the previous one was ever released" without affecting
+// behavior — connecting again still works, this only warns. Cleared via
+// each socket's own native "close" event, so it needs no cooperation from
+// a public close() method; whatever eventually destroys these sockets
+// (including a future close()) already fires that event.
+const openTargets = new Map<string, number>();
+
+function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void {
+  openTargets.set(key, (openTargets.get(key) ?? 0) + sockets.length);
+
+  for (const socket of sockets) {
+    socket.once("close", () => {
+      const remaining = (openTargets.get(key) ?? 1) - 1;
+      if (remaining <= 0) {
+        openTargets.delete(key);
+      } else {
+        openTargets.set(key, remaining);
+      }
+    });
+  }
+}
+
 /**
  * A client for nanocached: `host`/`port` may name either a single
  * nanocached-node or a nanocached-discovery server fronting a cluster —
@@ -58,9 +87,17 @@ export class NanocachedClient {
   private constructor(private readonly target: Target) {}
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
+    const key = targetKey(options);
+    if (openTargets.has(key)) {
+      console.warn(
+        `nanocached: connect() called for ${key} while a previous connection to it is still open — was close() forgotten?`,
+      );
+    }
+
     const identified = await connectAndIdentify(options);
 
     if (identified.kind === "node") {
+      trackOpenTarget(key, [identified.socket]);
       return new NanocachedClient({ kind: "single", socket: identified.socket });
     }
 
@@ -85,6 +122,8 @@ export class NanocachedClient {
       for (const socket of sockets.values()) socket.destroy();
       throw error;
     }
+
+    trackOpenTarget(key, [...sockets.values()]);
 
     return new NanocachedClient({
       kind: "cluster",
