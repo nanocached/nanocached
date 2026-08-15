@@ -35,17 +35,20 @@ const client = await NanocachedClient.connect({
 });
 ```
 
-With TLS (see the root README's [TLS](../../README.md#tls) section) — if
-the server's certificate is issued by a publicly-trusted CA, `tls: true`
-is enough:
+With TLS (see the root README's [TLS](../../README.md#tls) section):
+pass `tls: true` if the server's certificate is issued by a trusted CA —
+this verifies it against Node's default trust store, the normal way TLS
+works:
 
 ```ts
 const client = await NanocachedClient.connect({ host: "127.0.0.1", port: 8356, tls: true });
 ```
 
-If it's a private CA or self-signed certificate instead — the common case
-for nanocached-node's own `--tls-cert`/`--tls-key` — pass `ca`, which
-*replaces* Node's default trust store rather than adding to it (matching
+If there's no CA-issued certificate available — e.g. local development,
+or a private cluster with no PKI of its own — nanocached-node can be run
+with a self-signed certificate instead. Node's default trust store won't
+recognize it, so pass the certificate to trust explicitly via `ca`, which
+*replaces* the default trust store rather than adding to it (matching
 `node:tls`'s own behavior for an explicit `ca`, and nanocached-node's own
 `--tls-ca` semantics). `ca` takes PEM content directly, not a file path,
 so read the certificate yourself:

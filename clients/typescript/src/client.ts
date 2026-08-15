@@ -10,12 +10,14 @@ import {
 } from "./protocol.js";
 
 export interface NanocachedTlsOptions {
-  /** Extra PEM-encoded CA certificate(s) to trust, *replacing* Node's
-   * default (publicly-trusted) CA store rather than adding to it — that's
-   * how Node's own `tls.connect` treats an explicit `ca`. Matches
-   * nanocached-node's own --tls-ca semantics for a private cluster's
-   * self-signed certificate. Leave unset (use `tls: true`) if the server's
-   * certificate is issued by a publicly-trusted CA instead. */
+  /** PEM-encoded certificate(s) to trust when the server has no
+   * CA-issued certificate available (e.g. local development, or a private
+   * cluster with no PKI of its own) and runs with a self-signed
+   * certificate instead. This *replaces* Node's default (publicly-trusted)
+   * CA store rather than adding to it — that's how Node's own
+   * `tls.connect` treats an explicit `ca`. Matches nanocached-node's own
+   * --tls-ca option. Leave unset (use `tls: true`) whenever the server's
+   * certificate is issued by a trusted CA. */
   ca: string | Buffer | Array<string | Buffer>;
 }
 
@@ -27,9 +29,9 @@ export interface NanocachedClientOptions {
   authSecret?: string | Uint8Array;
   /** Connect over TLS instead of plaintext — required if the server was
    * started with --tls-cert/--tls-key. Pass `true` to verify the server's
-   * certificate against Node's default, publicly-trusted CA store; pass
-   * `{ ca }` to trust only a private CA or self-signed certificate instead
-   * (the common case for nanocached-node's own --tls-cert/--tls-key). */
+   * certificate against Node's default, publicly-trusted CA store — the
+   * normal case; pass `{ ca }` instead only if the server is running a
+   * self-signed certificate with no CA-issued alternative available. */
   tls?: true | NanocachedTlsOptions;
 }
 
