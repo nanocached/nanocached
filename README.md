@@ -12,6 +12,7 @@ uses a small, binary-safe TCP protocol and supports optional time-to-live
 - In-memory storage for binary keys and values
 - `G`, `S`, and `D` commands
 - Optional TTL for stored values
+- Optional shared-secret authentication (`A` command)
 - Multiple requests per TCP connection
 - Pipelined requests
 - Idle connection timeout
@@ -69,6 +70,32 @@ cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 The node sends a heartbeat every `--heartbeat-interval` seconds (default 5)
 declaring `--advertise-addr` (default: `--host:--port`); omit `--discovery`
 to run standalone.
+
+### Authentication
+
+Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared
+secret before issuing any other command (see [A (auth)](#a-auth) below). It's
+an environment variable rather than a CLI flag so the secret doesn't show up
+in `ps` output. Both `nanocached-node` and `nanocached-discovery` read it
+independently, so set it on both to protect a cluster:
+
+```sh
+NANOCACHED_AUTH_SECRET=change-me cargo run --bin nanocached-node -- --port 8356
+NANOCACHED_AUTH_SECRET=change-me cargo run --bin nanocached-discovery -- --port 8357
+```
+
+If a node registers with a discovery server that requires auth, it uses the
+same `NANOCACHED_AUTH_SECRET` value to authenticate its own heartbeats.
+
+Leaving `NANOCACHED_AUTH_SECRET` unset (or empty) disables authentication —
+matching Redis's own `requirepass`-unset default — and `A` becomes a no-op
+that always succeeds. This is a secondary layer of defense, not a substitute
+for network isolation: the protocol has no transport encryption, so an
+attacker who can already observe the connection can read the secret and
+every key/value in cleartext. Bind to `127.0.0.1` or a private network
+interface (the default) and treat authentication as protection against
+other processes/users reachable on that network, not as protection against
+network eavesdropping.
 
 ### A built binary, via ncd
 
@@ -128,6 +155,30 @@ keeping frames readable during development.
 
 A `<key-length>` of `0` is rejected for every command. There is no dedicated
 maximum key or value length beyond the overall request-size limit below.
+
+### A (auth)
+
+```text
+A <secret-length>\n<secret>
+```
+
+Responses:
+
+```text
+O\n
+```
+
+or, if the secret doesn't match:
+
+```text
+E\n
+```
+
+immediately followed by the server closing the connection. If the server
+has no auth secret configured, `A` always responds `O\n` regardless of what
+secret is sent. If it does, every other command on that connection is
+rejected with `E\n` (and the connection closed) until a matching `A` has
+been sent — `A` itself is always accepted before authentication.
 
 ### G (get)
 
@@ -243,6 +294,11 @@ consistent hashing:
 cargo run --release --bin bench -- --discovery 127.0.0.1:8357 -c 64 --workload mixed
 ```
 
+Pass `--auth-secret <secret>` if the target node(s) or discovery server
+require authentication (see [Authentication](#authentication)); it's a CLI
+flag rather than an environment variable because `bench` is an interactive
+dev/test tool, not a production service (mirroring `redis-cli -a`).
+
 Note: running bench and the node(s) it's driving on the same machine means
 they compete for the same CPU cores, which can make bench itself the
 bottleneck once enough nodes are involved. For a trustworthy capacity
@@ -260,6 +316,10 @@ has no dependency on nanocached's own protocol modules.
 cargo run --bin nanocached-discovery -- --help
 cargo run --bin nanocached-discovery -- --port 8357
 ```
+
+It supports the same `NANOCACHED_AUTH_SECRET`-based authentication as
+`nanocached-node` (see [Authentication](#authentication)); nodes and `bench`
+speak the same `A` handshake to it as they do to a cache node.
 
 ## Current limits
 

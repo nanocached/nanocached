@@ -5,6 +5,9 @@ use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    Auth {
+        secret: Bytes,
+    },
     Get {
         key: Bytes,
     },
@@ -19,8 +22,16 @@ pub enum Command {
 }
 
 impl Command {
+    /// Executes a cache operation. `Command::Auth` is intercepted by the
+    /// connection handler before a command ever reaches this point (it
+    /// isn't a cache operation and the actor has no auth state), so it
+    /// cannot appear here.
     pub fn execute(self, cache: &mut Cache) -> Response {
         match self {
+            Self::Auth { .. } => {
+                unreachable!("Auth is handled by the connection handler, not the cache actor")
+            }
+
             Self::Get { key } => match cache.get(&key) {
                 Some(value) => Response::Value(value),
                 None => Response::NotFound,
@@ -49,6 +60,7 @@ pub enum ParseError {
     InvalidCommand,
     InvalidLength,
     EmptyKey,
+    EmptySecret,
     Incomplete,
 }
 
@@ -64,6 +76,34 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
     let command = parts.next().ok_or(ParseError::InvalidCommand)?;
 
     match command {
+        b"A" => {
+            let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let secret_length = parse_length(secret_length)?;
+
+            if secret_length == 0 {
+                return Err(ParseError::EmptySecret);
+            }
+
+            let secret_start = header_end + 1;
+            let secret_end = secret_start
+                .checked_add(secret_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < secret_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(secret_end).freeze();
+            let secret = frame.slice(secret_start..secret_end);
+
+            Ok(Command::Auth { secret })
+        }
+
         b"G" | b"D" => {
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
@@ -176,6 +216,34 @@ mod tests {
 
     fn buf(bytes: &[u8]) -> BytesMut {
         BytesMut::from(bytes)
+    }
+
+    #[test]
+    fn parses_auth_command() {
+        let mut input = buf(b"A 6\nsecret");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Auth {
+                secret: Bytes::from_static(b"secret"),
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn rejects_empty_secret_for_auth() {
+        let mut input = buf(b"A 0\n");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptySecret));
+    }
+
+    #[test]
+    fn returns_incomplete_when_auth_secret_is_incomplete() {
+        let mut input = buf(b"A 6\nsec");
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], b"A 6\nsec");
     }
 
     #[test]
@@ -366,6 +434,18 @@ mod tests {
         };
 
         assert_eq!(command.execute(&mut cache), Response::NotFound);
+    }
+
+    #[test]
+    #[should_panic(expected = "Auth is handled by the connection handler")]
+    fn execute_panics_on_auth() {
+        let mut cache = Cache::new(usize::MAX);
+
+        let command = Command::Auth {
+            secret: Bytes::from_static(b"secret"),
+        };
+
+        let _ = command.execute(&mut cache);
     }
 
     #[test]

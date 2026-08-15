@@ -39,6 +39,7 @@ struct Args {
     host: String,
     port: u16,
     discovery: Option<String>,
+    auth_secret: Option<String>,
     requests: u64,
     connections: u64,
     workload: Workload,
@@ -55,6 +56,7 @@ impl Default for Args {
             host: "127.0.0.1".to_string(),
             port: 8356,
             discovery: None,
+            auth_secret: None,
             requests: 100_000,
             connections: 16,
             workload: Workload::Mixed,
@@ -78,6 +80,7 @@ fn parse_args() -> Result<Args, String> {
             "--host" => args.host = value()?,
             "--port" => args.port = parse_value(&value()?, "--port")?,
             "--discovery" => args.discovery = Some(value()?),
+            "--auth-secret" => args.auth_secret = Some(value()?),
             "-n" | "--requests" => args.requests = parse_value(&value()?, "--requests")?,
             "-c" | "--connections" => args.connections = parse_value(&value()?, "--connections")?,
             "--workload" => {
@@ -122,6 +125,9 @@ Usage: bench [options]
   --discovery <addr>     fetch the node list from a discovery server at
                           <addr> instead of using --host/--port, and route
                           keys across those nodes by consistent hashing
+  --auth-secret <secret> authenticate to the discovery server and every
+                          node with this secret before sending other
+                          commands (matches NANOCACHED_AUTH_SECRET)
   -n, --requests <n>     total requests (default 100000)
   -c, --connections <n>  concurrent connections (default 16)
   --workload <kind>      get | set | mixed (default mixed)
@@ -207,10 +213,37 @@ impl HashRing {
     }
 }
 
+/// Sends `A <len>\n<secret>` and confirms the server replied `O\n`. Both
+/// nanocached-node and nanocached-discovery speak this same handshake.
+async fn authenticate(stream: &mut TcpStream, secret: &str) -> std::io::Result<()> {
+    let mut request = BytesMut::new();
+    request.put_slice(b"A ");
+    request.put_slice(secret.len().to_string().as_bytes());
+    request.put_u8(b'\n');
+    request.put_slice(secret.as_bytes());
+    stream.write_all(&request).await?;
+
+    let mut response = [0_u8; 2];
+    stream.read_exact(&mut response).await?;
+    if &response != b"O\n" {
+        return Err(invalid_data("authentication failed"));
+    }
+
+    Ok(())
+}
+
 /// Fetches the current node list from a discovery server (`L\n` -> `N
 /// <count>\n` followed by `count` `<addr>\n` lines).
-async fn fetch_nodes(discovery_addr: &str) -> std::io::Result<Vec<String>> {
+async fn fetch_nodes(
+    discovery_addr: &str,
+    auth_secret: Option<&str>,
+) -> std::io::Result<Vec<String>> {
     let mut stream = TcpStream::connect(discovery_addr).await?;
+
+    if let Some(secret) = auth_secret {
+        authenticate(&mut stream, secret).await?;
+    }
+
     stream.write_all(b"L\n").await?;
 
     let mut recv_buf = BytesMut::new();
@@ -340,17 +373,25 @@ async fn worker(
 
     let mut connections: HashMap<String, TcpStream> = HashMap::with_capacity(ring.nodes.len());
     for node in &ring.nodes {
-        match TcpStream::connect(node.as_str()).await {
-            Ok(stream) => {
-                let _ = stream.set_nodelay(true);
-                connections.insert(node.clone(), stream);
-            }
+        let mut stream = match TcpStream::connect(node.as_str()).await {
+            Ok(stream) => stream,
             Err(error) => {
                 result.error = Some(format!("connect to {node}: {error}"));
                 barrier.wait().await;
                 return result;
             }
+        };
+        let _ = stream.set_nodelay(true);
+
+        if let Some(secret) = &args.auth_secret
+            && let Err(error) = authenticate(&mut stream, secret).await
+        {
+            result.error = Some(format!("auth to {node}: {error}"));
+            barrier.wait().await;
+            return result;
         }
+
+        connections.insert(node.clone(), stream);
     }
 
     barrier.wait().await;
@@ -455,7 +496,7 @@ async fn main() -> ExitCode {
         }
     };
     let nodes = if let Some(discovery_addr) = &args.discovery {
-        match fetch_nodes(discovery_addr).await {
+        match fetch_nodes(discovery_addr, args.auth_secret.as_deref()).await {
             Ok(nodes) if !nodes.is_empty() => nodes,
             Ok(_) => {
                 eprintln!("no live nodes registered with discovery server at {discovery_addr}");

@@ -3,11 +3,24 @@ mod command;
 mod response;
 mod server;
 
+use bytes::Bytes;
 use server::HeartbeatConfig;
 use std::process::ExitCode;
 use std::time::Duration;
 
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
+const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
+
+/// Reads the shared auth secret from the environment rather than a CLI
+/// flag, since CLI arguments are visible to anyone who can list processes
+/// (e.g. `ps`) on the host. An unset or empty value means auth is not
+/// required, matching Redis's own `requirepass`-unset default.
+fn read_auth_secret() -> Option<Bytes> {
+    std::env::var(AUTH_SECRET_ENV_VAR)
+        .ok()
+        .filter(|secret| !secret.is_empty())
+        .map(Bytes::from)
+}
 
 struct Args {
     host: String,
@@ -88,13 +101,15 @@ async fn main() -> ExitCode {
     };
 
     let address = format!("{}:{}", args.host, args.port);
+    let auth_secret = read_auth_secret();
     let heartbeat = args.discovery.map(|discovery_addr| HeartbeatConfig {
         discovery_addr,
         advertise_addr: args.advertise_addr.unwrap_or_else(|| address.clone()),
         interval: args.heartbeat_interval,
+        auth_secret: auth_secret.clone(),
     });
 
-    if let Err(err) = server::run(&address, heartbeat).await {
+    if let Err(err) = server::run(&address, heartbeat, auth_secret).await {
         eprintln!("nanocached-node: {err}");
         return ExitCode::FAILURE;
     }

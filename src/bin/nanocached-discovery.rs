@@ -18,6 +18,17 @@
 //!                             Response: `N <count>\n` followed by
 //!                             `count` lines, each `<addr>\n`.
 //!
+//!   A <secret-length>\n<secret>   Authenticate. Response: `O\n` on success,
+//!                             `E\n` (then the connection closes) if a
+//!                             secret is configured and this doesn't match
+//!                             it. If no secret is configured (the
+//!                             `NANOCACHED_AUTH_SECRET` environment
+//!                             variable is unset or empty), this is a
+//!                             no-op that always succeeds. If a secret is
+//!                             configured, `H`/`L` are rejected with `E\n`
+//!                             until a matching `A` has been sent on the
+//!                             connection.
+//!
 //! If the connection limit has been reached, the server responds with
 //! `B\n` and closes the connection instead of accepting the command.
 //!
@@ -30,7 +41,7 @@
 //! process can be restarted at any time and self-heals within one
 //! heartbeat interval.
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -49,8 +60,45 @@ const MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 
 type Registry = Arc<Mutex<FxHashMap<String, Instant>>>;
+
+/// Per-connection settings that don't change once `run` starts, grouped so
+/// `dispatch_connection`/`handle_connection` take one value instead of two.
+#[derive(Clone)]
+struct ConnectionConfig {
+    idle_timeout: Duration,
+    auth_secret: Option<Bytes>,
+}
+
+/// Reads the shared auth secret from the environment rather than a CLI
+/// flag, since CLI arguments are visible to anyone who can list processes
+/// (e.g. `ps`) on the host. An unset or empty value means auth is not
+/// required.
+fn read_auth_secret() -> Option<Bytes> {
+    std::env::var(AUTH_SECRET_ENV_VAR)
+        .ok()
+        .filter(|secret| !secret.is_empty())
+        .map(Bytes::from)
+}
+
+/// Compares two byte strings without leaking, via timing, how many leading
+/// bytes matched. Length differs openly (no secret ever has a length worth
+/// hiding), but once lengths match, every byte is compared regardless of
+/// earlier mismatches.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+
+    diff == 0
+}
 
 struct Args {
     host: String,
@@ -111,6 +159,7 @@ Usage: nanocached-discovery [options]
 
 #[derive(Debug, PartialEq, Eq)]
 enum DiscoveryCommand {
+    Auth(Bytes),
     Heartbeat(String),
     List,
 }
@@ -120,6 +169,7 @@ enum ParseError {
     InvalidCommand,
     InvalidLength,
     EmptyAddress,
+    EmptySecret,
     InvalidAddress,
     Incomplete,
 }
@@ -135,6 +185,34 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
     let command = parts.next().ok_or(ParseError::InvalidCommand)?;
 
     match command {
+        b"A" => {
+            let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let secret_length = parse_length(secret_length)?;
+
+            if secret_length == 0 {
+                return Err(ParseError::EmptySecret);
+            }
+
+            let secret_start = header_end + 1;
+            let secret_end = secret_start
+                .checked_add(secret_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < secret_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(secret_end).freeze();
+            let secret = frame.slice(secret_start..secret_end);
+
+            Ok(DiscoveryCommand::Auth(secret))
+        }
+
         b"L" => {
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -223,12 +301,20 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
-async fn run(address: &str, liveness_timeout: Duration) -> io::Result<()> {
+async fn run(
+    address: &str,
+    liveness_timeout: Duration,
+    auth_secret: Option<Bytes>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let connection_config = ConnectionConfig {
+        idle_timeout: IDLE_TIMEOUT,
+        auth_secret,
+    };
 
     let sweep_task = tokio::spawn(sweep_expired(
         Arc::clone(&registry),
@@ -264,7 +350,7 @@ async fn run(address: &str, liveness_timeout: Duration) -> io::Result<()> {
                     address,
                     Arc::clone(&registry),
                     Arc::clone(&connection_limit),
-                    IDLE_TIMEOUT,
+                    connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
                 )
@@ -299,7 +385,7 @@ async fn dispatch_connection(
     address: SocketAddr,
     registry: Registry,
     connection_limit: Arc<Semaphore>,
-    idle_timeout: Duration,
+    config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
 ) -> bool {
@@ -319,7 +405,7 @@ async fn dispatch_connection(
     connection_tasks.spawn(async move {
         let _connection_permit = permit;
 
-        if let Err(error) = handle_connection(stream, registry, idle_timeout, shutdown_rx).await {
+        if let Err(error) = handle_connection(stream, registry, config, shutdown_rx).await {
             eprintln!("connection error from {address}: {error}");
         }
     });
@@ -351,10 +437,13 @@ async fn sweep_expired(
 async fn handle_connection(
     mut stream: TcpStream,
     registry: Registry,
-    idle_timeout: Duration,
+    config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut received = BytesMut::new();
+    // No secret configured means auth isn't required, so every connection
+    // starts already authenticated.
+    let mut authenticated = config.auth_secret.is_none();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -362,6 +451,31 @@ async fn handle_connection(
         }
 
         match parse(&mut received) {
+            Ok(DiscoveryCommand::Auth(secret)) => {
+                let accepted = match &config.auth_secret {
+                    Some(expected) => constant_time_eq(&secret, expected),
+                    None => true,
+                };
+
+                if accepted {
+                    authenticated = true;
+                    stream.write_all(b"O\n").await?;
+                    continue;
+                }
+
+                stream.write_all(b"E\n").await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid auth secret",
+                ));
+            }
+            Ok(_) if !authenticated => {
+                stream.write_all(b"E\n").await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "command sent before authenticating",
+                ));
+            }
             Ok(DiscoveryCommand::Heartbeat(addr)) => {
                 lock(&registry).insert(addr, Instant::now());
                 stream.write_all(b"A\n").await?;
@@ -391,7 +505,7 @@ async fn handle_connection(
         let bytes_read = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
 
-            result = timeout(idle_timeout, stream.read_buf(&mut received)) => {
+            result = timeout(config.idle_timeout, stream.read_buf(&mut received)) => {
                 result.map_err(|_| {
                     io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout")
                 })??
@@ -429,7 +543,7 @@ async fn main() -> ExitCode {
     };
 
     let address = format!("{}:{}", args.host, args.port);
-    if let Err(err) = run(&address, args.liveness_timeout).await {
+    if let Err(err) = run(&address, args.liveness_timeout, read_auth_secret()).await {
         eprintln!("discovery: {err}");
         return ExitCode::FAILURE;
     }
@@ -501,6 +615,37 @@ mod tests {
         assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
     }
 
+    #[test]
+    fn parse_reads_an_auth_command() {
+        let mut input = BytesMut::from(&b"A 6\nsecretL\n"[..]);
+        assert_eq!(
+            parse(&mut input),
+            Ok(DiscoveryCommand::Auth(Bytes::from_static(b"secret")))
+        );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_rejects_an_empty_secret() {
+        let mut input = BytesMut::from(&b"A 0\n"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::EmptySecret));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_identical_byte_strings() {
+        assert!(constant_time_eq(b"same-secret", b"same-secret"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_content_of_the_same_length() {
+        assert!(!constant_time_eq(b"secret-one", b"secret-two"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a much longer value"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn heartbeat_then_list_reports_the_registered_node() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -511,8 +656,16 @@ mod tests {
         let server_registry = Arc::clone(&registry);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_connection(stream, server_registry, Duration::from_secs(5), shutdown_rx)
-                .await;
+            let _ = handle_connection(
+                stream,
+                server_registry,
+                ConnectionConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    auth_secret: None,
+                },
+                shutdown_rx,
+            )
+            .await;
         });
 
         let mut client = TcpStream::connect(address).await.unwrap();
@@ -532,6 +685,118 @@ mod tests {
         }
 
         assert_eq!(received, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_rejects_commands_sent_before_authenticating() {
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            registry,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"L\n").await.unwrap();
+
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"E\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_rejects_an_incorrect_auth_secret() {
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            registry,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"A 11\nwrong-value").await.unwrap();
+
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"E\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_accepts_commands_after_correct_auth() {
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            registry,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"A 14\ncorrect-secretL\n").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O\nN 0\n";
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 64];
+
+        while received.len() < expected.len() {
+            let bytes_read = client.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response arrived");
+            received.extend_from_slice(&chunk[..bytes_read]);
+        }
+        assert_eq!(received, expected);
+
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_treats_auth_as_a_no_op_when_no_secret_is_configured() {
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            registry,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"A 8\nanything").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
     }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
@@ -564,7 +829,10 @@ mod tests {
             first_address,
             Arc::clone(&registry),
             Arc::clone(&connection_limit),
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx.clone(),
             &mut connection_tasks,
         )
@@ -581,7 +849,10 @@ mod tests {
             second_address,
             registry,
             connection_limit,
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
             &mut connection_tasks,
         )

@@ -1,7 +1,7 @@
 use crate::cache::Cache;
 use crate::command::{Command, ParseError, parse};
 use crate::response::Response;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,9 +23,34 @@ fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
 }
 
+/// Compares two byte strings without leaking, via timing, how many leading
+/// bytes matched. Length differs openly (no secret ever has a length worth
+/// hiding), but once lengths match, every byte is compared regardless of
+/// earlier mismatches.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+
+    diff == 0
+}
+
 struct CacheRequest {
     command: Command,
     response_tx: oneshot::Sender<Response>,
+}
+
+/// Per-connection settings that don't change once `run` starts, grouped so
+/// `dispatch_connection`/`handle_connection` take one value instead of two.
+#[derive(Clone)]
+struct ConnectionConfig {
+    idle_timeout: Duration,
+    auth_secret: Option<Bytes>,
 }
 
 /// Configuration for registering this node with a discovery server (see
@@ -36,6 +61,10 @@ pub(crate) struct HeartbeatConfig {
     pub(crate) discovery_addr: String,
     pub(crate) advertise_addr: String,
     pub(crate) interval: Duration,
+    /// Sent to the discovery server before the first heartbeat on each
+    /// (re)connection, if the discovery server requires auth. This is the
+    /// same shared secret this node uses to gate its own connections.
+    pub(crate) auth_secret: Option<Bytes>,
 }
 
 async fn shutdown_signal() -> io::Result<()> {
@@ -57,7 +86,11 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
-pub(crate) async fn run(address: &str, heartbeat: Option<HeartbeatConfig>) -> io::Result<()> {
+pub(crate) async fn run(
+    address: &str,
+    heartbeat: Option<HeartbeatConfig>,
+    auth_secret: Option<Bytes>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
     let (request_tx, request_rx) = mpsc::channel(1024);
@@ -68,6 +101,11 @@ pub(crate) async fn run(address: &str, heartbeat: Option<HeartbeatConfig>) -> io
     let cache_task = tokio::spawn(run_cache(request_rx));
     let heartbeat_task =
         heartbeat.map(|config| tokio::spawn(send_heartbeats(config, shutdown_rx.clone())));
+
+    let connection_config = ConnectionConfig {
+        idle_timeout: IDLE_TIMEOUT,
+        auth_secret,
+    };
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -97,7 +135,7 @@ pub(crate) async fn run(address: &str, heartbeat: Option<HeartbeatConfig>) -> io
                     address,
                     request_tx.clone(),
                     Arc::clone(&connection_limit),
-                    IDLE_TIMEOUT,
+                    connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
                 )
@@ -143,7 +181,7 @@ async fn dispatch_connection(
     address: SocketAddr,
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
-    idle_timeout: Duration,
+    config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
 ) -> bool {
@@ -169,7 +207,7 @@ async fn dispatch_connection(
     connection_tasks.spawn(async move {
         let _connection_permit = permit;
 
-        if let Err(error) = handle_connection(stream, request_tx, idle_timeout, shutdown_rx).await {
+        if let Err(error) = handle_connection(stream, request_tx, config, shutdown_rx).await {
             eprintln!("connection error from {address}: {error}");
         }
     });
@@ -180,10 +218,13 @@ async fn dispatch_connection(
 async fn handle_connection(
     mut stream: TcpStream,
     request_tx: mpsc::Sender<CacheRequest>,
-    idle_timeout: Duration,
+    config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut received = BytesMut::new();
+    // No secret configured means auth isn't required, so every connection
+    // starts already authenticated.
+    let mut authenticated = config.auth_secret.is_none();
 
     loop {
         if *shutdown_rx.borrow() {
@@ -191,6 +232,31 @@ async fn handle_connection(
         }
 
         match parse(&mut received) {
+            Ok(Command::Auth { secret }) => {
+                let accepted = match &config.auth_secret {
+                    Some(expected) => constant_time_eq(&secret, expected),
+                    None => true,
+                };
+
+                if accepted {
+                    authenticated = true;
+                    stream.write_all(&Response::AuthOk.encode()).await?;
+                    continue;
+                }
+
+                stream.write_all(&Response::Unauthorized.encode()).await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid auth secret",
+                ));
+            }
+            Ok(_) if !authenticated => {
+                stream.write_all(&Response::Unauthorized.encode()).await?;
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "command sent before authenticating",
+                ));
+            }
             Ok(command) => {
                 let (response_tx, response_rx) = oneshot::channel();
 
@@ -224,7 +290,7 @@ async fn handle_connection(
         let bytes_read = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
 
-            result = timeout(idle_timeout, stream.read_buf(&mut received)) => {
+            result = timeout(config.idle_timeout, stream.read_buf(&mut received)) => {
                 result.map_err(|_| {
                     io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -270,6 +336,12 @@ fn heartbeat_message(advertise_addr: &str) -> Vec<u8> {
     message
 }
 
+fn auth_message(secret: &[u8]) -> Vec<u8> {
+    let mut message = format!("A {}\n", secret.len()).into_bytes();
+    message.extend_from_slice(secret);
+    message
+}
+
 /// Holds one long-lived connection to the discovery server and sends a
 /// heartbeat on it every `config.interval`, reconnecting on any I/O error
 /// after waiting out the interval. Each heartbeat is a self-contained
@@ -287,23 +359,46 @@ async fn send_heartbeats(config: HeartbeatConfig, mut shutdown_rx: watch::Receiv
             Ok(mut stream) => {
                 let _ = stream.set_nodelay(true);
 
-                loop {
-                    if stream.write_all(&message).await.is_err() {
-                        break;
+                let authenticated = match &config.auth_secret {
+                    Some(secret) => {
+                        let auth = auth_message(secret);
+                        match stream.write_all(&auth).await {
+                            Ok(()) => {
+                                let mut ack = [0u8; 2];
+                                stream.read_exact(&mut ack).await.is_ok() && &ack == b"O\n"
+                            }
+                            Err(_) => false,
+                        }
                     }
+                    None => true,
+                };
 
-                    let mut ack = [0u8; 2];
-                    let read_ack = tokio::select! {
-                        _ = shutdown_rx.changed() => return,
-                        result = stream.read_exact(&mut ack) => result,
-                    };
+                if !authenticated {
+                    eprintln!(
+                        "discovery server at {} rejected the auth secret",
+                        config.discovery_addr
+                    );
+                }
 
-                    if read_ack.is_err() || &ack != b"A\n" {
-                        break;
-                    }
+                if authenticated {
+                    loop {
+                        if stream.write_all(&message).await.is_err() {
+                            break;
+                        }
 
-                    if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
-                        return;
+                        let mut ack = [0u8; 2];
+                        let read_ack = tokio::select! {
+                            _ = shutdown_rx.changed() => return,
+                            result = stream.read_exact(&mut ack) => result,
+                        };
+
+                        if read_ack.is_err() || &ack != b"A\n" {
+                            break;
+                        }
+
+                        if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
+                            return;
+                        }
                     }
                 }
             }
@@ -377,7 +472,10 @@ mod tests {
         let connection_task = tokio::spawn(handle_connection(
             server,
             request_tx.clone(),
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
         ));
 
@@ -411,7 +509,10 @@ mod tests {
         let connection_task = tokio::spawn(handle_connection(
             server,
             request_tx,
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
         ));
 
@@ -429,7 +530,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
 
-        let error = run(&address, None).await.unwrap_err();
+        let error = run(&address, None, None).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
@@ -444,7 +545,10 @@ mod tests {
         let connection_task = tokio::spawn(handle_connection(
             server,
             request_tx,
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
         ));
 
@@ -497,7 +601,10 @@ mod tests {
             first_address,
             request_tx.clone(),
             Arc::clone(&connection_limit),
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx.clone(),
             &mut connection_tasks,
         )
@@ -514,7 +621,10 @@ mod tests {
             second_address,
             request_tx.clone(),
             Arc::clone(&connection_limit),
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
             &mut connection_tasks,
         )
@@ -545,7 +655,10 @@ mod tests {
         let connection_task = tokio::spawn(handle_connection(
             server,
             request_tx,
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
         ));
 
@@ -564,7 +677,10 @@ mod tests {
         let connection_task = tokio::spawn(handle_connection(
             server,
             request_tx,
-            IDLE_TIMEOUT,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
             shutdown_rx,
         ));
 
@@ -594,6 +710,138 @@ mod tests {
         assert_eq!(response, expected);
 
         connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_rejects_commands_sent_before_authenticating() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"G 4\nname").await.unwrap();
+
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"E\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_rejects_an_incorrect_auth_secret() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"A 11\nwrong-value").await.unwrap();
+
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"E\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_accepts_commands_after_correct_auth() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cache_task = tokio::spawn(run_cache(request_rx));
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(b"A 14\ncorrect-secretG 4\nname")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O\nN\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_treats_auth_as_a_no_op_when_no_secret_is_configured() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cache_task = tokio::spawn(run_cache(request_rx));
+        let connection_task = tokio::spawn(handle_connection(
+            server,
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"A 8\nanything").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn constant_time_eq_matches_identical_byte_strings() {
+        assert!(constant_time_eq(b"same-secret", b"same-secret"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_content_of_the_same_length() {
+        assert!(!constant_time_eq(b"secret-one", b"secret-two"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        assert!(!constant_time_eq(b"short", b"a much longer value"));
     }
 
     async fn send_command(request_tx: &mpsc::Sender<CacheRequest>, command: Command) -> Response {
@@ -642,6 +890,7 @@ mod tests {
                 discovery_addr: "127.0.0.1:1".to_string(),
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_secs(60),
+                auth_secret: None,
             },
             shutdown_rx,
         )
@@ -684,6 +933,7 @@ mod tests {
                 discovery_addr,
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_millis(20),
+                auth_secret: None,
             },
             shutdown_rx,
         ));
@@ -719,6 +969,7 @@ mod tests {
                 discovery_addr: discovery_addr.clone(),
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_millis(20),
+                auth_secret: None,
             },
             shutdown_rx,
         ));

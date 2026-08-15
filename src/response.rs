@@ -7,6 +7,8 @@ pub enum Response {
     Deleted,
     NotFound,
     Busy,
+    AuthOk,
+    Unauthorized,
 }
 
 impl Response {
@@ -16,6 +18,8 @@ impl Response {
             Self::Deleted => b"D\n".to_vec(),
             Self::NotFound => b"N\n".to_vec(),
             Self::Busy => b"B\n".to_vec(),
+            Self::AuthOk => b"O\n".to_vec(),
+            Self::Unauthorized => b"E\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -55,6 +59,16 @@ mod tests {
     #[test]
     fn encodes_busy_response() {
         assert_eq!(Response::Busy.encode(), b"B\n");
+    }
+
+    #[test]
+    fn encodes_auth_ok_response() {
+        assert_eq!(Response::AuthOk.encode(), b"O\n");
+    }
+
+    #[test]
+    fn encodes_unauthorized_response() {
+        assert_eq!(Response::Unauthorized.encode(), b"E\n");
     }
 
     #[test]
