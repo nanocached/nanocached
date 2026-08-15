@@ -190,6 +190,18 @@ cargo run --release --bin bench -- --help
 cargo run --release --bin bench -- -c 64 --workload mixed
 ```
 
+### Discovery server
+
+`src/bin/discovery.rs` is a standalone cluster-membership registry that
+cache nodes and client SDKs use to find each other for horizontal scaling
+(see `doc/adr/0002-*.md` for the design rationale). It has no dependency on
+kvelo's own protocol modules.
+
+```sh
+cargo run --bin discovery -- --help
+cargo run --bin discovery -- --port 8357
+```
+
 ## Current limits
 
 - Maximum request size: 1 MiB
