@@ -1,8 +1,12 @@
 [package]
-name = "kvelo"
+name = "nanocached"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
+
+[[bin]]
+name = "nanocached-node"
+path = "src/main.rs"
 
 [dependencies]
 bytes = "1"

@@ -1,10 +1,11 @@
-# Kvelo
+# nanocached
 
-Kvelo is a compact in-memory key-value cache server written in Rust. It uses a
-small, binary-safe TCP protocol and supports optional time-to-live (TTL) values.
+nanocached is a compact in-memory key-value cache server written in Rust. It
+uses a small, binary-safe TCP protocol and supports optional time-to-live
+(TTL) values.
 
 > [!NOTE]
-> Kvelo is currently experimental and is not ready for production use.
+> nanocached is currently experimental and is not ready for production use.
 
 ## Features
 
@@ -26,19 +27,41 @@ small, binary-safe TCP protocol and supports optional time-to-live (TTL) values.
 The repository includes `rust-toolchain.toml`, so Rustup selects the required
 toolchain and installs the Clippy and rustfmt components automatically.
 
+## Command-line tools
+
+Building the project produces four binaries:
+
+- `ncd` — a thin dispatcher: `ncd node start [options]` runs the cache node,
+  `ncd discovery start [options]` runs the discovery server. This is the
+  intended entry point for running a built binary or container.
+- `nanocached-node` — the cache server itself.
+- `nanocached-discovery` — the standalone cluster-membership registry (see
+  [Discovery server](#discovery-server) below).
+- `bench` — a load-test client; a development tool, not part of the
+  product, so it is intentionally not reachable through `ncd` (see
+  [Benchmarking](#benchmarking) below).
+
+`ncd` looks up `nanocached-node`/`nanocached-discovery` next to its own
+executable, so it only works once both have been built into the same
+`target/` directory (`cargo build` covers this; `cargo run --bin ncd` alone
+does not, since Cargo only builds the binary you asked to run).
+
 ## Running the server
 
-### Cargo
+### Cargo, for local development
 
 ```sh
-cargo run
+cargo run --bin nanocached-node -- --host 0.0.0.0 --port 8356
 ```
 
-Kvelo listens on `127.0.0.1:8356` by default. Override the bind address and
-port with `--host` and `--port`:
+nanocached listens on `127.0.0.1:8356` by default. Override the bind address
+and port with `--host` and `--port`.
+
+### A built binary, via ncd
 
 ```sh
-cargo run -- --host 0.0.0.0 --port 8356
+cargo build --release
+./target/release/ncd node start --host 0.0.0.0 --port 8356
 ```
 
 ### Docker
@@ -47,8 +70,15 @@ Use the included `Dockerfile` to build and run the Alpine-based container
 image:
 
 ```sh
-docker build --tag kvelo .
-docker run --rm --publish 8356:8356 kvelo
+docker build --tag nanocached .
+docker run --rm --publish 8356:8356 nanocached
+```
+
+The image's `ENTRYPOINT` is `ncd`, defaulting to `node start --host
+0.0.0.0`; override the command to run the discovery server instead:
+
+```sh
+docker run --rm --publish 8357:8357 nanocached discovery start --host 0.0.0.0
 ```
 
 The latest image built from the `main` branch is also available from GitHub
@@ -182,7 +212,7 @@ make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
 
 ### Benchmarking
 
-`src/bin/bench.rs` is an async, multi-threaded load client for kvelo's
+`src/bin/bench.rs` is an async, multi-threaded load client for nanocached's
 protocol:
 
 ```sh
@@ -192,14 +222,14 @@ cargo run --release --bin bench -- -c 64 --workload mixed
 
 ### Discovery server
 
-`src/bin/discovery.rs` is a standalone cluster-membership registry that
-cache nodes and client SDKs use to find each other for horizontal scaling
-(see `doc/adr/0002-*.md` for the design rationale). It has no dependency on
-kvelo's own protocol modules.
+`src/bin/nanocached-discovery.rs` is a standalone cluster-membership
+registry that cache nodes and client SDKs use to find each other for
+horizontal scaling (see `doc/adr/0002-*.md` for the design rationale). It
+has no dependency on nanocached's own protocol modules.
 
 ```sh
-cargo run --bin discovery -- --help
-cargo run --bin discovery -- --port 8357
+cargo run --bin nanocached-discovery -- --help
+cargo run --bin nanocached-discovery -- --port 8357
 ```
 
 ## Current limits

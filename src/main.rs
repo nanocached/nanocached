@@ -44,7 +44,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn usage() -> String {
     "\
-Usage: kvelo [options]
+Usage: nanocached-node [options]
 
   --host <addr>  bind address (default 127.0.0.1)
   --port <port>  bind port (default 8356)"
@@ -63,7 +63,7 @@ async fn main() -> ExitCode {
 
     let address = format!("{}:{}", args.host, args.port);
     if let Err(err) = server::run(&address).await {
-        eprintln!("kvelo: {err}");
+        eprintln!("nanocached-node: {err}");
         return ExitCode::FAILURE;
     }
 

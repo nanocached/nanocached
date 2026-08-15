@@ -1,10 +1,11 @@
-//! Async, multi-threaded load client for the Kvelo TCP protocol.
+//! Async, multi-threaded load client for the nanocached TCP protocol.
 //!
-//! `tools/kvelo_bench.py` is GIL-bound and cannot drive enough concurrent
-//! I/O to saturate the server; this binary exists to find kvelo's actual
-//! ceiling.
+//! An earlier Python load-test tool was GIL-bound and could not drive
+//! enough concurrent I/O to saturate the server; this binary exists to find
+//! nanocached's actual ceiling. It is a development tool, not part of the
+//! product, so it is intentionally not reachable through `ncd`.
 //!
-//! There is deliberately no pipelining option. kvelo's target workload is
+//! There is deliberately no pipelining option. nanocached's target workload is
 //! one lookup per client request (e.g. a web request checking a session or
 //! a cached record), which cannot be pipelined because the caller doesn't
 //! know the next key before seeing the current result. A pipeline flag
@@ -244,7 +245,7 @@ async fn worker(id: u64, args: Arc<Args>, barrier: Arc<Barrier>) -> WorkerResult
     }
 
     while remaining > 0 {
-        let key = format!("kvelo:{}", rng.below(args.keys));
+        let key = format!("nanocached:{}", rng.below(args.keys));
         let is_get = match args.workload {
             Workload::Get => true,
             Workload::Set => false,

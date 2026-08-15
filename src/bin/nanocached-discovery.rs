@@ -1,8 +1,10 @@
-//! Standalone cluster-membership registry for kvelo cache nodes.
+//! Standalone cluster-membership registry for nanocached cache nodes.
 //!
 //! This binary has no dependency on the cache server's own modules (see
 //! `src/bin/bench.rs` for the same independence rule and rationale); its
-//! protocol is unrelated to kvelo's cache protocol, so nothing is shared.
+//! protocol is unrelated to nanocached's cache protocol, so nothing is
+//! shared. Run it via `ncd discovery start`, or directly as
+//! `nanocached-discovery`.
 //!
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
@@ -93,7 +95,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn usage() -> String {
     "\
-Usage: discovery [options]
+Usage: nanocached-discovery [options]
 
   --host <addr>                 bind address (default 127.0.0.1)
   --port <port>                 bind port (default 8357)
