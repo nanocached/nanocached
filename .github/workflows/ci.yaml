@@ -24,3 +24,33 @@ jobs:
 
       - name: Run tests
         run: make test
+
+  typescript-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+
+      - name: Build nanocached-node
+        run: cargo build --bin nanocached-node
+
+      - name: Install dependencies
+        working-directory: clients/typescript
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: clients/typescript
+        run: npm run typecheck
+
+      - name: Run tests
+        working-directory: clients/typescript
+        run: npm test
