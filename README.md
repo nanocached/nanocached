@@ -295,7 +295,8 @@ B\n
 ## Clients
 
 - [`clients/typescript`](clients/typescript/README.md) — a TypeScript/
-  Node.js client (`get`/`set`/`delete`, authentication, TLS).
+  Node.js client (`get`/`set`/`delete`, authentication, TLS, and
+  discovery-based cluster routing).
 
 ## Development
 

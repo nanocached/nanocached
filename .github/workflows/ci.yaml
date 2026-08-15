@@ -40,8 +40,8 @@ jobs:
           cache: npm
           cache-dependency-path: clients/typescript/package-lock.json
 
-      - name: Build nanocached-node
-        run: cargo build --bin nanocached-node
+      - name: Build nanocached-node and nanocached-discovery
+        run: cargo build --bin nanocached-node --bin nanocached-discovery
 
       - name: Install dependencies
         working-directory: clients/typescript

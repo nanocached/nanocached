@@ -9,6 +9,7 @@ import path from "node:path";
 // correct regardless of how deep the compiled test output is nested.
 const repoRoot = path.resolve(process.cwd(), "..", "..");
 export const nodeBinary = path.join(repoRoot, "target", "debug", "nanocached-node");
+export const discoveryBinary = path.join(repoRoot, "target", "debug", "nanocached-discovery");
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -112,11 +113,47 @@ export interface TestServerOptions {
   authSecret?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
+  /** Registers this node with a discovery server at `host:port`, the same
+   * as nanocached-node's own --discovery/--advertise-addr. */
+  discovery?: { host: string; port: number };
 }
 
 export interface TestServer {
   port: number;
   stop(): Promise<void>;
+}
+
+function authEnv(authSecret: string | undefined): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (authSecret !== undefined) {
+    env.NANOCACHED_AUTH_SECRET = authSecret;
+  } else {
+    delete env.NANOCACHED_AUTH_SECRET;
+  }
+  return env;
+}
+
+function spawnAndWaitListening(
+  binary: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  port: number,
+): Promise<ChildProcess> {
+  const child: ChildProcess = spawn(binary, args, { env, stdio: "ignore" });
+
+  const exited = new Promise<never>((_resolve, reject) => {
+    child.once("exit", (code, signal) => {
+      reject(new Error(`${binary} exited early (code=${code}, signal=${signal})`));
+    });
+    child.once("error", reject);
+  });
+
+  return Promise.race([waitUntilListening(port, 2000), exited])
+    .then(() => child)
+    .catch((error) => {
+      child.kill();
+      throw error;
+    });
 }
 
 /** Spawns a real nanocached-node binary (built via `cargo build`) on a free
@@ -128,27 +165,50 @@ export async function startTestServer(options: TestServerOptions = {}): Promise<
   if (options.tlsCertPath && options.tlsKeyPath) {
     args.push("--tls-cert", options.tlsCertPath, "--tls-key", options.tlsKeyPath);
   }
-
-  const env = { ...process.env };
-  if (options.authSecret !== undefined) {
-    env.NANOCACHED_AUTH_SECRET = options.authSecret;
-  } else {
-    delete env.NANOCACHED_AUTH_SECRET;
+  if (options.discovery) {
+    args.push(
+      "--discovery",
+      `${options.discovery.host}:${options.discovery.port}`,
+      "--advertise-addr",
+      `127.0.0.1:${port}`,
+      "--heartbeat-interval",
+      "1",
+    );
   }
 
-  const child: ChildProcess = spawn(nodeBinary, args, { env, stdio: "ignore" });
+  const child = await spawnAndWaitListening(nodeBinary, args, authEnv(options.authSecret), port);
 
-  const exited = new Promise<never>((_resolve, reject) => {
-    child.once("exit", (code, signal) => {
-      reject(new Error(`nanocached-node exited early (code=${code}, signal=${signal})`));
-    });
-    child.once("error", reject);
-  });
+  return {
+    port,
+    async stop() {
+      child.kill();
+      await new Promise((resolve) => child.once("exit", resolve));
+    },
+  };
+}
 
-  await Promise.race([waitUntilListening(port, 2000), exited]).catch((error) => {
-    child.kill();
-    throw error;
-  });
+export interface TestDiscoveryOptions {
+  authSecret?: string;
+  tlsCertPath?: string;
+  tlsKeyPath?: string;
+}
+
+export interface TestDiscovery {
+  port: number;
+  stop(): Promise<void>;
+}
+
+/** Spawns a real nanocached-discovery binary (built via `cargo build`) on a
+ * free port. */
+export async function startTestDiscovery(options: TestDiscoveryOptions = {}): Promise<TestDiscovery> {
+  const port = await freePort();
+
+  const args = ["--host", "127.0.0.1", "--port", String(port)];
+  if (options.tlsCertPath && options.tlsKeyPath) {
+    args.push("--tls-cert", options.tlsCertPath, "--tls-key", options.tlsKeyPath);
+  }
+
+  const child = await spawnAndWaitListening(discoveryBinary, args, authEnv(options.authSecret), port);
 
   return {
     port,
