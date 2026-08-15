@@ -238,8 +238,16 @@ cargo run --bin nanocached-discovery -- --port 8357
 
 ## Current limits
 
+### nanocached-node
+
 - Maximum request size: 1 MiB
 - Maximum concurrent connections: 1,024
 - Maximum cache memory usage: 256 MiB (approximate: sum of stored key and
   value bytes), least-recently-used entries evicted first
+- Idle connection timeout: 30 seconds
+
+### nanocached-discovery
+
+- Maximum request size: 4 KiB
+- Maximum concurrent connections: 1,024
 - Idle connection timeout: 30 seconds

@@ -18,6 +18,9 @@
 //!                             Response: `N <count>\n` followed by
 //!                             `count` lines, each `<addr>\n`.
 //!
+//! If the connection limit has been reached, the server responds with
+//! `B\n` and closes the connection instead of accepting the command.
+//!
 //! A node is expected to hold one long-lived connection and send `H` on it
 //! periodically. A client SDK polls with `L`, typically on its own
 //! connection. A node that stops sending heartbeats is dropped once
@@ -30,17 +33,19 @@
 use bytes::BytesMut;
 use rustc_hash::FxHashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval, timeout};
 
 const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
+const MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -221,6 +226,7 @@ async fn shutdown_signal() -> io::Result<()> {
 async fn run(address: &str, liveness_timeout: Duration) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+    let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -252,18 +258,17 @@ async fn run(address: &str, liveness_timeout: Duration) -> io::Result<()> {
 
             result = listener.accept() => {
                 let (stream, address) = result?;
-                let _ = stream.set_nodelay(true);
 
-                let registry = Arc::clone(&registry);
-                let shutdown_rx = shutdown_rx.clone();
-
-                connection_tasks.spawn(async move {
-                    if let Err(error) =
-                        handle_connection(stream, registry, IDLE_TIMEOUT, shutdown_rx).await
-                    {
-                        eprintln!("connection error from {address}: {error}");
-                    }
-                });
+                dispatch_connection(
+                    stream,
+                    address,
+                    Arc::clone(&registry),
+                    Arc::clone(&connection_limit),
+                    IDLE_TIMEOUT,
+                    shutdown_rx.clone(),
+                    &mut connection_tasks,
+                )
+                .await;
             }
         }
     }
@@ -287,6 +292,39 @@ async fn run(address: &str, liveness_timeout: Duration) -> io::Result<()> {
     let _ = sweep_task.await;
 
     Ok(())
+}
+
+async fn dispatch_connection(
+    mut stream: TcpStream,
+    address: SocketAddr,
+    registry: Registry,
+    connection_limit: Arc<Semaphore>,
+    idle_timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+    connection_tasks: &mut JoinSet<()>,
+) -> bool {
+    let _ = stream.set_nodelay(true);
+
+    let permit = match connection_limit.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Err(error) = stream.write_all(b"B\n").await {
+                eprintln!("failed to send busy response to {address}: {error}");
+            }
+
+            return false;
+        }
+    };
+
+    connection_tasks.spawn(async move {
+        let _connection_permit = permit;
+
+        if let Err(error) = handle_connection(stream, registry, idle_timeout, shutdown_rx).await {
+            eprintln!("connection error from {address}: {error}");
+        }
+    });
+
+    true
 }
 
 async fn sweep_expired(
@@ -494,6 +532,66 @@ mod tests {
         }
 
         assert_eq!(received, expected);
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let connect = TcpStream::connect(address);
+        let accept = listener.accept();
+
+        let (client, server) = tokio::join!(connect, accept);
+
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+
+        (client, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_connection_when_connection_limit_is_reached() {
+        let connection_limit = Arc::new(Semaphore::new(1));
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut connection_tasks = JoinSet::new();
+
+        let (_first_client, first_server) = tcp_pair().await;
+        let first_address = first_server.peer_addr().unwrap();
+
+        let first_connection = dispatch_connection(
+            first_server,
+            first_address,
+            Arc::clone(&registry),
+            Arc::clone(&connection_limit),
+            IDLE_TIMEOUT,
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        )
+        .await;
+
+        assert!(first_connection);
+        assert_eq!(connection_limit.available_permits(), 0);
+
+        let (mut second_client, second_server) = tcp_pair().await;
+        let second_address = second_server.peer_addr().unwrap();
+
+        let second_connection = dispatch_connection(
+            second_server,
+            second_address,
+            registry,
+            connection_limit,
+            IDLE_TIMEOUT,
+            shutdown_rx,
+            &mut connection_tasks,
+        )
+        .await;
+
+        assert!(!second_connection);
+
+        let mut response = [0u8; 2];
+        second_client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"B\n");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
