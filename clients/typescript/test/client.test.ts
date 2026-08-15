@@ -33,6 +33,25 @@ describeOrSkip("get/set/delete round-trip against a real server", async () => {
   }
 });
 
+describeOrSkip("tls accepts a plain boolean (e.g. from an env var), not just the literal true", async () => {
+  const server = await startTestServer();
+  try {
+    // A widened `boolean`, not a `true` literal — this is what a real
+    // `process.env.SOMETHING === "1"`-style expression produces, and must
+    // type-check against NanocachedClientOptions.tls.
+    const tls: boolean = false;
+    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: server.port, tls });
+    try {
+      await client.set("name", "Alice");
+      assert.deepEqual(await client.get("name"), Buffer.from("Alice"));
+    } finally {
+      client.close();
+    }
+  } finally {
+    await server.stop();
+  }
+});
+
 describeOrSkip("set respects a TTL", async () => {
   const server = await startTestServer();
   try {

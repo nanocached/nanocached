@@ -44,6 +44,18 @@ works:
 const client = await NanocachedClient.connect({ host: "127.0.0.1", port: 8356, tls: true });
 ```
 
+`tls` accepts a plain `boolean`, not just the literal `true`, so the same
+code can toggle it per environment (e.g. off locally, on in staging/prod)
+without an `x ? true : undefined` workaround:
+
+```ts
+const client = await NanocachedClient.connect({
+  host: "127.0.0.1",
+  port: 8356,
+  tls: process.env.NANOCACHED_TLS === "1",
+});
+```
+
 If there's no CA-issued certificate available — e.g. local development,
 or a private cluster with no PKI of its own — nanocached-node can be run
 with a self-signed certificate instead. Node's default trust store won't
