@@ -235,6 +235,20 @@ cargo run --release --bin bench -- --help
 cargo run --release --bin bench -- -c 64 --workload mixed
 ```
 
+Pass `--discovery <addr>` instead of `--host`/`--port` to fetch the node
+list from a discovery server and route keys across those nodes by
+consistent hashing:
+
+```sh
+cargo run --release --bin bench -- --discovery 127.0.0.1:8357 -c 64 --workload mixed
+```
+
+Note: running bench and the node(s) it's driving on the same machine means
+they compete for the same CPU cores, which can make bench itself the
+bottleneck once enough nodes are involved. For a trustworthy capacity
+measurement of more than a couple of nodes, run bench on separate hardware
+from the nodes.
+
 ### Discovery server
 
 `src/bin/nanocached-discovery.rs` is a standalone cluster-membership

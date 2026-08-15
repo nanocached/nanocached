@@ -11,8 +11,15 @@
 //! know the next key before seeing the current result. A pipeline flag
 //! invites optimizing for a throughput number the real workload doesn't
 //! produce.
+//!
+//! With `--discovery <addr>`, the node list is fetched once from a
+//! discovery server (see `src/bin/nanocached-discovery.rs`) instead of
+//! using a single `--host`/`--port`, and keys are routed across those
+//! nodes by consistent hashing (see ADR 0002), so this binary can also
+//! measure how throughput scales as nodes are added.
 
 use bytes::{Buf, BufMut, BytesMut};
+use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +38,7 @@ enum Workload {
 struct Args {
     host: String,
     port: u16,
+    discovery: Option<String>,
     requests: u64,
     connections: u64,
     workload: Workload,
@@ -46,6 +54,7 @@ impl Default for Args {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8356,
+            discovery: None,
             requests: 100_000,
             connections: 16,
             workload: Workload::Mixed,
@@ -68,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--host" => args.host = value()?,
             "--port" => args.port = parse_value(&value()?, "--port")?,
+            "--discovery" => args.discovery = Some(value()?),
             "-n" | "--requests" => args.requests = parse_value(&value()?, "--requests")?,
             "-c" | "--connections" => args.connections = parse_value(&value()?, "--connections")?,
             "--workload" => {
@@ -109,6 +119,9 @@ Usage: bench [options]
 
   --host <addr>          server host (default 127.0.0.1)
   --port <port>          server port (default 8356)
+  --discovery <addr>     fetch the node list from a discovery server at
+                          <addr> instead of using --host/--port, and route
+                          keys across those nodes by consistent hashing
   -n, --requests <n>     total requests (default 100000)
   -c, --connections <n>  concurrent connections (default 16)
   --workload <kind>      get | set | mixed (default mixed)
@@ -143,6 +156,104 @@ impl Rng {
     fn unit(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
+}
+
+const VIRTUAL_NODES_PER_NODE: u32 = 128;
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// A consistent-hash ring over a fixed node list (see ADR 0002), built once
+/// at startup from either `--host`/`--port` or a discovery server's node
+/// list. Routing a key never needs to change once the ring is built, since
+/// this binary doesn't react to nodes joining or leaving mid-run.
+struct HashRing {
+    nodes: Vec<String>,
+    points: Vec<(u64, usize)>,
+}
+
+impl HashRing {
+    fn new(nodes: Vec<String>) -> Self {
+        let mut points = Vec::with_capacity(nodes.len() * VIRTUAL_NODES_PER_NODE as usize);
+
+        for (index, node) in nodes.iter().enumerate() {
+            for virtual_id in 0..VIRTUAL_NODES_PER_NODE {
+                let point = fnv1a(format!("{node}#{virtual_id}").as_bytes());
+                points.push((point, index));
+            }
+        }
+
+        points.sort_unstable_by_key(|(point, _)| *point);
+
+        Self { nodes, points }
+    }
+
+    fn route(&self, key: &[u8]) -> &str {
+        let hash = fnv1a(key);
+        let position = self.points.partition_point(|(point, _)| *point < hash);
+        let position = if position == self.points.len() {
+            0
+        } else {
+            position
+        };
+
+        &self.nodes[self.points[position].1]
+    }
+}
+
+/// Fetches the current node list from a discovery server (`L\n` -> `N
+/// <count>\n` followed by `count` `<addr>\n` lines).
+async fn fetch_nodes(discovery_addr: &str) -> std::io::Result<Vec<String>> {
+    let mut stream = TcpStream::connect(discovery_addr).await?;
+    stream.write_all(b"L\n").await?;
+
+    let mut recv_buf = BytesMut::new();
+    loop {
+        if let Some(nodes) = parse_node_list(&recv_buf) {
+            return Ok(nodes);
+        }
+
+        let mut chunk = [0_u8; 4096];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(invalid_data("discovery server closed the connection"));
+        }
+        recv_buf.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_node_list(buf: &[u8]) -> Option<Vec<String>> {
+    if buf.first() != Some(&b'N') {
+        return None;
+    }
+
+    let header_end = buf.iter().position(|&byte| byte == b'\n')?;
+    let count: usize = std::str::from_utf8(&buf[2..header_end])
+        .ok()?
+        .parse()
+        .ok()?;
+
+    let mut offset = header_end + 1;
+    let mut nodes = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let line_len = buf[offset..].iter().position(|&byte| byte == b'\n')?;
+        let line_end = offset + line_len;
+        nodes.push(
+            std::str::from_utf8(&buf[offset..line_end])
+                .ok()?
+                .to_string(),
+        );
+        offset = line_end + 1;
+    }
+
+    Some(nodes)
 }
 
 fn write_get_request(key: &[u8], out: &mut BytesMut) {
@@ -219,18 +330,28 @@ struct WorkerResult {
     error: Option<String>,
 }
 
-async fn worker(id: u64, args: Arc<Args>, barrier: Arc<Barrier>) -> WorkerResult {
+async fn worker(
+    id: u64,
+    args: Arc<Args>,
+    ring: Arc<HashRing>,
+    barrier: Arc<Barrier>,
+) -> WorkerResult {
     let mut result = WorkerResult::default();
 
-    let mut stream = match TcpStream::connect((args.host.as_str(), args.port)).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            result.error = Some(format!("connect: {error}"));
-            barrier.wait().await;
-            return result;
+    let mut connections: HashMap<String, TcpStream> = HashMap::with_capacity(ring.nodes.len());
+    for node in &ring.nodes {
+        match TcpStream::connect(node.as_str()).await {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                connections.insert(node.clone(), stream);
+            }
+            Err(error) => {
+                result.error = Some(format!("connect to {node}: {error}"));
+                barrier.wait().await;
+                return result;
+            }
         }
-    };
-    let _ = stream.set_nodelay(true);
+    }
 
     barrier.wait().await;
 
@@ -259,15 +380,20 @@ async fn worker(id: u64, args: Arc<Args>, barrier: Arc<Barrier>) -> WorkerResult
             write_set_request(key.as_bytes(), &value, args.ttl, &mut send_buf);
         }
 
+        let node = ring.route(key.as_bytes());
+        let stream = connections
+            .get_mut(node)
+            .expect("ring only routes to a node this worker connected to");
+
         let started = Instant::now();
 
         if let Err(error) = stream.write_all(&send_buf).await {
-            result.error = Some(format!("write: {error}"));
+            result.error = Some(format!("write to {node}: {error}"));
             break;
         }
         result.bytes_sent += send_buf.len() as u64;
 
-        match read_response(&mut stream, &mut recv_buf).await {
+        match read_response(stream, &mut recv_buf).await {
             Ok((kind, len)) => {
                 result.bytes_received += len as u64;
                 let valid = if is_get {
@@ -276,12 +402,12 @@ async fn worker(id: u64, args: Arc<Args>, barrier: Arc<Barrier>) -> WorkerResult
                     kind == b'S'
                 };
                 if !valid {
-                    result.error = Some(format!("unexpected response byte: {kind:#x}"));
+                    result.error = Some(format!("unexpected response byte from {node}: {kind:#x}"));
                     break;
                 }
             }
             Err(error) => {
-                result.error = Some(format!("read: {error}"));
+                result.error = Some(format!("read from {node}: {error}"));
                 break;
             }
         }
@@ -328,13 +454,37 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let nodes = if let Some(discovery_addr) = &args.discovery {
+        match fetch_nodes(discovery_addr).await {
+            Ok(nodes) if !nodes.is_empty() => nodes,
+            Ok(_) => {
+                eprintln!("no live nodes registered with discovery server at {discovery_addr}");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("failed to fetch node list from {discovery_addr}: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        vec![format!("{}:{}", args.host, args.port)]
+    };
+
+    println!("nodes ({}): {}", nodes.len(), nodes.join(", "));
+
+    let ring = Arc::new(HashRing::new(nodes));
     let args = Arc::new(args);
 
     let barrier = Arc::new(Barrier::new(args.connections as usize + 1));
     let mut workers = JoinSet::new();
 
     for id in 0..args.connections {
-        workers.spawn(worker(id, Arc::clone(&args), Arc::clone(&barrier)));
+        workers.spawn(worker(
+            id,
+            Arc::clone(&args),
+            Arc::clone(&ring),
+            Arc::clone(&barrier),
+        ));
     }
 
     barrier.wait().await;
