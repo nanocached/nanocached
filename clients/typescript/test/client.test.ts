@@ -122,6 +122,21 @@ describeOrSkipTls("get/set/delete round-trip over TLS", async () => {
   }
 });
 
+describeOrSkipTls("tls: true rejects a self-signed cert not in Node's default trust store", async () => {
+  if (!cert) throw new Error("unreachable: guarded by describeOrSkipTls");
+
+  const server = await startTestServer({ tlsCertPath: cert.certPath, tlsKeyPath: cert.keyPath });
+  try {
+    // No `ca` means Node verifies against its default, publicly-trusted CA
+    // store, which a throwaway self-signed cert was never issued by.
+    await assert.rejects(
+      NanocachedClient.connect({ host: "127.0.0.1", port: server.port, tls: true }),
+    );
+  } finally {
+    await server.stop();
+  }
+});
+
 describeOrSkipTls("rejects a plaintext connection to a TLS-only port", async () => {
   if (!cert) throw new Error("unreachable: guarded by describeOrSkipTls");
 

@@ -10,8 +10,12 @@ import {
 } from "./protocol.js";
 
 export interface NanocachedTlsOptions {
-  /** PEM-encoded CA certificate(s) to trust; only these are trusted, not
-   * the system trust store, matching nanocached-node's --tls-ca semantics. */
+  /** Extra PEM-encoded CA certificate(s) to trust, *replacing* Node's
+   * default (publicly-trusted) CA store rather than adding to it — that's
+   * how Node's own `tls.connect` treats an explicit `ca`. Matches
+   * nanocached-node's own --tls-ca semantics for a private cluster's
+   * self-signed certificate. Leave unset (use `tls: true`) if the server's
+   * certificate is issued by a publicly-trusted CA instead. */
   ca: string | Buffer | Array<string | Buffer>;
 }
 
@@ -21,9 +25,12 @@ export interface NanocachedClientOptions {
   /** Shared secret to authenticate with, matching NANOCACHED_AUTH_SECRET
    * on the server. Omit if the server has no secret configured. */
   authSecret?: string | Uint8Array;
-  /** Connect over TLS instead of plaintext. Required if the server was
-   * started with --tls-cert/--tls-key. */
-  tls?: NanocachedTlsOptions;
+  /** Connect over TLS instead of plaintext — required if the server was
+   * started with --tls-cert/--tls-key. Pass `true` to verify the server's
+   * certificate against Node's default, publicly-trusted CA store; pass
+   * `{ ca }` to trust only a private CA or self-signed certificate instead
+   * (the common case for nanocached-node's own --tls-cert/--tls-key). */
+  tls?: true | NanocachedTlsOptions;
 }
 
 interface Waiter {
@@ -65,7 +72,11 @@ export class NanocachedClient {
       const onError = (error: Error) => reject(error);
 
       const socket = options.tls
-        ? tlsConnect({ host: options.host, port: options.port, ca: options.tls.ca })
+        ? tlsConnect({
+            host: options.host,
+            port: options.port,
+            ...(options.tls === true ? {} : { ca: options.tls.ca }),
+          })
         : netConnect({ host: options.host, port: options.port });
 
       socket.once("error", onError);
