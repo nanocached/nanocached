@@ -18,16 +18,20 @@
 //!                             Response: `N <count>\n` followed by
 //!                             `count` lines, each `<addr>\n`.
 //!
-//!   A <secret-length>\n<secret>   Authenticate. Response: `O\n` on success,
-//!                             `E\n` (then the connection closes) if a
+//!   A <secret-length>\n<secret>   Authenticate. Response: `Od\n` on success,
+//!                             `Ed\n` (then the connection closes) if a
 //!                             secret is configured and this doesn't match
 //!                             it. If no secret is configured (the
 //!                             `NANOCACHED_AUTH_SECRET` environment
 //!                             variable is unset or empty), this is a
 //!                             no-op that always succeeds. If a secret is
-//!                             configured, `H`/`L` are rejected with `E\n`
+//!                             configured, `H`/`L` are rejected with `Ed\n`
 //!                             until a matching `A` has been sent on the
-//!                             connection.
+//!                             connection. The `d` distinguishes this
+//!                             response from nanocached-node's own `On\n`/
+//!                             `En\n`, letting a client tell the two apart
+//!                             from the response to the same `A` request
+//!                             without knowing in advance which it dialed.
 //!
 //! If the connection limit has been reached, the server responds with
 //! `B\n` and closes the connection instead of accepting the command.
@@ -577,18 +581,18 @@ async fn handle_connection(
 
                 if accepted {
                     authenticated = true;
-                    stream.write_all(b"O\n").await?;
+                    stream.write_all(b"Od\n").await?;
                     continue;
                 }
 
-                stream.write_all(b"E\n").await?;
+                stream.write_all(b"Ed\n").await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "invalid auth secret",
                 ));
             }
             Ok(_) if !authenticated => {
-                stream.write_all(b"E\n").await?;
+                stream.write_all(b"Ed\n").await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "command sent before authenticating",
@@ -847,9 +851,9 @@ mod tests {
 
         client.write_all(b"L\n").await.unwrap();
 
-        let mut response = [0u8; 2];
+        let mut response = [0u8; 3];
         client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"E\n");
+        assert_eq!(&response, b"Ed\n");
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -874,9 +878,9 @@ mod tests {
 
         client.write_all(b"A 11\nwrong-value").await.unwrap();
 
-        let mut response = [0u8; 2];
+        let mut response = [0u8; 3];
         client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"E\n");
+        assert_eq!(&response, b"Ed\n");
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -902,7 +906,7 @@ mod tests {
         client.write_all(b"A 14\ncorrect-secretL\n").await.unwrap();
         client.shutdown().await.unwrap();
 
-        let expected = b"O\nN 0\n";
+        let expected = b"Od\nN 0\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -936,7 +940,7 @@ mod tests {
         client.write_all(b"A 8\nanything").await.unwrap();
         client.shutdown().await.unwrap();
 
-        let expected = b"O\n";
+        let expected = b"Od\n";
         let mut response = vec![0_u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);

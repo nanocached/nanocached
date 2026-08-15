@@ -18,8 +18,8 @@ impl Response {
             Self::Deleted => b"D\n".to_vec(),
             Self::NotFound => b"N\n".to_vec(),
             Self::Busy => b"B\n".to_vec(),
-            Self::AuthOk => b"O\n".to_vec(),
-            Self::Unauthorized => b"E\n".to_vec(),
+            Self::AuthOk => b"On\n".to_vec(),
+            Self::Unauthorized => b"En\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -63,12 +63,12 @@ mod tests {
 
     #[test]
     fn encodes_auth_ok_response() {
-        assert_eq!(Response::AuthOk.encode(), b"O\n");
+        assert_eq!(Response::AuthOk.encode(), b"On\n");
     }
 
     #[test]
     fn encodes_unauthorized_response() {
-        assert_eq!(Response::Unauthorized.encode(), b"E\n");
+        assert_eq!(Response::Unauthorized.encode(), b"En\n");
     }
 
     #[test]

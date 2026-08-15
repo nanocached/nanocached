@@ -316,8 +316,13 @@ impl HashRing {
     }
 }
 
-/// Sends `A <len>\n<secret>` and confirms the server replied `O\n`. Both
-/// nanocached-node and nanocached-discovery speak this same handshake.
+/// Sends `A <len>\n<secret>` and confirms the server accepted it. Both
+/// nanocached-node and nanocached-discovery speak this same handshake, but
+/// reply with a different second byte (`On\n`/`En\n` for a node, `Od\n`/
+/// `Ed\n` for discovery) so a client can tell which kind of server answered
+/// without knowing in advance which it dialed. bench doesn't care which
+/// kind it's talking to here — it already knows from its own arguments —
+/// so it only checks the leading `O`/`E`.
 async fn authenticate(stream: &mut MaybeTls, secret: &str) -> std::io::Result<()> {
     let mut request = BytesMut::new();
     request.put_slice(b"A ");
@@ -326,9 +331,9 @@ async fn authenticate(stream: &mut MaybeTls, secret: &str) -> std::io::Result<()
     request.put_slice(secret.as_bytes());
     stream.write_all(&request).await?;
 
-    let mut response = [0_u8; 2];
+    let mut response = [0_u8; 3];
     stream.read_exact(&mut response).await?;
-    if &response != b"O\n" {
+    if response[0] != b'O' {
         return Err(invalid_data("authentication failed"));
     }
 

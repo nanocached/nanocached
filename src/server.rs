@@ -542,8 +542,8 @@ async fn send_heartbeats(config: HeartbeatConfig, mut shutdown_rx: watch::Receiv
                         let auth = auth_message(secret);
                         match stream.write_all(&auth).await {
                             Ok(()) => {
-                                let mut ack = [0u8; 2];
-                                stream.read_exact(&mut ack).await.is_ok() && &ack == b"O\n"
+                                let mut ack = [0u8; 3];
+                                stream.read_exact(&mut ack).await.is_ok() && &ack == b"Od\n"
                             }
                             Err(_) => false,
                         }
@@ -916,9 +916,9 @@ mod tests {
 
         client.write_all(b"G 4\nname").await.unwrap();
 
-        let mut response = [0u8; 2];
+        let mut response = [0u8; 3];
         client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"E\n");
+        assert_eq!(&response, b"En\n");
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -943,9 +943,9 @@ mod tests {
 
         client.write_all(b"A 11\nwrong-value").await.unwrap();
 
-        let mut response = [0u8; 2];
+        let mut response = [0u8; 3];
         client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"E\n");
+        assert_eq!(&response, b"En\n");
 
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -975,7 +975,7 @@ mod tests {
             .unwrap();
         client.shutdown().await.unwrap();
 
-        let expected = b"O\nN\n";
+        let expected = b"On\nN\n";
         let mut response = vec![0_u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
@@ -1007,7 +1007,7 @@ mod tests {
         client.write_all(b"A 8\nanything").await.unwrap();
         client.shutdown().await.unwrap();
 
-        let expected = b"O\n";
+        let expected = b"On\n";
         let mut response = vec![0_u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
