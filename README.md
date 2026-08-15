@@ -86,11 +86,11 @@ The latest images built from the `main` branch are also available from
 GitHub Container Registry:
 
 ```sh
-docker pull ghcr.io/t0k0sh1/kvelo-node:latest
-docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/kvelo-node:latest
+docker pull ghcr.io/t0k0sh1/nanocached-node:latest
+docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/nanocached-node:latest
 
-docker pull ghcr.io/t0k0sh1/kvelo-discovery:latest
-docker run --rm --publish 8357:8357 ghcr.io/t0k0sh1/kvelo-discovery:latest
+docker pull ghcr.io/t0k0sh1/nanocached-discovery:latest
+docker run --rm --publish 8357:8357 ghcr.io/t0k0sh1/nanocached-discovery:latest
 ```
 
 For example, store and retrieve the value `Alice` under the key `name`:
