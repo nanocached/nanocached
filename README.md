@@ -59,6 +59,17 @@ cargo run --bin nanocached-node -- --host 0.0.0.0 --port 8356
 nanocached listens on `127.0.0.1:8356` by default. Override the bind address
 and port with `--host` and `--port`.
 
+To register with a [discovery server](#discovery-server) so client SDKs can
+find this node, pass `--discovery`:
+
+```sh
+cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
+```
+
+The node sends a heartbeat every `--heartbeat-interval` seconds (default 5)
+declaring `--advertise-addr` (default: `--host:--port`); omit `--discovery`
+to run standalone.
+
 ### A built binary, via ncd
 
 ```sh

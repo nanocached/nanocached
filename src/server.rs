@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
@@ -26,6 +26,16 @@ fn request_is_too_large(size: usize) -> bool {
 struct CacheRequest {
     command: Command,
     response_tx: oneshot::Sender<Response>,
+}
+
+/// Configuration for registering this node with a discovery server (see
+/// `src/bin/nanocached-discovery.rs`). When set, `run` sends a heartbeat
+/// declaring `advertise_addr` on `interval`, well under the discovery
+/// server's own liveness timeout.
+pub(crate) struct HeartbeatConfig {
+    pub(crate) discovery_addr: String,
+    pub(crate) advertise_addr: String,
+    pub(crate) interval: Duration,
 }
 
 async fn shutdown_signal() -> io::Result<()> {
@@ -47,7 +57,7 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
-pub(crate) async fn run(address: &str) -> io::Result<()> {
+pub(crate) async fn run(address: &str, heartbeat: Option<HeartbeatConfig>) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
     let (request_tx, request_rx) = mpsc::channel(1024);
@@ -56,6 +66,8 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let cache_task = tokio::spawn(run_cache(request_rx));
+    let heartbeat_task =
+        heartbeat.map(|config| tokio::spawn(send_heartbeats(config, shutdown_rx.clone())));
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -116,6 +128,12 @@ pub(crate) async fn run(address: &str) -> io::Result<()> {
     cache_task
         .await
         .map_err(|error| io::Error::other(format!("cache task failed: {error}")))?;
+
+    if let Some(heartbeat_task) = heartbeat_task {
+        heartbeat_task
+            .await
+            .map_err(|error| io::Error::other(format!("heartbeat task failed: {error}")))?;
+    }
 
     Ok(())
 }
@@ -246,6 +264,71 @@ async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>) {
     }
 }
 
+fn heartbeat_message(advertise_addr: &str) -> Vec<u8> {
+    let mut message = format!("H {}\n", advertise_addr.len()).into_bytes();
+    message.extend_from_slice(advertise_addr.as_bytes());
+    message
+}
+
+/// Holds one long-lived connection to the discovery server and sends a
+/// heartbeat on it every `config.interval`, reconnecting on any I/O error
+/// after waiting out the interval. Each heartbeat is a self-contained
+/// register-or-refresh, so a dropped connection just delays the next
+/// heartbeat rather than requiring any resend/replay logic.
+async fn send_heartbeats(config: HeartbeatConfig, mut shutdown_rx: watch::Receiver<bool>) {
+    let message = heartbeat_message(&config.advertise_addr);
+
+    loop {
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
+        match TcpStream::connect(&config.discovery_addr).await {
+            Ok(mut stream) => {
+                let _ = stream.set_nodelay(true);
+
+                loop {
+                    if stream.write_all(&message).await.is_err() {
+                        break;
+                    }
+
+                    let mut ack = [0u8; 2];
+                    let read_ack = tokio::select! {
+                        _ = shutdown_rx.changed() => return,
+                        result = stream.read_exact(&mut ack) => result,
+                    };
+
+                    if read_ack.is_err() || &ack != b"A\n" {
+                        break;
+                    }
+
+                    if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "failed to connect to discovery server at {}: {error}",
+                    config.discovery_addr
+                );
+            }
+        }
+
+        if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
+            return;
+        }
+    }
+}
+
+/// Waits for `duration`, or returns `true` early if shutdown is signaled.
+async fn wait_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
+    tokio::select! {
+        _ = sleep(duration) => false,
+        _ = shutdown_rx.changed() => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,7 +429,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
 
-        let error = run(&address).await.unwrap_err();
+        let error = run(&address, None).await.unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
@@ -540,5 +623,114 @@ mod tests {
         let (server, _) = server.unwrap();
 
         (client, server)
+    }
+
+    #[test]
+    fn heartbeat_message_declares_the_address_length_before_the_address() {
+        assert_eq!(
+            heartbeat_message("127.0.0.1:8356"),
+            b"H 14\n127.0.0.1:8356".to_vec()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_heartbeats_stops_immediately_when_already_shut_down() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+
+        send_heartbeats(
+            HeartbeatConfig {
+                discovery_addr: "127.0.0.1:1".to_string(),
+                advertise_addr: "127.0.0.1:8356".to_string(),
+                interval: Duration::from_secs(60),
+            },
+            shutdown_rx,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_heartbeats_sends_periodic_heartbeats_on_one_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+
+        let received: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fake_discovery_received = Arc::clone(&received);
+
+        let fake_discovery = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 64];
+
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(bytes_read) => {
+                        fake_discovery_received
+                            .lock()
+                            .unwrap()
+                            .push(buffer[..bytes_read].to_vec());
+
+                        if connection.write_all(b"A\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addr,
+                advertise_addr: "127.0.0.1:8356".to_string(),
+                interval: Duration::from_millis(20),
+            },
+            shutdown_rx,
+        ));
+
+        sleep(Duration::from_millis(150)).await;
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
+
+        let received = received.lock().unwrap();
+        assert!(
+            received.len() >= 3,
+            "expected at least 3 heartbeats, got {}",
+            received.len()
+        );
+        for message in received.iter() {
+            assert_eq!(message, b"H 14\n127.0.0.1:8356");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_heartbeats_retries_after_the_discovery_server_is_unreachable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        // Close the listener immediately so the first connect attempt fails,
+        // then bind a fresh listener on the same address for the retry.
+        drop(listener);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addr: discovery_addr.clone(),
+                advertise_addr: "127.0.0.1:8356".to_string(),
+                interval: Duration::from_millis(20),
+            },
+            shutdown_rx,
+        ));
+
+        sleep(Duration::from_millis(50)).await;
+
+        let listener = TcpListener::bind(&discovery_addr).await.unwrap();
+        let accepted = timeout(Duration::from_secs(2), listener.accept()).await;
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+
+        assert!(accepted.is_ok(), "expected a retried connection attempt");
     }
 }
