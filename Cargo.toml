@@ -12,12 +12,16 @@ path = "src/main.rs"
 bytes = "1"
 lru = "0.18"
 rustc-hash = "2"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2.0"
 tokio = {
   version = "1",
   features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"]
 }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
+rcgen = "0.14.9"
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.clippy]

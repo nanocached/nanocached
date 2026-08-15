@@ -13,6 +13,8 @@ uses a small, binary-safe TCP protocol and supports optional time-to-live
 - `G`, `S`, and `D` commands
 - Optional TTL for stored values
 - Optional shared-secret authentication (`A` command)
+- Optional TLS (required for every connection once configured, no
+  plaintext fallback)
 - Multiple requests per TCP connection
 - Pipelined requests
 - Idle connection timeout
@@ -90,12 +92,60 @@ same `NANOCACHED_AUTH_SECRET` value to authenticate its own heartbeats.
 Leaving `NANOCACHED_AUTH_SECRET` unset (or empty) disables authentication —
 matching Redis's own `requirepass`-unset default — and `A` becomes a no-op
 that always succeeds. This is a secondary layer of defense, not a substitute
-for network isolation: the protocol has no transport encryption, so an
-attacker who can already observe the connection can read the secret and
-every key/value in cleartext. Bind to `127.0.0.1` or a private network
-interface (the default) and treat authentication as protection against
-other processes/users reachable on that network, not as protection against
-network eavesdropping.
+for network isolation: without [TLS](#tls), the protocol has no transport
+encryption, so an attacker who can already observe the connection can read
+the secret and every key/value in cleartext. Bind to `127.0.0.1` or a
+private network interface (the default) and treat authentication as
+protection against other processes/users reachable on that network, not
+against network eavesdropping, unless TLS is also enabled.
+
+### TLS
+
+Pass `--tls-cert`/`--tls-key` (PEM files) to require TLS on every
+connection a node or discovery server accepts — there is no plaintext
+fallback once set, matching how [authentication](#authentication) is
+either fully required or fully off:
+
+```sh
+cargo run --bin nanocached-node -- --port 8356 --tls-cert cert.pem --tls-key key.pem
+cargo run --bin nanocached-discovery -- --port 8357 --tls-cert cert.pem --tls-key key.pem
+```
+
+A node that registers with a TLS-secured discovery server also needs
+`--tls-ca` (a PEM file of CA certificate(s) to trust) so its heartbeat
+connection can verify the discovery server's certificate — only those CAs
+are trusted, not the system trust store, since this is meant for a
+private cluster's own certificates rather than publicly-issued ones:
+
+```sh
+cargo run --bin nanocached-node -- --port 8356 --tls-cert cert.pem --tls-key key.pem \
+  --tls-ca ca.pem --discovery 127.0.0.1:8357
+```
+
+For local development, generate a self-signed certificate with OpenSSL.
+The certificate must have `CA:FALSE` in its basic constraints — a
+self-signed cert generated with defaults is often marked as its own CA,
+which rustls correctly refuses to accept as a server's leaf certificate —
+and a `subjectAltName` matching whatever host/IP clients will actually
+connect to:
+
+```sh
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 \
+  -subj "/CN=127.0.0.1" \
+  -addext "subjectAltName=IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth"
+```
+
+Since this is self-signed, the same `cert.pem` doubles as the `--tls-ca`
+trust anchor for any client (a node's heartbeat, or `bench --tls-ca`)
+connecting to a server using it.
+
+Unlike authentication, TLS has no environment-variable option: certificate
+and key paths aren't secrets themselves (the private key file's contents
+are, but the OS already protects that via file permissions), so there's no
+`ps`-visibility concern with passing paths as CLI flags.
 
 ### A built binary, via ncd
 
@@ -299,6 +349,11 @@ require authentication (see [Authentication](#authentication)); it's a CLI
 flag rather than an environment variable because `bench` is an interactive
 dev/test tool, not a production service (mirroring `redis-cli -a`).
 
+Pass `--tls-ca <path>` if the target node(s) or discovery server require
+TLS (see [TLS](#tls)); `bench` then connects to every node and the
+discovery server over TLS instead of plaintext, trusting only the CA(s) in
+that file.
+
 Note: running bench and the node(s) it's driving on the same machine means
 they compete for the same CPU cores, which can make bench itself the
 bottleneck once enough nodes are involved. For a trustworthy capacity
@@ -317,9 +372,10 @@ cargo run --bin nanocached-discovery -- --help
 cargo run --bin nanocached-discovery -- --port 8357
 ```
 
-It supports the same `NANOCACHED_AUTH_SECRET`-based authentication as
-`nanocached-node` (see [Authentication](#authentication)); nodes and `bench`
-speak the same `A` handshake to it as they do to a cache node.
+It supports the same `NANOCACHED_AUTH_SECRET`-based authentication and
+`--tls-cert`/`--tls-key`-based TLS as `nanocached-node` (see
+[Authentication](#authentication) and [TLS](#tls)); nodes and `bench` speak
+the same `A` handshake and TLS handshake to it as they do to a cache node.
 
 ## Current limits
 

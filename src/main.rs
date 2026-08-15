@@ -28,6 +28,9 @@ struct Args {
     discovery: Option<String>,
     advertise_addr: Option<String>,
     heartbeat_interval: Duration,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_ca: Option<String>,
 }
 
 impl Default for Args {
@@ -38,6 +41,9 @@ impl Default for Args {
             discovery: None,
             advertise_addr: None,
             heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca: None,
         }
     }
 }
@@ -66,9 +72,16 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --heartbeat-interval: {raw_secs}"))?;
                 args.heartbeat_interval = Duration::from_secs(secs);
             }
+            "--tls-cert" => args.tls_cert = Some(value()?),
+            "--tls-key" => args.tls_key = Some(value()?),
+            "--tls-ca" => args.tls_ca = Some(value()?),
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
         }
+    }
+
+    if args.tls_cert.is_some() != args.tls_key.is_some() {
+        return Err("--tls-cert and --tls-key must be set together".to_string());
     }
 
     Ok(args)
@@ -86,18 +99,50 @@ Usage: nanocached-node [options]
   --advertise-addr <addr>     address to register with the discovery
                                server (default: --host:--port)
   --heartbeat-interval <secs> seconds between heartbeats to the discovery
-                               server (default 5)"
+                               server (default 5)
+  --tls-cert <path>           PEM certificate chain; requires TLS on every
+                               accepted connection (no plaintext fallback)
+  --tls-key <path>            PEM private key matching --tls-cert
+  --tls-ca <path>             PEM CA certificate(s) to trust when
+                               connecting to a TLS-secured discovery server
+                               for heartbeats (see --discovery)"
         .to_string()
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no other rustls crypto provider is installed this early in the process");
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
         }
+    };
+
+    let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => match server::load_tls_acceptor(cert, key) {
+            Ok(acceptor) => Some(acceptor),
+            Err(err) => {
+                eprintln!("nanocached-node: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+
+    let tls_connector = match &args.tls_ca {
+        Some(ca) => match server::load_tls_connector(ca) {
+            Ok(connector) => Some(connector),
+            Err(err) => {
+                eprintln!("nanocached-node: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
     };
 
     let address = format!("{}:{}", args.host, args.port);
@@ -107,9 +152,10 @@ async fn main() -> ExitCode {
         advertise_addr: args.advertise_addr.unwrap_or_else(|| address.clone()),
         interval: args.heartbeat_interval,
         auth_secret: auth_secret.clone(),
+        tls_connector,
     });
 
-    if let Err(err) = server::run(&address, heartbeat, auth_secret).await {
+    if let Err(err) = server::run(&address, heartbeat, auth_secret, tls_acceptor).await {
         eprintln!("nanocached-node: {err}");
         return ExitCode::FAILURE;
     }

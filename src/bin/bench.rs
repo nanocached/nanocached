@@ -19,14 +19,110 @@
 //! measure how throughput scales as nodes are added.
 
 use bytes::{Buf, BufMut, BytesMut};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConfig, RootCertStore};
 use std::collections::HashMap;
+use std::io::BufReader;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
+use tokio_rustls::TlsConnector;
+
+/// Wraps either a plain TCP connection or one wrapped in TLS behind a
+/// single type, so the rest of this file doesn't need to know which is in
+/// play once a connection is established.
+enum MaybeTls {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MaybeTls {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTls {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Loads CA certificates from a PEM file and builds a `TlsConnector` that
+/// trusts only those CAs (not the system trust store), matching
+/// nanocached-node/nanocached-discovery's own `--tls-ca` semantics.
+fn load_tls_connector(ca_path: &str) -> std::io::Result<TlsConnector> {
+    let file = std::fs::File::open(ca_path)?;
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(file)).collect::<std::io::Result<_>>()?;
+
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|error| invalid_data(&error.to_string()))?;
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Connects to `addr`, upgrading to TLS first if `tls` is set. There is no
+/// plaintext fallback: if TLS is configured and the handshake fails, the
+/// connection attempt fails too.
+async fn connect(addr: &str, tls: Option<&TlsConnector>) -> std::io::Result<MaybeTls> {
+    let stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+
+    match tls {
+        Some(connector) => {
+            let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+            let server_name = ServerName::try_from(host.to_string()).map_err(|error| {
+                invalid_data(&format!("invalid TLS server name {host:?}: {error}"))
+            })?;
+            let tls_stream = connector.connect(server_name, stream).await?;
+            Ok(MaybeTls::Tls(Box::new(tls_stream)))
+        }
+        None => Ok(MaybeTls::Plain(stream)),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Workload {
@@ -40,6 +136,7 @@ struct Args {
     port: u16,
     discovery: Option<String>,
     auth_secret: Option<String>,
+    tls_ca: Option<String>,
     requests: u64,
     connections: u64,
     workload: Workload,
@@ -57,6 +154,7 @@ impl Default for Args {
             port: 8356,
             discovery: None,
             auth_secret: None,
+            tls_ca: None,
             requests: 100_000,
             connections: 16,
             workload: Workload::Mixed,
@@ -81,6 +179,7 @@ fn parse_args() -> Result<Args, String> {
             "--port" => args.port = parse_value(&value()?, "--port")?,
             "--discovery" => args.discovery = Some(value()?),
             "--auth-secret" => args.auth_secret = Some(value()?),
+            "--tls-ca" => args.tls_ca = Some(value()?),
             "-n" | "--requests" => args.requests = parse_value(&value()?, "--requests")?,
             "-c" | "--connections" => args.connections = parse_value(&value()?, "--connections")?,
             "--workload" => {
@@ -128,6 +227,10 @@ Usage: bench [options]
   --auth-secret <secret> authenticate to the discovery server and every
                           node with this secret before sending other
                           commands (matches NANOCACHED_AUTH_SECRET)
+  --tls-ca <path>        PEM CA certificate(s) to trust; connects to the
+                          discovery server and every node over TLS instead
+                          of plaintext (matches --tls-cert/--tls-key on
+                          nanocached-node/nanocached-discovery)
   -n, --requests <n>     total requests (default 100000)
   -c, --connections <n>  concurrent connections (default 16)
   --workload <kind>      get | set | mixed (default mixed)
@@ -215,7 +318,7 @@ impl HashRing {
 
 /// Sends `A <len>\n<secret>` and confirms the server replied `O\n`. Both
 /// nanocached-node and nanocached-discovery speak this same handshake.
-async fn authenticate(stream: &mut TcpStream, secret: &str) -> std::io::Result<()> {
+async fn authenticate(stream: &mut MaybeTls, secret: &str) -> std::io::Result<()> {
     let mut request = BytesMut::new();
     request.put_slice(b"A ");
     request.put_slice(secret.len().to_string().as_bytes());
@@ -237,8 +340,9 @@ async fn authenticate(stream: &mut TcpStream, secret: &str) -> std::io::Result<(
 async fn fetch_nodes(
     discovery_addr: &str,
     auth_secret: Option<&str>,
+    tls: Option<&TlsConnector>,
 ) -> std::io::Result<Vec<String>> {
-    let mut stream = TcpStream::connect(discovery_addr).await?;
+    let mut stream = connect(discovery_addr, tls).await?;
 
     if let Some(secret) = auth_secret {
         authenticate(&mut stream, secret).await?;
@@ -313,7 +417,7 @@ fn write_set_request(key: &[u8], value: &[u8], ttl: Option<u64>, out: &mut Bytes
 /// Reads one response frame from `stream`, buffering through `recv_buf`.
 /// Returns the response's leading byte and its total encoded length.
 async fn read_response(
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     recv_buf: &mut BytesMut,
 ) -> std::io::Result<(u8, usize)> {
     loop {
@@ -368,12 +472,13 @@ async fn worker(
     args: Arc<Args>,
     ring: Arc<HashRing>,
     barrier: Arc<Barrier>,
+    tls: Option<TlsConnector>,
 ) -> WorkerResult {
     let mut result = WorkerResult::default();
 
-    let mut connections: HashMap<String, TcpStream> = HashMap::with_capacity(ring.nodes.len());
+    let mut connections: HashMap<String, MaybeTls> = HashMap::with_capacity(ring.nodes.len());
     for node in &ring.nodes {
-        let mut stream = match TcpStream::connect(node.as_str()).await {
+        let mut stream = match connect(node.as_str(), tls.as_ref()).await {
             Ok(stream) => stream,
             Err(error) => {
                 result.error = Some(format!("connect to {node}: {error}"));
@@ -381,7 +486,6 @@ async fn worker(
                 return result;
             }
         };
-        let _ = stream.set_nodelay(true);
 
         if let Some(secret) = &args.auth_secret
             && let Err(error) = authenticate(&mut stream, secret).await
@@ -488,6 +592,10 @@ fn with_thousands(value: u64) -> String {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no other rustls crypto provider is installed this early in the process");
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
@@ -495,8 +603,20 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    let tls = match &args.tls_ca {
+        Some(ca) => match load_tls_connector(ca) {
+            Ok(connector) => Some(connector),
+            Err(error) => {
+                eprintln!("failed to load --tls-ca {ca}: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let nodes = if let Some(discovery_addr) = &args.discovery {
-        match fetch_nodes(discovery_addr, args.auth_secret.as_deref()).await {
+        match fetch_nodes(discovery_addr, args.auth_secret.as_deref(), tls.as_ref()).await {
             Ok(nodes) if !nodes.is_empty() => nodes,
             Ok(_) => {
                 eprintln!("no live nodes registered with discovery server at {discovery_addr}");
@@ -525,6 +645,7 @@ async fn main() -> ExitCode {
             Arc::clone(&args),
             Arc::clone(&ring),
             Arc::clone(&barrier),
+            tls.clone(),
         ));
     }
 

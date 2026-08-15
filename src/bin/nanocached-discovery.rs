@@ -43,16 +43,22 @@
 
 use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io;
+use std::io::BufReader;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval, timeout};
+use tokio_rustls::TlsAcceptor;
 
 const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
@@ -60,9 +66,87 @@ const MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 
 type Registry = Arc<Mutex<FxHashMap<String, Instant>>>;
+
+/// Wraps either a plain TCP connection or one wrapped in TLS behind a
+/// single type, so the rest of the connection-handling code doesn't need to
+/// know which is in play.
+enum MaybeTls {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+}
+
+impl AsyncRead for MaybeTls {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTls {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_flush(cx),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTls::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
+            MaybeTls::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Loads a certificate chain and private key from PEM files and builds a
+/// `TlsAcceptor` for terminating incoming TLS connections.
+fn load_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
+    let certs = load_cert_chain(cert_path)?;
+    let key = load_private_key(key_path)?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn load_cert_chain(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)?;
+    rustls_pemfile::certs(&mut BufReader::new(file)).collect()
+}
+
+fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)?;
+    rustls_pemfile::private_key(&mut BufReader::new(file))?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no private key found in {path}"),
+        )
+    })
+}
 
 /// Per-connection settings that don't change once `run` starts, grouped so
 /// `dispatch_connection`/`handle_connection` take one value instead of two.
@@ -70,6 +154,9 @@ type Registry = Arc<Mutex<FxHashMap<String, Instant>>>;
 struct ConnectionConfig {
     idle_timeout: Duration,
     auth_secret: Option<Bytes>,
+    /// When set, every accepted connection must complete a TLS handshake
+    /// before speaking the protocol; there is no plaintext fallback.
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 /// Reads the shared auth secret from the environment rather than a CLI
@@ -104,6 +191,8 @@ struct Args {
     host: String,
     port: u16,
     liveness_timeout: Duration,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
 }
 
 impl Default for Args {
@@ -112,6 +201,8 @@ impl Default for Args {
             host: "127.0.0.1".to_string(),
             port: 8357,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -138,9 +229,15 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --liveness-timeout: {raw_secs}"))?;
                 args.liveness_timeout = Duration::from_secs(secs);
             }
+            "--tls-cert" => args.tls_cert = Some(value()?),
+            "--tls-key" => args.tls_key = Some(value()?),
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
         }
+    }
+
+    if args.tls_cert.is_some() != args.tls_key.is_some() {
+        return Err("--tls-cert and --tls-key must be set together".to_string());
     }
 
     Ok(args)
@@ -153,7 +250,11 @@ Usage: nanocached-discovery [options]
   --host <addr>                 bind address (default 127.0.0.1)
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
-                                 a heartbeat (default 15)"
+                                 a heartbeat (default 15)
+  --tls-cert <path>             PEM certificate chain; requires TLS on
+                                 every accepted connection (no plaintext
+                                 fallback)
+  --tls-key <path>              PEM private key matching --tls-cert"
         .to_string()
 }
 
@@ -305,6 +406,7 @@ async fn run(
     address: &str,
     liveness_timeout: Duration,
     auth_secret: Option<Bytes>,
+    tls_acceptor: Option<TlsAcceptor>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
@@ -314,6 +416,7 @@ async fn run(
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
         auth_secret,
+        tls_acceptor,
     };
 
     let sweep_task = tokio::spawn(sweep_expired(
@@ -381,7 +484,7 @@ async fn run(
 }
 
 async fn dispatch_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     address: SocketAddr,
     registry: Registry,
     connection_limit: Arc<Semaphore>,
@@ -390,6 +493,21 @@ async fn dispatch_connection(
     connection_tasks: &mut JoinSet<()>,
 ) -> bool {
     let _ = stream.set_nodelay(true);
+
+    let mut stream: MaybeTls = match &config.tls_acceptor {
+        Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+            Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
+            Ok(Err(error)) => {
+                eprintln!("TLS handshake with {address} failed: {error}");
+                return false;
+            }
+            Err(_) => {
+                eprintln!("TLS handshake with {address} timed out");
+                return false;
+            }
+        },
+        None => MaybeTls::Plain(stream),
+    };
 
     let permit = match connection_limit.try_acquire_owned() {
         Ok(permit) => permit,
@@ -435,7 +553,7 @@ async fn sweep_expired(
 }
 
 async fn handle_connection(
-    mut stream: TcpStream,
+    mut stream: MaybeTls,
     registry: Registry,
     config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -534,6 +652,10 @@ async fn handle_connection(
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("no other rustls crypto provider is installed this early in the process");
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(message) => {
@@ -542,8 +664,26 @@ async fn main() -> ExitCode {
         }
     };
 
+    let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => match load_tls_acceptor(cert, key) {
+            Ok(acceptor) => Some(acceptor),
+            Err(err) => {
+                eprintln!("discovery: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => None,
+    };
+
     let address = format!("{}:{}", args.host, args.port);
-    if let Err(err) = run(&address, args.liveness_timeout, read_auth_secret()).await {
+    if let Err(err) = run(
+        &address,
+        args.liveness_timeout,
+        read_auth_secret(),
+        tls_acceptor,
+    )
+    .await
+    {
         eprintln!("discovery: {err}");
         return ExitCode::FAILURE;
     }
@@ -657,11 +797,12 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let _ = handle_connection(
-                stream,
+                MaybeTls::Plain(stream),
                 server_registry,
                 ConnectionConfig {
                     idle_timeout: Duration::from_secs(5),
                     auth_secret: None,
+                    tls_acceptor: None,
                 },
                 shutdown_rx,
             )
@@ -694,11 +835,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
-            server,
+            MaybeTls::Plain(server),
             registry,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
+                tls_acceptor: None,
             },
             shutdown_rx,
         ));
@@ -720,11 +862,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
-            server,
+            MaybeTls::Plain(server),
             registry,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
+                tls_acceptor: None,
             },
             shutdown_rx,
         ));
@@ -746,11 +889,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
-            server,
+            MaybeTls::Plain(server),
             registry,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
+                tls_acceptor: None,
             },
             shutdown_rx,
         ));
@@ -779,11 +923,12 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
-            server,
+            MaybeTls::Plain(server),
             registry,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
+                tls_acceptor: None,
             },
             shutdown_rx,
         ));
@@ -832,6 +977,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
+                tls_acceptor: None,
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -852,6 +998,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
+                tls_acceptor: None,
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -885,5 +1032,76 @@ mod tests {
 
         shutdown_tx.send_replace(true);
         sweep_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_connection_serves_commands_over_tls() {
+        use rustls::pki_types::ServerName;
+        use rustls::{ClientConfig, RootCertStore};
+        use tokio_rustls::TlsConnector;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let connection_limit = Arc::new(Semaphore::new(1));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: Some(acceptor),
+        };
+
+        let server_task = tokio::spawn(async move {
+            let (stream, peer_addr) = listener.accept().await.unwrap();
+            let mut connection_tasks = JoinSet::new();
+
+            dispatch_connection(
+                stream,
+                peer_addr,
+                registry,
+                connection_limit,
+                config,
+                shutdown_rx,
+                &mut connection_tasks,
+            )
+            .await;
+
+            while connection_tasks.join_next().await.is_some() {}
+        });
+
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+        tls.write_all(b"L\n").await.unwrap();
+
+        let expected = b"N 0\n";
+        let mut response = vec![0_u8; expected.len()];
+        tls.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        server_task.await.unwrap();
     }
 }
