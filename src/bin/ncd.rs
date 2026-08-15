@@ -8,6 +8,15 @@
 //! it only looks up and runs the sibling binary installed next to itself.
 //! `bench` is a development tool, not a product component, so it is
 //! deliberately not reachable through `ncd`.
+//!
+//! On Unix, the sibling binary replaces `ncd`'s own process image (via
+//! `exec`) rather than running as a child. A plain spawn-and-wait leaves an
+//! orphaned, still-running child if something sends a signal to `ncd`'s
+//! PID specifically rather than to its process group (interactive Ctrl+C
+//! reaches both via the process group and was never the problem; a process
+//! supervisor targeting `ncd`'s PID is). Replacing the process image
+//! removes the parent/child relationship entirely, so there is nothing left
+//! to orphan.
 
 use std::env;
 use std::path::PathBuf;
@@ -79,7 +88,22 @@ fn main() -> ExitCode {
         }
     };
 
-    match Command::new(&binary_path).args(args).status() {
+    run(&binary_path, args)
+}
+
+#[cfg(unix)]
+fn run(binary_path: &PathBuf, args: impl Iterator<Item = String>) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+
+    // `exec` only returns on failure; on success it replaces this process.
+    let error = Command::new(binary_path).args(args).exec();
+    eprintln!("failed to run {}: {error}", binary_path.display());
+    ExitCode::FAILURE
+}
+
+#[cfg(not(unix))]
+fn run(binary_path: &PathBuf, args: impl Iterator<Item = String>) -> ExitCode {
+    match Command::new(binary_path).args(args).status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(error) => {
