@@ -34,7 +34,12 @@ toolchain and installs the Clippy and rustfmt components automatically.
 cargo run
 ```
 
-Kvelo listens on `0.0.0.0:8356`.
+Kvelo listens on `127.0.0.1:8356` by default. Override the bind address and
+port with `--host` and `--port`:
+
+```sh
+cargo run -- --host 0.0.0.0 --port 8356
+```
 
 ### Docker
 

@@ -19,3 +19,4 @@ USER 10001:10001
 EXPOSE 8356
 
 ENTRYPOINT ["kvelo"]
+CMD ["--host", "0.0.0.0"]
