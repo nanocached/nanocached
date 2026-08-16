@@ -209,6 +209,22 @@ struct NodeContext {
     /// `X` (cancel) uses it to find (by `joining_name`) and abort a
     /// matching in-flight handoff.
     active_migration: Arc<Mutex<Option<ActiveMigration>>>,
+    /// This node's best current understanding of cluster membership, used
+    /// to reject a client's `G`/`S`/`D` for a key this node no longer
+    /// owns (see `wrong_node`) instead of silently serving stale local
+    /// data forever to a client whose own view of `L` hasn't caught up
+    /// yet. Updated once a handoff this node ran (successfully) finishes
+    /// — not the moment `M` arrives — so this node keeps accepting
+    /// writes for a key up through the handoff (propagating them, see
+    /// `run_migration`) and only starts rejecting once its own share is
+    /// actually done; updating any earlier would reject requests for a
+    /// joining node that may not even be promoted yet. Runs for every
+    /// `M`, whether or not any of this node's own keys route to the
+    /// joiner, so it stays current with joins elsewhere in the cluster
+    /// too. `None` until this node's first successful handoff — a lone
+    /// or freshly-bootstrapped node has no membership to reject against
+    /// yet.
+    known_ring: Arc<Mutex<Option<Arc<HashRing>>>>,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -289,6 +305,7 @@ pub(crate) async fn run(
         name: Uuid::new_v4().to_string(),
         discovery_addr: config.discovery_addr.clone(),
         active_migration: Arc::clone(&active_migration),
+        known_ring: Arc::new(Mutex::new(None)),
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
@@ -445,6 +462,25 @@ async fn dispatch_connection(
     true
 }
 
+async fn execute_command(
+    request_tx: &mpsc::Sender<CacheRequest>,
+    command: Command,
+) -> io::Result<Response> {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    request_tx
+        .send(CacheRequest {
+            command,
+            response_tx,
+        })
+        .await
+        .map_err(|_| io::Error::other("cache task stopped"))?;
+
+    response_rx
+        .await
+        .map_err(|_| io::Error::other("cache task dropped response"))
+}
+
 async fn handle_connection(
     mut stream: ServerStream,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -545,21 +581,84 @@ async fn handle_connection(
 
                 continue;
             }
+            Ok(Command::Get { key }) => {
+                if let Some(node_context) = &config.node_context
+                    && wrong_node(node_context, &key)
+                {
+                    stream.write_all(&Response::WrongNode.encode()).await?;
+                    continue;
+                }
+
+                let response = execute_command(&request_tx, Command::Get { key }).await?;
+                stream.write_all(&response.encode()).await?;
+
+                continue;
+            }
+            Ok(Command::Set { key, value, ttl }) => {
+                if let Some(node_context) = &config.node_context
+                    && wrong_node(node_context, &key)
+                {
+                    stream.write_all(&Response::WrongNode.encode()).await?;
+                    continue;
+                }
+
+                let response = execute_command(
+                    &request_tx,
+                    Command::Set {
+                        key: key.clone(),
+                        value: value.clone(),
+                        ttl,
+                    },
+                )
+                .await?;
+                stream.write_all(&response.encode()).await?;
+
+                // ADR-0008: this key may be one an in-progress handoff is
+                // moving to a joining node — see `migration_target_for`.
+                if let Some(node_context) = &config.node_context
+                    && let Some(joining_addr) = migration_target_for(node_context, &key)
+                    && let Err(error) =
+                        set_on_joining_node(node_context, &joining_addr, &key, &value, ttl).await
+                {
+                    eprintln!(
+                        "failed to forward a concurrent SET for a migrating key to \
+                         {joining_addr}: {error}"
+                    );
+                }
+
+                continue;
+            }
+            Ok(Command::Delete { key }) => {
+                if let Some(node_context) = &config.node_context
+                    && wrong_node(node_context, &key)
+                {
+                    stream.write_all(&Response::WrongNode.encode()).await?;
+                    continue;
+                }
+
+                let response =
+                    execute_command(&request_tx, Command::Delete { key: key.clone() }).await?;
+                stream.write_all(&response.encode()).await?;
+
+                if let Some(node_context) = &config.node_context
+                    && let Some(joining_addr) = migration_target_for(node_context, &key)
+                    && let Err(error) =
+                        delete_on_joining_node(node_context, &joining_addr, &key).await
+                {
+                    eprintln!(
+                        "failed to forward a concurrent DELETE for a migrating key to \
+                         {joining_addr}: {error}"
+                    );
+                }
+
+                continue;
+            }
             Ok(command) => {
-                let (response_tx, response_rx) = oneshot::channel();
-
-                request_tx
-                    .send(CacheRequest {
-                        command,
-                        response_tx,
-                    })
-                    .await
-                    .map_err(|_| io::Error::other("cache task stopped"))?;
-
-                let response = response_rx
-                    .await
-                    .map_err(|_| io::Error::other("cache task dropped response"))?;
-
+                // `ListEntries`/`MarkMigrated`/`UnmarkMigrated`/`Sweep`/
+                // `PeekEntry`: internal-only, constructed directly by
+                // server-side tasks, never by `parse()` — this arm exists
+                // only so the match stays exhaustive.
+                let response = execute_command(&request_tx, command).await?;
                 stream.write_all(&response.encode()).await?;
 
                 continue;
@@ -787,6 +886,14 @@ fn set_message(key: &[u8], value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     message
 }
 
+/// ADR-0008: propagates a client's `D` for a key an in-progress handoff
+/// is moving to the joining node too (see `forward_delete_to_joining_node`).
+fn delete_message(key: &[u8]) -> Vec<u8> {
+    let mut message = format!("D {}\n", key.len()).into_bytes();
+    message.extend_from_slice(key);
+    message
+}
+
 /// ADR-0008: reports to discovery that this node (identified by `name`,
 /// ADR-0009) has finished handing off its share of the current join.
 fn complete_message(name: &str) -> Vec<u8> {
@@ -795,31 +902,43 @@ fn complete_message(name: &str) -> Vec<u8> {
     message
 }
 
-/// A `run_migration` in flight: which handoff it's for, and the flag an
-/// incoming `X` (cancel) sets to ask it to stop. See
+/// A `run_migration` in flight: which handoff it's for, where the joining
+/// node is, the ring this handoff computed (so a concurrent client write
+/// on another connection can tell whether *its* key is one this handoff
+/// is moving — see `handle_connection`'s forwarding of `S`/`D`), and the
+/// flag an incoming `X` (cancel) sets to ask it to stop. See
 /// `NodeContext::active_migration`.
 struct ActiveMigration {
     joining_name: String,
+    joining_addr: String,
+    after_ring: Arc<HashRing>,
     abort_requested: Arc<AtomicBool>,
 }
 
-/// Occupies `slot` with an `ActiveMigration` for `joining_name` for this
-/// guard's lifetime (cleared back to `None` on drop — including an early
-/// return or panic), so `run_sweep` can tell to pause and an incoming `X`
-/// can find this handoff to cancel it. Exposes `abort_requested` so
-/// `run_migration` can poll it directly without re-locking `slot` on
-/// every entry.
+/// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
+/// (cleared back to `None` on drop — including an early return or panic),
+/// so `run_sweep` can tell to pause, an incoming `X` can find this
+/// handoff to cancel it, and a concurrent client write can find it to
+/// forward. Exposes `abort_requested` so `run_migration` can poll it
+/// directly without re-locking `slot` on every entry.
 struct MigrationGuard<'a> {
     slot: &'a Mutex<Option<ActiveMigration>>,
     abort_requested: Arc<AtomicBool>,
 }
 
 impl<'a> MigrationGuard<'a> {
-    fn new(slot: &'a Mutex<Option<ActiveMigration>>, joining_name: String) -> Self {
+    fn new(
+        slot: &'a Mutex<Option<ActiveMigration>>,
+        joining_name: String,
+        joining_addr: String,
+        after_ring: Arc<HashRing>,
+    ) -> Self {
         let abort_requested = Arc::new(AtomicBool::new(false));
 
         *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveMigration {
             joining_name,
+            joining_addr,
+            after_ring,
             abort_requested: Arc::clone(&abort_requested),
         });
 
@@ -859,11 +978,16 @@ async fn run_migration(
     joining_addr: String,
     joined: Vec<(String, String)>,
 ) {
-    let migration_guard = MigrationGuard::new(&node_context.active_migration, joining_name.clone());
-
     let mut ring_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
     ring_members.push(joining_name.clone());
-    let after_ring = HashRing::new(ring_members);
+    let after_ring = Arc::new(HashRing::new(ring_members));
+
+    let migration_guard = MigrationGuard::new(
+        &node_context.active_migration,
+        joining_name.clone(),
+        joining_addr.clone(),
+        Arc::clone(&after_ring),
+    );
 
     let entries = match list_entries(&node_context.request_tx).await {
         Some(entries) => entries,
@@ -875,7 +999,7 @@ async fn run_migration(
 
     let mut marked_this_run = Vec::new();
 
-    for (key, value, ttl) in entries {
+    for (key, _, _) in entries {
         if migration_guard.abort_requested.load(Ordering::SeqCst) {
             break;
         }
@@ -883,6 +1007,19 @@ async fn run_migration(
         if after_ring.route(&key) != joining_name {
             continue;
         }
+
+        // Re-checked live rather than trusting `entries()`'s snapshot: a
+        // concurrent client write racing this key's turn (see
+        // `handle_connection`'s own forwarding of `S`/`D` for a key this
+        // migration is moving) must win over whatever was true when the
+        // snapshot was taken, or its update would ship stale to the
+        // joining node. If the key is gone by now (deleted, expired, or
+        // already forwarded-and-since-removed), there's nothing to send —
+        // `handle_connection`'s own delete-forwarding path (or nothing
+        // ever existing to send in the first place) already covers it.
+        let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
+            continue;
+        };
 
         if let Err(error) =
             set_on_joining_node(&node_context, &joining_addr, &key, &value, ttl).await
@@ -904,6 +1041,14 @@ async fn run_migration(
 
         return;
     }
+
+    // From here on, this node considers the joining node authoritative
+    // for anything `after_ring` routes to it — see
+    // `NodeContext::known_ring`.
+    *node_context
+        .known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(after_ring);
 
     if let Err(error) = report_complete(&node_context).await {
         eprintln!(
@@ -928,6 +1073,26 @@ async fn list_entries(
 
     match response_rx.await.ok()? {
         Response::Entries(entries) => Some(entries),
+        _ => None,
+    }
+}
+
+async fn peek_entry(
+    request_tx: &mpsc::Sender<CacheRequest>,
+    key: &Bytes,
+) -> Option<(Bytes, Bytes, Option<Duration>)> {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    request_tx
+        .send(CacheRequest {
+            command: Command::PeekEntry { key: key.clone() },
+            response_tx,
+        })
+        .await
+        .ok()?;
+
+    match response_rx.await.ok()? {
+        Response::Entries(mut entries) => entries.pop(),
         _ => None,
     }
 }
@@ -1053,6 +1218,75 @@ async fn set_on_joining_node(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "joining node did not acknowledge the transferred key",
+        ));
+    }
+
+    Ok(())
+}
+
+/// This node's own current view of cluster membership, if it has one yet
+/// (see `NodeContext::known_ring`) says `key` isn't this node's to serve
+/// anymore.
+fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
+    node_context
+        .known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|ring| ring.route(key) != node_context.name)
+}
+
+/// If a handoff is currently in flight and `key` is one it's moving (per
+/// its `after_ring`), returns the joining node's address — for
+/// `handle_connection` to also propagate a client's `S`/`D` for that key
+/// there, so the joining node doesn't end up serving a stale value once
+/// promoted (see doc/adr/0008's Consequences).
+fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String> {
+    node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|active| active.after_ring.route(key) == active.joining_name)
+        .map(|active| active.joining_addr.clone())
+}
+
+/// Forwards a client's `D` for `key` to `joining_addr`, mirroring
+/// `set_on_joining_node` but for deletes — see `migration_target_for`.
+/// Accepts either `D\n` (the key was present there too) or `N\n` (it
+/// hadn't arrived yet, e.g. this delete raced ahead of the migration
+/// task's own send of it) as a successful delivery.
+async fn delete_on_joining_node(
+    node_context: &NodeContext,
+    joining_addr: &str,
+    key: &[u8],
+) -> io::Result<()> {
+    let mut stream =
+        connect_client_stream(joining_addr, node_context.tls_connector.as_ref()).await?;
+
+    if let Some(secret) = &node_context.auth_secret {
+        stream.write_all(&auth_message(secret)).await?;
+
+        let mut ack = [0u8; 3];
+        stream.read_exact(&mut ack).await?;
+
+        if &ack != b"On\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "joining node rejected the auth secret",
+            ));
+        }
+    }
+
+    stream.write_all(&delete_message(key)).await?;
+
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+
+    if &ack != b"D\n" && &ack != b"N\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "joining node did not acknowledge the forwarded delete",
         ));
     }
 
@@ -1667,6 +1901,7 @@ mod tests {
                     name: "ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -1769,6 +2004,7 @@ mod tests {
                     name: "ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),

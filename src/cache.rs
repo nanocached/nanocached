@@ -154,6 +154,36 @@ impl Cache {
             .collect()
     }
 
+    /// The current value and remaining TTL for one key, same shape as one
+    /// `entries()` row, without disturbing recency (`LruCache::peek`, not
+    /// `get`). For ADR-0008's migration task, to re-check a key's *live*
+    /// value right before sending it, instead of trusting whatever
+    /// `entries()`'s snapshot captured at the start of the handoff — a
+    /// concurrent client write between the snapshot and this key's turn
+    /// would otherwise ship a stale value to the joining node. `None` if
+    /// the key isn't present or has expired.
+    pub fn peek_entry(&self, key: &[u8]) -> Option<(Bytes, Bytes, Option<Duration>)> {
+        self.peek_entry_at(key, Instant::now())
+    }
+
+    fn peek_entry_at(&self, key: &[u8], now: Instant) -> Option<(Bytes, Bytes, Option<Duration>)> {
+        let entry = self.entries.peek(key)?;
+
+        if entry.is_expired_at(now) {
+            return None;
+        }
+
+        let remaining_ttl = entry
+            .expires_at
+            .map(|expires_at| expires_at.saturating_duration_since(now));
+
+        Some((
+            Bytes::copy_from_slice(key),
+            entry.value.clone(),
+            remaining_ttl,
+        ))
+    }
+
     /// Marks `key` as handed off during an ADR-0008 migration this node
     /// was the source for. A no-op if the key is already marked or no
     /// longer present; `sweep` reclaims marked entries later.
@@ -549,6 +579,60 @@ mod tests {
         // would become most-recently-used here and survive the eviction
         // below instead of "b".
         let _ = cache.entries();
+
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"XXX")); // evicts "a" (still LRU)
+
+        assert_eq!(cache.get(b"a"), None);
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"XX")));
+    }
+
+    #[test]
+    fn peek_entry_returns_the_current_value_and_remaining_ttl() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+
+        let (key, value, ttl) = cache.peek_entry(b"name").unwrap();
+
+        assert_eq!(key, Bytes::from_static(b"name"));
+        assert_eq!(value, Bytes::from_static(b"Alice"));
+        assert!(ttl.unwrap() <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn peek_entry_is_none_for_a_missing_key() {
+        let cache = Cache::new(UNBOUNDED);
+
+        assert_eq!(cache.peek_entry(b"missing"), None);
+    }
+
+    #[test]
+    fn peek_entry_is_none_for_an_expired_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+
+        let future = Instant::now() + Duration::from_secs(6);
+
+        assert_eq!(cache.peek_entry_at(b"name", future), None);
+    }
+
+    #[test]
+    fn peek_entry_does_not_disturb_lru_order() {
+        let mut cache = Cache::new(8);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XX"));
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XX"));
+
+        let _ = cache.peek_entry(b"a");
 
         cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"XXX")); // evicts "a" (still LRU)
 

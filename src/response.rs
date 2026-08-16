@@ -19,6 +19,13 @@ pub enum Response {
     /// was actually found and aborted (a cancel for an already-finished
     /// or never-started handoff is a safe no-op on the node's side).
     MigrationCancelled,
+    /// ADR-0008: this node no longer (or not yet) owns the key a `G`/`S`/
+    /// `D` named, per this node's own current view of cluster membership
+    /// (see `NodeContext::known_ring`) — the client's view of `L` is
+    /// stale. Carries no forwarding address; the client is expected to
+    /// re-fetch `L` from discovery and recompute where the key belongs,
+    /// not trust this node to know or proxy the request.
+    WrongNode,
     /// Internal-only (ADR-0008), in answer to `Command::ListEntries` —
     /// never encoded for a wire client, see `encode`.
     Entries(Vec<(Bytes, Bytes, Option<Duration>)>),
@@ -42,6 +49,7 @@ impl Response {
             Self::Unauthorized => b"En\n".to_vec(),
             Self::MigrationAccepted => b"A\n".to_vec(),
             Self::MigrationCancelled => b"A\n".to_vec(),
+            Self::WrongNode => b"W\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -103,6 +111,11 @@ mod tests {
     #[test]
     fn encodes_migration_accepted_response() {
         assert_eq!(Response::MigrationAccepted.encode(), b"A\n");
+    }
+
+    #[test]
+    fn encodes_wrong_node_response() {
+        assert_eq!(Response::WrongNode.encode(), b"W\n");
     }
 
     #[test]

@@ -24,6 +24,15 @@ pub enum Command {
     /// currently holds, to compute which ones a newly joining node now
     /// owns. See `Response::Entries`.
     ListEntries,
+    /// Internal-only (ADR-0008): the migration task's live re-check of a
+    /// single key's current value right before sending it, instead of
+    /// trusting `ListEntries`'s snapshot (which may be stale by the time
+    /// this key's turn comes up). Answered with `Response::Entries`
+    /// holding zero or one entry — reusing its shape rather than adding a
+    /// new one for what's otherwise the exact same data.
+    PeekEntry {
+        key: Bytes,
+    },
     /// Internal-only (ADR-0008): marks a key as handed off to another
     /// node during a migration this node was the source for. `Sweep`
     /// reclaims marked entries later.
@@ -101,6 +110,10 @@ impl Command {
             }
 
             Self::ListEntries => Response::Entries(cache.entries()),
+
+            Self::PeekEntry { key } => {
+                Response::Entries(cache.peek_entry(&key).into_iter().collect())
+            }
 
             Self::MarkMigrated { key } => {
                 cache.mark_migrated(&key);
@@ -727,6 +740,36 @@ mod tests {
                 None
             )])
         );
+    }
+
+    #[test]
+    fn peek_entry_returns_the_matching_entry() {
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+
+        let command = Command::PeekEntry {
+            key: Bytes::from_static(b"name"),
+        };
+
+        assert_eq!(
+            command.execute(&mut cache),
+            Response::Entries(vec![(
+                Bytes::from_static(b"name"),
+                Bytes::from_static(b"Alice"),
+                None
+            )])
+        );
+    }
+
+    #[test]
+    fn peek_entry_returns_no_entries_for_a_missing_key() {
+        let mut cache = Cache::new(usize::MAX);
+
+        let command = Command::PeekEntry {
+            key: Bytes::from_static(b"missing"),
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::Entries(Vec::new()));
     }
 
     #[test]
