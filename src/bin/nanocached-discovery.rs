@@ -38,6 +38,19 @@
 //!                             ordinary heartbeat connection (`H` from
 //!                             here on).
 //!
+//!   P <name-length> <addr-length>\n<name><addr>   Announce (ADR-0010): an
+//!                             already-promoted node (re-)declaring "I am a
+//!                             `Joined` member at this address" — after a
+//!                             heartbeat connection broke, after this
+//!                             process restarted with an empty registry, or
+//!                             to a standby replica it never `J`ed with.
+//!                             Upserts the node straight to `Joined` with no
+//!                             ADR-0008 handoff. Response: `R\n`, after
+//!                             which the connection carries `H` heartbeats,
+//!                             exactly like a `J` connection after
+//!                             promotion. Rejected for a name currently
+//!                             mid-join (`Waiting`/`Joining`).
+//!
 //!   C <name-length>\n<name>   Sent by an already-`Joined` node to report
 //!                             it has finished handing its share of the
 //!                             keyspace off to the node currently joining
@@ -60,7 +73,13 @@
 //!                             dialed.
 //!
 //! If the connection limit has been reached, the server responds with
-//! `B\n` and closes the connection instead of accepting the command.
+//! `B\n` and closes the connection instead of accepting the command. `L`
+//! is answered the same way (`B\n`, connection closed) during the startup
+//! grace period (ADR-0010, `--startup-grace`): after a restart the
+//! registry re-fills from `P` announces within about one heartbeat
+//! interval, and until the grace has passed a fresh client must not build
+//! a ring from the partial list. All other commands work during the grace
+//! — recovery itself depends on them.
 //!
 //! A node moves through three states (ADR-0008): `Waiting` (registered via
 //! `J`, but either another join is already in progress or its handoff
@@ -76,9 +95,12 @@
 //! `Joined` node that stops sending heartbeats is dropped once
 //! `--liveness-timeout` has elapsed since its last heartbeat; no explicit
 //! "leave" message is required, so this covers both graceful shutdown and
-//! crashes. Because the registry is rebuilt from `J`/`H`, this process can
-//! be restarted at any time and self-heals, modulo any join in progress at
-//! the time (not yet designed — see `doc/adr/0008-*.md`).
+//! crashes. Because the registry is rebuilt from `P` announces (ADR-0010)
+//! within about one heartbeat interval, this process can be restarted at
+//! any time and self-heals with no data movement, modulo any join in
+//! progress at the time (not yet designed — see `doc/adr/0008-*.md`); it
+//! can also run as several independent replicas that each converge on the
+//! same registry by listening to the same nodes.
 
 use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
@@ -342,6 +364,11 @@ async fn connect_client_stream(
 #[derive(Clone)]
 struct ConnectionConfig {
     idle_timeout: Duration,
+    /// ADR-0010 startup grace: until this instant, `L` answers `B\n`
+    /// instead of a node list — after a restart the registry re-fills from
+    /// announces within about one heartbeat interval, and serving the
+    /// partial list to a bootstrapping client would hand it a wrong ring.
+    list_ready_at: Instant,
     auth_secret: Option<Bytes>,
     /// When set, every accepted connection must complete a TLS handshake
     /// before speaking the protocol; there is no plaintext fallback.
@@ -384,6 +411,10 @@ struct Args {
     port: u16,
     liveness_timeout: Duration,
     migration_timeout: Duration,
+    /// ADR-0010: how long after startup `L` keeps answering `B\n` while
+    /// the registry re-fills from announces. `None` (the default) means
+    /// "same as the liveness timeout".
+    startup_grace: Option<Duration>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
@@ -396,6 +427,7 @@ impl Default for Args {
             port: 8357,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
             migration_timeout: DEFAULT_MIGRATION_TIMEOUT,
+            startup_grace: None,
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
@@ -432,6 +464,13 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --migration-timeout: {raw_secs}"))?;
                 args.migration_timeout = Duration::from_secs(secs);
             }
+            "--startup-grace" => {
+                let raw_secs = value()?;
+                let secs: u64 = raw_secs
+                    .parse()
+                    .map_err(|_| format!("invalid value for --startup-grace: {raw_secs}"))?;
+                args.startup_grace = Some(Duration::from_secs(secs));
+            }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
@@ -458,6 +497,10 @@ Usage: nanocached-discovery [options]
   --migration-timeout <secs>    abandon a join if a ready node hasn't
                                  reported completion after this many
                                  seconds (default 60)
+  --startup-grace <secs>        answer L with B\\n (busy) for this many
+                                 seconds after startup, while the registry
+                                 re-fills from node announces (ADR-0010);
+                                 0 disables (default: --liveness-timeout)
   --tls-cert <path>             PEM certificate chain; requires TLS on
                                  every accepted connection (no plaintext
                                  fallback)
@@ -486,6 +529,13 @@ enum DiscoveryCommand {
     /// ADR-0008: a ready node reporting it has finished handing off its
     /// share of the current join, identified by its own name (ADR-0009).
     Complete(String),
+    /// ADR-0010: an already-promoted node (re-)declaring membership, with
+    /// the same name/address shape as `Join` — upserted straight to
+    /// `Joined`, no handoff orchestration.
+    Announce {
+        name: String,
+        addr: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -567,7 +617,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             Ok(make(name))
         }
 
-        b"J" => {
+        b"J" | b"P" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
@@ -577,10 +627,17 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let name_length = parse_length(name_length)?;
             let addr_length = parse_length(addr_length)?;
+            // Same owned-fn-pointer dance as `H`/`C` above: resolve the
+            // variant while `command` is still alive, so `input` can be
+            // reborrowed mutably below.
+            let make: fn(String, String) -> DiscoveryCommand = match command {
+                b"J" => |name, addr| DiscoveryCommand::Join { name, addr },
+                _ => |name, addr| DiscoveryCommand::Announce { name, addr },
+            };
             let (name, addr) =
                 parse_two_string_fields(input, header_end, name_length, addr_length)?;
 
-            Ok(DiscoveryCommand::Join { name, addr })
+            Ok(make(name, addr))
         }
 
         _ => Err(ParseError::InvalidCommand),
@@ -1138,6 +1195,7 @@ async fn run(
     address: &str,
     liveness_timeout: Duration,
     migration_timeout: Duration,
+    startup_grace: Duration,
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
     tls_connector: Option<TlsConnector>,
@@ -1152,6 +1210,7 @@ async fn run(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
+        list_ready_at: Instant::now() + startup_grace,
         auth_secret: auth_secret.clone(),
         tls_acceptor,
         tls_connector: tls_connector.clone(),
@@ -1415,6 +1474,16 @@ async fn handle_connection(
                 continue;
             }
             Ok(DiscoveryCommand::List) => {
+                if Instant::now() < config.list_ready_at {
+                    // ADR-0010 startup grace — see `ConnectionConfig::
+                    // list_ready_at`. Same `B\n`-then-close shape as the
+                    // connection-limit rejection: "can't serve you right
+                    // now, retry", which the SDK maps to trying its next
+                    // discovery seed.
+                    stream.write_all(b"B\n").await?;
+                    return Ok(());
+                }
+
                 let nodes: Vec<(String, String)> = lock(&registry)
                     .iter()
                     .filter(|(_, info)| info.state == NodeState::Joined)
@@ -1444,6 +1513,42 @@ async fn handle_connection(
 
                 wait_for_promotion(&mut stream, promoted, shutdown_rx.clone()).await?;
 
+                continue;
+            }
+            Ok(DiscoveryCommand::Announce { name, addr }) => {
+                // Same bookkeeping as `J`: this connection now belongs to
+                // `name`, so its death runs `on_node_connection_ended`.
+                *connection_name
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
+
+                let accepted = {
+                    let mut guard = lock(&registry);
+                    match guard.get_mut(&name) {
+                        // A name mid-join announcing would corrupt the
+                        // ADR-0008 join bookkeeping, and no correct node
+                        // does it (announces only happen after promotion).
+                        Some(info) if info.state != NodeState::Joined => false,
+                        Some(info) => {
+                            info.address = addr;
+                            info.last_heartbeat = Instant::now();
+                            true
+                        }
+                        None => {
+                            guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined));
+                            true
+                        }
+                    }
+                };
+
+                if !accepted {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "announce for a node that is mid-join",
+                    ));
+                }
+
+                stream.write_all(b"R\n").await?;
                 continue;
             }
             Ok(DiscoveryCommand::Complete(name)) => {
@@ -1540,6 +1645,7 @@ async fn main() -> ExitCode {
         &address,
         args.liveness_timeout,
         args.migration_timeout,
+        args.startup_grace.unwrap_or(args.liveness_timeout),
         read_auth_secret(),
         tls_acceptor,
         tls_connector,
@@ -1708,6 +1814,7 @@ mod tests {
                 server_current_join,
                 ConnectionConfig {
                     idle_timeout: Duration::from_secs(5),
+                    list_ready_at: Instant::now(),
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
@@ -1743,6 +1850,215 @@ mod tests {
         assert_eq!(received, expected);
     }
 
+    #[test]
+    fn parse_reads_an_announce_command_and_consumes_only_that_frame() {
+        let mut input = BytesMut::from(&b"P 9 14\nsome-name127.0.0.1:8356L\n"[..]);
+        let command = parse(&mut input).unwrap();
+        assert_eq!(
+            command,
+            DiscoveryCommand::Announce {
+                name: "some-name".to_string(),
+                addr: "127.0.0.1:8356".to_string(),
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn announce_upserts_a_joined_node_without_any_join_orchestration() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_registry = Arc::clone(&registry);
+        let server_current_join = Arc::clone(&current_join);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_connection(
+                MaybeTls::Plain(stream),
+                server_registry,
+                server_current_join,
+                ConnectionConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    list_ready_at: Instant::now(),
+                    auth_secret: None,
+                    tls_acceptor: None,
+                    tls_connector: None,
+                },
+                shutdown_rx,
+                Arc::new(std::sync::Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        // ADR-0010: an announce lands straight in `Joined` — promoted (R),
+        // heartbeating (A), and visible in L — with no ADR-0008 join
+        // machinery involved.
+        client
+            .write_all(b"P 6 14\nnode-a127.0.0.1:8356H 6\nnode-aL\n")
+            .await
+            .unwrap();
+
+        let expected = b"R\nA\nN 1\n6 14\nnode-a127.0.0.1:8356\n";
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 64];
+
+        while received.len() < expected.len() {
+            let bytes_read = client.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response arrived");
+            received.extend_from_slice(&chunk[..bytes_read]);
+        }
+
+        assert_eq!(received, expected);
+        assert!(
+            lock_current_join(&current_join).is_none(),
+            "an announce must not start join orchestration"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn announce_updates_the_address_of_an_already_joined_node() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new("127.0.0.1:1111".to_string(), NodeState::Joined),
+        );
+
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        client
+            .write_all(b"P 6 14\nnode-a127.0.0.1:2222")
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"R\n");
+
+        assert_eq!(
+            lock(&registry).get("node-a").unwrap().address,
+            "127.0.0.1:2222"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn announce_for_a_name_mid_join_is_rejected() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new("127.0.0.1:1111".to_string(), NodeState::Waiting),
+        );
+
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        client
+            .write_all(b"P 6 14\nnode-a127.0.0.1:2222")
+            .await
+            .unwrap();
+
+        // The connection is closed with no `R` — the announce was refused.
+        let mut buffer = [0u8; 2];
+        let bytes_read = client.read(&mut buffer).await.unwrap();
+        assert_eq!(
+            bytes_read, 0,
+            "expected the connection to close, got {buffer:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_answers_busy_during_the_startup_grace_while_announce_still_works() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = || ConnectionConfig {
+            idle_timeout: Duration::from_secs(5),
+            // Still inside the ADR-0010 grace for the whole test.
+            list_ready_at: Instant::now() + Duration::from_secs(60),
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+        };
+
+        // An announce during the grace must work — recovery depends on it.
+        let (mut announcing, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        announcing
+            .write_all(b"P 6 14\nnode-a127.0.0.1:8356")
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        announcing.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"R\n");
+
+        // A list during the grace gets the busy byte and a closed
+        // connection, never the (possibly partial) node list.
+        let (mut listing, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        listing.write_all(b"L\n").await.unwrap();
+
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 16];
+        loop {
+            let bytes_read = listing.read(&mut chunk).await.unwrap();
+            if bytes_read == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..bytes_read]);
+        }
+        assert_eq!(received, b"B\n");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_second_node_joining_waits_for_a_completion_report_before_being_promoted() {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
@@ -1751,6 +2067,7 @@ mod tests {
 
         let config = || ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
@@ -1847,6 +2164,7 @@ mod tests {
 
         let config = || ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
@@ -1955,6 +2273,7 @@ mod tests {
             current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
@@ -1986,6 +2305,7 @@ mod tests {
             current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2017,6 +2337,7 @@ mod tests {
             current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2055,6 +2376,7 @@ mod tests {
             current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2109,6 +2431,7 @@ mod tests {
             Arc::clone(&connection_limit),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2131,6 +2454,7 @@ mod tests {
             connection_limit,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2211,6 +2535,7 @@ mod tests {
 
         let config = ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
             auth_secret: None,
             tls_acceptor: Some(acceptor),
             tls_connector: None,

@@ -73,6 +73,16 @@ The node sends a heartbeat every `--heartbeat-interval` seconds (default 5)
 declaring `--advertise-addr` (default: `--host:--port`); omit `--discovery`
 to run standalone.
 
+`--discovery` accepts a comma-separated list of discovery replicas
+(`doc/adr/0010-*.md`): the node registers with and heartbeats to all of
+them, but only the first — the primary — ever orchestrates its join. Every
+node in a cluster must list the same addresses in the same order:
+
+```sh
+cargo run --bin nanocached-node -- --port 8356 \
+  --discovery 127.0.0.1:8357,127.0.0.1:8358
+```
+
 ### Authentication
 
 Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared
@@ -382,6 +392,16 @@ It supports the same `NANOCACHED_AUTH_SECRET`-based authentication and
 `--tls-cert`/`--tls-key`-based TLS as `nanocached-node` (see
 [Authentication](#authentication) and [TLS](#tls)); nodes and `bench` speak
 the same `A` handshake and TLS handshake to it as they do to a cache node.
+
+Discovery's registry is soft state, rebuilt from node announces, so it can
+run as several independent replicas with no coordination between them
+(`doc/adr/0010-*.md`): point every node's `--discovery` (and every SDK
+client's `seeds`) at the same list of replicas, and losing any one replica
+— including the primary — costs neither cache traffic nor client
+bootstrap. Only *joins* need the primary up. After a (re)start, a replica
+answers `L` with `B` (busy) for `--startup-grace` seconds (default: the
+liveness timeout) while live members re-announce themselves, so a
+bootstrapping client never sees a half-recovered node list.
 
 ## Current limits
 

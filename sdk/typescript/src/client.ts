@@ -17,9 +17,22 @@ export class AlreadyClosedError extends Error {
   }
 }
 
-export interface NanocachedClientOptions {
+export interface NanocachedSeed {
   host: string;
   port: number;
+}
+
+export interface NanocachedClientOptions {
+  host?: string;
+  port?: number;
+  /** Discovery replicas (ADR-0010), tried in order — an alternative to
+   * `host`/`port` for clusters running more than one discovery server.
+   * Both the initial connect and every later node-list refresh walk this
+   * list until a seed provides a node list, so losing any one replica
+   * costs nothing. A seed that answers `B` (still inside its startup
+   * grace after a restart) is skipped the same way as an unreachable
+   * one. */
+  seeds?: NanocachedSeed[];
   /** Shared secret to authenticate with, matching NANOCACHED_AUTH_SECRET
    * on the server. Omit if the server has no secret configured. */
   authSecret?: string | Uint8Array;
@@ -140,10 +153,15 @@ export class NanocachedClient {
 
   private constructor(
     private target: Target,
-    /** The `host:port` passed to connect() — a node's own address in
-     * single mode, the discovery server's address in cluster mode. */
+    /** The seed that answered connect() — a node's own address in single
+     * mode (which is also what a lazy reconnect redials), the winning
+     * discovery server's address in cluster mode. */
     readonly url: string,
     nodeUrls: readonly string[],
+    /** Every configured discovery seed (ADR-0010) — what fetchNodeList
+     * walks on a refresh, not just the seed that happened to win the
+     * initial connect. */
+    private readonly seeds: readonly NanocachedSeed[],
     private readonly authSecret: string | Uint8Array | undefined,
     private readonly tls: boolean | NanocachedTlsOptions | undefined,
     keepAliveIntervalMs: number | undefined,
@@ -164,69 +182,98 @@ export class NanocachedClient {
       );
     }
 
-    const key = targetKey(options);
-    if (openTargets.has(key)) {
-      console.warn(
-        `nanocached: connect() called for ${key} while a previous connection to it is still open — was close() forgotten?`,
-      );
+    const seeds: NanocachedSeed[] =
+      options.seeds ??
+      (options.host !== undefined && options.port !== undefined
+        ? [{ host: options.host, port: options.port }]
+        : []);
+    if (seeds.length === 0) {
+      throw new Error("nanocached: connect() needs either host/port or a non-empty seeds list");
     }
 
-    const identified = await connectAndIdentify(options);
+    // Walk the seeds in order until one yields a working target. A seed
+    // is skipped when it's unreachable, answers `B` (ADR-0010 startup
+    // grace), or knows no live nodes — the next replica may do better.
+    let lastError: Error | null = null;
 
-    if (identified.kind === "node") {
-      trackOpenTarget(key, [identified.socket]);
+    for (const seed of seeds) {
+      const key = targetKey(seed);
+      if (openTargets.has(key)) {
+        console.warn(
+          `nanocached: connect() called for ${key} while a previous connection to it is still open — was close() forgotten?`,
+        );
+      }
+
+      let identified;
+      try {
+        identified = await connectAndIdentify({ host: seed.host, port: seed.port, authSecret: options.authSecret, tls: options.tls });
+      } catch (error) {
+        lastError = error as Error;
+        continue;
+      }
+
+      if (identified.kind === "node") {
+        trackOpenTarget(key, [identified.socket]);
+        return new NanocachedClient(
+          { kind: "single", connection: new Connection(identified.socket) },
+          key,
+          [key],
+          seeds,
+          options.authSecret,
+          options.tls,
+          options.keepAliveIntervalMs,
+        );
+      }
+
+      if (identified.nodes.length === 0) {
+        lastError = new Error(`nanocached: no live nodes registered with the discovery server at ${key}`);
+        continue;
+      }
+
+      // Keyed by name (doc/adr/0009-*.md), not address — see `Target`.
+      const sockets = new Map<string, Socket | TLSSocket>();
+
+      try {
+        for (const node of identified.nodes) {
+          const { host, port } = splitHostPort(node.address);
+          const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls });
+
+          if (nodeIdentified.kind !== "node") {
+            throw new Error(`nanocached: discovery server returned a non-node address: ${node.address}`);
+          }
+
+          sockets.set(node.name, nodeIdentified.socket);
+        }
+      } catch (error) {
+        // A node (not the discovery seed) is the problem here; another
+        // seed would hand back the same node list, so don't try one.
+        for (const socket of sockets.values()) socket.destroy();
+        throw error;
+      }
+
+      trackOpenTarget(key, [...sockets.values()]);
+
+      const members = new Map<string, ClusterMember>();
+      for (const node of identified.nodes) {
+        members.set(node.name, { address: node.address, connection: new Connection(sockets.get(node.name)!) });
+      }
+
       return new NanocachedClient(
-        { kind: "single", connection: new Connection(identified.socket) },
+        {
+          kind: "cluster",
+          ring: new HashRing(identified.nodes.map((node) => node.name)),
+          members,
+        },
         key,
-        [key],
+        identified.nodes.map((node) => node.address),
+        seeds,
         options.authSecret,
         options.tls,
         options.keepAliveIntervalMs,
       );
     }
 
-    if (identified.nodes.length === 0) {
-      throw new Error(`nanocached: no live nodes registered with the discovery server at ${options.host}:${options.port}`);
-    }
-
-    // Keyed by name (doc/adr/0009-*.md), not address — see `Target`.
-    const sockets = new Map<string, Socket | TLSSocket>();
-
-    try {
-      for (const node of identified.nodes) {
-        const { host, port } = splitHostPort(node.address);
-        const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls });
-
-        if (nodeIdentified.kind !== "node") {
-          throw new Error(`nanocached: discovery server returned a non-node address: ${node.address}`);
-        }
-
-        sockets.set(node.name, nodeIdentified.socket);
-      }
-    } catch (error) {
-      for (const socket of sockets.values()) socket.destroy();
-      throw error;
-    }
-
-    trackOpenTarget(key, [...sockets.values()]);
-
-    const members = new Map<string, ClusterMember>();
-    for (const node of identified.nodes) {
-      members.set(node.name, { address: node.address, connection: new Connection(sockets.get(node.name)!) });
-    }
-
-    return new NanocachedClient(
-      {
-        kind: "cluster",
-        ring: new HashRing(identified.nodes.map((node) => node.name)),
-        members,
-      },
-      key,
-      identified.nodes.map((node) => node.address),
-      options.authSecret,
-      options.tls,
-      options.keepAliveIntervalMs,
-    );
+    throw lastError ?? new Error("nanocached: could not connect to any seed");
   }
 
   /** Whether close() has already been called on this instance. */
@@ -341,23 +388,8 @@ export class NanocachedClient {
     if (this.target.kind !== "cluster") return;
     const currentMembers = this.target.members;
 
-    let identified;
-    try {
-      identified = await connectAndIdentify({ ...splitHostPort(this.url), authSecret: this.authSecret, tls: this.tls });
-    } catch (error) {
-      console.warn(`nanocached: could not refresh the node list from ${this.url}, keeping the last-known list: ${(error as Error).message}`);
-      this.lastNodeListFetch = Date.now();
-      return;
-    }
-
-    if (identified.kind !== "cluster") {
-      console.warn(`nanocached: ${this.url} no longer identifies as a discovery server, keeping the last-known list`);
-      this.lastNodeListFetch = Date.now();
-      return;
-    }
-
-    if (identified.nodes.length === 0) {
-      console.warn(`nanocached: discovery server at ${this.url} returned no live nodes, keeping the last-known list`);
+    const identified = await this.fetchNodeList();
+    if (identified === null) {
       this.lastNodeListFetch = Date.now();
       return;
     }
@@ -400,6 +432,40 @@ export class NanocachedClient {
     this.target = { kind: "cluster", ring: new HashRing([...members.keys()]), members };
     this.nodeUrls = identified.nodes.filter((node) => members.has(node.name)).map((node) => node.address);
     this.lastNodeListFetch = Date.now();
+  }
+
+  /** Walks every discovery seed (ADR-0010) in order for a fresh node
+   * list. Returns `null` — keep the last-known list — when no seed can
+   * provide one: unreachable, still inside its startup grace (`B`), no
+   * longer a discovery server, or knowing no live nodes. */
+  private async fetchNodeList(): Promise<{ nodes: DiscoveredNode[] } | null> {
+    for (const seed of this.seeds) {
+      const key = targetKey(seed);
+
+      let identified;
+      try {
+        identified = await connectAndIdentify({ host: seed.host, port: seed.port, authSecret: this.authSecret, tls: this.tls });
+      } catch (error) {
+        console.warn(`nanocached: could not refresh the node list from ${key}: ${(error as Error).message}`);
+        continue;
+      }
+
+      if (identified.kind !== "cluster") {
+        identified.socket.destroy();
+        console.warn(`nanocached: ${key} no longer identifies as a discovery server, skipping`);
+        continue;
+      }
+
+      if (identified.nodes.length === 0) {
+        console.warn(`nanocached: discovery server at ${key} returned no live nodes, skipping`);
+        continue;
+      }
+
+      return identified;
+    }
+
+    console.warn("nanocached: no discovery seed could provide a node list, keeping the last-known list");
+    return null;
   }
 
   /** The single "ensure connected" path (issue #1) every request funnels

@@ -117,6 +117,17 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   throw new Error("nanocached: unexpected response to A");
 }
 
+/** Thrown when a discovery server answers `L` with `B` — it is inside its
+ * startup grace (ADR-0010), re-learning cluster membership after a
+ * restart, and refuses to serve a possibly-partial node list. The caller
+ * should try another seed, or retry shortly. */
+export class DiscoveryBusyError extends Error {
+  constructor() {
+    super("nanocached: the discovery server is warming up after a restart");
+    this.name = "DiscoveryBusyError";
+  }
+}
+
 /** Parses an `N <count>\n` header followed by `count` entries, each
  * `<name-length> <addr-length>\n<name><addr>\n` (doc/adr/0009-*.md) —
  * name and address are simply concatenated, split by their declared
@@ -125,6 +136,10 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
 function tryParseNodeList(buf: Buffer): DiscoveredNode[] | null {
   const headerEnd = buf.indexOf(0x0a);
   if (headerEnd === -1) return null;
+
+  if (buf[0] === 0x42 /* 'B' */) {
+    throw new DiscoveryBusyError();
+  }
 
   if (buf[0] !== 0x4e /* 'N' */) {
     throw new Error(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
