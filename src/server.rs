@@ -31,6 +31,10 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK_SIZE: usize = 1024;
+/// How many times `run_migration` tries to transfer a single key to the
+/// joining node (reconnecting between tries) before giving up on the
+/// whole migration. See `run_migration`'s own doc comment.
+const KEY_TRANSFER_ATTEMPTS: u32 = 3;
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -1015,11 +1019,25 @@ impl Drop for MigrationGuard<'_> {
 /// is sufficient; there's no need to also build and compare a pre-join
 /// ring. Transfers each such entry via an ordinary `SET` (reusing the
 /// client protocol, not a new one), marks it migrated, and once done
-/// reports `C` to discovery. Errors along the way (an unreachable joining
-/// node, a lost discovery connection for the final `C`) are logged and
-/// otherwise swallowed — ADR-0008 doesn't yet define a retry/failure
-/// policy for this, so for now a failed attempt just leaves the join
-/// stalled rather than crashing this node.
+/// reports `C` to discovery.
+///
+/// All transfers for one migration share a single connection to the
+/// joining node instead of opening (and tearing down) one per key —
+/// with tens of thousands of keys, one-connection-per-key was observed
+/// to exhaust the ephemeral port range mid-migration, at which point
+/// every further key was silently skipped while the migration still
+/// went on to flip `known_ring` and report completion, quietly losing
+/// whatever didn't make it across. A key whose transfer fails is retried
+/// up to `KEY_TRANSFER_ATTEMPTS` times, reconnecting each time (the
+/// connection's state after a failed write/read is unknown, so it isn't
+/// reused as-is). If a key still can't be transferred after that, this
+/// gives up on the whole migration: it rolls back every mark from this
+/// run (same as the `abort_requested` path below) and returns without
+/// flipping `known_ring` or reporting `C`, leaving discovery's own
+/// `--migration-timeout` to reap the stalled join rather than have this
+/// node claim success over a joining node that's missing data. A lost
+/// discovery connection for the final `C` is a separate, already-
+/// terminal failure (the transfer itself succeeded) and is just logged.
 async fn run_migration(
     node_context: NodeContext,
     joining_name: String,
@@ -1046,6 +1064,7 @@ async fn run_migration(
     };
 
     let mut marked_this_run = Vec::new();
+    let mut stream: Option<ClientStream> = None;
 
     for (key, _, _) in entries {
         if migration_guard.abort_requested.load(Ordering::SeqCst) {
@@ -1069,11 +1088,57 @@ async fn run_migration(
             continue;
         };
 
-        if let Err(error) =
-            set_on_joining_node(&node_context, &joining_addr, &key, &value, ttl).await
-        {
-            eprintln!("migration to {joining_addr} failed to transfer a key: {error}");
-            continue;
+        let mut sent = false;
+
+        for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+            if stream.is_none() {
+                match connect_and_authenticate(&node_context, &joining_addr).await {
+                    Ok(connected) => stream = Some(connected),
+                    Err(error) => {
+                        eprintln!(
+                            "migration to {joining_addr} failed to connect \
+                             (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            let active_stream = match stream.as_mut() {
+                Some(active_stream) => active_stream,
+                None => continue,
+            };
+
+            match send_set(active_stream, &key, &value, ttl).await {
+                Ok(()) => {
+                    sent = true;
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "migration to {joining_addr} failed to transfer a key \
+                         (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                    );
+                    // The connection's state after a failed write/read is
+                    // unknown (e.g. a partial write) — reconnect rather
+                    // than risk a desynced stream on the next attempt.
+                    stream = None;
+                }
+            }
+        }
+
+        if !sent {
+            eprintln!(
+                "migration to {joining_addr} permanently failed to transfer a key after \
+                 {KEY_TRANSFER_ATTEMPTS} attempts; abandoning the join for discovery's \
+                 migration-timeout to reap"
+            );
+
+            for key in marked_this_run {
+                unmark_migrated(&node_context.request_tx, &key).await;
+            }
+
+            return;
         }
 
         mark_migrated(&node_context.request_tx, &key).await;
@@ -1240,15 +1305,17 @@ async fn sweep(request_tx: &mpsc::Sender<CacheRequest>) -> Option<usize> {
     }
 }
 
-async fn set_on_joining_node(
+/// Connects to `addr` and, if `node_context.auth_secret` is set, performs
+/// the auth handshake it expects before accepting any other command —
+/// shared by every place that opens an outbound node-to-node connection
+/// (`run_migration`'s own persistent connection, and the one-shot
+/// `set_on_joining_node`/`delete_on_joining_node` calls used to forward a
+/// racing client write mid-migration).
+async fn connect_and_authenticate(
     node_context: &NodeContext,
-    joining_addr: &str,
-    key: &[u8],
-    value: &[u8],
-    ttl: Option<Duration>,
-) -> io::Result<()> {
-    let mut stream =
-        connect_client_stream(joining_addr, node_context.tls_connector.as_ref()).await?;
+    addr: &str,
+) -> io::Result<ClientStream> {
+    let mut stream = connect_client_stream(addr, node_context.tls_connector.as_ref()).await?;
 
     if let Some(secret) = &node_context.auth_secret {
         stream.write_all(&auth_message(secret)).await?;
@@ -1264,6 +1331,15 @@ async fn set_on_joining_node(
         }
     }
 
+    Ok(stream)
+}
+
+async fn send_set(
+    stream: &mut ClientStream,
+    key: &[u8],
+    value: &[u8],
+    ttl: Option<Duration>,
+) -> io::Result<()> {
     stream.write_all(&set_message(key, value, ttl)).await?;
 
     let mut ack = [0u8; 2];
@@ -1277,6 +1353,17 @@ async fn set_on_joining_node(
     }
 
     Ok(())
+}
+
+async fn set_on_joining_node(
+    node_context: &NodeContext,
+    joining_addr: &str,
+    key: &[u8],
+    value: &[u8],
+    ttl: Option<Duration>,
+) -> io::Result<()> {
+    let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
+    send_set(&mut stream, key, value, ttl).await
 }
 
 /// This node's own current view of cluster membership, if it has one yet
@@ -1316,22 +1403,7 @@ async fn delete_on_joining_node(
     joining_addr: &str,
     key: &[u8],
 ) -> io::Result<()> {
-    let mut stream =
-        connect_client_stream(joining_addr, node_context.tls_connector.as_ref()).await?;
-
-    if let Some(secret) = &node_context.auth_secret {
-        stream.write_all(&auth_message(secret)).await?;
-
-        let mut ack = [0u8; 3];
-        stream.read_exact(&mut ack).await?;
-
-        if &ack != b"On\n" {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "joining node rejected the auth secret",
-            ));
-        }
-    }
+    let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
 
     stream.write_all(&delete_message(key)).await?;
 
@@ -2144,6 +2216,268 @@ mod tests {
         assert!(
             no_completion_reported,
             "a cancelled migration must not report completion"
+        );
+
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: Bytes::from_static(b"name")
+                }
+            )
+            .await,
+            Response::Value(Bytes::from_static(b"Alice"))
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep).await,
+            Response::Swept(0)
+        );
+
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        migration_relay.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_reuses_one_connection_for_every_key() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"age"),
+                value: Bytes::from_static(b"30"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake joining node: accepts exactly one connection and expects
+        // both SETs on it — `run_migration` must reuse one connection
+        // across keys rather than reconnecting per key (see its own doc
+        // comment on the ephemeral-port exhaustion that used to cause).
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_received: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joining_received_task = Arc::clone(&joining_received);
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+
+            for _ in 0..2 {
+                let mut buffer = [0u8; 256];
+                let bytes_read = connection.read(&mut buffer).await.unwrap();
+                joining_received_task
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..bytes_read]);
+                connection.write_all(b"S\n").await.unwrap();
+            }
+
+            let second_connection =
+                timeout(Duration::from_millis(200), joining_listener.accept()).await;
+            assert!(
+                second_connection.is_err(),
+                "expected the same connection to be reused for both keys"
+            );
+        });
+
+        // A fake discovery server: accepts one connection, expects C, acks
+        // it.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_received: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let discovery_received_task = Arc::clone(&discovery_received);
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            discovery_received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Stands in for `run`'s own loop, which is what normally drains
+        // `migration_tx` and spawns what it receives (see
+        // `ConnectionConfig::migration_tx`) — `handle_connection` itself no
+        // longer spawns `run_migration` directly.
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    discovery_addr,
+                    active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+                migration_tx,
+            },
+            shutdown_rx.clone(),
+        ));
+
+        let joining_name = "joining-node";
+        let mut migrate_message =
+            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+
+        client.write_all(&migrate_message).await.unwrap();
+
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        for _ in 0..1000 {
+            if !discovery_received.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let expected_name = set_message(b"name", b"Alice", None);
+        let expected_age = set_message(b"age", b"30", None);
+        let received = joining_received.lock().unwrap().clone();
+        assert!(
+            received
+                .windows(expected_name.len())
+                .any(|window| window == expected_name.as_slice()),
+            "expected the joining node to receive the SET for \"name\""
+        );
+        assert!(
+            received
+                .windows(expected_age.len())
+                .any(|window| window == expected_age.as_slice()),
+            "expected the joining node to receive the SET for \"age\""
+        );
+        assert_eq!(
+            *discovery_received.lock().unwrap(),
+            complete_message("ready-node")
+        );
+
+        joining_task.await.unwrap();
+        discovery_task.await.unwrap();
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        migration_relay.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_gives_up_and_rolls_back_after_permanent_transfer_failure() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A joining node address nothing is listening on: every connect
+        // attempt fails immediately, so `run_migration` exhausts
+        // `KEY_TRANSFER_ATTEMPTS` and gives up on the whole migration.
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = dead_listener.local_addr().unwrap().to_string();
+        drop(dead_listener);
+
+        // A fake discovery server: must receive nothing — a migration
+        // that permanently failed to transfer a key must not report
+        // completion.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Stands in for `run`'s own loop, which is what normally drains
+        // `migration_tx` and spawns what it receives (see
+        // `ConnectionConfig::migration_tx`) — `handle_connection` itself no
+        // longer spawns `run_migration` directly.
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    discovery_addr,
+                    active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+                migration_tx,
+            },
+            shutdown_rx.clone(),
+        ));
+
+        let joining_name = "joining-node";
+        let mut migrate_message =
+            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+
+        client.write_all(&migrate_message).await.unwrap();
+
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        // Nothing should ever connect to "discovery".
+        let no_completion_reported =
+            timeout(Duration::from_millis(200), discovery_listener.accept())
+                .await
+                .is_err();
+        assert!(
+            no_completion_reported,
+            "a migration that permanently failed to transfer a key must not report completion"
         );
 
         assert_eq!(
