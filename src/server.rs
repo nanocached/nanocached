@@ -1,5 +1,6 @@
 use crate::cache::Cache;
 use crate::command::{Command, ParseError, parse};
+use crate::hash_ring::HashRing;
 use crate::response::Response;
 use bytes::{Bytes, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -17,6 +18,7 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use uuid::Uuid;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
@@ -181,12 +183,31 @@ struct ConnectionConfig {
     /// When set, every accepted connection must complete a TLS handshake
     /// before speaking the cache protocol; there is no plaintext fallback.
     tls_acceptor: Option<TlsAcceptor>,
+    /// Only present when this node is configured to register with a
+    /// discovery server (ADR-0008/0009) — an `M` arriving otherwise has
+    /// nowhere sensible to report `C` to and is rejected.
+    node_context: Option<NodeContext>,
+}
+
+/// What an ADR-0008 migration task (triggered by an incoming `M`) needs
+/// beyond the cache itself: this node's own identity, and how to reach
+/// the discovery server to report `C` once the handoff is done.
+#[derive(Clone)]
+struct NodeContext {
+    /// This node's own random per-process identity (ADR-0009), needed to
+    /// identify this node as the sender when it reports `C`.
+    name: String,
+    discovery_addr: String,
+    auth_secret: Option<Bytes>,
+    tls_connector: Option<TlsConnector>,
+    request_tx: mpsc::Sender<CacheRequest>,
 }
 
 /// Configuration for registering this node with a discovery server (see
-/// `src/bin/nanocached-discovery.rs`). When set, `run` sends a heartbeat
-/// declaring `advertise_addr` on `interval`, well under the discovery
-/// server's own liveness timeout.
+/// `src/bin/nanocached-discovery.rs`). When set, `run` asks to join once
+/// (ADR-0008) using a random per-process name (ADR-0009) and, once
+/// promoted, sends a heartbeat declaring that name on `interval`, well
+/// under the discovery server's own liveness timeout.
 pub(crate) struct HeartbeatConfig {
     pub(crate) discovery_addr: String,
     pub(crate) advertise_addr: String,
@@ -235,13 +256,34 @@ pub(crate) async fn run(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let cache_task = tokio::spawn(run_cache(request_rx));
-    let heartbeat_task =
-        heartbeat.map(|config| tokio::spawn(send_heartbeats(config, shutdown_rx.clone())));
+
+    // Generated once and kept for this process's lifetime (ADR-0009): a
+    // restarted node has no data to reclaim its old identity for, so
+    // there's nothing a stable name would preserve across a restart that
+    // isn't already lost anyway. Only meaningful when this node registers
+    // with a discovery server at all.
+    let node_context = heartbeat.as_ref().map(|config| NodeContext {
+        name: Uuid::new_v4().to_string(),
+        discovery_addr: config.discovery_addr.clone(),
+        auth_secret: config.auth_secret.clone(),
+        tls_connector: config.tls_connector.clone(),
+        request_tx: request_tx.clone(),
+    });
+
+    let heartbeat_task = match (heartbeat, &node_context) {
+        (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
+            config,
+            node_context.name.clone(),
+            shutdown_rx.clone(),
+        ))),
+        _ => None,
+    };
 
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
         auth_secret,
         tls_acceptor,
+        node_context,
     };
 
     let shutdown = shutdown_signal();
@@ -409,6 +451,36 @@ async fn handle_connection(
                     "command sent before authenticating",
                 ));
             }
+            Ok(Command::Migrate {
+                joining_name,
+                joining_addr,
+                joined,
+            }) => {
+                let Some(node_context) = config.node_context.clone() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "received M but this node isn't configured with a discovery server",
+                    ));
+                };
+
+                stream
+                    .write_all(&Response::MigrationAccepted.encode())
+                    .await?;
+
+                // Detached: not tracked by `run`'s `connection_tasks`, so
+                // an in-progress migration is abandoned on shutdown
+                // rather than waited on. ADR-0008 doesn't yet define
+                // failure/recovery behavior for an interrupted handoff
+                // anyway (see its Consequences), so this isn't a new gap.
+                tokio::spawn(run_migration(
+                    node_context,
+                    joining_name,
+                    joining_addr,
+                    joined,
+                ));
+
+                continue;
+            }
             Ok(command) => {
                 let (response_tx, response_rx) = oneshot::channel();
 
@@ -482,9 +554,23 @@ async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>) {
     }
 }
 
-fn heartbeat_message(advertise_addr: &str) -> Vec<u8> {
-    let mut message = format!("H {}\n", advertise_addr.len()).into_bytes();
+/// ADR-0008: sent once per connection, before any heartbeat. `name` is
+/// this node's random per-process identity (ADR-0009); `advertise_addr` is
+/// how to reach it. Discovery holds this connection open and pushes
+/// `R\n` on it once this node is promoted to `Joined`.
+fn join_message(name: &str, advertise_addr: &str) -> Vec<u8> {
+    let mut message = format!("J {} {}\n", name.len(), advertise_addr.len()).into_bytes();
+    message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(advertise_addr.as_bytes());
+    message
+}
+
+/// Only valid once this node has been promoted to `Joined` (ADR-0008); the
+/// address was already established by `join_message` on this connection,
+/// so a heartbeat only needs to carry `name` to refresh liveness.
+fn heartbeat_message(name: &str) -> Vec<u8> {
+    let mut message = format!("H {}\n", name.len()).into_bytes();
+    message.extend_from_slice(name.as_bytes());
     message
 }
 
@@ -494,32 +580,27 @@ fn auth_message(secret: &[u8]) -> Vec<u8> {
     message
 }
 
-/// Holds one long-lived connection to the discovery server and sends a
-/// heartbeat on it every `config.interval`, reconnecting on any I/O error
-/// after waiting out the interval. Each heartbeat is a self-contained
-/// register-or-refresh, so a dropped connection just delays the next
-/// heartbeat rather than requiring any resend/replay logic.
-/// Connects to the discovery server, upgrading to TLS first if
-/// `config.tls_connector` is set. There is no plaintext fallback: if TLS is
-/// configured and the handshake fails, the connection attempt fails too.
-async fn connect_heartbeat_stream(config: &HeartbeatConfig) -> io::Result<ClientStream> {
-    let stream = TcpStream::connect(&config.discovery_addr).await?;
+/// Connects out to `addr` as a client — either the discovery server (for
+/// heartbeats, ADR-0008's `J`/`C`) or another node (for ADR-0008's
+/// `SET`-based handoff) — upgrading to TLS first if `tls_connector` is
+/// set. There is no plaintext fallback: if TLS is configured and the
+/// handshake fails, the connection attempt fails too.
+async fn connect_client_stream(
+    addr: &str,
+    tls_connector: Option<&TlsConnector>,
+) -> io::Result<ClientStream> {
+    let stream = TcpStream::connect(addr).await?;
     let _ = stream.set_nodelay(true);
 
-    match &config.tls_connector {
+    match tls_connector {
         Some(connector) => {
-            let server_name = server_name_from_addr(&config.discovery_addr)?;
+            let server_name = server_name_from_addr(addr)?;
             let tls_stream = timeout(
                 TLS_HANDSHAKE_TIMEOUT,
                 connector.connect(server_name, stream),
             )
             .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "TLS handshake with discovery server timed out",
-                )
-            })??;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
 
             Ok(ClientStream::Tls(Box::new(tls_stream)))
         }
@@ -527,15 +608,28 @@ async fn connect_heartbeat_stream(config: &HeartbeatConfig) -> io::Result<Client
     }
 }
 
-async fn send_heartbeats(config: HeartbeatConfig, mut shutdown_rx: watch::Receiver<bool>) {
-    let message = heartbeat_message(&config.advertise_addr);
+/// Holds one long-lived connection to the discovery server: joins once
+/// (ADR-0008), then sends a heartbeat on it every `config.interval`,
+/// reconnecting (and re-joining under the same name) on any I/O error
+/// after waiting out the interval. `name` is this node's own ADR-0009
+/// identity, generated once by `run` and shared with `ConnectionConfig`'s
+/// `NodeContext` — not generated here, so a migration task triggered by
+/// an incoming `M` on some other connection reports `C` under the same
+/// name this task heartbeats as.
+async fn send_heartbeats(
+    config: HeartbeatConfig,
+    name: String,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let join = join_message(&name, &config.advertise_addr);
+    let heartbeat = heartbeat_message(&name);
 
     loop {
         if *shutdown_rx.borrow() {
             return;
         }
 
-        match connect_heartbeat_stream(&config).await {
+        match connect_client_stream(&config.discovery_addr, config.tls_connector.as_ref()).await {
             Ok(mut stream) => {
                 let authenticated = match &config.auth_secret {
                     Some(secret) => {
@@ -558,24 +652,36 @@ async fn send_heartbeats(config: HeartbeatConfig, mut shutdown_rx: watch::Receiv
                     );
                 }
 
-                if authenticated {
-                    loop {
-                        if stream.write_all(&message).await.is_err() {
-                            break;
-                        }
+                if authenticated && stream.write_all(&join).await.is_ok() {
+                    // ADR-0008: this connection is held open by discovery
+                    // (no idle timeout applies) until this node is
+                    // promoted, which may take an unbounded amount of
+                    // time if another join is already in progress.
+                    let mut promoted = [0u8; 2];
+                    let read_promoted = tokio::select! {
+                        _ = shutdown_rx.changed() => return,
+                        result = stream.read_exact(&mut promoted) => result,
+                    };
 
-                        let mut ack = [0u8; 2];
-                        let read_ack = tokio::select! {
-                            _ = shutdown_rx.changed() => return,
-                            result = stream.read_exact(&mut ack) => result,
-                        };
+                    if read_promoted.is_ok() && &promoted == b"R\n" {
+                        loop {
+                            if stream.write_all(&heartbeat).await.is_err() {
+                                break;
+                            }
 
-                        if read_ack.is_err() || &ack != b"A\n" {
-                            break;
-                        }
+                            let mut ack = [0u8; 2];
+                            let read_ack = tokio::select! {
+                                _ = shutdown_rx.changed() => return,
+                                result = stream.read_exact(&mut ack) => result,
+                            };
 
-                        if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
-                            return;
+                            if read_ack.is_err() || &ack != b"A\n" {
+                                break;
+                            }
+
+                            if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
+                                return;
+                            }
                         }
                     }
                 }
@@ -600,6 +706,195 @@ async fn wait_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<
         _ = sleep(duration) => false,
         _ = shutdown_rx.changed() => true,
     }
+}
+
+fn set_message(key: &[u8], value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
+    let mut header = format!("S {} {}", key.len(), value.len());
+
+    if let Some(ttl) = ttl {
+        header.push_str(&format!(" {}", ttl.as_secs()));
+    }
+
+    header.push('\n');
+
+    let mut message = header.into_bytes();
+    message.extend_from_slice(key);
+    message.extend_from_slice(value);
+    message
+}
+
+/// ADR-0008: reports to discovery that this node (identified by `name`,
+/// ADR-0009) has finished handing off its share of the current join.
+fn complete_message(name: &str) -> Vec<u8> {
+    let mut message = format!("C {}\n", name.len()).into_bytes();
+    message.extend_from_slice(name.as_bytes());
+    message
+}
+
+/// ADR-0008: triggered by an incoming `M`. Computes, using the same
+/// consistent-hash algorithm clients use ([[0002]]; `HashRing` here is
+/// `src/hash_ring.rs`'s copy, see ADR-0006), which of this node's own
+/// entries the joining node now owns — adding exactly one node can only
+/// move keys to that new node, never reshuffle ownership between two
+/// already-existing nodes, so comparing against the post-join ring alone
+/// is sufficient; there's no need to also build and compare a pre-join
+/// ring. Transfers each such entry via an ordinary `SET` (reusing the
+/// client protocol, not a new one), marks it migrated, and once done
+/// reports `C` to discovery. Errors along the way (an unreachable joining
+/// node, a lost discovery connection for the final `C`) are logged and
+/// otherwise swallowed — ADR-0008 doesn't yet define a retry/failure
+/// policy for this, so for now a failed attempt just leaves the join
+/// stalled rather than crashing this node.
+async fn run_migration(
+    node_context: NodeContext,
+    joining_name: String,
+    joining_addr: String,
+    joined: Vec<(String, String)>,
+) {
+    let mut ring_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
+    ring_members.push(joining_name.clone());
+    let after_ring = HashRing::new(ring_members);
+
+    let entries = match list_entries(&node_context.request_tx).await {
+        Some(entries) => entries,
+        None => {
+            eprintln!("migration to {joining_name} aborted: cache task is unavailable");
+            return;
+        }
+    };
+
+    for (key, value, ttl) in entries {
+        if after_ring.route(&key) != joining_name {
+            continue;
+        }
+
+        if let Err(error) =
+            set_on_joining_node(&node_context, &joining_addr, &key, &value, ttl).await
+        {
+            eprintln!("migration to {joining_addr} failed to transfer a key: {error}");
+            continue;
+        }
+
+        mark_migrated(&node_context.request_tx, &key).await;
+    }
+
+    if let Err(error) = report_complete(&node_context).await {
+        eprintln!(
+            "migration to {joining_addr} finished but reporting completion to {} failed: {error}",
+            node_context.discovery_addr
+        );
+    }
+}
+
+async fn list_entries(
+    request_tx: &mpsc::Sender<CacheRequest>,
+) -> Option<Vec<(Bytes, Bytes, Option<Duration>)>> {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    request_tx
+        .send(CacheRequest {
+            command: Command::ListEntries,
+            response_tx,
+        })
+        .await
+        .ok()?;
+
+    match response_rx.await.ok()? {
+        Response::Entries(entries) => Some(entries),
+        _ => None,
+    }
+}
+
+async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    if request_tx
+        .send(CacheRequest {
+            command: Command::MarkMigrated { key: key.clone() },
+            response_tx,
+        })
+        .await
+        .is_ok()
+    {
+        let _ = response_rx.await;
+    }
+}
+
+async fn set_on_joining_node(
+    node_context: &NodeContext,
+    joining_addr: &str,
+    key: &[u8],
+    value: &[u8],
+    ttl: Option<Duration>,
+) -> io::Result<()> {
+    let mut stream =
+        connect_client_stream(joining_addr, node_context.tls_connector.as_ref()).await?;
+
+    if let Some(secret) = &node_context.auth_secret {
+        stream.write_all(&auth_message(secret)).await?;
+
+        let mut ack = [0u8; 3];
+        stream.read_exact(&mut ack).await?;
+
+        if &ack != b"On\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "joining node rejected the auth secret",
+            ));
+        }
+    }
+
+    stream.write_all(&set_message(key, value, ttl)).await?;
+
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+
+    if &ack != b"S\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "joining node did not acknowledge the transferred key",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn report_complete(node_context: &NodeContext) -> io::Result<()> {
+    let mut stream = connect_client_stream(
+        &node_context.discovery_addr,
+        node_context.tls_connector.as_ref(),
+    )
+    .await?;
+
+    if let Some(secret) = &node_context.auth_secret {
+        stream.write_all(&auth_message(secret)).await?;
+
+        let mut ack = [0u8; 3];
+        stream.read_exact(&mut ack).await?;
+
+        if &ack != b"Od\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "discovery server rejected the auth secret",
+            ));
+        }
+    }
+
+    stream
+        .write_all(&complete_message(&node_context.name))
+        .await?;
+
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+
+    if &ack != b"A\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "discovery server did not acknowledge C",
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -654,6 +949,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -692,6 +988,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -729,6 +1026,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -786,6 +1084,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -807,6 +1106,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -842,6 +1142,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -865,6 +1166,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -910,6 +1212,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -937,6 +1240,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -965,6 +1269,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -1000,6 +1305,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                node_context: None,
             },
             shutdown_rx,
         ));
@@ -1063,11 +1369,177 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_message_declares_the_address_length_before_the_address() {
+    fn heartbeat_message_declares_the_name_length_before_the_name() {
+        assert_eq!(heartbeat_message("some-name"), b"H 9\nsome-name".to_vec());
+    }
+
+    #[test]
+    fn join_message_declares_both_lengths_before_the_name_and_address() {
         assert_eq!(
-            heartbeat_message("127.0.0.1:8356"),
-            b"H 14\n127.0.0.1:8356".to_vec()
+            join_message("some-name", "127.0.0.1:8356"),
+            b"J 9 14\nsome-name127.0.0.1:8356".to_vec()
         );
+    }
+
+    #[test]
+    fn set_message_without_a_ttl_omits_the_third_header_field() {
+        assert_eq!(
+            set_message(b"name", b"Alice", None),
+            b"S 4 5\nnameAlice".to_vec()
+        );
+    }
+
+    #[test]
+    fn set_message_with_a_ttl_rounds_down_to_whole_seconds() {
+        assert_eq!(
+            set_message(b"name", b"Alice", Some(Duration::from_millis(4900))),
+            b"S 4 5 4\nnameAlice".to_vec()
+        );
+    }
+
+    #[test]
+    fn complete_message_declares_the_name_length_before_the_name() {
+        assert_eq!(complete_message("some-name"), b"C 9\nsome-name".to_vec());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_transfers_matching_keys_and_reports_completion() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake joining node: accepts one connection, expects a SET (no
+        // auth configured), and acks it.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_received: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joining_received_task = Arc::clone(&joining_received);
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            joining_received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"S\n").await.unwrap();
+        });
+
+        // A fake discovery server: accepts one connection, expects C, acks
+        // it.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_received: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let discovery_received_task = Arc::clone(&discovery_received);
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            discovery_received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    discovery_addr,
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+            },
+            shutdown_rx.clone(),
+        ));
+
+        // No other Joined nodes: the after-join ring has only the joining
+        // node in it, so every key (including "name") routes to it.
+        let joining_name = "joining-node";
+        let mut migrate_message =
+            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+
+        client.write_all(&migrate_message).await.unwrap();
+
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        for _ in 0..1000 {
+            if !discovery_received.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        let expected_set = set_message(b"name", b"Alice", None);
+        assert_eq!(*joining_received.lock().unwrap(), expected_set);
+        assert_eq!(
+            *discovery_received.lock().unwrap(),
+            complete_message("ready-node")
+        );
+
+        joining_task.await.unwrap();
+        discovery_task.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+    }
+
+    /// Parses a `J <name-length> <addr-length>\n<name><addr>` message (the
+    /// only one whose shape the test doesn't already know, since its name
+    /// is a random UUID generated inside `send_heartbeats`) and asserts
+    /// every subsequent message in `received` is the matching
+    /// `H <name-length>\n<name>` heartbeat for that same name.
+    fn assert_join_then_heartbeats(received: &[Vec<u8>], advertise_addr: &str) {
+        assert!(
+            received.len() >= 4,
+            "expected a join plus at least 3 heartbeats, got {}",
+            received.len()
+        );
+
+        let join = String::from_utf8(received[0].clone()).unwrap();
+        let header_end = join.find('\n').unwrap();
+        let mut header = join[..header_end].split(' ');
+        assert_eq!(header.next(), Some("J"));
+
+        let name_length: usize = header.next().unwrap().parse().unwrap();
+        let addr_length: usize = header.next().unwrap().parse().unwrap();
+        assert_eq!(header.next(), None);
+        assert_eq!(addr_length, advertise_addr.len());
+
+        let body = &join[header_end + 1..];
+        let name = &body[..name_length];
+        assert_eq!(&body[name_length..], advertise_addr);
+
+        let expected_heartbeat = format!("H {}\n{name}", name.len());
+        for message in &received[1..] {
+            assert_eq!(message, expected_heartbeat.as_bytes());
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1082,6 +1554,7 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
+            "test-node".to_string(),
             shutdown_rx,
         )
         .await;
@@ -1098,7 +1571,8 @@ mod tests {
 
         let fake_discovery = tokio::spawn(async move {
             let (mut connection, _) = listener.accept().await.unwrap();
-            let mut buffer = [0u8; 64];
+            let mut buffer = [0u8; 128];
+            let mut first = true;
 
             loop {
                 match connection.read(&mut buffer).await {
@@ -1109,7 +1583,12 @@ mod tests {
                             .unwrap()
                             .push(buffer[..bytes_read].to_vec());
 
-                        if connection.write_all(b"A\n").await.is_err() {
+                        // The first message is J (join); every one after
+                        // that is H (heartbeat, once promoted).
+                        let ack: &[u8] = if first { b"R\n" } else { b"A\n" };
+                        first = false;
+
+                        if connection.write_all(ack).await.is_err() {
                             return;
                         }
                     }
@@ -1126,6 +1605,7 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
+            "test-node".to_string(),
             shutdown_rx,
         ));
 
@@ -1135,15 +1615,7 @@ mod tests {
         heartbeat_task.await.unwrap();
         fake_discovery.abort();
 
-        let received = received.lock().unwrap();
-        assert!(
-            received.len() >= 3,
-            "expected at least 3 heartbeats, got {}",
-            received.len()
-        );
-        for message in received.iter() {
-            assert_eq!(message, b"H 14\n127.0.0.1:8356");
-        }
+        assert_join_then_heartbeats(&received.lock().unwrap(), "127.0.0.1:8356");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1163,6 +1635,7 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
+            "test-node".to_string(),
             shutdown_rx,
         ));
 
@@ -1231,6 +1704,7 @@ mod tests {
             idle_timeout: IDLE_TIMEOUT,
             auth_secret: None,
             tls_acceptor: Some(acceptor),
+            node_context: None,
         };
 
         let server_task = tokio::spawn(async move {
@@ -1280,7 +1754,8 @@ mod tests {
         let fake_discovery = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut tls = acceptor.accept(stream).await.unwrap();
-            let mut buffer = [0u8; 64];
+            let mut buffer = [0u8; 128];
+            let mut first = true;
 
             loop {
                 match tls.read(&mut buffer).await {
@@ -1291,7 +1766,10 @@ mod tests {
                             .unwrap()
                             .push(buffer[..bytes_read].to_vec());
 
-                        if tls.write_all(b"A\n").await.is_err() {
+                        let ack: &[u8] = if first { b"R\n" } else { b"A\n" };
+                        first = false;
+
+                        if tls.write_all(ack).await.is_err() {
                             return;
                         }
                     }
@@ -1308,6 +1786,7 @@ mod tests {
                 auth_secret: None,
                 tls_connector: Some(connector),
             },
+            "test-node".to_string(),
             shutdown_rx,
         ));
 
@@ -1317,14 +1796,6 @@ mod tests {
         heartbeat_task.await.unwrap();
         fake_discovery.abort();
 
-        let received = received.lock().unwrap();
-        assert!(
-            received.len() >= 3,
-            "expected at least 3 heartbeats, got {}",
-            received.len()
-        );
-        for message in received.iter() {
-            assert_eq!(message, b"H 14\n127.0.0.1:8356");
-        }
+        assert_join_then_heartbeats(&received.lock().unwrap(), "127.0.0.1:8356");
     }
 }

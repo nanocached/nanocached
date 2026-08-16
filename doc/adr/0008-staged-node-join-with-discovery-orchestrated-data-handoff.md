@@ -177,4 +177,8 @@ follow-up work:
   own design.
 - The exact wire-level mechanics of the joining/ready node distinction —
   how discovery signals existing nodes, how completion is reported — are
-  not finalized by this ADR and remain implementation work.
+  not finalized by this ADR and remain implementation work. Working out
+  those mechanics surfaced a dependency this ADR didn't anticipate: a
+  ready node's diff computation needs every node's hashing identity to
+  agree with what clients use, which a plain network address can't
+  guarantee in general (see [[0009]]).

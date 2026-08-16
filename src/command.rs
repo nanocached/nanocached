@@ -19,17 +19,44 @@ pub enum Command {
     Delete {
         key: Bytes,
     },
+    /// Internal-only (ADR-0008): never produced by `parse()`, constructed
+    /// directly by the migration task to snapshot every entry this node
+    /// currently holds, to compute which ones a newly joining node now
+    /// owns. See `Response::Entries`.
+    ListEntries,
+    /// Internal-only (ADR-0008): marks a key as handed off to another
+    /// node during a migration this node was the source for. The
+    /// active-deletion sweep that reclaims marked entries is a separate,
+    /// not-yet-implemented follow-up.
+    MarkMigrated {
+        key: Bytes,
+    },
+    /// ADR-0008: sent by discovery to a `Joined` node when a new node is
+    /// joining, so this node can compute (via `HashRing`) which of its
+    /// own keys the joining node now owns. `joining_name`/`joining_addr`
+    /// identify the joining node; `joined` is every currently-`Joined`
+    /// node (ADR-0009 names, including this one) — the "before" ring,
+    /// to which `joining_name` is the "after" addition.
+    Migrate {
+        joining_name: String,
+        joining_addr: String,
+        joined: Vec<(String, String)>,
+    },
 }
 
 impl Command {
-    /// Executes a cache operation. `Command::Auth` is intercepted by the
-    /// connection handler before a command ever reaches this point (it
-    /// isn't a cache operation and the actor has no auth state), so it
-    /// cannot appear here.
+    /// Executes a cache operation. `Command::Auth`/`Migrate` are
+    /// intercepted by the connection handler before a command ever
+    /// reaches this point (neither is a plain cache operation: `Auth`
+    /// because the actor has no auth state, `Migrate` because it needs
+    /// network access the cache actor doesn't have), so neither can
+    /// appear here.
     pub fn execute(self, cache: &mut Cache) -> Response {
         match self {
-            Self::Auth { .. } => {
-                unreachable!("Auth is handled by the connection handler, not the cache actor")
+            Self::Auth { .. } | Self::Migrate { .. } => {
+                unreachable!(
+                    "Auth and Migrate are handled by the connection handler, not the cache actor"
+                )
             }
 
             Self::Get { key } => match cache.get(&key) {
@@ -51,6 +78,13 @@ impl Command {
                     Response::NotFound
                 }
             }
+
+            Self::ListEntries => Response::Entries(cache.entries()),
+
+            Self::MarkMigrated { key } => {
+                cache.mark_migrated(&key);
+                Response::Marked
+            }
         }
     }
 }
@@ -61,6 +95,11 @@ pub enum ParseError {
     InvalidLength,
     EmptyKey,
     EmptySecret,
+    /// A name/address field in `M` (ADR-0008/0009) was declared with
+    /// length 0.
+    EmptyField,
+    /// A name/address field in `M` wasn't valid UTF-8.
+    InvalidUtf8,
     Incomplete,
 }
 
@@ -185,8 +224,125 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             Ok(Command::Set { key, value, ttl })
         }
 
+        b"M" => {
+            let joining_name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let joining_addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let joined_count = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let joining_name_length = parse_length(joining_name_length)?;
+            let joining_addr_length = parse_length(joining_addr_length)?;
+            let joined_count = parse_length(joined_count)?;
+
+            parse_migrate(
+                input,
+                header_end,
+                joining_name_length,
+                joining_addr_length,
+                joined_count,
+            )
+        }
+
         _ => Err(ParseError::InvalidCommand),
     }
+}
+
+/// Parses `M`'s body: the joining node's own name+address, followed by
+/// `joined_count` entries of the same `<name-length> <addr-length>\n
+/// <name><addr>` shape `nanocached-discovery`'s `L` response uses. Unlike
+/// a single length-prefixed field, the joined roster's total byte length
+/// can't be known from the header alone (each entry has its own embedded
+/// length prefix), so this does a read-only scan to confirm everything
+/// needed is already buffered before consuming any of it — preserving
+/// `parse`'s "untouched on `Incomplete`" contract even though the frame
+/// is variable-length and nested.
+fn parse_migrate(
+    input: &mut BytesMut,
+    header_end: usize,
+    joining_name_length: usize,
+    joining_addr_length: usize,
+    joined_count: usize,
+) -> Result<Command, ParseError> {
+    if joining_name_length == 0 || joining_addr_length == 0 {
+        return Err(ParseError::EmptyField);
+    }
+
+    let joining_name_start = header_end + 1;
+    let joining_addr_start = joining_name_start
+        .checked_add(joining_name_length)
+        .ok_or(ParseError::InvalidLength)?;
+    let mut cursor = joining_addr_start
+        .checked_add(joining_addr_length)
+        .ok_or(ParseError::InvalidLength)?;
+
+    if input.len() < cursor {
+        return Err(ParseError::Incomplete);
+    }
+
+    // Read-only pass: record each entry's span and advance `cursor`,
+    // without mutating `input`, so a still-arriving trailing entry leaves
+    // `input` untouched.
+    let mut entry_spans = Vec::with_capacity(joined_count);
+
+    for _ in 0..joined_count {
+        let entry_header_end = cursor + find_lf(&input[cursor..]).ok_or(ParseError::Incomplete)?;
+        let mut entry_parts = input[cursor..entry_header_end].split(|byte| *byte == b' ');
+        let name_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
+        let addr_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
+
+        if entry_parts.next().is_some() {
+            return Err(ParseError::InvalidLength);
+        }
+
+        let name_length = parse_length(name_length)?;
+        let addr_length = parse_length(addr_length)?;
+
+        if name_length == 0 || addr_length == 0 {
+            return Err(ParseError::EmptyField);
+        }
+
+        let name_start = entry_header_end + 1;
+        let addr_start = name_start
+            .checked_add(name_length)
+            .ok_or(ParseError::InvalidLength)?;
+        let entry_end = addr_start
+            .checked_add(addr_length)
+            .ok_or(ParseError::InvalidLength)?;
+
+        if input.len() < entry_end {
+            return Err(ParseError::Incomplete);
+        }
+
+        entry_spans.push((name_start, name_length, addr_start, addr_length));
+        cursor = entry_end;
+    }
+
+    // Everything needed is present: consume the whole frame in one go and
+    // decode each field from the now-owned `frame`.
+    let frame = input.split_to(cursor);
+
+    let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
+    let joining_addr = decode_field(&frame, joining_addr_start, joining_addr_length)?;
+
+    let mut joined = Vec::with_capacity(joined_count);
+    for (name_start, name_length, addr_start, addr_length) in entry_spans {
+        let name = decode_field(&frame, name_start, name_length)?;
+        let addr = decode_field(&frame, addr_start, addr_length)?;
+        joined.push((name, addr));
+    }
+
+    Ok(Command::Migrate {
+        joining_name,
+        joining_addr,
+        joined,
+    })
+}
+
+fn decode_field(frame: &[u8], start: usize, length: usize) -> Result<String, ParseError> {
+    String::from_utf8(frame[start..start + length].to_vec()).map_err(|_| ParseError::InvalidUtf8)
 }
 
 fn find_lf(input: &[u8]) -> Option<usize> {
@@ -437,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Auth is handled by the connection handler")]
+    #[should_panic(expected = "Auth and Migrate are handled by the connection handler")]
     fn execute_panics_on_auth() {
         let mut cache = Cache::new(usize::MAX);
 
@@ -498,5 +654,83 @@ mod tests {
         };
 
         assert_eq!(command.execute(&mut cache), Response::NotFound);
+    }
+
+    #[test]
+    fn list_entries_returns_every_stored_entry() {
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(
+            Command::ListEntries.execute(&mut cache),
+            Response::Entries(vec![(
+                Bytes::from_static(b"name"),
+                Bytes::from_static(b"Alice"),
+                None
+            )])
+        );
+    }
+
+    #[test]
+    fn mark_migrated_returns_marked() {
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+
+        let command = Command::MarkMigrated {
+            key: Bytes::from_static(b"name"),
+        };
+
+        assert_eq!(command.execute(&mut cache), Response::Marked);
+    }
+
+    #[test]
+    fn parses_a_migrate_command_with_no_joined_nodes() {
+        let mut input = buf(b"M 6 14 0\nnode-b127.0.0.1:8357");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Migrate {
+                joining_name: "node-b".to_string(),
+                joining_addr: "127.0.0.1:8357".to_string(),
+                joined: Vec::new(),
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_a_migrate_command_with_joined_nodes_and_consumes_only_that_frame() {
+        let mut input = buf(
+            b"M 6 14 2\nnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
+        );
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Migrate {
+                joining_name: "node-b".to_string(),
+                joining_addr: "127.0.0.1:8357".to_string(),
+                joined: vec![
+                    ("node-a".to_string(), "127.0.0.1:8356".to_string()),
+                    ("node-c".to_string(), "127.0.0.1:8358".to_string()),
+                ],
+            })
+        );
+        assert_eq!(&input[..], b"G 1\nx");
+    }
+
+    #[test]
+    fn parse_leaves_a_migrate_command_untouched_when_a_joined_entry_is_incomplete() {
+        let original = b"M 6 14 1\nnode-b127.0.0.1:83576 14\nnode-a127.0.0".to_vec();
+        let mut input = BytesMut::from(&original[..]);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn rejects_an_empty_joining_name_in_migrate() {
+        let mut input = buf(b"M 0 14 0\n127.0.0.1:8357");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
 }

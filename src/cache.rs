@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use lru::LruCache;
 use rustc_hash::FxBuildHasher;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 struct Entry {
@@ -12,6 +13,11 @@ pub struct Cache {
     entries: LruCache<Bytes, Entry, FxBuildHasher>,
     used_bytes: usize,
     max_memory_bytes: usize,
+    /// Keys handed off to another node during an ADR-0008 migration this
+    /// node was the source for. Only ever added to today — the
+    /// active-deletion sweep that reclaims marked entries is a separate,
+    /// not-yet-implemented follow-up (see ADR-0008's Decision).
+    migrated: HashSet<Bytes>,
 }
 
 impl Entry {
@@ -26,6 +32,7 @@ impl Cache {
             entries: LruCache::unbounded_with_hasher(FxBuildHasher),
             used_bytes: 0,
             max_memory_bytes,
+            migrated: HashSet::new(),
         }
     }
 
@@ -106,6 +113,40 @@ impl Cache {
         let entry = self.entries.pop(key)?;
         self.used_bytes -= key.len() + entry.value.len();
         Some(entry)
+    }
+
+    /// A point-in-time snapshot of every non-expired entry, each with its
+    /// remaining TTL (not the original one, so a transferred entry expires
+    /// at the same wall-clock time it would have here). For ADR-0008's
+    /// migration task, to compute which of these a newly joining node now
+    /// owns. Uses `LruCache::iter`, not `get`, so listing entries doesn't
+    /// itself perturb recency.
+    pub fn entries(&self) -> Vec<(Bytes, Bytes, Option<Duration>)> {
+        self.entries_at(Instant::now())
+    }
+
+    fn entries_at(&self, now: Instant) -> Vec<(Bytes, Bytes, Option<Duration>)> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| !entry.is_expired_at(now))
+            .map(|(key, entry)| {
+                let remaining_ttl = entry
+                    .expires_at
+                    .map(|expires_at| expires_at.saturating_duration_since(now));
+
+                (key.clone(), entry.value.clone(), remaining_ttl)
+            })
+            .collect()
+    }
+
+    /// Marks `key` as handed off during an ADR-0008 migration this node
+    /// was the source for. A no-op if the key is already marked or no
+    /// longer present. See `migrated`'s doc comment for what this does
+    /// and doesn't do yet.
+    pub fn mark_migrated(&mut self, key: &[u8]) {
+        if self.entries.contains(key) {
+            self.migrated.insert(Bytes::copy_from_slice(key));
+        }
     }
 }
 
@@ -374,5 +415,96 @@ mod tests {
 
         assert_eq!(cache.get(b"k1"), None);
         assert_eq!(cache.get(b"k2"), Some(Bytes::from_static(b"vvvv")));
+    }
+
+    #[test]
+    fn entries_includes_every_stored_key_with_its_value() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+
+        let mut entries = cache.entries();
+        entries.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+
+        assert_eq!(
+            entries,
+            vec![
+                (Bytes::from_static(b"a"), Bytes::from_static(b"1"), None),
+                (Bytes::from_static(b"b"), Bytes::from_static(b"2"), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_reports_the_remaining_ttl_not_the_original_one() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(10),
+        );
+
+        let later = Instant::now() + Duration::from_secs(4);
+        let entries = cache.entries_at(later);
+
+        assert_eq!(entries.len(), 1);
+        let (_, _, remaining_ttl) = &entries[0];
+        // 10s TTL minus the 4s that "elapsed" leaves ~6s, not the original 10s.
+        assert!(remaining_ttl.unwrap() <= Duration::from_secs(6));
+        assert!(remaining_ttl.unwrap() > Duration::from_secs(5));
+    }
+
+    #[test]
+    fn entries_excludes_expired_keys() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+
+        let future = Instant::now() + Duration::from_secs(6);
+
+        assert_eq!(cache.entries_at(future), Vec::new());
+    }
+
+    #[test]
+    fn entries_does_not_disturb_lru_order() {
+        let mut cache = Cache::new(8);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XX")); // used 3
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XX")); // used 6
+
+        // If listing entries touched recency the same way `get` does, "a"
+        // would become most-recently-used here and survive the eviction
+        // below instead of "b".
+        let _ = cache.entries();
+
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"XXX")); // evicts "a" (still LRU)
+
+        assert_eq!(cache.get(b"a"), None);
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"XX")));
+    }
+
+    #[test]
+    fn mark_migrated_is_a_no_op_for_a_missing_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        // Just needs to not panic; there is no observable state to assert
+        // on yet (the sweep that consumes marks is a separate follow-up).
+        cache.mark_migrated(b"missing");
+    }
+
+    #[test]
+    fn mark_migrated_does_not_remove_or_change_the_entry() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
     }
 }

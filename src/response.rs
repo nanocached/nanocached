@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
@@ -9,6 +10,15 @@ pub enum Response {
     Busy,
     AuthOk,
     Unauthorized,
+    /// ADR-0008: acknowledges an `M` (migrate) request was received and
+    /// parsed — not that the handoff it kicks off has finished. That
+    /// completion is reported separately, node-to-discovery, via `C`.
+    MigrationAccepted,
+    /// Internal-only (ADR-0008), in answer to `Command::ListEntries` —
+    /// never encoded for a wire client, see `encode`.
+    Entries(Vec<(Bytes, Bytes, Option<Duration>)>),
+    /// Internal-only (ADR-0008), in answer to `Command::MarkMigrated`.
+    Marked,
 }
 
 impl Response {
@@ -20,6 +30,7 @@ impl Response {
             Self::Busy => b"B\n".to_vec(),
             Self::AuthOk => b"On\n".to_vec(),
             Self::Unauthorized => b"En\n".to_vec(),
+            Self::MigrationAccepted => b"A\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -32,6 +43,13 @@ impl Response {
                 encoded.extend_from_slice(value);
 
                 encoded
+            }
+
+            Self::Entries(_) | Self::Marked => {
+                unreachable!(
+                    "internal-only response (ADR-0008): never sent to a wire client, only \
+                     matched directly in Rust by the migration task"
+                )
             }
         }
     }
@@ -69,6 +87,11 @@ mod tests {
     #[test]
     fn encodes_unauthorized_response() {
         assert_eq!(Response::Unauthorized.encode(), b"En\n");
+    }
+
+    #[test]
+    fn encodes_migration_accepted_response() {
+        assert_eq!(Response::MigrationAccepted.encode(), b"A\n");
     }
 
     #[test]

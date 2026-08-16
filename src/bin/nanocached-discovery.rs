@@ -9,14 +9,39 @@
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
 //!
-//!   H <addr-length>\n<addr>   Register or refresh a node's advertised
-//!                             address. Idempotent: creates the entry if
-//!                             absent, otherwise just refreshes its
-//!                             liveness. Response: `A\n`.
+//!   H <name-length>\n<name>   Heartbeat, identified by name (a random
+//!                             per-process identity, ADR-0009 — not the
+//!                             node's address, which carries no identity
+//!                             meaning and was already established by
+//!                             `J` on this connection). Only valid for a
+//!                             node already `Joined` (see below) —
+//!                             refreshes its liveness. Response: `A\n`.
 //!
-//!   L\n                       List currently live node addresses.
-//!                             Response: `N <count>\n` followed by
-//!                             `count` lines, each `<addr>\n`.
+//!   L\n                       List currently `Joined` nodes. Response:
+//!                             `N <count>\n` followed by `count` lines,
+//!                             each `<name-length> <addr-length>\n
+//!                             <name><addr>` — `name` (ADR-0009) is what
+//!                             hash-ring computations use; `addr` is only
+//!                             for opening a connection.
+//!
+//!   J <name-length> <addr-length>\n<name><addr>   Ask to join (ADR-0008),
+//!                             declaring the node's own name (ADR-0009)
+//!                             and advertised address. Sent once; the
+//!                             connection is then held open (no idle
+//!                             timeout applies) rather than closed or
+//!                             reused for anything else, since this is
+//!                             the node's only channel for learning about
+//!                             a state change it didn't itself cause.
+//!                             When the node is promoted to `Joined`,
+//!                             discovery pushes `R\n` on this same
+//!                             connection, which then becomes that node's
+//!                             ordinary heartbeat connection (`H` from
+//!                             here on).
+//!
+//!   C <name-length>\n<name>   Sent by an already-`Joined` node to report
+//!                             it has finished handing its share of the
+//!                             keyspace off to the node currently joining
+//!                             (see below). Response: `A\n`.
 //!
 //!   A <secret-length>\n<secret>   Authenticate. Response: `Od\n` on success,
 //!                             `Ed\n` (then the connection closes) if a
@@ -25,30 +50,41 @@
 //!                             `NANOCACHED_AUTH_SECRET` environment
 //!                             variable is unset or empty), this is a
 //!                             no-op that always succeeds. If a secret is
-//!                             configured, `H`/`L` are rejected with `Ed\n`
-//!                             until a matching `A` has been sent on the
-//!                             connection. The `d` distinguishes this
-//!                             response from nanocached-node's own `On\n`/
-//!                             `En\n`, letting a client tell the two apart
-//!                             from the response to the same `A` request
-//!                             without knowing in advance which it dialed.
+//!                             configured, every other command is rejected
+//!                             with `Ed\n` until a matching `A` has been
+//!                             sent on the connection. The `d` distinguishes
+//!                             this response from nanocached-node's own
+//!                             `On\n`/`En\n`, letting a client tell the two
+//!                             apart from the response to the same `A`
+//!                             request without knowing in advance which it
+//!                             dialed.
 //!
 //! If the connection limit has been reached, the server responds with
 //! `B\n` and closes the connection instead of accepting the command.
 //!
-//! A node is expected to hold one long-lived connection and send `H` on it
-//! periodically. A client SDK polls with `L`, typically on its own
-//! connection. A node that stops sending heartbeats is dropped once
+//! A node moves through three states (ADR-0008): `Waiting` (registered via
+//! `J`, but either another join is already in progress or its handoff
+//! hasn't started), `Joining` (actively receiving its handoff from every
+//! `Joined` node), and `Joined` (handoff complete, included in `L`
+//! responses, now heartbeating normally via `H`). Only `Joined` nodes are
+//! visible to clients; `Waiting`/`Joining` nodes are excluded from `L`
+//! exactly like a node that was never registered. Only one node moves
+//! through `Waiting` -> `Joining` at a time. A `Waiting`/`Joining` node has
+//! no heartbeat to time out — its liveness is tied to the one connection
+//! it opened with `J`, which discovery holds open the whole time; the
+//! registry entry is dropped if that connection dies before promotion. A
+//! `Joined` node that stops sending heartbeats is dropped once
 //! `--liveness-timeout` has elapsed since its last heartbeat; no explicit
 //! "leave" message is required, so this covers both graceful shutdown and
-//! crashes. Because the registry is fully rebuilt from heartbeats, this
-//! process can be restarted at any time and self-heals within one
-//! heartbeat interval.
+//! crashes. Because the registry is rebuilt from `J`/`H`, this process can
+//! be restarted at any time and self-heals, modulo any join in progress at
+//! the time (not yet designed — see `doc/adr/0008-*.md`).
 
 use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use std::collections::HashSet;
 use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -59,7 +95,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval, timeout};
 use tokio_rustls::TlsAcceptor;
@@ -73,7 +109,74 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 
-type Registry = Arc<Mutex<FxHashMap<String, Instant>>>;
+/// A registered node's place in the ADR-0008 join lifecycle: `Waiting`
+/// (registered, asked to join, but another join is already in progress)
+/// -> `Joining` (actively receiving its handoff) -> `Joined` (handoff
+/// complete, included in `L` responses, now heartbeating normally). There
+/// is no separate "start up already joining" state — every node begins at
+/// `Waiting` when it first sends `J`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeState {
+    Waiting,
+    Joining,
+    Joined,
+}
+
+struct NodeInfo {
+    /// How to open a connection to this node (a client's `G`/`S`/`D`, or,
+    /// per [[0008]], a ready node's handoff). Carries no identity meaning
+    /// — see ADR-0009 — the registry's key (this node's random per-process
+    /// name) is what hashing and lookups use.
+    address: String,
+    state: NodeState,
+    /// Only meaningful (and only refreshed) once `state` is `Joined` —
+    /// `Waiting`/`Joining` nodes hold one long-lived connection open
+    /// instead of heartbeating, and are dropped when that connection dies
+    /// rather than by `sweep_expired`'s liveness check.
+    last_heartbeat: Instant,
+    /// Fired (via `notify_one`, not `notify_waiters` — this must survive
+    /// being sent before the connection task starts waiting on it, e.g.
+    /// a bootstrap join that's promoted synchronously) when this node
+    /// should move to `Joined`; the connection task holding this node's
+    /// `J` connection open waits on it instead of polling.
+    promoted: Arc<Notify>,
+}
+
+impl NodeInfo {
+    fn new(address: String, state: NodeState) -> Self {
+        Self {
+            address,
+            state,
+            last_heartbeat: Instant::now(),
+            promoted: Arc::new(Notify::new()),
+        }
+    }
+}
+
+/// Keyed by name (ADR-0009's random per-process node identity), not
+/// address — see `NodeInfo::address`.
+type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
+
+/// Tracks the single in-progress join (ADR-0008: only one node moves
+/// through `Waiting` -> `Joining` at a time). `completed` accumulates the
+/// names (ADR-0009) of ready nodes that have reported finishing their
+/// handoff via `C`; once it covers all of `expected`, the joining node is
+/// promoted.
+struct PendingJoin {
+    expected: HashSet<String>,
+    completed: HashSet<String>,
+}
+
+type CurrentJoin = Arc<Mutex<Option<PendingJoin>>>;
+
+/// The node registry and ADR-0008 join-orchestration state, bundled since
+/// every connection needs both and they're always threaded through
+/// together (keeps `dispatch_connection`'s argument count down).
+#[derive(Clone)]
+struct ClusterState {
+    registry: Registry,
+    current_join: CurrentJoin,
+}
 
 /// Wraps either a plain TCP connection or one wrapped in TLS behind a
 /// single type, so the rest of the connection-handling code doesn't need to
@@ -265,17 +368,30 @@ Usage: nanocached-discovery [options]
 #[derive(Debug, PartialEq, Eq)]
 enum DiscoveryCommand {
     Auth(Bytes),
+    /// A refresh from an already-`Joined` node, identified by its name
+    /// (ADR-0009) — its address was already established by `Join` on this
+    /// same connection.
     Heartbeat(String),
     List,
+    /// ADR-0008: a node asking to join, identified by its name (ADR-0009)
+    /// and its advertised address. Sent once, on a connection the node
+    /// then holds open to receive the `R\n` promotion push.
+    Join {
+        name: String,
+        addr: String,
+    },
+    /// ADR-0008: a ready node reporting it has finished handing off its
+    /// share of the current join, identified by its own name (ADR-0009).
+    Complete(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum ParseError {
     InvalidCommand,
     InvalidLength,
-    EmptyAddress,
+    EmptyField,
     EmptySecret,
-    InvalidAddress,
+    InvalidUtf8,
     Incomplete,
 }
 
@@ -327,37 +443,102 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             Ok(DiscoveryCommand::List)
         }
 
-        b"H" => {
+        b"H" | b"C" => {
+            let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let name_length = parse_length(name_length)?;
+            // Resolve which variant to build as an owned fn pointer now,
+            // while `command` (borrowed from `header`, in turn from
+            // `input`) is still alive, so `input` is free to reborrow
+            // mutably below without `command` needing to stay live too.
+            let make: fn(String) -> DiscoveryCommand = match command {
+                b"H" => DiscoveryCommand::Heartbeat,
+                _ => DiscoveryCommand::Complete,
+            };
+            let name = parse_string_field(input, header_end, name_length)?;
+
+            Ok(make(name))
+        }
+
+        b"J" => {
+            let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
 
+            let name_length = parse_length(name_length)?;
             let addr_length = parse_length(addr_length)?;
+            let (name, addr) =
+                parse_two_string_fields(input, header_end, name_length, addr_length)?;
 
-            if addr_length == 0 {
-                return Err(ParseError::EmptyAddress);
-            }
-
-            let addr_start = header_end + 1;
-            let addr_end = addr_start
-                .checked_add(addr_length)
-                .ok_or(ParseError::InvalidLength)?;
-
-            if input.len() < addr_end {
-                return Err(ParseError::Incomplete);
-            }
-
-            let frame = input.split_to(addr_end);
-            let addr = String::from_utf8(frame[addr_start..addr_end].to_vec())
-                .map_err(|_| ParseError::InvalidAddress)?;
-
-            Ok(DiscoveryCommand::Heartbeat(addr))
+            Ok(DiscoveryCommand::Join { name, addr })
         }
 
         _ => Err(ParseError::InvalidCommand),
     }
+}
+
+/// Parses a single length-prefixed field (a name or an address, both
+/// plain UTF-8 strings) starting right after the header's `\n`.
+fn parse_string_field(
+    input: &mut BytesMut,
+    header_end: usize,
+    length: usize,
+) -> Result<String, ParseError> {
+    if length == 0 {
+        return Err(ParseError::EmptyField);
+    }
+
+    let start = header_end + 1;
+    let end = start.checked_add(length).ok_or(ParseError::InvalidLength)?;
+
+    if input.len() < end {
+        return Err(ParseError::Incomplete);
+    }
+
+    let frame = input.split_to(end);
+    String::from_utf8(frame[start..end].to_vec()).map_err(|_| ParseError::InvalidUtf8)
+}
+
+/// Parses two consecutive length-prefixed fields (`J`'s name then
+/// address), checking both are fully buffered before consuming any of
+/// `input`, so `parse`'s "untouched on `Incomplete`" contract holds even
+/// though this reads across two fields in one call.
+fn parse_two_string_fields(
+    input: &mut BytesMut,
+    header_end: usize,
+    first_length: usize,
+    second_length: usize,
+) -> Result<(String, String), ParseError> {
+    if first_length == 0 || second_length == 0 {
+        return Err(ParseError::EmptyField);
+    }
+
+    let first_start = header_end + 1;
+    let first_end = first_start
+        .checked_add(first_length)
+        .ok_or(ParseError::InvalidLength)?;
+    let second_end = first_end
+        .checked_add(second_length)
+        .ok_or(ParseError::InvalidLength)?;
+
+    if input.len() < second_end {
+        return Err(ParseError::Incomplete);
+    }
+
+    let frame = input.split_to(second_end);
+    let first = String::from_utf8(frame[first_start..first_end].to_vec())
+        .map_err(|_| ParseError::InvalidUtf8)?;
+    let second = String::from_utf8(frame[first_end..second_end].to_vec())
+        .map_err(|_| ParseError::InvalidUtf8)?;
+
+    Ok((first, second))
 }
 
 fn find_lf(input: &[u8]) -> Option<usize> {
@@ -381,10 +562,320 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
     })
 }
 
-fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, Instant>> {
+fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
     registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_current_join(current_join: &CurrentJoin) -> std::sync::MutexGuard<'_, Option<PendingJoin>> {
+    current_join
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// If no join is currently in progress, picks one `Waiting` node (if any)
+/// and starts it toward `Joined`: promoted straight to `Joined` if there
+/// are no `Joined` nodes yet to hand data off from (the bootstrap case —
+/// nothing to receive), otherwise moved to `Joining` with a `PendingJoin`
+/// tracking every currently-`Joined` node (by name, ADR-0009) as one it
+/// must receive a `C` from before promotion, and sent an `M` (concurrently,
+/// one connection per ready node) telling it to start its handoff.
+async fn try_begin_next_join(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    auth_secret: &Option<Bytes>,
+) {
+    // Scoped to a block, not just an explicit `drop()`, so `join_guard`
+    // (a std::sync::MutexGuard, not Send) is unambiguously out of scope
+    // before the awaits below — required for this (and everything that
+    // calls it) to remain a Send future, which `tokio::spawn` needs.
+    let (name, joining_addr, joined) = {
+        let mut join_guard = lock_current_join(current_join);
+
+        if join_guard.is_some() {
+            return;
+        }
+
+        let next_waiting = lock(registry)
+            .iter()
+            .find(|(_, info)| info.state == NodeState::Waiting)
+            .map(|(name, info)| (name.clone(), info.address.clone()));
+
+        let Some((name, joining_addr)) = next_waiting else {
+            return;
+        };
+
+        let joined: Vec<(String, String)> = lock(registry)
+            .iter()
+            .filter(|(_, info)| info.state == NodeState::Joined)
+            .map(|(name, info)| (name.clone(), info.address.clone()))
+            .collect();
+
+        if let Some(info) = lock(registry).get_mut(&name) {
+            info.state = NodeState::Joining;
+        }
+
+        if joined.is_empty() {
+            drop(join_guard);
+            promote_to_joined(registry, &name);
+            return;
+        }
+
+        let expected: HashSet<String> = joined.iter().map(|(name, _)| name.clone()).collect();
+
+        *join_guard = Some(PendingJoin {
+            expected,
+            completed: HashSet::new(),
+        });
+
+        (name, joining_addr, joined)
+    };
+
+    let mut sends = JoinSet::new();
+
+    for (ready_name, ready_addr) in joined.iter().cloned() {
+        let auth_secret = auth_secret.clone();
+        let joining_name = name.clone();
+        let joining_addr = joining_addr.clone();
+        let joined_roster = joined.clone();
+
+        sends.spawn(async move {
+            let result = send_migrate(
+                &ready_addr,
+                &auth_secret,
+                &joining_name,
+                &joining_addr,
+                &joined_roster,
+            )
+            .await;
+
+            (ready_name, result)
+        });
+    }
+
+    while let Some(outcome) = sends.join_next().await {
+        match outcome {
+            Ok((ready_name, Err(error))) => {
+                // ADR-0008 doesn't yet define a retry/timeout policy for
+                // this: a ready node that never got (or never acted on)
+                // `M` just never sends `C`, and this join stalls — a
+                // known, recorded gap (see ADR-0008's Consequences).
+                eprintln!("failed to send M to {ready_name}: {error}");
+            }
+            Ok((_, Ok(()))) => {}
+            Err(error) => eprintln!("a task sending M panicked: {error}"),
+        }
+    }
+}
+
+/// Connects to `address` (a `Joined` node) as a client, sends `M` with the
+/// joining node's identity and the full `joined` roster (ADR-0009 names +
+/// addresses), and waits for the `A\n` acknowledgment — confirmation that
+/// `M` was received and parsed, not that the handoff it kicks off (which
+/// happens asynchronously on the node's side) has finished; that's
+/// reported separately, node-to-discovery, via `C`.
+async fn send_migrate(
+    address: &str,
+    auth_secret: &Option<Bytes>,
+    joining_name: &str,
+    joining_addr: &str,
+    joined: &[(String, String)],
+) -> io::Result<()> {
+    let mut stream = TcpStream::connect(address).await?;
+    let _ = stream.set_nodelay(true);
+
+    if let Some(secret) = auth_secret {
+        let mut auth = format!("A {}\n", secret.len()).into_bytes();
+        auth.extend_from_slice(secret);
+        stream.write_all(&auth).await?;
+
+        let mut ack = [0u8; 3];
+        stream.read_exact(&mut ack).await?;
+
+        if &ack != b"On\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "node rejected the auth secret",
+            ));
+        }
+    }
+
+    let mut message = format!(
+        "M {} {} {}\n",
+        joining_name.len(),
+        joining_addr.len(),
+        joined.len()
+    )
+    .into_bytes();
+    message.extend_from_slice(joining_name.as_bytes());
+    message.extend_from_slice(joining_addr.as_bytes());
+
+    for (name, addr) in joined {
+        message.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
+        message.extend_from_slice(name.as_bytes());
+        message.extend_from_slice(addr.as_bytes());
+    }
+
+    stream.write_all(&message).await?;
+
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+
+    if &ack != b"A\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "node did not acknowledge M",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Moves `name` to `Joined`, making it visible in future `L` responses,
+/// and wakes its held-open connection so it can push the `R\n` promotion
+/// notice.
+fn promote_to_joined(registry: &Registry, name: &str) {
+    let promoted = {
+        let mut guard = lock(registry);
+        guard.get_mut(name).map(|info| {
+            info.state = NodeState::Joined;
+            info.last_heartbeat = Instant::now();
+            Arc::clone(&info.promoted)
+        })
+    };
+
+    if let Some(promoted) = promoted {
+        promoted.notify_one();
+    }
+}
+
+/// Registers `name` as `Waiting` with `address` (a no-op if it's already
+/// registered — this must not downgrade a node already past `Waiting`)
+/// and attempts to start it toward `Joined` immediately. Returns the
+/// `Notify` its connection should hold open and wait on for promotion.
+async fn start_join(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    auth_secret: &Option<Bytes>,
+    name: &str,
+    address: String,
+) -> Arc<Notify> {
+    let promoted = {
+        let mut guard = lock(registry);
+        let info = guard
+            .entry(name.to_string())
+            .or_insert_with(|| NodeInfo::new(address, NodeState::Waiting));
+        Arc::clone(&info.promoted)
+    };
+
+    try_begin_next_join(registry, current_join, auth_secret).await;
+
+    promoted
+}
+
+/// Records a ready node's completion report for the in-progress join. If
+/// this was the last of `expected` to report in, promotes the joining
+/// node and lets the next `Waiting` node (if any) start.
+async fn handle_complete(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    auth_secret: &Option<Bytes>,
+    reporting_name: &str,
+) {
+    let joining_name = {
+        let mut join_guard = lock_current_join(current_join);
+
+        let Some(pending) = join_guard.as_mut() else {
+            return;
+        };
+
+        if !pending.expected.contains(reporting_name) {
+            return;
+        }
+
+        pending.completed.insert(reporting_name.to_string());
+
+        if pending.completed.len() < pending.expected.len() {
+            return;
+        }
+
+        *join_guard = None;
+
+        lock(registry)
+            .iter()
+            .find(|(_, info)| info.state == NodeState::Joining)
+            .map(|(name, _)| name.clone())
+    };
+
+    if let Some(name) = joining_name {
+        promote_to_joined(registry, &name);
+    }
+
+    try_begin_next_join(registry, current_join, auth_secret).await;
+}
+
+/// Cleans up after a Waiting/Joining node's connection dies before it
+/// reached Joined: removes its registry entry, and if it was the node
+/// currently tracked as Joining, clears the in-progress join so a future
+/// join request isn't blocked on one that can never complete, and lets
+/// the next Waiting node (if any) start.
+async fn abandon_join(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    auth_secret: &Option<Bytes>,
+    name: &str,
+) {
+    let was_joining = lock(registry)
+        .remove(name)
+        .map(|info| info.state == NodeState::Joining)
+        .unwrap_or(false);
+
+    if was_joining {
+        *lock_current_join(current_join) = None;
+        try_begin_next_join(registry, current_join, auth_secret).await;
+    }
+}
+
+/// Holds a Waiting/Joining node's connection open after it sends `J`,
+/// since it has no other way to learn it's been promoted (see
+/// `NodeInfo::promoted`). Waits for either the promotion notification or
+/// the connection dying; any bytes the node sends in the meantime are a
+/// protocol error — a well-behaved node sends nothing more until
+/// promoted. Deliberately does not apply the ordinary idle timeout: a
+/// node may legitimately wait here far longer than `IDLE_TIMEOUT` while
+/// another node's join is in progress.
+async fn wait_for_promotion(
+    stream: &mut MaybeTls,
+    promoted: Arc<Notify>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> io::Result<()> {
+    let mut idle_byte = [0u8; 1];
+
+    tokio::select! {
+        _ = promoted.notified() => {
+            stream.write_all(b"R\n").await?;
+            Ok(())
+        }
+        _ = shutdown_rx.changed() => {
+            Err(io::Error::other("shutting down"))
+        }
+        result = stream.read(&mut idle_byte) => {
+            let bytes_read = result?;
+
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed while waiting to join",
+                ));
+            }
+
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected data while waiting to join",
+            ))
+        }
+    }
 }
 
 async fn shutdown_signal() -> io::Result<()> {
@@ -413,7 +904,10 @@ async fn run(
     tls_acceptor: Option<TlsAcceptor>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
-    let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+    let cluster_state = ClusterState {
+        registry: Arc::new(Mutex::new(FxHashMap::default())),
+        current_join: Arc::new(Mutex::new(None)),
+    };
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -424,7 +918,7 @@ async fn run(
     };
 
     let sweep_task = tokio::spawn(sweep_expired(
-        Arc::clone(&registry),
+        Arc::clone(&cluster_state.registry),
         liveness_timeout,
         shutdown_rx.clone(),
     ));
@@ -455,7 +949,7 @@ async fn run(
                 dispatch_connection(
                     stream,
                     address,
-                    Arc::clone(&registry),
+                    cluster_state.clone(),
                     Arc::clone(&connection_limit),
                     connection_config.clone(),
                     shutdown_rx.clone(),
@@ -490,7 +984,7 @@ async fn run(
 async fn dispatch_connection(
     stream: TcpStream,
     address: SocketAddr,
-    registry: Registry,
+    cluster_state: ClusterState,
     connection_limit: Arc<Semaphore>,
     config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
@@ -527,7 +1021,15 @@ async fn dispatch_connection(
     connection_tasks.spawn(async move {
         let _connection_permit = permit;
 
-        if let Err(error) = handle_connection(stream, registry, config, shutdown_rx).await {
+        if let Err(error) = handle_connection(
+            stream,
+            cluster_state.registry,
+            cluster_state.current_join,
+            config,
+            shutdown_rx,
+        )
+        .await
+        {
             eprintln!("connection error from {address}: {error}");
         }
     });
@@ -549,7 +1051,14 @@ async fn sweep_expired(
         tokio::select! {
             _ = ticker.tick() => {
                 let now = Instant::now();
-                lock(&registry).retain(|_, last_seen| now.duration_since(*last_seen) < liveness_timeout);
+                // Waiting/Joining nodes hold one long-lived connection
+                // open instead of heartbeating (see NodeInfo::promoted);
+                // their liveness is tied to that connection, not to this
+                // sweep, so only Joined nodes are subject to it.
+                lock(&registry).retain(|_, info| {
+                    info.state != NodeState::Joined
+                        || now.duration_since(info.last_heartbeat) < liveness_timeout
+                });
             }
             _ = shutdown_rx.changed() => return,
         }
@@ -559,6 +1068,7 @@ async fn sweep_expired(
 async fn handle_connection(
     mut stream: MaybeTls,
     registry: Registry,
+    current_join: CurrentJoin,
     config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
@@ -598,19 +1108,57 @@ async fn handle_connection(
                     "command sent before authenticating",
                 ));
             }
-            Ok(DiscoveryCommand::Heartbeat(addr)) => {
-                lock(&registry).insert(addr, Instant::now());
+            Ok(DiscoveryCommand::Heartbeat(name)) => {
+                let refreshed = {
+                    let mut guard = lock(&registry);
+                    match guard.get_mut(&name) {
+                        Some(info) if info.state == NodeState::Joined => {
+                            info.last_heartbeat = Instant::now();
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+
+                if !refreshed {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "heartbeat from a node that has not joined",
+                    ));
+                }
+
                 stream.write_all(b"A\n").await?;
                 continue;
             }
             Ok(DiscoveryCommand::List) => {
-                let nodes: Vec<String> = lock(&registry).keys().cloned().collect();
+                let nodes: Vec<(String, String)> = lock(&registry)
+                    .iter()
+                    .filter(|(_, info)| info.state == NodeState::Joined)
+                    .map(|(name, info)| (name.clone(), info.address.clone()))
+                    .collect();
                 let mut response = format!("N {}\n", nodes.len());
-                for node in &nodes {
-                    response.push_str(node);
-                    response.push('\n');
+                for (name, addr) in &nodes {
+                    response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
                 }
                 stream.write_all(response.as_bytes()).await?;
+                continue;
+            }
+            Ok(DiscoveryCommand::Join { name, addr }) => {
+                let promoted =
+                    start_join(&registry, &current_join, &config.auth_secret, &name, addr).await;
+
+                if let Err(error) =
+                    wait_for_promotion(&mut stream, promoted, shutdown_rx.clone()).await
+                {
+                    abandon_join(&registry, &current_join, &config.auth_secret, &name).await;
+                    return Err(error);
+                }
+
+                continue;
+            }
+            Ok(DiscoveryCommand::Complete(name)) => {
+                handle_complete(&registry, &current_join, &config.auth_secret, &name).await;
+                stream.write_all(b"A\n").await?;
                 continue;
             }
             Err(ParseError::Incomplete) => {}
@@ -706,19 +1254,55 @@ mod tests {
     }
 
     #[test]
-    fn parse_reports_incomplete_while_the_address_body_is_still_arriving() {
+    fn parse_reports_incomplete_while_the_field_body_is_still_arriving() {
         let mut input = BytesMut::from(&b"H 9\n1.2.3"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn parse_reads_a_heartbeat_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"H 9\n127.0.0.1L\n"[..]);
+        let mut input = BytesMut::from(&b"H 9\nsome-nameL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
-            DiscoveryCommand::Heartbeat("127.0.0.1".to_string())
+            DiscoveryCommand::Heartbeat("some-name".to_string())
         );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_reads_a_join_command_and_consumes_only_that_frame() {
+        let mut input = BytesMut::from(&b"J 9 14\nsome-name127.0.0.1:8356L\n"[..]);
+        let command = parse(&mut input).unwrap();
+        assert_eq!(
+            command,
+            DiscoveryCommand::Join {
+                name: "some-name".to_string(),
+                addr: "127.0.0.1:8356".to_string(),
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_reports_incomplete_while_a_joins_second_field_is_still_arriving() {
+        let mut input = BytesMut::from(&b"J 9 14\nsome-name127.0.0"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+    }
+
+    #[test]
+    fn parse_leaves_input_untouched_when_a_joins_second_field_is_incomplete() {
+        let original = b"J 9 14\nsome-name127.0.0".to_vec();
+        let mut input = BytesMut::from(&original[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn parse_reads_a_complete_command() {
+        let mut input = BytesMut::from(&b"C 9\nsome-nameL\n"[..]);
+        let command = parse(&mut input).unwrap();
+        assert_eq!(command, DiscoveryCommand::Complete("some-name".to_string()));
         assert_eq!(&input[..], b"L\n");
     }
 
@@ -736,9 +1320,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_an_empty_address() {
+    fn parse_rejects_an_empty_field() {
         let mut input = BytesMut::from(&b"H 0\n"[..]);
-        assert_eq!(parse(&mut input), Err(ParseError::EmptyAddress));
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn parse_rejects_an_empty_second_field_in_join() {
+        let mut input = BytesMut::from(&b"J 9 0\nsome-name"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
 
     #[test]
@@ -748,9 +1338,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_invalid_utf8_addresses() {
+    fn parse_rejects_invalid_utf8_fields() {
         let mut input = BytesMut::from(&b"H 2\n\xff\xfe"[..]);
-        assert_eq!(parse(&mut input), Err(ParseError::InvalidAddress));
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidUtf8));
     }
 
     #[test]
@@ -791,18 +1381,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn heartbeat_then_list_reports_the_registered_node() {
+    async fn join_then_heartbeat_then_list_reports_the_registered_node() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_registry = Arc::clone(&registry);
+        let server_current_join = Arc::clone(&current_join);
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let _ = handle_connection(
                 MaybeTls::Plain(stream),
                 server_registry,
+                server_current_join,
                 ConnectionConfig {
                     idle_timeout: Duration::from_secs(5),
                     auth_secret: None,
@@ -814,12 +1407,18 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        client.write_all(b"H 14\n127.0.0.1:8356L\n").await.unwrap();
+        // With no Joined nodes yet, this is the bootstrap case: the join
+        // is accepted with nothing to hand off, so promotion is immediate.
+        client
+            .write_all(b"J 6 14\nnode-a127.0.0.1:8356H 6\nnode-aL\n")
+            .await
+            .unwrap();
 
-        // The two responses are written in separate calls but the client may
-        // observe them coalesced into a single read, so accumulate until the
-        // expected byte count has arrived instead of assuming read boundaries.
-        let expected = b"A\nN 1\n127.0.0.1:8356\n";
+        // The three responses are written in separate calls but the client
+        // may observe them coalesced into a single read, so accumulate
+        // until the expected byte count has arrived instead of assuming
+        // read boundaries.
+        let expected = b"R\nA\nN 1\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -833,14 +1432,208 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_second_node_joining_waits_for_a_completion_report_before_being_promoted() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: None,
+        };
+
+        // Node A joins first. There are no Joined nodes yet, so it's the
+        // bootstrap case: promoted immediately, with nothing to receive.
+        let (mut node_a, server_a) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_a),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+        ));
+        node_a
+            .write_all(b"J 6 14\nnode-a127.0.0.1:9001")
+            .await
+            .unwrap();
+        let mut node_a_response = [0u8; 2];
+        node_a.read_exact(&mut node_a_response).await.unwrap();
+        assert_eq!(&node_a_response, b"R\n");
+
+        // Node B joins next. A is now Joined, so B moves to Joining and
+        // must wait for A's completion report — it must not be promoted
+        // yet, and so must not appear in L.
+        let (mut node_b, server_b) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_b),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+        ));
+        node_b
+            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
+            .await
+            .unwrap();
+
+        // The write completing only means the OS accepted the bytes, not
+        // that the spawned connection task has read and processed them
+        // yet; poll briefly instead of assuming one yield is enough.
+        for _ in 0..1000 {
+            if lock(&registry).contains_key("node-b") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        assert_eq!(
+            lock(&registry).get("node-b").unwrap().state,
+            NodeState::Joining
+        );
+
+        let (mut lister, server_l) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_l),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+        ));
+        lister.write_all(b"L\n").await.unwrap();
+        let expected_list = b"N 1\n6 14\nnode-a127.0.0.1:9001\n";
+        let mut list_response = vec![0u8; expected_list.len()];
+        lister.read_exact(&mut list_response).await.unwrap();
+        assert_eq!(list_response, expected_list);
+
+        // A reports it has finished handing its share off to B. B should
+        // now be promoted and receive its own R\n on the connection it's
+        // been holding open since it sent J.
+        node_a.write_all(b"C 6\nnode-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        let mut node_b_response = [0u8; 2];
+        node_b.read_exact(&mut node_b_response).await.unwrap();
+        assert_eq!(&node_b_response, b"R\n");
+        assert_eq!(
+            lock(&registry).get("node-b").unwrap().state,
+            NodeState::Joined
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ready_node_receives_m_when_a_second_node_joins() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            auth_secret: None,
+            tls_acceptor: None,
+        };
+
+        // A fake ready node: a real listener that expects M and acks it,
+        // standing in for node A's registered address.
+        let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready_addr = ready_listener.local_addr().unwrap().to_string();
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let ready_task = tokio::spawn(async move {
+            let (mut connection, _) = ready_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        // Node A joins first (bootstrap: no ready nodes yet), registered
+        // at the fake ready node's address.
+        let (mut node_a, server_a) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_a),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+        ));
+        node_a
+            .write_all(format!("J 6 {}\nnode-a{ready_addr}", ready_addr.len()).as_bytes())
+            .await
+            .unwrap();
+        let mut node_a_response = [0u8; 2];
+        node_a.read_exact(&mut node_a_response).await.unwrap();
+        assert_eq!(&node_a_response, b"R\n");
+
+        // Node B joins next — A is Joined and ready, so discovery should
+        // send it M.
+        let (mut node_b, server_b) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_b),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+        ));
+        node_b
+            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
+            .await
+            .unwrap();
+
+        for _ in 0..1000 {
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        ready_task.await.unwrap();
+
+        let message = String::from_utf8(received.lock().unwrap().clone()).unwrap();
+        let header_end = message.find('\n').unwrap();
+        let mut header = message[..header_end].split(' ');
+        assert_eq!(header.next(), Some("M"));
+
+        let joining_name_length: usize = header.next().unwrap().parse().unwrap();
+        let joining_addr_length: usize = header.next().unwrap().parse().unwrap();
+        let joined_count: usize = header.next().unwrap().parse().unwrap();
+        assert_eq!(header.next(), None);
+        assert_eq!(joined_count, 1);
+
+        let body = &message[header_end + 1..];
+        assert_eq!(&body[..joining_name_length], "node-b");
+        assert_eq!(
+            &body[joining_name_length..joining_name_length + joining_addr_length],
+            "127.0.0.1:9002"
+        );
+
+        let roster = &body[joining_name_length + joining_addr_length..];
+        assert!(
+            roster.contains("node-a"),
+            "roster should list node-a: {roster:?}"
+        );
+        assert!(
+            roster.contains(&ready_addr),
+            "roster should list node-a's address: {roster:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_rejects_commands_sent_before_authenticating() {
         let (mut client, server) = tcp_pair().await;
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
             registry,
+            current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
@@ -863,11 +1656,13 @@ mod tests {
     async fn handle_connection_rejects_an_incorrect_auth_secret() {
         let (mut client, server) = tcp_pair().await;
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
             registry,
+            current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
@@ -890,11 +1685,13 @@ mod tests {
     async fn handle_connection_accepts_commands_after_correct_auth() {
         let (mut client, server) = tcp_pair().await;
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
             registry,
+            current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
@@ -924,11 +1721,13 @@ mod tests {
     async fn handle_connection_treats_auth_as_a_no_op_when_no_secret_is_configured() {
         let (mut client, server) = tcp_pair().await;
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
             registry,
+            current_join,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -966,7 +1765,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_connection_when_connection_limit_is_reached() {
         let connection_limit = Arc::new(Semaphore::new(1));
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let cluster_state = ClusterState {
+            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            current_join: Arc::new(Mutex::new(None)),
+        };
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut connection_tasks = JoinSet::new();
 
@@ -976,7 +1778,7 @@ mod tests {
         let first_connection = dispatch_connection(
             first_server,
             first_address,
-            Arc::clone(&registry),
+            cluster_state.clone(),
             Arc::clone(&connection_limit),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -997,7 +1799,7 @@ mod tests {
         let second_connection = dispatch_connection(
             second_server,
             second_address,
-            registry,
+            cluster_state,
             connection_limit,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -1019,7 +1821,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sweep_expired_drops_nodes_past_the_liveness_timeout() {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
-        lock(&registry).insert("127.0.0.1:8356".to_string(), Instant::now());
+        lock(&registry).insert(
+            "some-name".to_string(),
+            NodeInfo::new("127.0.0.1:8356".to_string(), NodeState::Joined),
+        );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let sweep_task = tokio::spawn(sweep_expired(
@@ -1067,7 +1872,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
 
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let cluster_state = ClusterState {
+            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            current_join: Arc::new(Mutex::new(None)),
+        };
         let connection_limit = Arc::new(Semaphore::new(1));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1084,7 +1892,7 @@ mod tests {
             dispatch_connection(
                 stream,
                 peer_addr,
-                registry,
+                cluster_state,
                 connection_limit,
                 config,
                 shutdown_rx,
