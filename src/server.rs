@@ -1,4 +1,4 @@
-use crate::cache::Cache;
+use crate::cache::{Cache, SWEEP_BUDGET};
 use crate::command::{Command, ParseError, parse};
 use crate::hash_ring::HashRing;
 use crate::response::Response;
@@ -10,6 +10,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -24,6 +25,8 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the ADR-0008 active-deletion sweep runs. See `run_sweep`.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK_SIZE: usize = 1024;
@@ -198,6 +201,12 @@ struct NodeContext {
     /// identify this node as the sender when it reports `C`.
     name: String,
     discovery_addr: String,
+    /// Incremented while `run_migration` is active, decremented when it
+    /// finishes (see `MigrationGuard`). `run_sweep` checks this and skips
+    /// its pass while it's non-zero, per ADR-0008: a marked-but-not-yet-
+    /// swept key may still be needed as the authoritative source for a
+    /// subsequent hop while a handoff is in flight.
+    migration_in_progress: Arc<AtomicU32>,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -257,6 +266,18 @@ pub(crate) async fn run(
 
     let cache_task = tokio::spawn(run_cache(request_rx));
 
+    // Shared with `node_context` (when this node has one) so `run_sweep`
+    // can tell whether an ADR-0008 handoff this node is the source for is
+    // currently in flight, regardless of discovery configuration — a node
+    // running standalone never touches this beyond the initial 0.
+    let migration_in_progress = Arc::new(AtomicU32::new(0));
+
+    let sweep_task = tokio::spawn(run_sweep(
+        request_tx.clone(),
+        Arc::clone(&migration_in_progress),
+        shutdown_rx.clone(),
+    ));
+
     // Generated once and kept for this process's lifetime (ADR-0009): a
     // restarted node has no data to reclaim its old identity for, so
     // there's nothing a stable name would preserve across a restart that
@@ -265,6 +286,7 @@ pub(crate) async fn run(
     let node_context = heartbeat.as_ref().map(|config| NodeContext {
         name: Uuid::new_v4().to_string(),
         discovery_addr: config.discovery_addr.clone(),
+        migration_in_progress: Arc::clone(&migration_in_progress),
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
@@ -341,10 +363,22 @@ pub(crate) async fn run(
     }
 
     drop(request_tx);
+    // `connection_config` (specifically the `NodeContext.request_tx` clone
+    // inside it, when this node has a discovery config) is otherwise not
+    // dropped until `run` itself returns — after `cache_task.await` below,
+    // which needs every sender dropped to see its channel close. Without
+    // this, a discovery-configured node deadlocks on shutdown: `cache_task`
+    // waits on a sender only `run`'s own return would drop, and `run` can't
+    // return until `cache_task` resolves.
+    drop(connection_config);
 
     cache_task
         .await
         .map_err(|error| io::Error::other(format!("cache task failed: {error}")))?;
+
+    sweep_task
+        .await
+        .map_err(|error| io::Error::other(format!("sweep task failed: {error}")))?;
 
     if let Some(heartbeat_task) = heartbeat_task {
         heartbeat_task
@@ -731,6 +765,25 @@ fn complete_message(name: &str) -> Vec<u8> {
     message
 }
 
+/// Tracks that a `run_migration` is active for the counter's lifetime
+/// (incremented on construction, decremented on drop — including an early
+/// return or panic), so `run_sweep` can tell to pause. See
+/// `NodeContext::migration_in_progress`.
+struct MigrationGuard(Arc<AtomicU32>);
+
+impl MigrationGuard {
+    fn new(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for MigrationGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// ADR-0008: triggered by an incoming `M`. Computes, using the same
 /// consistent-hash algorithm clients use ([[0002]]; `HashRing` here is
 /// `src/hash_ring.rs`'s copy, see ADR-0006), which of this node's own
@@ -751,6 +804,8 @@ async fn run_migration(
     joining_addr: String,
     joined: Vec<(String, String)>,
 ) {
+    let _migration_guard = MigrationGuard::new(Arc::clone(&node_context.migration_in_progress));
+
     let mut ring_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
     ring_members.push(joining_name.clone());
     let after_ring = HashRing::new(ring_members);
@@ -817,6 +872,59 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
         .is_ok()
     {
         let _ = response_rx.await;
+    }
+}
+
+/// ADR-0008's active-deletion background task: every `SWEEP_INTERVAL`,
+/// reclaims migrated-marked and TTL-expired entries. `Cache::sweep`
+/// removes at most `SWEEP_BUDGET` entries per call so it can't stall other
+/// cache commands queued behind it on the single-threaded actor for long
+/// (measured: ~500ns per removal, so a full-cache sweep over a backlog of
+/// hundreds of thousands of entries would otherwise block for 100ms+) — a
+/// call that hits that cap likely left more behind, so this loops back
+/// immediately (no `SWEEP_INTERVAL` wait) until a call reports less than a
+/// full budget removed, meaning the backlog is drained for now. Skips
+/// (and doesn't drain a backlog) while `migration_in_progress` is
+/// non-zero — this node is the source for an in-progress handoff, so a
+/// marked-but-not-yet-swept key may still be needed as the authoritative
+/// source for a subsequent hop (see `NodeContext::migration_in_progress`).
+async fn run_sweep(
+    request_tx: mpsc::Sender<CacheRequest>,
+    migration_in_progress: Arc<AtomicU32>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        if wait_or_shutdown(SWEEP_INTERVAL, &mut shutdown_rx).await {
+            return;
+        }
+
+        loop {
+            if migration_in_progress.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+
+            match sweep(&request_tx).await {
+                Some(removed) if removed >= SWEEP_BUDGET => continue,
+                _ => break,
+            }
+        }
+    }
+}
+
+async fn sweep(request_tx: &mpsc::Sender<CacheRequest>) -> Option<usize> {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    request_tx
+        .send(CacheRequest {
+            command: Command::Sweep,
+            response_tx,
+        })
+        .await
+        .ok()?;
+
+    match response_rx.await.ok()? {
+        Response::Swept(removed) => Some(removed),
+        _ => None,
     }
 }
 
@@ -1466,6 +1574,7 @@ mod tests {
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
                     discovery_addr,
+                    migration_in_progress: Arc::new(AtomicU32::new(0)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),

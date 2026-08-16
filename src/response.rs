@@ -19,6 +19,9 @@ pub enum Response {
     Entries(Vec<(Bytes, Bytes, Option<Duration>)>),
     /// Internal-only (ADR-0008), in answer to `Command::MarkMigrated`.
     Marked,
+    /// Internal-only (ADR-0008), in answer to `Command::Sweep` — how many
+    /// entries the sweep actually removed.
+    Swept(usize),
 }
 
 impl Response {
@@ -45,7 +48,7 @@ impl Response {
                 encoded
             }
 
-            Self::Entries(_) | Self::Marked => {
+            Self::Entries(_) | Self::Marked | Self::Swept(_) => {
                 unreachable!(
                     "internal-only response (ADR-0008): never sent to a wire client, only \
                      matched directly in Rust by the migration task"

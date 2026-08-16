@@ -1,8 +1,18 @@
 use bytes::Bytes;
 use lru::LruCache;
 use rustc_hash::FxBuildHasher;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
+
+/// Caps how many entries a single `sweep` call removes. Scanning for
+/// expired/marked entries is cheap even over a large cache (~4ms/1M
+/// entries, measured), but each removal itself is not (~500ns/entry,
+/// measured — `LruCache::pop` unlinks from both a hash map and a linked
+/// list) — sweeping hundreds of thousands of entries in one call has been
+/// measured to take 100ms+, which would stall every other command queued
+/// behind it on the single-threaded cache actor for that long. Chunking
+/// removals lets client commands interleave between `sweep` calls instead.
+pub(crate) const SWEEP_BUDGET: usize = 2_000;
 
 struct Entry {
     value: Bytes,
@@ -14,10 +24,14 @@ pub struct Cache {
     used_bytes: usize,
     max_memory_bytes: usize,
     /// Keys handed off to another node during an ADR-0008 migration this
-    /// node was the source for. Only ever added to today — the
-    /// active-deletion sweep that reclaims marked entries is a separate,
-    /// not-yet-implemented follow-up (see ADR-0008's Decision).
+    /// node was the source for, awaiting `sweep`'s next pass.
     migrated: HashSet<Bytes>,
+    /// Expired/marked keys queued for removal by `sweep`, in
+    /// `SWEEP_BUDGET`-sized bites. Refilled (by scanning `entries` for
+    /// expired keys and draining `migrated`) only once this drains empty,
+    /// so an in-progress sweep pass isn't rescanned from scratch every
+    /// call.
+    pending_removal: VecDeque<Bytes>,
 }
 
 impl Entry {
@@ -33,6 +47,7 @@ impl Cache {
             used_bytes: 0,
             max_memory_bytes,
             migrated: HashSet::new(),
+            pending_removal: VecDeque::new(),
         }
     }
 
@@ -141,12 +156,53 @@ impl Cache {
 
     /// Marks `key` as handed off during an ADR-0008 migration this node
     /// was the source for. A no-op if the key is already marked or no
-    /// longer present. See `migrated`'s doc comment for what this does
-    /// and doesn't do yet.
+    /// longer present; `sweep` reclaims marked entries later.
     pub fn mark_migrated(&mut self, key: &[u8]) {
         if self.entries.contains(key) {
             self.migrated.insert(Bytes::copy_from_slice(key));
         }
+    }
+
+    /// ADR-0008's active-deletion facility: reclaims entries marked by
+    /// `mark_migrated`, and — since `get_at`/`delete_at` only expire a
+    /// TTL'd entry lazily, on access — also proactively removes anything
+    /// past its TTL, so an unread expired key doesn't sit in memory
+    /// indefinitely. Removes at most `SWEEP_BUDGET` entries per call (the
+    /// caller should call again if the backlog isn't drained yet — see
+    /// `pending_removal`), so one call can't stall every other cache
+    /// command behind it for as long as a full pass over a large cache
+    /// would take. Returns how many entries were actually removed this
+    /// call (a marked or expired key may already be gone, e.g. deleted by
+    /// a client in the meantime) — `< SWEEP_BUDGET` means the backlog is
+    /// now fully drained.
+    pub fn sweep(&mut self) -> usize {
+        self.sweep_at(Instant::now())
+    }
+
+    fn sweep_at(&mut self, now: Instant) -> usize {
+        if self.pending_removal.is_empty() {
+            self.pending_removal.extend(
+                self.entries
+                    .iter()
+                    .filter(|(_, entry)| entry.is_expired_at(now))
+                    .map(|(key, _)| key.clone()),
+            );
+            self.pending_removal.extend(self.migrated.drain());
+        }
+
+        let mut removed = 0;
+
+        for _ in 0..SWEEP_BUDGET {
+            let Some(key) = self.pending_removal.pop_front() else {
+                break;
+            };
+
+            if self.remove_entry(&key).is_some() {
+                removed += 1;
+            }
+        }
+
+        removed
     }
 }
 
@@ -493,9 +549,9 @@ mod tests {
     fn mark_migrated_is_a_no_op_for_a_missing_key() {
         let mut cache = Cache::new(UNBOUNDED);
 
-        // Just needs to not panic; there is no observable state to assert
-        // on yet (the sweep that consumes marks is a separate follow-up).
         cache.mark_migrated(b"missing");
+
+        assert_eq!(cache.sweep(), 0);
     }
 
     #[test]
@@ -506,5 +562,153 @@ mod tests {
         cache.mark_migrated(b"name");
 
         assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn sweep_removes_a_marked_entry_and_reports_it_removed() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+
+        assert_eq!(cache.sweep(), 1);
+        assert_eq!(cache.get(b"name"), None);
+    }
+
+    #[test]
+    fn sweep_does_not_touch_an_unmarked_entry() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(cache.sweep(), 0);
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn sweep_frees_the_memory_a_marked_entry_used() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+        cache.sweep();
+
+        cache.set(Bytes::from_static(b"other"), Bytes::from_static(b"Bob"));
+
+        assert_eq!(cache.get(b"other"), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn sweep_proactively_removes_an_expired_entry_without_being_read_first() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+
+        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6));
+
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn sweep_does_not_remove_an_entry_that_has_not_expired() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(cache.sweep(), 0);
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn sweep_only_counts_each_entry_once_when_both_marked_and_expired() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(5),
+        );
+        cache.mark_migrated(b"name");
+
+        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6));
+
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn sweep_removes_at_most_sweep_budget_entries_per_call() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        for i in 0..(SWEEP_BUDGET + 500) {
+            let key = format!("key-{i}").into_bytes();
+            cache.set(Bytes::copy_from_slice(&key), Bytes::from_static(b"x"));
+            cache.mark_migrated(&key);
+        }
+
+        assert_eq!(cache.sweep(), SWEEP_BUDGET);
+        assert_eq!(cache.sweep(), 500);
+        assert_eq!(cache.sweep(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_one_sweep_chunk_against_a_large_removal_backlog() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        for i in 0..1_000_000u32 {
+            let key = Bytes::copy_from_slice(format!("key-{i}").as_bytes());
+            let value = Bytes::copy_from_slice(format!("value-{i}").as_bytes());
+            cache.set(key, value);
+        }
+
+        for i in 0..250_000u32 {
+            let key = format!("key-{i}").into_bytes();
+            cache.mark_migrated(&key);
+        }
+
+        // First call also pays the one-time refill scan (see
+        // `pending_removal`); this is the worst-case single blocking call.
+        let start = std::time::Instant::now();
+        let removed = cache.sweep();
+        let first_call = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let mut total_removed = removed;
+        while total_removed < 250_000 {
+            total_removed += cache.sweep();
+        }
+        let total_elapsed = start.elapsed();
+
+        eprintln!(
+            "first sweep() call (refill + one {SWEEP_BUDGET}-entry chunk, {removed} removed) \
+             took {first_call:?}; draining the remaining {} marked entries took {total_elapsed:?} more",
+            250_000 - removed
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn perf_a_ttl_only_sweep_scan_with_nothing_marked() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        for i in 0..1_000_000u32 {
+            let key = Bytes::copy_from_slice(format!("key-{i}").as_bytes());
+            let value = Bytes::copy_from_slice(format!("value-{i}").as_bytes());
+            cache.set_with_ttl(key, value, Duration::from_secs(3600));
+        }
+
+        let start = std::time::Instant::now();
+        let removed = cache.sweep();
+        let elapsed = start.elapsed();
+
+        eprintln!("scanned 1_000_000 non-expired TTL'd entries, removed {removed}, in {elapsed:?}");
     }
 }

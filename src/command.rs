@@ -25,12 +25,16 @@ pub enum Command {
     /// owns. See `Response::Entries`.
     ListEntries,
     /// Internal-only (ADR-0008): marks a key as handed off to another
-    /// node during a migration this node was the source for. The
-    /// active-deletion sweep that reclaims marked entries is a separate,
-    /// not-yet-implemented follow-up.
+    /// node during a migration this node was the source for. `Sweep`
+    /// reclaims marked entries later.
     MarkMigrated {
         key: Bytes,
     },
+    /// Internal-only (ADR-0008): the active-deletion pass, run
+    /// periodically by a background task. Reclaims every marked entry
+    /// and, since TTL expiry is otherwise only checked lazily on access,
+    /// also proactively removes anything already past its TTL.
+    Sweep,
     /// ADR-0008: sent by discovery to a `Joined` node when a new node is
     /// joining, so this node can compute (via `HashRing`) which of its
     /// own keys the joining node now owns. `joining_name`/`joining_addr`
@@ -85,6 +89,8 @@ impl Command {
                 cache.mark_migrated(&key);
                 Response::Marked
             }
+
+            Self::Sweep => Response::Swept(cache.sweep()),
         }
     }
 }
@@ -681,6 +687,15 @@ mod tests {
         };
 
         assert_eq!(command.execute(&mut cache), Response::Marked);
+    }
+
+    #[test]
+    fn sweep_returns_how_many_entries_it_removed() {
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+
+        assert_eq!(Command::Sweep.execute(&mut cache), Response::Swept(1));
     }
 
     #[test]
