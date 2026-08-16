@@ -82,8 +82,8 @@
 
 use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::HashSet;
 use std::io;
 use std::io::BufReader;
@@ -98,7 +98,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval, timeout};
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
@@ -192,13 +192,17 @@ struct ClusterState {
 
 /// Wraps either a plain TCP connection or one wrapped in TLS behind a
 /// single type, so the rest of the connection-handling code doesn't need to
-/// know which is in play.
-enum MaybeTls {
-    Plain(TcpStream),
-    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+/// know which is in play. Generic over the plain (`P`) and TLS (`T`) stream
+/// types since this process both accepts connections (`ServerStream`, TLS
+/// terminated by `TlsAcceptor`) and, since ADR-0008 added `M`/`X`, also
+/// opens its own outbound ones to nodes (`ClientStream`, TLS via
+/// `TlsConnector`) — the two use different `tokio_rustls` stream types.
+enum MaybeTls<P, T> {
+    Plain(P),
+    Tls(Box<T>),
 }
 
-impl AsyncRead for MaybeTls {
+impl<P: AsyncRead + Unpin, T: AsyncRead + Unpin> AsyncRead for MaybeTls<P, T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -211,7 +215,7 @@ impl AsyncRead for MaybeTls {
     }
 }
 
-impl AsyncWrite for MaybeTls {
+impl<P: AsyncWrite + Unpin, T: AsyncWrite + Unpin> AsyncWrite for MaybeTls<P, T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -238,6 +242,12 @@ impl AsyncWrite for MaybeTls {
     }
 }
 
+/// A connection this process accepted, plaintext or TLS-terminated.
+type ServerStream = MaybeTls<TcpStream, tokio_rustls::server::TlsStream<TcpStream>>;
+/// A connection this process opened outbound (to a node, sending `M`/`X`),
+/// plaintext or TLS-secured.
+type ClientStream = MaybeTls<TcpStream, tokio_rustls::client::TlsStream<TcpStream>>;
+
 /// Loads a certificate chain and private key from PEM files and builds a
 /// `TlsAcceptor` for terminating incoming TLS connections.
 fn load_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
@@ -250,6 +260,26 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor>
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Loads CA certificates from a PEM file and builds a `TlsConnector` that
+/// trusts only those CAs (not the system trust store), for this process's
+/// own outbound connections to a node's TLS-secured port (sending `M`/`X`).
+fn load_tls_connector(ca_path: &str) -> io::Result<TlsConnector> {
+    let certs = load_cert_chain(ca_path)?;
+    let mut roots = RootCertStore::empty();
+
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 fn load_cert_chain(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
@@ -267,6 +297,46 @@ fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
     })
 }
 
+/// Parses the host portion of a `host:port` address into a TLS server name
+/// for certificate verification, accepting either a DNS name or IP address.
+fn server_name_from_addr(addr: &str) -> io::Result<ServerName<'static>> {
+    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+
+    ServerName::try_from(host.to_string()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TLS server name {host:?}: {error}"),
+        )
+    })
+}
+
+/// Connects to `addr` (a node, to send `M`/`X`), upgrading to TLS first if
+/// `tls_connector` is set. There is no plaintext fallback: if TLS is
+/// configured and the handshake fails, the connection attempt fails too —
+/// mirrors `nanocached-node`'s own `connect_client_stream`.
+async fn connect_client_stream(
+    addr: &str,
+    tls_connector: Option<&TlsConnector>,
+) -> io::Result<ClientStream> {
+    let stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
+
+    match tls_connector {
+        Some(connector) => {
+            let server_name = server_name_from_addr(addr)?;
+            let tls_stream = timeout(
+                TLS_HANDSHAKE_TIMEOUT,
+                connector.connect(server_name, stream),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
+
+            Ok(ClientStream::Tls(Box::new(tls_stream)))
+        }
+        None => Ok(ClientStream::Plain(stream)),
+    }
+}
+
 /// Per-connection settings that don't change once `run` starts, grouped so
 /// `dispatch_connection`/`handle_connection` take one value instead of two.
 #[derive(Clone)]
@@ -276,6 +346,9 @@ struct ConnectionConfig {
     /// When set, every accepted connection must complete a TLS handshake
     /// before speaking the protocol; there is no plaintext fallback.
     tls_acceptor: Option<TlsAcceptor>,
+    /// When set, this process's own outbound connections to a node
+    /// (sending `M`/`X`) upgrade to TLS; see `connect_client_stream`.
+    tls_connector: Option<TlsConnector>,
 }
 
 /// Reads the shared auth secret from the environment rather than a CLI
@@ -313,6 +386,7 @@ struct Args {
     migration_timeout: Duration,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    tls_ca: Option<String>,
 }
 
 impl Default for Args {
@@ -324,6 +398,7 @@ impl Default for Args {
             migration_timeout: DEFAULT_MIGRATION_TIMEOUT,
             tls_cert: None,
             tls_key: None,
+            tls_ca: None,
         }
     }
 }
@@ -359,6 +434,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
+            "--tls-ca" => args.tls_ca = Some(value()?),
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
         }
@@ -385,7 +461,10 @@ Usage: nanocached-discovery [options]
   --tls-cert <path>             PEM certificate chain; requires TLS on
                                  every accepted connection (no plaintext
                                  fallback)
-  --tls-key <path>              PEM private key matching --tls-cert"
+  --tls-key <path>              PEM private key matching --tls-cert
+  --tls-ca <path>               PEM CA certificate(s) to trust when this
+                                 process connects out to a TLS-secured node
+                                 to send M/X"
         .to_string()
 }
 
@@ -609,6 +688,7 @@ async fn try_begin_next_join(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
 ) {
     // Scoped to a block, not just an explicit `drop()`, so `join_guard`
     // (a std::sync::MutexGuard, not Send) is unambiguously out of scope
@@ -662,6 +742,7 @@ async fn try_begin_next_join(
 
     for (ready_name, ready_addr) in joined.iter().cloned() {
         let auth_secret = auth_secret.clone();
+        let tls_connector = tls_connector.clone();
         let joining_name = name.clone();
         let joining_addr = joining_addr.clone();
         let joined_roster = joined.clone();
@@ -670,6 +751,7 @@ async fn try_begin_next_join(
             let result = send_migrate(
                 &ready_addr,
                 &auth_secret,
+                &tls_connector,
                 &joining_name,
                 &joining_addr,
                 &joined_roster,
@@ -704,12 +786,12 @@ async fn try_begin_next_join(
 async fn send_migrate(
     address: &str,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
     joining_name: &str,
     joining_addr: &str,
     joined: &[(String, String)],
 ) -> io::Result<()> {
-    let mut stream = TcpStream::connect(address).await?;
-    let _ = stream.set_nodelay(true);
+    let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
 
     if let Some(secret) = auth_secret {
         let mut auth = format!("A {}\n", secret.len()).into_bytes();
@@ -769,10 +851,10 @@ async fn send_migrate(
 async fn send_cancel(
     address: &str,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
     joining_name: &str,
 ) -> io::Result<()> {
-    let mut stream = TcpStream::connect(address).await?;
-    let _ = stream.set_nodelay(true);
+    let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
 
     if let Some(secret) = auth_secret {
         let mut auth = format!("A {}\n", secret.len()).into_bytes();
@@ -834,6 +916,7 @@ async fn start_join(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
     name: &str,
     address: String,
 ) -> Arc<Notify> {
@@ -845,7 +928,7 @@ async fn start_join(
         Arc::clone(&info.promoted)
     };
 
-    try_begin_next_join(registry, current_join, auth_secret).await;
+    try_begin_next_join(registry, current_join, auth_secret, tls_connector).await;
 
     promoted
 }
@@ -857,6 +940,7 @@ async fn handle_complete(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
     reporting_name: &str,
 ) {
     let joining_name = {
@@ -882,7 +966,7 @@ async fn handle_complete(
     };
 
     promote_to_joined(registry, &joining_name);
-    try_begin_next_join(registry, current_join, auth_secret).await;
+    try_begin_next_join(registry, current_join, auth_secret, tls_connector).await;
 }
 
 /// Called whenever any node's connection to discovery ends (cleanly or
@@ -903,6 +987,7 @@ async fn on_node_connection_ended(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
     name: &str,
 ) {
     let was_waiting_or_joining = lock(registry)
@@ -919,7 +1004,7 @@ async fn on_node_connection_ended(
             .is_some_and(|pending| pending.expected.contains(name));
 
     if matters_to_current_join {
-        abandon_current_join(registry, current_join, auth_secret).await;
+        abandon_current_join(registry, current_join, auth_secret, tls_connector).await;
     }
 }
 
@@ -935,6 +1020,7 @@ async fn abandon_current_join(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
 ) {
     let Some(pending) = lock_current_join(current_join).take() else {
         return;
@@ -959,10 +1045,12 @@ async fn abandon_current_join(
 
     for (ready_name, ready_addr) in ready_addrs {
         let auth_secret = auth_secret.clone();
+        let tls_connector = tls_connector.clone();
         let joining_name = pending.joining_name.clone();
 
         sends.spawn(async move {
-            let result = send_cancel(&ready_addr, &auth_secret, &joining_name).await;
+            let result =
+                send_cancel(&ready_addr, &auth_secret, &tls_connector, &joining_name).await;
             (ready_name, result)
         });
     }
@@ -977,7 +1065,7 @@ async fn abandon_current_join(
         }
     }
 
-    try_begin_next_join(registry, current_join, auth_secret).await;
+    try_begin_next_join(registry, current_join, auth_secret, tls_connector).await;
 }
 
 /// Holds a Waiting/Joining node's connection open after it sends `J`,
@@ -989,7 +1077,7 @@ async fn abandon_current_join(
 /// node may legitimately wait here far longer than `IDLE_TIMEOUT` while
 /// another node's join is in progress.
 async fn wait_for_promotion(
-    stream: &mut MaybeTls,
+    stream: &mut ServerStream,
     promoted: Arc<Notify>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
@@ -1046,6 +1134,7 @@ async fn run(
     migration_timeout: Duration,
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
+    tls_connector: Option<TlsConnector>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let cluster_state = ClusterState {
@@ -1059,12 +1148,14 @@ async fn run(
         idle_timeout: IDLE_TIMEOUT,
         auth_secret: auth_secret.clone(),
         tls_acceptor,
+        tls_connector: tls_connector.clone(),
     };
 
     let sweep_task = tokio::spawn(sweep_expired(
         Arc::clone(&cluster_state.registry),
         Arc::clone(&cluster_state.current_join),
         auth_secret,
+        tls_connector,
         liveness_timeout,
         migration_timeout,
         shutdown_rx.clone(),
@@ -1139,7 +1230,7 @@ async fn dispatch_connection(
 ) -> bool {
     let _ = stream.set_nodelay(true);
 
-    let mut stream: MaybeTls = match &config.tls_acceptor {
+    let mut stream: ServerStream = match &config.tls_acceptor {
         Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
             Ok(Err(error)) => {
@@ -1199,6 +1290,7 @@ async fn dispatch_connection(
                 &cluster_state.registry,
                 &cluster_state.current_join,
                 &config.auth_secret,
+                &config.tls_connector,
                 &name,
             )
             .await;
@@ -1212,6 +1304,7 @@ async fn sweep_expired(
     registry: Registry,
     current_join: CurrentJoin,
     auth_secret: Option<Bytes>,
+    tls_connector: Option<TlsConnector>,
     liveness_timeout: Duration,
     migration_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1241,7 +1334,7 @@ async fn sweep_expired(
                     .is_some_and(|pending| pending.started_at.elapsed() >= migration_timeout);
 
                 if timed_out {
-                    abandon_current_join(&registry, &current_join, &auth_secret).await;
+                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector).await;
                 }
             }
             _ = shutdown_rx.changed() => return,
@@ -1250,7 +1343,7 @@ async fn sweep_expired(
 }
 
 async fn handle_connection(
-    mut stream: MaybeTls,
+    mut stream: ServerStream,
     registry: Registry,
     current_join: CurrentJoin,
     config: ConnectionConfig,
@@ -1333,15 +1426,29 @@ async fn handle_connection(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
 
-                let promoted =
-                    start_join(&registry, &current_join, &config.auth_secret, &name, addr).await;
+                let promoted = start_join(
+                    &registry,
+                    &current_join,
+                    &config.auth_secret,
+                    &config.tls_connector,
+                    &name,
+                    addr,
+                )
+                .await;
 
                 wait_for_promotion(&mut stream, promoted, shutdown_rx.clone()).await?;
 
                 continue;
             }
             Ok(DiscoveryCommand::Complete(name)) => {
-                handle_complete(&registry, &current_join, &config.auth_secret, &name).await;
+                handle_complete(
+                    &registry,
+                    &current_join,
+                    &config.auth_secret,
+                    &config.tls_connector,
+                    &name,
+                )
+                .await;
                 stream.write_all(b"A\n").await?;
                 continue;
             }
@@ -1411,6 +1518,17 @@ async fn main() -> ExitCode {
         _ => None,
     };
 
+    let tls_connector = match &args.tls_ca {
+        Some(ca) => match load_tls_connector(ca) {
+            Ok(connector) => Some(connector),
+            Err(err) => {
+                eprintln!("discovery: {err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let address = format!("{}:{}", args.host, args.port);
     if let Err(err) = run(
         &address,
@@ -1418,6 +1536,7 @@ async fn main() -> ExitCode {
         args.migration_timeout,
         read_auth_secret(),
         tls_acceptor,
+        tls_connector,
     )
     .await
     {
@@ -1585,6 +1704,7 @@ mod tests {
                     idle_timeout: Duration::from_secs(5),
                     auth_secret: None,
                     tls_acceptor: None,
+                    tls_connector: None,
                 },
                 shutdown_rx,
                 Arc::new(std::sync::Mutex::new(None)),
@@ -1627,6 +1747,7 @@ mod tests {
             idle_timeout: IDLE_TIMEOUT,
             auth_secret: None,
             tls_acceptor: None,
+            tls_connector: None,
         };
 
         // Node A joins first. There are no Joined nodes yet, so it's the
@@ -1722,6 +1843,7 @@ mod tests {
             idle_timeout: IDLE_TIMEOUT,
             auth_secret: None,
             tls_acceptor: None,
+            tls_connector: None,
         };
 
         // A fake ready node: a real listener that expects M and acks it,
@@ -1829,6 +1951,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
+                tls_connector: None,
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -1859,6 +1982,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
+                tls_connector: None,
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -1889,6 +2013,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
+                tls_connector: None,
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -1926,6 +2051,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                tls_connector: None,
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -1979,6 +2105,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                tls_connector: None,
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -2000,6 +2127,7 @@ mod tests {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
                 tls_acceptor: None,
+                tls_connector: None,
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -2027,6 +2155,7 @@ mod tests {
             Arc::clone(&registry),
             current_join,
             None,
+            None,
             Duration::from_secs(1),
             Duration::from_secs(60),
             shutdown_rx,
@@ -2044,10 +2173,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dispatch_connection_serves_commands_over_tls() {
-        use rustls::pki_types::ServerName;
-        use rustls::{ClientConfig, RootCertStore};
-        use tokio_rustls::TlsConnector;
-
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let rcgen::CertifiedKey { cert, signing_key } =
@@ -2082,6 +2207,7 @@ mod tests {
             idle_timeout: IDLE_TIMEOUT,
             auth_secret: None,
             tls_acceptor: Some(acceptor),
+            tls_connector: None,
         };
 
         let server_task = tokio::spawn(async move {
@@ -2114,6 +2240,112 @@ mod tests {
         assert_eq!(response, expected);
 
         server_task.await.unwrap();
+    }
+
+    /// Builds a self-signed cert/key pair plus a matching `TlsAcceptor`
+    /// (for a fake node standing in as the connection's server side) and
+    /// `TlsConnector` (for discovery's own outbound connect), mirroring
+    /// `dispatch_connection_serves_commands_over_tls`'s setup.
+    fn self_signed_tls_pair() -> (TlsAcceptor, TlsConnector) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        (acceptor, connector)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_delivers_m_to_a_tls_secured_node() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (acceptor, connector) = self_signed_tls_pair();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The self-signed cert is issued for "localhost", not an IP, so
+        // connect via that name for SNI/hostname verification to pass.
+        let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let node_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = tls.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            tls.write_all(b"A\n").await.unwrap();
+        });
+
+        // A plaintext-only `send_migrate` call would never complete a TLS
+        // handshake with this fake node and this would hang/error instead.
+        send_migrate(
+            &address,
+            &None,
+            &Some(connector),
+            "joining-node",
+            "127.0.0.1:9",
+            &[],
+        )
+        .await
+        .unwrap();
+
+        node_task.await.unwrap();
+
+        let mut expected = b"M 12 11 0\n".to_vec();
+        expected.extend_from_slice(b"joining-node");
+        expected.extend_from_slice(b"127.0.0.1:9");
+        assert_eq!(*received.lock().unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_cancel_delivers_x_to_a_tls_secured_node() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (acceptor, connector) = self_signed_tls_pair();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The self-signed cert is issued for "localhost", not an IP, so
+        // connect via that name for SNI/hostname verification to pass.
+        let address = format!("localhost:{}", listener.local_addr().unwrap().port());
+
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let node_task = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = tls.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            tls.write_all(b"A\n").await.unwrap();
+        });
+
+        send_cancel(&address, &None, &Some(connector), "joining-node")
+            .await
+            .unwrap();
+
+        node_task.await.unwrap();
+
+        let mut expected = b"X 12\n".to_vec();
+        expected.extend_from_slice(b"joining-node");
+        assert_eq!(*received.lock().unwrap(), expected);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2162,7 +2394,7 @@ mod tests {
 
         // Node A's connection to discovery dies (ADR-0008 pattern: a ready
         // node dies mid-handoff).
-        on_node_connection_ended(&registry, &current_join, &None, "node-a").await;
+        on_node_connection_ended(&registry, &current_join, &None, &None, "node-a").await;
 
         other_ready_task.await.unwrap();
 
@@ -2214,7 +2446,7 @@ mod tests {
 
         // Node B (the joining node itself) disconnects before being
         // promoted (ADR-0008 pattern: the joining node dies mid-handoff).
-        on_node_connection_ended(&registry, &current_join, &None, "node-b").await;
+        on_node_connection_ended(&registry, &current_join, &None, &None, "node-b").await;
 
         ready_task.await.unwrap();
 
@@ -2250,6 +2482,7 @@ mod tests {
         let sweep_task = tokio::spawn(sweep_expired(
             Arc::clone(&registry),
             Arc::clone(&current_join),
+            None,
             None,
             Duration::from_secs(60),
             Duration::from_secs(2),
