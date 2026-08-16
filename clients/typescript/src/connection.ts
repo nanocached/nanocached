@@ -15,6 +15,21 @@ function unexpectedResponse(response: ParsedResponse): Error {
   return new Error(`nanocached: unexpected response from server: ${response.kind}`);
 }
 
+/** Thrown by get/set/delete when the node answers `W` (ADR-0008): per its
+ * own current view of cluster membership, this node no longer (or not yet)
+ * owns the key — the caller's routing table is stale. Carries no
+ * forwarding address; `NanocachedClient` catches this to re-fetch the node
+ * list and retry once (see its own doc comment), not something callers of
+ * `NanocachedClient.get`/`set`/`delete` normally need to handle themselves
+ * unless they're bypassing that retry (e.g. by calling a single `Connection`
+ * directly). */
+export class WrongNodeError extends Error {
+  constructor() {
+    super("nanocached: this node no longer owns the requested key");
+    this.name = "WrongNodeError";
+  }
+}
+
 /**
  * One already-identified (see `identify.ts`) connection to a single
  * nanocached-node. Requests are pipelined onto one TCP (or TLS) connection
@@ -41,11 +56,13 @@ export class Connection {
     const response = await this.send(encodeGet(toBytes(key)));
     if (response.kind === "value") return response.value ?? Buffer.alloc(0);
     if (response.kind === "notFound") return null;
+    if (response.kind === "wrongNode") throw new WrongNodeError();
     throw unexpectedResponse(response);
   }
 
   async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
     const response = await this.send(encodeSet(toBytes(key), toBytes(value), options?.ttlSeconds));
+    if (response.kind === "wrongNode") throw new WrongNodeError();
     if (response.kind !== "stored") throw unexpectedResponse(response);
   }
 
@@ -54,6 +71,7 @@ export class Connection {
     const response = await this.send(encodeDelete(toBytes(key)));
     if (response.kind === "deleted") return true;
     if (response.kind === "notFound") return false;
+    if (response.kind === "wrongNode") throw new WrongNodeError();
     throw unexpectedResponse(response);
   }
 

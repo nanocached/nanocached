@@ -27,7 +27,7 @@ export function encodeDelete(key: Uint8Array): Buffer {
 }
 
 export interface ParsedResponse {
-  kind: "value" | "stored" | "deleted" | "notFound" | "busy";
+  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode";
   value?: Buffer;
 }
 
@@ -36,6 +36,7 @@ const MARKER_DELETED = 0x44; // 'D'
 const MARKER_NOT_FOUND = 0x4e; // 'N'
 const MARKER_BUSY = 0x42; // 'B'
 const MARKER_VALUE = 0x56; // 'V'
+const MARKER_WRONG_NODE = 0x57; // 'W'
 const LF = 0x0a;
 
 /** Parses one response frame from the front of `buf`, returning `null`
@@ -53,6 +54,8 @@ export function tryParseResponse(buf: Buffer): { response: ParsedResponse; consu
       return buf.length < 2 ? null : { response: { kind: "notFound" }, consumed: 2 };
     case MARKER_BUSY:
       return buf.length < 2 ? null : { response: { kind: "busy" }, consumed: 2 };
+    case MARKER_WRONG_NODE:
+      return buf.length < 2 ? null : { response: { kind: "wrongNode" }, consumed: 2 };
 
     case MARKER_VALUE: {
       const headerEnd = buf.indexOf(LF);

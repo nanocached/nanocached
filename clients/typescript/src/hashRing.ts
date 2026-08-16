@@ -6,8 +6,14 @@
  * consistent hash, but *this specific* one. nanocached-node instances are
  * independent (no cross-node coordination or replication), so which node
  * holds a given key is entirely a client-side decision; if this SDK's ring
- * disagreed with another client's (or bench's), the two would read and
- * write the same key on different nodes and never see each other's data.
+ * disagreed with another client's (or a node's own `src/hash_ring.rs`
+ * copy, computing an ADR-0008 handoff diff), the two would disagree about
+ * which node owns a key.
+ *
+ * Built from node *names*, not addresses (doc/adr/0009-*.md) — `route`
+ * returns a name, which the caller then looks up in a separate name ->
+ * address map to actually open a connection. This class itself doesn't
+ * know or care what its string identifiers mean.
  */
 
 const VIRTUAL_NODES_PER_NODE = 128;

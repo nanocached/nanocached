@@ -1,11 +1,12 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { Connection } from "./connection.js";
-import { connectAndIdentify } from "./identify.js";
+import { Connection, WrongNodeError } from "./connection.js";
+import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import type { NanocachedTlsOptions } from "./socket.js";
 
 export type { NanocachedTlsOptions } from "./socket.js";
+export { WrongNodeError } from "./connection.js";
 
 /** Thrown by get/set/delete when called after close(). Not thrown by
  * close() itself, which is idempotent (see NanocachedClient.close). */
@@ -50,6 +51,9 @@ function splitHostPort(address: string): { host: string; port: number } {
 
 type Target =
   | { kind: "single"; connection: Connection }
+  // `connections` is keyed by node *name* (doc/adr/0009-*.md), matching
+  // what `ring.route()` returns — not by address, which carries no
+  // identity meaning and is only used once, to open the connection.
   | { kind: "cluster"; ring: HashRing; connections: ReadonlyMap<string, Connection> };
 
 function targetKey(options: { host: string; port: number }): string {
@@ -102,10 +106,12 @@ export class NanocachedClient {
   private lastNodeListFetch = Date.now();
   private nodeListRefresh: Promise<void> | null = null;
 
-  /** The node(s) actually being talked to: `[url]` in single mode, or the
-   * set of nodes this instance currently holds a connection to in cluster
-   * mode — kept current by maybeRefreshNodeList(), which reconciles
-   * `target`'s ring/connections to match (see refreshNodeList). */
+  /** The node(s) actually being talked to, by address (for display/
+   * introspection — routing itself uses each node's name, not its
+   * address, see doc/adr/0009-*.md): `[url]` in single mode, or the set of
+   * nodes this instance currently holds a connection to in cluster mode —
+   * kept current by maybeRefreshNodeList(), which reconciles `target`'s
+   * ring/connections to match (see refreshNodeList). */
   nodeUrls: readonly string[];
 
   private constructor(
@@ -145,18 +151,19 @@ export class NanocachedClient {
       throw new Error(`nanocached: no live nodes registered with the discovery server at ${options.host}:${options.port}`);
     }
 
+    // Keyed by name (doc/adr/0009-*.md), not address — see `Target`.
     const sockets = new Map<string, Socket | TLSSocket>();
 
     try {
-      for (const nodeAddress of identified.nodes) {
-        const { host, port } = splitHostPort(nodeAddress);
+      for (const node of identified.nodes) {
+        const { host, port } = splitHostPort(node.address);
         const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls });
 
         if (nodeIdentified.kind !== "node") {
-          throw new Error(`nanocached: discovery server returned a non-node address: ${nodeAddress}`);
+          throw new Error(`nanocached: discovery server returned a non-node address: ${node.address}`);
         }
 
-        sockets.set(nodeAddress, nodeIdentified.socket);
+        sockets.set(node.name, nodeIdentified.socket);
       }
     } catch (error) {
       for (const socket of sockets.values()) socket.destroy();
@@ -166,16 +173,16 @@ export class NanocachedClient {
     trackOpenTarget(key, [...sockets.values()]);
 
     const connections = new Map<string, Connection>();
-    for (const [nodeAddress, socket] of sockets) connections.set(nodeAddress, new Connection(socket));
+    for (const [name, socket] of sockets) connections.set(name, new Connection(socket));
 
     return new NanocachedClient(
       {
         kind: "cluster",
-        ring: new HashRing(identified.nodes),
+        ring: new HashRing(identified.nodes.map((node) => node.name)),
         connections,
       },
       key,
-      identified.nodes,
+      identified.nodes.map((node) => node.address),
       options.authSecret,
       options.tls,
     );
@@ -208,31 +215,57 @@ export class NanocachedClient {
   async get(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.route(key).get(key);
+    return this.withWrongNodeRetry(key, (connection) => connection.get(key));
   }
 
   async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.route(key).set(key, value, options);
+    return this.withWrongNodeRetry(key, (connection) => connection.set(key, value, options));
   }
 
   /** Returns whether the key existed before this call. */
   async delete(key: string | Uint8Array): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.route(key).delete(key);
+    return this.withWrongNodeRetry(key, (connection) => connection.delete(key));
+  }
+
+  /** Runs `op` against `key`'s currently-routed connection. If the node
+   * answers `W` (ADR-0008: it no longer owns this key per its own view of
+   * cluster membership — this client's routing table is stale), forces a
+   * node-list refresh and retries once against the freshly-routed
+   * connection. A second `W` after a *fresh* refresh is unusual enough
+   * (this client, the routed-to node, and discovery all disagreeing right
+   * after resyncing) that retrying further would likely just mask a real
+   * problem, so that error propagates. In single mode there's no
+   * discovery to refresh from, so `W` propagates immediately — see
+   * `WrongNodeError`. */
+  private async withWrongNodeRetry<T>(
+    key: string | Uint8Array,
+    op: (connection: Connection) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await op(this.route(key));
+    } catch (error) {
+      if (!(error instanceof WrongNodeError) || this.target.kind !== "cluster") throw error;
+      await this.maybeRefreshNodeList({ force: true });
+      return await op(this.route(key));
+    }
   }
 
   /** No-op in single mode. In cluster mode, re-fetches the node list from
-   * discovery if it's older than NODE_LIST_STALE_AFTER_MS. Concurrent
-   * callers that both see a stale list share one in-flight refresh
-   * (nodeListRefresh is set synchronously, before the first await, so a
-   * second caller arriving before the first refresh resolves sees it
-   * already set) rather than each starting their own. */
-  private async maybeRefreshNodeList(): Promise<void> {
+   * discovery if it's older than NODE_LIST_STALE_AFTER_MS, or unconditionally
+   * when `force` is set (see withWrongNodeRetry). Concurrent callers that
+   * both need a refresh share one in-flight refresh (nodeListRefresh is set
+   * synchronously, before the first await, so a second caller arriving
+   * before the first refresh resolves sees it already set) rather than each
+   * starting their own — including a `force` call arriving while an
+   * ordinary staleness-triggered refresh is already in flight, which is
+   * still enough to satisfy it (either way, the node list ends up current). */
+  private async maybeRefreshNodeList(options?: { force?: boolean }): Promise<void> {
     if (this.target.kind !== "cluster") return;
-    if (Date.now() - this.lastNodeListFetch < NODE_LIST_STALE_AFTER_MS) return;
+    if (!options?.force && Date.now() - this.lastNodeListFetch < NODE_LIST_STALE_AFTER_MS) return;
 
     if (this.nodeListRefresh) {
       await this.nodeListRefresh;
@@ -283,36 +316,37 @@ export class NanocachedClient {
       return;
     }
 
-    const nodeSet = new Set(identified.nodes);
+    // Reconciled by name (doc/adr/0009-*.md), not address — see `Target`.
+    const nodeByName = new Map<string, DiscoveredNode>(identified.nodes.map((node) => [node.name, node]));
     const connections = new Map<string, Connection>(currentConnections);
 
-    for (const [address, connection] of currentConnections) {
-      if (!nodeSet.has(address)) {
+    for (const [name, connection] of currentConnections) {
+      if (!nodeByName.has(name)) {
         connection.close();
-        connections.delete(address);
+        connections.delete(name);
       }
     }
 
-    for (const address of identified.nodes) {
-      if (connections.has(address)) continue;
+    for (const node of identified.nodes) {
+      if (connections.has(node.name)) continue;
 
       try {
-        const nodeIdentified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls });
+        const nodeIdentified = await connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls });
 
         if (nodeIdentified.kind !== "node") {
-          console.warn(`nanocached: discovery server returned a non-node address: ${address}, skipping`);
+          console.warn(`nanocached: discovery server returned a non-node address: ${node.address}, skipping`);
           continue;
         }
 
         trackOpenTarget(this.url, [nodeIdentified.socket]);
-        connections.set(address, new Connection(nodeIdentified.socket));
+        connections.set(node.name, new Connection(nodeIdentified.socket));
       } catch (error) {
-        console.warn(`nanocached: could not connect to new node ${address}, will retry on the next refresh: ${(error as Error).message}`);
+        console.warn(`nanocached: could not connect to new node ${node.address}, will retry on the next refresh: ${(error as Error).message}`);
       }
     }
 
     this.target = { kind: "cluster", ring: new HashRing([...connections.keys()]), connections };
-    this.nodeUrls = [...connections.keys()];
+    this.nodeUrls = identified.nodes.filter((node) => connections.has(node.name)).map((node) => node.address);
     this.lastNodeListFetch = Date.now();
   }
 
@@ -320,11 +354,11 @@ export class NanocachedClient {
     if (this.target.kind === "single") return this.target.connection;
 
     const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
-    const node = this.target.ring.route(keyBytes);
+    const name = this.target.ring.route(keyBytes);
 
-    const connection = this.target.connections.get(node);
+    const connection = this.target.connections.get(name);
     if (!connection) {
-      throw new Error(`nanocached: ring routed to ${node}, which has no open connection`);
+      throw new Error(`nanocached: ring routed to ${name}, which has no open connection`);
     }
 
     return connection;

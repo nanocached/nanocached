@@ -9,16 +9,29 @@ export interface IdentifyOptions {
   tls?: boolean | NanocachedTlsOptions;
 }
 
+/** A node's consistent-hashing identity (a random per-process UUID) and
+ * its network address (`host:port`) — two different things since
+ * doc/adr/0009-*.md. `name` is what a hash ring must be built from, so
+ * every party (this client, another client, or a node computing a
+ * handoff) agrees on cluster membership; `address` is only for opening a
+ * connection, and carries no identity meaning of its own. */
+export interface DiscoveredNode {
+  name: string;
+  address: string;
+}
+
 /**
  * A single connection can turn out to be either a cache node (`kind:
  * "node"` — the socket is handed back live, ready for `G`/`S`/`D`) or a
  * discovery server (`kind: "cluster"` — the socket has already been used
- * for `L` and discarded; `nodes` is the address list it returned). Callers
- * never choose which of these to expect: `A`'s response says so (see
- * doc/adr/0007-*.md), which is what lets `NanocachedClient.connect()` take
- * the exact same options for either.
+ * for `L` and discarded; `nodes` is the name/address list it returned).
+ * Callers never choose which of these to expect: `A`'s response says so
+ * (see doc/adr/0007-*.md), which is what lets `NanocachedClient.connect()`
+ * take the exact same options for either.
  */
-export type IdentifyResult = { kind: "node"; socket: Socket | TLSSocket } | { kind: "cluster"; nodes: string[] };
+export type IdentifyResult =
+  | { kind: "node"; socket: Socket | TLSSocket }
+  | { kind: "cluster"; nodes: DiscoveredNode[] };
 
 function toBytes(value: string | Uint8Array): Buffer {
   return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
@@ -104,9 +117,12 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   throw new Error("nanocached: unexpected response to A");
 }
 
-/** Parses an `N <count>\n` header followed by `count` `<addr>\n` lines,
- * returning `null` while more bytes are still needed. */
-function tryParseNodeList(buf: Buffer): string[] | null {
+/** Parses an `N <count>\n` header followed by `count` entries, each
+ * `<name-length> <addr-length>\n<name><addr>\n` (doc/adr/0009-*.md) —
+ * name and address are simply concatenated, split by their declared
+ * lengths, not by a delimiter. Returns `null` while more bytes are still
+ * needed. */
+function tryParseNodeList(buf: Buffer): DiscoveredNode[] | null {
   const headerEnd = buf.indexOf(0x0a);
   if (headerEnd === -1) return null;
 
@@ -119,14 +135,39 @@ function tryParseNodeList(buf: Buffer): string[] | null {
     throw new Error("nanocached: invalid node count in discovery response");
   }
 
-  const nodes: string[] = [];
+  const nodes: DiscoveredNode[] = [];
   let offset = headerEnd + 1;
 
   for (let i = 0; i < count; i++) {
-    const lineEnd = buf.indexOf(0x0a, offset);
-    if (lineEnd === -1) return null;
-    nodes.push(buf.subarray(offset, lineEnd).toString("utf8"));
-    offset = lineEnd + 1;
+    const entryHeaderEnd = buf.indexOf(0x0a, offset);
+    if (entryHeaderEnd === -1) return null;
+
+    const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
+    if (lengths.length !== 2) {
+      throw new Error("nanocached: invalid node entry header in discovery response");
+    }
+
+    const nameLength = Number(lengths[0]);
+    const addrLength = Number(lengths[1]);
+    if (!Number.isInteger(nameLength) || nameLength < 0 || !Number.isInteger(addrLength) || addrLength < 0) {
+      throw new Error("nanocached: invalid node entry lengths in discovery response");
+    }
+
+    const nameStart = entryHeaderEnd + 1;
+    const addrStart = nameStart + nameLength;
+    const addrEnd = addrStart + addrLength;
+    const entryEnd = addrEnd + 1; // the trailing '\n' after the address
+
+    if (buf.length < entryEnd) return null;
+    if (buf[addrEnd] !== 0x0a) {
+      throw new Error("nanocached: malformed node entry in discovery response");
+    }
+
+    nodes.push({
+      name: buf.subarray(nameStart, addrStart).toString("utf8"),
+      address: buf.subarray(addrStart, addrEnd).toString("utf8"),
+    });
+    offset = entryEnd;
   }
 
   return nodes;
