@@ -30,6 +30,12 @@ pub enum Command {
     MarkMigrated {
         key: Bytes,
     },
+    /// Internal-only (ADR-0008): reverses `MarkMigrated` for a key whose
+    /// migration was cancelled (see `Command::CancelMigration`), so
+    /// `Sweep` doesn't reclaim it after all.
+    UnmarkMigrated {
+        key: Bytes,
+    },
     /// Internal-only (ADR-0008): the active-deletion pass, run
     /// periodically by a background task. Reclaims every marked entry
     /// and, since TTL expiry is otherwise only checked lazily on access,
@@ -46,20 +52,31 @@ pub enum Command {
         joining_addr: String,
         joined: Vec<(String, String)>,
     },
+    /// ADR-0008: sent by discovery to a ready node to abandon a handoff
+    /// it's mid-`Migrate` for — a ready or joining node died, or
+    /// discovery gave up waiting on a completion report. `joining_name`
+    /// identifies which handoff to abandon (a node only ever has one
+    /// active at a time, but a cancel for an already-finished or
+    /// never-started one must be a safe no-op — see `run_migration`).
+    CancelMigration {
+        joining_name: String,
+    },
 }
 
 impl Command {
-    /// Executes a cache operation. `Command::Auth`/`Migrate` are
-    /// intercepted by the connection handler before a command ever
-    /// reaches this point (neither is a plain cache operation: `Auth`
-    /// because the actor has no auth state, `Migrate` because it needs
-    /// network access the cache actor doesn't have), so neither can
+    /// Executes a cache operation. `Command::Auth`/`Migrate`/
+    /// `CancelMigration` are intercepted by the connection handler before
+    /// a command ever reaches this point (none is a plain cache
+    /// operation: `Auth` because the actor has no auth state,
+    /// `Migrate`/`CancelMigration` because they need network access or
+    /// migration-task state the cache actor doesn't have), so none can
     /// appear here.
     pub fn execute(self, cache: &mut Cache) -> Response {
         match self {
-            Self::Auth { .. } | Self::Migrate { .. } => {
+            Self::Auth { .. } | Self::Migrate { .. } | Self::CancelMigration { .. } => {
                 unreachable!(
-                    "Auth and Migrate are handled by the connection handler, not the cache actor"
+                    "Auth, Migrate, and CancelMigration are handled by the connection handler, \
+                     not the cache actor"
                 )
             }
 
@@ -88,6 +105,11 @@ impl Command {
             Self::MarkMigrated { key } => {
                 cache.mark_migrated(&key);
                 Response::Marked
+            }
+
+            Self::UnmarkMigrated { key } => {
+                cache.unmark_migrated(&key);
+                Response::Unmarked
             }
 
             Self::Sweep => Response::Swept(cache.sweep()),
@@ -228,6 +250,34 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let value = frame.slice(key_end..value_end);
 
             Ok(Command::Set { key, value, ttl })
+        }
+
+        b"X" => {
+            let joining_name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let joining_name_length = parse_length(joining_name_length)?;
+
+            if joining_name_length == 0 {
+                return Err(ParseError::EmptyField);
+            }
+
+            let joining_name_start = header_end + 1;
+            let joining_name_end = joining_name_start
+                .checked_add(joining_name_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < joining_name_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(joining_name_end);
+            let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
+
+            Ok(Command::CancelMigration { joining_name })
         }
 
         b"M" => {
@@ -599,7 +649,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Auth and Migrate are handled by the connection handler")]
+    #[should_panic(
+        expected = "Auth, Migrate, and CancelMigration are handled by the connection handler"
+    )]
     fn execute_panics_on_auth() {
         let mut cache = Cache::new(usize::MAX);
 
@@ -745,6 +797,35 @@ mod tests {
     #[test]
     fn rejects_an_empty_joining_name_in_migrate() {
         let mut input = buf(b"M 0 14 0\n127.0.0.1:8357");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn parses_a_cancel_migration_command() {
+        let mut input = buf(b"X 6\nnode-b");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::CancelMigration {
+                joining_name: "node-b".to_string(),
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_leaves_a_cancel_migration_command_untouched_when_the_name_is_incomplete() {
+        let original = b"X 6\nnod".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn rejects_an_empty_joining_name_in_cancel_migration() {
+        let mut input = buf(b"X 0\n");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }

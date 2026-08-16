@@ -163,6 +163,17 @@ impl Cache {
         }
     }
 
+    /// Reverses `mark_migrated`: this node is keeping `key` after all (its
+    /// migration was cancelled), so it must not be swept. A no-op if `key`
+    /// wasn't marked. Does not touch `pending_removal` — a key already
+    /// queued there by an earlier `sweep` refill finishes being removed
+    /// regardless (see `sweep_at`), since cancellation only runs while
+    /// `migration_in_progress` keeps `sweep` paused, so nothing this node
+    /// marks can have reached `pending_removal` yet.
+    pub fn unmark_migrated(&mut self, key: &[u8]) {
+        self.migrated.remove(key);
+    }
+
     /// ADR-0008's active-deletion facility: reclaims entries marked by
     /// `mark_migrated`, and — since `get_at`/`delete_at` only expire a
     /// TTL'd entry lazily, on access — also proactively removes anything
@@ -560,6 +571,28 @@ mod tests {
 
         cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
         cache.mark_migrated(b"name");
+
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn unmark_migrated_keeps_sweep_from_removing_the_entry() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+        cache.unmark_migrated(b"name");
+
+        assert_eq!(cache.sweep(), 0);
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn unmark_migrated_is_a_no_op_for_a_key_that_was_never_marked() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.unmark_migrated(b"name");
 
         assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
     }

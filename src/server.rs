@@ -9,8 +9,8 @@ use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -201,12 +201,14 @@ struct NodeContext {
     /// identify this node as the sender when it reports `C`.
     name: String,
     discovery_addr: String,
-    /// Incremented while `run_migration` is active, decremented when it
-    /// finishes (see `MigrationGuard`). `run_sweep` checks this and skips
-    /// its pass while it's non-zero, per ADR-0008: a marked-but-not-yet-
-    /// swept key may still be needed as the authoritative source for a
-    /// subsequent hop while a handoff is in flight.
-    migration_in_progress: Arc<AtomicU32>,
+    /// Set while `run_migration` is active, cleared when it finishes (see
+    /// `MigrationGuard`). Serves two purposes: `run_sweep` checks it and
+    /// skips its pass while it's `Some`, per ADR-0008 — a marked-but-not-
+    /// yet-swept key may still be needed as the authoritative source for
+    /// a subsequent hop while a handoff is in flight — and an incoming
+    /// `X` (cancel) uses it to find (by `joining_name`) and abort a
+    /// matching in-flight handoff.
+    active_migration: Arc<Mutex<Option<ActiveMigration>>>,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -269,12 +271,12 @@ pub(crate) async fn run(
     // Shared with `node_context` (when this node has one) so `run_sweep`
     // can tell whether an ADR-0008 handoff this node is the source for is
     // currently in flight, regardless of discovery configuration — a node
-    // running standalone never touches this beyond the initial 0.
-    let migration_in_progress = Arc::new(AtomicU32::new(0));
+    // running standalone never touches this beyond the initial `None`.
+    let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
 
     let sweep_task = tokio::spawn(run_sweep(
         request_tx.clone(),
-        Arc::clone(&migration_in_progress),
+        Arc::clone(&active_migration),
         shutdown_rx.clone(),
     ));
 
@@ -286,7 +288,7 @@ pub(crate) async fn run(
     let node_context = heartbeat.as_ref().map(|config| NodeContext {
         name: Uuid::new_v4().to_string(),
         discovery_addr: config.discovery_addr.clone(),
-        migration_in_progress: Arc::clone(&migration_in_progress),
+        active_migration: Arc::clone(&active_migration),
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
@@ -512,6 +514,34 @@ async fn handle_connection(
                     joining_addr,
                     joined,
                 ));
+
+                continue;
+            }
+            Ok(Command::CancelMigration { joining_name }) => {
+                let Some(node_context) = config.node_context.clone() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "received X but this node isn't configured with a discovery server",
+                    ));
+                };
+
+                // A safe no-op if there's no active migration, or it's for
+                // a different `joining_name` (already finished, or this
+                // cancel arrived late) — `run_migration` alone decides
+                // whether to actually stop.
+                if let Some(active) = node_context
+                    .active_migration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    && active.joining_name == joining_name
+                {
+                    active.abort_requested.store(true, Ordering::SeqCst);
+                }
+
+                stream
+                    .write_all(&Response::MigrationCancelled.encode())
+                    .await?;
 
                 continue;
             }
@@ -765,22 +795,47 @@ fn complete_message(name: &str) -> Vec<u8> {
     message
 }
 
-/// Tracks that a `run_migration` is active for the counter's lifetime
-/// (incremented on construction, decremented on drop — including an early
-/// return or panic), so `run_sweep` can tell to pause. See
-/// `NodeContext::migration_in_progress`.
-struct MigrationGuard(Arc<AtomicU32>);
+/// A `run_migration` in flight: which handoff it's for, and the flag an
+/// incoming `X` (cancel) sets to ask it to stop. See
+/// `NodeContext::active_migration`.
+struct ActiveMigration {
+    joining_name: String,
+    abort_requested: Arc<AtomicBool>,
+}
 
-impl MigrationGuard {
-    fn new(counter: Arc<AtomicU32>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self(counter)
+/// Occupies `slot` with an `ActiveMigration` for `joining_name` for this
+/// guard's lifetime (cleared back to `None` on drop — including an early
+/// return or panic), so `run_sweep` can tell to pause and an incoming `X`
+/// can find this handoff to cancel it. Exposes `abort_requested` so
+/// `run_migration` can poll it directly without re-locking `slot` on
+/// every entry.
+struct MigrationGuard<'a> {
+    slot: &'a Mutex<Option<ActiveMigration>>,
+    abort_requested: Arc<AtomicBool>,
+}
+
+impl<'a> MigrationGuard<'a> {
+    fn new(slot: &'a Mutex<Option<ActiveMigration>>, joining_name: String) -> Self {
+        let abort_requested = Arc::new(AtomicBool::new(false));
+
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveMigration {
+            joining_name,
+            abort_requested: Arc::clone(&abort_requested),
+        });
+
+        Self {
+            slot,
+            abort_requested,
+        }
     }
 }
 
-impl Drop for MigrationGuard {
+impl Drop for MigrationGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -804,7 +859,7 @@ async fn run_migration(
     joining_addr: String,
     joined: Vec<(String, String)>,
 ) {
-    let _migration_guard = MigrationGuard::new(Arc::clone(&node_context.migration_in_progress));
+    let migration_guard = MigrationGuard::new(&node_context.active_migration, joining_name.clone());
 
     let mut ring_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
     ring_members.push(joining_name.clone());
@@ -818,7 +873,13 @@ async fn run_migration(
         }
     };
 
+    let mut marked_this_run = Vec::new();
+
     for (key, value, ttl) in entries {
+        if migration_guard.abort_requested.load(Ordering::SeqCst) {
+            break;
+        }
+
         if after_ring.route(&key) != joining_name {
             continue;
         }
@@ -831,6 +892,17 @@ async fn run_migration(
         }
 
         mark_migrated(&node_context.request_tx, &key).await;
+        marked_this_run.push(key);
+    }
+
+    if migration_guard.abort_requested.load(Ordering::SeqCst) {
+        for key in marked_this_run {
+            unmark_migrated(&node_context.request_tx, &key).await;
+        }
+
+        eprintln!("migration to {joining_addr} cancelled by discovery; rolled back its marks");
+
+        return;
     }
 
     if let Err(error) = report_complete(&node_context).await {
@@ -875,6 +947,21 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
     }
 }
 
+async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
+    let (response_tx, response_rx) = oneshot::channel();
+
+    if request_tx
+        .send(CacheRequest {
+            command: Command::UnmarkMigrated { key: key.clone() },
+            response_tx,
+        })
+        .await
+        .is_ok()
+    {
+        let _ = response_rx.await;
+    }
+}
+
 /// ADR-0008's active-deletion background task: every `SWEEP_INTERVAL`,
 /// reclaims migrated-marked and TTL-expired entries. `Cache::sweep`
 /// removes at most `SWEEP_BUDGET` entries per call so it can't stall other
@@ -884,13 +971,13 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
 /// call that hits that cap likely left more behind, so this loops back
 /// immediately (no `SWEEP_INTERVAL` wait) until a call reports less than a
 /// full budget removed, meaning the backlog is drained for now. Skips
-/// (and doesn't drain a backlog) while `migration_in_progress` is
-/// non-zero — this node is the source for an in-progress handoff, so a
-/// marked-but-not-yet-swept key may still be needed as the authoritative
-/// source for a subsequent hop (see `NodeContext::migration_in_progress`).
+/// (and doesn't drain a backlog) while `active_migration` is `Some` — this
+/// node is the source for an in-progress handoff, so a marked-but-not-yet-
+/// swept key may still be needed as the authoritative source for a
+/// subsequent hop (see `NodeContext::active_migration`).
 async fn run_sweep(
     request_tx: mpsc::Sender<CacheRequest>,
-    migration_in_progress: Arc<AtomicU32>,
+    active_migration: Arc<Mutex<Option<ActiveMigration>>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -899,7 +986,12 @@ async fn run_sweep(
         }
 
         loop {
-            if migration_in_progress.load(Ordering::SeqCst) > 0 {
+            let migration_active = active_migration
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some();
+
+            if migration_active {
                 break;
             }
 
@@ -1574,7 +1666,7 @@ mod tests {
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
                     discovery_addr,
-                    migration_in_progress: Arc::new(AtomicU32::new(0)),
+                    active_migration: Arc::new(Mutex::new(None)),
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
@@ -1613,10 +1705,139 @@ mod tests {
 
         joining_task.await.unwrap();
         discovery_task.await.unwrap();
-        drop(request_tx);
-        cache_task.await.unwrap();
+        // Ends `connection_task` (dropping its `node_context`'s
+        // `request_tx` clone) before awaiting `cache_task`, which needs
+        // every sender dropped to see its channel close — otherwise this
+        // deadlocks until `handle_connection`'s own idle timeout breaks
+        // it, wasting `IDLE_TIMEOUT` (30s) on every run for nothing (the
+        // same class of ordering bug `run`'s shutdown path had).
         client.shutdown().await.unwrap();
         let _ = connection_task.await;
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_cancelled_mid_transfer_rolls_back_marks_and_skips_completion() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake joining node: accepts the SET but withholds its ack until
+        // told to, via `release_rx` — so the test can be sure `X` is fully
+        // processed before `run_migration`'s `set_on_joining_node` call
+        // for this key ever returns, making this deterministic regardless
+        // of relative timing.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let (set_received_tx, set_received_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            set_received_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            connection.write_all(b"S\n").await.unwrap();
+        });
+
+        // A fake discovery server: must receive nothing — a cancelled
+        // migration doesn't report completion.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    discovery_addr,
+                    active_migration: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+            },
+            shutdown_rx.clone(),
+        ));
+
+        let joining_name = "joining-node";
+        let mut migrate_message =
+            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+
+        client.write_all(&migrate_message).await.unwrap();
+
+        let mut ack = [0u8; 2];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        // The joining node has the SET in hand but hasn't acked it yet, so
+        // `run_migration` is still blocked on that ack — send the cancel
+        // now, on the same connection (a fresh one-shot connection, as
+        // discovery would really use, is equivalent from the node's side).
+        set_received_rx.await.unwrap();
+
+        let mut cancel_message = format!("X {}\n", joining_name.len()).into_bytes();
+        cancel_message.extend_from_slice(joining_name.as_bytes());
+        client.write_all(&cancel_message).await.unwrap();
+
+        let mut cancel_ack = [0u8; 2];
+        client.read_exact(&mut cancel_ack).await.unwrap();
+        assert_eq!(&cancel_ack, b"A\n");
+
+        // Only now let the joining node's ack through, so `run_migration`
+        // resumes with `abort_requested` already set.
+        release_tx.send(()).unwrap();
+        joining_task.await.unwrap();
+
+        // Nothing should ever connect to "discovery" — poll briefly for
+        // the absence of a connection rather than asserting instantly.
+        let no_completion_reported =
+            timeout(Duration::from_millis(200), discovery_listener.accept())
+                .await
+                .is_err();
+        assert!(
+            no_completion_reported,
+            "a cancelled migration must not report completion"
+        );
+
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: Bytes::from_static(b"name")
+                }
+            )
+            .await,
+            Response::Value(Bytes::from_static(b"Alice"))
+        );
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep).await,
+            Response::Swept(0)
+        );
+
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     /// Parses a `J <name-length> <addr-length>\n<name><addr>` message (the

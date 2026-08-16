@@ -104,6 +104,14 @@ const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
 const MAX_CONNECTIONS: usize = 1024;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
+/// ADR-0008 pattern-3 guard: a ready node can be alive (heartbeating
+/// normally) yet never report `C` for a handoff it's mid-`Migrate` for —
+/// no TCP-level signal distinguishes "legitimately still working" from
+/// "stuck" (a lost ack, a bug), so this is a plain timeout. Past it,
+/// `abandon_current_join` scraps the join and sends every ready node an
+/// `X` to roll back, exactly as it does when a node's connection dies
+/// outright (patterns 1/2).
+const DEFAULT_MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -161,10 +169,14 @@ type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
 /// through `Waiting` -> `Joining` at a time). `completed` accumulates the
 /// names (ADR-0009) of ready nodes that have reported finishing their
 /// handoff via `C`; once it covers all of `expected`, the joining node is
-/// promoted.
+/// promoted. `started_at` backs the timeout that catches a ready node
+/// that's alive but never reports in (see `abandon_current_join`,
+/// `MIGRATION_TIMEOUT`).
 struct PendingJoin {
+    joining_name: String,
     expected: HashSet<String>,
     completed: HashSet<String>,
+    started_at: Instant,
 }
 
 type CurrentJoin = Arc<Mutex<Option<PendingJoin>>>;
@@ -298,6 +310,7 @@ struct Args {
     host: String,
     port: u16,
     liveness_timeout: Duration,
+    migration_timeout: Duration,
     tls_cert: Option<String>,
     tls_key: Option<String>,
 }
@@ -308,6 +321,7 @@ impl Default for Args {
             host: "127.0.0.1".to_string(),
             port: 8357,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
+            migration_timeout: DEFAULT_MIGRATION_TIMEOUT,
             tls_cert: None,
             tls_key: None,
         }
@@ -336,6 +350,13 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --liveness-timeout: {raw_secs}"))?;
                 args.liveness_timeout = Duration::from_secs(secs);
             }
+            "--migration-timeout" => {
+                let raw_secs = value()?;
+                let secs: u64 = raw_secs
+                    .parse()
+                    .map_err(|_| format!("invalid value for --migration-timeout: {raw_secs}"))?;
+                args.migration_timeout = Duration::from_secs(secs);
+            }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "-h" | "--help" => return Err(usage()),
@@ -358,6 +379,9 @@ Usage: nanocached-discovery [options]
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
                                  a heartbeat (default 15)
+  --migration-timeout <secs>    abandon a join if a ready node hasn't
+                                 reported completion after this many
+                                 seconds (default 60)
   --tls-cert <path>             PEM certificate chain; requires TLS on
                                  every accepted connection (no plaintext
                                  fallback)
@@ -625,8 +649,10 @@ async fn try_begin_next_join(
         let expected: HashSet<String> = joined.iter().map(|(name, _)| name.clone()).collect();
 
         *join_guard = Some(PendingJoin {
+            joining_name: name.clone(),
             expected,
             completed: HashSet::new(),
+            started_at: Instant::now(),
         });
 
         (name, joining_addr, joined)
@@ -732,6 +758,56 @@ async fn send_migrate(
     Ok(())
 }
 
+/// Connects to `address` (a ready node) as a client and sends `X`, telling
+/// it to abandon whatever handoff it has in flight for `joining_name` —
+/// used by `abandon_current_join` to return every ready node to its
+/// pre-migration state once a join is scrapped. Best-effort: the caller
+/// moves on regardless of the outcome here (see its doc comment) — a node
+/// that never receives this either wasn't actually working on this
+/// handoff (safe no-op on its end) or will find out its `C` report goes
+/// nowhere once `current_join` has already moved on.
+async fn send_cancel(
+    address: &str,
+    auth_secret: &Option<Bytes>,
+    joining_name: &str,
+) -> io::Result<()> {
+    let mut stream = TcpStream::connect(address).await?;
+    let _ = stream.set_nodelay(true);
+
+    if let Some(secret) = auth_secret {
+        let mut auth = format!("A {}\n", secret.len()).into_bytes();
+        auth.extend_from_slice(secret);
+        stream.write_all(&auth).await?;
+
+        let mut ack = [0u8; 3];
+        stream.read_exact(&mut ack).await?;
+
+        if &ack != b"On\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "node rejected the auth secret",
+            ));
+        }
+    }
+
+    let mut message = format!("X {}\n", joining_name.len()).into_bytes();
+    message.extend_from_slice(joining_name.as_bytes());
+
+    stream.write_all(&message).await?;
+
+    let mut ack = [0u8; 2];
+    stream.read_exact(&mut ack).await?;
+
+    if &ack != b"A\n" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "node did not acknowledge X",
+        ));
+    }
+
+    Ok(())
+}
+
 /// Moves `name` to `Joined`, making it visible in future `L` responses,
 /// and wakes its held-open connection so it can push the `R\n` promotion
 /// notice.
@@ -800,41 +876,108 @@ async fn handle_complete(
             return;
         }
 
+        let joining_name = pending.joining_name.clone();
         *join_guard = None;
-
-        lock(registry)
-            .iter()
-            .find(|(_, info)| info.state == NodeState::Joining)
-            .map(|(name, _)| name.clone())
+        joining_name
     };
 
-    if let Some(name) = joining_name {
-        promote_to_joined(registry, &name);
-    }
-
+    promote_to_joined(registry, &joining_name);
     try_begin_next_join(registry, current_join, auth_secret).await;
 }
 
-/// Cleans up after a Waiting/Joining node's connection dies before it
-/// reached Joined: removes its registry entry, and if it was the node
-/// currently tracked as Joining, clears the in-progress join so a future
-/// join request isn't blocked on one that can never complete, and lets
-/// the next Waiting node (if any) start.
-async fn abandon_join(
+/// Called whenever any node's connection to discovery ends (cleanly or
+/// not), by name. A Waiting/Joining node has no liveness signal besides
+/// this one connection (see `NodeInfo::promoted`'s doc comment), so its
+/// registry entry is removed outright; a `Joined` node keeps relying on
+/// `sweep_expired`'s timeout instead, since an ordinary connection
+/// hiccup — reconnecting for the next heartbeat, say — shouldn't evict it
+/// (this fires once per connection, not once per heartbeat).
+///
+/// If `name` turns out to matter to the current join — it *was* that
+/// join's Waiting/Joining node (pattern: joining node dies mid-handoff),
+/// or it's a ready node `current_join` is still waiting on a `C` from
+/// (pattern: a ready node dies mid-handoff) — the whole join is
+/// abandoned via `abandon_current_join`. An ordinary `Joined` node with
+/// no bearing on any in-progress join is left alone here.
+async fn on_node_connection_ended(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     name: &str,
 ) {
-    let was_joining = lock(registry)
-        .remove(name)
-        .map(|info| info.state == NodeState::Joining)
-        .unwrap_or(false);
+    let was_waiting_or_joining = lock(registry)
+        .get(name)
+        .is_some_and(|info| info.state != NodeState::Joined);
 
-    if was_joining {
-        *lock_current_join(current_join) = None;
-        try_begin_next_join(registry, current_join, auth_secret).await;
+    if was_waiting_or_joining {
+        lock(registry).remove(name);
     }
+
+    let matters_to_current_join = was_waiting_or_joining
+        || lock_current_join(current_join)
+            .as_ref()
+            .is_some_and(|pending| pending.expected.contains(name));
+
+    if matters_to_current_join {
+        abandon_current_join(registry, current_join, auth_secret).await;
+    }
+}
+
+/// Scraps the current join (if any), returning every node it touched to
+/// its pre-migration state: clears `current_join`, removes the joining
+/// node from the registry (it was never in `L` to begin with, so this is
+/// nothing more than dropping bookkeeping), and tells every still-
+/// registered ready node in `expected` to roll back via `X` (see
+/// `send_cancel`) — a ready node that already finished, or never gets the
+/// message, is unaffected. Then lets the next `Waiting` node (if any)
+/// start. A no-op if no join is in progress.
+async fn abandon_current_join(
+    registry: &Registry,
+    current_join: &CurrentJoin,
+    auth_secret: &Option<Bytes>,
+) {
+    let Some(pending) = lock_current_join(current_join).take() else {
+        return;
+    };
+
+    lock(registry).remove(&pending.joining_name);
+
+    let ready_addrs: Vec<(String, String)> = {
+        let guard = lock(registry);
+        pending
+            .expected
+            .iter()
+            .filter_map(|name| {
+                guard
+                    .get(name)
+                    .map(|info| (name.clone(), info.address.clone()))
+            })
+            .collect()
+    };
+
+    let mut sends = JoinSet::new();
+
+    for (ready_name, ready_addr) in ready_addrs {
+        let auth_secret = auth_secret.clone();
+        let joining_name = pending.joining_name.clone();
+
+        sends.spawn(async move {
+            let result = send_cancel(&ready_addr, &auth_secret, &joining_name).await;
+            (ready_name, result)
+        });
+    }
+
+    while let Some(outcome) = sends.join_next().await {
+        match outcome {
+            Ok((ready_name, Err(error))) => {
+                eprintln!("failed to send X (cancel) to {ready_name}: {error}");
+            }
+            Ok((_, Ok(()))) => {}
+            Err(error) => eprintln!("a task sending X panicked: {error}"),
+        }
+    }
+
+    try_begin_next_join(registry, current_join, auth_secret).await;
 }
 
 /// Holds a Waiting/Joining node's connection open after it sends `J`,
@@ -900,6 +1043,7 @@ async fn shutdown_signal() -> io::Result<()> {
 async fn run(
     address: &str,
     liveness_timeout: Duration,
+    migration_timeout: Duration,
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> io::Result<()> {
@@ -913,13 +1057,16 @@ async fn run(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
-        auth_secret,
+        auth_secret: auth_secret.clone(),
         tls_acceptor,
     };
 
     let sweep_task = tokio::spawn(sweep_expired(
         Arc::clone(&cluster_state.registry),
+        Arc::clone(&cluster_state.current_join),
+        auth_secret,
         liveness_timeout,
+        migration_timeout,
         shutdown_rx.clone(),
     ));
 
@@ -1020,17 +1167,41 @@ async fn dispatch_connection(
 
     connection_tasks.spawn(async move {
         let _connection_permit = permit;
+        // Written once this connection identifies itself via `J` (a plain
+        // client connection never does, and stays `None`) — read
+        // afterward, regardless of how `handle_connection` exits, so
+        // `on_node_connection_ended` runs uniformly instead of needing a
+        // cleanup call at every one of its internal return points.
+        let connection_name: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
 
-        if let Err(error) = handle_connection(
+        let result = handle_connection(
             stream,
-            cluster_state.registry,
-            cluster_state.current_join,
-            config,
+            cluster_state.registry.clone(),
+            cluster_state.current_join.clone(),
+            config.clone(),
             shutdown_rx,
+            Arc::clone(&connection_name),
         )
-        .await
-        {
+        .await;
+
+        if let Err(error) = &result {
             eprintln!("connection error from {address}: {error}");
+        }
+
+        let name = connection_name
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        if let Some(name) = name {
+            on_node_connection_ended(
+                &cluster_state.registry,
+                &cluster_state.current_join,
+                &config.auth_secret,
+                &name,
+            )
+            .await;
         }
     });
 
@@ -1039,7 +1210,10 @@ async fn dispatch_connection(
 
 async fn sweep_expired(
     registry: Registry,
+    current_join: CurrentJoin,
+    auth_secret: Option<Bytes>,
     liveness_timeout: Duration,
+    migration_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let sweep_interval = (liveness_timeout / 4)
@@ -1059,6 +1233,16 @@ async fn sweep_expired(
                     info.state != NodeState::Joined
                         || now.duration_since(info.last_heartbeat) < liveness_timeout
                 });
+
+                // ADR-0008 pattern 3: a ready node alive but never
+                // reporting `C` (see `DEFAULT_MIGRATION_TIMEOUT`).
+                let timed_out = lock_current_join(&current_join)
+                    .as_ref()
+                    .is_some_and(|pending| pending.started_at.elapsed() >= migration_timeout);
+
+                if timed_out {
+                    abandon_current_join(&registry, &current_join, &auth_secret).await;
+                }
             }
             _ = shutdown_rx.changed() => return,
         }
@@ -1071,6 +1255,7 @@ async fn handle_connection(
     current_join: CurrentJoin,
     config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
+    connection_name: Arc<std::sync::Mutex<Option<String>>>,
 ) -> io::Result<()> {
     let mut received = BytesMut::new();
     // No secret configured means auth isn't required, so every connection
@@ -1144,15 +1329,14 @@ async fn handle_connection(
                 continue;
             }
             Ok(DiscoveryCommand::Join { name, addr }) => {
+                *connection_name
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
+
                 let promoted =
                     start_join(&registry, &current_join, &config.auth_secret, &name, addr).await;
 
-                if let Err(error) =
-                    wait_for_promotion(&mut stream, promoted, shutdown_rx.clone()).await
-                {
-                    abandon_join(&registry, &current_join, &config.auth_secret, &name).await;
-                    return Err(error);
-                }
+                wait_for_promotion(&mut stream, promoted, shutdown_rx.clone()).await?;
 
                 continue;
             }
@@ -1231,6 +1415,7 @@ async fn main() -> ExitCode {
     if let Err(err) = run(
         &address,
         args.liveness_timeout,
+        args.migration_timeout,
         read_auth_secret(),
         tls_acceptor,
     )
@@ -1402,6 +1587,7 @@ mod tests {
                     tls_acceptor: None,
                 },
                 shutdown_rx,
+                Arc::new(std::sync::Mutex::new(None)),
             )
             .await;
         });
@@ -1452,6 +1638,7 @@ mod tests {
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         node_a
             .write_all(b"J 6 14\nnode-a127.0.0.1:9001")
@@ -1471,6 +1658,7 @@ mod tests {
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         node_b
             .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
@@ -1499,6 +1687,7 @@ mod tests {
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         lister.write_all(b"L\n").await.unwrap();
         let expected_list = b"N 1\n6 14\nnode-a127.0.0.1:9001\n";
@@ -1561,6 +1750,7 @@ mod tests {
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         node_a
             .write_all(format!("J 6 {}\nnode-a{ready_addr}", ready_addr.len()).as_bytes())
@@ -1579,6 +1769,7 @@ mod tests {
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
         ));
         node_b
             .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
@@ -1640,6 +1831,7 @@ mod tests {
                 tls_acceptor: None,
             },
             shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         client.write_all(b"L\n").await.unwrap();
@@ -1669,6 +1861,7 @@ mod tests {
                 tls_acceptor: None,
             },
             shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         client.write_all(b"A 11\nwrong-value").await.unwrap();
@@ -1698,6 +1891,7 @@ mod tests {
                 tls_acceptor: None,
             },
             shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         client.write_all(b"A 14\ncorrect-secretL\n").await.unwrap();
@@ -1734,6 +1928,7 @@ mod tests {
                 tls_acceptor: None,
             },
             shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
         ));
 
         client.write_all(b"A 8\nanything").await.unwrap();
@@ -1827,9 +2022,13 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let sweep_task = tokio::spawn(sweep_expired(
             Arc::clone(&registry),
+            current_join,
+            None,
             Duration::from_secs(1),
+            Duration::from_secs(60),
             shutdown_rx,
         ));
 
@@ -1915,5 +2114,156 @@ mod tests {
         assert_eq!(response, expected);
 
         server_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ready_nodes_connection_dying_mid_join_abandons_the_join_and_cancels_other_ready_nodes()
+     {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+
+        // A fake still-alive ready node, standing in for node B: expects
+        // an `X` naming the abandoned join and acks it.
+        let other_ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other_ready_addr = other_ready_listener.local_addr().unwrap().to_string();
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let other_ready_task = tokio::spawn(async move {
+            let (mut connection, _) = other_ready_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(other_ready_addr, NodeState::Joined),
+        );
+        lock(&registry).insert(
+            "node-c".to_string(),
+            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-c".to_string(),
+            expected: ["node-a".to_string(), "node-b".to_string()]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+        })));
+
+        // Node A's connection to discovery dies (ADR-0008 pattern: a ready
+        // node dies mid-handoff).
+        on_node_connection_ended(&registry, &current_join, &None, "node-a").await;
+
+        other_ready_task.await.unwrap();
+
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(
+            !lock(&registry).contains_key("node-c"),
+            "the abandoned joining node must not linger in the registry"
+        );
+
+        let mut expected_cancel = b"X 6\n".to_vec();
+        expected_cancel.extend_from_slice(b"node-c");
+        assert_eq!(*received.lock().unwrap(), expected_cancel);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_joining_nodes_connection_dying_abandons_its_own_join_and_cancels_ready_nodes() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+
+        let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready_addr = ready_listener.local_addr().unwrap().to_string();
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let ready_task = tokio::spawn(async move {
+            let (mut connection, _) = ready_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(ready_addr, NodeState::Joined),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: ["node-a".to_string()].into_iter().collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+        })));
+
+        // Node B (the joining node itself) disconnects before being
+        // promoted (ADR-0008 pattern: the joining node dies mid-handoff).
+        on_node_connection_ended(&registry, &current_join, &None, "node-b").await;
+
+        ready_task.await.unwrap();
+
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-b"));
+
+        let mut expected_cancel = b"X 6\n".to_vec();
+        expected_cancel.extend_from_slice(b"node-b");
+        assert_eq!(*received.lock().unwrap(), expected_cancel);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_join_that_never_completes_is_abandoned_after_the_migration_timeout() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: ["node-a".to_string()].into_iter().collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+        })));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            Duration::from_secs(60),
+            Duration::from_secs(2),
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::task::yield_now().await;
+
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-b"));
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
     }
 }

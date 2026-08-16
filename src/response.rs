@@ -14,11 +14,18 @@ pub enum Response {
     /// parsed — not that the handoff it kicks off has finished. That
     /// completion is reported separately, node-to-discovery, via `C`.
     MigrationAccepted,
+    /// ADR-0008: acknowledges an `X` (cancel migration) request was
+    /// received and parsed — not that any in-progress handoff it names
+    /// was actually found and aborted (a cancel for an already-finished
+    /// or never-started handoff is a safe no-op on the node's side).
+    MigrationCancelled,
     /// Internal-only (ADR-0008), in answer to `Command::ListEntries` —
     /// never encoded for a wire client, see `encode`.
     Entries(Vec<(Bytes, Bytes, Option<Duration>)>),
     /// Internal-only (ADR-0008), in answer to `Command::MarkMigrated`.
     Marked,
+    /// Internal-only (ADR-0008), in answer to `Command::UnmarkMigrated`.
+    Unmarked,
     /// Internal-only (ADR-0008), in answer to `Command::Sweep` — how many
     /// entries the sweep actually removed.
     Swept(usize),
@@ -34,6 +41,7 @@ impl Response {
             Self::AuthOk => b"On\n".to_vec(),
             Self::Unauthorized => b"En\n".to_vec(),
             Self::MigrationAccepted => b"A\n".to_vec(),
+            Self::MigrationCancelled => b"A\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -48,7 +56,7 @@ impl Response {
                 encoded
             }
 
-            Self::Entries(_) | Self::Marked | Self::Swept(_) => {
+            Self::Entries(_) | Self::Marked | Self::Unmarked | Self::Swept(_) => {
                 unreachable!(
                     "internal-only response (ADR-0008): never sent to a wire client, only \
                      matched directly in Rust by the migration task"
