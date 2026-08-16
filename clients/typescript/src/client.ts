@@ -56,6 +56,11 @@ function targetKey(options: { host: string; port: number }): string {
   return `${options.host}:${options.port}`;
 }
 
+// How long a cluster client's node list may go without being re-fetched
+// from discovery before get/set/delete refreshes it first. Checked lazily
+// on use rather than on a timer — see NanocachedClient.maybeRefreshNodeList.
+const NODE_LIST_STALE_AFTER_MS = 30_000;
+
 // Tracks, per connect() target (not per instance — there's no `close()` yet
 // to hook into), how many live sockets are still open for it. Purely a
 // programming-error guard: catches "connect() called again for the same
@@ -94,8 +99,26 @@ function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void 
  */
 export class NanocachedClient {
   private closed = false;
+  private lastNodeListFetch = Date.now();
+  private nodeListRefresh: Promise<void> | null = null;
 
-  private constructor(private readonly target: Target) {}
+  /** The node(s) actually being talked to: `[url]` in single mode, or the
+   * set of nodes this instance currently holds a connection to in cluster
+   * mode — kept current by maybeRefreshNodeList(), which reconciles
+   * `target`'s ring/connections to match (see refreshNodeList). */
+  nodeUrls: readonly string[];
+
+  private constructor(
+    private target: Target,
+    /** The `host:port` passed to connect() — a node's own address in
+     * single mode, the discovery server's address in cluster mode. */
+    readonly url: string,
+    nodeUrls: readonly string[],
+    private readonly authSecret: string | Uint8Array | undefined,
+    private readonly tls: boolean | NanocachedTlsOptions | undefined,
+  ) {
+    this.nodeUrls = nodeUrls;
+  }
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
     const key = targetKey(options);
@@ -109,7 +132,13 @@ export class NanocachedClient {
 
     if (identified.kind === "node") {
       trackOpenTarget(key, [identified.socket]);
-      return new NanocachedClient({ kind: "single", connection: new Connection(identified.socket) });
+      return new NanocachedClient(
+        { kind: "single", connection: new Connection(identified.socket) },
+        key,
+        [key],
+        options.authSecret,
+        options.tls,
+      );
     }
 
     if (identified.nodes.length === 0) {
@@ -139,11 +168,17 @@ export class NanocachedClient {
     const connections = new Map<string, Connection>();
     for (const [nodeAddress, socket] of sockets) connections.set(nodeAddress, new Connection(socket));
 
-    return new NanocachedClient({
-      kind: "cluster",
-      ring: new HashRing(identified.nodes),
-      connections,
-    });
+    return new NanocachedClient(
+      {
+        kind: "cluster",
+        ring: new HashRing(identified.nodes),
+        connections,
+      },
+      key,
+      identified.nodes,
+      options.authSecret,
+      options.tls,
+    );
   }
 
   /** Whether close() has already been called on this instance. */
@@ -172,18 +207,113 @@ export class NanocachedClient {
 
   async get(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
     return this.route(key).get(key);
   }
 
   async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
     return this.route(key).set(key, value, options);
   }
 
   /** Returns whether the key existed before this call. */
   async delete(key: string | Uint8Array): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
     return this.route(key).delete(key);
+  }
+
+  /** No-op in single mode. In cluster mode, re-fetches the node list from
+   * discovery if it's older than NODE_LIST_STALE_AFTER_MS. Concurrent
+   * callers that both see a stale list share one in-flight refresh
+   * (nodeListRefresh is set synchronously, before the first await, so a
+   * second caller arriving before the first refresh resolves sees it
+   * already set) rather than each starting their own. */
+  private async maybeRefreshNodeList(): Promise<void> {
+    if (this.target.kind !== "cluster") return;
+    if (Date.now() - this.lastNodeListFetch < NODE_LIST_STALE_AFTER_MS) return;
+
+    if (this.nodeListRefresh) {
+      await this.nodeListRefresh;
+      return;
+    }
+
+    this.nodeListRefresh = this.refreshNodeList();
+    try {
+      await this.nodeListRefresh;
+    } finally {
+      this.nodeListRefresh = null;
+    }
+  }
+
+  /** Re-fetches the node list and reconciles `target`'s ring/connections
+   * to match: closes connections to nodes no longer listed, opens
+   * connections to newly listed ones, and leaves unchanged nodes' existing
+   * connections (and any in-flight requests on them) alone.
+   *
+   * Per ADR-2, a discovery outage should degrade only topology updates,
+   * not already-established cache traffic — so failure here (discovery
+   * unreachable, or a specific new node failing to connect) never throws
+   * out to the get/set/delete call that triggered it. It logs a warning,
+   * keeps the current target as-is (skipping just the node that failed to
+   * connect, if only one did), and tries again on the next stale check. */
+  private async refreshNodeList(): Promise<void> {
+    if (this.target.kind !== "cluster") return;
+    const currentConnections = this.target.connections;
+
+    let identified;
+    try {
+      identified = await connectAndIdentify({ ...splitHostPort(this.url), authSecret: this.authSecret, tls: this.tls });
+    } catch (error) {
+      console.warn(`nanocached: could not refresh the node list from ${this.url}, keeping the last-known list: ${(error as Error).message}`);
+      this.lastNodeListFetch = Date.now();
+      return;
+    }
+
+    if (identified.kind !== "cluster") {
+      console.warn(`nanocached: ${this.url} no longer identifies as a discovery server, keeping the last-known list`);
+      this.lastNodeListFetch = Date.now();
+      return;
+    }
+
+    if (identified.nodes.length === 0) {
+      console.warn(`nanocached: discovery server at ${this.url} returned no live nodes, keeping the last-known list`);
+      this.lastNodeListFetch = Date.now();
+      return;
+    }
+
+    const nodeSet = new Set(identified.nodes);
+    const connections = new Map<string, Connection>(currentConnections);
+
+    for (const [address, connection] of currentConnections) {
+      if (!nodeSet.has(address)) {
+        connection.close();
+        connections.delete(address);
+      }
+    }
+
+    for (const address of identified.nodes) {
+      if (connections.has(address)) continue;
+
+      try {
+        const nodeIdentified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls });
+
+        if (nodeIdentified.kind !== "node") {
+          console.warn(`nanocached: discovery server returned a non-node address: ${address}, skipping`);
+          continue;
+        }
+
+        trackOpenTarget(this.url, [nodeIdentified.socket]);
+        connections.set(address, new Connection(nodeIdentified.socket));
+      } catch (error) {
+        console.warn(`nanocached: could not connect to new node ${address}, will retry on the next refresh: ${(error as Error).message}`);
+      }
+    }
+
+    this.target = { kind: "cluster", ring: new HashRing([...connections.keys()]), connections };
+    this.nodeUrls = [...connections.keys()];
+    this.lastNodeListFetch = Date.now();
   }
 
   private route(key: string | Uint8Array): Connection {
