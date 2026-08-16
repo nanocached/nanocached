@@ -10,7 +10,7 @@ Builds on [2. Client-side consistent hashing with a lightweight self-hosted disc
 
 ## Context
 
-The TypeScript client (`clients/typescript`) was rebuilt from scratch after
+The TypeScript client (`sdk/typescript`) was rebuilt from scratch after
 a review found its previous design split into two unrelated classes —
 `NanocachedClient` for a single node, `NanocachedClusterClient` for a
 discovery-fronted cluster — with different `connect()` option shapes
@@ -69,7 +69,7 @@ inline auth responses (`src/bin/nanocached-discovery.rs`) encode as
 purely an additional byte of information on an existing exchange, not a
 new command or a new required step.
 
-The TypeScript client (`clients/typescript/src/identify.ts`) always sends
+The TypeScript client (`sdk/typescript/src/identify.ts`) always sends
 `A` on `connect()`, using the caller's `authSecret` if given, or a 1-byte
 placeholder otherwise (a server with no secret configured accepts any
 non-empty secret without inspecting it, so the placeholder authenticates

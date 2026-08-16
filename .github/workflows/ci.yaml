@@ -38,19 +38,19 @@ jobs:
         with:
           node-version: lts/*
           cache: npm
-          cache-dependency-path: clients/typescript/package-lock.json
+          cache-dependency-path: sdk/typescript/package-lock.json
 
       - name: Build nanocached-node and nanocached-discovery
         run: cargo build --bin nanocached-node --bin nanocached-discovery
 
       - name: Install dependencies
-        working-directory: clients/typescript
+        working-directory: sdk/typescript
         run: npm ci
 
       - name: Typecheck
-        working-directory: clients/typescript
+        working-directory: sdk/typescript
         run: npm run typecheck
 
       - name: Run tests
-        working-directory: clients/typescript
+        working-directory: sdk/typescript
         run: npm test
