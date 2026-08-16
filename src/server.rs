@@ -1187,7 +1187,11 @@ async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
 /// (and doesn't drain a backlog) while `active_migration` is `Some` — this
 /// node is the source for an in-progress handoff, so a marked-but-not-yet-
 /// swept key may still be needed as the authoritative source for a
-/// subsequent hop (see `NodeContext::active_migration`).
+/// subsequent hop (see `NodeContext::active_migration`). Also watches
+/// `shutdown_rx` while draining a backlog, so a large backlog can't delay
+/// this task from dropping its `request_tx` clone past `SHUTDOWN_TIMEOUT`
+/// — without it, `run`'s shutdown drain would just be waiting on this task
+/// to notice on its own, one `SWEEP_BUDGET`-sized chunk at a time.
 async fn run_sweep(
     request_tx: mpsc::Sender<CacheRequest>,
     active_migration: Arc<Mutex<Option<ActiveMigration>>>,
@@ -1208,9 +1212,12 @@ async fn run_sweep(
                 break;
             }
 
-            match sweep(&request_tx).await {
-                Some(removed) if removed >= SWEEP_BUDGET => continue,
-                _ => break,
+            tokio::select! {
+                result = sweep(&request_tx) => match result {
+                    Some(removed) if removed >= SWEEP_BUDGET => continue,
+                    _ => break,
+                },
+                _ = shutdown_rx.changed() => return,
             }
         }
     }
