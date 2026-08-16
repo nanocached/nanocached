@@ -5,6 +5,7 @@ use crate::response::Response;
 use bytes::{Bytes, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use std::future::Future;
 use std::io;
 use std::io::BufReader;
 use std::net::SocketAddr;
@@ -177,6 +178,11 @@ struct CacheRequest {
     response_tx: oneshot::Sender<Response>,
 }
 
+/// A `run_migration` invocation, boxed so `handle_connection` can hand it to
+/// `run`'s own loop over `ConnectionConfig::migration_tx` instead of
+/// spawning it directly — see that field's doc comment for why.
+type MigrationTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// Per-connection settings that don't change once `run` starts, grouped so
 /// `dispatch_connection`/`handle_connection` take one value instead of two.
 #[derive(Clone)]
@@ -190,6 +196,12 @@ struct ConnectionConfig {
     /// discovery server (ADR-0008/0009) — an `M` arriving otherwise has
     /// nowhere sensible to report `C` to and is rejected.
     node_context: Option<NodeContext>,
+    /// Where `handle_connection` hands off a `run_migration` future for
+    /// `run`'s own loop to `connection_tasks.spawn` — spawning it directly
+    /// from inside a connection task (as opposed to from `run`) would leave
+    /// it untracked by `connection_tasks`, so graceful shutdown couldn't
+    /// wait for it (or ask it to unwind cleanly) before the process exits.
+    migration_tx: mpsc::Sender<MigrationTask>,
 }
 
 /// What an ADR-0008 migration task (triggered by an incoming `M`) needs
@@ -320,11 +332,18 @@ pub(crate) async fn run(
         _ => None,
     };
 
+    // Buffered rather than unbounded: ADR-0008 allows only one migration in
+    // flight per node (see `NodeContext::active_migration`), so a handful of
+    // slots is already more than a well-behaved cluster would ever need at
+    // once.
+    let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(4);
+
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
         auth_secret,
         tls_acceptor,
         node_context,
+        migration_tx,
     };
 
     let shutdown = shutdown_signal();
@@ -338,6 +357,25 @@ pub(crate) async fn run(
                 result?;
                 println!("shutdown signal received");
                 shutdown_tx.send_replace(true);
+
+                // `run_migration` doesn't watch `shutdown_rx` itself (it's
+                // driven entirely by `abort_requested`, the same flag an
+                // incoming `X` uses) — ask it to unwind now rather than
+                // letting `connection_tasks`'s drain-then-`abort_all`
+                // below simply run out the clock on it. A raw task abort
+                // wouldn't run `run_migration`'s own rollback of
+                // `marked_this_run`, only `MigrationGuard::drop`'s slot
+                // clear, so this in-band request is what lets the rest of
+                // this shutdown path stay a normal bounded wait instead of
+                // a forced kill.
+                if let Some(migration) = active_migration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                {
+                    migration.abort_requested.store(true, Ordering::SeqCst);
+                }
+
                 break;
             }
 
@@ -345,6 +383,10 @@ pub(crate) async fn run(
                 if let Some(Err(error)) = result {
                     eprintln!("connection task failed: {error}");
                 }
+            }
+
+            Some(task) = migration_rx.recv() => {
+                connection_tasks.spawn(task);
             }
 
             result = listener.accept() => {
@@ -539,17 +581,23 @@ async fn handle_connection(
                     .write_all(&Response::MigrationAccepted.encode())
                     .await?;
 
-                // Detached: not tracked by `run`'s `connection_tasks`, so
-                // an in-progress migration is abandoned on shutdown
-                // rather than waited on. ADR-0008 doesn't yet define
-                // failure/recovery behavior for an interrupted handoff
-                // anyway (see its Consequences), so this isn't a new gap.
-                tokio::spawn(run_migration(
-                    node_context,
-                    joining_name,
-                    joining_addr,
-                    joined,
-                ));
+                // Handed to `run`'s own loop rather than spawned here
+                // directly, so it ends up tracked by `connection_tasks` —
+                // see `ConnectionConfig::migration_tx`. If the receiving
+                // end is already gone (`run` has moved past its select
+                // loop into its own shutdown drain), there's nothing left
+                // to hand this to; the migration is simply not started,
+                // matching how a same-timing `M` arriving a moment later
+                // would find the listener already closed.
+                let _ = config
+                    .migration_tx
+                    .send(Box::pin(run_migration(
+                        node_context,
+                        joining_name,
+                        joining_addr,
+                        joined,
+                    )))
+                    .await;
 
                 continue;
             }
@@ -1384,6 +1432,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1423,6 +1472,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1461,6 +1511,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1519,6 +1570,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -1541,6 +1593,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -1577,6 +1630,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1601,6 +1655,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1647,6 +1702,7 @@ mod tests {
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1675,6 +1731,7 @@ mod tests {
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1704,6 +1761,7 @@ mod tests {
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1740,6 +1798,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 node_context: None,
+                migration_tx: mpsc::channel(1).0,
             },
             shutdown_rx,
         ));
@@ -1890,6 +1949,17 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        // Stands in for `run`'s own loop, which is what normally drains
+        // `migration_tx` and spawns what it receives (see
+        // `ConnectionConfig::migration_tx`) — `handle_connection` itself no
+        // longer spawns `run_migration` directly.
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
             request_tx.clone(),
@@ -1906,6 +1976,7 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                 }),
+                migration_tx,
             },
             shutdown_rx.clone(),
         ));
@@ -1948,6 +2019,7 @@ mod tests {
         // same class of ordering bug `run`'s shutdown path had).
         client.shutdown().await.unwrap();
         let _ = connection_task.await;
+        migration_relay.await.unwrap();
         drop(request_tx);
         cache_task.await.unwrap();
     }
@@ -1993,6 +2065,17 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
+        // Stands in for `run`'s own loop, which is what normally drains
+        // `migration_tx` and spawns what it receives (see
+        // `ConnectionConfig::migration_tx`) — `handle_connection` itself no
+        // longer spawns `run_migration` directly.
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
             request_tx.clone(),
@@ -2009,6 +2092,7 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                 }),
+                migration_tx,
             },
             shutdown_rx.clone(),
         ));
@@ -2072,6 +2156,7 @@ mod tests {
 
         client.shutdown().await.unwrap();
         let _ = connection_task.await;
+        migration_relay.await.unwrap();
         drop(request_tx);
         cache_task.await.unwrap();
     }
@@ -2271,6 +2356,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: Some(acceptor),
             node_context: None,
+            migration_tx: mpsc::channel(1).0,
         };
 
         let server_task = tokio::spawn(async move {
