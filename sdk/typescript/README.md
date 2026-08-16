@@ -80,9 +80,32 @@ the SDK refreshes the node list and retries that operation once. A discovery
 outage degrades only topology updates: existing connections keep serving
 traffic on the last-known node list.
 
+## Idle connections, reconnect, and keep-alive
+
+`nanocached-node` closes connections that have been idle for 30 seconds.
+The SDK handles this transparently: a request that finds its connection
+dead reconnects to the same node first (concurrent requests share one
+reconnect). The only cost is one extra round trip on the first request
+after a long idle gap.
+
+If that round trip matters, opt in to keep-alive:
+
+```ts
+const client = await NanocachedClient.connect({
+  host,
+  port,
+  keepAliveIntervalMs: 15_000, // must sit below the server's 30s idle timeout
+});
+```
+
+Every interval, each connection that real traffic has left idle for at
+least that long gets a lightweight request, keeping the server's idle
+timer from ever firing. This trades background load on every node (from
+every long-lived client) for latency, so it is off by default.
+
 ## API
 
-- `NanocachedClient.connect(options)` — `options: { host, port, authSecret?, tls? }`
+- `NanocachedClient.connect(options)` — `options: { host, port, authSecret?, tls?, keepAliveIntervalMs? }`
 - `client.get(key)` — resolves `Buffer | null`
 - `client.set(key, value, { ttlSeconds? })` — `ttlSeconds` must be a
   non-negative integer; omit it for no expiry

@@ -17,6 +17,13 @@ export interface MockNode extends MockServerBase {
   store: Map<string, Buffer>;
   /** Queue a one-off `W` reply for the next G/S/D request. */
   answerWrongNodeOnce(): void;
+  /** How many connections this server has ever accepted. */
+  connectionCount(): number;
+  /** How many `G` requests this server has ever received. */
+  getCount(): number;
+  /** Server-side close of every currently open connection (a FIN, like
+   * nanocached-node's own idle timeout), leaving the server listening. */
+  dropConnections(): void;
 }
 
 export interface MockDiscovery extends MockServerBase {
@@ -57,8 +64,11 @@ function trackAndClose(server: Server): { sockets: Set<Socket>; close: () => Pro
 export async function startMockNode(options: { requiredSecret?: string } = {}): Promise<MockNode> {
   const store = new Map<string, Buffer>();
   let wrongNodeReplies = 0;
+  let connections = 0;
+  let gets = 0;
 
   const server = createServer((socket) => {
+    connections++;
     let buffer = Buffer.alloc(0);
 
     socket.on("data", (chunk: Buffer) => {
@@ -92,6 +102,7 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
             if (buffer.length < bodyStart + keyLength) return;
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + keyLength);
+            gets++;
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
@@ -151,7 +162,7 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
     });
   });
 
-  const { close } = trackAndClose(server);
+  const { sockets, close } = trackAndClose(server);
   const port = await listen(server);
 
   return {
@@ -160,6 +171,11 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
     store,
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
+    },
+    connectionCount: () => connections,
+    getCount: () => gets,
+    dropConnections: () => {
+      for (const socket of sockets) socket.end();
     },
     close,
   };

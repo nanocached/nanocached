@@ -4,6 +4,20 @@ import { AlreadyClosedError, NanocachedClient, WrongNodeError } from "../src/ind
 import { HashRing } from "../src/hashRing.js";
 import { startMockDiscovery, startMockNode, type MockNode } from "./mockServers.js";
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Polls until `condition` holds — used to wait for the client to notice a
+ * server-side FIN without hardcoding a sleep long enough to be flaky. */
+async function waitFor(condition: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (condition()) return;
+    await delay(5);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 describe("NanocachedClient against a single node", () => {
   it("round-trips set/get/delete", async () => {
     const node = await startMockNode();
@@ -134,6 +148,177 @@ describe("NanocachedClient against a single node", () => {
       await assert.rejects(client.get("k"), AlreadyClosedError);
       await assert.rejects(client.set("k", "v"), AlreadyClosedError);
       await assert.rejects(client.delete("k"), AlreadyClosedError);
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+// Reaches into the client's internals to observe when it has processed a
+// server-side FIN — there is deliberately no public API for this, and the
+// tests must not proceed before the close event has fired.
+function singleConnectionClosed(client: NanocachedClient): boolean {
+  return (client as any).target.connection.isClosed();
+}
+function memberConnectionClosed(client: NanocachedClient, name: string): boolean {
+  return (client as any).target.members.get(name).connection.isClosed();
+}
+
+describe("NanocachedClient reconnect-on-use", () => {
+  it("transparently reconnects after the server closes an idle connection", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      try {
+        await client.set("k", "v");
+
+        // Simulate the server's 30s idle timeout: a clean server-side FIN.
+        node.dropConnections();
+        await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
+
+        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("shares one reconnect between concurrent requests", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      try {
+        await client.set("k", "v");
+        node.dropConnections();
+        await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
+
+        const values = await Promise.all(Array.from({ length: 10 }, () => client.get("k")));
+        for (const value of values) assert.deepEqual(value, Buffer.from("v"));
+        assert.equal(node.connectionCount(), 2, "concurrent requests dialed more than one reconnect");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("propagates the dial error when the node is gone for good", async () => {
+    const node = await startMockNode();
+    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+    try {
+      await node.close();
+      await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
+      await assert.rejects(client.get("k"), /ECONNREFUSED/);
+    } finally {
+      client.close();
+    }
+  });
+
+  it("reconnects to the routed cluster member only", async () => {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+    const discovery = await startMockDiscovery([
+      { name: names[0], address: nodeA.address },
+      { name: names[1], address: nodeB.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: discovery.port });
+      try {
+        const key = "some-key";
+        await client.set(key, "v");
+
+        const ring = new HashRing(names);
+        const ownerName = ring.route(Buffer.from(key));
+        const owner = ownerName === names[0] ? nodeA : nodeB;
+        const other = owner === nodeA ? nodeB : nodeA;
+
+        owner.dropConnections();
+        await waitFor(() => memberConnectionClosed(client, ownerName), "the client to see the FIN");
+
+        assert.deepEqual(await client.get(key), Buffer.from("v"));
+        assert.equal(owner.connectionCount(), 2);
+        assert.equal(other.connectionCount(), 1, "reconnected a member whose connection never died");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+});
+
+describe("NanocachedClient keep-alive", () => {
+  it("rejects a non-positive or non-integer interval synchronously", async () => {
+    for (const keepAliveIntervalMs of [0, -5, 3.5, NaN, Infinity]) {
+      await assert.rejects(
+        NanocachedClient.connect({ host: "127.0.0.1", port: 1, keepAliveIntervalMs }),
+        RangeError,
+      );
+    }
+  });
+
+  it("pings an idle connection often enough to reset the server's idle timer", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        host: "127.0.0.1",
+        port: node.port,
+        keepAliveIntervalMs: 40,
+      });
+      try {
+        await waitFor(() => node.getCount() >= 2, "keep-alive pings to arrive");
+        // The pings rode the original connection — no reconnects happened.
+        assert.equal(node.connectionCount(), 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("stops pinging once the client is closed", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        host: "127.0.0.1",
+        port: node.port,
+        keepAliveIntervalMs: 20,
+      });
+      await waitFor(() => node.getCount() >= 1, "a keep-alive ping to arrive");
+      client.close();
+
+      const pingsAtClose = node.getCount();
+      await delay(100);
+      assert.equal(node.getCount(), pingsAtClose);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("does not ping a connection that real traffic keeps busy", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        host: "127.0.0.1",
+        port: node.port,
+        keepAliveIntervalMs: 60,
+      });
+      try {
+        for (let i = 0; i < 10; i++) {
+          await client.set("k", "v");
+          await delay(15);
+        }
+        // Every request above reset the idle clock well inside the 60ms
+        // interval, so no ping should ever have fired: no `G` at all.
+        assert.equal(node.getCount(), 0);
+      } finally {
+        client.close();
+      }
     } finally {
       await node.close();
     }

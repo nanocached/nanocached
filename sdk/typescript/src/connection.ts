@@ -44,6 +44,7 @@ export class Connection {
   private readonly pending: Waiter[] = [];
   private closed = false;
   private lastError: Error | null = null;
+  private lastUsed = Date.now();
 
   constructor(socket: Socket | TLSSocket) {
     this.socket = socket;
@@ -79,10 +80,26 @@ export class Connection {
     this.socket.destroy();
   }
 
+  /** Whether the underlying socket has closed — locally via close(), or
+   * remotely (e.g. the server's 30s idle timeout sent a FIN). Once true, a
+   * caller holding this connection must open a new one; see
+   * `NanocachedClient.routedConnection`. */
+  isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** Milliseconds since the last request was sent on this connection —
+   * what the keep-alive timer checks against the ping interval, so pings
+   * only go out on connections real traffic isn't already keeping alive. */
+  idleMs(): number {
+    return Date.now() - this.lastUsed;
+  }
+
   private send(frame: Buffer): Promise<ParsedResponse> {
     if (this.closed) {
       return Promise.reject(this.lastError ?? new Error("nanocached: connection is closed"));
     }
+    this.lastUsed = Date.now();
 
     return new Promise((resolve, reject) => {
       const waiter: Waiter = { resolve, reject };

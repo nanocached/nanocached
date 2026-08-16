@@ -32,6 +32,15 @@ export interface NanocachedClientOptions {
    * server is running a self-signed certificate with no CA-issued
    * alternative available. */
   tls?: boolean | NanocachedTlsOptions;
+  /** Opt-in keep-alive: every `keepAliveIntervalMs`, send a lightweight
+   * request on each connection that real traffic has left idle for at
+   * least that long. nanocached-node closes connections idle for 30s
+   * (hardcoded), so pick something comfortably below that — e.g. 10—15s.
+   * Without this, an idle connection is simply closed by the server and
+   * transparently reopened on the next request (one extra round trip);
+   * keep-alive is purely a latency optimization, at the cost of putting
+   * background load on every node from every long-lived client. */
+  keepAliveIntervalMs?: number;
 }
 
 function splitHostPort(address: string): { host: string; port: number } {
@@ -49,12 +58,21 @@ function splitHostPort(address: string): { host: string; port: number } {
   return { host, port };
 }
 
+interface ClusterMember {
+  /** Last-known address for this node name — kept so a connection the
+   * server closed (e.g. its 30s idle timeout) can be reopened lazily on
+   * the next request that routes here, without waiting for a node-list
+   * refresh. */
+  address: string;
+  connection: Connection;
+}
+
 type Target =
   | { kind: "single"; connection: Connection }
-  // `connections` is keyed by node *name* (doc/adr/0009-*.md), matching
+  // `members` is keyed by node *name* (doc/adr/0009-*.md), matching
   // what `ring.route()` returns — not by address, which carries no
-  // identity meaning and is only used once, to open the connection.
-  | { kind: "cluster"; ring: HashRing; connections: ReadonlyMap<string, Connection> };
+  // identity meaning and is only used to open connections.
+  | { kind: "cluster"; ring: HashRing; members: Map<string, ClusterMember> };
 
 function targetKey(options: { host: string; port: number }): string {
   return `${options.host}:${options.port}`;
@@ -105,6 +123,12 @@ export class NanocachedClient {
   private closed = false;
   private lastNodeListFetch = Date.now();
   private nodeListRefresh: Promise<void> | null = null;
+  /** One in-flight lazy reconnect per connection slot (the node name in
+   * cluster mode, "" in single mode) — concurrent requests that all find
+   * the same dead connection share one reconnect instead of dialing N
+   * times. See routedConnection. */
+  private readonly reconnects = new Map<string, Promise<Connection>>();
+  private keepAliveTimer: NodeJS.Timeout | null = null;
 
   /** The node(s) actually being talked to, by address (for display/
    * introspection — routing itself uses each node's name, not its
@@ -122,11 +146,24 @@ export class NanocachedClient {
     nodeUrls: readonly string[],
     private readonly authSecret: string | Uint8Array | undefined,
     private readonly tls: boolean | NanocachedTlsOptions | undefined,
+    keepAliveIntervalMs: number | undefined,
   ) {
     this.nodeUrls = nodeUrls;
+    if (keepAliveIntervalMs !== undefined) this.startKeepAlive(keepAliveIntervalMs);
   }
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
+    if (
+      options.keepAliveIntervalMs !== undefined &&
+      (!Number.isInteger(options.keepAliveIntervalMs) || options.keepAliveIntervalMs <= 0)
+    ) {
+      // Same reasoning as encodeSet's TTL check: fail synchronously on a
+      // value that could never be meant, before opening any connection.
+      throw new RangeError(
+        `nanocached: keepAliveIntervalMs must be a positive integer, got ${options.keepAliveIntervalMs}`,
+      );
+    }
+
     const key = targetKey(options);
     if (openTargets.has(key)) {
       console.warn(
@@ -144,6 +181,7 @@ export class NanocachedClient {
         [key],
         options.authSecret,
         options.tls,
+        options.keepAliveIntervalMs,
       );
     }
 
@@ -172,19 +210,22 @@ export class NanocachedClient {
 
     trackOpenTarget(key, [...sockets.values()]);
 
-    const connections = new Map<string, Connection>();
-    for (const [name, socket] of sockets) connections.set(name, new Connection(socket));
+    const members = new Map<string, ClusterMember>();
+    for (const node of identified.nodes) {
+      members.set(node.name, { address: node.address, connection: new Connection(sockets.get(node.name)!) });
+    }
 
     return new NanocachedClient(
       {
         kind: "cluster",
         ring: new HashRing(identified.nodes.map((node) => node.name)),
-        connections,
+        members,
       },
       key,
       identified.nodes.map((node) => node.address),
       options.authSecret,
       options.tls,
+      options.keepAliveIntervalMs,
     );
   }
 
@@ -204,12 +245,17 @@ export class NanocachedClient {
     }
     this.closed = true;
 
+    if (this.keepAliveTimer !== null) {
+      clearInterval(this.keepAliveTimer);
+      this.keepAliveTimer = null;
+    }
+
     if (this.target.kind === "single") {
       this.target.connection.close();
       return;
     }
 
-    for (const connection of this.target.connections.values()) connection.close();
+    for (const member of this.target.members.values()) member.connection.close();
   }
 
   async get(key: string | Uint8Array): Promise<Buffer | null> {
@@ -246,11 +292,11 @@ export class NanocachedClient {
     op: (connection: Connection) => Promise<T>,
   ): Promise<T> {
     try {
-      return await op(this.route(key));
+      return await op(await this.routedConnection(key));
     } catch (error) {
       if (!(error instanceof WrongNodeError) || this.target.kind !== "cluster") throw error;
       await this.maybeRefreshNodeList({ force: true });
-      return await op(this.route(key));
+      return await op(await this.routedConnection(key));
     }
   }
 
@@ -293,7 +339,7 @@ export class NanocachedClient {
    * connect, if only one did), and tries again on the next stale check. */
   private async refreshNodeList(): Promise<void> {
     if (this.target.kind !== "cluster") return;
-    const currentConnections = this.target.connections;
+    const currentMembers = this.target.members;
 
     let identified;
     try {
@@ -318,17 +364,23 @@ export class NanocachedClient {
 
     // Reconciled by name (doc/adr/0009-*.md), not address — see `Target`.
     const nodeByName = new Map<string, DiscoveredNode>(identified.nodes.map((node) => [node.name, node]));
-    const connections = new Map<string, Connection>(currentConnections);
+    const members = new Map<string, ClusterMember>(currentMembers);
 
-    for (const [name, connection] of currentConnections) {
+    for (const [name, member] of currentMembers) {
       if (!nodeByName.has(name)) {
-        connection.close();
-        connections.delete(name);
+        member.connection.close();
+        members.delete(name);
       }
     }
 
     for (const node of identified.nodes) {
-      if (connections.has(node.name)) continue;
+      const existing = members.get(node.name);
+      if (existing) {
+        // Same name means the same node process (names are per-process
+        // UUIDs), but keep the address current for lazy reconnects anyway.
+        existing.address = node.address;
+        continue;
+      }
 
       try {
         const nodeIdentified = await connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls });
@@ -339,28 +391,119 @@ export class NanocachedClient {
         }
 
         trackOpenTarget(this.url, [nodeIdentified.socket]);
-        connections.set(node.name, new Connection(nodeIdentified.socket));
+        members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket) });
       } catch (error) {
         console.warn(`nanocached: could not connect to new node ${node.address}, will retry on the next refresh: ${(error as Error).message}`);
       }
     }
 
-    this.target = { kind: "cluster", ring: new HashRing([...connections.keys()]), connections };
-    this.nodeUrls = identified.nodes.filter((node) => connections.has(node.name)).map((node) => node.address);
+    this.target = { kind: "cluster", ring: new HashRing([...members.keys()]), members };
+    this.nodeUrls = identified.nodes.filter((node) => members.has(node.name)).map((node) => node.address);
     this.lastNodeListFetch = Date.now();
   }
 
-  private route(key: string | Uint8Array): Connection {
-    if (this.target.kind === "single") return this.target.connection;
+  /** The single "ensure connected" path (issue #1) every request funnels
+   * through: routes `key` to its connection and, if that connection has
+   * died since it was opened — most commonly the server's 30s idle
+   * timeout — reconnects to the same node first. Reconnecting is lazy
+   * (nothing watches for closes in the background) and shared (concurrent
+   * requests finding the same dead connection await one dial, see
+   * `reconnects`). */
+  private async routedConnection(key: string | Uint8Array): Promise<Connection> {
+    if (this.target.kind === "single") {
+      if (!this.target.connection.isClosed()) return this.target.connection;
+
+      const connection = await this.ensureConnected("", this.url);
+      if (this.target.kind === "single" && this.target.connection.isClosed()) {
+        this.target.connection = connection;
+      }
+      return connection;
+    }
 
     const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
     const name = this.target.ring.route(keyBytes);
 
-    const connection = this.target.connections.get(name);
-    if (!connection) {
+    const member = this.target.members.get(name);
+    if (!member) {
       throw new Error(`nanocached: ring routed to ${name}, which has no open connection`);
     }
+    if (!member.connection.isClosed()) return member.connection;
 
-    return connection;
+    const connection = await this.ensureConnected(name, member.address);
+
+    // A node-list refresh may have swapped `target` while we dialed; adopt
+    // the new connection only into a member still holding the dead one, and
+    // re-route (or defer to the refresh's own connection) otherwise so no
+    // socket is left open but untracked.
+    const current = this.target.kind === "cluster" ? this.target.members.get(name) : null;
+    if (!current) {
+      connection.close();
+      return this.routedConnection(key);
+    }
+    if (current.connection.isClosed()) {
+      current.connection = connection;
+      return connection;
+    }
+    if (current.connection !== connection) connection.close();
+    return current.connection;
+  }
+
+  private async ensureConnected(slot: string, address: string): Promise<Connection> {
+    const inFlight = this.reconnects.get(slot);
+    if (inFlight) return inFlight;
+
+    const attempt = this.openNodeConnection(address);
+    this.reconnects.set(slot, attempt);
+    try {
+      return await attempt;
+    } finally {
+      this.reconnects.delete(slot);
+    }
+  }
+
+  private async openNodeConnection(address: string): Promise<Connection> {
+    const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls });
+
+    if (identified.kind !== "node") {
+      throw new Error(`nanocached: ${address} no longer identifies as a cache node`);
+    }
+    if (this.closed) {
+      identified.socket.destroy();
+      throw new AlreadyClosedError();
+    }
+
+    trackOpenTarget(this.url, [identified.socket]);
+    return new Connection(identified.socket);
+  }
+
+  /** See NanocachedClientOptions.keepAliveIntervalMs. Each tick pings only
+   * connections that are open (dead ones stay lazy, reconnected on use)
+   * and that real traffic has left idle for at least a full interval. Any
+   * parseable reply proves liveness and resets the server's idle timer —
+   * `N` from a node without the key, or `W` from a clustered node that
+   * doesn't own it (there is no dedicated ping in the wire protocol, so
+   * the ping is a real, harmless `G`) — hence errors are swallowed rather
+   * than routed through the wrong-node retry. */
+  private startKeepAlive(intervalMs: number): void {
+    const timer = setInterval(() => {
+      const connections =
+        this.target.kind === "single"
+          ? [this.target.connection]
+          : [...this.target.members.values()].map((member) => member.connection);
+
+      for (const connection of connections) {
+        if (connection.isClosed()) continue;
+        if (connection.idleMs() < intervalMs) continue;
+        connection.get(KEEPALIVE_KEY).catch(() => {});
+      }
+    }, intervalMs);
+
+    // A keep-alive timer must never be what keeps the process running.
+    timer.unref();
+    this.keepAliveTimer = timer;
   }
 }
+
+// The server rejects empty keys, so the keep-alive `G` needs at least one
+// byte; a single NUL keeps it out of the way of any real key space.
+const KEEPALIVE_KEY = Uint8Array.from([0]);
