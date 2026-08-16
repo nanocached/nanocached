@@ -71,12 +71,34 @@ and left for a future ADR.
 
 Node join becomes staged and orchestrated by `nanocached-discovery`,
 instead of a node becoming visible to clients as soon as its first
-heartbeat is registered:
+heartbeat is registered. A node moves through three states, not two:
 
-- A joining node registers with discovery but is **not** included in the
-  list `L` returns to clients until its join completes. Clients therefore
-  only ever see a node set that changes atomically from fully-populated
-  set to fully-populated set — never a newly-registered, still-empty node.
+- **Waiting**: a node that has started and is heartbeating to discovery as
+  usual, but has not asked to join. This is the default state on startup —
+  there is no separate "start up already joining" mode. A node sits here
+  for as long as it likes before requesting to join, and discovery may
+  hold it here regardless (see below).
+- **Joining**: a node that has sent an explicit join request (a new
+  command) and is actively receiving its handoff data from every ready
+  node.
+- **Joined**: a node whose handoff is complete and is now included in the
+  list `L` returns to clients.
+
+Only a **joining** node is excluded from `L`; a **waiting** node is also
+excluded (it isn't yet safe to route to and hasn't asked to be). Clients
+therefore only ever see a node set that changes atomically from
+fully-populated set to fully-populated set — never a newly-registered,
+still-empty node, and never a node mid-handoff.
+
+Discovery only progresses one node through waiting → joining at a time:
+if a join request arrives while another node is already joining, the
+requester is left in (or returned to) waiting until the in-progress join
+finishes, rather than running two handoffs concurrently. A cluster scaled
+from 1 to 3 nodes in quick succession therefore passes through a state
+where one of the two new nodes is joining and the other is still waiting.
+
+Once a node's join request is accepted and it enters joining:
+
 - Discovery tells every already-ready node about the join.
 - Each ready node computes, using the same consistent-hash algorithm
   clients use ([[0002]]; `HashRing` in the TypeScript client, the matching
@@ -94,8 +116,6 @@ heartbeat is registered:
 - Each ready node reports completion to discovery. Once every ready node
   has reported done, discovery marks the joining node ready and publishes
   it — the next `L` response includes it.
-- Only one join is in progress at a time; a second join request is held
-  back until the in-progress one completes.
 - Handed-off keys must eventually be reclaimed from the node that no
   longer owns them, and ordinary reactive LRU eviction cannot be trusted
   to target them specifically (see Context). Handed-off keys are instead
@@ -136,7 +156,13 @@ follow-up work:
   adopt it, to keep the join mechanism itself tractable first.
 - **An existing ready node that fails or never responds** during a
   handoff has no defined timeout/retry policy yet — today this could stall
-  a join indefinitely on one unresponsive node.
+  a join indefinitely on one unresponsive node. The likely shape of a fix:
+  if completion reports don't arrive from every ready node within some
+  timeout, discovery rejects the join (the joining node returns to
+  waiting, not joined) and tells every ready node to clear whatever
+  handed-off-key marks they set for this join, so the abandoned attempt
+  doesn't leave stray marked entries for the background deletion task to
+  act on. Not designed in detail; recorded here so it isn't lost.
 - **The joining node itself failing or disconnecting mid-handoff** has no
   defined recovery — whether the join is retried, abandoned, or requires
   operator intervention is undecided.
