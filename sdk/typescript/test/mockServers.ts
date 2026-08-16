@@ -28,6 +28,18 @@ export interface MockNode extends MockServerBase {
 
 export interface MockDiscovery extends MockServerBase {
   setNodes(nodes: Array<{ name: string; address: string }>): void;
+  /** While true, `L` answers `B\n` and closes — the ADR-0010 startup
+   * grace of a freshly restarted discovery server. */
+  setWarmingUp(warming: boolean): void;
+}
+
+/** A port with nothing listening on it — bound once to reserve a real
+ * ephemeral port, then released. */
+export async function unusedPort(): Promise<number> {
+  const server = createServer();
+  const port = await listen(server);
+  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+  return port;
 }
 
 function listen(server: Server): Promise<number> {
@@ -185,6 +197,7 @@ export async function startMockDiscovery(
   initialNodes: Array<{ name: string; address: string }>,
 ): Promise<MockDiscovery> {
   let nodes = initialNodes;
+  let warmingUp = false;
 
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0);
@@ -210,6 +223,13 @@ export async function startMockDiscovery(
 
           case "L": {
             buffer = buffer.subarray(bodyStart);
+
+            if (warmingUp) {
+              socket.write("B\n");
+              socket.end();
+              return;
+            }
+
             const entries = nodes.map(({ name, address }) => {
               const nameBytes = Buffer.from(name, "utf8");
               const addrBytes = Buffer.from(address, "utf8");
@@ -240,6 +260,9 @@ export async function startMockDiscovery(
     address: `127.0.0.1:${port}`,
     setNodes: (next) => {
       nodes = next;
+    },
+    setWarmingUp: (warming) => {
+      warmingUp = warming;
     },
     close,
   };

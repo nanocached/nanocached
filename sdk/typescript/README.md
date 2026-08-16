@@ -80,6 +80,26 @@ the SDK refreshes the node list and retries that operation once. A discovery
 outage degrades only topology updates: existing connections keep serving
 traffic on the last-known node list.
 
+### Discovery replicas
+
+When the cluster runs more than one discovery server, pass them all as
+`seeds` instead of a single `host`/`port`:
+
+```ts
+const client = await NanocachedClient.connect({
+  seeds: [
+    { host: "10.0.0.1", port: 8357 },
+    { host: "10.0.0.2", port: 8357 },
+  ],
+});
+```
+
+Both the initial connect and every node-list refresh try the seeds in
+order, so losing any one discovery replica costs nothing. A seed that is
+still warming up after a restart (it answers `B` while re-learning cluster
+membership) is skipped like an unreachable one; if *every* seed is warming
+up, `connect()` rejects with `DiscoveryBusyError` — retry shortly.
+
 ## Idle connections, reconnect, and keep-alive
 
 `nanocached-node` closes connections that have been idle for 30 seconds.
@@ -105,7 +125,8 @@ every long-lived client) for latency, so it is off by default.
 
 ## API
 
-- `NanocachedClient.connect(options)` — `options: { host, port, authSecret?, tls?, keepAliveIntervalMs? }`
+- `NanocachedClient.connect(options)` — `options: { host?, port?, seeds?, authSecret?, tls?, keepAliveIntervalMs? }`
+  (give either `host`/`port` or a non-empty `seeds` list)
 - `client.get(key)` — resolves `Buffer | null`
 - `client.set(key, value, { ttlSeconds? })` — `ttlSeconds` must be a
   non-negative integer; omit it for no expiry

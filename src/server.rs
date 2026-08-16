@@ -246,13 +246,17 @@ struct NodeContext {
     request_tx: mpsc::Sender<CacheRequest>,
 }
 
-/// Configuration for registering this node with a discovery server (see
+/// Configuration for registering this node with discovery servers (see
 /// `src/bin/nanocached-discovery.rs`). When set, `run` asks to join once
 /// (ADR-0008) using a random per-process name (ADR-0009) and, once
 /// promoted, sends a heartbeat declaring that name on `interval`, well
 /// under the discovery server's own liveness timeout.
 pub(crate) struct HeartbeatConfig {
-    pub(crate) discovery_addr: String,
+    /// One or more discovery replicas (ADR-0010). The first is the
+    /// primary — the only one this node ever sends `J` (and `C`) to;
+    /// the rest learn about this node via `P` announces once the primary
+    /// has promoted it. Never empty (main.rs validates).
+    pub(crate) discovery_addrs: Vec<String>,
     pub(crate) advertise_addr: String,
     pub(crate) interval: Duration,
     /// Sent to the discovery server before the first heartbeat on each
@@ -319,7 +323,9 @@ pub(crate) async fn run(
     // with a discovery server at all.
     let node_context = heartbeat.as_ref().map(|config| NodeContext {
         name: Uuid::new_v4().to_string(),
-        discovery_addr: config.discovery_addr.clone(),
+        // The primary (ADR-0010) — where `C` completion reports go,
+        // matching where `J` was sent.
+        discovery_addr: config.discovery_addrs[0].clone(),
         active_migration: Arc::clone(&active_migration),
         known_ring: Arc::new(Mutex::new(None)),
         auth_secret: config.auth_secret.clone(),
@@ -790,6 +796,15 @@ fn join_message(name: &str, advertise_addr: &str) -> Vec<u8> {
     message
 }
 
+/// ADR-0010: same shape as `join_message`, but declares an
+/// already-promoted member — no handoff orchestration on the other end.
+fn announce_message(name: &str, advertise_addr: &str) -> Vec<u8> {
+    let mut message = format!("P {} {}\n", name.len(), advertise_addr.len()).into_bytes();
+    message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(advertise_addr.as_bytes());
+    message
+}
+
 /// Only valid once this node has been promoted to `Joined` (ADR-0008); the
 /// address was already established by `join_message` on this connection,
 /// so a heartbeat only needs to carry `name` to refresh liveness.
@@ -833,30 +848,101 @@ async fn connect_client_stream(
     }
 }
 
-/// Holds one long-lived connection to the discovery server: joins once
-/// (ADR-0008), then sends a heartbeat on it every `config.interval`,
-/// reconnecting (and re-joining under the same name) on any I/O error
-/// after waiting out the interval. `name` is this node's own ADR-0009
-/// identity, generated once by `run` and shared with `ConnectionConfig`'s
-/// `NodeContext` — not generated here, so a migration task triggered by
-/// an incoming `M` on some other connection reports `C` under the same
-/// name this task heartbeats as.
+/// This registration task's relationship to one discovery replica
+/// (ADR-0010). The primary is the only one ever sent `J` — the ADR-0008
+/// join, with its data handoff — and flips the shared `promoted` flag
+/// once `R` arrives for it. Standbys (and the primary itself, on any
+/// re-registration after that first promotion) send `P` announces, which
+/// upsert this node as a member with no handoff.
+enum DiscoveryRole {
+    Primary(Arc<watch::Sender<bool>>),
+    Standby(watch::Receiver<bool>),
+}
+
+/// Registers this node with every configured discovery replica
+/// (ADR-0010): one `register_with_discovery` task per address, sharing a
+/// `promoted` watch so standbys hold off announcing until the primary's
+/// ADR-0008 join has actually completed. `name` is this node's own
+/// ADR-0009 identity, generated once by `run` and shared with
+/// `ConnectionConfig`'s `NodeContext` — not generated here, so a
+/// migration task triggered by an incoming `M` on some other connection
+/// reports `C` under the same name these tasks register as.
 async fn send_heartbeats(
     config: HeartbeatConfig,
     name: String,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    let (promoted_tx, promoted_rx) = watch::channel(false);
+    let promoted_tx = Arc::new(promoted_tx);
+
+    let mut tasks = JoinSet::new();
+    for (index, discovery_addr) in config.discovery_addrs.iter().enumerate() {
+        let role = if index == 0 {
+            DiscoveryRole::Primary(Arc::clone(&promoted_tx))
+        } else {
+            DiscoveryRole::Standby(promoted_rx.clone())
+        };
+
+        tasks.spawn(register_with_discovery(
+            discovery_addr.clone(),
+            config.advertise_addr.clone(),
+            config.interval,
+            config.auth_secret.clone(),
+            config.tls_connector.clone(),
+            name.clone(),
+            role,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Holds one long-lived connection to a single discovery replica:
+/// registers (`J` for the primary's first time, `P` otherwise — see
+/// `DiscoveryRole`), then sends a heartbeat on it every `interval`,
+/// reconnecting (and re-registering under the same name) on any I/O
+/// error after waiting out the interval.
+#[allow(clippy::too_many_arguments)]
+async fn register_with_discovery(
+    discovery_addr: String,
+    advertise_addr: String,
+    interval: Duration,
+    auth_secret: Option<Bytes>,
+    tls_connector: Option<TlsConnector>,
+    name: String,
+    mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let join = join_message(&name, &config.advertise_addr);
+    let join = join_message(&name, &advertise_addr);
+    let announce = announce_message(&name, &advertise_addr);
     let heartbeat = heartbeat_message(&name);
+
+    // A standby must not announce a node the primary hasn't promoted yet:
+    // that would make it visible in the standby's `L` before its ADR-0008
+    // handoff has run, which is exactly the state `J`'s staging exists to
+    // prevent.
+    if let DiscoveryRole::Standby(promoted_rx) = &mut role {
+        while !*promoted_rx.borrow() {
+            tokio::select! {
+                _ = shutdown_rx.changed() => return,
+                result = promoted_rx.changed() => {
+                    if result.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 
     loop {
         if *shutdown_rx.borrow() {
             return;
         }
 
-        match connect_client_stream(&config.discovery_addr, config.tls_connector.as_ref()).await {
+        match connect_client_stream(&discovery_addr, tls_connector.as_ref()).await {
             Ok(mut stream) => {
-                let authenticated = match &config.auth_secret {
+                let authenticated = match &auth_secret {
                     Some(secret) => {
                         let auth = auth_message(secret);
                         match stream.write_all(&auth).await {
@@ -871,17 +957,20 @@ async fn send_heartbeats(
                 };
 
                 if !authenticated {
-                    eprintln!(
-                        "discovery server at {} rejected the auth secret",
-                        config.discovery_addr
-                    );
+                    eprintln!("discovery server at {discovery_addr} rejected the auth secret");
                 }
 
-                if authenticated && stream.write_all(&join).await.is_ok() {
-                    // ADR-0008: this connection is held open by discovery
-                    // (no idle timeout applies) until this node is
-                    // promoted, which may take an unbounded amount of
-                    // time if another join is already in progress.
+                let registration = match &role {
+                    DiscoveryRole::Primary(promoted_tx) if !*promoted_tx.borrow() => &join,
+                    _ => &announce,
+                };
+
+                if authenticated && stream.write_all(registration).await.is_ok() {
+                    // For `J`, ADR-0008: this connection is held open by
+                    // discovery (no idle timeout applies) until this node
+                    // is promoted, which may take an unbounded amount of
+                    // time if another join is already in progress. For
+                    // `P`, the same `R\n` comes back immediately.
                     let mut promoted = [0u8; 2];
                     let read_promoted = tokio::select! {
                         _ = shutdown_rx.changed() => return,
@@ -889,6 +978,10 @@ async fn send_heartbeats(
                     };
 
                     if read_promoted.is_ok() && &promoted == b"R\n" {
+                        if let DiscoveryRole::Primary(promoted_tx) = &role {
+                            promoted_tx.send_replace(true);
+                        }
+
                         loop {
                             if stream.write_all(&heartbeat).await.is_err() {
                                 break;
@@ -904,7 +997,7 @@ async fn send_heartbeats(
                                 break;
                             }
 
-                            if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
+                            if wait_or_shutdown(interval, &mut shutdown_rx).await {
                                 return;
                             }
                         }
@@ -912,14 +1005,11 @@ async fn send_heartbeats(
                 }
             }
             Err(error) => {
-                eprintln!(
-                    "failed to connect to discovery server at {}: {error}",
-                    config.discovery_addr
-                );
+                eprintln!("failed to connect to discovery server at {discovery_addr}: {error}");
             }
         }
 
-        if wait_or_shutdown(config.interval, &mut shutdown_rx).await {
+        if wait_or_shutdown(interval, &mut shutdown_rx).await {
             return;
         }
     }
@@ -2550,7 +2640,7 @@ mod tests {
 
         send_heartbeats(
             HeartbeatConfig {
-                discovery_addr: "127.0.0.1:1".to_string(),
+                discovery_addrs: vec!["127.0.0.1:1".to_string()],
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_secs(60),
                 auth_secret: None,
@@ -2601,7 +2691,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
-                discovery_addr,
+                discovery_addrs: vec![discovery_addr],
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_millis(20),
                 auth_secret: None,
@@ -2621,6 +2711,170 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_reconnection_after_promotion_announces_instead_of_rejoining() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+
+        let registrations: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fake_registrations = Arc::clone(&registrations);
+
+        let fake_discovery = tokio::spawn(async move {
+            // First connection: J -> R, then hang up mid-heartbeat so the
+            // node has to re-register.
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 128];
+            let bytes_read = first.read(&mut buffer).await.unwrap();
+            fake_registrations
+                .lock()
+                .unwrap()
+                .push(buffer[..bytes_read].to_vec());
+            first.write_all(b"R\n").await.unwrap();
+            let _ = first.read(&mut buffer).await;
+            drop(first);
+
+            // Second connection: the re-registration (ADR-0010: must be P,
+            // not another handoff-orchestrating J).
+            let (mut second, _) = listener.accept().await.unwrap();
+            let bytes_read = second.read(&mut buffer).await.unwrap();
+            fake_registrations
+                .lock()
+                .unwrap()
+                .push(buffer[..bytes_read].to_vec());
+            second.write_all(b"R\n").await.unwrap();
+
+            loop {
+                match second.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if second.write_all(b"A\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                advertise_addr: "127.0.0.1:8356".to_string(),
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            "test-node".to_string(),
+            shutdown_rx,
+        ));
+
+        for _ in 0..500 {
+            if registrations.lock().unwrap().len() >= 2 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
+
+        let registrations = registrations.lock().unwrap();
+        assert!(registrations.len() >= 2, "node never re-registered");
+        assert_eq!(registrations[0], b"J 9 14\ntest-node127.0.0.1:8356");
+        assert_eq!(registrations[1], b"P 9 14\ntest-node127.0.0.1:8356");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_standby_discovery_receives_an_announce_only_after_promotion() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let standby_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap().to_string();
+        let standby_addr = standby_listener.local_addr().unwrap().to_string();
+
+        let events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let primary_events = Arc::clone(&events);
+        let fake_primary = tokio::spawn(async move {
+            let (mut connection, _) = primary_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 128];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            assert!(buffer[..bytes_read].starts_with(b"J "));
+
+            // Give a broken standby (one that doesn't wait for promotion)
+            // time to announce early, which the event order would expose.
+            sleep(Duration::from_millis(50)).await;
+            primary_events.lock().unwrap().push("promoted".to_string());
+            connection.write_all(b"R\n").await.unwrap();
+
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if connection.write_all(b"A\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let standby_events = Arc::clone(&events);
+        let fake_standby = tokio::spawn(async move {
+            let (mut connection, _) = standby_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 128];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            standby_events.lock().unwrap().push("announced".to_string());
+            assert_eq!(&buffer[..bytes_read], b"P 9 14\ntest-node127.0.0.1:8356");
+            connection.write_all(b"R\n").await.unwrap();
+
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if connection.write_all(b"A\n").await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![primary_addr, standby_addr],
+                advertise_addr: "127.0.0.1:8356".to_string(),
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            "test-node".to_string(),
+            shutdown_rx,
+        ));
+
+        for _ in 0..500 {
+            if events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "announced")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_primary.abort();
+        fake_standby.abort();
+
+        assert_eq!(*events.lock().unwrap(), vec!["promoted", "announced"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn send_heartbeats_retries_after_the_discovery_server_is_unreachable() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let discovery_addr = listener.local_addr().unwrap().to_string();
@@ -2631,7 +2885,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
-                discovery_addr: discovery_addr.clone(),
+                discovery_addrs: vec![discovery_addr.clone()],
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_millis(20),
                 auth_secret: None,
@@ -2782,7 +3036,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
-                discovery_addr,
+                discovery_addrs: vec![discovery_addr],
                 advertise_addr: "127.0.0.1:8356".to_string(),
                 interval: Duration::from_millis(20),
                 auth_secret: None,

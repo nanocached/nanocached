@@ -94,9 +94,13 @@ Usage: nanocached-node [options]
 
   --host <addr>               bind address (default 127.0.0.1)
   --port <port>                bind port (default 8356)
-  --discovery <addr>          register with a discovery server at <addr>
-                               (see nanocached-discovery); omit to run
-                               standalone
+  --discovery <addrs>         register with the discovery server(s) at
+                               <addrs>, a comma-separated list (see
+                               nanocached-discovery). The first address is
+                               the primary, the only one asked to
+                               orchestrate a join (ADR-0010) — every node
+                               in a cluster must list the same addresses
+                               in the same order. Omit to run standalone
   --advertise-addr <addr>     address to register with the discovery
                                server (default: --host:--port)
   --heartbeat-interval <secs> seconds between heartbeats to the discovery
@@ -148,13 +152,29 @@ async fn main() -> ExitCode {
 
     let address = format!("{}:{}", args.host, args.port);
     let auth_secret = read_auth_secret();
-    let heartbeat = args.discovery.map(|discovery_addr| HeartbeatConfig {
-        discovery_addr,
-        advertise_addr: args.advertise_addr.unwrap_or_else(|| address.clone()),
-        interval: args.heartbeat_interval,
-        auth_secret: auth_secret.clone(),
-        tls_connector,
-    });
+    let heartbeat = match args.discovery {
+        Some(list) => {
+            let discovery_addrs: Vec<String> = list
+                .split(',')
+                .map(|addr| addr.trim().to_string())
+                .filter(|addr| !addr.is_empty())
+                .collect();
+
+            if discovery_addrs.is_empty() {
+                eprintln!("nanocached-node: --discovery requires at least one address");
+                return ExitCode::FAILURE;
+            }
+
+            Some(HeartbeatConfig {
+                discovery_addrs,
+                advertise_addr: args.advertise_addr.unwrap_or_else(|| address.clone()),
+                interval: args.heartbeat_interval,
+                auth_secret: auth_secret.clone(),
+                tls_connector,
+            })
+        }
+        None => None,
+    };
 
     if let Err(err) = server::run(&address, heartbeat, auth_secret, tls_acceptor).await {
         eprintln!("nanocached-node: {err}");

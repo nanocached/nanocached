@@ -1,8 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { AlreadyClosedError, NanocachedClient, WrongNodeError } from "../src/index.js";
+import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
-import { startMockDiscovery, startMockNode, type MockNode } from "./mockServers.js";
+import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -163,6 +163,117 @@ function singleConnectionClosed(client: NanocachedClient): boolean {
 function memberConnectionClosed(client: NanocachedClient, name: string): boolean {
   return (client as any).target.members.get(name).connection.isClosed();
 }
+
+describe("NanocachedClient discovery seeds", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  it("rejects when neither host/port nor seeds are given", async () => {
+    await assert.rejects(NanocachedClient.connect({}), /needs either host\/port or a non-empty seeds list/);
+  });
+
+  it("connects through the second seed when the first is unreachable", async () => {
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
+    const deadPort = await unusedPort();
+    try {
+      const client = await NanocachedClient.connect({
+        seeds: [
+          { host: "127.0.0.1", port: deadPort },
+          { host: "127.0.0.1", port: discovery.port },
+        ],
+      });
+      try {
+        assert.equal(client.url, `127.0.0.1:${discovery.port}`);
+        await client.set("k", "v");
+        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
+    }
+  });
+
+  it("skips a warming-up discovery server and uses the next seed", async () => {
+    const node = await startMockNode();
+    const [warming, healthy] = await Promise.all([
+      startMockDiscovery([{ name: names[0], address: node.address }]),
+      startMockDiscovery([{ name: names[0], address: node.address }]),
+    ]);
+    warming.setWarmingUp(true);
+    try {
+      const client = await NanocachedClient.connect({
+        seeds: [
+          { host: "127.0.0.1", port: warming.port },
+          { host: "127.0.0.1", port: healthy.port },
+        ],
+      });
+      try {
+        assert.equal(client.url, `127.0.0.1:${healthy.port}`);
+        await client.set("k", "v");
+        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([warming.close(), healthy.close(), node.close()]);
+    }
+  });
+
+  it("rejects with DiscoveryBusyError when every seed is warming up", async () => {
+    const [first, second] = await Promise.all([startMockDiscovery([]), startMockDiscovery([])]);
+    first.setWarmingUp(true);
+    second.setWarmingUp(true);
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({
+          seeds: [
+            { host: "127.0.0.1", port: first.port },
+            { host: "127.0.0.1", port: second.port },
+          ],
+        }),
+        DiscoveryBusyError,
+      );
+    } finally {
+      await Promise.all([first.close(), second.close()]);
+    }
+  });
+
+  it("refreshes the node list through the next seed when the first stops answering", async () => {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], address: nodeA.address },
+      { name: names[1], address: nodeB.address },
+    ];
+    const [primary, standby] = await Promise.all([startMockDiscovery(nodes), startMockDiscovery(nodes)]);
+    try {
+      const client = await NanocachedClient.connect({
+        seeds: [
+          { host: "127.0.0.1", port: primary.port },
+          { host: "127.0.0.1", port: standby.port },
+        ],
+      });
+      try {
+        const key = "some-key";
+        await client.set(key, "v");
+
+        // The primary discovery restarts into its grace period; the next
+        // forced refresh (triggered by a W answer) must fall through to
+        // the standby and still let the retry succeed.
+        primary.setWarmingUp(true);
+        const ring = new HashRing(names);
+        const owner = ring.route(Buffer.from(key)) === names[0] ? nodeA : nodeB;
+        owner.answerWrongNodeOnce();
+
+        assert.deepEqual(await client.get(key), Buffer.from("v"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([primary.close(), standby.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+});
 
 describe("NanocachedClient reconnect-on-use", () => {
   it("transparently reconnects after the server closes an idle connection", async () => {
