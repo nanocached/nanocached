@@ -56,8 +56,13 @@ impl Cache {
     }
 
     pub fn set_with_ttl(&mut self, key: Bytes, value: Bytes, ttl: Duration) {
-        let expires_at = Instant::now() + ttl;
-        self.insert(key, value, Some(expires_at));
+        // The TTL comes straight off the wire with no upper bound, so a huge
+        // value (up to `u64::MAX` seconds) would overflow `Instant + Duration`
+        // and panic — taking down the single cache actor and, with it, every
+        // client's cache operations. A TTL too far out to represent is treated
+        // as "never expires" (no expiry), which is the closest honest meaning.
+        let expires_at = Instant::now().checked_add(ttl);
+        self.insert(key, value, expires_at);
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<Bytes> {
@@ -316,6 +321,28 @@ mod tests {
         );
 
         assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn set_with_an_overflowing_ttl_never_expires_instead_of_panicking() {
+        // A TTL near `u64::MAX` seconds overflows `Instant + Duration`, which
+        // panics — taking down the whole cache actor. Such a value is stored
+        // with no expiry instead: it must not panic, and the entry stays
+        // retrievable arbitrarily far into the future.
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set_with_ttl(
+            Bytes::from_static(b"name"),
+            Bytes::from_static(b"Alice"),
+            Duration::from_secs(u64::MAX),
+        );
+
+        let far_future = Instant::now() + Duration::from_secs(1_000_000_000);
+
+        assert_eq!(
+            cache.get_at(b"name", far_future),
+            Some(Bytes::from_static(b"Alice"))
+        );
     }
 
     #[test]

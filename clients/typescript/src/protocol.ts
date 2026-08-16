@@ -15,6 +15,14 @@ export function encodeGet(key: Uint8Array): Buffer {
 }
 
 export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds?: number): Buffer {
+  if (ttlSeconds !== undefined && (!Number.isInteger(ttlSeconds) || ttlSeconds < 0)) {
+    // A non-integer/negative TTL (3.5, -1, NaN, Infinity) would serialize to a
+    // frame the server rejects with no reply, closing the shared, pipelined
+    // connection — taking every other in-flight request on it down too. Reject
+    // it here, synchronously, before anything is written.
+    throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+  }
+
   const header =
     ttlSeconds === undefined
       ? `S ${key.length} ${value.length}\n`

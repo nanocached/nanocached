@@ -998,10 +998,16 @@ async fn on_node_connection_ended(
         lock(registry).remove(name);
     }
 
-    let matters_to_current_join = was_waiting_or_joining
-        || lock_current_join(current_join)
-            .as_ref()
-            .is_some_and(|pending| pending.expected.contains(name));
+    // `was_waiting_or_joining` only tells us this node wasn't `Joined` — which
+    // is true for *any* queued `Waiting` node, not just the one this join is
+    // about. Abandoning on that alone lets an unrelated queued node's
+    // disconnect tear down (and de-register) the current join's joining node,
+    // stranding it forever in `wait_for_promotion`. The join only actually
+    // matters if `name` is its joining node, or a ready node it still awaits a
+    // `C` from.
+    let matters_to_current_join = lock_current_join(current_join)
+        .as_ref()
+        .is_some_and(|pending| pending.joining_name == name || pending.expected.contains(name));
 
     if matters_to_current_join {
         abandon_current_join(registry, current_join, auth_secret, tls_connector).await;

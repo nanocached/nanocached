@@ -354,7 +354,14 @@ fn parse_migrate(
     // Read-only pass: record each entry's span and advance `cursor`,
     // without mutating `input`, so a still-arriving trailing entry leaves
     // `input` untouched.
-    let mut entry_spans = Vec::with_capacity(joined_count);
+    //
+    // `joined_count` is attacker-controlled and unbounded (a header number,
+    // not tied to the buffered byte count), and this parse runs before the
+    // connection authenticates, so it must not size an allocation: a tiny
+    // `M 3 3 <huge>\n...` would otherwise make `Vec::with_capacity` request
+    // terabytes and abort the process. Grow as real entries are confirmed
+    // present instead — capacity then tracks the buffer, which is bounded.
+    let mut entry_spans = Vec::new();
 
     for _ in 0..joined_count {
         let entry_header_end = cursor + find_lf(&input[cursor..]).ok_or(ParseError::Incomplete)?;
@@ -842,6 +849,18 @@ mod tests {
         let mut input = buf(b"M 0 14 0\n127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn migrate_with_a_huge_joined_count_reports_incomplete_without_pre_allocating() {
+        // `joined_count` is attacker-controlled and unbounded; parsing must
+        // not size an allocation from it (a `Vec::with_capacity` on this value
+        // would request terabytes and abort the process). With the joining
+        // node's own fields present but no entries buffered, this must simply
+        // report `Incomplete` — cheaply, without touching that huge number.
+        let mut input = buf(b"M 6 14 999999999999\nnode-b127.0.0.1:8357");
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]

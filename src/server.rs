@@ -404,8 +404,7 @@ pub(crate) async fn run(
                     connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
-                )
-                .await;
+                );
             }
 
         }
@@ -454,7 +453,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-async fn dispatch_connection(
+fn dispatch_connection(
     stream: TcpStream,
     address: SocketAddr,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -462,50 +461,61 @@ async fn dispatch_connection(
     config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
-) -> bool {
+) {
     // Every request/response is small; without this, the kernel may delay
     // small writes waiting to coalesce with more data (Nagle's algorithm).
     let _ = stream.set_nodelay(true);
 
-    let mut stream: ServerStream = match &config.tls_acceptor {
-        Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-            Ok(Ok(tls_stream)) => ServerStream::Tls(Box::new(tls_stream)),
-            Ok(Err(error)) => {
-                eprintln!("TLS handshake with {address} failed: {error}");
-                return false;
-            }
-            Err(_) => {
-                eprintln!("TLS handshake with {address} timed out");
-                return false;
-            }
-        },
-        None => ServerStream::Plain(stream),
-    };
-
-    let permit = match connection_limit.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let busy = Response::Busy.encode();
-
-            if let Err(error) = stream.write_all(&busy).await {
-                eprintln!("failed to send busy response to {address}: {error}");
-            }
-
-            return false;
-        }
-    };
-
-    println!("accepted connection from {address}");
-
+    // Everything below — the TLS handshake and the over-limit "Busy" reply —
+    // runs inside the spawned task, never inline in `run`'s accept loop. A
+    // client that stalls its handshake (or never reads its "Busy" reply) would
+    // otherwise block `run`'s `select!`, freezing new-connection accepts,
+    // shutdown detection, and task reaping for the whole server.
     connection_tasks.spawn(async move {
+        let mut stream: ServerStream = match &config.tls_acceptor {
+            Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(tls_stream)) => ServerStream::Tls(Box::new(tls_stream)),
+                Ok(Err(error)) => {
+                    eprintln!("TLS handshake with {address} failed: {error}");
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("TLS handshake with {address} timed out");
+                    return;
+                }
+            },
+            None => ServerStream::Plain(stream),
+        };
+
+        let permit = match connection_limit.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let busy = Response::Busy.encode();
+
+                // Bound the write: a peer that never reads must not leak this
+                // task by leaving the write pending indefinitely.
+                match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(&busy)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        eprintln!("failed to send busy response to {address}: {error}");
+                    }
+                    Err(_) => {
+                        eprintln!("sending busy response to {address} timed out");
+                    }
+                }
+
+                return;
+            }
+        };
+
+        println!("accepted connection from {address}");
+
         let _connection_permit = permit;
 
         if let Err(error) = handle_connection(stream, request_tx, config, shutdown_rx).await {
             eprintln!("connection error from {address}: {error}");
         }
     });
-
-    true
 }
 
 async fn execute_command(
@@ -1639,7 +1649,7 @@ mod tests {
         let mut connection_tasks = JoinSet::new();
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let first_connection = dispatch_connection(
+        dispatch_connection(
             first_server,
             first_address,
             request_tx.clone(),
@@ -1653,16 +1663,17 @@ mod tests {
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
-        )
-        .await;
+        );
 
-        assert!(first_connection);
+        // The connection is now handled entirely in a spawned task; let it run
+        // far enough to take the sole permit and settle into its read loop.
+        tokio::task::yield_now().await;
         assert_eq!(connection_limit.available_permits(), 0);
 
         let (mut second_client, second_server) = tcp_pair().await;
         let second_address = second_server.peer_addr().unwrap();
 
-        let second_connection = dispatch_connection(
+        dispatch_connection(
             second_server,
             second_address,
             request_tx.clone(),
@@ -1676,21 +1687,20 @@ mod tests {
             },
             shutdown_rx,
             &mut connection_tasks,
-        )
-        .await;
+        );
 
-        assert!(!second_connection);
-
+        // Reading to EOF drives the over-limit task to completion: it replies
+        // "Busy" and closes without ever acquiring a permit.
         let mut response = Vec::new();
         second_client.read_to_end(&mut response).await.unwrap();
 
         assert_eq!(response, b"B\n");
+        assert_eq!(connection_limit.available_permits(), 0);
 
         connection_tasks.abort_all();
 
-        let join_error = connection_tasks.join_next().await.unwrap().unwrap_err();
+        while connection_tasks.join_next().await.is_some() {}
 
-        assert!(join_error.is_cancelled());
         assert!(connection_tasks.is_empty());
         assert_eq!(connection_limit.available_permits(), 1);
     }
@@ -2712,8 +2722,7 @@ mod tests {
                 config,
                 shutdown_rx,
                 &mut connection_tasks,
-            )
-            .await;
+            );
 
             while connection_tasks.join_next().await.is_some() {}
         });
