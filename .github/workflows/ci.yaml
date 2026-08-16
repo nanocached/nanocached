@@ -33,24 +33,28 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # pnpm's version comes from `packageManager` in this package.json
+          # (there is no repo-root package.json for the action's default).
+          package_json_file: sdk/typescript/package.json
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
-          cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
-
-      - name: Build nanocached-node and nanocached-discovery
-        run: cargo build --bin nanocached-node --bin nanocached-discovery
+          cache: pnpm
+          cache-dependency-path: sdk/typescript/pnpm-lock.yaml
 
       - name: Install dependencies
         working-directory: sdk/typescript
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck
         working-directory: sdk/typescript
-        run: npm run typecheck
+        run: pnpm typecheck
 
       - name: Run tests
         working-directory: sdk/typescript
-        run: npm test
+        run: pnpm test
