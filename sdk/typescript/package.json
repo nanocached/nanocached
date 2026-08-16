@@ -1,8 +1,25 @@
 {
   "name": "nanocached",
   "version": "0.1.0",
-  "description": "TypeScript client for nanocached",
+  "description": "TypeScript SDK for nanocached — a tiny distributed cache with client-side consistent hashing",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/t0k0sh1/nanocached.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/t0k0sh1/nanocached/tree/main/sdk/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/t0k0sh1/nanocached/issues"
+  },
+  "keywords": [
+    "nanocached",
+    "cache",
+    "distributed-cache",
+    "consistent-hashing",
+    "client",
+    "sdk"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -15,13 +32,16 @@
   "files": [
     "dist"
   ],
+  "sideEffects": false,
   "engines": {
     "node": ">=20"
   },
+  "packageManager": "pnpm@11.15.1",
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "prepublishOnly": "npm run test && npm run build"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
