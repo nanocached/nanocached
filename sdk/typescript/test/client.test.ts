@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
@@ -236,6 +236,43 @@ describe("NanocachedClient discovery seeds", () => {
       );
     } finally {
       await Promise.all([first.close(), second.close()]);
+    }
+  });
+
+  it("warns when multiple seeds resolve to a single pinned node", async () => {
+    const node = await startMockNode();
+    const deadPort = await unusedPort();
+    const warn = mock.method(console, "warn", () => {});
+    try {
+      const client = await NanocachedClient.connect({
+        seeds: [
+          { host: "127.0.0.1", port: node.port },
+          { host: "127.0.0.1", port: deadPort },
+        ],
+      });
+      client.close();
+
+      const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
+      assert.ok(
+        messages.some((message) => message.includes("pinned to that single server")),
+        `expected a pinned-node warning, got: ${JSON.stringify(messages)}`,
+      );
+    } finally {
+      warn.mock.restore();
+      await node.close();
+    }
+  });
+
+  it("does not warn when a single host/port intentionally targets a node", async () => {
+    const node = await startMockNode();
+    const warn = mock.method(console, "warn", () => {});
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      client.close();
+      assert.equal(warn.mock.calls.length, 0, JSON.stringify(warn.mock.calls.map((c) => c.arguments)));
+    } finally {
+      warn.mock.restore();
+      await node.close();
     }
   });
 

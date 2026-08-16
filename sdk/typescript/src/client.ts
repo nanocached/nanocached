@@ -213,6 +213,20 @@ export class NanocachedClient {
       }
 
       if (identified.kind === "node") {
+        if (seeds.length > 1) {
+          // Multiple seeds imply the caller expected redundancy, but a
+          // node target pins the client to exactly this one server: the
+          // remaining seeds don't form a cluster, and a later death of
+          // this node is redialed, never failed over. Direct node targets
+          // are for development or single-node deployments — clusters
+          // should seed discovery servers.
+          console.warn(
+            `nanocached: ${key} is a cache node, so this client is pinned to that single server — ` +
+              `the ${seeds.length - 1} remaining seed(s) will not be used. ` +
+              `Point seeds at discovery servers for cluster routing and failover.`,
+          );
+        }
+
         trackOpenTarget(key, [identified.socket]);
         return new NanocachedClient(
           { kind: "single", connection: new Connection(identified.socket) },

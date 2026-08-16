@@ -100,6 +100,13 @@ still warming up after a restart (it answers `B` while re-learning cluster
 membership) is skipped like an unreachable one; if *every* seed is warming
 up, `connect()` rejects with `DiscoveryBusyError` — retry shortly.
 
+Seeds should point at discovery servers. If a seed turns out to be a cache
+node, the client pins itself to that one server (a single node cannot
+provide cluster routing — the hash ring needs the name/address pairs only
+discovery serves), and any remaining seeds go unused; when several seeds
+were given, the client warns about this. Direct node targets are meant for
+development or deliberate single-node deployments.
+
 ## Idle connections, reconnect, and keep-alive
 
 `nanocached-node` closes connections that have been idle for 30 seconds.
