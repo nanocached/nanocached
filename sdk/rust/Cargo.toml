@@ -1,0 +1,23 @@
+[package]
+name = "nanocached"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Async client SDK for nanocached, a tiny distributed cache with client-side replication"
+license = "MIT"
+homepage = "https://nanocached.org"
+repository = "https://github.com/t0k0sh1/nanocached"
+keywords = ["nanocached", "cache", "distributed", "client", "sdk"]
+categories = ["caching", "asynchronous"]
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pki-types = { version = "1", optional = true }
+
+[features]
+default = []
+tls = ["dep:tokio-rustls", "dep:rustls-pki-types"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
