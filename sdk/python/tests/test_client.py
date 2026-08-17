@@ -220,8 +220,12 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         # the connect within the deadline instead of hanging.
         from nanocached import _identify
 
+        # Track accepted writers: nothing on the server side ever closes
+        # them (that's the point of a silent server), and on 3.12.1+
+        # Server.wait_closed() waits for every connection to finish.
+        accepted: list[asyncio.StreamWriter] = []
         silent = await asyncio.start_server(
-            lambda reader, writer: None, "127.0.0.1", 0
+            lambda reader, writer: accepted.append(writer), "127.0.0.1", 0
         )
         port = silent.sockets[0].getsockname()[1]
         original = _identify.CONNECT_DEADLINE
@@ -231,6 +235,8 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 await NanocachedClient.connect("127.0.0.1", port)
         finally:
             _identify.CONNECT_DEADLINE = original
+            for writer in accepted:
+                writer.close()
             silent.close()
             await silent.wait_closed()
 
