@@ -85,6 +85,11 @@ impl Cache {
         let value_len = value.len();
         let entry = Entry { value, expires_at };
 
+        // A fresh write is not the value a handoff transferred: a stale
+        // `migrated` mark left over from an earlier value must not condemn
+        // this one to the next sweep (it would silently delete it).
+        self.migrated.remove(&key[..]);
+
         match self.entries.put(key, entry) {
             Some(replaced) => self.used_bytes = self.used_bytes - replaced.value.len() + value_len,
             None => self.used_bytes += key_len + value_len,
@@ -101,6 +106,9 @@ impl Cache {
                 .expect("len() > 1 guarantees an entry to evict");
 
             self.used_bytes -= evicted_key.len() + evicted_entry.value.len();
+            // The marked value is gone; a future entry under this key is a
+            // different value and must not inherit the mark.
+            self.migrated.remove(&evicted_key[..]);
         }
     }
 
@@ -132,6 +140,9 @@ impl Cache {
     fn remove_entry(&mut self, key: &[u8]) -> Option<Entry> {
         let entry = self.entries.pop(key)?;
         self.used_bytes -= key.len() + entry.value.len();
+        // The mark referred to this entry's value; whatever is stored
+        // under the key later is a different value.
+        self.migrated.remove(key);
         Some(entry)
     }
 
@@ -233,7 +244,11 @@ impl Cache {
                     .filter(|(_, entry)| entry.is_expired_at(now))
                     .map(|(key, _)| key.clone()),
             );
-            self.pending_removal.extend(self.migrated.drain());
+            // Marks stay in `migrated` until the moment of removal (not
+            // drained here): the queue is only a snapshot of candidates,
+            // and a key rewritten after this point clears its mark, which
+            // the removability re-check below must still observe.
+            self.pending_removal.extend(self.migrated.iter().cloned());
         }
 
         let mut removed = 0;
@@ -243,7 +258,17 @@ impl Cache {
                 break;
             };
 
-            if self.remove_entry(&key).is_some() {
+            // Re-check at removal time: the snapshot above may be stale —
+            // the key may have been rewritten (mark cleared, or no longer
+            // expired) since it was queued, and a fresh value must never
+            // be swept on the strength of an old candidate entry.
+            let removable = self.migrated.contains(&key[..])
+                || self
+                    .entries
+                    .peek(&key[..])
+                    .is_some_and(|entry| entry.is_expired_at(now));
+
+            if removable && self.remove_entry(&key).is_some() {
                 removed += 1;
             }
         }
@@ -684,6 +709,86 @@ mod tests {
         cache.mark_migrated(b"name");
 
         assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn sweep_does_not_remove_a_value_rewritten_after_its_mark() {
+        // Regression for issue #2: a mark refers to the value that was
+        // handed off, not to the key forever — deleting the marked value
+        // and writing a fresh one must not condemn the fresh one.
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+        cache.delete(b"name");
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Bob"));
+
+        assert_eq!(cache.sweep(), 0);
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn overwriting_a_marked_key_clears_the_mark() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Bob"));
+
+        assert_eq!(cache.sweep(), 0);
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn eviction_clears_the_mark_for_the_evicted_key() {
+        // Room for roughly one small entry at a time, so the second set
+        // evicts the first.
+        let mut cache = Cache::new(16);
+
+        cache.set(Bytes::from_static(b"aaaa"), Bytes::from_static(b"11111111"));
+        cache.mark_migrated(b"aaaa");
+        cache.set(Bytes::from_static(b"bbbb"), Bytes::from_static(b"22222222")); // evicts "aaaa"
+        cache.set(Bytes::from_static(b"aaaa"), Bytes::from_static(b"33333333")); // fresh value
+
+        cache.sweep();
+        assert_eq!(cache.get(b"aaaa"), Some(Bytes::from_static(b"33333333")));
+    }
+
+    #[test]
+    fn a_key_rewritten_while_queued_for_removal_survives_the_sweep() {
+        // Regression for the same staleness through `pending_removal`: with
+        // more expired keys than one sweep's budget, a key can sit queued
+        // across sweeps; rewriting it fresh in that window must not let the
+        // stale queue entry delete the new value.
+        let mut cache = Cache::new(UNBOUNDED);
+        let now = Instant::now();
+
+        for i in 0..(SWEEP_BUDGET + 1) {
+            cache.set_with_ttl(
+                Bytes::from(format!("key-{i}")),
+                Bytes::from_static(b"old"),
+                Duration::from_secs(1),
+            );
+        }
+
+        let later = now + Duration::from_secs(60);
+        assert_eq!(cache.sweep_at(later), SWEEP_BUDGET);
+
+        // Exactly one expired key remains, and it is still queued. Rewrite
+        // it with a fresh, unexpiring value before the next sweep round.
+        let leftover = cache
+            .entries
+            .iter()
+            .map(|(key, _)| key.clone())
+            .next()
+            .expect("one expired entry should remain after the budgeted sweep");
+        cache.set(leftover.clone(), Bytes::from_static(b"fresh"));
+
+        cache.sweep_at(later);
+        assert_eq!(
+            cache.get_at(&leftover, later),
+            Some(Bytes::from_static(b"fresh"))
+        );
     }
 
     #[test]
