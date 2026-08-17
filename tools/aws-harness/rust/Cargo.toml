@@ -1,0 +1,11 @@
+[package]
+name = "nanotest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nanocached = { path = "../../../sdk/rust" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[workspace]
