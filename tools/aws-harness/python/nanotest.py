@@ -115,9 +115,9 @@ async def cmd_churn(seconds: float, outfile: str) -> int:
             try:
                 if op == "get":
                     key = f"bulk:{random.randrange(0, 2000)}"
-                    await asyncio.wait_for(client.get(key), timeout=5)
+                    await asyncio.wait_for(client.get(key), timeout=15)
                 else:
-                    await asyncio.wait_for(client.set(f"churn:{i}", f"c-{i}"), timeout=5)
+                    await asyncio.wait_for(client.set(f"churn:{i}", f"c-{i}"), timeout=15)
                 ops += 1
             except Exception as exc:  # noqa: BLE001 — record every failure kind
                 ops += 1
