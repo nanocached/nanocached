@@ -312,6 +312,8 @@ B\n
 - [`sdk/java`](sdk/java/README.md) — a thread-safe Java client with the
   same feature set (Java 17+, no runtime dependencies,
   `org.nanocached:nanocached`).
+- [`sdk/rust`](sdk/rust/README.md) — an async (tokio) Rust client with
+  the same feature set (TLS behind the `tls` feature).
 
 ## Capacity planning
 

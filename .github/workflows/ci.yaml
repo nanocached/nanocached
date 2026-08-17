@@ -98,3 +98,21 @@ jobs:
       - name: Run tests
         working-directory: sdk/java
         run: gradle test
+
+  rust-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check formatting and lints
+        working-directory: sdk/rust
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D clippy::all
+
+      - name: Run tests
+        working-directory: sdk/rust
+        run: cargo test --all-features
