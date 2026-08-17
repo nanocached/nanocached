@@ -1050,9 +1050,14 @@ fn delete_message(key: &[u8]) -> Vec<u8> {
 
 /// ADR-0008: reports to discovery that this node (identified by `name`,
 /// ADR-0009) has finished handing off its share of the current join.
-fn complete_message(name: &str) -> Vec<u8> {
-    let mut message = format!("C {}\n", name.len()).into_bytes();
+/// `C <name-len> <joining-len>\n<name><joining>` — the completion report
+/// names both the reporting node and the join it is for (issue #5): a
+/// bare name let a stale report from an abandoned handoff be credited to
+/// whatever join happened to be pending next.
+fn complete_message(name: &str, joining_name: &str) -> Vec<u8> {
+    let mut message = format!("C {} {}\n", name.len(), joining_name.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(joining_name.as_bytes());
     message
 }
 
@@ -1325,7 +1330,7 @@ async fn run_migration(
         replication,
     }));
 
-    if let Err(error) = report_complete(&node_context).await {
+    if let Err(error) = report_complete(&node_context, &joining_name).await {
         eprintln!(
             "migration to {joining_addr} finished but reporting completion to {} failed: {error}",
             node_context.discovery_addr
@@ -1594,7 +1599,7 @@ async fn delete_on_joining_node(
     Ok(())
 }
 
-async fn report_complete(node_context: &NodeContext) -> io::Result<()> {
+async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::Result<()> {
     let mut stream = connect_client_stream(
         &node_context.discovery_addr,
         node_context.tls_connector.as_ref(),
@@ -1616,7 +1621,7 @@ async fn report_complete(node_context: &NodeContext) -> io::Result<()> {
     }
 
     stream
-        .write_all(&complete_message(&node_context.name))
+        .write_all(&complete_message(&node_context.name, joining_name))
         .await?;
 
     let mut ack = [0u8; 2];
@@ -2278,7 +2283,10 @@ mod tests {
 
     #[test]
     fn complete_message_declares_the_name_length_before_the_name() {
-        assert_eq!(complete_message("some-name"), b"C 9\nsome-name".to_vec());
+        assert_eq!(
+            complete_message("some-name", "joiner"),
+            b"C 9 6\nsome-namejoiner".to_vec()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2394,7 +2402,7 @@ mod tests {
         assert_eq!(*joining_received.lock().unwrap(), expected_set);
         assert_eq!(
             *discovery_received.lock().unwrap(),
-            complete_message("ready-node")
+            complete_message("ready-node", "joiner-107")
         );
 
         joining_task.await.unwrap();
@@ -2696,7 +2704,7 @@ mod tests {
         );
         assert_eq!(
             *discovery_received.lock().unwrap(),
-            complete_message("ready-node")
+            complete_message("ready-node", "joiner-107")
         );
 
         joining_task.await.unwrap();
