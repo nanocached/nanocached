@@ -70,11 +70,14 @@ directly (<a href="architecture.html">how it works</a>).</p>
 <pre><code>cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 cargo run --bin nanocached-node -- --port 8358 --discovery 127.0.0.1:8357</code></pre>
 
-<p>Each node sends a heartbeat every 5 seconds declaring
-<code>--advertise-addr</code> (default
-<code>--host:--port</code> — set it explicitly when nodes sit behind
-NAT or in containers). New nodes join with a staged data handoff, so
-adding a node never drops the keys it takes ownership of.</p>
+<p>Each node sends a heartbeat every 5 seconds; the discovery server
+derives the node's reachable address from that connection's own source
+IP plus the node's port, so containerized deployments need no address
+configuration. (Asymmetric port mapping — Docker's
+<code>-p 9999:8356</code> — is unsupported: it is NAT, which the
+cluster design already excludes.) New nodes join with a staged data
+handoff, so adding a node never drops the keys it takes ownership
+of.</p>
 
 <h3>Replication factor</h3>
 <p>Discovery owns the cluster's replication factor R

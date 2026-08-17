@@ -263,7 +263,11 @@ pub(crate) struct HeartbeatConfig {
     /// the rest learn about this node via `P` announces once the primary
     /// has promoted it. Never empty (main.rs validates).
     pub(crate) discovery_addrs: Vec<String>,
-    pub(crate) advertise_addr: String,
+    /// The port this node serves on. `J`/`P` carry only this; the
+    /// discovery server derives the full address from the registration
+    /// connection's source IP (ADR-0012), so there is nothing to
+    /// configure in containerized deployments.
+    pub(crate) port: u16,
     pub(crate) interval: Duration,
     /// Sent to the discovery server before the first heartbeat on each
     /// (re)connection, if the discovery server requires auth. This is the
@@ -801,22 +805,22 @@ async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>) {
 }
 
 /// ADR-0008: sent once per connection, before any heartbeat. `name` is
-/// this node's random per-process identity (ADR-0009); `advertise_addr` is
-/// how to reach it. Discovery holds this connection open and pushes
-/// `R\n` on it once this node is promoted to `Joined`.
-fn join_message(name: &str, advertise_addr: &str) -> Vec<u8> {
-    let mut message = format!("J {} {}\n", name.len(), advertise_addr.len()).into_bytes();
+/// this node's random per-process identity (ADR-0009); `port` is where it
+/// serves — the discovery server composes the reachable address from this
+/// connection's own source IP plus that port (ADR-0012). Discovery holds
+/// this connection open and pushes `R\n` on it once this node is promoted
+/// to `Joined`.
+fn join_message(name: &str, port: u16) -> Vec<u8> {
+    let mut message = format!("J {} {port}\n", name.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
-    message.extend_from_slice(advertise_addr.as_bytes());
     message
 }
 
 /// ADR-0010: same shape as `join_message`, but declares an
 /// already-promoted member — no handoff orchestration on the other end.
-fn announce_message(name: &str, advertise_addr: &str) -> Vec<u8> {
-    let mut message = format!("P {} {}\n", name.len(), advertise_addr.len()).into_bytes();
+fn announce_message(name: &str, port: u16) -> Vec<u8> {
+    let mut message = format!("P {} {port}\n", name.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
-    message.extend_from_slice(advertise_addr.as_bytes());
     message
 }
 
@@ -900,7 +904,7 @@ async fn send_heartbeats(
 
         tasks.spawn(register_with_discovery(
             discovery_addr.clone(),
-            config.advertise_addr.clone(),
+            config.port,
             config.interval,
             config.auth_secret.clone(),
             config.tls_connector.clone(),
@@ -921,7 +925,7 @@ async fn send_heartbeats(
 #[allow(clippy::too_many_arguments)]
 async fn register_with_discovery(
     discovery_addr: String,
-    advertise_addr: String,
+    port: u16,
     interval: Duration,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
@@ -929,8 +933,8 @@ async fn register_with_discovery(
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let join = join_message(&name, &advertise_addr);
-    let announce = announce_message(&name, &advertise_addr);
+    let join = join_message(&name, port);
+    let announce = announce_message(&name, port);
     let heartbeat = heartbeat_message(&name);
 
     // A standby must not announce a node the primary hasn't promoted yet:
@@ -2343,10 +2347,10 @@ mod tests {
     }
 
     #[test]
-    fn join_message_declares_both_lengths_before_the_name_and_address() {
+    fn join_message_declares_the_name_length_and_the_port() {
         assert_eq!(
-            join_message("some-name", "127.0.0.1:8356"),
-            b"J 9 14\nsome-name127.0.0.1:8356".to_vec()
+            join_message("some-name", 8356),
+            b"J 9 8356\nsome-name".to_vec()
         );
     }
 
@@ -2945,12 +2949,12 @@ mod tests {
         cache_task.await.unwrap();
     }
 
-    /// Parses a `J <name-length> <addr-length>\n<name><addr>` message (the
-    /// only one whose shape the test doesn't already know, since its name
-    /// is a random UUID generated inside `send_heartbeats`) and asserts
-    /// every subsequent message in `received` is the matching
+    /// Parses a `J <name-length> <port>\n<name>` message (the only one
+    /// whose shape the test doesn't already know, since its name is a
+    /// random UUID generated inside `send_heartbeats`) and asserts every
+    /// subsequent message in `received` is the matching
     /// `H <name-length>\n<name>` heartbeat for that same name.
-    fn assert_join_then_heartbeats(received: &[Vec<u8>], advertise_addr: &str) {
+    fn assert_join_then_heartbeats(received: &[Vec<u8>], port: u16) {
         assert!(
             received.len() >= 4,
             "expected a join plus at least 3 heartbeats, got {}",
@@ -2963,13 +2967,13 @@ mod tests {
         assert_eq!(header.next(), Some("J"));
 
         let name_length: usize = header.next().unwrap().parse().unwrap();
-        let addr_length: usize = header.next().unwrap().parse().unwrap();
+        let sent_port: u16 = header.next().unwrap().parse().unwrap();
         assert_eq!(header.next(), None);
-        assert_eq!(addr_length, advertise_addr.len());
+        assert_eq!(sent_port, port);
 
         let body = &join[header_end + 1..];
         let name = &body[..name_length];
-        assert_eq!(&body[name_length..], advertise_addr);
+        assert_eq!(body.len(), name_length);
 
         let expected_heartbeat = format!("H {}\n{name}", name.len());
         for message in &received[1..] {
@@ -2984,7 +2988,7 @@ mod tests {
         send_heartbeats(
             HeartbeatConfig {
                 discovery_addrs: vec!["127.0.0.1:1".to_string()],
-                advertise_addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
                 interval: Duration::from_secs(60),
                 auth_secret: None,
                 tls_connector: None,
@@ -3035,7 +3039,7 @@ mod tests {
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
                 discovery_addrs: vec![discovery_addr],
-                advertise_addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
                 interval: Duration::from_millis(20),
                 auth_secret: None,
                 tls_connector: None,
@@ -3050,7 +3054,7 @@ mod tests {
         heartbeat_task.await.unwrap();
         fake_discovery.abort();
 
-        assert_join_then_heartbeats(&received.lock().unwrap(), "127.0.0.1:8356");
+        assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3102,7 +3106,7 @@ mod tests {
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
                 discovery_addrs: vec![discovery_addr],
-                advertise_addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
                 interval: Duration::from_millis(20),
                 auth_secret: None,
                 tls_connector: None,
@@ -3124,8 +3128,8 @@ mod tests {
 
         let registrations = registrations.lock().unwrap();
         assert!(registrations.len() >= 2, "node never re-registered");
-        assert_eq!(registrations[0], b"J 9 14\ntest-node127.0.0.1:8356");
-        assert_eq!(registrations[1], b"P 9 14\ntest-node127.0.0.1:8356");
+        assert_eq!(registrations[0], b"J 9 8356\ntest-node");
+        assert_eq!(registrations[1], b"P 9 8356\ntest-node");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3188,7 +3192,7 @@ mod tests {
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
                 discovery_addrs: vec![primary_addr, standby_addr],
-                advertise_addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
                 interval: Duration::from_millis(20),
                 auth_secret: None,
                 tls_connector: None,
@@ -3229,7 +3233,7 @@ mod tests {
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
                 discovery_addrs: vec![discovery_addr.clone()],
-                advertise_addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
                 interval: Duration::from_millis(20),
                 auth_secret: None,
                 tls_connector: None,
@@ -3380,7 +3384,7 @@ mod tests {
         let heartbeat_task = tokio::spawn(send_heartbeats(
             HeartbeatConfig {
                 discovery_addrs: vec![discovery_addr],
-                advertise_addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
                 interval: Duration::from_millis(20),
                 auth_secret: None,
                 tls_connector: Some(connector),
@@ -3395,6 +3399,6 @@ mod tests {
         heartbeat_task.await.unwrap();
         fake_discovery.abort();
 
-        assert_join_then_heartbeats(&received.lock().unwrap(), "127.0.0.1:8356");
+        assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
     }
 }
