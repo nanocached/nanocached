@@ -306,7 +306,9 @@ B\n
 
 - [`sdk/typescript`](sdk/typescript/README.md) — a TypeScript/
   Node.js client (`get`/`set`/`delete`, authentication, TLS, and
-  discovery-based cluster routing).
+  discovery-based cluster routing with replication).
+- [`sdk/python`](sdk/python/README.md) — an asyncio Python client with
+  the same feature set (Python 3.11+, no runtime dependencies).
 
 ## Capacity planning
 
