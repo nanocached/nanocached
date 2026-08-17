@@ -540,11 +540,13 @@ enum DiscoveryCommand {
     Heartbeat(String),
     List,
     /// ADR-0008: a node asking to join, identified by its name (ADR-0009)
-    /// and its advertised address. Sent once, on a connection the node
-    /// then holds open to receive the `R\n` promotion push.
+    /// and the port it serves on — the reachable address is composed from
+    /// this connection's own source IP plus that port (ADR-0012). Sent
+    /// once, on a connection the node then holds open to receive the
+    /// `R\n` promotion push.
     Join {
         name: String,
-        addr: String,
+        port: u16,
     },
     /// ADR-0008: a ready node reporting it has finished handing off its
     /// share of a join, identified by its own name (ADR-0009) and the
@@ -555,11 +557,11 @@ enum DiscoveryCommand {
         joining_name: String,
     },
     /// ADR-0010: an already-promoted node (re-)declaring membership, with
-    /// the same name/address shape as `Join` — upserted straight to
+    /// the same name/port shape as `Join` — upserted straight to
     /// `Joined`, no handoff orchestration.
     Announce {
         name: String,
-        addr: String,
+        port: u16,
     },
 }
 
@@ -652,25 +654,31 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
         b"J" | b"P" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
-            let addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let port = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
 
             let name_length = parse_length(name_length)?;
-            let addr_length = parse_length(addr_length)?;
+            // ADR-0012: the node declares only the port it serves on; the
+            // reachable address is composed with this connection's source
+            // IP. Port 0 can never be served on, so reject it.
+            let port: u16 = std::str::from_utf8(port)
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .filter(|port| *port != 0)
+                .ok_or(ParseError::InvalidLength)?;
             // Same owned-fn-pointer dance as `H`/`C` above: resolve the
             // variant while `command` is still alive, so `input` can be
             // reborrowed mutably below.
-            let make: fn(String, String) -> DiscoveryCommand = match command {
-                b"J" => |name, addr| DiscoveryCommand::Join { name, addr },
-                _ => |name, addr| DiscoveryCommand::Announce { name, addr },
+            let make: fn(String, u16) -> DiscoveryCommand = match command {
+                b"J" => |name, port| DiscoveryCommand::Join { name, port },
+                _ => |name, port| DiscoveryCommand::Announce { name, port },
             };
-            let (name, addr) =
-                parse_two_string_fields(input, header_end, name_length, addr_length)?;
+            let name = parse_string_field(input, header_end, name_length)?;
 
-            Ok(make(name, addr))
+            Ok(make(name, port))
         }
 
         _ => Err(ParseError::InvalidCommand),
@@ -1479,6 +1487,7 @@ async fn dispatch_connection(
 
         let result = handle_connection(
             stream,
+            address.ip(),
             cluster_state.registry.clone(),
             cluster_state.current_join.clone(),
             config.clone(),
@@ -1558,6 +1567,9 @@ async fn sweep_expired(
 
 async fn handle_connection(
     mut stream: ServerStream,
+    // The connection's source IP: combined with the port a `J`/`P`
+    // declares, it IS the node's address (ADR-0012).
+    peer_ip: std::net::IpAddr,
     registry: Registry,
     current_join: CurrentJoin,
     config: ConnectionConfig,
@@ -1645,7 +1657,8 @@ async fn handle_connection(
                 stream.write_all(response.as_bytes()).await?;
                 continue;
             }
-            Ok(DiscoveryCommand::Join { name, addr }) => {
+            Ok(DiscoveryCommand::Join { name, port }) => {
+                let addr = format!("{peer_ip}:{port}");
                 *connection_name
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
@@ -1666,7 +1679,8 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(DiscoveryCommand::Announce { name, addr }) => {
+            Ok(DiscoveryCommand::Announce { name, port }) => {
+                let addr = format!("{peer_ip}:{port}");
                 // Same bookkeeping as `J`: this connection now belongs to
                 // `name`, so its death runs `on_node_connection_ended`.
                 *connection_name
@@ -1846,13 +1860,13 @@ mod tests {
 
     #[test]
     fn parse_reads_a_join_command_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"J 9 14\nsome-name127.0.0.1:8356L\n"[..]);
+        let mut input = BytesMut::from(&b"J 9 8356\nsome-nameL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Join {
                 name: "some-name".to_string(),
-                addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -1860,13 +1874,13 @@ mod tests {
 
     #[test]
     fn parse_reports_incomplete_while_a_joins_second_field_is_still_arriving() {
-        let mut input = BytesMut::from(&b"J 9 14\nsome-name127.0.0"[..]);
+        let mut input = BytesMut::from(&b"J 9 8356\nsome-na"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn parse_leaves_input_untouched_when_a_joins_second_field_is_incomplete() {
-        let original = b"J 9 14\nsome-name127.0.0".to_vec();
+        let original = b"J 9 8356\nsome-na".to_vec();
         let mut input = BytesMut::from(&original[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
         assert_eq!(&input[..], &original[..]);
@@ -1906,9 +1920,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_rejects_an_empty_second_field_in_join() {
+    fn parse_rejects_port_zero_in_join() {
+        // Port 0 can never be served on — ADR-0012 derives the address
+        // from source IP + this port, so a zero here is protocol garbage.
         let mut input = BytesMut::from(&b"J 9 0\nsome-name"[..]);
-        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
@@ -1974,6 +1990,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let _ = handle_connection(
                 MaybeTls::Plain(stream),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 server_registry,
                 server_current_join,
                 ConnectionConfig {
@@ -1994,7 +2011,7 @@ mod tests {
         // With no Joined nodes yet, this is the bootstrap case: the join
         // is accepted with nothing to hand off, so promotion is immediate.
         client
-            .write_all(b"J 6 14\nnode-a127.0.0.1:8356H 6\nnode-aL\n")
+            .write_all(b"J 6 8356\nnode-aH 6\nnode-aL\n")
             .await
             .unwrap();
 
@@ -2017,13 +2034,13 @@ mod tests {
 
     #[test]
     fn parse_reads_an_announce_command_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"P 9 14\nsome-name127.0.0.1:8356L\n"[..]);
+        let mut input = BytesMut::from(&b"P 9 8356\nsome-nameL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Announce {
                 name: "some-name".to_string(),
-                addr: "127.0.0.1:8356".to_string(),
+                port: 8356,
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -2043,6 +2060,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let _ = handle_connection(
                 MaybeTls::Plain(stream),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 server_registry,
                 server_current_join,
                 ConnectionConfig {
@@ -2064,7 +2082,7 @@ mod tests {
         // heartbeating (A), and visible in L — with no ADR-0008 join
         // machinery involved.
         client
-            .write_all(b"P 6 14\nnode-a127.0.0.1:8356H 6\nnode-aL\n")
+            .write_all(b"P 6 8356\nnode-aH 6\nnode-aL\n")
             .await
             .unwrap();
 
@@ -2099,6 +2117,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             ConnectionConfig {
@@ -2113,10 +2132,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
 
-        client
-            .write_all(b"P 6 14\nnode-a127.0.0.1:2222")
-            .await
-            .unwrap();
+        client.write_all(b"P 6 2222\nnode-a").await.unwrap();
         let mut response = [0u8; 2];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"R\n");
@@ -2141,6 +2157,7 @@ mod tests {
         let (mut client, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             ConnectionConfig {
@@ -2155,10 +2172,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
 
-        client
-            .write_all(b"P 6 14\nnode-a127.0.0.1:2222")
-            .await
-            .unwrap();
+        client.write_all(b"P 6 2222\nnode-a").await.unwrap();
 
         // The connection is closed with no `R` — the announce was refused.
         let mut buffer = [0u8; 2];
@@ -2189,16 +2203,14 @@ mod tests {
         let (mut announcing, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        announcing
-            .write_all(b"P 6 14\nnode-a127.0.0.1:8356")
-            .await
-            .unwrap();
+        announcing.write_all(b"P 6 8356\nnode-a").await.unwrap();
         let mut response = [0u8; 2];
         announcing.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"R\n");
@@ -2208,6 +2220,7 @@ mod tests {
         let (mut listing, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
@@ -2249,16 +2262,14 @@ mod tests {
         let (mut node_a, server_a) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_a),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_a
-            .write_all(b"J 6 14\nnode-a127.0.0.1:9001")
-            .await
-            .unwrap();
+        node_a.write_all(b"J 6 9001\nnode-a").await.unwrap();
         let mut promoted = [0u8; 2];
         node_a.read_exact(&mut promoted).await.unwrap();
         assert_eq!(&promoted, b"R\n");
@@ -2266,16 +2277,14 @@ mod tests {
         let (mut node_b, server_b) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_b),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b
-            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
-            .await
-            .unwrap();
+        node_b.write_all(b"J 6 9002\nnode-b").await.unwrap();
 
         for _ in 0..1000 {
             if lock_current_join(&current_join).is_some() {
@@ -2338,16 +2347,14 @@ mod tests {
         let (mut node_b_second, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config,
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b_second
-            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
-            .await
-            .unwrap();
+        node_b_second.write_all(b"J 6 9002\nnode-b").await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await; // let it park
 
         node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
@@ -2438,16 +2445,14 @@ mod tests {
         let (mut node_a, server_a) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_a),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_a
-            .write_all(b"J 6 14\nnode-a127.0.0.1:9001")
-            .await
-            .unwrap();
+        node_a.write_all(b"J 6 9001\nnode-a").await.unwrap();
         let mut node_a_response = [0u8; 2];
         node_a.read_exact(&mut node_a_response).await.unwrap();
         assert_eq!(&node_a_response, b"R\n");
@@ -2458,16 +2463,14 @@ mod tests {
         let (mut node_b, server_b) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_b),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b
-            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
-            .await
-            .unwrap();
+        node_b.write_all(b"J 6 9002\nnode-b").await.unwrap();
 
         // The write completing only means the OS accepted the bytes, not
         // that the spawned connection task has read and processed them
@@ -2487,6 +2490,7 @@ mod tests {
         let (mut lister, server_l) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_l),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
@@ -2534,6 +2538,7 @@ mod tests {
         // A fake ready node: a real listener that expects M and acks it,
         // standing in for node A's registered address.
         let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready_port = ready_listener.local_addr().unwrap().port();
         let ready_addr = ready_listener.local_addr().unwrap().to_string();
         let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let received_task = Arc::clone(&received);
@@ -2553,6 +2558,7 @@ mod tests {
         let (mut node_a, server_a) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_a),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
@@ -2560,7 +2566,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
         node_a
-            .write_all(format!("J 6 {}\nnode-a{ready_addr}", ready_addr.len()).as_bytes())
+            .write_all(format!("J 6 {ready_port}\nnode-a").as_bytes())
             .await
             .unwrap();
         let mut node_a_response = [0u8; 2];
@@ -2572,16 +2578,14 @@ mod tests {
         let (mut node_b, server_b) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_b),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             Arc::clone(&registry),
             Arc::clone(&current_join),
             config(),
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b
-            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
-            .await
-            .unwrap();
+        node_b.write_all(b"J 6 9002\nnode-b").await.unwrap();
 
         for _ in 0..1000 {
             if !received.lock().unwrap().is_empty() {
@@ -2632,6 +2636,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             registry,
             current_join,
             ConnectionConfig {
@@ -2665,6 +2670,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             registry,
             current_join,
             ConnectionConfig {
@@ -2698,6 +2704,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             registry,
             current_join,
             ConnectionConfig {
@@ -2738,6 +2745,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             registry,
             current_join,
             ConnectionConfig {

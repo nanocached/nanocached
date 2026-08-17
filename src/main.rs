@@ -27,7 +27,6 @@ struct Args {
     host: String,
     port: u16,
     discovery: Option<String>,
-    advertise_addr: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
@@ -39,7 +38,6 @@ impl Default for Args {
             host: "127.0.0.1".to_string(),
             port: 8356,
             discovery: None,
-            advertise_addr: None,
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
@@ -63,7 +61,6 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --port: {raw_port}"))?;
             }
             "--discovery" => args.discovery = Some(value()?),
-            "--advertise-addr" => args.advertise_addr = Some(value()?),
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
@@ -92,8 +89,6 @@ Usage: nanocached-node [options]
                                orchestrate a join (ADR-0010) — every node
                                in a cluster must list the same addresses
                                in the same order. Omit to run standalone
-  --advertise-addr <addr>     address to register with the discovery
-                               server (default: --host:--port)
   --tls-cert <path>           PEM certificate chain; requires TLS on every
                                accepted connection (no plaintext fallback)
   --tls-key <path>            PEM private key matching --tls-cert
@@ -156,7 +151,7 @@ async fn main() -> ExitCode {
 
             Some(HeartbeatConfig {
                 discovery_addrs,
-                advertise_addr: args.advertise_addr.unwrap_or_else(|| address.clone()),
+                port: args.port,
                 interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
                 auth_secret: auth_secret.clone(),
                 tls_connector,

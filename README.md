@@ -68,8 +68,12 @@ find this node, pass `--discovery`:
 cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 ```
 
-The node sends a heartbeat every 5 seconds declaring `--advertise-addr`
-(default: `--host:--port`); omit `--discovery` to run standalone.
+The node sends a heartbeat every 5 seconds; the discovery server derives
+the node's reachable address from that connection's own source IP plus
+the node's port (`doc/adr/0012-*.md`), so containerized deployments need
+no address configuration. Omit `--discovery` to run standalone.
+(Asymmetric port mapping — e.g. Docker's `-p 9999:8356` — is
+unsupported: it is NAT, which the cluster design already excludes.)
 
 `--discovery` accepts a comma-separated list of discovery replicas
 (`doc/adr/0010-*.md`): the node registers with and heartbeats to all of

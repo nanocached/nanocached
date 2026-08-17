@@ -51,7 +51,10 @@ the working tree, not a published package.
 The 2026-08 test run used: ECS Fargate tasks (ARM64 images built from
 the repo `Dockerfile`, pushed to ECR) — two `nanocached-discovery`
 tasks started first so their private IPs could be passed to every
-node's `--discovery` (same list, same order) and to `NANOTEST_SEEDS`;
+node's `--discovery` (same list, same order) and to `NANOTEST_SEEDS`.
+(That run predated ADR-0012 and scraped each task's IP from the ECS
+metadata endpoint for `--advertise-addr`; nodes now need no address
+configuration at all.) The rest of the setup:
 cache nodes as standalone `run-task`s (no service, so a stopped task
 stays dead); one security group allowing 8356-8358 from itself; and an
 EC2 (Graviton, AL2023) test host in the same subnet/SG driven over SSM.
