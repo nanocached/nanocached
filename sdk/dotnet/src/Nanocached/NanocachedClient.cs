@@ -336,6 +336,12 @@ public sealed class NanocachedClient : IDisposable
             {
                 throw;
             }
+            catch (AlreadyClosedException)
+            {
+                // A Close() racing this read should fail fast, not walk
+                // the remaining owners (issue #12).
+                throw;
+            }
             catch (Exception error) when (error is NanocachedException)
             {
                 lastError = error;
@@ -515,6 +521,9 @@ public sealed class NanocachedClient : IDisposable
             {
                 _members[name].Connection.Close();
                 _members.Remove(name);
+                // Node names are per-process UUIDs; a departed node's
+                // redial gate would otherwise leak forever (issue #12).
+                _redialGates.Remove(name);
             }
 
             foreach (DiscoveredNode node in cluster.Nodes)
@@ -537,6 +546,13 @@ public sealed class NanocachedClient : IDisposable
                 Connection connection = await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false);
                 lock (_stateLock)
                 {
+                    if (_closed)
+                    {
+                        // Close() ran while we were dialing (issue #10):
+                        // installing this socket now would leak it.
+                        connection.Close();
+                        return;
+                    }
                     _members[node.Name] = new Member(node.Address, connection);
                 }
             }

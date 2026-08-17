@@ -15,6 +15,7 @@ class MockNode:
         self.connection_count = 0
         self.get_count = 0
         self._wrong_node_replies = 0
+        self._malformed_value_replies = 0
         self._server: asyncio.Server | None = None
         self._sockets: set[asyncio.StreamWriter] = set()
         self.port = 0
@@ -25,6 +26,9 @@ class MockNode:
 
     def answer_wrong_node_once(self) -> None:
         self._wrong_node_replies += 1
+
+    def answer_malformed_value_once(self) -> None:
+        self._malformed_value_replies += 1
 
     async def start(self) -> "MockNode":
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
@@ -68,6 +72,11 @@ class MockNode:
                 elif parts[0] == b"G":
                     key = await reader.readexactly(int(parts[1]))
                     self.get_count += 1
+                    if self._malformed_value_replies > 0:
+                        self._malformed_value_replies -= 1
+                        writer.write(b"V x\n")
+                        await writer.drain()
+                        continue
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W\n")

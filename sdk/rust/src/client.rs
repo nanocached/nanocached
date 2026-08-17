@@ -503,6 +503,12 @@ impl NanocachedClient {
         let connection = Arc::new(Connection::new(self.open_node_stream(&address).await?));
 
         let mut state = self.inner.state.lock().await;
+        if self.inner.closed.load(Ordering::SeqCst) {
+            // close() ran while we were dialing (issue #10): installing
+            // this connection now would leak it past teardown.
+            connection.close();
+            return Err(Error::AlreadyClosed);
+        }
         match (&mut state.target, slot) {
             (
                 Target::Single {
@@ -601,6 +607,14 @@ impl NanocachedClient {
             members: fresh,
             replication,
         };
+        drop(state);
+
+        // Node names are per-process UUIDs; departed nodes' redial gates
+        // would otherwise accumulate forever (issue #12).
+        let live: std::collections::HashSet<String> =
+            nodes.iter().map(|node| node.name.clone()).collect();
+        let mut redials = self.inner.redials.lock().await;
+        redials.retain(|slot, _| slot.is_empty() || live.contains(slot));
     }
 
     /// Walks every seed (ADR-0010); `None` means keep the last-known list.

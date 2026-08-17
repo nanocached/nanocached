@@ -401,7 +401,11 @@ public final class NanocachedClient implements AutoCloseable {
             member = members.get(name);
         }
         if (member == null) {
-            throw new NanocachedException("nanocached: " + name + " has no open connection");
+            // Connection-classified (issue #8): the usual cause is a
+            // refresh racing this operation, which the refresh-and-retry
+            // layer heals.
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: " + name + " has no open connection", null);
         }
         if (!member.connection.isClosed()) return member.connection;
 
@@ -442,7 +446,11 @@ public final class NanocachedClient implements AutoCloseable {
 
         Identify.Result identified = Identify.connectAndIdentify(host, port, authSecret, tls);
         if (!(identified instanceof Identify.NodeTarget node)) {
-            throw new NanocachedException("nanocached: " + address + " no longer identifies as a cache node");
+            // Connection-classified (issue #8): a topology change, healed
+            // by the refresh-and-retry layer — unlike an auth failure,
+            // which stays a plain (non-retryable) exception.
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: " + address + " no longer identifies as a cache node", null);
         }
         if (closed) {
             try {
@@ -479,6 +487,9 @@ public final class NanocachedClient implements AutoCloseable {
             members.entrySet().removeIf(entry -> {
                 if (!byName.containsKey(entry.getKey())) {
                     entry.getValue().connection.close();
+                    // Node names are per-process UUIDs; a departed node's
+                    // redial gate would otherwise leak forever (issue #12).
+                    redialLocks.remove(entry.getKey());
                     return true;
                 }
                 return false;

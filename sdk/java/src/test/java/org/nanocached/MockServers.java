@@ -28,6 +28,7 @@ final class MockServers {
         final AtomicInteger connectionCount = new AtomicInteger();
         final AtomicInteger getCount = new AtomicInteger();
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
+        private final AtomicInteger malformedValueReplies = new AtomicInteger();
         private final byte[] requiredSecret;
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
@@ -56,6 +57,11 @@ final class MockServers {
 
         void answerWrongNodeOnce() {
             wrongNodeReplies.incrementAndGet();
+        }
+
+        /** Queue a one-off garbage `V` header for the next G request. */
+        void answerMalformedValueOnce() {
+            malformedValueReplies.incrementAndGet();
         }
 
         /** Server-side FIN on every open connection, like the idle timeout. */
@@ -110,6 +116,11 @@ final class MockServers {
                         case "G" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             getCount.incrementAndGet();
+                            if (malformedValueReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                                out.write("V x\n".getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (takeWrongNode()) {
                                 out.write("W\n".getBytes(StandardCharsets.US_ASCII));
                             } else {

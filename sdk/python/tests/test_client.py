@@ -151,6 +151,42 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
 
+class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_malformed_value_length_poisons_the_connection(self):
+        # Regression for issue #8: a garbage `V <len>` header desyncs the
+        # stream; the connection must be poisoned and the error must be
+        # connection-classified, so the next request redials cleanly.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect("127.0.0.1", node.port)
+            try:
+                await client.set("k", "v")
+                node.answer_malformed_value_once()
+                with self.assertRaises(ConnectionError):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), b"v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_a_refresh_finishing_after_close_installs_no_connections(self):
+        # Regression for issue #10.
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
+        try:
+            client = await NanocachedClient.connect("127.0.0.1", discovery.port)
+            before = node.connection_count
+            client.close()
+            await client._refresh_node_list()
+            self.assertEqual(node.connection_count, before)
+        finally:
+            await discovery.close()
+            await node.close()
+
+
 class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
     async def test_pings_an_idle_connection(self):
         node = await MockNode().start()

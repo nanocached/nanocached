@@ -23,6 +23,7 @@ struct NodeState {
     connections: AtomicUsize,
     gets: AtomicUsize,
     wrong_node_replies: AtomicUsize,
+    malformed_value_replies: AtomicUsize,
     required_secret: Option<Vec<u8>>,
 }
 
@@ -102,6 +103,12 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             "G" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
                 state.gets.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.malformed_value_replies) {
+                    if stream.get_mut().write_all(b"V x\n").await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let reply = if take_wrong_node(&state) {
                     b"W\n".to_vec()
                 } else {
@@ -150,8 +157,11 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
 }
 
 fn take_wrong_node(state: &NodeState) -> bool {
-    state
-        .wrong_node_replies
+    take_one(&state.wrong_node_replies)
+}
+
+fn take_one(counter: &AtomicUsize) -> bool {
+    counter
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
             (pending > 0).then(|| pending - 1)
         })
@@ -335,6 +345,34 @@ async fn rejects_use_after_close() {
     client.close(); // idempotent
     assert!(client.is_closed());
     assert!(matches!(client.get("k").await, Err(Error::AlreadyClosed)));
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_malformed_value_length_poisons_the_connection_and_retries_transparently() {
+    // Regression for issue #8/#12: a garbage V header poisons the
+    // connection (a Protocol error, deliberately not auto-retried), so
+    // the next request redials cleanly instead of reading stray bytes
+    // from a desynced stream.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", None).await.unwrap();
+    node.state
+        .malformed_value_replies
+        .fetch_add(1, Ordering::SeqCst);
+
+    let first = client.get("k").await;
+    assert!(
+        matches!(first, Err(Error::Protocol(_))),
+        "expected a protocol error, got {first:?}"
+    );
+
+    let value = client.get("k").await.unwrap();
+    assert_eq!(value, Some(b"v".to_vec()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close();
     node.stop();
 }
 

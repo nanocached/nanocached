@@ -39,6 +39,10 @@ export interface ParsedResponse {
   value?: Buffer;
 }
 
+// The server never stores values above its 1 MiB request limit, so a
+// claimed length beyond this is a corrupt or malicious frame.
+const MAX_VALUE_LENGTH = 2 * 1024 * 1024;
+
 const MARKER_STORED = 0x53; // 'S'
 const MARKER_DELETED = 0x44; // 'D'
 const MARKER_NOT_FOUND = 0x4e; // 'N'
@@ -70,7 +74,9 @@ export function tryParseResponse(buf: Buffer): { response: ParsedResponse; consu
       if (headerEnd === -1) return null;
 
       const length = Number(buf.subarray(2, headerEnd).toString("ascii"));
-      if (!Number.isInteger(length) || length < 0) {
+      // Lengths beyond the server's own 1 MiB request cap are protocol
+      // garbage — reject before buffering toward them (issue #12).
+      if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
         throw new Error("nanocached: invalid value length in response");
       }
 

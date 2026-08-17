@@ -16,6 +16,10 @@ import time
 
 from ._errors import NanocachedError, WrongNodeError
 
+# The server never stores values above its 1 MiB request limit, so a
+# claimed length beyond this is a corrupt or malicious frame.
+_MAX_VALUE_LENGTH = 2 * 1024 * 1024
+
 
 def _encode_get(key: bytes) -> bytes:
     return b"G %d\n%b" % (len(key), key)
@@ -101,7 +105,18 @@ class Connection:
         if marker == b"V":
             # `V <length>\n<value>`
             header = await self._reader.readuntil(b"\n")
-            length = int(header[1:-1])
+            try:
+                length = int(header[1:-1])
+            except ValueError:
+                length = -1
+            # A non-numeric, negative, or absurd length (the server caps
+            # requests at 1 MiB) is protocol garbage; the connection is
+            # desynced mid-frame and must be poisoned, and the error must
+            # be connection-classified so the retry layer handles it
+            # (issue #8).
+            if length < 0 or length > _MAX_VALUE_LENGTH:
+                self.close()
+                raise ConnectionError("nanocached: invalid value length in response")
             value = await self._reader.readexactly(length)
             return marker, value
 
