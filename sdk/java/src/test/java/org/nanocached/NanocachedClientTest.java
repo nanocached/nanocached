@@ -121,6 +121,24 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aMismatchedResponseKindPoisonsTheConnection() throws Exception {
+        // A well-formed response of the wrong kind (`S` answering a G)
+        // means the request/response streams are off by one; reusing the
+        // connection would answer every later request with the previous
+        // one's response. The mismatch poisons the connection, and the
+        // connection-classified error is healed by the built-in
+        // redial-and-retry-once — never by reusing the desynced stream.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                node.answerStoredToGetOnce();
+                assertArrayEquals("v".getBytes(), client.get("k"));
+                assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
     void transparentlyReconnectsAfterAServerFin() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", node.port())) {

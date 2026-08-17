@@ -19,6 +19,12 @@ from ._errors import DiscoveryBusyError, NanocachedError
 # real secret correctly rejects this placeholder.
 _NO_SECRET_PLACEHOLDER = b"\x00"
 
+# Bound on dial + handshake, matching the Go and Java SDKs. Without it, a
+# node whose IP has been reclaimed (a stopped container, a dead cloud
+# instance) blackholes the TCP connect and a caller hangs for the kernel's
+# own timeout — minutes — instead of failing over.
+CONNECT_DEADLINE = 10.0
+
 
 @dataclass(frozen=True)
 class DiscoveredNode:
@@ -49,6 +55,22 @@ def split_host_port(address: str) -> tuple[str, int]:
 
 
 async def connect_and_identify(
+    host: str,
+    port: int,
+    auth_secret: bytes | None,
+    tls: bool | ssl_module.SSLContext,
+) -> NodeTarget | ClusterTarget:
+    try:
+        return await asyncio.wait_for(
+            _connect_and_identify(host, port, auth_secret, tls), CONNECT_DEADLINE
+        )
+    except TimeoutError as error:
+        raise ConnectionError(
+            f"nanocached: connecting to {host}:{port} timed out after {CONNECT_DEADLINE}s"
+        ) from error
+
+
+async def _connect_and_identify(
     host: str,
     port: int,
     auth_secret: bytes | None,

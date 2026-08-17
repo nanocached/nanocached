@@ -23,6 +23,7 @@ public sealed class MockNode : IDisposable
     private int _getCount;
     private int _wrongNodeReplies;
     private int _malformedValueReplies;
+    private int _storedToGetReplies;
 
     public MockNode(string? requiredSecret = null)
     {
@@ -40,6 +41,10 @@ public sealed class MockNode : IDisposable
 
     /// <summary>Queue a one-off garbage V header for the next G request.</summary>
     public void AnswerMalformedValueOnce() => Interlocked.Increment(ref _malformedValueReplies);
+
+    /// <summary>Reply <c>S</c> to the next G — a well-formed frame of the
+    /// wrong kind, as a desynced (off-by-one) stream would produce.</summary>
+    public void AnswerStoredToGetOnce() => Interlocked.Increment(ref _storedToGetReplies);
 
     /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
     public void DropConnections()
@@ -102,6 +107,11 @@ public sealed class MockNode : IDisposable
                             await Wire.WriteAsync(stream, "V x\n");
                             break;
                         }
+                        if (TakeOne(ref _storedToGetReplies))
+                        {
+                            await Wire.WriteAsync(stream, "S\n");
+                            break;
+                        }
                         if (TakeWrongNode())
                         {
                             await Wire.WriteAsync(stream, "W\n");
@@ -158,6 +168,19 @@ public sealed class MockNode : IDisposable
         {
             _clients.TryRemove(client, out _);
             client.Close();
+        }
+    }
+
+    private static bool TakeOne(ref int counter)
+    {
+        while (true)
+        {
+            int pending = counter;
+            if (pending == 0) return false;
+            if (Interlocked.CompareExchange(ref counter, pending - 1, pending) == pending)
+            {
+                return true;
+            }
         }
     }
 

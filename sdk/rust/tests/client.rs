@@ -24,6 +24,8 @@ struct NodeState {
     gets: AtomicUsize,
     wrong_node_replies: AtomicUsize,
     malformed_value_replies: AtomicUsize,
+    stored_to_get_replies: AtomicUsize,
+    get_delay_ms: AtomicUsize,
     required_secret: Option<Vec<u8>>,
 }
 
@@ -103,6 +105,16 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             "G" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
                 state.gets.fetch_add(1, Ordering::SeqCst);
+                let delay = state.get_delay_ms.swap(0, Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                }
+                if take_one(&state.stored_to_get_replies) {
+                    if stream.get_mut().write_all(b"S\n").await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if take_one(&state.malformed_value_replies) {
                     if stream.get_mut().write_all(b"V x\n").await.is_err() {
                         return;
@@ -374,6 +386,90 @@ async fn a_malformed_value_length_poisons_the_connection_and_retries_transparent
 
     client.close();
     node.stop();
+}
+
+#[tokio::test]
+async fn a_mismatched_response_kind_poisons_the_connection() {
+    // A well-formed response of the wrong kind (`S` answering a G) means
+    // the request/response streams are off by one; reusing the connection
+    // would answer every later request with the previous one's response.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", None).await.unwrap();
+    node.state
+        .stored_to_get_replies
+        .fetch_add(1, Ordering::SeqCst);
+
+    // The mismatch poisons the connection; the connection-classified
+    // error is healed by the client's single transparent redial-and-retry
+    // — but never by reusing the desynced stream.
+    let value = client.get("k").await.unwrap();
+    assert_eq!(value, Some(b"v".to_vec()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn an_abandoned_request_future_poisons_the_connection() {
+    // A caller dropping an in-flight request (tokio::time::timeout and
+    // friends) leaves its response unread on the wire; reusing the
+    // connection would silently answer later requests with earlier
+    // responses. The next request must poison and redial instead.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", None).await.unwrap();
+    node.state.get_delay_ms.store(30_000, Ordering::SeqCst);
+
+    let abandoned =
+        tokio::time::timeout(std::time::Duration::from_millis(50), client.get("k")).await;
+    assert!(abandoned.is_err(), "expected the outer timeout to fire");
+
+    let value = client.get("k").await.unwrap();
+    assert_eq!(value, Some(b"v".to_vec()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn connecting_to_a_silent_server_fails_within_the_deadline() {
+    // A server that accepts the TCP connection but never answers the
+    // handshake (a blackholed address behaves the same way) must fail the
+    // connect within the deadline instead of hanging.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let holder = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            sockets.push(socket);
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let result = NanocachedClient::connect(
+        options(port).connect_deadline(std::time::Duration::from_millis(100)),
+    )
+    .await;
+
+    let error = result.err();
+    assert!(
+        matches!(error, Some(Error::ConnectionLost(_))),
+        "expected a connection-lost error, got {error:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "connect() took {:?}",
+        started.elapsed()
+    );
+    holder.abort();
 }
 
 #[tokio::test]

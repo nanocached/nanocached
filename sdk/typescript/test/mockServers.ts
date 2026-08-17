@@ -19,6 +19,10 @@ export interface MockNode extends MockServerBase {
   answerWrongNodeOnce(): void;
   /** Queue a one-off garbage `V` header for the next G request. */
   answerMalformedValueOnce(): void;
+  /** Queue a one-off `S` reply for the next G request — a well-formed
+   * frame of the wrong kind, as a desynced (off-by-one) stream would
+   * produce. */
+  answerStoredToGetOnce(): void;
   /** How many connections this server has ever accepted. */
   connectionCount(): number;
   /** How many `G` requests this server has ever received. */
@@ -84,6 +88,7 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
   const store = new Map<string, Buffer>();
   let wrongNodeReplies = 0;
   let malformedValueReplies = 0;
+  let storedToGetReplies = 0;
   let connections = 0;
   let gets = 0;
 
@@ -127,6 +132,12 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
             if (malformedValueReplies > 0) {
               malformedValueReplies--;
               socket.write("V x\n");
+              break;
+            }
+
+            if (storedToGetReplies > 0) {
+              storedToGetReplies--;
+              socket.write("S\n");
               break;
             }
 
@@ -200,6 +211,9 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
     },
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
+    },
+    answerStoredToGetOnce: () => {
+      storedToGetReplies++;
     },
     connectionCount: () => connections,
     getCount: () => gets,

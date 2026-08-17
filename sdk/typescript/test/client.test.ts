@@ -354,6 +354,59 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("a mismatched response kind poisons the connection and the next request redials", async () => {
+    // A well-formed response of the wrong kind (`S` answering a G) means
+    // the request/response streams are off by one; reusing the connection
+    // would answer every later request with the previous one's response.
+    // The connection is poisoned; the next request transparently redials.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      try {
+        await client.set("k", "v");
+        node.answerStoredToGetOnce();
+        await assert.rejects(client.get("k"), /does not match the request/);
+
+        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("connecting to a silent server fails within the deadline", async () => {
+    // A server that accepts the TCP connection but never answers the
+    // handshake (a blackholed address behaves the same way) must fail
+    // the connect within the deadline instead of hanging.
+    const { createServer } = await import("node:net");
+    const accepted = new Set<import("node:net").Socket>();
+    const silent = createServer((socket) => {
+      // Keep the socket paused (never read, never answer) — but track it,
+      // since an unread FIN never surfaces and server.close() would wait
+      // on it forever.
+      accepted.add(socket);
+      socket.on("error", () => {});
+    });
+    const port = await new Promise<number>((resolve) => {
+      silent.listen(0, "127.0.0.1", () => {
+        resolve((silent.address() as { port: number }).port);
+      });
+    });
+    try {
+      const { connectAndIdentify } = await import("../src/identify.js");
+      await assert.rejects(
+        connectAndIdentify({ host: "127.0.0.1", port, connectDeadlineMs: 100 }),
+        /no response from server within/,
+      );
+    } finally {
+      for (const socket of accepted) socket.destroy();
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  });
+
   it("a malformed value length poisons the connection and the next request redials", async () => {
     // Regression for issue #8: a garbage `V <len>` header desyncs the
     // stream; the connection must be poisoned (never reused mid-frame)

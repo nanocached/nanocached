@@ -64,14 +64,14 @@ class Connection:
             return None
         if marker == b"W":
             raise WrongNodeError()
-        raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
+        raise self._mismatch(marker)
 
     async def set(self, key: bytes, value: bytes, ttl_seconds: int | None) -> None:
         marker, _ = await self._request(_encode_set(key, value, ttl_seconds))
         if marker == b"W":
             raise WrongNodeError()
         if marker != b"S":
-            raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
+            raise self._mismatch(marker)
 
     async def delete(self, key: bytes) -> bool:
         marker, _ = await self._request(_encode_delete(key))
@@ -81,7 +81,18 @@ class Connection:
             return False
         if marker == b"W":
             raise WrongNodeError()
-        raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
+        raise self._mismatch(marker)
+
+    def _mismatch(self, marker: bytes) -> ConnectionError:
+        # A well-formed response of the wrong kind (a `V` answering a set)
+        # means the request/response streams are misaligned — every later
+        # response would answer the wrong request, silently returning
+        # other keys' data. Poison the connection, and classify as a
+        # connection error so the retry layer redials and retries once.
+        self.close()
+        return ConnectionError(
+            f"nanocached: response {marker!r} does not match the request (connection desynced)"
+        )
 
     async def _request(self, frame: bytes) -> tuple[bytes, bytes | None]:
         if self.closed:
@@ -98,6 +109,13 @@ class Connection:
                 # poison the connection so the client redials lazily.
                 self.close()
                 raise ConnectionError(f"nanocached: connection failed: {error}") from error
+            except asyncio.CancelledError:
+                # The caller abandoned this request (asyncio.wait_for and
+                # friends) after bytes may already be on the wire; a later
+                # request would read THIS request's response and desync the
+                # stream. The connection cannot be reused.
+                self.close()
+                raise
 
     async def _read_response(self) -> tuple[bytes, bytes | None]:
         marker = await self._reader.readexactly(1)

@@ -1,12 +1,16 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { connectSocket, type NanocachedTlsOptions } from "./socket.js";
+import { ConnectionLostError } from "./connection.js";
+import { CONNECT_DEADLINE_MS, connectSocket, type NanocachedTlsOptions } from "./socket.js";
 
 export interface IdentifyOptions {
   host: string;
   port: number;
   authSecret?: string | Uint8Array;
   tls?: boolean | NanocachedTlsOptions;
+  /** Bound on each phase of connecting (dial, handshake read); defaults
+   * to `CONNECT_DEADLINE_MS`. Exposed for tests. */
+  connectDeadlineMs?: number;
 }
 
 /** A node's consistent-hashing identity (a random per-process UUID) and
@@ -50,11 +54,23 @@ const NO_SECRET_PLACEHOLDER = Buffer.from([0]);
 /** Reads from `socket` until `tryParse` returns non-null, resolving with
  * that value. One-shot: meant for a single request/response, not a
  * long-lived connection matching multiple in-flight requests. */
-function readFrame<T>(socket: Socket | TLSSocket, tryParse: (buf: Buffer) => T | null): Promise<T> {
+function readFrame<T>(
+  socket: Socket | TLSSocket,
+  tryParse: (buf: Buffer) => T | null,
+  deadlineMs: number,
+): Promise<T> {
   return new Promise((resolve, reject) => {
     let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
 
+    // A server that accepts the connection but never answers (a
+    // blackholed address behaves the same way) must not hang the caller.
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new ConnectionLostError(`nanocached: no response from server within ${deadlineMs}ms`));
+    }, deadlineMs);
+
     const cleanup = () => {
+      clearTimeout(timer);
       socket.off("data", onData);
       socket.off("error", onError);
       socket.off("close", onClose);
@@ -214,6 +230,7 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
  * (matching its one-shot fetch-then-close role elsewhere in this SDK).
  */
 export async function connectAndIdentify(options: IdentifyOptions): Promise<IdentifyResult> {
+  const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
   const socket = await connectSocket(options);
 
   const secret = options.authSecret !== undefined ? toBytes(options.authSecret) : NO_SECRET_PLACEHOLDER;
@@ -222,7 +239,7 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
   let identity: AuthIdentity;
   try {
     socket.write(authFrame);
-    identity = await readFrame(socket, tryParseIdentity);
+    identity = await readFrame(socket, tryParseIdentity, deadlineMs);
   } catch (error) {
     socket.destroy();
     throw error;
@@ -244,7 +261,7 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
 
   try {
     socket.write(Buffer.from("L\n"));
-    const { nodes, replication } = await readFrame(socket, tryParseNodeList);
+    const { nodes, replication } = await readFrame(socket, tryParseNodeList, deadlineMs);
     return { kind: "cluster", nodes, replication };
   } finally {
     socket.destroy();
