@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Protocol — nanocached</title>
+<meta name="description" content="The nanocached wire protocol: ASCII headers, binary-safe bodies, one-byte commands.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html" aria-current="page">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>Wire protocol</h1>
+<p class="lede">Each request starts with an ASCII header terminated by
+<code>\n</code>; key and value bodies follow immediately, read by their
+declared byte lengths. Bodies have no terminator and may contain
+arbitrary bytes. One-byte commands keep overhead minimal while frames
+stay readable during development.</p>
+
+<p>Multiple requests per connection and pipelining are both supported. A
+<code>&lt;key-length&gt;</code> of <code>0</code> is rejected for every
+command; there is no dedicated key or value length limit beyond the
+overall request-size limit (1 MiB per request on a node).</p>
+
+<h2 id="a">A — authenticate</h2>
+<pre><code>A &lt;secret-length&gt;\n&lt;secret&gt;</code></pre>
+<p>Responds <code>O\n</code> on success or <code>E\n</code> followed by
+the server closing the connection. If the server has no auth secret
+configured, <code>A</code> always succeeds. If it does, every other
+command is rejected with <code>E\n</code> (and the connection closed)
+until a matching <code>A</code> has been sent.</p>
+<div class="note">SDKs send an extended handshake and receive
+<code>On</code>/<code>Od</code> (node/discovery) instead of a bare
+<code>O</code> — that one extra byte is how a client discovers what kind
+of server it reached and adapts, with no configuration. Plain
+<code>A</code> as documented here always works.</div>
+
+<h2 id="g">G — get</h2>
+<pre><code>G &lt;key-length&gt;\n&lt;key&gt;</code></pre>
+<p>Responds with the value:</p>
+<pre><code>V &lt;value-length&gt;\n&lt;value&gt;</code></pre>
+<p>or <code>N\n</code> when the key is missing or expired.</p>
+
+<h2 id="s">S — set</h2>
+<pre><code>S &lt;key-length&gt; &lt;value-length&gt;\n&lt;key&gt;&lt;value&gt;
+S &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt;\n&lt;key&gt;&lt;value&gt;</code></pre>
+<p>Responds <code>S\n</code>. Without a TTL the entry lives until
+evicted (LRU under the memory bound) or deleted; with one it also
+expires <code>&lt;ttl-seconds&gt;</code> after the write.</p>
+
+<h2 id="d">D — delete</h2>
+<pre><code>D &lt;key-length&gt;\n&lt;key&gt;</code></pre>
+<p>Responds <code>D\n</code> if the key existed, <code>N\n</code>
+otherwise.</p>
+
+<h2 id="status">Other statuses you may see</h2>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Reply</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>B\n</code></td><td>Busy. From a node: the connection
+    limit is reached. From a discovery server: it is inside its startup
+    grace after a restart, re-learning membership — retry shortly or try
+    another replica.</td></tr>
+    <tr><td><code>W\n</code></td><td>Wrong node (clusters only): per the
+    node's own view of membership it does not own this key, so the
+    client's routing table is stale. SDKs respond by refreshing the node
+    list and retrying once.</td></tr>
+    <tr><td><code>E\n</code></td><td>Error — authentication required or
+    failed, or the request was malformed. Usually followed by the server
+    closing the connection.</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="cluster">Cluster-internal commands</h2>
+<p>Nodes, discovery servers, and SDKs additionally exchange membership
+and migration frames — <code>L</code> (node list),
+<code>J</code>/<code>H</code>/<code>P</code> (join, heartbeat,
+announce), <code>M</code>/<code>X</code>/<code>C</code> (migrate,
+cancel, complete). These are versioned with the server and not part of
+the public caching API; the
+<a href="https://github.com/nanocached/nanocached/tree/main/doc/adr">ADRs</a>
+specify them in detail (0008 join/handoff, 0010 discovery HA,
+0011 replication).</p>
+
+<h2 id="example">A complete session</h2>
+<pre><code>$ printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356
+S
+V 5
+Alice</code></pre>
+<p>Two pipelined requests — a set and a get — answered in order on one
+connection.</p>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+    <a href="https://github.com/nanocached/nanocached/tree/main/doc/adr">Design decisions (ADRs)</a>
+  </div>
+</footer>
+
+</body>
+</html>

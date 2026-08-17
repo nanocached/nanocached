@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SDKs — nanocached</title>
+<meta name="description" content="Official nanocached client SDKs for TypeScript, Python, Java, Rust, .NET, and Go — one behavior across all six.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html" aria-current="page">SDKs</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>SDKs</h1>
+<p class="lede">Six official clients, one behavior. Point any of them at
+a single node or at a discovery server — the SDK detects which from the
+server's own handshake, so development and production use identical
+code.</p>
+
+<p>Every SDK ships the full feature set: authentication, TLS, discovery
+seeds, replication-aware routing (reads fail over, writes fan out to all
+R owners), transparent reconnect with a single retry, optional
+keep-alive, and the same rendezvous-hashing pipeline verified against
+shared cross-language test vectors.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Language</th><th>Requires</th><th>Package</th><th>Docs</th></tr></thead>
+  <tbody>
+    <tr><td>TypeScript / Node.js</td><td>Node 20+</td><td><code>nanocached</code> (npm)</td><td><a href="https://github.com/nanocached/nanocached/tree/main/sdk/typescript#readme">README</a></td></tr>
+    <tr><td>Python</td><td>3.11+, asyncio</td><td><code>nanocached</code> (PyPI)</td><td><a href="https://github.com/nanocached/nanocached/tree/main/sdk/python#readme">README</a></td></tr>
+    <tr><td>Java</td><td>17+</td><td><code>org.nanocached:nanocached</code> (Maven Central)</td><td><a href="https://github.com/nanocached/nanocached/tree/main/sdk/java#readme">README</a></td></tr>
+    <tr><td>Rust</td><td>tokio</td><td><code>nanocached</code> (crates.io)</td><td><a href="https://github.com/nanocached/nanocached/tree/main/sdk/rust#readme">README</a></td></tr>
+    <tr><td>.NET</td><td>.NET 8+</td><td><code>Nanocached</code> (NuGet)</td><td><a href="https://github.com/nanocached/nanocached/tree/main/sdk/dotnet#readme">README</a></td></tr>
+    <tr><td>Go</td><td>1.22+</td><td><code>github.com/nanocached/nanocached/sdk/go</code></td><td><a href="https://github.com/nanocached/nanocached/tree/main/sdk/go#readme">README</a></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>None of the SDKs has runtime dependencies outside its language's
+standard library (Rust's client uses tokio; TLS sits behind the
+<code>tls</code> feature).</p>
+
+<div class="note">v1.0.0 is the first published release. If a registry
+doesn't list the package yet, the release is still rolling out — every
+SDK also builds directly from the
+<a href="https://github.com/nanocached/nanocached">repository</a>.</div>
+
+<h2 id="typescript">TypeScript</h2>
+<pre><code>npm install nanocached</code></pre>
+<pre><code>import { NanocachedClient } from "nanocached";
+
+const client = await NanocachedClient.connect({ host: "127.0.0.1", port: 8357 });
+
+await client.set("greeting", "hello", { ttlSeconds: 60 });
+const value = await client.get("greeting");     // Buffer | null
+const existed = await client.delete("greeting"); // boolean
+
+client.close();</code></pre>
+
+<h2 id="python">Python</h2>
+<pre><code>pip install nanocached</code></pre>
+<pre><code>import asyncio
+from nanocached import NanocachedClient
+
+async def main():
+    client = await NanocachedClient.connect("127.0.0.1", 8357)
+
+    await client.set("greeting", "hello", ttl_seconds=60)
+    value = await client.get("greeting")        # bytes | None
+    existed = await client.delete("greeting")   # bool
+
+    client.close()
+
+asyncio.run(main())</code></pre>
+
+<h2 id="java">Java</h2>
+<p>Group/artifact: <code>org.nanocached:nanocached</code>.</p>
+<pre><code>import org.nanocached.NanocachedClient;
+
+try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", 8357)) {
+    client.set("greeting", "hello", 60);       // TTL in seconds (optional)
+    byte[] value = client.get("greeting");     // null when missing
+    boolean existed = client.delete("greeting");
+}</code></pre>
+
+<h2 id="rust">Rust</h2>
+<pre><code>cargo add nanocached</code></pre>
+<pre><code>use nanocached::{NanocachedClient, Options};
+
+let client = NanocachedClient::connect(Options::new().host("127.0.0.1", 8357)).await?;
+
+client.set("greeting", "hello", Some(60)).await?;      // TTL in seconds
+let value: Option&lt;Vec&lt;u8&gt;&gt; = client.get("greeting").await?;
+let existed: bool = client.delete("greeting").await?;
+
+client.close();</code></pre>
+
+<h2 id="dotnet">.NET</h2>
+<pre><code>dotnet add package Nanocached</code></pre>
+<pre><code>using Nanocached;
+
+using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", 8357);
+
+await client.SetAsync("greeting", "hello", ttlSeconds: 60);
+byte[]? value = await client.GetAsync("greeting");   // null when missing
+bool existed = await client.DeleteAsync("greeting");</code></pre>
+
+<h2 id="go">Go</h2>
+<pre><code>go get github.com/nanocached/nanocached/sdk/go</code></pre>
+<pre><code>import nanocached "github.com/nanocached/nanocached/sdk/go"
+
+client, err := nanocached.Connect(nanocached.Config{
+    Seeds: []string{"127.0.0.1:8357"},
+})
+if err != nil { /* ... */ }
+defer client.Close()
+
+err = client.Set("greeting", []byte("hello"), 60*time.Second) // 0 = no expiry
+value, ok, err := client.Get("greeting")                      // ok=false when missing
+existed, err := client.Delete("greeting")</code></pre>
+
+<h2 id="behavior">Shared behavior, briefly</h2>
+<ul>
+  <li><b>Discovery seeds</b> — list every discovery replica; connect and
+  refresh try them in order, skipping busy or unreachable seeds.</li>
+  <li><b>Replication</b> — R rides along with the node list, so there is
+  nothing to configure; each client exposes the factor in use.</li>
+  <li><b>Failure recovery</b> — a stale routing table (a node answers
+  <code>W</code>) or a dead primary both trigger one node-list refresh
+  and one retry; recovery is bounded by discovery's liveness timeout.</li>
+  <li><b>Reconnect</b> — nodes close idle connections after 30 s; SDKs
+  redial lazily on next use, or keep connections warm with the opt-in
+  keep-alive interval.</li>
+  <li><b>Concurrency</b> — every client is safe for concurrent use;
+  requests are serialized per connection.</li>
+</ul>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+    <a href="https://github.com/nanocached/nanocached/tree/main/doc/adr">Design decisions (ADRs)</a>
+  </div>
+</footer>
+
+</body>
+</html>

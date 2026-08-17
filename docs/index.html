@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanocached</title>
+<meta name="description" content="A tiny distributed in-memory cache written in Rust, with client-side rendezvous hashing, replication, and SDKs for six languages.">
+<meta property="og:title" content="nanocached">
+<meta property="og:description" content="A tiny distributed in-memory cache written in Rust, with client-side rendezvous hashing, replication, and SDKs for six languages.">
+<meta property="og:image" content="https://nanocached.github.io/nanocached/assets/og.jpg">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main class="wide">
+
+  <section class="hero">
+    <div class="mark"><img src="assets/mark.jpg" alt="nanocached logo"></div>
+    <div>
+      <h1><b>nano</b><span>cached</span></h1>
+      <p class="tagline">A tiny distributed in-memory cache written in Rust.
+      One small binary per role, a wire protocol you can read with
+      <code>nc</code>, and clients that do the clustering — no proxies,
+      no coordinators.</p>
+      <div class="actions">
+        <a class="button primary" href="getting-started.html">Get started</a>
+        <a class="button ghost" href="https://github.com/nanocached/nanocached">Source on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <div class="warn"><b>Experimental.</b> nanocached is not ready for
+  production use yet. The protocol and APIs are stable within v1, but the
+  project is young — treat it accordingly.</div>
+
+  <section class="feature-grid">
+    <div class="feature">
+      <h3>Small on purpose</h3>
+      <p>An in-memory key-value store with <code>get</code> / <code>set</code> /
+      <code>delete</code>, optional TTL, and LRU eviction under a memory
+      bound. Nothing else.</p>
+    </div>
+    <div class="feature">
+      <h3>Client-side clustering</h3>
+      <p>Clients route keys with rendezvous hashing over a node list served
+      by a lightweight discovery server. No proxy hop on the data path.</p>
+    </div>
+    <div class="feature">
+      <h3>Replication built in</h3>
+      <p>Each key lives on its top-R nodes (default R=2). A node death
+      costs no cached data: reads fail over, writes recover within
+      seconds.</p>
+    </div>
+    <div class="feature">
+      <h3>No single point of failure</h3>
+      <p>Discovery replicas hold only soft state rebuilt from node
+      announces — run several with zero coordination between them.</p>
+    </div>
+    <div class="feature">
+      <h3>Auth and TLS, all or nothing</h3>
+      <p>Shared-secret authentication and TLS are off by default and
+      strictly required once enabled — no plaintext fallback.</p>
+    </div>
+    <div class="feature">
+      <h3>A protocol you can read</h3>
+      <p>ASCII headers, binary-safe bodies, one-byte commands. Debug a
+      cluster with <code>printf</code> and <code>nc</code>.</p>
+    </div>
+  </section>
+
+  <h2>Try it in a minute</h2>
+  <pre><code>docker pull ghcr.io/nanocached/nanocached-node:latest
+docker run --rm --publish 8356:8356 ghcr.io/nanocached/nanocached-node:latest
+
+# store "Alice" under "name", then read it back
+printf 'S 4 5\nnameAliceG 4\nname' | nc 127.0.0.1 8356</code></pre>
+  <p>The server answers <code>S</code>, then <code>V 5</code> and
+  <code>Alice</code>. That is the whole protocol experience — the
+  <a href="protocol.html">reference</a> fits on one page.</p>
+
+  <h2>Six SDKs, one behavior</h2>
+  <p>Every client speaks the same handshake, routes with the same hash,
+  and recovers from the same failures — verified against shared
+  cross-language test vectors.</p>
+  <div class="lang-row">
+    <span>TypeScript</span><span>Python</span><span>Java</span>
+    <span>Rust</span><span>.NET</span><span>Go</span>
+  </div>
+  <p>Point any of them at a single node or at a discovery server; the SDK
+  detects which from the server's own reply and behaves accordingly. See
+  <a href="sdks.html">SDKs</a> for install and quick-start snippets.</p>
+
+  <h2>Plan before you size</h2>
+  <p>Memory, effective capacity, replication factor, TTL, and hit rate
+  trade off against each other — and only the binding constraint responds
+  to tuning. The <a href="capacity-planner.html">capacity planner</a> is a
+  self-contained, offline estimator that shows which lever actually moves
+  your hit rate.</p>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+    <a href="https://github.com/nanocached/nanocached/tree/main/doc/adr">Design decisions (ADRs)</a>
+  </div>
+</footer>
+
+</body>
+</html>

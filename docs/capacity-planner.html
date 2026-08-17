@@ -1,0 +1,558 @@
+<title>nanocached容量プランナー</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<style>
+  :root {
+    --bg: #f6f8f7;
+    --surface: #ffffff;
+    --ink: #1c2321;
+    --muted: #5c6b66;
+    --faint: #8b9a94;
+    --accent: #0e7c66;
+    --accent-soft: #0e7c6618;
+    --amber: #b4690e;
+    --amber-soft: #b4690e14;
+    --hairline: #dde4e1;
+    --grid: #ecf0ee;
+    --tooltip-bg: #1c2321;
+    --tooltip-ink: #f6f8f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #121715;
+      --surface: #1a211e;
+      --ink: #e8edea;
+      --muted: #93a39c;
+      --faint: #6b7a74;
+      --accent: #3fbfa0;
+      --accent-soft: #3fbfa022;
+      --amber: #e0a458;
+      --amber-soft: #e0a45820;
+      --hairline: #2a332f;
+      --grid: #222b27;
+      --tooltip-bg: #e8edea;
+      --tooltip-ink: #121715;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #121715;
+    --surface: #1a211e;
+    --ink: #e8edea;
+    --muted: #93a39c;
+    --faint: #6b7a74;
+    --accent: #3fbfa0;
+    --accent-soft: #3fbfa022;
+    --amber: #e0a458;
+    --amber-soft: #e0a45820;
+    --hairline: #2a332f;
+    --grid: #222b27;
+    --tooltip-bg: #e8edea;
+    --tooltip-ink: #121715;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.65;
+  }
+  .num, input[type="number"], .tick, .tooltip {
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  header {
+    padding: 28px 32px 20px;
+    border-bottom: 1px solid var(--hairline);
+  }
+  header h1 {
+    margin: 0 0 4px;
+    font-size: 21px;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+    text-wrap: balance;
+  }
+  header p { margin: 0; color: var(--muted); max-width: 62ch; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 300px minmax(0, 1fr);
+    gap: 24px;
+    padding: 24px 32px 48px;
+    max-width: 1200px;
+  }
+  @media (max-width: 880px) { .layout { grid-template-columns: 1fr; } }
+
+  /* ── 入力レール ─────────────────────────── */
+  .controls { display: flex; flex-direction: column; gap: 18px; }
+  fieldset {
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--surface);
+    padding: 14px 16px 16px;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  legend {
+    padding: 0 6px;
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.09em;
+    color: var(--muted);
+  }
+  .field { display: grid; grid-template-columns: 1fr 104px; align-items: center; gap: 8px; }
+  .field label { color: var(--ink); }
+  .field .unit-wrap { display: flex; align-items: center; gap: 5px; }
+  .field input[type="number"], .field select {
+    width: 100%;
+    padding: 5px 7px;
+    border: 1px solid var(--hairline);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 13px;
+  }
+  .field select { font-family: inherit; }
+  .field .unit { color: var(--faint); font-size: 11px; white-space: nowrap; min-width: 26px; }
+  input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+  .hint { font-size: 11.5px; color: var(--faint); margin: -4px 0 0; line-height: 1.5; }
+
+  /* ── 結果 ──────────────────────────────── */
+  .results { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .tile {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 12px 14px;
+  }
+  .tile .k { font-size: 11px; letter-spacing: 0.07em; color: var(--muted); font-weight: 600; }
+  .tile .v { font-size: 24px; font-weight: 650; line-height: 1.3; margin-top: 2px; }
+  .tile .s { font-size: 11.5px; color: var(--faint); }
+  .tile.hero .v { color: var(--accent); }
+  .badge {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 2px 9px;
+    border-radius: 99px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .badge.cap  { background: var(--amber-soft); color: var(--amber); }
+  .badge.ttl  { background: var(--amber-soft); color: var(--amber); }
+  .badge.ok   { background: var(--accent-soft); color: var(--accent); }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 16px 18px;
+  }
+  .panel h2 { margin: 0 0 8px; font-size: 13px; font-weight: 650; letter-spacing: 0.05em; color: var(--muted); }
+  .chart-wrap { position: relative; }
+  .chart-wrap svg { display: block; width: 100%; height: auto; }
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--tooltip-bg);
+    color: var(--tooltip-ink);
+    border-radius: 4px;
+    padding: 5px 9px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: nowrap;
+    transform: translate(-50%, -130%);
+    opacity: 0;
+    transition: opacity 0.08s;
+  }
+  @media (prefers-reduced-motion: reduce) { .tooltip { transition: none; } }
+
+  #reco { line-height: 1.8; }
+  #reco strong.num { color: var(--accent); font-size: 15px; }
+  #reco .warn { color: var(--amber); font-weight: 600; }
+
+  details.assumptions { color: var(--muted); font-size: 12.5px; }
+  details.assumptions summary { cursor: pointer; font-weight: 600; }
+  details.assumptions ul { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+</style>
+
+<header>
+  <p style="margin:0 0 .5rem"><a href="index.html" style="color:var(--muted);font-size:.85rem;text-decoration:none">&larr; nanocached docs</a></p>
+  <h1>nanocached容量プランナー</h1>
+  <p>ワークロードとクラスタ構成からキャッシュヒット率を見積もり、目標に必要なメモリと TTL を逆算します。メモリを削ればヒット率が下がり、TTL を短くしても下がる — その釣り合いを数字で見るための道具です。</p>
+</header>
+
+<div class="layout">
+  <div class="controls">
+    <fieldset>
+      <legend>ワークロード</legend>
+      <div class="field"><label for="keyBytes">平均キー長</label><span class="unit-wrap"><input id="keyBytes" type="number" value="32" min="1" step="1"><span class="unit">B</span></span></div>
+      <div class="field"><label for="valBytes">平均値長</label><span class="unit-wrap"><input id="valBytes" type="number" value="2048" min="1" step="1"><span class="unit">B</span></span></div>
+      <div class="field"><label for="uniqueKeys">ユニークキー数</label><span class="unit-wrap"><input id="uniqueKeys" type="number" value="1000000" min="100" step="1000"><span class="unit">個</span></span></div>
+      <div class="field"><label for="reqRate">リクエスト量</label><span class="unit-wrap"><input id="reqRate" type="number" value="500" min="1" step="10"><span class="unit">req/s</span></span></div>
+      <div class="field"><label for="alpha">アクセスの偏り</label><span class="unit-wrap"><select id="alpha">
+        <option value="0.7">弱い (α=0.7)</option>
+        <option value="0.9" selected>標準 (α=0.9)</option>
+        <option value="1.1">強い (α=1.1)</option>
+      </select></span></div>
+      <p class="hint">偏り = Zipf 分布の指数。Web 系アクセスは 0.9 前後が定番です。</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>鮮度</legend>
+      <div class="field"><label for="ttl">TTL</label><span class="unit-wrap"><input id="ttl" type="number" value="300" min="1" step="10"><span class="unit">秒</span></span></div>
+      <p class="hint">0 や空欄は不可。無期限にしたい場合は大きな値(例: 86400)を。</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>クラスタ</legend>
+      <div class="field"><label for="nodes">ノード数</label><span class="unit-wrap"><input id="nodes" type="number" value="3" min="1" step="1"><span class="unit">台</span></span></div>
+      <div class="field"><label for="memMiB">ノードメモリ</label><span class="unit-wrap"><input id="memMiB" type="number" value="256" min="16" step="16"><span class="unit">MiB</span></span></div>
+      <div class="field"><label for="replication">複製数 R</label><span class="unit-wrap"><select id="replication">
+        <option value="1">1(複製なし)</option>
+        <option value="2" selected>2(既定)</option>
+        <option value="3">3</option>
+      </select></span></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>目標</legend>
+      <div class="field"><label for="target">目標ヒット率</label><span class="unit-wrap"><input id="target" type="number" value="90" min="1" max="99.9" step="0.5"><span class="unit">%</span></span></div>
+    </fieldset>
+  </div>
+
+  <div class="results">
+    <div class="tiles">
+      <div class="tile hero">
+        <div class="k">予測ヒット率</div>
+        <div class="v num" id="hitRate">—</div>
+        <div class="s" id="bindingWrap"><span class="badge ok" id="binding">—</span></div>
+      </div>
+      <div class="tile">
+        <div class="k">実効容量</div>
+        <div class="v num" id="capEntries">—</div>
+        <div class="s num" id="capBytes">—</div>
+      </div>
+      <div class="tile">
+        <div class="k">TTL上限ヒット率</div>
+        <div class="v num" id="ttlCeil">—</div>
+        <div class="s">メモリ無限でもここまで</div>
+      </div>
+      <div class="tile">
+        <div class="k">容量上限ヒット率</div>
+        <div class="v num" id="capCeil">—</div>
+        <div class="s">TTL無限でもここまで</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>ヒット率 × ノードメモリ(現在の TTL で固定)</h2>
+      <div class="chart-wrap" id="chartMem"></div>
+    </div>
+
+    <div class="panel">
+      <h2>ヒット率 × TTL(現在のメモリで固定)</h2>
+      <div class="chart-wrap" id="chartTtl"></div>
+    </div>
+
+    <div class="panel">
+      <h2>目標 <span class="num" id="targetEcho">90</span>% への推奨</h2>
+      <div id="reco">—</div>
+    </div>
+
+    <details class="assumptions">
+      <summary>前提と近似について</summary>
+      <ul>
+        <li>アクセスは Zipf 分布(指数 α)+ポアソン到着、キャッシュは cache-aside(ミス時にアプリが再投入し TTL リセット)を仮定。</li>
+        <li>ヒット率はキー i ごとに h<sub>i</sub> = λ<sub>i</sub>τ / (1 + λ<sub>i</sub>τ)、τ = min(LRU 特性時間, TTL) の近似(Che 近似の TTL 拡張)。±数%の目安であり保証値ではありません。</li>
+        <li>エントリのメモリはキー長+値長+管理オーバーヘッド 112 B で概算。nanocached の会計(キー+値のみ)より実態寄りです。</li>
+        <li>実効容量 = ノード数 × ノードメモリ ÷ R(複製コピーも同じメモリを消費するため)。分布は均等(HRW は偏差 2% 未満)とみなします。</li>
+        <li>ノード障害・rebalance 中の一時的なヒット率低下、書き込み比率の影響は含みません。</li>
+      </ul>
+    </details>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const OVERHEAD_BYTES = 112;
+const $ = (id) => document.getElementById(id);
+
+/* ── Zipf の対数バケット化 ─────────────────────────────
+   ランク 1..N を幾何級数で ~360 バケットに割り、各バケットの
+   キー数と代表アクセス確率を積分近似で持つ。N=10^8 でも高速。 */
+function buildBuckets(N, alpha) {
+  const buckets = [];
+  const zint = (a, b) => // Σ i^-α over [a,b] の積分近似(端点補正つき台形)
+    alpha === 1
+      ? Math.log((b + 0.5) / (a - 0.5))
+      : (Math.pow(a - 0.5, 1 - alpha) - Math.pow(b + 0.5, 1 - alpha)) / (alpha - 1);
+
+  let start = 1;
+  // 先頭 64 ランクは 1 個ずつ(ヘッドの精度が支配的)
+  for (; start <= Math.min(64, N); start++) {
+    buckets.push({ count: 1, weight: Math.pow(start, -alpha) });
+  }
+  while (start <= N) {
+    const end = Math.min(N, Math.max(start, Math.floor(start * 1.045)));
+    buckets.push({ count: end - start + 1, weight: zint(start, end) });
+    start = end + 1;
+  }
+
+  const H = buckets.reduce((sum, b) => sum + b.weight, 0);
+  for (const b of buckets) {
+    b.p = b.weight / H / b.count; // キー1個あたりのアクセス確率
+  }
+  return buckets;
+}
+
+/* h_i = x/(1+x), x = λ_i·τ。占有率もこれと同値(TTL 再生モデル)。 */
+function occupancy(buckets, lambda, tau) {
+  let occ = 0;
+  for (const b of buckets) {
+    const x = lambda * b.p * tau;
+    occ += b.count * (x / (1 + x));
+  }
+  return occ;
+}
+function hitRate(buckets, lambda, tau) {
+  let h = 0;
+  for (const b of buckets) {
+    const x = lambda * b.p * tau;
+    h += b.count * b.p * (x / (1 + x));
+  }
+  return h;
+}
+
+/* 容量 C・TTL T のもとでの τ = min(t_C, T) を解いてヒット率を返す */
+function solve(buckets, lambda, capacityEntries, ttl) {
+  if (capacityEntries < 1) return { hit: 0, tau: 0, capBound: true };
+  if (occupancy(buckets, lambda, ttl) <= capacityEntries) {
+    return { hit: hitRate(buckets, lambda, ttl), tau: ttl, capBound: false };
+  }
+  let lo = 0, hi = ttl;
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    if (occupancy(buckets, lambda, mid) > capacityEntries) hi = mid; else lo = mid;
+  }
+  return { hit: hitRate(buckets, lambda, lo), tau: lo, capBound: true };
+}
+
+function fmtPct(x) { return (x * 100).toFixed(1) + "%"; }
+function fmtInt(x) {
+  if (x >= 1e8) return (x / 1e8).toFixed(2) + "億";
+  if (x >= 1e4) return (x / 1e4).toFixed(1) + "万";
+  return Math.round(x).toLocaleString();
+}
+function fmtBytes(x) {
+  if (x >= 1024 ** 3) return (x / 1024 ** 3).toFixed(1) + " GiB";
+  return Math.round(x / 1024 ** 2).toLocaleString() + " MiB";
+}
+function fmtSecs(x) {
+  if (x >= 86400) return (x / 86400).toFixed(1) + "日";
+  if (x >= 3600) return (x / 3600).toFixed(1) + "時間";
+  if (x >= 60) return Math.round(x / 60) + "分";
+  return Math.round(x) + "秒";
+}
+
+function readInputs() {
+  const value = (id, min) => Math.max(min, Number($(id).value) || min);
+  return {
+    entryBytes: value("keyBytes", 1) + value("valBytes", 1) + OVERHEAD_BYTES,
+    N: Math.round(value("uniqueKeys", 100)),
+    lambda: value("reqRate", 1),
+    alpha: Number($("alpha").value),
+    ttl: value("ttl", 1),
+    nodes: Math.round(value("nodes", 1)),
+    memBytes: value("memMiB", 16) * 1024 ** 2,
+    R: Number($("replication").value),
+    target: Math.min(0.999, value("target", 1) / 100),
+  };
+}
+
+/* ── チャート描画(単系列ライン+参照線+現在点)────────── */
+function drawChart(host, points, current, ceiling, xFmt, xLabel) {
+  const W = 640, H = 220, m = { t: 14, r: 16, b: 34, l: 44 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const xs = points.map((p) => Math.log(p.x));
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const X = (x) => m.l + ((Math.log(x) - xMin) / (xMax - xMin)) * iw;
+  const Y = (y) => m.t + (1 - y) * ih;
+
+  let grid = "", ticksY = "";
+  for (const g of [0, 0.25, 0.5, 0.75, 1]) {
+    grid += `<line x1="${m.l}" y1="${Y(g)}" x2="${W - m.r}" y2="${Y(g)}" stroke="var(--grid)" stroke-width="1"/>`;
+    ticksY += `<text class="tick" x="${m.l - 7}" y="${Y(g) + 4}" text-anchor="end" font-size="10.5" fill="var(--faint)">${g * 100}%</text>`;
+  }
+  let ticksX = "";
+  const tickCount = 5;
+  for (let i = 0; i <= tickCount; i++) {
+    const lx = xMin + ((xMax - xMin) * i) / tickCount;
+    const v = Math.exp(lx);
+    ticksX += `<text class="tick" x="${m.l + (iw * i) / tickCount}" y="${H - m.b + 17}" text-anchor="middle" font-size="10.5" fill="var(--faint)">${xFmt(v)}</text>`;
+  }
+
+  const path = points.map((p, i) => `${i ? "L" : "M"}${X(p.x).toFixed(1)},${Y(p.y).toFixed(1)}`).join("");
+  const ceilLine = ceiling < 0.999
+    ? `<line x1="${m.l}" y1="${Y(ceiling)}" x2="${W - m.r}" y2="${Y(ceiling)}" stroke="var(--amber)" stroke-width="1.5" stroke-dasharray="5 4"/>
+       <text x="${W - m.r - 4}" y="${Y(ceiling) - 5}" text-anchor="end" font-size="10.5" fill="var(--amber)">TTL上限 ${fmtPct(ceiling)}</text>`
+    : "";
+
+  host.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${xLabel}に対するヒット率の変化">
+      ${grid}${ticksY}${ticksX}
+      <text x="${W - m.r}" y="${H - 4}" text-anchor="end" font-size="10.5" fill="var(--faint)">${xLabel} →</text>
+      ${ceilLine}
+      <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
+      <circle cx="${X(current.x)}" cy="${Y(current.y)}" r="5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>
+      <line class="cross" x1="0" y1="${m.t}" x2="0" y2="${H - m.b}" stroke="var(--faint)" stroke-width="1" stroke-dasharray="3 3" opacity="0"/>
+      <circle class="probe" r="3.5" fill="var(--accent)" stroke="var(--surface)" stroke-width="1.5" opacity="0"/>
+      <rect class="hit-area" x="${m.l}" y="${m.t}" width="${iw}" height="${ih}" fill="transparent"/>
+    </svg>
+    <div class="tooltip"></div>`;
+
+  const svg = host.querySelector("svg");
+  const tooltip = host.querySelector(".tooltip");
+  const cross = svg.querySelector(".cross");
+  const probe = svg.querySelector(".probe");
+  svg.querySelector(".hit-area").addEventListener("pointermove", (event) => {
+    const rect = svg.getBoundingClientRect();
+    const fx = ((event.clientX - rect.left) / rect.width) * W;
+    const lx = xMin + ((fx - m.l) / iw) * (xMax - xMin);
+    let best = points[0];
+    for (const p of points) if (Math.abs(Math.log(p.x) - lx) < Math.abs(Math.log(best.x) - lx)) best = p;
+    cross.setAttribute("x1", X(best.x)); cross.setAttribute("x2", X(best.x)); cross.setAttribute("opacity", 1);
+    probe.setAttribute("cx", X(best.x)); probe.setAttribute("cy", Y(best.y)); probe.setAttribute("opacity", 1);
+    tooltip.style.left = (X(best.x) / W) * rect.width + "px";
+    tooltip.style.top = (Y(best.y) / H) * rect.height + "px";
+    tooltip.textContent = `${xFmt(best.x)} → ${fmtPct(best.y)}`;
+    tooltip.style.opacity = 1;
+  });
+  svg.addEventListener("pointerleave", () => {
+    tooltip.style.opacity = 0; cross.setAttribute("opacity", 0); probe.setAttribute("opacity", 0);
+  });
+}
+
+function recalc() {
+  const input = readInputs();
+  const buckets = buildBuckets(input.N, input.alpha);
+  const capacity = Math.floor((input.nodes * input.memBytes) / input.R / input.entryBytes);
+  const HUGE_TTL = 365 * 86400;
+
+  const now = solve(buckets, input.lambda, capacity, input.ttl);
+  const ttlCeil = hitRate(buckets, input.lambda, input.ttl);          // メモリ無限
+  const capCeil = solve(buckets, input.lambda, capacity, HUGE_TTL).hit; // TTL無限
+
+  $("hitRate").textContent = fmtPct(now.hit);
+  $("capEntries").textContent = fmtInt(capacity) + " エントリ";
+  $("capBytes").textContent = `${input.nodes}台 × ${fmtBytes(input.memBytes)} ÷ R=${input.R}`;
+  $("ttlCeil").textContent = fmtPct(ttlCeil);
+  $("capCeil").textContent = fmtPct(capCeil);
+
+  const badge = $("binding");
+  const capGap = capCeil - now.hit, ttlGap = ttlCeil - now.hit;
+  if (ttlGap < 0.005 && capGap < 0.005) { badge.textContent = "TTL・容量とも上限付近"; badge.className = "badge ok"; }
+  else if (now.capBound && ttlGap >= 0.005) { badge.textContent = "ボトルネック: 容量 — メモリ追加が効く"; badge.className = "badge cap"; }
+  else if (ttlGap < capGap) { badge.textContent = "ボトルネック: TTL — TTL延長が効く"; badge.className = "badge ttl"; }
+  else { badge.textContent = "ボトルネック: 容量 — メモリ追加が効く"; badge.className = "badge cap"; }
+
+  // チャート1: ノードメモリを 32MiB〜16GiB でスイープ
+  const memPoints = [];
+  for (let i = 0; i <= 72; i++) {
+    const mem = 32 * 1024 ** 2 * Math.pow(16384 / 32, i / 72);
+    const cap = Math.floor((input.nodes * mem) / input.R / input.entryBytes);
+    memPoints.push({ x: mem / 1024 ** 2, y: solve(buckets, input.lambda, cap, input.ttl).hit });
+  }
+  drawChart(
+    $("chartMem"), memPoints,
+    { x: input.memBytes / 1024 ** 2, y: now.hit }, ttlCeil,
+    (v) => (v >= 1024 ? (v / 1024).toFixed(1).replace(/\.0$/, "") + "G" : Math.round(v) + "M"),
+    "ノードメモリ",
+  );
+
+  // チャート2: TTL を 5秒〜24時間でスイープ
+  const ttlPoints = [];
+  for (let i = 0; i <= 72; i++) {
+    const t = 5 * Math.pow(86400 / 5, i / 72);
+    ttlPoints.push({ x: t, y: solve(buckets, input.lambda, capacity, t).hit });
+  }
+  drawChart(
+    $("chartTtl"), ttlPoints,
+    { x: input.ttl, y: now.hit }, capCeil,
+    (v) => (v >= 3600 ? Math.round(v / 3600) + "h" : v >= 60 ? Math.round(v / 60) + "m" : Math.round(v) + "s"),
+    "TTL",
+  );
+  // チャート2の参照線は容量上限なのでラベルを差し替え
+  const ttlSvg = $("chartTtl").querySelector("svg");
+  const refText = ttlSvg && [...ttlSvg.querySelectorAll("text")].find((t) => t.textContent.startsWith("TTL上限"));
+  if (refText) refText.textContent = refText.textContent.replace("TTL上限", "容量上限");
+
+  // 推奨: 目標に必要な TTL と、その TTL 下で必要なノードメモリ
+  $("targetEcho").textContent = (input.target * 100).toFixed(1).replace(/\.0$/, "");
+  const reco = $("reco");
+  const parts = [];
+
+  if (now.hit >= input.target) {
+    parts.push(`現在の構成で目標を<strong class="num">達成済み</strong>です(予測 ${fmtPct(now.hit)})。`);
+    // どこまで削れるかも示す
+    let lo = 16 * 1024 ** 2, hi = input.memBytes;
+    if (solve(buckets, input.lambda, Math.floor((input.nodes * lo) / input.R / input.entryBytes), input.ttl).hit < input.target) {
+      for (let i = 0; i < 40; i++) {
+        const mid = (lo + hi) / 2;
+        const cap = Math.floor((input.nodes * mid) / input.R / input.entryBytes);
+        if (solve(buckets, input.lambda, cap, input.ttl).hit >= input.target) hi = mid; else lo = mid;
+      }
+      parts.push(`この TTL のまま目標を守れる下限は、ノードメモリ <strong class="num">${fmtBytes(hi)}</strong> 前後です。`);
+    } else {
+      parts.push(`ノードメモリは 16 MiB まで下げても目標を維持できる見積もりです(ボトルネックは TTL)。`);
+    }
+  } else {
+    // 目標に必要な最小 TTL(メモリ無限)
+    if (hitRate(buckets, input.lambda, HUGE_TTL) < input.target) {
+      parts.push(`<span class="warn">この目標はアクセスの偏りとキー数に対して到達不能です</span>(TTL・メモリを無限にしても ${fmtPct(hitRate(buckets, input.lambda, HUGE_TTL))})。目標を下げるか、対象キーを絞ってください。`);
+    } else {
+      let ttlLo = 1, ttlHi = HUGE_TTL;
+      for (let i = 0; i < 48; i++) {
+        const mid = Math.sqrt(ttlLo * ttlHi);
+        if (hitRate(buckets, input.lambda, mid) >= input.target) ttlHi = mid; else ttlLo = mid;
+      }
+      parts.push(`目標には TTL <strong class="num">${fmtSecs(ttlHi)}</strong> 以上が必要です(これはメモリ無限の下限)。`);
+
+      const ttlNeeded = Math.max(input.ttl, ttlHi * 1.05);
+      let memLo = input.memBytes, memHi = 1024 * 1024 ** 3;
+      const capOf = (mem) => Math.floor((input.nodes * mem) / input.R / input.entryBytes);
+      if (solve(buckets, input.lambda, capOf(memHi), ttlNeeded).hit < input.target) {
+        parts.push(`ただし現在の TTL(${fmtSecs(input.ttl)})のままでは、メモリをいくら足しても届きません。`);
+      } else {
+        for (let i = 0; i < 48; i++) {
+          const mid = Math.sqrt(memLo * memHi);
+          if (solve(buckets, input.lambda, capOf(mid), ttlNeeded).hit >= input.target) memHi = mid; else memLo = mid;
+        }
+        const ttlNote = ttlNeeded > input.ttl ? `TTL を <strong class="num">${fmtSecs(ttlNeeded)}</strong> に延ばした上で、` : "";
+        parts.push(`${ttlNote}ノードメモリ <strong class="num">${fmtBytes(memHi)}</strong>(${input.nodes}台 × R=${input.R})あれば目標に届く見積もりです。`);
+      }
+      if (input.R > 1) {
+        const r1 = solve(buckets, input.lambda, Math.floor((input.nodes * input.memBytes) / 1 / input.entryBytes), input.ttl);
+        parts.push(`参考: R=1 に落とせば同じメモリで ${fmtPct(r1.hit)} まで上がりますが、ノード死でそのノード分のキャッシュを失います。`);
+      }
+    }
+  }
+  reco.innerHTML = parts.join("<br>");
+}
+
+let timer = null;
+for (const el of document.querySelectorAll("input, select")) {
+  el.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(recalc, 120); });
+}
+recalc();
+</script>

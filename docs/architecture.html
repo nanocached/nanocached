@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — nanocached</title>
+<meta name="description" content="How nanocached clusters work: client-side rendezvous hashing, replication, staged node joins, and coordination-free discovery replicas.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <nav>
+    <a class="brand" href="index.html"><img src="favicon.svg" alt=""><span><b>nano</b>cached</span></a>
+    <div class="links">
+      <a href="getting-started.html">Getting started</a>
+      <a href="protocol.html">Protocol</a>
+      <a href="architecture.html" aria-current="page">Architecture</a>
+      <a href="sdks.html">SDKs</a>
+      <a href="capacity-planner.html">Capacity planner</a>
+      <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+
+<h1>Architecture</h1>
+<p class="lede">The clients do the clustering. Nodes store data,
+discovery servers track membership, and every routing decision happens
+in the SDK — so the data path has no extra hop.</p>
+
+<h2>The three roles</h2>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Role</th><th>Holds</th><th>On the data path?</th></tr></thead>
+  <tbody>
+    <tr><td><code>nanocached-node</code></td><td>Cache entries (memory-bounded, LRU)</td><td>Yes — clients connect directly</td></tr>
+    <tr><td><code>nanocached-discovery</code></td><td>Soft-state membership registry</td><td>No — consulted only at bootstrap and on refresh</td></tr>
+    <tr><td>SDK client</td><td>The node list, R, and open connections</td><td>Is the data path</td></tr>
+  </tbody>
+</table>
+</div>
+<p>An SDK bootstraps by connecting to any seed. The server's handshake
+reply says whether it is a node or a discovery server; against a
+discovery server the client fetches the node list (which carries the
+replication factor R) and then talks to nodes directly.</p>
+
+<h2>Routing: rendezvous hashing</h2>
+<p>For each key, every node gets a score —
+<code>fmix64(fnv1a(node-name) XOR fnv1a(key))</code> — and the nodes
+ranked by descending score are the key's owner list. The top-R nodes
+hold the key.</p>
+<p>Rendezvous (highest-random-weight) hashing has a property that
+matters here: adding or removing a node never reorders the surviving
+nodes in any key's ranking. A new node takes exactly its share of keys
+and nothing else moves; a dead node's keys fall to the next owner that
+already holds a replica.</p>
+<p>All six SDKs and the server implement this pipeline bit-for-bit and
+assert the same published test vectors, so a polyglot deployment routes
+identically from every language.</p>
+
+<h2>Replication</h2>
+<p>Writes fan out from the client to all R owners; the primary's result
+decides the operation, and a dead replica never fails a write. Reads go
+to the primary and fail over to the next owner only when the holder is
+unreachable.</p>
+<p>Two self-healing behaviors close the failure gaps:</p>
+<ul>
+  <li>A node that is asked for a key it does not own (stale client
+  routing) answers <code>W</code>; the client refreshes its node list
+  and retries once.</li>
+  <li>A write whose primary just died fails its connection, which
+  triggers the same refresh-and-retry — so writes recover as soon as
+  discovery drops the dead node (bounded by the liveness timeout,
+  seconds).</li>
+</ul>
+<p>Node identity is a random per-process name, decoupled from the
+network address — routing hashes the name, connections use the address —
+so a node restarting on the same address is correctly treated as a new
+member.</p>
+
+<h2>Joining a node: staged handoff</h2>
+<p>Adding a node must not drop the keys it takes ownership of, so joins
+are orchestrated by discovery in stages:</p>
+<ol>
+  <li>The joining node registers; discovery tells the existing nodes to
+  migrate the keys the newcomer now owns.</li>
+  <li>While migration runs, existing nodes keep serving those keys and
+  forward concurrent writes to the joiner, so no update is lost.</li>
+  <li>When every node reports completion, discovery promotes the joiner
+  into the served node list; clients pick it up on their next
+  refresh.</li>
+</ol>
+<p>Migrated-away entries are swept only after the handoff completes, and
+the forwarding window stays open past completion to cover clients still
+routing with the older node list.</p>
+
+<h2>Discovery without a single point of failure</h2>
+<p>The registry is deliberately soft state: nodes announce themselves and
+heartbeat continuously, so a discovery server's knowledge is always
+rebuildable from the nodes alone. That allows N independent replicas
+with <em>zero coordination</em> — no consensus, no leader election, no
+shared storage:</p>
+<ul>
+  <li>Every node and client is configured with the same replica list.
+  Nodes heartbeat to all replicas; clients try seeds in order.</li>
+  <li>Losing any replica — including the first-listed primary — costs
+  neither cache traffic nor client bootstrap. Only <em>joins</em>
+  pause until the primary is back, because exactly one orchestrator
+  keeps handoffs simple.</li>
+  <li>A restarted replica answers <code>B</code> (busy) during a startup
+  grace while live members re-announce, so clients never bootstrap from
+  a half-recovered list; SDKs skip a busy seed like a dead one.</li>
+</ul>
+<p>Pair this with a supervisor that restarts a dead replica (systemd,
+Kubernetes) and two replicas make discovery effectively always
+available.</p>
+
+<h2>Design decisions</h2>
+<p>Every one of these choices is recorded as an ADR in the repository,
+with the alternatives that were rejected and why:</p>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>ADR</th><th>Decision</th></tr></thead>
+  <tbody>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0002-client-side-consistent-hashing-with-a-lightweight-self-hosted-discovery-server.md">0002</a></td><td>Client-side hashing with a lightweight discovery server</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0005-shared-secret-authentication-via-environment-variable.md">0005</a></td><td>Shared-secret authentication via environment variable</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0006-tls-support-via-rustls-required-once-configured.md">0006</a></td><td>TLS via rustls, required once configured</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0007-encode-server-type-in-the-auth-response-for-a-unified-connect.md">0007</a></td><td>Server type in the auth response → one unified connect</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0008-staged-node-join-with-discovery-orchestrated-data-handoff.md">0008</a></td><td>Staged node join with orchestrated data handoff</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0009-decouple-node-identity-from-network-address.md">0009</a></td><td>Node identity decoupled from network address</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0010-discovery-ha-via-soft-state-replicas-and-member-announce.md">0010</a></td><td>Discovery HA via soft-state replicas and announces</td></tr>
+    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0011-client-side-replication-via-rendezvous-hashing.md">0011</a></td><td>Client-side replication via rendezvous hashing</td></tr>
+  </tbody>
+</table>
+</div>
+
+</main>
+
+<footer class="site-footer">
+  <div>
+    <span>nanocached</span>
+    <a href="https://github.com/nanocached/nanocached">GitHub</a>
+    <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
+    <a href="https://github.com/nanocached/nanocached/tree/main/doc/adr">Design decisions (ADRs)</a>
+  </div>
+</footer>
+
+</body>
+</html>
