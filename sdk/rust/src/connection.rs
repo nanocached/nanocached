@@ -224,8 +224,6 @@ impl Connection {
     }
 }
 
-
-
 pub(crate) async fn read_line(stream: &mut BufReader<Stream>) -> Result<String> {
     let mut line = Vec::new();
     loop {

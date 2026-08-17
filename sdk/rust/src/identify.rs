@@ -106,8 +106,11 @@ pub(crate) async fn connect_and_identify(
     tls: Option<&TlsConfig>,
     deadline: std::time::Duration,
 ) -> Result<Identified> {
-    match tokio::time::timeout(deadline, do_connect_and_identify(host, port, auth_secret, tls))
-        .await
+    match tokio::time::timeout(
+        deadline,
+        do_connect_and_identify(host, port, auth_secret, tls),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_) => Err(Error::ConnectionLost(format!(
