@@ -60,6 +60,11 @@ function trackAndClose(server: Server): { sockets: Set<Socket>; close: () => Pro
   const sockets = new Set<Socket>();
   server.on("connection", (socket) => {
     sockets.add(socket);
+    // An abrupt client-side destroy (e.g. close() racing an in-flight
+    // keep-alive ping) surfaces as ECONNRESET here; without a listener
+    // the 'error' event would crash the test process as an uncaught
+    // exception — a pure test-infra flake.
+    socket.on("error", () => {});
     socket.on("close", () => sockets.delete(socket));
   });
 
