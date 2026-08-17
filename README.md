@@ -314,6 +314,8 @@ B\n
   `org.nanocached:nanocached`).
 - [`sdk/rust`](sdk/rust/README.md) — an async (tokio) Rust client with
   the same feature set (TLS behind the `tls` feature).
+- [`sdk/dotnet`](sdk/dotnet/README.md) — an async .NET client with the
+  same feature set (.NET 8+, no dependencies, NuGet ID `Nanocached`).
 
 ## Capacity planning
 

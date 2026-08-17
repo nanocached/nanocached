@@ -116,3 +116,20 @@ jobs:
       - name: Run tests
         working-directory: sdk/rust
         run: cargo test --all-features
+
+  dotnet-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Run tests
+        working-directory: sdk/dotnet
+        run: dotnet test tests/Nanocached.Tests -v q
