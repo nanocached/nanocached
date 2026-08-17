@@ -114,11 +114,29 @@ final class Connection {
         }
     }
 
+    // The server never stores values above its 1 MiB request limit, so a
+    // claimed length beyond this is a corrupt or malicious frame.
+    private static final int MAX_VALUE_LENGTH = 2 * 1024 * 1024;
+
     private Response readResponse() throws IOException {
         int marker = readByte();
         switch (marker) {
             case 'V' -> {
-                int length = Integer.parseInt(readLine());
+                // A non-numeric, negative, or absurd length is protocol
+                // garbage: the connection is desynced mid-frame and must
+                // be poisoned, and the error must be connection-classified
+                // so the redial/retry layer handles it (issue #8).
+                int length;
+                try {
+                    length = Integer.parseInt(readLine());
+                } catch (NumberFormatException malformed) {
+                    length = -1;
+                }
+                if (length < 0 || length > MAX_VALUE_LENGTH) {
+                    close();
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid value length in response", null);
+                }
                 return new Response(marker, readExactly(length));
             }
             case 'S', 'D', 'N', 'W' -> {
@@ -132,8 +150,12 @@ final class Connection {
                         "nanocached: server rejected the connection (connection limit reached)", null);
             }
             default -> {
+                // A garbage marker means the stream is desynced; poison
+                // and classify as connection-level (issue #8) so the
+                // retry layer redials instead of failing the op outright.
                 close();
-                throw unexpected(marker);
+                throw new NanocachedException.ConnectionFailed(
+                        "nanocached: unexpected response from server: " + (char) marker, null);
             }
         }
     }

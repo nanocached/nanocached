@@ -354,6 +354,49 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("a malformed value length poisons the connection and the next request redials", async () => {
+    // Regression for issue #8: a garbage `V <len>` header desyncs the
+    // stream; the connection must be poisoned (never reused mid-frame)
+    // so the next request transparently redials.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      try {
+        await client.set("k", "v");
+        node.answerMalformedValueOnce();
+        await assert.rejects(client.get("k"), /invalid value length/);
+
+        // The poisoned connection is replaced lazily; no stray bytes leak
+        // into this response.
+        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a refresh finishing after close() installs no new connections", async () => {
+    // Regression for issue #10: close() must win against an in-flight
+    // node-list refresh — a freshly dialed socket installed afterwards
+    // would leak with nothing left to close it.
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([
+      { name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: discovery.port });
+      const before = node.connectionCount();
+      client.close();
+      await (client as any).refreshNodeList();
+      assert.equal(node.connectionCount(), before, "refresh after close dialed a node");
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
+    }
+  });
+
   it("propagates the dial error when the node is gone for good", async () => {
     const node = await startMockNode();
     const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });

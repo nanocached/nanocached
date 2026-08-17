@@ -14,6 +14,10 @@ namespace Nanocached;
 /// </summary>
 internal sealed class Connection
 {
+    // The server never stores values above its 1 MiB request limit, so a
+    // claimed length beyond this is a corrupt or malicious frame.
+    private const int MaxValueLength = 2 * 1024 * 1024;
+
     private readonly Stream _stream;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
@@ -117,7 +121,18 @@ internal sealed class Connection
         {
             case (byte)'V':
             {
-                int length = int.Parse(await ReadLineAsync().ConfigureAwait(false));
+                // A non-numeric, negative, or absurd length (the server
+                // caps requests at 1 MiB) is protocol garbage: the
+                // connection is desynced mid-frame and must be poisoned,
+                // and the error must be connection-classified so the
+                // redial/retry layer handles it (issue #8).
+                if (!int.TryParse(await ReadLineAsync().ConfigureAwait(false), out int length)
+                    || length < 0
+                    || length > MaxValueLength)
+                {
+                    Close();
+                    throw new ConnectionLostException("nanocached: invalid value length in response");
+                }
                 var value = new byte[length];
                 await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
                 return (marker, value);
@@ -134,8 +149,12 @@ internal sealed class Connection
                 throw new ConnectionLostException(
                     "nanocached: server rejected the connection (connection limit reached)");
             default:
+                // A garbage marker means the stream is desynced; poison
+                // and classify as connection-level (issue #8) so the
+                // retry layer redials instead of failing the op outright.
                 Close();
-                throw Unexpected(marker);
+                throw new ConnectionLostException(
+                    $"nanocached: unexpected response from server: {(char)marker}");
         }
     }
 

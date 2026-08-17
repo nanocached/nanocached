@@ -104,6 +104,23 @@ class NanocachedClientTest {
     // ── 遅延再接続と keep-alive ───────────────────────────────────
 
     @Test
+    void aMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently() throws Exception {
+        // Regression for issue #8: a garbage `V <len>` header desyncs the
+        // stream; the error must be connection-classified so the built-in
+        // redial-and-retry-once makes the SAME call succeed, and the
+        // poisoned connection must never serve stray bytes to a later
+        // request.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                node.answerMalformedValueOnce();
+                assertArrayEquals("v".getBytes(), client.get("k"));
+                assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
     void transparentlyReconnectsAfterAServerFin() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", node.port())) {

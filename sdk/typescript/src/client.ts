@@ -200,7 +200,10 @@ export class NanocachedClient {
 
     for (const seed of seeds) {
       const key = targetKey(seed);
-      if (openTargets.has(key)) {
+      // Only meaningful for a single explicit target: with a seeds list,
+      // another client instance legitimately holding connections to the
+      // same seed makes this heuristic false-positive (issue #12).
+      if (seeds.length === 1 && openTargets.has(key)) {
         console.warn(
           `nanocached: connect() called for ${key} while a previous connection to it is still open — was close() forgotten?`,
         );
@@ -533,11 +536,25 @@ export class NanocachedClient {
           continue;
         }
 
+        if (this.closed) {
+          // close() ran while we were dialing (issue #10): installing this
+          // socket now would leak it — nothing will ever close it again.
+          nodeIdentified.socket.destroy();
+          return;
+        }
+
         trackOpenTarget(this.url, [nodeIdentified.socket]);
         members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket) });
       } catch (error) {
         console.warn(`nanocached: could not connect to new node ${node.address}, will retry on the next refresh: ${(error as Error).message}`);
       }
+    }
+
+    if (this.closed) {
+      // Same race, caught at commit time: close() already tore down the
+      // members it knew about; anything newly opened here must die too.
+      for (const member of members.values()) member.connection.close();
+      return;
     }
 
     this.target = {
@@ -614,7 +631,9 @@ export class NanocachedClient {
 
     const member = this.target.members.get(name);
     if (!member) {
-      throw new Error(`nanocached: ${name} has no open connection`);
+      // Connection-classified (issue #8): the usual cause is a refresh
+      // racing this operation, which the refresh-and-retry layer heals.
+      throw new ConnectionLostError(`nanocached: ${name} has no open connection`);
     }
     if (!member.connection.isClosed()) return member.connection;
 

@@ -76,17 +76,32 @@ final class Identify {
         }
     }
 
+    private static final int CONNECT_TIMEOUT_MS = 10_000;
+
     private static Socket open(String host, int port, SSLContext tls) throws IOException {
-        if (tls == null) {
-            Socket socket = new Socket();
-            socket.connect(new InetSocketAddress(host, port), 10_000);
-            socket.setTcpNoDelay(true);
+        // Both paths bound the TCP connect (issue #11): the TLS factory's
+        // own connect(host, port) has no timeout, so an unresponsive
+        // (packet-dropping) seed would hang connect()/refresh forever
+        // instead of failing over. Layer SSL over a pre-connected,
+        // timeout-bounded plain socket instead, and bound the handshake
+        // with a read timeout.
+        Socket plain = new Socket();
+        try {
+            plain.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            plain.setTcpNoDelay(true);
+            if (tls == null) {
+                return plain;
+            }
+            SSLSocket socket =
+                    (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
+            socket.setSoTimeout(CONNECT_TIMEOUT_MS);
+            socket.startHandshake();
+            socket.setSoTimeout(0);
             return socket;
+        } catch (IOException error) {
+            plain.close();
+            throw error;
         }
-        SSLSocket socket = (SSLSocket) tls.getSocketFactory().createSocket(host, port);
-        socket.setTcpNoDelay(true);
-        socket.startHandshake();
-        return socket;
     }
 
     private static ClusterTarget readNodeList(InputStream in) throws IOException {

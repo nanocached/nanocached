@@ -97,6 +97,21 @@ public class NanocachedClientTests
     // ── 遅延再接続と keep-alive ───────────────────────────────────
 
     [Fact]
+    public async Task AMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently()
+    {
+        // Regression for issue #8: a garbage V header must be
+        // connection-classified so the built-in redial-and-retry-once
+        // makes the same call succeed, never serving stray bytes.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+
+        await client.SetAsync("k", "v");
+        node.AnswerMalformedValueOnce();
+        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
     public async Task TransparentlyReconnectsAfterAServerFin()
     {
         using var node = new MockNode();

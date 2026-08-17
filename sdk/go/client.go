@@ -207,7 +207,11 @@ func (c *Client) Set(key string, value []byte, ttl time.Duration) error {
 	}
 	ttlSeconds := int64(-1) // no expiry
 	if ttl > 0 {
-		ttlSeconds = int64(ttl / time.Second)
+		// Round sub-second TTLs UP (issue #9): truncation turned e.g.
+		// 300ms into an explicit 0-second TTL — near-immediate expiry —
+		// silently changing the caller's intent. TTL granularity on the
+		// wire is whole seconds.
+		ttlSeconds = int64((ttl + time.Second - 1) / time.Second)
 	}
 	keyBytes := []byte(key)
 	return c.withClusterRetry(func() error {
@@ -421,6 +425,12 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		// Close() ran while we were dialing (issue #10): installing this
+		// connection now would leak it past teardown.
+		fresh.close()
+		return nil, ErrClosed
+	}
 	if slot == "" {
 		c.single = fresh
 		return fresh, nil
@@ -515,6 +525,19 @@ func (c *Client) refreshNodeList() {
 	c.members = fresh
 	c.ring = NewHashRing(names)
 	c.replication = replication
+
+	// Node names are per-process UUIDs; departed nodes' redial gates
+	// would otherwise accumulate forever (issue #12).
+	c.redialMu.Lock()
+	for slot := range c.redialGates {
+		if slot == "" {
+			continue
+		}
+		if _, live := fresh[slot]; !live {
+			delete(c.redialGates, slot)
+		}
+	}
+	c.redialMu.Unlock()
 }
 
 // fetchNodeList walks every seed (ADR-0010); ok=false means keep the

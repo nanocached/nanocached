@@ -17,6 +17,11 @@ import (
 // deliberate v1 simplification over the TypeScript SDK's pipelining:
 // nanocached-node answers in arrival order, so serializing is always
 // correct, just less concurrent. Concurrent callers queue on the mutex.
+// maxValueLength bounds a `V <len>` response before allocation: the
+// server never stores values above its 1 MiB request limit, so anything
+// larger is a corrupt or malicious frame.
+const maxValueLength = 2 * 1024 * 1024
+
 type connection struct {
 	mu       sync.Mutex
 	conn     net.Conn // nil only for the pre-poisoned placeholder
@@ -155,9 +160,10 @@ func (c *connection) roundTrip(frame []byte) (byte, []byte, error) {
 			return 0, nil, err
 		}
 		// The wire is `V <len>\n`; after the marker byte the header still
-		// carries the leading space.
+		// carries the leading space. Lengths beyond the server's own 1 MiB
+		// request cap are protocol garbage — reject before allocating.
 		length, err := strconv.Atoi(strings.TrimSpace(header))
-		if err != nil || length < 0 {
+		if err != nil || length < 0 || length > maxValueLength {
 			return 0, nil, fmt.Errorf("invalid value length in response")
 		}
 		value := make([]byte, length)

@@ -31,7 +31,9 @@ type mockNode struct {
 	connectionCount atomic.Int32
 	getCount        atomic.Int32
 	wrongNodeLeft   atomic.Int32
-	conns           sync.Map // net.Conn -> struct{}
+	malformedLeft   atomic.Int32
+	lastSetTTL      atomic.Value // string: the TTL field of the last S, or "none"
+	conns           sync.Map     // net.Conn -> struct{}
 }
 
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
@@ -112,6 +114,12 @@ func (m *mockNode) serve(conn net.Conn) {
 		case "G":
 			key := string(mustRead(reader, atoiOrPanic(parts[1])))
 			m.getCount.Add(1)
+			if m.takeOne(&m.malformedLeft) {
+				if _, err := conn.Write([]byte("V x\n")); err != nil {
+					return
+				}
+				continue
+			}
 			var reply []byte
 			if m.takeWrongNode() {
 				reply = []byte("W\n")
@@ -127,6 +135,11 @@ func (m *mockNode) serve(conn net.Conn) {
 		case "S":
 			key := string(mustRead(reader, atoiOrPanic(parts[1])))
 			value := mustRead(reader, atoiOrPanic(parts[2]))
+			if len(parts) == 4 {
+				m.lastSetTTL.Store(parts[3])
+			} else {
+				m.lastSetTTL.Store("none")
+			}
 			reply := "S\n"
 			if m.takeWrongNode() {
 				reply = "W\n"
@@ -154,12 +167,16 @@ func (m *mockNode) serve(conn net.Conn) {
 }
 
 func (m *mockNode) takeWrongNode() bool {
+	return m.takeOne(&m.wrongNodeLeft)
+}
+
+func (m *mockNode) takeOne(counter *atomic.Int32) bool {
 	for {
-		pending := m.wrongNodeLeft.Load()
+		pending := counter.Load()
 		if pending == 0 {
 			return false
 		}
-		if m.wrongNodeLeft.CompareAndSwap(pending, pending-1) {
+		if counter.CompareAndSwap(pending, pending-1) {
 			return true
 		}
 	}
@@ -387,6 +404,60 @@ func TestRejectsUseAfterClose(t *testing.T) {
 }
 
 // ── 遅延再接続と keep-alive ───────────────────────────────────────
+
+func TestSubSecondTtlRoundsUpToOneSecond(t *testing.T) {
+	// Regression for issue #9: 300ms must not truncate to an explicit
+	// 0-second TTL (near-immediate expiry).
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Seeds: []string{node.address()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", []byte("v"), 300*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.lastSetTTL.Load(); got != "1" {
+		t.Fatalf("300ms TTL sent as %v, want \"1\"", got)
+	}
+	if err := client.Set("k", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.lastSetTTL.Load(); got != "none" {
+		t.Fatalf("zero TTL sent as %v, want none", got)
+	}
+	if err := client.Set("k", []byte("v"), 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.lastSetTTL.Load(); got != "2" {
+		t.Fatalf("2s TTL sent as %v, want \"2\"", got)
+	}
+}
+
+func TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently(t *testing.T) {
+	// Regression for issue #8/#12: a garbage V header is
+	// connection-classified, so the built-in redial-and-retry-once makes
+	// the same call succeed, never serving stray bytes.
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Seeds: []string{node.address()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	node.malformedLeft.Add(1)
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || string(value) != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if node.connectionCount.Load() != 2 {
+		t.Fatalf("connections = %d", node.connectionCount.Load())
+	}
+}
 
 func TestTransparentlyReconnectsAfterAServerFin(t *testing.T) {
 	node := startMockNode(t, nil)

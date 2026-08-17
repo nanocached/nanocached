@@ -255,9 +255,12 @@ class NanocachedClient:
                 return await op(connection)
             except WrongNodeError:
                 raise
-            except (ConnectionError, OSError) as error:
+            except (NanocachedError, ConnectionError, OSError) as error:
+                # Fall through to the next owner on anything but a
+                # WrongNode answer (issue #8) — matching the TypeScript
+                # SDK's semantics.
                 last_error = error
-        raise last_error if last_error is not None else NanocachedError(
+        raise last_error if last_error is not None else ConnectionError(
             "nanocached: no owner is reachable for this key"
         )
 
@@ -267,7 +270,7 @@ class NanocachedClient:
 
         names = self._owner_names(key)
         if not names:
-            raise NanocachedError("nanocached: no owner is reachable for this key")
+            raise ConnectionError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
 
         async def replica_write(name: str) -> None:
@@ -292,45 +295,61 @@ class NanocachedClient:
         assert self._single is not None and self._single_address is not None
         if not self._single.closed:
             return self._single
-        connection = await self._redial("", self._single_address)
-        if self._single.closed:
-            self._single = connection
-        return self._single
+        return await self._redial("", self._single_address)
 
     async def _member_connection(self, name: str) -> Connection:
         member = self._members.get(name)
         if member is None:
-            raise NanocachedError(f"nanocached: {name} has no open connection")
+            # Connection-classified (issue #8): the usual cause is a
+            # refresh racing this operation, which the retry layer heals.
+            raise ConnectionError(f"nanocached: {name} has no open connection")
         if not member.connection.closed:
             return member.connection
-
-        connection = await self._redial(name, member.address)
-
-        current = self._members.get(name)
-        if current is None:
-            connection.close()
-            raise ConnectionError(f"nanocached: {name} left the cluster while reconnecting")
-        if current.connection.closed:
-            current.connection = connection
-            return connection
-        if current.connection is not connection:
-            connection.close()
-        return current.connection
+        return await self._redial(name, member.address)
 
     async def _redial(self, slot: str, address: str) -> Connection:
         """Concurrent requests finding the same dead connection share one
-        dial instead of each opening a socket."""
+        dial instead of each opening a socket. The shared task itself
+        adopts the fresh connection into client state (issue #10): with
+        adoption in the awaiting caller, a cancelled caller (e.g.
+        asyncio.wait_for around a client call) would abandon the
+        shield-protected task's connection unreferenced — a leaked
+        socket."""
         in_flight = self._redials.get(slot)
         if in_flight is not None:
             return await asyncio.shield(in_flight)
 
-        task = asyncio.ensure_future(self._open_node_connection(address))
+        task = asyncio.ensure_future(self._open_and_adopt(slot, address))
         self._redials[slot] = task
         try:
             return await asyncio.shield(task)
         finally:
             if self._redials.get(slot) is task:
                 del self._redials[slot]
+
+    async def _open_and_adopt(self, slot: str, address: str) -> Connection:
+        connection = await self._open_node_connection(address)
+
+        if slot == "":
+            if self._single is not None and self._single.closed:
+                self._single = connection
+                return connection
+            if self._single is connection or (self._single is not None and not self._single.closed):
+                if self._single is not connection:
+                    connection.close()
+                    return self._single
+            return connection
+
+        current = self._members.get(slot)
+        if current is None:
+            connection.close()
+            raise ConnectionError(f"nanocached: {slot} left the cluster while reconnecting")
+        if current.connection.closed:
+            current.connection = connection
+            return connection
+        if current.connection is not connection:
+            connection.close()
+        return current.connection
 
     async def _open_node_connection(self, address: str) -> Connection:
         node_host, node_port = split_host_port(address)
@@ -378,9 +397,18 @@ class NanocachedClient:
                 if not isinstance(target, NodeTarget):
                     _warn(f"nanocached: discovery returned a non-node address: {node.address}, skipping")
                     continue
+                if self._closed:
+                    # close() ran while we were dialing (issue #10):
+                    # installing this socket now would leak it.
+                    target.writer.close()
+                    return
                 self._members[node.name] = _Member(node.address, Connection(target.reader, target.writer))
             except (NanocachedError, OSError) as error:
                 _warn(f"nanocached: could not connect to new node {node.address}, will retry: {error}")
+
+        if self._closed:
+            self._teardown()
+            return
 
         self._ring = HashRing(list(self._members))
         self._replication = cluster.replication

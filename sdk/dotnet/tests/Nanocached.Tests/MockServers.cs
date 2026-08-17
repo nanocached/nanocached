@@ -22,6 +22,7 @@ public sealed class MockNode : IDisposable
     private int _connectionCount;
     private int _getCount;
     private int _wrongNodeReplies;
+    private int _malformedValueReplies;
 
     public MockNode(string? requiredSecret = null)
     {
@@ -36,6 +37,9 @@ public sealed class MockNode : IDisposable
     public string Address => $"127.0.0.1:{Port}";
 
     public void AnswerWrongNodeOnce() => Interlocked.Increment(ref _wrongNodeReplies);
+
+    /// <summary>Queue a one-off garbage V header for the next G request.</summary>
+    public void AnswerMalformedValueOnce() => Interlocked.Increment(ref _malformedValueReplies);
 
     /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
     public void DropConnections()
@@ -93,6 +97,11 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         Interlocked.Increment(ref _getCount);
+                        if (TakeMalformedValue())
+                        {
+                            await Wire.WriteAsync(stream, "V x\n");
+                            break;
+                        }
                         if (TakeWrongNode())
                         {
                             await Wire.WriteAsync(stream, "W\n");
@@ -149,6 +158,19 @@ public sealed class MockNode : IDisposable
         {
             _clients.TryRemove(client, out _);
             client.Close();
+        }
+    }
+
+    private bool TakeMalformedValue()
+    {
+        while (true)
+        {
+            int pending = _malformedValueReplies;
+            if (pending == 0) return false;
+            if (Interlocked.CompareExchange(ref _malformedValueReplies, pending - 1, pending) == pending)
+            {
+                return true;
+            }
         }
     }
 

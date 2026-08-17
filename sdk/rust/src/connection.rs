@@ -15,6 +15,9 @@ use tokio::sync::Mutex;
 use crate::error::{Error, Result};
 use crate::identify::Stream;
 
+/// The server never stores values above its 1 MiB request limit.
+const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
+
 pub(crate) struct Connection {
     /// `None` only for the pre-poisoned placeholder (`dead()`) a node-list
     /// refresh installs for a newly discovered member — the first request
@@ -146,9 +149,18 @@ impl Connection {
         match marker {
             b'V' => {
                 let header = read_line(stream).await?;
-                let length: usize = header.trim().parse().map_err(|_| {
-                    Error::Protocol("nanocached: invalid value length in response".to_string())
-                })?;
+                // The server never stores values above its 1 MiB request
+                // limit, so a claimed length beyond MAX_VALUE_LENGTH is a
+                // corrupt or malicious frame (issue #12); reject before
+                // allocating.
+                let length: usize = header
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|length| *length <= MAX_VALUE_LENGTH)
+                    .ok_or_else(|| {
+                        Error::Protocol("nanocached: invalid value length in response".to_string())
+                    })?;
                 let mut value = vec![0u8; length];
                 stream.read_exact(&mut value).await?;
                 Ok(ResponseKind::Value(value))
