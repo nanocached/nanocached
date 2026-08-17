@@ -316,6 +316,9 @@ B\n
   the same feature set (TLS behind the `tls` feature).
 - [`sdk/dotnet`](sdk/dotnet/README.md) — an async .NET client with the
   same feature set (.NET 8+, no dependencies, NuGet ID `Nanocached`).
+- [`sdk/go`](sdk/go/README.md) — a Go client with the same feature set
+  (Go 1.22+, standard library only, module
+  `github.com/t0k0sh1/nanocached/sdk/go` — interim path, see its README).
 
 ## Capacity planning
 
