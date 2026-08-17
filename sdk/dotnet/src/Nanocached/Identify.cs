@@ -27,6 +27,13 @@ internal static class Identify
     // requires a real secret correctly rejects this placeholder.
     private static readonly byte[] NoSecretPlaceholder = { 0 };
 
+    // Bound on dial + handshake, matching the Go and Java SDKs. Without
+    // it, a node whose IP has been reclaimed (a stopped container, a dead
+    // cloud instance) blackholes the TCP connect and a caller hangs for
+    // the kernel's own timeout — minutes — instead of failing over.
+    // Internal and mutable only so tests can shorten it.
+    internal static TimeSpan ConnectDeadline = TimeSpan.FromSeconds(10);
+
     internal abstract record Result;
 
     internal sealed record NodeTarget(Stream Stream) : Result;
@@ -36,17 +43,34 @@ internal static class Identify
     internal static async Task<Result> ConnectAndIdentifyAsync(
         string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls)
     {
-        Stream stream = await OpenAsync(host, port, tls).ConfigureAwait(false);
+        using var deadline = new CancellationTokenSource(ConnectDeadline);
+        try
+        {
+            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, deadline.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        {
+            throw new ConnectionLostException(
+                $"nanocached: connecting to {host}:{port} timed out after {ConnectDeadline.TotalSeconds}s");
+        }
+    }
+
+    private static async Task<Result> ConnectAndIdentifyAsync(
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls,
+        CancellationToken cancel)
+    {
+        Stream stream = await OpenAsync(host, port, tls, cancel).ConfigureAwait(false);
         try
         {
             byte[] secret = authSecret ?? NoSecretPlaceholder;
             byte[] header = Encoding.ASCII.GetBytes($"A {secret.Length}\n");
-            await stream.WriteAsync(header).ConfigureAwait(false);
-            await stream.WriteAsync(secret).ConfigureAwait(false);
-            await stream.FlushAsync().ConfigureAwait(false);
+            await stream.WriteAsync(header, cancel).ConfigureAwait(false);
+            await stream.WriteAsync(secret, cancel).ConfigureAwait(false);
+            await stream.FlushAsync(cancel).ConfigureAwait(false);
 
             var ack = new byte[3];
-            await stream.ReadExactlyAsync(ack).ConfigureAwait(false);
+            await stream.ReadExactlyAsync(ack, cancel).ConfigureAwait(false);
             bool shaped = ack[2] == (byte)'\n'
                 && ack[0] is (byte)'O' or (byte)'E'
                 && ack[1] is (byte)'n' or (byte)'d';
@@ -69,9 +93,9 @@ internal static class Identify
             }
 
             // A discovery server: one-shot L, then this connection is done.
-            await stream.WriteAsync("L\n"u8.ToArray()).ConfigureAwait(false);
-            await stream.FlushAsync().ConfigureAwait(false);
-            ClusterTarget cluster = await ReadNodeListAsync(stream).ConfigureAwait(false);
+            await stream.WriteAsync("L\n"u8.ToArray(), cancel).ConfigureAwait(false);
+            await stream.FlushAsync(cancel).ConfigureAwait(false);
+            ClusterTarget cluster = await ReadNodeListAsync(stream, cancel).ConfigureAwait(false);
             stream.Dispose();
             return cluster;
         }
@@ -83,12 +107,12 @@ internal static class Identify
     }
 
     private static async Task<Stream> OpenAsync(
-        string host, int port, SslClientAuthenticationOptions? tls)
+        string host, int port, SslClientAuthenticationOptions? tls, CancellationToken cancel)
     {
         var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
         try
         {
-            await socket.ConnectAsync(host, port).ConfigureAwait(false);
+            await socket.ConnectAsync(host, port, cancel).ConfigureAwait(false);
             var network = new NetworkStream(socket, ownsSocket: true);
             if (tls is null)
             {
@@ -102,7 +126,7 @@ internal static class Identify
                 options.TargetHost = host;
             }
             var ssl = new SslStream(network);
-            await ssl.AuthenticateAsClientAsync(options).ConfigureAwait(false);
+            await ssl.AuthenticateAsClientAsync(options, cancel).ConfigureAwait(false);
             return ssl;
         }
         catch
@@ -122,9 +146,9 @@ internal static class Identify
             EnabledSslProtocols = options.EnabledSslProtocols,
         };
 
-    private static async Task<ClusterTarget> ReadNodeListAsync(Stream stream)
+    private static async Task<ClusterTarget> ReadNodeListAsync(Stream stream, CancellationToken cancel)
     {
-        string header = await ReadLineAsync(stream).ConfigureAwait(false);
+        string header = await ReadLineAsync(stream, cancel).ConfigureAwait(false);
 
         if (header.StartsWith('B'))
         {
@@ -152,7 +176,7 @@ internal static class Identify
         var nodes = new List<DiscoveredNode>(count);
         for (int i = 0; i < count; i++)
         {
-            string[] lengths = (await ReadLineAsync(stream).ConfigureAwait(false)).Split(' ');
+            string[] lengths = (await ReadLineAsync(stream, cancel).ConfigureAwait(false)).Split(' ');
             if (lengths.Length != 2
                 || !int.TryParse(lengths[0], out int nameLength)
                 || !int.TryParse(lengths[1], out int addrLength))
@@ -161,7 +185,7 @@ internal static class Identify
             }
 
             var body = new byte[nameLength + addrLength + 1]; // +1: trailing '\n'
-            await stream.ReadExactlyAsync(body).ConfigureAwait(false);
+            await stream.ReadExactlyAsync(body, cancel).ConfigureAwait(false);
             if (body[^1] != (byte)'\n')
             {
                 throw new NanocachedException("nanocached: malformed node entry in discovery response");
@@ -174,13 +198,13 @@ internal static class Identify
         return new ClusterTarget(nodes, replication);
     }
 
-    private static async Task<string> ReadLineAsync(Stream stream)
+    private static async Task<string> ReadLineAsync(Stream stream, CancellationToken cancel)
     {
         var line = new StringBuilder();
         var single = new byte[1];
         while (true)
         {
-            await stream.ReadExactlyAsync(single).ConfigureAwait(false);
+            await stream.ReadExactlyAsync(single, cancel).ConfigureAwait(false);
             if (single[0] == (byte)'\n') return line.ToString();
             line.Append((char)single[0]);
         }

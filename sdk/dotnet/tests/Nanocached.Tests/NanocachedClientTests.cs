@@ -112,6 +112,47 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AMismatchedResponseKindPoisonsTheConnection()
+    {
+        // A well-formed response of the wrong kind (`S` answering a G)
+        // means the request/response streams are off by one; reusing the
+        // connection would answer every later request with the previous
+        // one's response. The mismatch poisons the connection, and the
+        // connection-classified error is healed by the built-in
+        // redial-and-retry-once — never by reusing the desynced stream.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+
+        await client.SetAsync("k", "v");
+        node.AnswerStoredToGetOnce();
+        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task ConnectingToASilentServerFailsWithinTheDeadline()
+    {
+        // A server that accepts the TCP connection but never answers the
+        // handshake (a blackholed address behaves the same way) must fail
+        // the connect within the deadline instead of hanging.
+        var silent = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        silent.Start();
+        int port = ((System.Net.IPEndPoint)silent.LocalEndpoint).Port;
+        TimeSpan original = Identify.ConnectDeadline;
+        Identify.ConnectDeadline = TimeSpan.FromMilliseconds(100);
+        try
+        {
+            await Assert.ThrowsAsync<ConnectionLostException>(
+                () => NanocachedClient.ConnectAsync("127.0.0.1", port));
+        }
+        finally
+        {
+            Identify.ConnectDeadline = original;
+            silent.Stop();
+        }
+    }
+
+    [Fact]
     public async Task TransparentlyReconnectsAfterAServerFin()
     {
         using var node = new MockNode();

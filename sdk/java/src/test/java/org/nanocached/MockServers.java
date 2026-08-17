@@ -29,6 +29,7 @@ final class MockServers {
         final AtomicInteger getCount = new AtomicInteger();
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
+        private final AtomicInteger storedToGetReplies = new AtomicInteger();
         private final byte[] requiredSecret;
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
@@ -62,6 +63,12 @@ final class MockServers {
         /** Queue a one-off garbage `V` header for the next G request. */
         void answerMalformedValueOnce() {
             malformedValueReplies.incrementAndGet();
+        }
+
+        /** Reply {@code S} to the next G — a well-formed frame of the
+         * wrong kind, as a desynced (off-by-one) stream would produce. */
+        void answerStoredToGetOnce() {
+            storedToGetReplies.incrementAndGet();
         }
 
         /** Server-side FIN on every open connection, like the idle timeout. */
@@ -118,6 +125,11 @@ final class MockServers {
                             getCount.incrementAndGet();
                             if (malformedValueReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                                 out.write("V x\n".getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            if (storedToGetReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                                out.write("S\n".getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }

@@ -11,9 +11,6 @@ function toBytes(value: string | Uint8Array): Buffer {
   return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
 }
 
-function unexpectedResponse(response: ParsedResponse): Error {
-  return new Error(`nanocached: unexpected response from server: ${response.kind}`);
-}
 
 /** Thrown by get/set/delete when the node answers `W` (ADR-0008): per its
  * own current view of cluster membership, this node no longer (or not yet)
@@ -76,13 +73,13 @@ export class Connection {
     if (response.kind === "value") return response.value ?? Buffer.alloc(0);
     if (response.kind === "notFound") return null;
     if (response.kind === "wrongNode") throw new WrongNodeError();
-    throw unexpectedResponse(response);
+    throw this.mismatch(response);
   }
 
   async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
     const response = await this.send(encodeSet(toBytes(key), toBytes(value), options?.ttlSeconds));
     if (response.kind === "wrongNode") throw new WrongNodeError();
-    if (response.kind !== "stored") throw unexpectedResponse(response);
+    if (response.kind !== "stored") throw this.mismatch(response);
   }
 
   /** Returns whether the key existed before this call. */
@@ -91,7 +88,25 @@ export class Connection {
     if (response.kind === "deleted") return true;
     if (response.kind === "notFound") return false;
     if (response.kind === "wrongNode") throw new WrongNodeError();
-    throw unexpectedResponse(response);
+    throw this.mismatch(response);
+  }
+
+  /** A well-formed response of the wrong kind (a `stored` answering a G)
+   * means the request/response streams are misaligned — every later
+   * response would answer the wrong request, silently returning other
+   * keys' data. Poison the connection, and classify as a connection error
+   * so the client's retry layer redials and retries once. */
+  private mismatch(response: ParsedResponse): ConnectionLostError {
+    const error = new ConnectionLostError(
+      `nanocached: response "${response.kind}" does not match the request (connection desynced)`,
+    );
+    // Mark closed synchronously — destroy()'s 'close' event only lands on
+    // a later tick, and the client's retry layer re-checks isClosed()
+    // before then to decide whether to redial.
+    this.closed = true;
+    this.lastError = error;
+    this.socket.destroy();
+    return error;
   }
 
   close(): void {

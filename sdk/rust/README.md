@@ -66,6 +66,11 @@ let client = NanocachedClient::connect(
 ).await?;
 ```
 
+Every dial (connect, redial, refresh) is bounded by a 10-second
+connect deadline covering the TCP connect and handshake, so a node
+whose address has become a blackhole (a dead cloud instance) fails
+over instead of hanging; tune it with `Options::connect_deadline`.
+
 ## Authentication and TLS
 
 ```rust

@@ -93,7 +93,30 @@ pub(crate) enum Identified {
     },
 }
 
+/// Default bound on dial + handshake, matching the Go and Java SDKs.
+/// Without it, a node whose IP has been reclaimed (a stopped container, a
+/// dead cloud instance) blackholes the TCP connect and a caller hangs for
+/// the kernel's own timeout — minutes — instead of failing over.
+pub(crate) const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) async fn connect_and_identify(
+    host: &str,
+    port: u16,
+    auth_secret: Option<&[u8]>,
+    tls: Option<&TlsConfig>,
+    deadline: std::time::Duration,
+) -> Result<Identified> {
+    match tokio::time::timeout(deadline, do_connect_and_identify(host, port, auth_secret, tls))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::ConnectionLost(format!(
+            "nanocached: connecting to {host}:{port} timed out after {deadline:?}"
+        ))),
+    }
+}
+
+async fn do_connect_and_identify(
     host: &str,
     port: u16,
     auth_secret: Option<&[u8]>,

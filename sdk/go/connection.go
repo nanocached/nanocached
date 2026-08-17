@@ -80,7 +80,7 @@ func (c *connection) get(key []byte) ([]byte, bool, error) {
 	case 'W':
 		return nil, false, ErrWrongNode
 	default:
-		return nil, false, fmt.Errorf("nanocached: unexpected response from server: %c", marker)
+		return nil, false, c.mismatch(marker)
 	}
 }
 
@@ -102,7 +102,7 @@ func (c *connection) set(key, value []byte, ttlSeconds int64) error {
 	case 'W':
 		return ErrWrongNode
 	default:
-		return fmt.Errorf("nanocached: unexpected response from server: %c", marker)
+		return c.mismatch(marker)
 	}
 }
 
@@ -120,8 +120,19 @@ func (c *connection) delete(key []byte) (bool, error) {
 	case 'W':
 		return false, ErrWrongNode
 	default:
-		return false, fmt.Errorf("nanocached: unexpected response from server: %c", marker)
+		return false, c.mismatch(marker)
 	}
+}
+
+// mismatch handles a well-formed response of the wrong kind (a `S`
+// answering a G): the request/response streams are misaligned — every
+// later response would answer the wrong request, silently returning
+// other keys' data. Poison the connection, and classify as
+// connection-lost so the client's retry layer redials and retries once.
+func (c *connection) mismatch(marker byte) error {
+	c.close()
+	return connectionLost(
+		fmt.Sprintf("response %q does not match the request (connection desynced)", marker), nil)
 }
 
 func (c *connection) request(frame []byte) (byte, []byte, error) {
