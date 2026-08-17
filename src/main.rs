@@ -28,7 +28,6 @@ struct Args {
     port: u16,
     discovery: Option<String>,
     advertise_addr: Option<String>,
-    heartbeat_interval: Duration,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
@@ -41,7 +40,6 @@ impl Default for Args {
             port: 8356,
             discovery: None,
             advertise_addr: None,
-            heartbeat_interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
@@ -66,13 +64,6 @@ fn parse_args() -> Result<Args, String> {
             }
             "--discovery" => args.discovery = Some(value()?),
             "--advertise-addr" => args.advertise_addr = Some(value()?),
-            "--heartbeat-interval" => {
-                let raw_secs = value()?;
-                let secs: u64 = raw_secs
-                    .parse()
-                    .map_err(|_| format!("invalid value for --heartbeat-interval: {raw_secs}"))?;
-                args.heartbeat_interval = Duration::from_secs(secs);
-            }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
@@ -103,8 +94,6 @@ Usage: nanocached-node [options]
                                in the same order. Omit to run standalone
   --advertise-addr <addr>     address to register with the discovery
                                server (default: --host:--port)
-  --heartbeat-interval <secs> seconds between heartbeats to the discovery
-                               server (default 5)
   --tls-cert <path>           PEM certificate chain; requires TLS on every
                                accepted connection (no plaintext fallback)
   --tls-key <path>            PEM private key matching --tls-cert
@@ -168,7 +157,7 @@ async fn main() -> ExitCode {
             Some(HeartbeatConfig {
                 discovery_addrs,
                 advertise_addr: args.advertise_addr.unwrap_or_else(|| address.clone()),
-                interval: args.heartbeat_interval,
+                interval: Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS),
                 auth_secret: auth_secret.clone(),
                 tls_connector,
             })

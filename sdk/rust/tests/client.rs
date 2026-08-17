@@ -437,42 +437,6 @@ async fn an_abandoned_request_future_poisons_the_connection() {
 }
 
 #[tokio::test]
-async fn connecting_to_a_silent_server_fails_within_the_deadline() {
-    // A server that accepts the TCP connection but never answers the
-    // handshake (a blackholed address behaves the same way) must fail the
-    // connect within the deadline instead of hanging.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let holder = tokio::spawn(async move {
-        let mut sockets = Vec::new();
-        loop {
-            let Ok((socket, _)) = listener.accept().await else {
-                return;
-            };
-            sockets.push(socket);
-        }
-    });
-
-    let started = std::time::Instant::now();
-    let result = NanocachedClient::connect(
-        options(port).connect_deadline(std::time::Duration::from_millis(100)),
-    )
-    .await;
-
-    let error = result.err();
-    assert!(
-        matches!(error, Some(Error::ConnectionLost(_))),
-        "expected a connection-lost error, got {error:?}"
-    );
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(5),
-        "connect() took {:?}",
-        started.elapsed()
-    );
-    holder.abort();
-}
-
-#[tokio::test]
 async fn transparently_reconnects_after_a_server_fin() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();

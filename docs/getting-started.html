@@ -70,8 +70,8 @@ directly (<a href="architecture.html">how it works</a>).</p>
 <pre><code>cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 cargo run --bin nanocached-node -- --port 8358 --discovery 127.0.0.1:8357</code></pre>
 
-<p>Each node sends a heartbeat every <code>--heartbeat-interval</code>
-seconds (default 5) declaring <code>--advertise-addr</code> (default
+<p>Each node sends a heartbeat every 5 seconds declaring
+<code>--advertise-addr</code> (default
 <code>--host:--port</code> — set it explicitly when nodes sit behind
 NAT or in containers). New nodes join with a staged data handoff, so
 adding a node never drops the keys it takes ownership of.</p>
@@ -97,8 +97,8 @@ cargo run --bin nanocached-node -- --port 8356 \
   --discovery 127.0.0.1:8357,127.0.0.1:8358</code></pre>
 <p>Losing any one replica — including the first-listed primary — costs
 neither cache traffic nor client bootstrap; only <em>joins</em> need the
-primary up. A restarted replica answers <code>B</code> (busy) for
-<code>--startup-grace</code> seconds while live members re-announce, so a
+primary up. A restarted replica answers <code>B</code> (busy) for the
+liveness-timeout window while live members re-announce, so a
 bootstrapping client never sees a half-recovered node list.</p>
 
 <h2>Authentication</h2>

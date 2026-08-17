@@ -40,7 +40,6 @@ pub struct Options {
     auth_secret: Option<Vec<u8>>,
     tls: Option<TlsConfig>,
     keep_alive_interval: Option<Duration>,
-    connect_deadline: Option<Duration>,
 }
 
 impl Options {
@@ -74,15 +73,6 @@ impl Options {
         self.keep_alive_interval = Some(interval);
         self
     }
-
-    /// Bound on each dial + handshake (default 10s). Without it, a node
-    /// whose IP has been reclaimed (a stopped container, a dead cloud
-    /// instance) blackholes the TCP connect and a caller would hang for
-    /// the kernel's own timeout — minutes — instead of failing over.
-    pub fn connect_deadline(mut self, deadline: Duration) -> Self {
-        self.connect_deadline = Some(deadline);
-        self
-    }
 }
 
 struct Member {
@@ -108,7 +98,6 @@ struct Inner {
     seeds: Vec<(String, u16)>,
     auth_secret: Option<Vec<u8>>,
     tls: Option<TlsConfig>,
-    connect_deadline: Duration,
     closed: AtomicBool,
 }
 
@@ -151,7 +140,7 @@ impl NanocachedClient {
                 *port,
                 options.auth_secret.as_deref(),
                 options.tls.as_ref(),
-                options.connect_deadline.unwrap_or(CONNECT_DEADLINE),
+                CONNECT_DEADLINE,
             )
             .await
             {
@@ -186,7 +175,7 @@ impl NanocachedClient {
                             node_port,
                             options.auth_secret.as_deref(),
                             options.tls.as_ref(),
-                            options.connect_deadline.unwrap_or(CONNECT_DEADLINE),
+                            CONNECT_DEADLINE,
                         )
                         .await?;
                         let Identified::Node(stream) = identified else {
@@ -229,7 +218,6 @@ impl NanocachedClient {
             seeds: options.seeds,
             auth_secret: options.auth_secret,
             tls: options.tls,
-            connect_deadline: options.connect_deadline.unwrap_or(CONNECT_DEADLINE),
             closed: AtomicBool::new(false),
         });
 
@@ -556,7 +544,7 @@ impl NanocachedClient {
             port,
             self.inner.auth_secret.as_deref(),
             self.inner.tls.as_ref(),
-            self.inner.connect_deadline,
+            CONNECT_DEADLINE,
         )
         .await?;
         match identified {
@@ -642,7 +630,7 @@ impl NanocachedClient {
                 *port,
                 self.inner.auth_secret.as_deref(),
                 self.inner.tls.as_ref(),
-                self.inner.connect_deadline,
+                CONNECT_DEADLINE,
             )
             .await
             {

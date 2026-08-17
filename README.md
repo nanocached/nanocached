@@ -69,9 +69,8 @@ find this node, pass `--discovery`:
 cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 ```
 
-The node sends a heartbeat every `--heartbeat-interval` seconds (default 5)
-declaring `--advertise-addr` (default: `--host:--port`); omit `--discovery`
-to run standalone.
+The node sends a heartbeat every 5 seconds declaring `--advertise-addr`
+(default: `--host:--port`); omit `--discovery` to run standalone.
 
 `--discovery` accepts a comma-separated list of discovery replicas
 (`doc/adr/0010-*.md`): the node registers with and heartbeats to all of
@@ -450,9 +449,9 @@ run as several independent replicas with no coordination between them
 client's `seeds`) at the same list of replicas, and losing any one replica
 — including the primary — costs neither cache traffic nor client
 bootstrap. Only *joins* need the primary up. After a (re)start, a replica
-answers `L` with `B` (busy) for `--startup-grace` seconds (default: the
-liveness timeout) while live members re-announce themselves, so a
-bootstrapping client never sees a half-recovered node list.
+answers `L` with `B` (busy) for the liveness-timeout window while live
+members re-announce themselves, so a bootstrapping client never sees a
+half-recovered node list.
 
 ## Current limits
 
