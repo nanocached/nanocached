@@ -51,10 +51,15 @@
 //!                             promotion. Rejected for a name currently
 //!                             mid-join (`Waiting`/`Joining`).
 //!
-//!   C <name-length>\n<name>   Sent by an already-`Joined` node to report
-//!                             it has finished handing its share of the
-//!                             keyspace off to the node currently joining
-//!                             (see below). Response: `A\n`.
+//!   C <name-length> <joining-length>\n<name><joining>   Sent by an
+//!                             already-`Joined` node to report it has
+//!                             finished handing its share of the keyspace
+//!                             off to `joining` (the joining node's name).
+//!                             Naming the join it is for keeps a stale
+//!                             report from an abandoned handoff from being
+//!                             credited to whatever join is pending next.
+//!                             Ignored unless `joining` matches the
+//!                             in-progress join. Response: `A\n`.
 //!
 //!   A <secret-length>\n<secret>   Authenticate. Response: `Od\n` on success,
 //!                             `Ed\n` (then the connection closes) if a
@@ -137,6 +142,11 @@ const DEFAULT_MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds every outbound dial and ack read this process makes toward a
+/// node (`M`/`X`, issue #6): without it, one node that accepts TCP but
+/// never answers freezes the single sweep task — and with it all
+/// liveness eviction — and can hang shutdown indefinitely.
+const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 
 /// A registered node's place in the ADR-0008 join lifecycle: `Waiting`
@@ -340,7 +350,9 @@ async fn connect_client_stream(
     addr: &str,
     tls_connector: Option<&TlsConnector>,
 ) -> io::Result<ClientStream> {
-    let stream = TcpStream::connect(addr).await?;
+    let stream = timeout(OUTBOUND_IO_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
     let _ = stream.set_nodelay(true);
 
     match tls_connector {
@@ -548,8 +560,13 @@ enum DiscoveryCommand {
         addr: String,
     },
     /// ADR-0008: a ready node reporting it has finished handing off its
-    /// share of the current join, identified by its own name (ADR-0009).
-    Complete(String),
+    /// share of a join, identified by its own name (ADR-0009) and the
+    /// joining node's name — so a stale report for an abandoned join can
+    /// never be credited to the current one (issue #5).
+    Complete {
+        name: String,
+        joining_name: String,
+    },
     /// ADR-0010: an already-promoted node (re-)declaring membership, with
     /// the same name/address shape as `Join` — upserted straight to
     /// `Joined`, no handoff orchestration.
@@ -617,7 +634,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             Ok(DiscoveryCommand::List)
         }
 
-        b"H" | b"C" => {
+        b"H" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
@@ -625,17 +642,25 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             }
 
             let name_length = parse_length(name_length)?;
-            // Resolve which variant to build as an owned fn pointer now,
-            // while `command` (borrowed from `header`, in turn from
-            // `input`) is still alive, so `input` is free to reborrow
-            // mutably below without `command` needing to stay live too.
-            let make: fn(String) -> DiscoveryCommand = match command {
-                b"H" => DiscoveryCommand::Heartbeat,
-                _ => DiscoveryCommand::Complete,
-            };
             let name = parse_string_field(input, header_end, name_length)?;
 
-            Ok(make(name))
+            Ok(DiscoveryCommand::Heartbeat(name))
+        }
+
+        b"C" => {
+            let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let joining_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let name_length = parse_length(name_length)?;
+            let joining_length = parse_length(joining_length)?;
+            let (name, joining_name) =
+                parse_two_string_fields(input, header_end, name_length, joining_length)?;
+
+            Ok(DiscoveryCommand::Complete { name, joining_name })
         }
 
         b"J" | b"P" => {
@@ -835,6 +860,7 @@ async fn try_begin_next_join(
                 &joining_addr,
                 &joined_roster,
                 replication,
+                OUTBOUND_IO_TIMEOUT,
             )
             .await;
 
@@ -863,6 +889,7 @@ async fn try_begin_next_join(
 /// `M` was received and parsed, not that the handoff it kicks off (which
 /// happens asynchronously on the node's side) has finished; that's
 /// reported separately, node-to-discovery, via `C`.
+#[allow(clippy::too_many_arguments)]
 async fn send_migrate(
     address: &str,
     auth_secret: &Option<Bytes>,
@@ -871,6 +898,7 @@ async fn send_migrate(
     joining_addr: &str,
     joined: &[(String, String)],
     replication: usize,
+    io_timeout: Duration,
 ) -> io::Result<()> {
     let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
 
@@ -880,7 +908,7 @@ async fn send_migrate(
         stream.write_all(&auth).await?;
 
         let mut ack = [0u8; 3];
-        stream.read_exact(&mut ack).await?;
+        read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
 
         if &ack != b"On\n" {
             return Err(io::Error::new(
@@ -910,7 +938,7 @@ async fn send_migrate(
     stream.write_all(&message).await?;
 
     let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
+    read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
 
     if &ack != b"A\n" {
         return Err(io::Error::new(
@@ -919,6 +947,18 @@ async fn send_migrate(
         ));
     }
 
+    Ok(())
+}
+
+/// `read_exact` bounded by `io_timeout` — see `OUTBOUND_IO_TIMEOUT`.
+async fn read_exact_timed(
+    stream: &mut ClientStream,
+    buf: &mut [u8],
+    io_timeout: Duration,
+) -> io::Result<()> {
+    timeout(io_timeout, stream.read_exact(buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ack read timed out"))??;
     Ok(())
 }
 
@@ -935,6 +975,7 @@ async fn send_cancel(
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     joining_name: &str,
+    io_timeout: Duration,
 ) -> io::Result<()> {
     let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
 
@@ -944,7 +985,7 @@ async fn send_cancel(
         stream.write_all(&auth).await?;
 
         let mut ack = [0u8; 3];
-        stream.read_exact(&mut ack).await?;
+        read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
 
         if &ack != b"On\n" {
             return Err(io::Error::new(
@@ -960,7 +1001,7 @@ async fn send_cancel(
     stream.write_all(&message).await?;
 
     let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
+    read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
 
     if &ack != b"A\n" {
         return Err(io::Error::new(
@@ -986,6 +1027,11 @@ fn promote_to_joined(registry: &Registry, name: &str) {
     };
 
     if let Some(promoted) = promoted {
+        // Wake every currently-parked `J` connection (a duplicate `J`
+        // under the same name shares this Notify — issue #7) AND store a
+        // permit for a waiter that hasn't parked yet (the bootstrap case,
+        // promoted synchronously before `wait_for_promotion` runs).
+        promoted.notify_waiters();
         promoted.notify_one();
     }
 }
@@ -1034,6 +1080,7 @@ async fn handle_complete(
     tls_connector: &Option<TlsConnector>,
     replication: usize,
     reporting_name: &str,
+    for_joining_name: &str,
 ) {
     let joining_name = {
         let mut join_guard = lock_current_join(current_join);
@@ -1041,6 +1088,13 @@ async fn handle_complete(
         let Some(pending) = join_guard.as_mut() else {
             return;
         };
+
+        // Issue #5: a report for an earlier, since-abandoned join must
+        // not be credited to this one — the reporter has sent this join's
+        // target nothing.
+        if pending.joining_name != for_joining_name {
+            return;
+        }
 
         if !pending.expected.contains(reporting_name) {
             return;
@@ -1140,7 +1194,18 @@ async fn abandon_current_join(
         return;
     };
 
-    lock(registry).remove(&pending.joining_name);
+    // Issue #4: the joining node's connection is parked in
+    // `wait_for_promotion` with the idle timeout deliberately disabled —
+    // removing its entry without waking it would strand that connection
+    // (and the node behind it, which waits on `R` forever instead of
+    // re-joining). Wake it; the re-check in `wait_for_promotion` sees the
+    // entry is gone and errors the connection closed, so the node's
+    // heartbeat loop redials and re-`J`s.
+    let stranded = lock(registry).remove(&pending.joining_name);
+    if let Some(info) = stranded {
+        info.promoted.notify_waiters();
+        info.promoted.notify_one();
+    }
 
     let ready_addrs: Vec<(String, String)> = {
         let guard = lock(registry);
@@ -1163,8 +1228,14 @@ async fn abandon_current_join(
         let joining_name = pending.joining_name.clone();
 
         sends.spawn(async move {
-            let result =
-                send_cancel(&ready_addr, &auth_secret, &tls_connector, &joining_name).await;
+            let result = send_cancel(
+                &ready_addr,
+                &auth_secret,
+                &tls_connector,
+                &joining_name,
+                OUTBOUND_IO_TIMEOUT,
+            )
+            .await;
             (ready_name, result)
         });
     }
@@ -1199,33 +1270,54 @@ async fn abandon_current_join(
 /// another node's join is in progress.
 async fn wait_for_promotion(
     stream: &mut ServerStream,
+    registry: &Registry,
+    name: &str,
     promoted: Arc<Notify>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut idle_byte = [0u8; 1];
 
-    tokio::select! {
-        _ = promoted.notified() => {
-            stream.write_all(b"R\n").await?;
-            Ok(())
-        }
-        _ = shutdown_rx.changed() => {
-            Err(io::Error::other("shutting down"))
-        }
-        result = stream.read(&mut idle_byte) => {
-            let bytes_read = result?;
+    loop {
+        tokio::select! {
+            _ = promoted.notified() => {
+                // A wake means the join resolved — but in which direction
+                // is the registry's call: promotion (issue #7 wakes every
+                // duplicate waiter, all of which must answer `R`) or an
+                // abandoned join that removed the entry (issue #4). A
+                // still-Waiting state would be a spurious wake; keep
+                // waiting.
+                let state = lock(registry).get(name).map(|info| info.state);
+                match state {
+                    Some(NodeState::Joined) => {
+                        stream.write_all(b"R\n").await?;
+                        return Ok(());
+                    }
+                    None => {
+                        return Err(io::Error::other(
+                            "join abandoned while waiting for promotion",
+                        ));
+                    }
+                    Some(_) => continue,
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                return Err(io::Error::other("shutting down"));
+            }
+            result = stream.read(&mut idle_byte) => {
+                let bytes_read = result?;
 
-            if bytes_read == 0 {
+                if bytes_read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed while waiting to join",
+                    ));
+                }
+
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "connection closed while waiting to join",
+                    io::ErrorKind::InvalidData,
+                    "unexpected data while waiting to join",
                 ));
             }
-
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unexpected data while waiting to join",
-            ))
         }
     }
 }
@@ -1341,7 +1433,12 @@ async fn run(
         while connection_tasks.join_next().await.is_some() {}
     }
 
-    let _ = sweep_task.await;
+    // Bounded like everything else on the shutdown path (issue #6): a
+    // sweep pass wedged on an unresponsive node must not hold up process
+    // exit.
+    if timeout(SHUTDOWN_TIMEOUT, sweep_task).await.is_err() {
+        eprintln!("sweep task did not finish before the shutdown timeout");
+    }
 
     Ok(())
 }
@@ -1577,7 +1674,8 @@ async fn handle_connection(
                 )
                 .await;
 
-                wait_for_promotion(&mut stream, promoted, shutdown_rx.clone()).await?;
+                wait_for_promotion(&mut stream, &registry, &name, promoted, shutdown_rx.clone())
+                    .await?;
 
                 continue;
             }
@@ -1617,7 +1715,7 @@ async fn handle_connection(
                 stream.write_all(b"R\n").await?;
                 continue;
             }
-            Ok(DiscoveryCommand::Complete(name)) => {
+            Ok(DiscoveryCommand::Complete { name, joining_name }) => {
                 handle_complete(
                     &registry,
                     &current_join,
@@ -1625,6 +1723,7 @@ async fn handle_connection(
                     &config.tls_connector,
                     config.replication,
                     &name,
+                    &joining_name,
                 )
                 .await;
                 stream.write_all(b"A\n").await?;
@@ -1784,9 +1883,15 @@ mod tests {
 
     #[test]
     fn parse_reads_a_complete_command() {
-        let mut input = BytesMut::from(&b"C 9\nsome-nameL\n"[..]);
+        let mut input = BytesMut::from(&b"C 9 6\nsome-namejoinerL\n"[..]);
         let command = parse(&mut input).unwrap();
-        assert_eq!(command, DiscoveryCommand::Complete("some-name".to_string()));
+        assert_eq!(
+            command,
+            DiscoveryCommand::Complete {
+                name: "some-name".to_string(),
+                joining_name: "joiner".to_string(),
+            }
+        );
         assert_eq!(&input[..], b"L\n");
     }
 
@@ -2132,6 +2237,196 @@ mod tests {
         assert_eq!(received, b"B\n");
     }
 
+    /// Boots a registry with node-a Joined (bootstrap join) and node-b
+    /// parked in `wait_for_promotion` (Joining, expecting node-a's C).
+    /// Returns the client sockets plus the shared state.
+    async fn registry_with_a_joined_and_b_waiting(
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+        };
+
+        let (mut node_a, server_a) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_a),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_a
+            .write_all(b"J 6 14\nnode-a127.0.0.1:9001")
+            .await
+            .unwrap();
+        let mut promoted = [0u8; 2];
+        node_a.read_exact(&mut promoted).await.unwrap();
+        assert_eq!(&promoted, b"R\n");
+
+        let (mut node_b, server_b) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_b),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_b
+            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
+            .await
+            .unwrap();
+
+        for _ in 0..1000 {
+            if lock_current_join(&current_join).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(lock_current_join(&current_join).is_some());
+
+        (node_a, node_b, registry, current_join)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandoned_join_wakes_and_closes_the_waiting_connection() {
+        // Regression for issue #4: abandoning a join must not strand the
+        // joining node's held-open connection — it must observe the
+        // rejection (connection closed) so the node redials and re-joins.
+        let (_node_a, mut node_b, registry, current_join) = {
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            // Keep the sender alive for the test's duration by leaking it
+            // into the tuple below via _node_a's lifetime; the tasks only
+            // need the receiver clones they already hold.
+            let tuple = registry_with_a_joined_and_b_waiting(shutdown_rx).await;
+            std::mem::forget(_shutdown_tx);
+            tuple
+        };
+
+        abandon_current_join(&registry, &current_join, &None, &None, 2).await;
+
+        // node-b's connection must observe the abandonment promptly.
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), node_b.read(&mut byte))
+            .await
+            .expect("the waiting connection was stranded by the abandoned join");
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "expected the connection to close, not data"
+        );
+        assert!(!lock(&registry).contains_key("node-b"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_j_connections_under_one_name_both_receive_the_promotion() {
+        // Regression for issue #7: a second live `J` under the same name
+        // (a redial racing a half-open old connection) shares the entry's
+        // Notify; promotion must wake both, not just one.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, mut node_b_first, registry, current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx.clone()).await;
+
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+        };
+        let (mut node_b_second, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config,
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_b_second
+            .write_all(b"J 6 14\nnode-b127.0.0.1:9002")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await; // let it park
+
+        node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+
+        for stream in [&mut node_b_first, &mut node_b_second] {
+            let mut response = [0u8; 2];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut response))
+                .await
+                .expect("a duplicate J connection was never woken by the promotion")
+                .unwrap();
+            assert_eq!(&response, b"R\n");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_complete_for_a_different_join_is_ignored() {
+        // Regression for issue #5: a stale C naming an earlier, abandoned
+        // join must not be credited to the current one.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, mut node_b, registry, _current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx).await;
+
+        // Stale: names a join for "node-x", not the pending one for node-b.
+        node_a.write_all(b"C 6 6\nnode-anode-x").await.unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_ne!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joined),
+            "a stale C was credited to the wrong join"
+        );
+
+        // The genuine report still promotes.
+        node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
+        node_a.read_exact(&mut ack).await.unwrap();
+        let mut promoted = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut promoted))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&promoted, b"R\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_cancel_times_out_against_a_silent_node() {
+        // Regression for issue #6: an accepted-but-silent node must not
+        // block the caller (the sweep task) indefinitely.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let silent = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Hold the connection open without ever answering.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let started = Instant::now();
+        let result =
+            send_cancel(&address, &None, &None, "node-b", Duration::from_millis(100)).await;
+        silent.abort();
+
+        let error = result.expect_err("expected the silent node to time the ack read out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_second_node_joining_waits_for_a_completion_report_before_being_promoted() {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
@@ -2216,7 +2511,7 @@ mod tests {
         // A reports it has finished handing its share off to B. B should
         // now be promoted and receive its own R\n on the connection it's
         // been holding open since it sent J.
-        node_a.write_all(b"C 6\nnode-a").await.unwrap();
+        node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
         let mut ack = [0u8; 2];
         node_a.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"A\n");
@@ -2718,6 +3013,7 @@ mod tests {
             "127.0.0.1:9",
             &[],
             2,
+            OUTBOUND_IO_TIMEOUT,
         )
         .await
         .unwrap();
@@ -2754,9 +3050,15 @@ mod tests {
             tls.write_all(b"A\n").await.unwrap();
         });
 
-        send_cancel(&address, &None, &Some(connector), "joining-node")
-            .await
-            .unwrap();
+        send_cancel(
+            &address,
+            &None,
+            &Some(connector),
+            "joining-node",
+            OUTBOUND_IO_TIMEOUT,
+        )
+        .await
+        .unwrap();
 
         node_task.await.unwrap();
 
