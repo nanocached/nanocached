@@ -469,3 +469,7 @@ bootstrapping client never sees a half-recovered node list.
 - Maximum request size: 4 KiB
 - Maximum concurrent connections: 1,024
 - Idle connection timeout: 30 seconds
+
+## License
+
+nanocached and all six SDKs are released under the [MIT License](LICENSE).

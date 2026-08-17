@@ -1,6 +1,7 @@
 [package]
 name = "nanocached"
 version = "1.0.0"
+license = "MIT"
 edition = "2024"
 rust-version = "1.96"
 
