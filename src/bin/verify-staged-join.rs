@@ -249,8 +249,6 @@ fn spawn_node(
         .arg(port.to_string())
         .arg("--discovery")
         .arg(discovery_addr)
-        .arg("--heartbeat-interval")
-        .arg("1")
         .kill_on_drop(true)
         .stdout(log_file(log_dir, &format!("node-{port}.log"))?)
         .stderr(log_file(log_dir, &format!("node-{port}.err.log"))?)

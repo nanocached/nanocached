@@ -256,3 +256,47 @@ pub(crate) fn split_host_port(address: &str) -> Result<(String, u16)> {
     })?;
     Ok((host.to_string(), port))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connecting_to_a_silent_server_fails_within_the_deadline() {
+        // A server that accepts the TCP connection but never answers the
+        // handshake (a blackholed address behaves the same way) must fail
+        // the connect within the deadline instead of hanging.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let holder = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    return;
+                };
+                sockets.push(socket);
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = connect_and_identify(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
+            "expected a connection-lost error"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "connect_and_identify took {:?}",
+            started.elapsed()
+        );
+        holder.abort();
+    }
+}

@@ -80,7 +80,7 @@
 //! If the connection limit has been reached, the server responds with
 //! `B\n` and closes the connection instead of accepting the command. `L`
 //! is answered the same way (`B\n`, connection closed) during the startup
-//! grace period (ADR-0010, `--startup-grace`): after a restart the
+//! grace period (ADR-0010, one liveness-timeout long): after a restart the
 //! registry re-fills from `P` announces within about one heartbeat
 //! interval, and until the grace has passed a fresh client must not build
 //! a ring from the partial list. All other commands work during the grace
@@ -429,7 +429,6 @@ struct Args {
     /// ADR-0010: how long after startup `L` keeps answering `B\n` while
     /// the registry re-fills from announces. `None` (the default) means
     /// "same as the liveness timeout".
-    startup_grace: Option<Duration>,
     /// ADR-0011: the cluster's replication factor R — how many nodes hold
     /// each key. This process is R's single source of truth: clients learn
     /// it from `L`, nodes from `M`.
@@ -446,7 +445,6 @@ impl Default for Args {
             port: 8357,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
             migration_timeout: DEFAULT_MIGRATION_TIMEOUT,
-            startup_grace: None,
             replication_factor: 2,
             tls_cert: None,
             tls_key: None,
@@ -484,13 +482,6 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --migration-timeout: {raw_secs}"))?;
                 args.migration_timeout = Duration::from_secs(secs);
             }
-            "--startup-grace" => {
-                let raw_secs = value()?;
-                let secs: u64 = raw_secs
-                    .parse()
-                    .map_err(|_| format!("invalid value for --startup-grace: {raw_secs}"))?;
-                args.startup_grace = Some(Duration::from_secs(secs));
-            }
             "--replication-factor" => {
                 let raw = value()?;
                 let factor: usize = raw
@@ -527,10 +518,6 @@ Usage: nanocached-discovery [options]
   --migration-timeout <secs>    abandon a join if a ready node hasn't
                                  reported completion after this many
                                  seconds (default 60)
-  --startup-grace <secs>        answer L with B\\n (busy) for this many
-                                 seconds after startup, while the registry
-                                 re-fills from node announces (ADR-0010);
-                                 0 disables (default: --liveness-timeout)
   --replication-factor <n>      how many nodes hold each key (ADR-0011);
                                  distributed to clients via L and to nodes
                                  via M (default 2, min 1)
@@ -1811,7 +1798,11 @@ async fn main() -> ExitCode {
         &address,
         args.liveness_timeout,
         args.migration_timeout,
-        args.startup_grace.unwrap_or(args.liveness_timeout),
+        // The startup grace (ADR-0010) is the liveness window by
+        // definition: it exists so every live member has had time to
+        // re-announce before L is served, and that time IS the liveness
+        // timeout. Not separately configurable.
+        args.liveness_timeout,
         args.replication_factor,
         read_auth_secret(),
         tls_acceptor,
