@@ -1,4 +1,6 @@
-# nanocached
+<p align="center">
+  <img src="docs/assets/logo.jpg" alt="nanocached" width="100%">
+</p>
 
 nanocached is a compact in-memory key-value cache server written in Rust. It
 uses a small, binary-safe TCP protocol and supports optional time-to-live
