@@ -55,7 +55,7 @@ final class Connection {
             case 'V' -> response.value;
             case 'N' -> null;
             case 'W' -> throw new NanocachedException.WrongNode();
-            default -> throw unexpected(response.marker);
+            default -> throw mismatch(response.marker);
         };
     }
 
@@ -65,7 +65,7 @@ final class Connection {
                 : "S " + key.length + " " + value.length + " " + ttlSeconds + "\n";
         Response response = request(frame(header, key, value));
         if (response.marker == 'W') throw new NanocachedException.WrongNode();
-        if (response.marker != 'S') throw unexpected(response.marker);
+        if (response.marker != 'S') throw mismatch(response.marker);
     }
 
     boolean delete(byte[] key) {
@@ -74,12 +74,22 @@ final class Connection {
             case 'D' -> true;
             case 'N' -> false;
             case 'W' -> throw new NanocachedException.WrongNode();
-            default -> throw unexpected(response.marker);
+            default -> throw mismatch(response.marker);
         };
     }
 
-    private static NanocachedException unexpected(int marker) {
-        return new NanocachedException("nanocached: unexpected response from server: " + (char) marker);
+    /**
+     * A well-formed response of the wrong kind (a {@code S} answering a G)
+     * means the request/response streams are misaligned — every later
+     * response would answer the wrong request, silently returning other
+     * keys' data. Poison the connection, and classify as connection-level
+     * so the client's retry layer redials and retries once.
+     */
+    private NanocachedException mismatch(int marker) {
+        close();
+        return new NanocachedException.ConnectionFailed(
+                "nanocached: response '" + (char) marker + "' does not match the request (connection desynced)",
+                null);
     }
 
     private static byte[] frame(String header, byte[] key, byte[] value) {

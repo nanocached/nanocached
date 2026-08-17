@@ -37,16 +37,28 @@ type identified struct {
 // (doc/adr/0007-*.md). A node's conn is handed back live; a discovery
 // connection is used once for L and closed, returning the name/address
 // list and the cluster's replication factor R (doc/adr/0009, 0010, 0011).
+// handshakeDeadline bounds the identify exchange after the dial: a
+// server that accepts the TCP connection but never answers (a blackholed
+// address behaves the same way) must not hang the caller. A variable
+// only so tests can shorten it.
+var handshakeDeadline = 10 * time.Second
+
 func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config) (*identified, error) {
 	conn, err := open(address, tlsConfig)
 	if err != nil {
 		return nil, connectionLost("could not connect to "+address, err)
 	}
 
+	_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
 	result, err := identify(conn, address, authSecret)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
+	}
+	if result.conn != nil {
+		// The deadline only bounds the handshake; a live node connection
+		// must not inherit it.
+		_ = result.conn.SetDeadline(time.Time{})
 	}
 	return result, nil
 }

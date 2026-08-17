@@ -16,6 +16,8 @@ class MockNode:
         self.get_count = 0
         self._wrong_node_replies = 0
         self._malformed_value_replies = 0
+        self._stored_to_get_replies = 0
+        self._get_delay = 0.0
         self._server: asyncio.Server | None = None
         self._sockets: set[asyncio.StreamWriter] = set()
         self.port = 0
@@ -29,6 +31,16 @@ class MockNode:
 
     def answer_malformed_value_once(self) -> None:
         self._malformed_value_replies += 1
+
+    def answer_stored_to_get_once(self) -> None:
+        """Reply `S` to the next G — a well-formed frame of the wrong kind,
+        as a desynced (off-by-one) stream would produce."""
+        self._stored_to_get_replies += 1
+
+    def delay_next_get(self, seconds: float) -> None:
+        """Hold the next G's response, so a test can abandon the request
+        mid-flight (asyncio.wait_for) and probe cancellation safety."""
+        self._get_delay = seconds
 
     async def start(self) -> "MockNode":
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
@@ -72,6 +84,14 @@ class MockNode:
                 elif parts[0] == b"G":
                     key = await reader.readexactly(int(parts[1]))
                     self.get_count += 1
+                    if self._get_delay > 0:
+                        delay, self._get_delay = self._get_delay, 0.0
+                        await asyncio.sleep(delay)
+                    if self._stored_to_get_replies > 0:
+                        self._stored_to_get_replies -= 1
+                        writer.write(b"S\n")
+                        await writer.drain()
+                        continue
                     if self._malformed_value_replies > 0:
                         self._malformed_value_replies -= 1
                         writer.write(b"V x\n")

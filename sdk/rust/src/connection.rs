@@ -24,6 +24,11 @@ pub(crate) struct Connection {
     /// through it fails as connection-lost and triggers the lazy redial.
     stream: Mutex<Option<BufReader<Stream>>>,
     closed: AtomicBool,
+    /// True while a round trip is on the wire, cleared when its response
+    /// has been fully read. A caller dropping the request future mid-way
+    /// (`tokio::time::timeout` and friends) leaves it set — the response
+    /// is still unread, so the stream is desynced and must not be reused.
+    in_flight: AtomicBool,
     /// Milliseconds since `epoch` of the last request — what the
     /// keep-alive timer checks against its interval.
     last_used_ms: AtomicU64,
@@ -42,6 +47,7 @@ impl Connection {
         Self {
             stream: Mutex::new(Some(BufReader::new(stream))),
             closed: AtomicBool::new(false),
+            in_flight: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
         }
@@ -53,6 +59,7 @@ impl Connection {
         Self {
             stream: Mutex::new(None),
             closed: AtomicBool::new(true),
+            in_flight: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
         }
@@ -81,7 +88,7 @@ impl Connection {
         match self.request(&frame).await? {
             ResponseKind::Value(value) => Ok(Some(value)),
             ResponseKind::NotFound => Ok(None),
-            other => Err(unexpected(&other)),
+            other => Err(self.mismatch(&other)),
         }
     }
 
@@ -100,7 +107,7 @@ impl Connection {
         frame.extend_from_slice(value);
         match self.request(&frame).await? {
             ResponseKind::Stored => Ok(()),
-            other => Err(unexpected(&other)),
+            other => Err(self.mismatch(&other)),
         }
     }
 
@@ -110,7 +117,7 @@ impl Connection {
         match self.request(&frame).await? {
             ResponseKind::Deleted => Ok(true),
             ResponseKind::NotFound => Ok(false),
-            other => Err(unexpected(&other)),
+            other => Err(self.mismatch(&other)),
         }
     }
 
@@ -130,11 +137,25 @@ impl Connection {
         self.last_used_ms
             .store(self.epoch.elapsed().as_millis() as u64, Ordering::SeqCst);
 
+        if self.in_flight.load(Ordering::SeqCst) {
+            // The previous request's future was dropped mid-round-trip;
+            // its response is still unread on the wire, so reusing this
+            // stream would answer every later request with an earlier
+            // response. Poison, and let the caller redial.
+            self.close();
+            return Err(Error::ConnectionLost(
+                "nanocached: a previous request was abandoned mid-flight (connection desynced)"
+                    .to_string(),
+            ));
+        }
+
+        self.in_flight.store(true, Ordering::SeqCst);
         let outcome = async {
             stream.get_mut().write_all(frame).await?;
             self.read_response(stream).await
         }
         .await;
+        self.in_flight.store(false, Ordering::SeqCst);
 
         if matches!(outcome, Err(Error::ConnectionLost(_) | Error::Protocol(_))) {
             // The stream state after a failed round trip is unknown —
@@ -142,6 +163,24 @@ impl Connection {
             self.close();
         }
         outcome
+    }
+
+    /// A well-formed response of the wrong kind (a `S` answering a G)
+    /// means the request/response streams are misaligned — every later
+    /// response would answer the wrong request, silently returning other
+    /// keys' data. Poison the connection, and classify as connection-lost
+    /// so the client's retry layer redials and retries once.
+    fn mismatch(&self, kind: &ResponseKind) -> Error {
+        let name = match kind {
+            ResponseKind::Value(_) => "value",
+            ResponseKind::NotFound => "not-found",
+            ResponseKind::Stored => "stored",
+            ResponseKind::Deleted => "deleted",
+        };
+        self.close();
+        Error::ConnectionLost(format!(
+            "nanocached: response \"{name}\" does not match the request (connection desynced)"
+        ))
     }
 
     async fn read_response(&self, stream: &mut BufReader<Stream>) -> Result<ResponseKind> {
@@ -183,18 +222,6 @@ impl Connection {
             ))),
         }
     }
-}
-
-fn unexpected(kind: &ResponseKind) -> Error {
-    let name = match kind {
-        ResponseKind::Value(_) => "value",
-        ResponseKind::NotFound => "not-found",
-        ResponseKind::Stored => "stored",
-        ResponseKind::Deleted => "deleted",
-    };
-    Error::Protocol(format!(
-        "nanocached: unexpected response from server: {name}"
-    ))
 }
 
 pub(crate) async fn read_line(stream: &mut BufReader<Stream>) -> Result<String> {

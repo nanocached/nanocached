@@ -32,6 +32,7 @@ type mockNode struct {
 	getCount        atomic.Int32
 	wrongNodeLeft   atomic.Int32
 	malformedLeft   atomic.Int32
+	storedToGetLeft atomic.Int32
 	lastSetTTL      atomic.Value // string: the TTL field of the last S, or "none"
 	conns           sync.Map     // net.Conn -> struct{}
 }
@@ -116,6 +117,14 @@ func (m *mockNode) serve(conn net.Conn) {
 			m.getCount.Add(1)
 			if m.takeOne(&m.malformedLeft) {
 				if _, err := conn.Write([]byte("V x\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeOne(&m.storedToGetLeft) {
+				// A well-formed frame of the wrong kind, as a desynced
+				// (off-by-one) stream would produce.
+				if _, err := conn.Write([]byte("S\n")); err != nil {
 					return
 				}
 				continue
@@ -432,6 +441,66 @@ func TestSubSecondTtlRoundsUpToOneSecond(t *testing.T) {
 	}
 	if got := node.lastSetTTL.Load(); got != "2" {
 		t.Fatalf("2s TTL sent as %v, want \"2\"", got)
+	}
+}
+
+func TestAMismatchedResponseKindPoisonsTheConnection(t *testing.T) {
+	// A well-formed response of the wrong kind (`S` answering a G) means
+	// the request/response streams are off by one; reusing the connection
+	// would answer every later request with the previous one's response.
+	// The mismatch poisons the connection, and the connection-classified
+	// error is healed by the built-in redial-and-retry-once — never by
+	// reusing the desynced stream.
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Seeds: []string{node.address()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", []byte("v"), 0); err != nil {
+		t.Fatal(err)
+	}
+	node.storedToGetLeft.Add(1)
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || string(value) != "v" {
+		t.Fatalf("Get after mismatched response = %q, %v, %v", value, ok, err)
+	}
+	if got := node.connectionCount.Load(); got != 2 {
+		t.Fatalf("connectionCount = %d, want 2 (poison + redial)", got)
+	}
+}
+
+func TestConnectingToASilentServerFailsWithinTheDeadline(t *testing.T) {
+	// A server that accepts the TCP connection but never answers the
+	// handshake (a blackholed address behaves the same way) must fail the
+	// connect within the deadline instead of hanging.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	original := handshakeDeadline
+	handshakeDeadline = 100 * time.Millisecond
+	defer func() { handshakeDeadline = original }()
+
+	started := time.Now()
+	_, err = Connect(Config{Seeds: []string{listener.Addr().String()}})
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Connect against a silent server = %v, want ErrConnectionLost", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Connect took %v, want well under the kernel timeout", elapsed)
 	}
 }
 

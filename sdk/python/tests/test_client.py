@@ -172,6 +172,74 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_a_mismatched_response_kind_poisons_the_connection(self):
+        # A well-formed response of the wrong kind (`S` answering a G)
+        # means the request/response streams are off by one; reusing the
+        # connection would answer every later request with the previous
+        # one's response. It must poison and redial like malformed input.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect("127.0.0.1", node.port)
+            try:
+                await client.set("k", "v")
+                node.answer_stored_to_get_once()
+                with self.assertRaises(ConnectionError):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), b"v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_a_cancelled_request_poisons_the_connection(self):
+        # A caller abandoning an in-flight request (asyncio.wait_for)
+        # leaves its response unread on the wire; reusing the connection
+        # would desync the stream, silently answering later requests with
+        # earlier responses. The cancel must poison the connection.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect("127.0.0.1", node.port)
+            try:
+                await client.set("k", "v")
+                node.delay_next_get(30.0)
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.get("k"), timeout=0.05)
+
+                self.assertEqual(await client.get("k"), b"v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_connect_times_out_against_a_silent_server(self):
+        # A server that accepts the TCP connection but never answers the
+        # handshake (a blackholed address behaves the same way) must fail
+        # the connect within the deadline instead of hanging.
+        from nanocached import _identify
+
+        # Track accepted writers: nothing on the server side ever closes
+        # them (that's the point of a silent server), and on 3.12.1+
+        # Server.wait_closed() waits for every connection to finish.
+        accepted: list[asyncio.StreamWriter] = []
+        silent = await asyncio.start_server(
+            lambda reader, writer: accepted.append(writer), "127.0.0.1", 0
+        )
+        port = silent.sockets[0].getsockname()[1]
+        original = _identify.CONNECT_DEADLINE
+        _identify.CONNECT_DEADLINE = 0.1
+        try:
+            with self.assertRaises(ConnectionError):
+                await NanocachedClient.connect("127.0.0.1", port)
+        finally:
+            _identify.CONNECT_DEADLINE = original
+            for writer in accepted:
+                writer.close()
+            silent.close()
+            await silent.wait_closed()
+
     async def test_a_refresh_finishing_after_close_installs_no_connections(self):
         # Regression for issue #10.
         node = await MockNode().start()

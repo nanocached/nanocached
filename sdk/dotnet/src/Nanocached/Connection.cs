@@ -47,7 +47,7 @@ internal sealed class Connection
             (byte)'V' => value,
             (byte)'N' => null,
             (byte)'W' => throw new WrongNodeException(),
-            _ => throw Unexpected(marker),
+            _ => throw Mismatch(marker),
         };
     }
 
@@ -58,7 +58,7 @@ internal sealed class Connection
             : $"S {key.Length} {value.Length} {ttlSeconds}\n";
         var (marker, _) = await RequestAsync(Frame(header, key, value)).ConfigureAwait(false);
         if (marker == (byte)'W') throw new WrongNodeException();
-        if (marker != (byte)'S') throw Unexpected(marker);
+        if (marker != (byte)'S') throw Mismatch(marker);
     }
 
     internal async Task<bool> DeleteAsync(byte[] key)
@@ -69,7 +69,7 @@ internal sealed class Connection
             (byte)'D' => true,
             (byte)'N' => false,
             (byte)'W' => throw new WrongNodeException(),
-            _ => throw Unexpected(marker),
+            _ => throw Mismatch(marker),
         };
     }
 
@@ -83,8 +83,19 @@ internal sealed class Connection
         return frame;
     }
 
-    private static NanocachedException Unexpected(byte marker) =>
-        new($"nanocached: unexpected response from server: {(char)marker}");
+    /// <summary>
+    /// A well-formed response of the wrong kind (a <c>S</c> answering a G)
+    /// means the request/response streams are misaligned — every later
+    /// response would answer the wrong request, silently returning other
+    /// keys' data. Poison the connection, and classify as connection-lost
+    /// so the client's retry layer redials and retries once.
+    /// </summary>
+    private ConnectionLostException Mismatch(byte marker)
+    {
+        Close();
+        return new ConnectionLostException(
+            $"nanocached: response '{(char)marker}' does not match the request (connection desynced)");
+    }
 
     private async Task<(byte Marker, byte[]? Value)> RequestAsync(byte[] frame)
     {
