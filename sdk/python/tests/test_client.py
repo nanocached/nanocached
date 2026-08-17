@@ -390,6 +390,34 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
                 except Exception:
                     pass
 
+    async def test_writes_route_around_a_dead_primary_once_discovery_drops_it(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect("127.0.0.1", discovery.port)
+        try:
+            key = "written-after-primary-death"
+            primary, replica = self.owners_of(key)
+
+            # The primary dies AND discovery has already noticed: the first
+            # write attempt fails on the dead primary, forcing a refresh
+            # that re-ranks onto the survivor, and the retry succeeds.
+            await nodes[primary].close()
+            discovery.nodes = [(replica, nodes[replica].address)]
+            await wait_for(
+                lambda: client._members[primary].connection.closed,
+                "the client to see the FIN",
+            )
+
+            await client.set(key, "v")
+            self.assertEqual(await client.get(key), b"v")
+        finally:
+            client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
     async def test_fans_deletes_out_to_every_owner(self):
         nodes, discovery = await self.start_cluster()
         try:

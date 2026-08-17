@@ -309,6 +309,9 @@ B\n
   discovery-based cluster routing with replication).
 - [`sdk/python`](sdk/python/README.md) — an asyncio Python client with
   the same feature set (Python 3.11+, no runtime dependencies).
+- [`sdk/java`](sdk/java/README.md) — a thread-safe Java client with the
+  same feature set (Java 17+, no runtime dependencies,
+  `org.nanocached:nanocached`).
 
 ## Capacity planning
 

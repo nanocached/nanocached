@@ -1,6 +1,6 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { Connection, WrongNodeError } from "./connection.js";
+import { Connection, ConnectionLostError, isConnectionError, WrongNodeError } from "./connection.js";
 import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import type { NanocachedTlsOptions } from "./socket.js";
@@ -397,7 +397,7 @@ export class NanocachedClient {
       }
     }
 
-    throw lastError ?? new Error("nanocached: no owner is reachable for this key");
+    throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
   }
 
   /** Cluster write (ADR-0011): fan the operation out to every owner in
@@ -413,7 +413,7 @@ export class NanocachedClient {
   ): Promise<T> {
     const [primaryName, ...replicaNames] = this.ownerNames(key);
     if (primaryName === undefined) {
-      throw new Error("nanocached: no owner is reachable for this key");
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
     }
 
     const replicaWrites = replicaNames.map(async (name) => {
@@ -446,7 +446,13 @@ export class NanocachedClient {
     try {
       return await operation();
     } catch (error) {
-      if (!(error instanceof WrongNodeError) || this.target.kind !== "cluster") throw error;
+      // Connection-level failures retry the same way `W` does: the usual
+      // cause is a node death that discovery has since noticed, so a
+      // forced refresh re-ranks the key onto survivors. The retry window
+      // for a dead primary is therefore bounded by discovery's liveness
+      // timeout. A second failure after a fresh refresh propagates.
+      const retryable = error instanceof WrongNodeError || isConnectionError(error);
+      if (!retryable || this.target.kind !== "cluster") throw error;
       await this.maybeRefreshNodeList({ force: true });
       return await operation();
     }

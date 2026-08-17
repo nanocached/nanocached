@@ -30,6 +30,24 @@ export class WrongNodeError extends Error {
   }
 }
 
+/** A connection-level failure: the socket died (or was already dead) out
+ * from under a request. In cluster mode the client treats this like `W` —
+ * refresh the node list and retry once — since the usual cause is a node
+ * death that discovery has since noticed. */
+export class ConnectionLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ConnectionLostError";
+  }
+}
+
+/** Whether an error is connection-shaped: our own ConnectionLostError, or
+ * a Node system error (ECONNREFUSED, ECONNRESET, EPIPE, ...). */
+export function isConnectionError(error: unknown): boolean {
+  if (error instanceof ConnectionLostError) return true;
+  return error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string";
+}
+
 /**
  * One already-identified (see `identify.ts`) connection to a single
  * nanocached-node. Requests are pipelined onto one TCP (or TLS) connection
@@ -97,7 +115,7 @@ export class Connection {
 
   private send(frame: Buffer): Promise<ParsedResponse> {
     if (this.closed) {
-      return Promise.reject(this.lastError ?? new Error("nanocached: connection is closed"));
+      return Promise.reject(this.lastError ?? new ConnectionLostError("nanocached: connection is closed"));
     }
     this.lastUsed = Date.now();
 
@@ -151,7 +169,7 @@ export class Connection {
 
   private onClose(): void {
     this.closed = true;
-    const error = this.lastError ?? new Error("nanocached: connection closed");
+    const error = this.lastError ?? new ConnectionLostError("nanocached: connection closed");
     const waiters = this.pending.splice(0);
     for (const waiter of waiters) waiter.reject(error);
   }

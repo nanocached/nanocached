@@ -566,6 +566,29 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
     }
   });
 
+  it("routes writes around a dead primary once discovery drops it", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+    try {
+      const key = "written-after-primary-death";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      // The primary dies AND discovery has already noticed: the first
+      // write attempt fails on the dead primary, forcing a refresh that
+      // re-ranks onto the survivor, and the retry succeeds.
+      await primary.mock.close();
+      cluster.discovery.setNodes([{ name: replica.name, address: replica.mock.address }]);
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+
+      await client.set(key, "v");
+      assert.deepEqual(await client.get(key), Buffer.from("v"));
+      assert.ok(replica.mock.store.has(key));
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
   it("fans deletes out to every owner", async () => {
     const cluster = await startReplicatedCluster();
     try {
