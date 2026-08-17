@@ -308,6 +308,37 @@ B\n
   Node.js client (`get`/`set`/`delete`, authentication, TLS, and
   discovery-based cluster routing).
 
+## Capacity planning
+
+Memory, effective capacity, replication (R), TTL, and hit rate trade off
+against each other — but not all at once: the hit rate is bounded by two
+independent ceilings (one set by capacity, one by TTL), and only the
+binding one responds to tuning. [`tools/capacity-planner.html`](tools/capacity-planner.html)
+is a self-contained, offline estimator (Japanese UI) that makes those
+trade-offs visible. Open it in any browser — no server, no build step:
+
+```sh
+open tools/capacity-planner.html
+```
+
+Enter your workload on the left — average key/value sizes, distinct key
+count, request rate, access skew (Zipf exponent), TTL, and the cluster
+shape (nodes × memory ÷ R) — and it estimates:
+
+- the predicted hit rate, and **which constraint is the bottleneck**
+  (adding memory only helps when capacity-bound; extending the TTL only
+  helps when TTL-bound — spend accordingly);
+- hit-rate curves against node memory and against TTL, with your current
+  configuration marked;
+- the minimum TTL and node memory needed to reach a target hit rate, or
+  a warning when the target is unreachable for the workload.
+
+The model is a TTL-extended Che approximation over a Zipf/Poisson
+workload (assumptions are listed at the bottom of the page). Treat the
+numbers as ±a-few-percent estimates for sizing, not guarantees; if they
+diverge from production, re-derive the skew and key count from real
+access logs first.
+
 ## Development
 
 Run formatting and static checks:
