@@ -267,8 +267,6 @@ impl Rng {
     }
 }
 
-const VIRTUAL_NODES_PER_NODE: u32 = 128;
-
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in bytes {
@@ -278,41 +276,50 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// A consistent-hash ring over a fixed node list (see ADR 0002), built once
-/// at startup from either `--host`/`--port` or a discovery server's node
-/// list. Routing a key never needs to change once the ring is built, since
-/// this binary doesn't react to nodes joining or leaving mid-run.
+/// MurmurHash3's 64-bit finalizer — see `src/hash_ring.rs`, whose
+/// computation this is a byte-for-byte copy of (ADR 0011).
+fn fmix64(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ceb9fe1a85ec53);
+    hash ^= hash >> 33;
+    hash
+}
+
+/// Rendezvous hashing over a fixed node list (ADR 0011, replacing ADR
+/// 0002's ring), built once at startup from either `--host`/`--port` or a
+/// discovery server's node list. Each entry pairs a node's ADR-0009 name
+/// (what routing hashes) with its address (what this binary dials).
+/// Routing a key never needs to change once built, since this binary
+/// doesn't react to nodes joining or leaving mid-run. bench always talks
+/// to a key's primary; replicas are the SDK's concern.
 struct HashRing {
-    nodes: Vec<String>,
-    points: Vec<(u64, usize)>,
+    /// (name, address) pairs.
+    nodes: Vec<(String, String)>,
+    node_hashes: Vec<u64>,
 }
 
 impl HashRing {
-    fn new(nodes: Vec<String>) -> Self {
-        let mut points = Vec::with_capacity(nodes.len() * VIRTUAL_NODES_PER_NODE as usize);
-
-        for (index, node) in nodes.iter().enumerate() {
-            for virtual_id in 0..VIRTUAL_NODES_PER_NODE {
-                let point = fnv1a(format!("{node}#{virtual_id}").as_bytes());
-                points.push((point, index));
-            }
-        }
-
-        points.sort_unstable_by_key(|(point, _)| *point);
-
-        Self { nodes, points }
+    fn new(nodes: Vec<(String, String)>) -> Self {
+        let node_hashes = nodes
+            .iter()
+            .map(|(name, _)| fnv1a(name.as_bytes()))
+            .collect();
+        Self { nodes, node_hashes }
     }
 
+    /// The key's primary, by name.
     fn route(&self, key: &[u8]) -> &str {
-        let hash = fnv1a(key);
-        let position = self.points.partition_point(|(point, _)| *point < hash);
-        let position = if position == self.points.len() {
-            0
-        } else {
-            position
-        };
-
-        &self.nodes[self.points[position].1]
+        let key_hash = fnv1a(key);
+        let (_, name) = self
+            .node_hashes
+            .iter()
+            .zip(&self.nodes)
+            .map(|(node_hash, (name, _))| (fmix64(node_hash ^ key_hash), name.as_str()))
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+            .expect("the ring is never built empty");
+        name
     }
 }
 
@@ -341,12 +348,13 @@ async fn authenticate(stream: &mut MaybeTls, secret: &str) -> std::io::Result<()
 }
 
 /// Fetches the current node list from a discovery server (`L\n` -> `N
-/// <count>\n` followed by `count` `<addr>\n` lines).
+/// <count> <r>\n` followed by `count` `<name-length> <addr-length>\n
+/// <name><addr>\n` entries — ADR 0009/0011).
 async fn fetch_nodes(
     discovery_addr: &str,
     auth_secret: Option<&str>,
     tls: Option<&TlsConnector>,
-) -> std::io::Result<Vec<String>> {
+) -> std::io::Result<Vec<(String, String)>> {
     let mut stream = connect(discovery_addr, tls).await?;
 
     if let Some(secret) = auth_secret {
@@ -370,29 +378,44 @@ async fn fetch_nodes(
     }
 }
 
-fn parse_node_list(buf: &[u8]) -> Option<Vec<String>> {
+fn parse_node_list(buf: &[u8]) -> Option<Vec<(String, String)>> {
     if buf.first() != Some(&b'N') {
         return None;
     }
 
     let header_end = buf.iter().position(|&byte| byte == b'\n')?;
-    let count: usize = std::str::from_utf8(&buf[2..header_end])
-        .ok()?
-        .parse()
-        .ok()?;
+    let mut header = std::str::from_utf8(&buf[2..header_end]).ok()?.split(' ');
+    let count: usize = header.next()?.parse().ok()?;
+    let _replication: usize = header.next()?.parse().ok()?;
 
     let mut offset = header_end + 1;
     let mut nodes = Vec::with_capacity(count);
 
     for _ in 0..count {
-        let line_len = buf[offset..].iter().position(|&byte| byte == b'\n')?;
-        let line_end = offset + line_len;
-        nodes.push(
-            std::str::from_utf8(&buf[offset..line_end])
+        let entry_header_end = offset + buf[offset..].iter().position(|&byte| byte == b'\n')?;
+        let mut lengths = std::str::from_utf8(&buf[offset..entry_header_end])
+            .ok()?
+            .split(' ');
+        let name_length: usize = lengths.next()?.parse().ok()?;
+        let addr_length: usize = lengths.next()?.parse().ok()?;
+
+        let name_start = entry_header_end + 1;
+        let addr_start = name_start + name_length;
+        let addr_end = addr_start + addr_length;
+        // +1 for the trailing '\n' after each entry's body.
+        if buf.len() < addr_end + 1 {
+            return None;
+        }
+
+        nodes.push((
+            std::str::from_utf8(&buf[name_start..addr_start])
                 .ok()?
                 .to_string(),
-        );
-        offset = line_end + 1;
+            std::str::from_utf8(&buf[addr_start..addr_end])
+                .ok()?
+                .to_string(),
+        ));
+        offset = addr_end + 1;
     }
 
     Some(nodes)
@@ -482,11 +505,11 @@ async fn worker(
     let mut result = WorkerResult::default();
 
     let mut connections: HashMap<String, MaybeTls> = HashMap::with_capacity(ring.nodes.len());
-    for node in &ring.nodes {
-        let mut stream = match connect(node.as_str(), tls.as_ref()).await {
+    for (name, addr) in &ring.nodes {
+        let mut stream = match connect(addr.as_str(), tls.as_ref()).await {
             Ok(stream) => stream,
             Err(error) => {
-                result.error = Some(format!("connect to {node}: {error}"));
+                result.error = Some(format!("connect to {addr}: {error}"));
                 barrier.wait().await;
                 return result;
             }
@@ -495,12 +518,13 @@ async fn worker(
         if let Some(secret) = &args.auth_secret
             && let Err(error) = authenticate(&mut stream, secret).await
         {
-            result.error = Some(format!("auth to {node}: {error}"));
+            result.error = Some(format!("auth to {addr}: {error}"));
             barrier.wait().await;
             return result;
         }
 
-        connections.insert(node.clone(), stream);
+        // Keyed by ADR-0009 name — what `route` returns.
+        connections.insert(name.clone(), stream);
     }
 
     barrier.wait().await;
@@ -633,10 +657,21 @@ async fn main() -> ExitCode {
             }
         }
     } else {
-        vec![format!("{}:{}", args.host, args.port)]
+        // Standalone: no discovery, no ADR-0009 name — the address doubles
+        // as the (only) ring identity.
+        let addr = format!("{}:{}", args.host, args.port);
+        vec![(addr.clone(), addr)]
     };
 
-    println!("nodes ({}): {}", nodes.len(), nodes.join(", "));
+    println!(
+        "nodes ({}): {}",
+        nodes.len(),
+        nodes
+            .iter()
+            .map(|(_, addr)| addr.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let ring = Arc::new(HashRing::new(nodes));
     let args = Arc::new(args);

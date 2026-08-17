@@ -369,6 +369,9 @@ struct ConnectionConfig {
     /// announces within about one heartbeat interval, and serving the
     /// partial list to a bootstrapping client would hand it a wrong ring.
     list_ready_at: Instant,
+    /// ADR-0011: the replication factor this process distributes (see
+    /// `Args::replication_factor`).
+    replication: usize,
     auth_secret: Option<Bytes>,
     /// When set, every accepted connection must complete a TLS handshake
     /// before speaking the protocol; there is no plaintext fallback.
@@ -415,6 +418,10 @@ struct Args {
     /// the registry re-fills from announces. `None` (the default) means
     /// "same as the liveness timeout".
     startup_grace: Option<Duration>,
+    /// ADR-0011: the cluster's replication factor R — how many nodes hold
+    /// each key. This process is R's single source of truth: clients learn
+    /// it from `L`, nodes from `M`.
+    replication_factor: usize,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
@@ -428,6 +435,7 @@ impl Default for Args {
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
             migration_timeout: DEFAULT_MIGRATION_TIMEOUT,
             startup_grace: None,
+            replication_factor: 2,
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
@@ -471,6 +479,16 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| format!("invalid value for --startup-grace: {raw_secs}"))?;
                 args.startup_grace = Some(Duration::from_secs(secs));
             }
+            "--replication-factor" => {
+                let raw = value()?;
+                let factor: usize = raw
+                    .parse()
+                    .map_err(|_| format!("invalid value for --replication-factor: {raw}"))?;
+                if factor == 0 {
+                    return Err("--replication-factor must be at least 1".to_string());
+                }
+                args.replication_factor = factor;
+            }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
@@ -501,6 +519,9 @@ Usage: nanocached-discovery [options]
                                  seconds after startup, while the registry
                                  re-fills from node announces (ADR-0010);
                                  0 disables (default: --liveness-timeout)
+  --replication-factor <n>      how many nodes hold each key (ADR-0011);
+                                 distributed to clients via L and to nodes
+                                 via M (default 2, min 1)
   --tls-cert <path>             PEM certificate chain; requires TLS on
                                  every accepted connection (no plaintext
                                  fallback)
@@ -746,6 +767,7 @@ async fn try_begin_next_join(
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
+    replication: usize,
 ) {
     // Scoped to a block, not just an explicit `drop()`, so `join_guard`
     // (a std::sync::MutexGuard, not Send) is unambiguously out of scope
@@ -812,6 +834,7 @@ async fn try_begin_next_join(
                 &joining_name,
                 &joining_addr,
                 &joined_roster,
+                replication,
             )
             .await;
 
@@ -847,6 +870,7 @@ async fn send_migrate(
     joining_name: &str,
     joining_addr: &str,
     joined: &[(String, String)],
+    replication: usize,
 ) -> io::Result<()> {
     let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
 
@@ -867,10 +891,11 @@ async fn send_migrate(
     }
 
     let mut message = format!(
-        "M {} {} {}\n",
+        "M {} {} {} {}\n",
         joining_name.len(),
         joining_addr.len(),
-        joined.len()
+        joined.len(),
+        replication
     )
     .into_bytes();
     message.extend_from_slice(joining_name.as_bytes());
@@ -969,11 +994,13 @@ fn promote_to_joined(registry: &Registry, name: &str) {
 /// registered — this must not downgrade a node already past `Waiting`)
 /// and attempts to start it toward `Joined` immediately. Returns the
 /// `Notify` its connection should hold open and wait on for promotion.
+#[allow(clippy::too_many_arguments)]
 async fn start_join(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
+    replication: usize,
     name: &str,
     address: String,
 ) -> Arc<Notify> {
@@ -985,7 +1012,14 @@ async fn start_join(
         Arc::clone(&info.promoted)
     };
 
-    try_begin_next_join(registry, current_join, auth_secret, tls_connector).await;
+    try_begin_next_join(
+        registry,
+        current_join,
+        auth_secret,
+        tls_connector,
+        replication,
+    )
+    .await;
 
     promoted
 }
@@ -998,6 +1032,7 @@ async fn handle_complete(
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
+    replication: usize,
     reporting_name: &str,
 ) {
     let joining_name = {
@@ -1023,7 +1058,14 @@ async fn handle_complete(
     };
 
     promote_to_joined(registry, &joining_name);
-    try_begin_next_join(registry, current_join, auth_secret, tls_connector).await;
+    try_begin_next_join(
+        registry,
+        current_join,
+        auth_secret,
+        tls_connector,
+        replication,
+    )
+    .await;
 }
 
 /// Called whenever any node's connection to discovery ends (cleanly or
@@ -1045,6 +1087,7 @@ async fn on_node_connection_ended(
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
+    replication: usize,
     name: &str,
 ) {
     let was_waiting_or_joining = lock(registry)
@@ -1067,7 +1110,14 @@ async fn on_node_connection_ended(
         .is_some_and(|pending| pending.joining_name == name || pending.expected.contains(name));
 
     if matters_to_current_join {
-        abandon_current_join(registry, current_join, auth_secret, tls_connector).await;
+        abandon_current_join(
+            registry,
+            current_join,
+            auth_secret,
+            tls_connector,
+            replication,
+        )
+        .await;
     }
 }
 
@@ -1084,6 +1134,7 @@ async fn abandon_current_join(
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
+    replication: usize,
 ) {
     let Some(pending) = lock_current_join(current_join).take() else {
         return;
@@ -1128,7 +1179,14 @@ async fn abandon_current_join(
         }
     }
 
-    try_begin_next_join(registry, current_join, auth_secret, tls_connector).await;
+    try_begin_next_join(
+        registry,
+        current_join,
+        auth_secret,
+        tls_connector,
+        replication,
+    )
+    .await;
 }
 
 /// Holds a Waiting/Joining node's connection open after it sends `J`,
@@ -1191,11 +1249,13 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     address: &str,
     liveness_timeout: Duration,
     migration_timeout: Duration,
     startup_grace: Duration,
+    replication: usize,
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
     tls_connector: Option<TlsConnector>,
@@ -1211,6 +1271,7 @@ async fn run(
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
         list_ready_at: Instant::now() + startup_grace,
+        replication,
         auth_secret: auth_secret.clone(),
         tls_acceptor,
         tls_connector: tls_connector.clone(),
@@ -1221,6 +1282,7 @@ async fn run(
         Arc::clone(&cluster_state.current_join),
         auth_secret,
         tls_connector,
+        replication,
         liveness_timeout,
         migration_timeout,
         shutdown_rx.clone(),
@@ -1356,6 +1418,7 @@ async fn dispatch_connection(
                 &cluster_state.current_join,
                 &config.auth_secret,
                 &config.tls_connector,
+                config.replication,
                 &name,
             )
             .await;
@@ -1365,11 +1428,13 @@ async fn dispatch_connection(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sweep_expired(
     registry: Registry,
     current_join: CurrentJoin,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
+    replication: usize,
     liveness_timeout: Duration,
     migration_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1399,7 +1464,7 @@ async fn sweep_expired(
                     .is_some_and(|pending| pending.started_at.elapsed() >= migration_timeout);
 
                 if timed_out {
-                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector).await;
+                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication).await;
                 }
             }
             _ = shutdown_rx.changed() => return,
@@ -1489,7 +1554,7 @@ async fn handle_connection(
                     .filter(|(_, info)| info.state == NodeState::Joined)
                     .map(|(name, info)| (name.clone(), info.address.clone()))
                     .collect();
-                let mut response = format!("N {}\n", nodes.len());
+                let mut response = format!("N {} {}\n", nodes.len(), config.replication);
                 for (name, addr) in &nodes {
                     response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
                 }
@@ -1506,6 +1571,7 @@ async fn handle_connection(
                     &current_join,
                     &config.auth_secret,
                     &config.tls_connector,
+                    config.replication,
                     &name,
                     addr,
                 )
@@ -1557,6 +1623,7 @@ async fn handle_connection(
                     &current_join,
                     &config.auth_secret,
                     &config.tls_connector,
+                    config.replication,
                     &name,
                 )
                 .await;
@@ -1646,6 +1713,7 @@ async fn main() -> ExitCode {
         args.liveness_timeout,
         args.migration_timeout,
         args.startup_grace.unwrap_or(args.liveness_timeout),
+        args.replication_factor,
         read_auth_secret(),
         tls_acceptor,
         tls_connector,
@@ -1815,6 +1883,7 @@ mod tests {
                 ConnectionConfig {
                     idle_timeout: Duration::from_secs(5),
                     list_ready_at: Instant::now(),
+                    replication: 2,
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
@@ -1837,7 +1906,7 @@ mod tests {
         // may observe them coalesced into a single read, so accumulate
         // until the expected byte count has arrived instead of assuming
         // read boundaries.
-        let expected = b"R\nA\nN 1\n6 14\nnode-a127.0.0.1:8356\n";
+        let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -1883,6 +1952,7 @@ mod tests {
                 ConnectionConfig {
                     idle_timeout: Duration::from_secs(5),
                     list_ready_at: Instant::now(),
+                    replication: 2,
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
@@ -1902,7 +1972,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = b"R\nA\nN 1\n6 14\nnode-a127.0.0.1:8356\n";
+        let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -1938,6 +2008,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: Duration::from_secs(5),
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -1979,6 +2050,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: Duration::from_secs(5),
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2011,6 +2083,7 @@ mod tests {
             idle_timeout: Duration::from_secs(5),
             // Still inside the ADR-0010 grace for the whole test.
             list_ready_at: Instant::now() + Duration::from_secs(60),
+            replication: 2,
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
@@ -2068,6 +2141,7 @@ mod tests {
         let config = || ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
             list_ready_at: Instant::now(),
+            replication: 2,
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
@@ -2134,7 +2208,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
         lister.write_all(b"L\n").await.unwrap();
-        let expected_list = b"N 1\n6 14\nnode-a127.0.0.1:9001\n";
+        let expected_list = b"N 1 2\n6 14\nnode-a127.0.0.1:9001\n";
         let mut list_response = vec![0u8; expected_list.len()];
         lister.read_exact(&mut list_response).await.unwrap();
         assert_eq!(list_response, expected_list);
@@ -2165,6 +2239,7 @@ mod tests {
         let config = || ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
             list_ready_at: Instant::now(),
+            replication: 2,
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
@@ -2239,8 +2314,10 @@ mod tests {
         let joining_name_length: usize = header.next().unwrap().parse().unwrap();
         let joining_addr_length: usize = header.next().unwrap().parse().unwrap();
         let joined_count: usize = header.next().unwrap().parse().unwrap();
+        let replication: usize = header.next().unwrap().parse().unwrap();
         assert_eq!(header.next(), None);
         assert_eq!(joined_count, 1);
+        assert_eq!(replication, 2);
 
         let body = &message[header_end + 1..];
         assert_eq!(&body[..joining_name_length], "node-b");
@@ -2274,6 +2351,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2306,6 +2384,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2338,6 +2417,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2349,7 +2429,7 @@ mod tests {
         client.write_all(b"A 14\ncorrect-secretL\n").await.unwrap();
         client.shutdown().await.unwrap();
 
-        let expected = b"Od\nN 0\n";
+        let expected = b"Od\nN 0 2\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -2377,6 +2457,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2432,6 +2513,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2455,6 +2537,7 @@ mod tests {
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
+                replication: 2,
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
@@ -2486,6 +2569,7 @@ mod tests {
             current_join,
             None,
             None,
+            2,
             Duration::from_secs(1),
             Duration::from_secs(60),
             shutdown_rx,
@@ -2536,6 +2620,7 @@ mod tests {
         let config = ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
             list_ready_at: Instant::now(),
+            replication: 2,
             auth_secret: None,
             tls_acceptor: Some(acceptor),
             tls_connector: None,
@@ -2565,7 +2650,7 @@ mod tests {
 
         tls.write_all(b"L\n").await.unwrap();
 
-        let expected = b"N 0\n";
+        let expected = b"N 0 2\n";
         let mut response = vec![0_u8; expected.len()];
         tls.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
@@ -2632,13 +2717,14 @@ mod tests {
             "joining-node",
             "127.0.0.1:9",
             &[],
+            2,
         )
         .await
         .unwrap();
 
         node_task.await.unwrap();
 
-        let mut expected = b"M 12 11 0\n".to_vec();
+        let mut expected = b"M 12 11 0 2\n".to_vec();
         expected.extend_from_slice(b"joining-node");
         expected.extend_from_slice(b"127.0.0.1:9");
         assert_eq!(*received.lock().unwrap(), expected);
@@ -2725,7 +2811,7 @@ mod tests {
 
         // Node A's connection to discovery dies (ADR-0008 pattern: a ready
         // node dies mid-handoff).
-        on_node_connection_ended(&registry, &current_join, &None, &None, "node-a").await;
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-a").await;
 
         other_ready_task.await.unwrap();
 
@@ -2777,7 +2863,7 @@ mod tests {
 
         // Node B (the joining node itself) disconnects before being
         // promoted (ADR-0008 pattern: the joining node dies mid-handoff).
-        on_node_connection_ended(&registry, &current_join, &None, &None, "node-b").await;
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b").await;
 
         ready_task.await.unwrap();
 
@@ -2815,6 +2901,7 @@ mod tests {
             Arc::clone(&current_join),
             None,
             None,
+            2,
             Duration::from_secs(60),
             Duration::from_secs(2),
             shutdown_rx,

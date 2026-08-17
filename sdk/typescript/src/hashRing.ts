@@ -1,22 +1,24 @@
 /**
- * Client-side consistent hashing over a fixed node list (see
- * doc/adr/0002-*.md in the repository root). This is deliberately a
- * byte-for-byte port of the same algorithm `src/bin/bench.rs` uses on the
- * Rust side (FNV-1a, 128 virtual nodes per real node) — not just "a"
- * consistent hash, but *this specific* one. nanocached-node instances are
- * independent (no cross-node coordination or replication), so which node
- * holds a given key is entirely a client-side decision; if this SDK's ring
- * disagreed with another client's (or a node's own `src/hash_ring.rs`
- * copy, computing an ADR-0008 handoff diff), the two would disagree about
- * which node owns a key.
+ * Rendezvous (highest-random-weight) hashing over a fixed node list (see
+ * doc/adr/0011-*.md, which replaced ADR-0002's virtual-node ring: FNV-1a's
+ * weak high-bit avalanche clustered ring points into narrow bands, skewing
+ * node shares by up to ~2×; HRW measures within 2% of fair and yields
+ * replica sets for free). This is deliberately a byte-for-byte port of the
+ * same computation the Rust side uses (`src/hash_ring.rs`, `src/bin/
+ * bench.rs`) — not just "a" rendezvous hash, but *this specific* one: if
+ * this SDK's ranking disagreed with a node's own copy, the two would
+ * disagree about which nodes hold a key.
  *
- * Built from node *names*, not addresses (doc/adr/0009-*.md) — `route`
- * returns a name, which the caller then looks up in a separate name ->
- * address map to actually open a connection. This class itself doesn't
- * know or care what its string identifiers mean.
+ * For each (node, key) pair, `score = fmix64(fnv1a(name) ^ fnv1a(key))`; a
+ * key's owners are the `replicas` highest-scoring nodes in descending
+ * score order (ties — effectively impossible at 64 bits — break toward the
+ * lexicographically smaller name), and its primary is the top one.
+ *
+ * Built from node *names*, not addresses (doc/adr/0009-*.md) — `owners`
+ * returns names, which the caller then looks up in a separate name ->
+ * address map to actually open connections.
  */
 
-const VIRTUAL_NODES_PER_NODE = 128;
 const FNV_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV_PRIME = 0x100000001b3n;
 const MASK_64 = (1n << 64n) - 1n;
@@ -33,56 +35,53 @@ export function fnv1a(bytes: Uint8Array): bigint {
   return hash;
 }
 
-/** First index `i` such that `points[i][0] >= target`, given `points` is
- * sorted ascending by its first element — a "lower bound" binary search,
- * matching Rust's `slice::partition_point(|p| p.0 < target)`. */
-function lowerBound(points: Array<[bigint, number]>, target: bigint): number {
-  let low = 0;
-  let high = points.length;
-
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    if (points[mid][0] < target) {
-      low = mid + 1;
-    } else {
-      high = mid;
-    }
-  }
-
-  return low;
+/** MurmurHash3's 64-bit finalizer: a full-avalanche bijective mix, which
+ * is what FNV-1a alone lacks (see the module docs). */
+export function fmix64(hash: bigint): bigint {
+  hash ^= hash >> 33n;
+  hash = (hash * 0xff51afd7ed558ccdn) & MASK_64;
+  hash ^= hash >> 33n;
+  hash = (hash * 0xc4ceb9fe1a85ec53n) & MASK_64;
+  hash ^= hash >> 33n;
+  return hash;
 }
 
 /**
- * A consistent-hash ring over a fixed node list, built once from a
- * discovery server's node list. Routing a key never changes once the ring
- * is built — this class doesn't react to nodes joining or leaving after
- * construction (matching bench.rs's own documented behavior).
+ * A rendezvous-hash ranking over a fixed node list, built once from a
+ * discovery server's node list. Ranking a key never changes once built —
+ * this class doesn't react to nodes joining or leaving after construction.
  */
 export class HashRing {
   private readonly nodes: readonly string[];
-  private readonly points: ReadonlyArray<[bigint, number]>;
+  private readonly nodeHashes: readonly bigint[];
 
   constructor(nodes: readonly string[]) {
     this.nodes = nodes;
-
-    const points: Array<[bigint, number]> = [];
-    for (let index = 0; index < nodes.length; index++) {
-      for (let virtualId = 0; virtualId < VIRTUAL_NODES_PER_NODE; virtualId++) {
-        const point = fnv1a(Buffer.from(`${nodes[index]}#${virtualId}`, "ascii"));
-        points.push([point, index]);
-      }
-    }
-    points.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-
-    this.points = points;
+    this.nodeHashes = nodes.map((node) => fnv1a(Buffer.from(node, "utf8")));
   }
 
-  route(key: Uint8Array): string {
-    const hash = fnv1a(key);
-    let position = lowerBound(this.points as Array<[bigint, number]>, hash);
-    if (position === this.points.length) position = 0;
+  /** The key's owners: the `replicas` highest-scoring nodes, primary
+   * first. Returns fewer than `replicas` when the cluster is smaller. */
+  owners(key: Uint8Array, replicas: number): string[] {
+    const keyHash = fnv1a(key);
 
-    const [, nodeIndex] = this.points[position];
-    return this.nodes[nodeIndex];
+    const scored = this.nodes.map((node, index) => ({
+      score: fmix64(this.nodeHashes[index] ^ keyHash),
+      node,
+    }));
+
+    // Descending by score; ties toward the lexicographically smaller
+    // name — a total order, so every implementation agrees.
+    scored.sort((a, b) => {
+      if (a.score !== b.score) return a.score < b.score ? 1 : -1;
+      return a.node < b.node ? -1 : 1;
+    });
+
+    return scored.slice(0, replicas).map(({ node }) => node);
+  }
+
+  /** The key's primary — `owners(key, 1)[0]`. */
+  route(key: Uint8Array): string {
+    return this.owners(key, 1)[0];
   }
 }

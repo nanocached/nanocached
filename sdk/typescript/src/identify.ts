@@ -31,7 +31,10 @@ export interface DiscoveredNode {
  */
 export type IdentifyResult =
   | { kind: "node"; socket: Socket | TLSSocket }
-  | { kind: "cluster"; nodes: DiscoveredNode[] };
+  // `replication` (ADR-0011) is discovery's replication factor R — how
+  // many nodes hold each key. It rides the `L` response so clients can't
+  // skew from the cluster's setting.
+  | { kind: "cluster"; nodes: DiscoveredNode[]; replication: number };
 
 function toBytes(value: string | Uint8Array): Buffer {
   return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
@@ -133,7 +136,7 @@ export class DiscoveryBusyError extends Error {
  * name and address are simply concatenated, split by their declared
  * lengths, not by a delimiter. Returns `null` while more bytes are still
  * needed. */
-function tryParseNodeList(buf: Buffer): DiscoveredNode[] | null {
+function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: number } | null {
   const headerEnd = buf.indexOf(0x0a);
   if (headerEnd === -1) return null;
 
@@ -145,9 +148,20 @@ function tryParseNodeList(buf: Buffer): DiscoveredNode[] | null {
     throw new Error(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
   }
 
-  const count = Number(buf.subarray(2, headerEnd).toString("ascii"));
+  // `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+  const header = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+  if (header.length !== 2) {
+    throw new Error("nanocached: invalid node-list header in discovery response");
+  }
+
+  const count = Number(header[0]);
   if (!Number.isInteger(count) || count < 0) {
     throw new Error("nanocached: invalid node count in discovery response");
+  }
+
+  const replication = Number(header[1]);
+  if (!Number.isInteger(replication) || replication < 1) {
+    throw new Error("nanocached: invalid replication factor in discovery response");
   }
 
   const nodes: DiscoveredNode[] = [];
@@ -185,7 +199,7 @@ function tryParseNodeList(buf: Buffer): DiscoveredNode[] | null {
     offset = entryEnd;
   }
 
-  return nodes;
+  return { nodes, replication };
 }
 
 /**
@@ -230,8 +244,8 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
 
   try {
     socket.write(Buffer.from("L\n"));
-    const nodes = await readFrame(socket, tryParseNodeList);
-    return { kind: "cluster", nodes };
+    const { nodes, replication } = await readFrame(socket, tryParseNodeList);
+    return { kind: "cluster", nodes, replication };
   } finally {
     socket.destroy();
   }

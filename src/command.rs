@@ -51,15 +51,18 @@ pub enum Command {
     /// also proactively removes anything already past its TTL.
     Sweep,
     /// ADR-0008: sent by discovery to a `Joined` node when a new node is
-    /// joining, so this node can compute (via `HashRing`) which of its
-    /// own keys the joining node now owns. `joining_name`/`joining_addr`
-    /// identify the joining node; `joined` is every currently-`Joined`
-    /// node (ADR-0009 names, including this one) — the "before" ring,
-    /// to which `joining_name` is the "after" addition.
+    /// joining, so this node can compute (via `HashRing`) how each of its
+    /// own keys' top-R owner set changes (ADR-0011). `joining_name`/
+    /// `joining_addr` identify the joining node; `joined` is every
+    /// currently-`Joined` node (ADR-0009 names, including this one) — the
+    /// "before" roster, to which `joining_name` is the "after" addition.
+    /// `replication` is discovery's replication factor R (ADR-0011) — the
+    /// single source nodes learn R from.
     Migrate {
         joining_name: String,
         joining_addr: String,
         joined: Vec<(String, String)>,
+        replication: usize,
     },
     /// ADR-0008: sent by discovery to a ready node to abandon a handoff
     /// it's mid-`Migrate` for — a ready or joining node died, or
@@ -297,6 +300,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let joining_name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joining_addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joined_count = parts.next().ok_or(ParseError::InvalidLength)?;
+            let replication = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -305,6 +309,13 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let joining_name_length = parse_length(joining_name_length)?;
             let joining_addr_length = parse_length(joining_addr_length)?;
             let joined_count = parse_length(joined_count)?;
+            let replication = parse_length(replication)?;
+
+            // R=0 could never be meant (nothing would own any key) and
+            // would make every ownership check vacuously reject.
+            if replication == 0 {
+                return Err(ParseError::InvalidLength);
+            }
 
             parse_migrate(
                 input,
@@ -312,6 +323,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
                 joining_name_length,
                 joining_addr_length,
                 joined_count,
+                replication,
             )
         }
 
@@ -334,6 +346,7 @@ fn parse_migrate(
     joining_name_length: usize,
     joining_addr_length: usize,
     joined_count: usize,
+    replication: usize,
 ) -> Result<Command, ParseError> {
     if joining_name_length == 0 || joining_addr_length == 0 {
         return Err(ParseError::EmptyField);
@@ -414,6 +427,7 @@ fn parse_migrate(
         joining_name,
         joining_addr,
         joined,
+        replication,
     })
 }
 
@@ -802,7 +816,7 @@ mod tests {
 
     #[test]
     fn parses_a_migrate_command_with_no_joined_nodes() {
-        let mut input = buf(b"M 6 14 0\nnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 0 2\nnode-b127.0.0.1:8357");
 
         assert_eq!(
             parse(&mut input),
@@ -810,6 +824,7 @@ mod tests {
                 joining_name: "node-b".to_string(),
                 joining_addr: "127.0.0.1:8357".to_string(),
                 joined: Vec::new(),
+                replication: 2,
             })
         );
         assert!(input.is_empty());
@@ -818,7 +833,7 @@ mod tests {
     #[test]
     fn parses_a_migrate_command_with_joined_nodes_and_consumes_only_that_frame() {
         let mut input = buf(
-            b"M 6 14 2\nnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
+            b"M 6 14 2 2\nnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
         );
 
         assert_eq!(
@@ -830,6 +845,7 @@ mod tests {
                     ("node-a".to_string(), "127.0.0.1:8356".to_string()),
                     ("node-c".to_string(), "127.0.0.1:8358".to_string()),
                 ],
+                replication: 2,
             })
         );
         assert_eq!(&input[..], b"G 1\nx");
@@ -837,7 +853,7 @@ mod tests {
 
     #[test]
     fn parse_leaves_a_migrate_command_untouched_when_a_joined_entry_is_incomplete() {
-        let original = b"M 6 14 1\nnode-b127.0.0.1:83576 14\nnode-a127.0.0".to_vec();
+        let original = b"M 6 14 1 2\nnode-b127.0.0.1:83576 14\nnode-a127.0.0".to_vec();
         let mut input = BytesMut::from(&original[..]);
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
@@ -846,7 +862,7 @@ mod tests {
 
     #[test]
     fn rejects_an_empty_joining_name_in_migrate() {
-        let mut input = buf(b"M 0 14 0\n127.0.0.1:8357");
+        let mut input = buf(b"M 0 14 0 2\n127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
@@ -858,7 +874,7 @@ mod tests {
         // would request terabytes and abort the process). With the joining
         // node's own fields present but no entries buffered, this must simply
         // report `Incomplete` — cheaply, without touching that huge number.
-        let mut input = buf(b"M 6 14 999999999999\nnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 999999999999 2\nnode-b127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }

@@ -82,10 +82,12 @@ interface ClusterMember {
 
 type Target =
   | { kind: "single"; connection: Connection }
-  // `members` is keyed by node *name* (doc/adr/0009-*.md), matching
-  // what `ring.route()` returns — not by address, which carries no
-  // identity meaning and is only used to open connections.
-  | { kind: "cluster"; ring: HashRing; members: Map<string, ClusterMember> };
+  // `members` is keyed by node *name* (doc/adr/0009-*.md), matching what
+  // `ring.owners()` returns — not by address, which carries no identity
+  // meaning and is only used to open connections. `replication` is
+  // discovery's R (ADR-0011), learned from the same `L` response as the
+  // member list.
+  | { kind: "cluster"; ring: HashRing; members: Map<string, ClusterMember>; replication: number };
 
 function targetKey(options: { host: string; port: number }): string {
   return `${options.host}:${options.port}`;
@@ -277,6 +279,7 @@ export class NanocachedClient {
           kind: "cluster",
           ring: new HashRing(identified.nodes.map((node) => node.name)),
           members,
+          replication: identified.replication,
         },
         key,
         identified.nodes.map((node) => node.address),
@@ -319,45 +322,133 @@ export class NanocachedClient {
     for (const member of this.target.members.values()) member.connection.close();
   }
 
+  /** How many nodes hold each key (ADR-0011) — discovery's replication
+   * factor in cluster mode, 1 against a single node. */
+  get replication(): number {
+    return this.target.kind === "cluster" ? this.target.replication : 1;
+  }
+
   async get(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.withWrongNodeRetry(key, (connection) => connection.get(key));
+    return this.withWrongNodeRetry(() =>
+      this.target.kind === "single"
+        ? this.singleConnection().then((connection) => connection.get(key))
+        : this.readFromOwners(key, (connection) => connection.get(key)),
+    );
   }
 
   async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.withWrongNodeRetry(key, (connection) => connection.set(key, value, options));
+    return this.withWrongNodeRetry(() =>
+      this.target.kind === "single"
+        ? this.singleConnection().then((connection) => connection.set(key, value, options))
+        : this.writeToOwners(key, (connection) => connection.set(key, value, options)),
+    );
   }
 
   /** Returns whether the key existed before this call. */
   async delete(key: string | Uint8Array): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.withWrongNodeRetry(key, (connection) => connection.delete(key));
+    return this.withWrongNodeRetry(() =>
+      this.target.kind === "single"
+        ? this.singleConnection().then((connection) => connection.delete(key))
+        : this.writeToOwners(key, (connection) => connection.delete(key)),
+    );
   }
 
-  /** Runs `op` against `key`'s currently-routed connection. If the node
-   * answers `W` (ADR-0008: it no longer owns this key per its own view of
-   * cluster membership — this client's routing table is stale), forces a
-   * node-list refresh and retries once against the freshly-routed
-   * connection. A second `W` after a *fresh* refresh is unusual enough
-   * (this client, the routed-to node, and discovery all disagreeing right
-   * after resyncing) that retrying further would likely just mask a real
-   * problem, so that error propagates. In single mode there's no
-   * discovery to refresh from, so `W` propagates immediately — see
-   * `WrongNodeError`. */
-  private async withWrongNodeRetry<T>(
+  /** The names of `key`'s top-R owners, primary first (ADR-0011). Only
+   * meaningful in cluster mode. */
+  private ownerNames(key: string | Uint8Array): string[] {
+    if (this.target.kind !== "cluster") return [];
+    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    return this.target.ring.owners(keyBytes, this.target.replication);
+  }
+
+  /** Cluster read (ADR-0011): ask the key's owners in rank order,
+   * falling through to the next one only on a connection-level failure —
+   * a replica is a hedge against a *dead* holder, not an extra lookup on
+   * every miss (a `notFound` from a live owner is the answer). A `W`
+   * propagates untouched: it means this client's routing table is stale,
+   * which withWrongNodeRetry fixes with a refresh and one retry. */
+  private async readFromOwners<T>(
     key: string | Uint8Array,
     op: (connection: Connection) => Promise<T>,
   ): Promise<T> {
+    const names = this.ownerNames(key);
+    let lastError: Error | null = null;
+
+    for (const name of names) {
+      let connection: Connection;
+      try {
+        connection = await this.memberConnection(name);
+      } catch (error) {
+        lastError = error as Error;
+        continue;
+      }
+
+      try {
+        return await op(connection);
+      } catch (error) {
+        if (error instanceof WrongNodeError) throw error;
+        lastError = error as Error;
+      }
+    }
+
+    throw lastError ?? new Error("nanocached: no owner is reachable for this key");
+  }
+
+  /** Cluster write (ADR-0011): fan the operation out to every owner in
+   * parallel. The primary's outcome is the operation's outcome; replica
+   * failures are swallowed — a dead replica must not fail writes, it just
+   * leaves the key under-replicated until the next node-list refresh
+   * drops the dead node out of the ranking. (A replica may also answer
+   * `W` when its own membership view disagrees; equally ignorable — the
+   * refresh converges everyone.) */
+  private async writeToOwners<T>(
+    key: string | Uint8Array,
+    op: (connection: Connection) => Promise<T>,
+  ): Promise<T> {
+    const [primaryName, ...replicaNames] = this.ownerNames(key);
+    if (primaryName === undefined) {
+      throw new Error("nanocached: no owner is reachable for this key");
+    }
+
+    const replicaWrites = replicaNames.map(async (name) => {
+      try {
+        const connection = await this.memberConnection(name);
+        await op(connection);
+      } catch {
+        // Swallowed by design — see the doc comment.
+      }
+    });
+
     try {
-      return await op(await this.routedConnection(key));
+      const connection = await this.memberConnection(primaryName);
+      return await op(connection);
+    } finally {
+      await Promise.all(replicaWrites);
+    }
+  }
+
+  /** Runs `operation`; if a routed-to node answers `W` (ADR-0008: it
+   * doesn't hold this key per its own view of cluster membership — this
+   * client's routing table is stale), forces a node-list refresh and
+   * retries the whole operation once against the fresh ranking. A second
+   * `W` after a *fresh* refresh is unusual enough (this client, the
+   * routed-to node, and discovery all disagreeing right after resyncing)
+   * that retrying further would likely just mask a real problem, so that
+   * error propagates. In single mode there's no discovery to refresh
+   * from, so `W` propagates immediately — see `WrongNodeError`. */
+  private async withWrongNodeRetry<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
     } catch (error) {
       if (!(error instanceof WrongNodeError) || this.target.kind !== "cluster") throw error;
       await this.maybeRefreshNodeList({ force: true });
-      return await op(await this.routedConnection(key));
+      return await operation();
     }
   }
 
@@ -443,7 +534,12 @@ export class NanocachedClient {
       }
     }
 
-    this.target = { kind: "cluster", ring: new HashRing([...members.keys()]), members };
+    this.target = {
+      kind: "cluster",
+      ring: new HashRing([...members.keys()]),
+      members,
+      replication: identified.replication,
+    };
     this.nodeUrls = identified.nodes.filter((node) => members.has(node.name)).map((node) => node.address);
     this.lastNodeListFetch = Date.now();
   }
@@ -452,7 +548,7 @@ export class NanocachedClient {
    * list. Returns `null` — keep the last-known list — when no seed can
    * provide one: unreachable, still inside its startup grace (`B`), no
    * longer a discovery server, or knowing no live nodes. */
-  private async fetchNodeList(): Promise<{ nodes: DiscoveredNode[] } | null> {
+  private async fetchNodeList(): Promise<{ nodes: DiscoveredNode[]; replication: number } | null> {
     for (const seed of this.seeds) {
       const key = targetKey(seed);
 
@@ -482,43 +578,50 @@ export class NanocachedClient {
     return null;
   }
 
-  /** The single "ensure connected" path (issue #1) every request funnels
-   * through: routes `key` to its connection and, if that connection has
-   * died since it was opened — most commonly the server's 30s idle
-   * timeout — reconnects to the same node first. Reconnecting is lazy
-   * (nothing watches for closes in the background) and shared (concurrent
-   * requests finding the same dead connection await one dial, see
-   * `reconnects`). */
-  private async routedConnection(key: string | Uint8Array): Promise<Connection> {
-    if (this.target.kind === "single") {
-      if (!this.target.connection.isClosed()) return this.target.connection;
-
-      const connection = await this.ensureConnected("", this.url);
-      if (this.target.kind === "single" && this.target.connection.isClosed()) {
-        this.target.connection = connection;
-      }
-      return connection;
+  /** The "ensure connected" path (issue #1) for a single-node target: if
+   * the one connection has died since it was opened — most commonly the
+   * server's 30s idle timeout — reconnect to the same node first.
+   * Reconnecting is lazy (nothing watches for closes in the background)
+   * and shared (concurrent requests finding the same dead connection
+   * await one dial, see `reconnects`). */
+  private async singleConnection(): Promise<Connection> {
+    if (this.target.kind !== "single") {
+      throw new Error("nanocached: internal error — singleConnection on a cluster target");
     }
+    if (!this.target.connection.isClosed()) return this.target.connection;
 
-    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
-    const name = this.target.ring.route(keyBytes);
+    const connection = await this.ensureConnected("", this.url);
+    if (this.target.kind === "single" && this.target.connection.isClosed()) {
+      this.target.connection = connection;
+    }
+    return connection;
+  }
+
+  /** The cluster-mode "ensure connected" path: the named member's
+   * connection, redialing its last-known address first if the connection
+   * has died (same laziness and sharing as `singleConnection`). Every
+   * read and every write leg funnels through here, per owner. */
+  private async memberConnection(name: string): Promise<Connection> {
+    if (this.target.kind !== "cluster") {
+      throw new Error("nanocached: internal error — memberConnection on a single target");
+    }
 
     const member = this.target.members.get(name);
     if (!member) {
-      throw new Error(`nanocached: ring routed to ${name}, which has no open connection`);
+      throw new Error(`nanocached: ${name} has no open connection`);
     }
     if (!member.connection.isClosed()) return member.connection;
 
     const connection = await this.ensureConnected(name, member.address);
 
     // A node-list refresh may have swapped `target` while we dialed; adopt
-    // the new connection only into a member still holding the dead one, and
-    // re-route (or defer to the refresh's own connection) otherwise so no
-    // socket is left open but untracked.
+    // the new connection only into a member still holding the dead one,
+    // and defer to the refresh's own connection otherwise so no socket is
+    // left open but untracked.
     const current = this.target.kind === "cluster" ? this.target.members.get(name) : null;
     if (!current) {
       connection.close();
-      return this.routedConnection(key);
+      throw new Error(`nanocached: ${name} left the cluster while reconnecting`);
     }
     if (current.connection.isClosed()) {
       current.connection = connection;

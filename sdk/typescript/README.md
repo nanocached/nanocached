@@ -69,10 +69,23 @@ const client = await NanocachedClient.connect({
 ## Cluster behavior
 
 When `connect()` reaches a discovery server, the SDK fetches the node list,
-opens one pipelined connection per node, and routes each key with the same
-consistent-hash ring (FNV-1a, 128 virtual nodes per node) every other
-nanocached client and node uses — so all parties agree on which node owns a
-key.
+opens one pipelined connection per node, and ranks each key's owners with
+the same rendezvous hashing every other nanocached client and node uses —
+so all parties agree on which nodes hold a key.
+
+### Replication
+
+The cluster's replication factor R (how many nodes hold each key — set by
+`nanocached-discovery --replication-factor`, default 2) rides along with
+the node list, so the SDK needs no configuration:
+
+- `set`/`delete` fan out to all R owners in parallel. The primary's result
+  is the operation's result; a dead replica never fails a write.
+- `get` asks the primary and falls over to the next owner only when the
+  holder is unreachable — a node death costs no cached data, not even a
+  latency blip on keys whose primary survived.
+- `client.replication` exposes the factor in use (1 against a single
+  node).
 
 The node list is re-fetched lazily when it is more than 30 seconds old. If a
 node answers that it no longer owns a key (its view of the cluster changed),

@@ -331,9 +331,12 @@ async fn fetch_joined(discovery_addr: &str) -> io::Result<Vec<(String, String)>>
 
     let mut buf = BytesMut::new();
     let header = read_line(&mut stream, &mut buf).await?;
+    // `N <count> <r>\n` since ADR-0011 (the replication factor rides
+    // along for clients; this harness doesn't need it).
     let count: usize = header
         .strip_prefix("N ")
-        .and_then(|rest| rest.parse().ok())
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|count| count.parse().ok())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
