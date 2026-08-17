@@ -220,7 +220,13 @@ class NanocachedClient:
     async def _with_wrong_node_retry(self, operation):
         try:
             return await operation()
-        except WrongNodeError:
+        except (WrongNodeError, ConnectionError, OSError):
+            # Connection-level failures retry the same way `W` does: the
+            # usual cause is a node death that discovery has since noticed,
+            # so a forced refresh re-ranks the key onto survivors. The
+            # retry window for a dead primary is therefore bounded by
+            # discovery's liveness timeout. A second failure after a fresh
+            # refresh propagates.
             if self._ring is None:
                 raise
             await self._maybe_refresh(force=True)
