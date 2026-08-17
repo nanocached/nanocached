@@ -473,6 +473,135 @@ describe("NanocachedClient keep-alive", () => {
   });
 });
 
+describe("NanocachedClient replication (ADR-0011, R=2)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("learns R from discovery and fans writes out to every owner", async () => {
+    const cluster = await startReplicatedCluster();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      try {
+        assert.equal(client.replication, 2);
+
+        const keys = Array.from({ length: 20 }, (_, i) => `key-${i}`);
+        await Promise.all(keys.map((key) => client.set(key, `value of ${key}`)));
+
+        // With R=2 over 2 nodes, every key must be on BOTH nodes.
+        for (const key of keys) {
+          for (const { name, mock } of cluster.nodes) {
+            assert.ok(mock.store.has(key), `${key} is missing from ${name}`);
+          }
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("serves reads from the replica when the primary node dies", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+    try {
+      const key = "survives-a-node-death";
+      await client.set(key, "still here");
+
+      const { primary } = cluster.ownerOf(key);
+      // Kill the primary outright — server gone, not just the connection.
+      await primary.mock.close();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+
+      assert.deepEqual(await client.get(key), Buffer.from("still here"));
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("does not fail a write when a replica is down", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+    try {
+      const key = "written-despite-dead-replica";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await replica.mock.close();
+      await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
+
+      await client.set(key, "v");
+      assert.ok(primary.mock.store.has(key));
+      assert.deepEqual(await client.get(key), Buffer.from("v"));
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("fans deletes out to every owner", async () => {
+    const cluster = await startReplicatedCluster();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      try {
+        const key = "deleted-everywhere";
+        await client.set(key, "v");
+        for (const { mock } of cluster.nodes) assert.ok(mock.store.has(key));
+
+        assert.equal(await client.delete(key), true);
+        for (const { name, mock } of cluster.nodes) {
+          assert.ok(!mock.store.has(key), `${key} still present on ${name}`);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("reports replication 1 against a single node", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      try {
+        assert.equal(client.replication, 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
 describe("NanocachedClient against a discovery-fronted cluster", () => {
   async function startCluster(): Promise<{
     nodes: Array<{ name: string; mock: MockNode }>;

@@ -195,9 +195,14 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
 
 export async function startMockDiscovery(
   initialNodes: Array<{ name: string; address: string }>,
+  options: { replication?: number } = {},
 ): Promise<MockDiscovery> {
   let nodes = initialNodes;
   let warmingUp = false;
+  // Default 1 (no replication) so single-placement assertions in tests
+  // stay exact; replication tests opt in explicitly. The real server
+  // defaults to 2.
+  const replication = options.replication ?? 1;
 
   const server = createServer((socket) => {
     let buffer = Buffer.alloc(0);
@@ -240,7 +245,7 @@ export async function startMockDiscovery(
                 Buffer.from("\n"),
               ]);
             });
-            socket.write(Buffer.concat([Buffer.from(`N ${nodes.length}\n`), ...entries]));
+            socket.write(Buffer.concat([Buffer.from(`N ${nodes.length} ${replication}\n`), ...entries]));
             break;
           }
 

@@ -393,6 +393,14 @@ It supports the same `NANOCACHED_AUTH_SECRET`-based authentication and
 [Authentication](#authentication) and [TLS](#tls)); nodes and `bench` speak
 the same `A` handshake and TLS handshake to it as they do to a cache node.
 
+`--replication-factor <n>` (default 2, min 1) sets how many nodes hold
+each key (`doc/adr/0011-*.md`): keys are ranked by rendezvous hashing and
+live on their top-R nodes, so any single node death costs no cached data —
+reads fail over to the next owner. Discovery is R's single source of
+truth: clients learn it from the `L` response, nodes from `M`. Effective
+cluster capacity is total memory ÷ R; `--replication-factor 1` restores
+single-copy behavior.
+
 Discovery's registry is soft state, rebuilt from node announces, so it can
 run as several independent replicas with no coordination between them
 (`doc/adr/0010-*.md`): point every node's `--discovery` (and every SDK

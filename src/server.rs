@@ -240,7 +240,7 @@ struct NodeContext {
     /// too. `None` until this node's first successful handoff — a lone
     /// or freshly-bootstrapped node has no membership to reject against
     /// yet.
-    known_ring: Arc<Mutex<Option<Arc<HashRing>>>>,
+    known_ring: Arc<Mutex<Option<Arc<Membership>>>>,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -589,6 +589,7 @@ async fn handle_connection(
                 joining_name,
                 joining_addr,
                 joined,
+                replication,
             }) => {
                 let Some(node_context) = config.node_context.clone() else {
                     return Err(io::Error::new(
@@ -616,6 +617,7 @@ async fn handle_connection(
                         joining_name,
                         joining_addr,
                         joined,
+                        replication,
                     )))
                     .await;
 
@@ -1054,6 +1056,15 @@ fn complete_message(name: &str) -> Vec<u8> {
     message
 }
 
+/// This node's view of cluster membership plus the replication factor it
+/// came with (ADR-0011) — the two always travel together, since "is this
+/// key mine to serve" is a top-R question and R arrived on the same `M`
+/// that carried the roster.
+struct Membership {
+    ring: Arc<HashRing>,
+    replication: usize,
+}
+
 /// A `run_migration` in flight: which handoff it's for, where the joining
 /// node is, the ring this handoff computed (so a concurrent client write
 /// on another connection can tell whether *its* key is one this handoff
@@ -1064,6 +1075,10 @@ struct ActiveMigration {
     joining_name: String,
     joining_addr: String,
     after_ring: Arc<HashRing>,
+    /// ADR-0011: discovery's replication factor, carried by the `M` that
+    /// started this handoff — membership in the joining node's copy set
+    /// is "in the key's top-R", not "is the key's owner".
+    replication: usize,
     abort_requested: Arc<AtomicBool>,
 }
 
@@ -1084,6 +1099,7 @@ impl<'a> MigrationGuard<'a> {
         joining_name: String,
         joining_addr: String,
         after_ring: Arc<HashRing>,
+        replication: usize,
     ) -> Self {
         let abort_requested = Arc::new(AtomicBool::new(false));
 
@@ -1091,6 +1107,7 @@ impl<'a> MigrationGuard<'a> {
             joining_name,
             joining_addr,
             after_ring,
+            replication,
             abort_requested: Arc::clone(&abort_requested),
         });
 
@@ -1110,13 +1127,19 @@ impl Drop for MigrationGuard<'_> {
     }
 }
 
-/// ADR-0008: triggered by an incoming `M`. Computes, using the same
-/// consistent-hash algorithm clients use ([[0002]]; `HashRing` here is
-/// `src/hash_ring.rs`'s copy, see ADR-0006), which of this node's own
-/// entries the joining node now owns — adding exactly one node can only
-/// move keys to that new node, never reshuffle ownership between two
-/// already-existing nodes, so comparing against the post-join ring alone
-/// is sufficient; there's no need to also build and compare a pre-join
+/// ADR-0008 (generalized by ADR-0011): triggered by an incoming `M`.
+/// Computes, using the same rendezvous-hash algorithm clients use
+/// (`HashRing` here is `src/hash_ring.rs`'s copy, see ADR-0006), how each
+/// of this node's own entries' top-R owner set changes when the joining
+/// node is added. Adding exactly one node can only insert it into a key's
+/// ranking, never reorder the existing nodes relative to each other, so
+/// per affected key exactly two roles exist among the pre-join owners:
+/// the old *primary* sends the joining node its copy (one designated
+/// sender — no duplicate transfers), and the node displaced from rank R
+/// to R+1 (if any — there is at most one) marks its now-dead copy for
+/// the post-handoff sweep. This node may hold either role, both (R=1:
+/// sender and displaced coincide, which is exactly the pre-ADR-0011
+/// behavior), or neither. There's no need to compare more than a pre-join
 /// ring. Transfers each such entry via an ordinary `SET` (reusing the
 /// client protocol, not a new one), marks it migrated, and once done
 /// reports `C` to discovery.
@@ -1143,16 +1166,28 @@ async fn run_migration(
     joining_name: String,
     joining_addr: String,
     joined: Vec<(String, String)>,
+    replication: usize,
 ) {
-    let mut ring_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
-    ring_members.push(joining_name.clone());
-    let after_ring = Arc::new(HashRing::new(ring_members));
+    let mut before_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
+    // Discovery always lists this node in the roster (it only sends `M` to
+    // `Joined` members), but the sender/displaced computations below are
+    // meaningless without self in the "before" set — make it structural
+    // rather than trusted.
+    if !before_members.iter().any(|name| name == &node_context.name) {
+        before_members.push(node_context.name.clone());
+    }
+    let mut after_members = before_members.clone();
+    after_members.push(joining_name.clone());
+
+    let before_ring = HashRing::new(before_members);
+    let after_ring = Arc::new(HashRing::new(after_members));
 
     let migration_guard = MigrationGuard::new(
         &node_context.active_migration,
         joining_name.clone(),
         joining_addr.clone(),
         Arc::clone(&after_ring),
+        replication,
     );
 
     let entries = match list_entries(&node_context.request_tx).await {
@@ -1166,12 +1201,33 @@ async fn run_migration(
     let mut marked_this_run = Vec::new();
     let mut stream: Option<ClientStream> = None;
 
+    let self_name = node_context.name.as_str();
+
     for (key, _, _) in entries {
         if migration_guard.abort_requested.load(Ordering::SeqCst) {
             break;
         }
 
-        if after_ring.route(&key) != joining_name {
+        // A key is affected only if the joiner cracks its top-R (HRW
+        // insertion can't change the set any other way).
+        if !after_ring.is_owner(&key, &joining_name, replication) {
+            continue;
+        }
+
+        let old_owners = before_ring.owners(&key, replication);
+        // ADR-0011: the old primary is the one designated sender.
+        let sends = old_owners.first() == Some(&self_name);
+        // The (at most one) node the joiner displaced from rank R: its
+        // copy is dead once the join completes — mark it for the sweep,
+        // whether or not this node also happens to be the sender.
+        let displaced =
+            old_owners.contains(&self_name) && !after_ring.is_owner(&key, self_name, replication);
+
+        if !sends {
+            if displaced {
+                mark_migrated(&node_context.request_tx, &key).await;
+                marked_this_run.push(key);
+            }
             continue;
         }
 
@@ -1241,8 +1297,12 @@ async fn run_migration(
             return;
         }
 
-        mark_migrated(&node_context.request_tx, &key).await;
-        marked_this_run.push(key);
+        // A sender that stays in the key's top-R keeps its copy (it's
+        // still a live replica, ADR-0011); only a displaced copy is dead.
+        if displaced {
+            mark_migrated(&node_context.request_tx, &key).await;
+            marked_this_run.push(key);
+        }
     }
 
     if migration_guard.abort_requested.load(Ordering::SeqCst) {
@@ -1255,13 +1315,15 @@ async fn run_migration(
         return;
     }
 
-    // From here on, this node considers the joining node authoritative
-    // for anything `after_ring` routes to it — see
-    // `NodeContext::known_ring`.
+    // From here on, this node considers the post-join top-R authoritative
+    // for every key — see `NodeContext::known_ring`.
     *node_context
         .known_ring
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(after_ring);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(Membership {
+        ring: after_ring,
+        replication,
+    }));
 
     if let Err(error) = report_complete(&node_context).await {
         eprintln!(
@@ -1475,7 +1537,13 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
-        .is_some_and(|ring| ring.route(key) != node_context.name)
+        .is_some_and(|membership| {
+            // ADR-0011: this node serves a key when it's anywhere in the
+            // key's top-R, not only when it's the primary.
+            !membership
+                .ring
+                .is_owner(key, &node_context.name, membership.replication)
+        })
 }
 
 /// If a handoff is currently in flight and `key` is one it's moving (per
@@ -1489,7 +1557,13 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
-        .filter(|active| active.after_ring.route(key) == active.joining_name)
+        .filter(|active| {
+            // ADR-0011: the joiner is a destination for `key` whenever it
+            // entered the key's top-R, not only as its new primary.
+            active
+                .after_ring
+                .is_owner(key, &active.joining_name, active.replication)
+        })
         .map(|active| active.joining_addr.clone())
 }
 
@@ -2040,6 +2114,139 @@ mod tests {
         (client, server)
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_with_replication_marks_displaced_copies_and_keeps_the_senders() {
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx));
+
+        // Chosen (ready-node / other-node / joiner-0, R=2) so both
+        // ADR-0011 roles land on this node at once:
+        //   "key-0": pre-join top-2 = [ready-node, other-node]; joiner-0
+        //            enters and displaces other-node — ready-node is the
+        //            designated sender and STAYS an owner, so it must
+        //            transfer the key and keep its own copy unmarked.
+        //   "key-3": pre-join top-2 = [other-node, ready-node]; joiner-0
+        //            enters and displaces ready-node, which is NOT the
+        //            sender — no transfer, but its now-dead copy must be
+        //            marked so the post-handoff sweep reclaims it.
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"key-0"),
+                value: Bytes::from_static(b"primary-copy"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"key-3"),
+                value: Bytes::from_static(b"replica-copy"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // Fake joining node: must receive exactly one SET (for "key-0").
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_received: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joining_received_task = Arc::clone(&joining_received);
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            joining_received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"S\n").await.unwrap();
+        });
+
+        // Fake discovery: expects the C completion report.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            discovery_addr,
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+        };
+
+        run_migration(
+            node_context.clone(),
+            "joiner-0".to_string(),
+            joining_addr,
+            vec![
+                ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+                ("other-node".to_string(), "127.0.0.1:1".to_string()),
+            ],
+            2,
+        )
+        .await;
+
+        // The joiner got exactly the sender's key, nothing else.
+        assert_eq!(
+            *joining_received.lock().unwrap(),
+            set_message(b"key-0", b"primary-copy", None)
+        );
+
+        // The displaced copy — and only it — is reclaimed by the sweep.
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep).await,
+            Response::Swept(1)
+        );
+        match send_command(
+            &request_tx,
+            Command::PeekEntry {
+                key: Bytes::from_static(b"key-0"),
+            },
+        )
+        .await
+        {
+            Response::Entries(entries) => {
+                assert_eq!(entries.len(), 1, "the sender must keep its copy")
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match send_command(
+            &request_tx,
+            Command::PeekEntry {
+                key: Bytes::from_static(b"key-3"),
+            },
+        )
+        .await
+        {
+            Response::Entries(entries) => {
+                assert!(entries.is_empty(), "the displaced copy must be swept")
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        // And the flipped membership now rejects the displaced key while
+        // still serving the kept one.
+        assert!(wrong_node(&node_context, b"key-3"));
+        assert!(!wrong_node(&node_context, b"key-0"));
+
+        joining_task.await.unwrap();
+        discovery_task.await.unwrap();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     #[test]
     fn heartbeat_message_declares_the_name_length_before_the_name() {
         assert_eq!(heartbeat_message("some-name"), b"H 9\nsome-name".to_vec());
@@ -2162,9 +2369,11 @@ mod tests {
 
         // No other Joined nodes: the after-join ring has only the joining
         // node in it, so every key (including "name") routes to it.
-        let joining_name = "joining-node";
+        // Chosen so HRW ranks it above "ready-node" for both test keys
+        // ("name", "age") — the transfer set must be non-empty.
+        let joining_name = "joiner-107";
         let mut migrate_message =
-            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -2276,9 +2485,11 @@ mod tests {
             shutdown_rx.clone(),
         ));
 
-        let joining_name = "joining-node";
+        // Chosen so HRW ranks it above "ready-node" for both test keys
+        // ("name", "age") — the transfer set must be non-empty.
+        let joining_name = "joiner-107";
         let mut migrate_message =
-            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -2447,9 +2658,11 @@ mod tests {
             shutdown_rx.clone(),
         ));
 
-        let joining_name = "joining-node";
+        // Chosen so HRW ranks it above "ready-node" for both test keys
+        // ("name", "age") — the transfer set must be non-empty.
+        let joining_name = "joiner-107";
         let mut migrate_message =
-            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -2558,9 +2771,11 @@ mod tests {
             shutdown_rx.clone(),
         ));
 
-        let joining_name = "joining-node";
+        // Chosen so HRW ranks it above "ready-node" for both test keys
+        // ("name", "age") — the transfer set must be non-empty.
+        let joining_name = "joiner-107";
         let mut migrate_message =
-            format!("M {} {} 0\n", joining_name.len(), joining_addr.len()).into_bytes();
+            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
