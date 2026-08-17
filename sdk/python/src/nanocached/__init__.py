@@ -1,6 +1,6 @@
 """nanocached — asyncio client SDK for the nanocached distributed cache.
 
-See https://github.com/t0k0sh1/nanocached for the server and protocol.
+See https://github.com/nanocached/nanocached for the server and protocol.
 """
 
 from ._errors import (

@@ -1,6 +1,6 @@
 # nanocached
 
-TypeScript/Node.js SDK for [nanocached](https://github.com/t0k0sh1/nanocached),
+TypeScript/Node.js SDK for [nanocached](https://github.com/nanocached/nanocached),
 a tiny distributed cache. Talks to either a single `nanocached-node` or a
 `nanocached-discovery`-fronted cluster with client-side consistent hashing —
 the SDK figures out which from the server's own handshake response, so the

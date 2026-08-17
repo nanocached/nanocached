@@ -184,11 +184,11 @@ The latest images built from the `main` branch are also available from
 GitHub Container Registry:
 
 ```sh
-docker pull ghcr.io/t0k0sh1/nanocached-node:latest
-docker run --rm --publish 8356:8356 ghcr.io/t0k0sh1/nanocached-node:latest
+docker pull ghcr.io/nanocached/nanocached-node:latest
+docker run --rm --publish 8356:8356 ghcr.io/nanocached/nanocached-node:latest
 
-docker pull ghcr.io/t0k0sh1/nanocached-discovery:latest
-docker run --rm --publish 8357:8357 ghcr.io/t0k0sh1/nanocached-discovery:latest
+docker pull ghcr.io/nanocached/nanocached-discovery:latest
+docker run --rm --publish 8357:8357 ghcr.io/nanocached/nanocached-discovery:latest
 ```
 
 For example, store and retrieve the value `Alice` under the key `name`:
@@ -318,7 +318,7 @@ B\n
   same feature set (.NET 8+, no dependencies, NuGet ID `Nanocached`).
 - [`sdk/go`](sdk/go/README.md) — a Go client with the same feature set
   (Go 1.22+, standard library only, module
-  `github.com/t0k0sh1/nanocached/sdk/go` — interim path, see its README).
+  `github.com/nanocached/nanocached/sdk/go`).
 
 ## Capacity planning
 

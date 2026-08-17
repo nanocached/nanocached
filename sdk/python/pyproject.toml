@@ -21,8 +21,8 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://nanocached.org"
-Repository = "https://github.com/t0k0sh1/nanocached"
-Issues = "https://github.com/t0k0sh1/nanocached/issues"
+Repository = "https://github.com/nanocached/nanocached"
+Issues = "https://github.com/nanocached/nanocached/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -5,12 +5,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/t0k0sh1/nanocached.git",
+    "url": "git+https://github.com/nanocached/nanocached.git",
     "directory": "sdk/typescript"
   },
-  "homepage": "https://github.com/t0k0sh1/nanocached/tree/main/sdk/typescript#readme",
+  "homepage": "https://github.com/nanocached/nanocached/tree/main/sdk/typescript#readme",
   "bugs": {
-    "url": "https://github.com/t0k0sh1/nanocached/issues"
+    "url": "https://github.com/nanocached/nanocached/issues"
   },
   "keywords": [
     "nanocached",

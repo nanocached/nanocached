@@ -1,27 +1,22 @@
 # nanocached (Go)
 
-Go client SDK for [nanocached](https://github.com/t0k0sh1/nanocached),
+Go client SDK for [nanocached](https://github.com/nanocached/nanocached),
 a tiny distributed cache. Talks to either a single `nanocached-node` or a
 `nanocached-discovery`-fronted cluster — the SDK figures out which from
 the server's own handshake, so the calling code is identical either way.
 
 Requires Go 1.22+. No dependencies outside the standard library.
 
-> **Interim module path.** The repository currently lives under
-> `t0k0sh1`; it may move to the `nanocached` GitHub organization. That
-> decision is made before the first tagged release, because changing a
-> Go module path afterwards breaks importers.
-
 ## Install
 
 ```sh
-go get github.com/t0k0sh1/nanocached/sdk/go
+go get github.com/nanocached/nanocached/sdk/go
 ```
 
 ## Quick start
 
 ```go
-import nanocached "github.com/t0k0sh1/nanocached/sdk/go"
+import nanocached "github.com/nanocached/nanocached/sdk/go"
 
 // Point at a single node, or at a discovery server fronting a
 // cluster — same call either way.

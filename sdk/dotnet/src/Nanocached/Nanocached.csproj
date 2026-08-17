@@ -13,7 +13,7 @@
     <Description>Async client SDK for nanocached, a tiny distributed cache with client-side replication.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://nanocached.org</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/t0k0sh1/nanocached</RepositoryUrl>
+    <RepositoryUrl>https://github.com/nanocached/nanocached</RepositoryUrl>
     <PackageTags>nanocached;cache;distributed-cache;client;sdk</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

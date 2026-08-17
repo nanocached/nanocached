@@ -1,6 +1,6 @@
 # nanocached (Python)
 
-asyncio client SDK for [nanocached](https://github.com/t0k0sh1/nanocached),
+asyncio client SDK for [nanocached](https://github.com/nanocached/nanocached),
 a tiny distributed cache. Talks to either a single `nanocached-node` or a
 `nanocached-discovery`-fronted cluster — the SDK figures out which from the
 server's own handshake, so the calling code is identical either way.
