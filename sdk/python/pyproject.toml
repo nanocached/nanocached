@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanocached"
+version = "0.1.0"
+description = "asyncio client SDK for nanocached, a tiny distributed cache with client-side replication"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Takashi Yamashina" }]
+keywords = ["nanocached", "cache", "distributed-cache", "rendezvous-hashing", "client", "sdk"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://nanocached.org"
+Repository = "https://github.com/t0k0sh1/nanocached"
+Issues = "https://github.com/t0k0sh1/nanocached/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
