@@ -29,7 +29,6 @@ public sealed class NanocachedClient : IDisposable
         internal List<(string Host, int Port)> Seeds { get; } = new();
         internal byte[]? AuthSecretBytes { get; private set; }
         internal SslClientAuthenticationOptions? TlsOptions { get; private set; }
-        internal TimeSpan? KeepAlive { get; private set; }
 
         /// <summary>Adds a target; call repeatedly to list discovery
         /// replicas (ADR-0010), tried in order for connect and every
@@ -55,18 +54,6 @@ public sealed class NanocachedClient : IDisposable
             return this;
         }
 
-        /// <summary>Opt-in keep-alive; pick something below the server's
-        /// 30s idle timeout.</summary>
-        public Options KeepAliveInterval(TimeSpan interval)
-        {
-            if (interval <= TimeSpan.Zero)
-            {
-                throw new ArgumentOutOfRangeException(
-                    nameof(interval), "nanocached: KeepAliveInterval must be positive");
-            }
-            KeepAlive = interval;
-            return this;
-        }
     }
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -154,7 +141,7 @@ public sealed class NanocachedClient : IDisposable
                         }
                         client._single = new Connection(node.Stream);
                         client._singleAddress = $"{host}:{port}";
-                        client.StartKeepAlive(options.KeepAlive);
+                        client.StartKeepAlive();
                         return client;
 
                     case Identify.ClusterTarget cluster when cluster.Nodes.Count == 0:
@@ -164,7 +151,7 @@ public sealed class NanocachedClient : IDisposable
 
                     case Identify.ClusterTarget cluster:
                         await client.OpenClusterAsync(cluster).ConfigureAwait(false);
-                        client.StartKeepAlive(options.KeepAlive);
+                        client.StartKeepAlive();
                         return client;
                 }
             }
@@ -608,9 +595,14 @@ public sealed class NanocachedClient : IDisposable
 
     // ── keep-alive ────────────────────────────────────────────────
 
-    private void StartKeepAlive(TimeSpan? interval)
+    // Always on, with an internal interval (issue #27): half the
+    // server's 30s idle timeout, so it never severs a healthy client.
+    // Internal and mutable only so tests can shorten it.
+    internal static TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(15);
+
+    private void StartKeepAlive()
     {
-        if (interval is not { } every) return;
+        TimeSpan every = KeepAliveInterval;
 
         CancellationToken token = _lifetime.Token;
         _ = Task.Run(async () =>

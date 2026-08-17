@@ -32,6 +32,11 @@ const NODE_LIST_STALE_AFTER: Duration = Duration::from_secs(30);
 // The keep-alive ping: the server rejects empty keys, so it needs at
 // least one byte; a single NUL stays out of any real key space.
 const KEEPALIVE_KEY: &[u8] = &[0];
+/// Internal keep-alive interval in milliseconds — see the comment at its
+/// use in `connect`. Public-but-hidden purely as a test hook.
+#[doc(hidden)]
+pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(15_000);
 
 /// Options for [`NanocachedClient::connect`].
 #[derive(Default)]
@@ -39,7 +44,6 @@ pub struct Options {
     seeds: Vec<(String, u16)>,
     auth_secret: Option<Vec<u8>>,
     tls: Option<TlsConfig>,
-    keep_alive_interval: Option<Duration>,
 }
 
 impl Options {
@@ -65,12 +69,6 @@ impl Options {
     /// `tls` feature.
     pub fn tls(mut self, config: TlsConfig) -> Self {
         self.tls = Some(config);
-        self
-    }
-
-    /// Opt-in keep-alive; pick something below the server's 30s idle timeout.
-    pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
-        self.keep_alive_interval = Some(interval);
         self
     }
 }
@@ -120,14 +118,6 @@ impl NanocachedClient {
                 "nanocached: connect() needs at least one host/port".to_string(),
             ));
         }
-        if let Some(interval) = options.keep_alive_interval {
-            if interval.is_zero() {
-                return Err(Error::InvalidArgument(
-                    "nanocached: keep_alive_interval must be positive".to_string(),
-                ));
-            }
-        }
-
         // Walk the seeds until one yields a working target; a seed that is
         // unreachable, warming up (`B`, ADR-0010), or knows no live nodes
         // is skipped — the next replica may do better.
@@ -221,7 +211,13 @@ impl NanocachedClient {
             closed: AtomicBool::new(false),
         });
 
-        let keepalive = options.keep_alive_interval.map(|interval| {
+        // Keep-alive is always on, with an internal interval (issue #27):
+        // half the server's 30s idle timeout, so it never severs a healthy
+        // client. Read once per connect; the static exists only so tests
+        // can shorten it.
+        let interval =
+            Duration::from_millis(KEEPALIVE_INTERVAL_MS.load(std::sync::atomic::Ordering::SeqCst));
+        let keepalive = Some({
             let inner = Arc::clone(&inner);
             Arc::new(tokio::spawn(async move {
                 loop {

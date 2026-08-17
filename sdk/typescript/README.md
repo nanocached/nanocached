@@ -122,30 +122,16 @@ development or deliberate single-node deployments.
 
 ## Idle connections, reconnect, and keep-alive
 
-`nanocached-node` closes connections that have been idle for 30 seconds.
-The SDK handles this transparently: a request that finds its connection
-dead reconnects to the same node first (concurrent requests share one
-reconnect). The only cost is one extra round trip on the first request
-after a long idle gap.
-
-If that round trip matters, opt in to keep-alive:
-
-```ts
-const client = await NanocachedClient.connect({
-  host,
-  port,
-  keepAliveIntervalMs: 15_000, // must sit below the server's 30s idle timeout
-});
-```
-
-Every interval, each connection that real traffic has left idle for at
-least that long gets a lightweight request, keeping the server's idle
-timer from ever firing. This trades background load on every node (from
-every long-lived client) for latency, so it is off by default.
+`nanocached-node` closes connections idle for 30 seconds; the SDK keeps
+its connections warm automatically, pinging any connection that real
+traffic has left idle for 15 seconds — so an idle timeout never severs a
+healthy client, and a request that does find its connection dead (a node
+restart, a network blip) redials and retries once transparently (all
+operations are idempotent). There is nothing to configure.
 
 ## API
 
-- `NanocachedClient.connect(options)` — `options: { host?, port?, seeds?, authSecret?, tls?, keepAliveIntervalMs? }`
+- `NanocachedClient.connect(options)` — `options: { host?, port?, seeds?, authSecret?, tls? }`
   (give either `host`/`port` or a non-empty `seeds` list)
 - `client.get(key)` — resolves `Buffer | null`
 - `client.set(key, value, { ttlSeconds? })` — `ttlSeconds` must be a

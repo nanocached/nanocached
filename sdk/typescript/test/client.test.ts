@@ -1,7 +1,8 @@
-import { describe, it, mock } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
+import { KEEPALIVE_TUNING } from "../src/client.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -496,22 +497,20 @@ describe("NanocachedClient reconnect-on-use", () => {
 });
 
 describe("NanocachedClient keep-alive", () => {
-  it("rejects a non-positive or non-integer interval synchronously", async () => {
-    for (const keepAliveIntervalMs of [0, -5, 3.5, NaN, Infinity]) {
-      await assert.rejects(
-        NanocachedClient.connect({ host: "127.0.0.1", port: 1, keepAliveIntervalMs }),
-        RangeError,
-      );
-    }
+  // Keep-alive is always on with an internal interval (issue #27);
+  // KEEPALIVE_TUNING exists only so these tests can shorten it.
+  const defaultIntervalMs = KEEPALIVE_TUNING.intervalMs;
+  afterEach(() => {
+    KEEPALIVE_TUNING.intervalMs = defaultIntervalMs;
   });
 
   it("pings an idle connection often enough to reset the server's idle timer", async () => {
     const node = await startMockNode();
     try {
+      KEEPALIVE_TUNING.intervalMs = 40;
       const client = await NanocachedClient.connect({
         host: "127.0.0.1",
         port: node.port,
-        keepAliveIntervalMs: 40,
       });
       try {
         await waitFor(() => node.getCount() >= 2, "keep-alive pings to arrive");
@@ -528,10 +527,10 @@ describe("NanocachedClient keep-alive", () => {
   it("stops pinging once the client is closed", async () => {
     const node = await startMockNode();
     try {
+      KEEPALIVE_TUNING.intervalMs = 20;
       const client = await NanocachedClient.connect({
         host: "127.0.0.1",
         port: node.port,
-        keepAliveIntervalMs: 20,
       });
       await waitFor(() => node.getCount() >= 1, "a keep-alive ping to arrive");
       client.close();
@@ -547,10 +546,10 @@ describe("NanocachedClient keep-alive", () => {
   it("does not ping a connection that real traffic keeps busy", async () => {
     const node = await startMockNode();
     try {
+      KEEPALIVE_TUNING.intervalMs = 60;
       const client = await NanocachedClient.connect({
         host: "127.0.0.1",
         port: node.port,
-        keepAliveIntervalMs: 60,
       });
       try {
         for (let i = 0; i < 10; i++) {

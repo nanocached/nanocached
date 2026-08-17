@@ -256,12 +256,23 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
 
 
 class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
+    # Keep-alive is always on with an internal interval (issue #27); the
+    # module-level constant exists only so these tests can shorten it.
+
+    def setUp(self):
+        from nanocached import client as client_module
+
+        self._client_module = client_module
+        self._default_interval = client_module._KEEPALIVE_INTERVAL
+
+    def tearDown(self):
+        self._client_module._KEEPALIVE_INTERVAL = self._default_interval
+
     async def test_pings_an_idle_connection(self):
         node = await MockNode().start()
         try:
-            client = await NanocachedClient.connect(
-                "127.0.0.1", node.port, keep_alive_interval=0.04
-            )
+            self._client_module._KEEPALIVE_INTERVAL = 0.04
+            client = await NanocachedClient.connect("127.0.0.1", node.port)
             try:
                 await wait_for(lambda: node.get_count >= 2, "keep-alive pings")
                 self.assertEqual(node.connection_count, 1)
@@ -273,9 +284,8 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
     async def test_stops_after_close(self):
         node = await MockNode().start()
         try:
-            client = await NanocachedClient.connect(
-                "127.0.0.1", node.port, keep_alive_interval=0.02
-            )
+            self._client_module._KEEPALIVE_INTERVAL = 0.02
+            client = await NanocachedClient.connect("127.0.0.1", node.port)
             await wait_for(lambda: node.get_count >= 1, "a keep-alive ping")
             client.close()
             pings = node.get_count
@@ -283,10 +293,6 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(node.get_count, pings)
         finally:
             await node.close()
-
-    async def test_rejects_a_non_positive_interval(self):
-        with self.assertRaises(ValueError):
-            await NanocachedClient.connect("127.0.0.1", 1, keep_alive_interval=0)
 
 
 class SeedTests(unittest.IsolatedAsyncioTestCase):

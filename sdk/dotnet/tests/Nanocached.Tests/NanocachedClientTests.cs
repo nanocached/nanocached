@@ -168,21 +168,22 @@ public class NanocachedClientTests
     [Fact]
     public async Task KeepAlivePingsAnIdleConnection()
     {
-        using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync(
-            new NanocachedClient.Options()
-                .Host("127.0.0.1", node.Port)
-                .KeepAliveInterval(TimeSpan.FromMilliseconds(40)));
+        // Keep-alive is always on with an internal interval (issue #27);
+        // the internal field exists only so tests can shorten it.
+        TimeSpan defaultInterval = NanocachedClient.KeepAliveInterval;
+        NanocachedClient.KeepAliveInterval = TimeSpan.FromMilliseconds(40);
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
 
-        await WaitForAsync(() => node.GetCount >= 2, "keep-alive pings");
-        Assert.Equal(1, node.ConnectionCount);
-    }
-
-    [Fact]
-    public void RejectsANonPositiveKeepAliveInterval()
-    {
-        Assert.Throws<ArgumentOutOfRangeException>(
-            () => new NanocachedClient.Options().KeepAliveInterval(TimeSpan.Zero));
+            await WaitForAsync(() => node.GetCount >= 2, "keep-alive pings");
+            Assert.Equal(1, node.ConnectionCount);
+        }
+        finally
+        {
+            NanocachedClient.KeepAliveInterval = defaultInterval;
+        }
     }
 
     // ── seeds ─────────────────────────────────────────────────────

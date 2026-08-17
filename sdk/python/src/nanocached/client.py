@@ -35,6 +35,9 @@ _NODE_LIST_STALE_AFTER = 30.0
 # The keep-alive ping: the server rejects empty keys, so it needs at least
 # one byte; a single NUL stays out of any real key space.
 _KEEPALIVE_KEY = b"\x00"
+# Half the server's 30s idle timeout; internal (issue #27), mutable only
+# so tests can shorten it.
+_KEEPALIVE_INTERVAL = 15.0
 
 
 def _warn(message: str) -> None:
@@ -81,13 +84,7 @@ class NanocachedClient:
         seeds: list[tuple[str, int]] | None = None,
         auth_secret: str | bytes | None = None,
         tls: bool | ssl_module.SSLContext = False,
-        keep_alive_interval: float | None = None,
     ) -> "NanocachedClient":
-        if keep_alive_interval is not None and keep_alive_interval <= 0:
-            raise ValueError(
-                f"nanocached: keep_alive_interval must be positive, got {keep_alive_interval}"
-            )
-
         resolved_seeds = seeds if seeds is not None else (
             [(host, port)] if host is not None and port is not None else []
         )
@@ -121,7 +118,7 @@ class NanocachedClient:
                     )
                 client._single = Connection(identified.reader, identified.writer)
                 client._single_address = f"{seed_host}:{seed_port}"
-                client._start_keepalive(keep_alive_interval)
+                client._start_keepalive()
                 return client
 
             if not identified.nodes:
@@ -136,7 +133,7 @@ class NanocachedClient:
             except BaseException:
                 client._teardown()
                 raise
-            client._start_keepalive(keep_alive_interval)
+            client._start_keepalive()
             return client
 
         raise last_error if last_error is not None else NanocachedError(
@@ -436,9 +433,11 @@ class NanocachedClient:
 
     # ── keep-alive ─────────────────────────────────────────────────
 
-    def _start_keepalive(self, interval: float | None) -> None:
-        if interval is None:
-            return
+    def _start_keepalive(self) -> None:
+        # Always on, with an internal interval (issue #27): half the
+        # server's 30s idle timeout, so it never severs a healthy client.
+        # Module-level only so tests can shorten it.
+        interval = _KEEPALIVE_INTERVAL
 
         async def ping_loop() -> None:
             while not self._closed:

@@ -45,16 +45,14 @@ export interface NanocachedClientOptions {
    * server is running a self-signed certificate with no CA-issued
    * alternative available. */
   tls?: boolean | NanocachedTlsOptions;
-  /** Opt-in keep-alive: every `keepAliveIntervalMs`, send a lightweight
-   * request on each connection that real traffic has left idle for at
-   * least that long. nanocached-node closes connections idle for 30s
-   * (hardcoded), so pick something comfortably below that — e.g. 10—15s.
-   * Without this, an idle connection is simply closed by the server and
-   * transparently reopened on the next request (one extra round trip);
-   * keep-alive is purely a latency optimization, at the cost of putting
-   * background load on every node from every long-lived client. */
-  keepAliveIntervalMs?: number;
 }
+
+/** Keep-alive is always on and internal (issue #27): every interval, a
+ * lightweight request goes out on each connection real traffic has left
+ * idle for at least that long, so the server's 30s idle timeout never
+ * severs a healthy client. Half the idle timeout by design; exported as
+ * a mutable object only so tests can shorten it. */
+export const KEEPALIVE_TUNING = { intervalMs: 15_000 };
 
 function splitHostPort(address: string): { host: string; port: number } {
   const separator = address.lastIndexOf(":");
@@ -166,24 +164,12 @@ export class NanocachedClient {
     private readonly seeds: readonly NanocachedSeed[],
     private readonly authSecret: string | Uint8Array | undefined,
     private readonly tls: boolean | NanocachedTlsOptions | undefined,
-    keepAliveIntervalMs: number | undefined,
   ) {
     this.nodeUrls = nodeUrls;
-    if (keepAliveIntervalMs !== undefined) this.startKeepAlive(keepAliveIntervalMs);
+    this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
   }
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
-    if (
-      options.keepAliveIntervalMs !== undefined &&
-      (!Number.isInteger(options.keepAliveIntervalMs) || options.keepAliveIntervalMs <= 0)
-    ) {
-      // Same reasoning as encodeSet's TTL check: fail synchronously on a
-      // value that could never be meant, before opening any connection.
-      throw new RangeError(
-        `nanocached: keepAliveIntervalMs must be a positive integer, got ${options.keepAliveIntervalMs}`,
-      );
-    }
-
     const seeds: NanocachedSeed[] =
       options.seeds ??
       (options.host !== undefined && options.port !== undefined
@@ -240,7 +226,6 @@ export class NanocachedClient {
           seeds,
           options.authSecret,
           options.tls,
-          options.keepAliveIntervalMs,
         );
       }
 
@@ -289,7 +274,6 @@ export class NanocachedClient {
         seeds,
         options.authSecret,
         options.tls,
-        options.keepAliveIntervalMs,
       );
     }
 
@@ -684,7 +668,7 @@ export class NanocachedClient {
     return new Connection(identified.socket);
   }
 
-  /** See NanocachedClientOptions.keepAliveIntervalMs. Each tick pings only
+  /** See KEEPALIVE_TUNING. Each tick pings only
    * connections that are open (dead ones stay lazy, reconnected on use)
    * and that real traffic has left idle for at least a full interval. Any
    * parseable reply proves liveness and resets the server's idle timer —

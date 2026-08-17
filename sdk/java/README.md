@@ -53,16 +53,12 @@ failed attempt forces a node-list refresh and one retry.
 
 ## Reconnect and keep-alive
 
-`nanocached-node` closes connections idle for 30 seconds; a request that
-finds its connection dead redials and retries once transparently (all
-operations are idempotent). If that extra round trip matters, opt in to
-keep-alive:
-
-```java
-NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
-        .host("127.0.0.1", 8357)
-        .keepAliveInterval(Duration.ofSeconds(15)));
-```
+`nanocached-node` closes connections idle for 30 seconds; the SDK keeps
+its connections warm automatically, pinging any connection that real
+traffic has left idle for 15 seconds — so an idle timeout never severs a
+healthy client, and a request that does find its connection dead (a node
+restart, a network blip) redials and retries once transparently (all
+operations are idempotent). There is nothing to configure.
 
 ## Authentication and TLS
 

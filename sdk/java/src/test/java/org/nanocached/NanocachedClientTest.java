@@ -153,20 +153,18 @@ class NanocachedClientTest {
 
     @Test
     void keepAlivePingsAnIdleConnection() throws Exception {
+        // Keep-alive is always on with an internal interval (issue #27);
+        // the package-visible field exists only so tests can shorten it.
+        long defaultInterval = NanocachedClient.keepAliveIntervalMillis;
+        NanocachedClient.keepAliveIntervalMillis = 40;
         try (MockNode node = new MockNode()) {
-            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
-                    .host("127.0.0.1", node.port())
-                    .keepAliveInterval(Duration.ofMillis(40)))) {
+            try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", node.port())) {
                 waitFor(() -> node.getCount.get() >= 2, "keep-alive pings");
                 assertEquals(1, node.connectionCount.get());
             }
+        } finally {
+            NanocachedClient.keepAliveIntervalMillis = defaultInterval;
         }
-    }
-
-    @Test
-    void rejectsANonPositiveKeepAliveInterval() {
-        assertThrows(IllegalArgumentException.class,
-                () -> NanocachedClient.builder().keepAliveInterval(Duration.ZERO));
     }
 
     // ── seeds ─────────────────────────────────────────────────────
