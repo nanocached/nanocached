@@ -460,12 +460,16 @@ async fn transparently_reconnects_after_a_server_fin() {
 
 #[tokio::test]
 async fn keep_alive_pings_an_idle_connection() {
+    // Keep-alive is always on with an internal interval (issue #27); the
+    // hidden static exists only so tests can shorten it. The interval is
+    // read once at connect, so restore it immediately after connecting to
+    // keep the lowered value from leaking into concurrently running tests.
     let node = MockNode::start().await;
-    let client = NanocachedClient::connect(
-        options(node.port).keep_alive_interval(Duration::from_millis(40)),
-    )
-    .await
-    .unwrap();
+    let default_interval = nanocached::KEEPALIVE_INTERVAL_MS.load(Ordering::SeqCst);
+    nanocached::KEEPALIVE_INTERVAL_MS.store(40, Ordering::SeqCst);
+    let connected = NanocachedClient::connect(options(node.port)).await;
+    nanocached::KEEPALIVE_INTERVAL_MS.store(default_interval, Ordering::SeqCst);
+    let client = connected.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while node.state.gets.load(Ordering::SeqCst) < 2 {
@@ -478,12 +482,6 @@ async fn keep_alive_pings_an_idle_connection() {
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
     client.close();
     node.stop();
-}
-
-#[tokio::test]
-async fn rejects_a_zero_keep_alive_interval() {
-    let result = NanocachedClient::connect(options(1).keep_alive_interval(Duration::ZERO)).await;
-    assert!(matches!(result, Err(Error::InvalidArgument(_))));
 }
 
 // ── seeds ─────────────────────────────────────────────────────────

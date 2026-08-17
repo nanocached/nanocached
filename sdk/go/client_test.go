@@ -552,11 +552,14 @@ func TestTransparentlyReconnectsAfterAServerFin(t *testing.T) {
 }
 
 func TestKeepAlivePingsAnIdleConnection(t *testing.T) {
+	// Keep-alive is always on with an internal interval (issue #27); the
+	// package variable exists only so tests can shorten it.
+	defaultInterval := keepAliveInterval
+	keepAliveInterval = 40 * time.Millisecond
+	defer func() { keepAliveInterval = defaultInterval }()
+
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{
-		Seeds:             []string{node.address()},
-		KeepAliveInterval: 40 * time.Millisecond,
-	})
+	client, err := Connect(Config{Seeds: []string{node.address()}})
 	if err != nil {
 		t.Fatal(err)
 	}

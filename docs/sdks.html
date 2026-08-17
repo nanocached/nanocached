@@ -36,7 +36,7 @@ code.</p>
 
 <p>Every SDK ships the full feature set: authentication, TLS, discovery
 seeds, replication-aware routing (reads fail over, writes fan out to all
-R owners), transparent reconnect with a single retry, optional
+R owners), transparent reconnect with a single retry, always-on
 keep-alive, and the same rendezvous-hashing pipeline verified against
 shared cross-language test vectors.</p>
 
@@ -147,8 +147,8 @@ existed, err := client.Delete("greeting")</code></pre>
   <code>W</code>) or a dead primary both trigger one node-list refresh
   and one retry; recovery is bounded by discovery's liveness timeout.</li>
   <li><b>Reconnect</b> — nodes close idle connections after 30 s; SDKs
-  redial lazily on next use, or keep connections warm with the opt-in
-  keep-alive interval.</li>
+  keep their connections warm automatically (an internal 15 s
+  keep-alive), and redial transparently if one does die.</li>
   <li><b>Concurrency</b> — every client is safe for concurrent use;
   requests are serialized per connection.</li>
 </ul>

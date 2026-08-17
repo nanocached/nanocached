@@ -48,10 +48,12 @@ type Config struct {
 	// TLS, when non-nil, connects every socket over TLS with this config
 	// (system roots by default; set RootCAs for a private CA).
 	TLS *tls.Config
-	// KeepAliveInterval, when positive, pings idle connections that often
-	// so the server's 30s idle timeout never fires; zero disables.
-	KeepAliveInterval time.Duration
 }
+
+// keepAliveInterval is the always-on keep-alive cadence (issue #27):
+// half the server's 30s idle timeout, so it never severs a healthy
+// client. A variable only so tests can shorten it.
+var keepAliveInterval = 15 * time.Second
 
 type member struct {
 	address    string
@@ -84,9 +86,6 @@ type Client struct {
 func Connect(config Config) (*Client, error) {
 	if len(config.Seeds) == 0 {
 		return nil, fmt.Errorf("nanocached: Connect needs at least one seed")
-	}
-	if config.KeepAliveInterval < 0 {
-		return nil, fmt.Errorf("nanocached: KeepAliveInterval must not be negative")
 	}
 
 	client := &Client{
@@ -122,7 +121,7 @@ func Connect(config Config) (*Client, error) {
 			}
 			client.single = newConnection(result.conn)
 			client.singleAddress = seed
-			client.startKeepalive(config.KeepAliveInterval)
+			client.startKeepalive(keepAliveInterval)
 			return client, nil
 		}
 
@@ -136,7 +135,7 @@ func Connect(config Config) (*Client, error) {
 			client.teardown()
 			return nil, err
 		}
-		client.startKeepalive(config.KeepAliveInterval)
+		client.startKeepalive(keepAliveInterval)
 		return client, nil
 	}
 
@@ -567,10 +566,6 @@ func (c *Client) fetchNodeList() ([]DiscoveredNode, int, bool) {
 // ── keep-alive ────────────────────────────────────────────────────
 
 func (c *Client) startKeepalive(interval time.Duration) {
-	if interval <= 0 {
-		return
-	}
-
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

@@ -59,14 +59,12 @@ holder is unreachable. `client.replication` exposes the factor in use.
 
 ## Reconnect and keep-alive
 
-`nanocached-node` closes connections idle for 30 seconds; a request that
-finds its connection dead transparently redials first (concurrent
-requests share one dial). If that extra round trip matters, opt in to
-keep-alive:
-
-```python
-client = await NanocachedClient.connect("127.0.0.1", 8357, keep_alive_interval=15.0)
-```
+`nanocached-node` closes connections idle for 30 seconds; the SDK keeps
+its connections warm automatically, pinging any connection that real
+traffic has left idle for 15 seconds — so an idle timeout never severs a
+healthy client, and a request that does find its connection dead (a node
+restart, a network blip) redials and retries once transparently (all
+operations are idempotent). There is nothing to configure.
 
 ## Authentication and TLS
 

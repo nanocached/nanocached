@@ -9,6 +9,8 @@ mod error;
 mod hash_ring;
 mod identify;
 
+#[doc(hidden)]
+pub use client::KEEPALIVE_INTERVAL_MS;
 pub use client::{NanocachedClient, Options};
 pub use error::{Error, Result};
 pub use hash_ring::HashRing;

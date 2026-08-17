@@ -40,7 +40,6 @@ public final class NanocachedClient implements AutoCloseable {
         private final List<Seed> seeds = new ArrayList<>();
         private byte[] authSecret;
         private SSLContext tls;
-        private Duration keepAliveInterval;
 
         public Options host(String host, int port) {
             seeds.add(new Seed(host, port));
@@ -66,14 +65,6 @@ public final class NanocachedClient implements AutoCloseable {
             return this;
         }
 
-        /** Opt-in keep-alive; pick something below the server's 30s idle timeout. */
-        public Options keepAliveInterval(Duration interval) {
-            if (interval.isZero() || interval.isNegative()) {
-                throw new IllegalArgumentException("nanocached: keepAliveInterval must be positive");
-            }
-            this.keepAliveInterval = interval;
-            return this;
-        }
     }
 
     public static Options builder() {
@@ -83,6 +74,7 @@ public final class NanocachedClient implements AutoCloseable {
     private static final Duration NODE_LIST_STALE_AFTER = Duration.ofSeconds(30);
     // The server rejects empty keys, so the keep-alive G needs one byte.
     private static final byte[] KEEPALIVE_KEY = {0};
+    static volatile long keepAliveIntervalMillis = 15_000;
 
     private final Object stateLock = new Object();
     private final Object refreshLock = new Object();
@@ -157,7 +149,7 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                     client.single = new Connection(node.socket());
                     client.singleAddress = seed.host() + ":" + seed.port();
-                    client.startKeepAlive(options.keepAliveInterval);
+                    client.startKeepAlive();
                     return client;
                 }
 
@@ -170,7 +162,7 @@ public final class NanocachedClient implements AutoCloseable {
                 }
 
                 client.openCluster(cluster);
-                client.startKeepAlive(options.keepAliveInterval);
+                client.startKeepAlive();
                 return client;
             } catch (IOException error) {
                 client.teardown();
@@ -549,8 +541,11 @@ public final class NanocachedClient implements AutoCloseable {
 
     // ── keep-alive ────────────────────────────────────────────────
 
-    private void startKeepAlive(Duration interval) {
-        if (interval == null) return;
+    private void startKeepAlive() {
+        // Always on, with an internal interval (issue #27): half the
+        // server's 30s idle timeout, so it never severs a healthy
+        // client. Package-visible only so tests can shorten it.
+        Duration interval = Duration.ofMillis(keepAliveIntervalMillis);
 
         keepAlive = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "nanocached-keepalive");
