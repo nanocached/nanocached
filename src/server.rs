@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
@@ -26,6 +26,12 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long after this node's own handoff completes it keeps forwarding
+/// concurrent writes to the joiner (issue #3) — matches discovery's
+/// default --migration-timeout, by which time the join has either
+/// completed cluster-wide (the joiner is in `L`, clients route to it
+/// directly) or been abandoned (an `X` cleared the slot).
+const FORWARDING_GRACE: Duration = Duration::from_secs(60);
 /// How often the ADR-0008 active-deletion sweep runs. See `run_sweep`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -635,14 +641,21 @@ async fn handle_connection(
                 // a different `joining_name` (already finished, or this
                 // cancel arrived late) — `run_migration` alone decides
                 // whether to actually stop.
-                if let Some(active) = node_context
-                    .active_migration
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .as_ref()
-                    && active.joining_name == joining_name
                 {
-                    active.abort_requested.store(true, Ordering::SeqCst);
+                    let mut slot = node_context
+                        .active_migration
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(active) = slot.as_ref()
+                        && active.joining_name == joining_name
+                    {
+                        active.abort_requested.store(true, Ordering::SeqCst);
+                        // A completed entry only lingers to forward writes
+                        // (issue #3); the join being abandoned ends that.
+                        if active.completed_at.is_some() {
+                            *slot = None;
+                        }
+                    }
                 }
 
                 stream
@@ -1084,6 +1097,16 @@ struct ActiveMigration {
     /// started this handoff — membership in the joining node's copy set
     /// is "in the key's top-R", not "is the key's owner".
     replication: usize,
+    /// `None` while this node's own transfer is running; `Some(when)`
+    /// once it finished successfully. Issue #3: discovery only publishes
+    /// the joiner after EVERY ready node reports `C`, so this node must
+    /// keep forwarding concurrent writes to the joiner after its own
+    /// share is done — a still-stale client that can't see the joiner in
+    /// `L` yet would otherwise write to this node without the joiner ever
+    /// learning of it. The window is bounded by `FORWARDING_GRACE`
+    /// (matching discovery's migration timeout: past it the join has
+    /// either completed cluster-wide or been abandoned).
+    completed_at: Option<Instant>,
     abort_requested: Arc<AtomicBool>,
 }
 
@@ -1113,6 +1136,7 @@ impl<'a> MigrationGuard<'a> {
             joining_addr,
             after_ring,
             replication,
+            completed_at: None,
             abort_requested: Arc::clone(&abort_requested),
         });
 
@@ -1120,6 +1144,23 @@ impl<'a> MigrationGuard<'a> {
             slot,
             abort_requested,
         }
+    }
+
+    /// Consumes the guard after a successful transfer: instead of
+    /// clearing the slot (which would close the write-forwarding window
+    /// the moment THIS node finishes — issue #3), it stamps the
+    /// completion time so `migration_target_for` keeps forwarding until
+    /// `FORWARDING_GRACE` passes or the slot is replaced/cancelled.
+    fn completed(self) {
+        if let Some(active) = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            active.completed_at = Some(Instant::now());
+        }
+        std::mem::forget(self);
     }
 }
 
@@ -1336,6 +1377,10 @@ async fn run_migration(
             node_context.discovery_addr
         );
     }
+
+    // Keep the write-forwarding window open past this node's own share
+    // (issue #3) — see `MigrationGuard::completed`.
+    migration_guard.completed();
 }
 
 async fn list_entries(
@@ -1435,10 +1480,14 @@ async fn run_sweep(
         }
 
         loop {
+            // Pause only while a transfer is actually running: a
+            // completed entry lingering for its forwarding grace
+            // (issue #3) must not stall TTL/mark sweeping for a minute.
             let migration_active = active_migration
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_some();
+                .as_ref()
+                .is_some_and(|active| active.completed_at.is_none());
 
             if migration_active {
                 break;
@@ -1557,11 +1606,24 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
 /// there, so the joining node doesn't end up serving a stale value once
 /// promoted (see doc/adr/0008's Consequences).
 fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String> {
-    node_context
+    let mut slot = node_context
         .active_migration
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Issue #3: a completed handoff keeps forwarding until the grace
+    // passes (discovery publishes the joiner — or abandons the join —
+    // well within it). Expired entries are cleared lazily here.
+    let expired = slot.as_ref().is_some_and(|active| {
+        active
+            .completed_at
+            .is_some_and(|completed_at| completed_at.elapsed() >= FORWARDING_GRACE)
+    });
+    if expired {
+        *slot = None;
+    }
+
+    slot.as_ref()
         .filter(|active| {
             // ADR-0011: the joiner is a destination for `key` whenever it
             // entered the key's top-R, not only as its new primary.
@@ -2193,7 +2255,7 @@ mod tests {
         run_migration(
             node_context.clone(),
             "joiner-0".to_string(),
-            joining_addr,
+            joining_addr.clone(),
             vec![
                 ("ready-node".to_string(), "127.0.0.1:1".to_string()),
                 ("other-node".to_string(), "127.0.0.1:1".to_string()),
@@ -2245,6 +2307,29 @@ mod tests {
         assert!(wrong_node(&node_context, b"key-3"));
         assert!(!wrong_node(&node_context, b"key-0"));
 
+        // Issue #3: this node's own share being done must NOT close the
+        // write-forwarding window — discovery hasn't published the joiner
+        // yet (other ready nodes may still be transferring), so a
+        // concurrent client write for a key in the joiner's top-R still
+        // needs forwarding.
+        assert_eq!(
+            migration_target_for(&node_context, b"key-0").as_deref(),
+            Some(joining_addr.as_str()),
+        );
+        // ...but sweeping must no longer be paused by the lingering entry
+        // (only a *running* transfer pauses it).
+        assert!(
+            node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .completed_at
+                .is_some(),
+            "the completed handoff should carry its completion stamp"
+        );
+
         joining_task.await.unwrap();
         discovery_task.await.unwrap();
         drop(node_context);
@@ -2286,6 +2371,41 @@ mod tests {
         assert_eq!(
             complete_message("some-name", "joiner"),
             b"C 9 6\nsome-namejoiner".to_vec()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_completed_forwarding_window_expires_after_the_grace() {
+        // Issue #3: the lingering entry forwards only within
+        // FORWARDING_GRACE; past it, migration_target_for clears the slot
+        // and stops forwarding.
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            discovery_addr: "127.0.0.1:1".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx,
+        };
+
+        *node_context.active_migration.lock().unwrap() = Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            completed_at: Some(Instant::now() - FORWARDING_GRACE - Duration::from_secs(1)),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+        });
+
+        assert_eq!(migration_target_for(&node_context, b"key-0"), None);
+        assert!(
+            node_context.active_migration.lock().unwrap().is_none(),
+            "an expired forwarding entry should be cleared lazily"
         );
     }
 
