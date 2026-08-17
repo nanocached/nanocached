@@ -32,7 +32,7 @@ toolchain and installs the Clippy and rustfmt components automatically.
 
 ## Command-line tools
 
-Building the project produces four binaries:
+Building the project produces three binaries:
 
 - `ncd` — a thin dispatcher: `ncd node start [options]` runs the cache node,
   `ncd discovery start [options]` runs the discovery server. Convenient for
@@ -42,9 +42,6 @@ Building the project produces four binaries:
 - `nanocached-node` — the cache server itself.
 - `nanocached-discovery` — the standalone cluster-membership registry (see
   [Discovery server](#discovery-server) below).
-- `bench` — a load-test client; a development tool, not part of the
-  product, so it is intentionally not reachable through `ncd` (see
-  [Benchmarking](#benchmarking) below).
 
 `ncd` looks up `nanocached-node`/`nanocached-discovery` next to its own
 executable, so it only works once both have been built into the same
@@ -148,8 +145,8 @@ openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 1 
 ```
 
 Since this is self-signed, the same `cert.pem` doubles as the `--tls-ca`
-trust anchor for any client (a node's heartbeat, or `bench --tls-ca`)
-connecting to a server using it.
+trust anchor for any client (a node's heartbeat, or an SDK's TLS `ca`
+option) connecting to a server using it.
 
 Unlike authentication, TLS has no environment-variable option: certificate
 and key paths aren't secrets themselves (the private key file's contents
@@ -384,40 +381,6 @@ Use `MUTANTS_BASE` to select a different comparison revision and
 make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
 ```
 
-### Benchmarking
-
-`src/bin/bench.rs` is an async, multi-threaded load client for nanocached's
-protocol:
-
-```sh
-cargo run --release --bin bench -- --help
-cargo run --release --bin bench -- -c 64 --workload mixed
-```
-
-Pass `--discovery <addr>` instead of `--host`/`--port` to fetch the node
-list from a discovery server and route keys across those nodes by
-consistent hashing:
-
-```sh
-cargo run --release --bin bench -- --discovery 127.0.0.1:8357 -c 64 --workload mixed
-```
-
-Pass `--auth-secret <secret>` if the target node(s) or discovery server
-require authentication (see [Authentication](#authentication)); it's a CLI
-flag rather than an environment variable because `bench` is an interactive
-dev/test tool, not a production service (mirroring `redis-cli -a`).
-
-Pass `--tls-ca <path>` if the target node(s) or discovery server require
-TLS (see [TLS](#tls)); `bench` then connects to every node and the
-discovery server over TLS instead of plaintext, trusting only the CA(s) in
-that file.
-
-Note: running bench and the node(s) it's driving on the same machine means
-they compete for the same CPU cores, which can make bench itself the
-bottleneck once enough nodes are involved. For a trustworthy capacity
-measurement of more than a couple of nodes, run bench on separate hardware
-from the nodes.
-
 ### Discovery server
 
 `src/bin/nanocached-discovery.rs` is a standalone cluster-membership
@@ -432,8 +395,8 @@ cargo run --bin nanocached-discovery -- --port 8357
 
 It supports the same `NANOCACHED_AUTH_SECRET`-based authentication and
 `--tls-cert`/`--tls-key`-based TLS as `nanocached-node` (see
-[Authentication](#authentication) and [TLS](#tls)); nodes and `bench` speak
-the same `A` handshake and TLS handshake to it as they do to a cache node.
+[Authentication](#authentication) and [TLS](#tls)); nodes speak the same
+`A` handshake and TLS handshake to it as clients do to a cache node.
 
 `--replication-factor <n>` (default 2, min 1) sets how many nodes hold
 each key (`doc/adr/0011-*.md`): keys are ranked by rendezvous hashing and
