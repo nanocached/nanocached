@@ -114,7 +114,7 @@ export class Connection {
   }
 
   /** Whether the underlying socket has closed — locally via close(), or
-   * remotely (e.g. the server's 30s idle timeout sent a FIN). Once true, a
+   * remotely (e.g. the server's 60s idle timeout sent a FIN). Once true, a
    * caller holding this connection must open a new one; see
    * `NanocachedClient.routedConnection`. */
   isClosed(): boolean {

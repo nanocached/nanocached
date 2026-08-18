@@ -7,7 +7,7 @@ import { ConnectionLostError } from "./connection.js";
  * container, a dead cloud instance) blackholes the TCP connect and a
  * caller hangs for the kernel's own timeout — minutes — instead of
  * failing over. */
-export const CONNECT_DEADLINE_MS = 10_000;
+export const CONNECT_DEADLINE_MS = 5_000;
 
 export interface ConnectSocketOptions {
   host: string;

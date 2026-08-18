@@ -18,7 +18,7 @@ namespace Nanocached;
 /// the next owner only when the holder is unreachable. Dead connections
 /// are redialed lazily on use (with one transparent retry — a socket only
 /// learns of a peer FIN on I/O, and every operation is idempotent), and an
-/// opt-in keep-alive can hold connections open across the server's 30s
+/// opt-in keep-alive can hold connections open across the server's 60s
 /// idle timeout.
 ///
 /// Thread-safe. Requests are serialized per connection; concurrent
@@ -391,7 +391,7 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>
     /// Runs <paramref name="op"/> against the slot's connection, retrying
     /// once on a connection-level failure: a socket only learns of a peer
-    /// FIN (e.g. the server's 30s idle timeout) on I/O, so lazy
+    /// FIN (e.g. the server's 60s idle timeout) on I/O, so lazy
     /// reconnect-on-use means the failed request poisons the connection,
     /// the redial replaces it, and the operation runs again. Safe because
     /// get/set/delete are all idempotent.
@@ -695,9 +695,9 @@ public sealed class NanocachedClient : IDisposable
     // ── keep-alive ────────────────────────────────────────────────
 
     // Always on, with an internal interval (issue #27): half the
-    // server's 30s idle timeout, so it never severs a healthy client.
+    // server's 60s idle timeout, so it never severs a healthy client.
     // Internal and mutable only so tests can shorten it.
-    internal static TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(15);
+    internal static TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
 
     private void StartKeepAlive()
     {

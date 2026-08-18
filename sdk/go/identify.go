@@ -41,7 +41,7 @@ type identified struct {
 // server that accepts the TCP connection but never answers (a blackholed
 // address behaves the same way) must not hang the caller. A variable
 // only so tests can shorten it.
-var handshakeDeadline = 10 * time.Second
+var handshakeDeadline = 5 * time.Second
 
 func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config) (*identified, error) {
 	conn, err := open(address, tlsConfig)

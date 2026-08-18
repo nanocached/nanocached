@@ -10,7 +10,7 @@
 //! are redialed lazily on use (with one transparent retry — a Rust
 //! socket only learns of a peer FIN on I/O, and every operation is
 //! idempotent), and an opt-in keep-alive can hold connections open
-//! across the server's 30s idle timeout.
+//! across the server's 60s idle timeout.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,7 +37,7 @@ const KEEPALIVE_KEY: &[u8] = &[0];
 /// use in `connect`. Public-but-hidden purely as a test hook.
 #[doc(hidden)]
 pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(15_000);
+    std::sync::atomic::AtomicU64::new(30_000);
 
 /// Options for [`NanocachedClient::connect`].
 #[derive(Default)]
@@ -304,7 +304,7 @@ impl NanocachedClient {
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
-        // half the server's 30s idle timeout, so it never severs a healthy
+        // half the server's 60s idle timeout, so it never severs a healthy
         // client. Read once per connect; the static exists only so tests
         // can shorten it.
         let interval =
@@ -548,7 +548,7 @@ impl NanocachedClient {
 
     /// Runs `op` against the slot's connection, retrying once on a
     /// connection-level failure: a Rust socket only learns of a peer FIN
-    /// (e.g. the server's 30s idle timeout) on I/O, so lazy
+    /// (e.g. the server's 60s idle timeout) on I/O, so lazy
     /// reconnect-on-use means the failed request poisons the connection,
     /// the redial replaces it, and the operation runs again. Safe because
     /// get/set/delete are all idempotent. `slot` is `None` in single mode.

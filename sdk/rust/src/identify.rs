@@ -177,7 +177,7 @@ pub(crate) enum Identified {
 /// Without it, a node whose IP has been reclaimed (a stopped container, a
 /// dead cloud instance) blackholes the TCP connect and a caller hangs for
 /// the kernel's own timeout — minutes — instead of failing over.
-pub(crate) const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) async fn connect_and_identify(
     host: &str,

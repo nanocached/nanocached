@@ -58,10 +58,10 @@ export interface NanocachedClientOptions {
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
  * lightweight request goes out on each connection real traffic has left
- * idle for at least that long, so the server's 30s idle timeout never
+ * idle for at least that long, so the server's 60s idle timeout never
  * severs a healthy client. Half the idle timeout by design; exported as
  * a mutable object only so tests can shorten it. */
-export const KEEPALIVE_TUNING = { intervalMs: 15_000 };
+export const KEEPALIVE_TUNING = { intervalMs: 30_000 };
 
 function splitHostPort(address: string): { host: string; port: number } {
   const separator = address.lastIndexOf(":");
@@ -80,7 +80,7 @@ function splitHostPort(address: string): { host: string; port: number } {
 
 interface ClusterMember {
   /** Last-known address for this node name — kept so a connection the
-   * server closed (e.g. its 30s idle timeout) can be reopened lazily on
+   * server closed (e.g. its 60s idle timeout) can be reopened lazily on
    * the next request that routes here, without waiting for a node-list
    * refresh. */
   address: string;
@@ -615,7 +615,7 @@ export class NanocachedClient {
 
   /** The "ensure connected" path (issue #1) for a single-node target: if
    * the one connection has died since it was opened — most commonly the
-   * server's 30s idle timeout — reconnect to the same node first.
+   * server's 60s idle timeout — reconnect to the same node first.
    * Reconnecting is lazy (nothing watches for closes in the background)
    * and shared (concurrent requests finding the same dead connection
    * await one dial, see `reconnects`). */

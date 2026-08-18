@@ -8,7 +8,7 @@ each key's top-R owners (the primary's result decides; a dead replica never
 fails a write), reads ask the primary and fall over to the next owner only
 when the holder is unreachable. Dead connections are redialed lazily on use
 (issue #1), and an opt-in keep-alive can hold connections open across the
-server's 30s idle timeout.
+server's 60s idle timeout.
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ _NODE_LIST_STALE_AFTER = 30.0
 # The keep-alive ping: the server rejects empty keys, so it needs at least
 # one byte; a single NUL stays out of any real key space.
 _KEEPALIVE_KEY = b"\x00"
-# Half the server's 30s idle timeout; internal (issue #27), mutable only
+# Half the server's 60s idle timeout; internal (issue #27), mutable only
 # so tests can shorten it.
-_KEEPALIVE_INTERVAL = 15.0
+_KEEPALIVE_INTERVAL = 30.0
 
 
 def _warn(message: str) -> None:
@@ -519,7 +519,7 @@ class NanocachedClient:
 
     def _start_keepalive(self) -> None:
         # Always on, with an internal interval (issue #27): half the
-        # server's 30s idle timeout, so it never severs a healthy client.
+        # server's 60s idle timeout, so it never severs a healthy client.
         # Module-level only so tests can shorten it.
         interval = _KEEPALIVE_INTERVAL
 
