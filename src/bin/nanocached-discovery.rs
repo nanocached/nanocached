@@ -837,6 +837,11 @@ async fn try_begin_next_join(
         (name, joining_addr, joined)
     };
 
+    println!(
+        "INFO join started: {name} (handoff from {} members)",
+        joined.len()
+    );
+
     let mut sends = JoinSet::new();
 
     for (ready_name, ready_addr) in joined.iter().cloned() {
@@ -870,10 +875,10 @@ async fn try_begin_next_join(
                 // this: a ready node that never got (or never acted on)
                 // `M` just never sends `C`, and this join stalls — a
                 // known, recorded gap (see ADR-0008's Consequences).
-                eprintln!("failed to send M to {ready_name}: {error}");
+                eprintln!("WARN failed to send M to {ready_name}: {error}");
             }
             Ok((_, Ok(()))) => {}
-            Err(error) => eprintln!("a task sending M panicked: {error}"),
+            Err(error) => eprintln!("WARN a task sending M panicked: {error}"),
         }
     }
 }
@@ -1012,16 +1017,22 @@ async fn send_cancel(
 /// and wakes its held-open connection so it can push the `R\n` promotion
 /// notice.
 fn promote_to_joined(registry: &Registry, name: &str) {
-    let promoted = {
+    let (promoted, members) = {
         let mut guard = lock(registry);
-        guard.get_mut(name).map(|info| {
+        let promoted = guard.get_mut(name).map(|info| {
             info.state = NodeState::Joined;
             info.last_heartbeat = Instant::now();
             Arc::clone(&info.promoted)
-        })
+        });
+        let members = guard
+            .values()
+            .filter(|info| info.state == NodeState::Joined)
+            .count();
+        (promoted, members)
     };
 
     if let Some(promoted) = promoted {
+        println!("INFO join promoted: {name} (members now {members})");
         // Wake every currently-parked `J` connection (a duplicate `J`
         // under the same name shares this Notify — issue #7) AND store a
         // permit for a waiter that hasn't parked yet (the bootstrap case,
@@ -1047,6 +1058,9 @@ async fn start_join(
 ) -> Arc<Notify> {
     let promoted = {
         let mut guard = lock(registry);
+        if !guard.contains_key(name) {
+            println!("INFO node registered: {name} at {address} (waiting to join)");
+        }
         let info = guard
             .entry(name.to_string())
             .or_insert_with(|| NodeInfo::new(address, NodeState::Waiting));
@@ -1096,6 +1110,11 @@ async fn handle_complete(
         }
 
         pending.completed.insert(reporting_name.to_string());
+        println!(
+            "INFO handoff completed: {reporting_name} -> {for_joining_name} ({}/{})",
+            pending.completed.len(),
+            pending.expected.len()
+        );
 
         if pending.completed.len() < pending.expected.len() {
             return;
@@ -1154,17 +1173,26 @@ async fn on_node_connection_ended(
     // stranding it forever in `wait_for_promotion`. The join only actually
     // matters if `name` is its joining node, or a ready node it still awaits a
     // `C` from.
-    let matters_to_current_join = lock_current_join(current_join)
+    let abandon_reason = lock_current_join(current_join)
         .as_ref()
-        .is_some_and(|pending| pending.joining_name == name || pending.expected.contains(name));
+        .and_then(|pending| {
+            if pending.joining_name == name {
+                Some("joining node disconnected".to_string())
+            } else if pending.expected.contains(name) {
+                Some(format!("ready member {name} disconnected"))
+            } else {
+                None
+            }
+        });
 
-    if matters_to_current_join {
+    if let Some(reason) = abandon_reason {
         abandon_current_join(
             registry,
             current_join,
             auth_secret,
             tls_connector,
             replication,
+            &reason,
         )
         .await;
     }
@@ -1184,10 +1212,16 @@ async fn abandon_current_join(
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     replication: usize,
+    reason: &str,
 ) {
     let Some(pending) = lock_current_join(current_join).take() else {
         return;
     };
+
+    eprintln!(
+        "WARN join abandoned: {} (reason={reason})",
+        pending.joining_name
+    );
 
     // Issue #4: the joining node's connection is parked in
     // `wait_for_promotion` with the idle timeout deliberately disabled —
@@ -1238,10 +1272,10 @@ async fn abandon_current_join(
     while let Some(outcome) = sends.join_next().await {
         match outcome {
             Ok((ready_name, Err(error))) => {
-                eprintln!("failed to send X (cancel) to {ready_name}: {error}");
+                eprintln!("WARN failed to send X (cancel) to {ready_name}: {error}");
             }
             Ok((_, Ok(()))) => {}
-            Err(error) => eprintln!("a task sending X panicked: {error}"),
+            Err(error) => eprintln!("WARN a task sending X panicked: {error}"),
         }
     }
 
@@ -1364,6 +1398,11 @@ async fn run(
         tls_connector: tls_connector.clone(),
     };
 
+    println!(
+        "INFO startup grace: refusing list queries for {}s",
+        startup_grace.as_secs()
+    );
+
     let sweep_task = tokio::spawn(sweep_expired(
         Arc::clone(&cluster_state.registry),
         Arc::clone(&cluster_state.current_join),
@@ -1384,14 +1423,14 @@ async fn run(
 
             result = &mut shutdown => {
                 result?;
-                println!("shutdown signal received");
+                println!("INFO shutdown signal received");
                 shutdown_tx.send_replace(true);
                 break;
             }
 
             result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
                 if let Some(Err(error)) = result {
-                    eprintln!("connection task failed: {error}");
+                    eprintln!("WARN connection task failed: {error}");
                 }
             }
 
@@ -1415,14 +1454,14 @@ async fn run(
     let connections_finished = timeout(SHUTDOWN_TIMEOUT, async {
         while let Some(result) = connection_tasks.join_next().await {
             if let Err(error) = result {
-                eprintln!("connection task failed: {error}");
+                eprintln!("WARN connection task failed: {error}");
             }
         }
     })
     .await;
 
     if connections_finished.is_err() {
-        eprintln!("shutdown timeout reached");
+        eprintln!("WARN shutdown timeout reached");
         connection_tasks.abort_all();
 
         while connection_tasks.join_next().await.is_some() {}
@@ -1432,7 +1471,7 @@ async fn run(
     // sweep pass wedged on an unresponsive node must not hold up process
     // exit.
     if timeout(SHUTDOWN_TIMEOUT, sweep_task).await.is_err() {
-        eprintln!("sweep task did not finish before the shutdown timeout");
+        eprintln!("WARN sweep task did not finish before the shutdown timeout");
     }
 
     Ok(())
@@ -1453,11 +1492,11 @@ async fn dispatch_connection(
         Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
             Ok(Err(error)) => {
-                eprintln!("TLS handshake with {address} failed: {error}");
+                eprintln!("WARN TLS handshake with {address} failed: {error}");
                 return false;
             }
             Err(_) => {
-                eprintln!("TLS handshake with {address} timed out");
+                eprintln!("WARN TLS handshake with {address} timed out");
                 return false;
             }
         },
@@ -1468,7 +1507,7 @@ async fn dispatch_connection(
         Ok(permit) => permit,
         Err(_) => {
             if let Err(error) = stream.write_all(b"B\n").await {
-                eprintln!("failed to send busy response to {address}: {error}");
+                eprintln!("WARN failed to send busy response to {address}: {error}");
             }
 
             return false;
@@ -1497,7 +1536,7 @@ async fn dispatch_connection(
         .await;
 
         if let Err(error) = &result {
-            eprintln!("connection error from {address}: {error}");
+            eprintln!("WARN connection error from {address}: {error}");
         }
 
         let name = connection_name
@@ -1545,10 +1584,21 @@ async fn sweep_expired(
                 // open instead of heartbeating (see NodeInfo::promoted);
                 // their liveness is tied to that connection, not to this
                 // sweep, so only Joined nodes are subject to it.
-                lock(&registry).retain(|_, info| {
-                    info.state != NodeState::Joined
-                        || now.duration_since(info.last_heartbeat) < liveness_timeout
+                let mut evicted = Vec::new();
+                lock(&registry).retain(|name, info| {
+                    let keep = info.state != NodeState::Joined
+                        || now.duration_since(info.last_heartbeat) < liveness_timeout;
+                    if !keep {
+                        evicted.push(name.clone());
+                    }
+                    keep
                 });
+                for name in evicted {
+                    eprintln!(
+                        "WARN node evicted: {name} (no heartbeat within {}s)",
+                        liveness_timeout.as_secs()
+                    );
+                }
 
                 // ADR-0008 pattern 3: a ready node alive but never
                 // reporting `C` (see `DEFAULT_MIGRATION_TIMEOUT`).
@@ -1557,7 +1607,7 @@ async fn sweep_expired(
                     .is_some_and(|pending| pending.started_at.elapsed() >= migration_timeout);
 
                 if timed_out {
-                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication).await;
+                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication, "migration timeout").await;
                 }
             }
             _ = shutdown_rx.changed() => return,
@@ -1700,6 +1750,7 @@ async fn handle_connection(
                             true
                         }
                         None => {
+                            println!("INFO node announced: {name} at {addr} (re-registered)");
                             guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined));
                             true
                         }
@@ -2312,7 +2363,7 @@ mod tests {
             tuple
         };
 
-        abandon_current_join(&registry, &current_join, &None, &None, 2).await;
+        abandon_current_join(&registry, &current_join, &None, &None, 2, "test").await;
 
         // node-b's connection must observe the abandonment promptly.
         let mut byte = [0u8; 1];

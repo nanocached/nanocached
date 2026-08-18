@@ -375,7 +375,7 @@ pub(crate) async fn run(
 
             result = &mut shutdown => {
                 result?;
-                println!("shutdown signal received");
+                println!("INFO shutdown signal received");
                 shutdown_tx.send_replace(true);
 
                 // `run_migration` doesn't watch `shutdown_rx` itself (it's
@@ -401,7 +401,7 @@ pub(crate) async fn run(
 
             result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
                 if let Some(Err(error)) = result {
-                    eprintln!("connection task failed: {error}");
+                    eprintln!("WARN connection task failed: {error}");
                 }
             }
 
@@ -429,14 +429,14 @@ pub(crate) async fn run(
     let connections_finished = timeout(SHUTDOWN_TIMEOUT, async {
         while let Some(result) = connection_tasks.join_next().await {
             if let Err(error) = result {
-                eprintln!("connection task failed: {error}");
+                eprintln!("WARN connection task failed: {error}");
             }
         }
     })
     .await;
 
     if connections_finished.is_err() {
-        eprintln!("shutdown timeout reached");
+        eprintln!("WARN shutdown timeout reached");
         connection_tasks.abort_all();
 
         while connection_tasks.join_next().await.is_some() {}
@@ -492,11 +492,11 @@ fn dispatch_connection(
             Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => ServerStream::Tls(Box::new(tls_stream)),
                 Ok(Err(error)) => {
-                    eprintln!("TLS handshake with {address} failed: {error}");
+                    eprintln!("WARN TLS handshake with {address} failed: {error}");
                     return;
                 }
                 Err(_) => {
-                    eprintln!("TLS handshake with {address} timed out");
+                    eprintln!("WARN TLS handshake with {address} timed out");
                     return;
                 }
             },
@@ -513,10 +513,10 @@ fn dispatch_connection(
                 match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(&busy)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        eprintln!("failed to send busy response to {address}: {error}");
+                        eprintln!("WARN failed to send busy response to {address}: {error}");
                     }
                     Err(_) => {
-                        eprintln!("sending busy response to {address} timed out");
+                        eprintln!("WARN sending busy response to {address} timed out");
                     }
                 }
 
@@ -524,12 +524,12 @@ fn dispatch_connection(
             }
         };
 
-        println!("accepted connection from {address}");
+        println!("INFO accepted connection from {address}");
 
         let _connection_permit = permit;
 
         if let Err(error) = handle_connection(stream, request_tx, config, shutdown_rx).await {
-            eprintln!("connection error from {address}: {error}");
+            eprintln!("WARN connection error from {address}: {error}");
         }
     });
 }
@@ -708,7 +708,7 @@ async fn handle_connection(
                         set_on_joining_node(node_context, &joining_addr, &key, &value, ttl).await
                 {
                     eprintln!(
-                        "failed to forward a concurrent SET for a migrating key to \
+                        "WARN failed to forward a concurrent SET for a migrating key to \
                          {joining_addr}: {error}"
                     );
                 }
@@ -733,7 +733,7 @@ async fn handle_connection(
                         delete_on_joining_node(node_context, &joining_addr, &key).await
                 {
                     eprintln!(
-                        "failed to forward a concurrent DELETE for a migrating key to \
+                        "WARN failed to forward a concurrent DELETE for a migrating key to \
                          {joining_addr}: {error}"
                     );
                 }
@@ -976,13 +976,14 @@ async fn register_with_discovery(
                 };
 
                 if !authenticated {
-                    eprintln!("discovery server at {discovery_addr} rejected the auth secret");
+                    eprintln!("WARN discovery server at {discovery_addr} rejected the auth secret");
                 }
 
-                let registration = match &role {
-                    DiscoveryRole::Primary(promoted_tx) if !*promoted_tx.borrow() => &join,
-                    _ => &announce,
-                };
+                let sending_join = matches!(
+                    &role,
+                    DiscoveryRole::Primary(promoted_tx) if !*promoted_tx.borrow()
+                );
+                let registration = if sending_join { &join } else { &announce };
 
                 if authenticated && stream.write_all(registration).await.is_ok() {
                     // For `J`, ADR-0008: this connection is held open by
@@ -997,6 +998,12 @@ async fn register_with_discovery(
                     };
 
                     if read_promoted.is_ok() && &promoted == b"R\n" {
+                        if sending_join {
+                            println!("INFO joined the cluster via discovery at {discovery_addr}");
+                        } else {
+                            println!("INFO re-registered with discovery at {discovery_addr}");
+                        }
+
                         if let DiscoveryRole::Primary(promoted_tx) = &role {
                             promoted_tx.send_replace(true);
                         }
@@ -1024,7 +1031,7 @@ async fn register_with_discovery(
                 }
             }
             Err(error) => {
-                eprintln!("failed to connect to discovery server at {discovery_addr}: {error}");
+                eprintln!("WARN failed to connect to discovery server at {discovery_addr}: {error}");
             }
         }
 
@@ -1240,15 +1247,18 @@ async fn run_migration(
         replication,
     );
 
+    println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
+
     let entries = match list_entries(&node_context.request_tx).await {
         Some(entries) => entries,
         None => {
-            eprintln!("migration to {joining_name} aborted: cache task is unavailable");
+            eprintln!("WARN migration to {joining_name} aborted: cache task is unavailable");
             return;
         }
     };
 
     let mut marked_this_run = Vec::new();
+    let mut sent_count = 0usize;
     let mut stream: Option<ClientStream> = None;
 
     let self_name = node_context.name.as_str();
@@ -1302,7 +1312,7 @@ async fn run_migration(
                     Ok(connected) => stream = Some(connected),
                     Err(error) => {
                         eprintln!(
-                            "migration to {joining_addr} failed to connect \
+                            "WARN migration to {joining_addr} failed to connect \
                              (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
                         );
                         continue;
@@ -1322,7 +1332,7 @@ async fn run_migration(
                 }
                 Err(error) => {
                     eprintln!(
-                        "migration to {joining_addr} failed to transfer a key \
+                        "WARN migration to {joining_addr} failed to transfer a key \
                          (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
                     );
                     // The connection's state after a failed write/read is
@@ -1335,7 +1345,7 @@ async fn run_migration(
 
         if !sent {
             eprintln!(
-                "migration to {joining_addr} permanently failed to transfer a key after \
+                "WARN migration to {joining_addr} permanently failed to transfer a key after \
                  {KEY_TRANSFER_ATTEMPTS} attempts; abandoning the join for discovery's \
                  migration-timeout to reap"
             );
@@ -1346,6 +1356,8 @@ async fn run_migration(
 
             return;
         }
+
+        sent_count += 1;
 
         // A sender that stays in the key's top-R keeps its copy (it's
         // still a live replica, ADR-0011); only a displaced copy is dead.
@@ -1360,7 +1372,7 @@ async fn run_migration(
             unmark_migrated(&node_context.request_tx, &key).await;
         }
 
-        eprintln!("migration to {joining_addr} cancelled by discovery; rolled back its marks");
+        eprintln!("WARN migration to {joining_addr} cancelled by discovery; rolled back its marks");
 
         return;
     }
@@ -1375,9 +1387,16 @@ async fn run_migration(
         replication,
     }));
 
+    println!(
+        "INFO migration completed: {joining_name} (sent {sent_count} keys, marked {} dead \
+         copies; forwarding writes for {}s)",
+        marked_this_run.len(),
+        FORWARDING_GRACE.as_secs()
+    );
+
     if let Err(error) = report_complete(&node_context, &joining_name).await {
         eprintln!(
-            "migration to {joining_addr} finished but reporting completion to {} failed: {error}",
+            "WARN migration to {joining_addr} finished but reporting completion to {} failed: {error}",
             node_context.discovery_addr
         );
     }
