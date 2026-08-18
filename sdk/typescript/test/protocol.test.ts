@@ -22,8 +22,8 @@ describe("encodeSet", () => {
     assert.deepEqual(encodeSet(Buffer.from("k"), Buffer.from("v"), 60), Buffer.from("S 1 1 60\nkv"));
   });
 
-  it("accepts a TTL of zero", () => {
-    assert.deepEqual(encodeSet(Buffer.from("k"), Buffer.from("v"), 0), Buffer.from("S 1 1 0\nkv"));
+  it("treats a TTL of zero as no expiry, omitting it from the wire like the default", () => {
+    assert.deepEqual(encodeSet(Buffer.from("k"), Buffer.from("v"), 0), Buffer.from("S 1 1\nkv"));
   });
 
   it("rejects non-integer and negative TTLs synchronously", () => {

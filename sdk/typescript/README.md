@@ -21,21 +21,27 @@ npm install nanocached
 import { NanocachedClient } from "nanocached";
 
 // Point at a single node, or at a discovery server fronting a cluster —
-// same options either way.
-const client = await NanocachedClient.connect({ host: "127.0.0.1", port: 11311 });
+// same options either way. `addresses` is always a list; a one-element
+// list is the single-target case.
+const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 11311 }] });
 
-await client.set("greeting", "hello", { ttlSeconds: 60 });
+await client.set("greeting", "hello", 60); // ttlSeconds; omit or pass 0 for no expiry
 
-const value = await client.get("greeting"); // Buffer | null
-console.log(value?.toString()); // "hello"
+const value = await client.get("greeting"); // string | null, strict UTF-8
+console.log(value); // "hello"
+
+const bytes = await client.getBytes("greeting"); // Buffer | null, raw bytes
 
 const existed = await client.delete("greeting"); // boolean
 
 client.close();
 ```
 
-Keys and values may be `string` (encoded as UTF-8) or `Uint8Array`; values
-always come back as `Buffer` (`null` when the key is missing).
+Keys and values may be `string` (encoded as UTF-8) or `Uint8Array`.
+`get()` decodes the value as UTF-8 and rejects (a native `TypeError`) if it
+isn't valid UTF-8 — never a silent replacement character. Use `getBytes()`
+to read a value's raw bytes instead, e.g. for values this client didn't
+itself write as a UTF-8 string.
 
 ## Authentication
 
@@ -44,8 +50,7 @@ secret:
 
 ```ts
 const client = await NanocachedClient.connect({
-  host: "cache.internal",
-  port: 11311,
+  addresses: [{ host: "cache.internal", port: 11311 }],
   authSecret: process.env.NANOCACHED_AUTH_SECRET,
 });
 ```
@@ -56,15 +61,19 @@ If the server was started with `--tls-cert`/`--tls-key`:
 
 ```ts
 // Certificate issued by a publicly trusted CA:
-const client = await NanocachedClient.connect({ host, port, tls: true });
+const client = await NanocachedClient.connect({ addresses, tls: true });
 
 // Self-signed / private CA — trust exactly that certificate instead:
 const client = await NanocachedClient.connect({
-  host,
-  port,
-  tls: { ca: fs.readFileSync("cluster-ca.pem") },
+  addresses,
+  tls: true,
+  ca: "cluster-ca.pem", // path to a PEM file, read once inside connect()
 });
 ```
+
+`ca` is only meaningful when `tls: true`; a `ca` set with `tls` unset or
+`false` is silently ignored. An unreadable or unparseable CA file is a
+connect-time error.
 
 ## Cluster behavior
 
@@ -95,30 +104,31 @@ traffic on the last-known node list.
 
 ### Discovery replicas
 
-When the cluster runs more than one discovery server, pass them all as
-`seeds` instead of a single `host`/`port`:
+When the cluster runs more than one discovery server, list them all in
+`addresses`:
 
 ```ts
 const client = await NanocachedClient.connect({
-  seeds: [
+  addresses: [
     { host: "10.0.0.1", port: 8357 },
     { host: "10.0.0.2", port: 8357 },
   ],
 });
 ```
 
-Both the initial connect and every node-list refresh try the seeds in
-order, so losing any one discovery replica costs nothing. A seed that is
-still warming up after a restart (it answers `B` while re-learning cluster
-membership) is skipped like an unreachable one; if *every* seed is warming
-up, `connect()` rejects with `DiscoveryBusyError` — retry shortly.
+Both the initial connect and every node-list refresh try the addresses in
+order, so losing any one discovery replica costs nothing. An address that
+is still warming up after a restart (it answers `B` while re-learning
+cluster membership) is skipped like an unreachable one; if *every* address
+is warming up, `connect()` rejects with `DiscoveryBusyError` — retry
+shortly.
 
-Seeds should point at discovery servers. If a seed turns out to be a cache
-node, the client pins itself to that one server (a single node cannot
-provide cluster routing — the hash ring needs the name/address pairs only
-discovery serves), and any remaining seeds go unused; when several seeds
-were given, the client warns about this. Direct node targets are meant for
-development or deliberate single-node deployments.
+Addresses should point at discovery servers. If an address turns out to be
+a cache node, the client pins itself to that one server (a single node
+cannot provide cluster routing — the hash ring needs the name/address
+pairs only discovery serves), and any remaining addresses go unused; when
+several addresses were given, the client warns about this. Direct node
+targets are meant for development or deliberate single-node deployments.
 
 ## Idle connections, reconnect, and keep-alive
 
@@ -131,14 +141,17 @@ operations are idempotent). There is nothing to configure.
 
 ## API
 
-- `NanocachedClient.connect(options)` — `options: { host?, port?, seeds?, authSecret?, tls? }`
-  (give either `host`/`port` or a non-empty `seeds` list)
-- `client.get(key)` — resolves `Buffer | null`
-- `client.set(key, value, { ttlSeconds? })` — `ttlSeconds` must be a
-  non-negative integer; omit it for no expiry
+- `NanocachedClient.connect(options)` —
+  `options: { addresses, authSecret?, tls?, ca? }` (`addresses` is a
+  required, non-empty `NanocachedAddress[]`, each `{ host, port }`)
+- `client.get(key)` — resolves `string | null`, strictly decoded as UTF-8
+  (rejects with a `TypeError` if the value isn't valid UTF-8)
+- `client.getBytes(key)` — resolves `Buffer | null`, the raw bytes
+- `client.set(key, value, ttlSeconds = 0)` — `ttlSeconds` must be a
+  non-negative integer; 0 (the default) means no expiry
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
 - `client.close()` — closes all connections; later calls reject with
-  `AlreadyClosedError`
+  `AlreadyClosedError`; a second `close()` warns but stays idempotent
 - `client.nodeUrls` — addresses currently connected to (introspection)
 
 ## License

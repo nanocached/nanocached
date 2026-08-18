@@ -1,15 +1,18 @@
 // Rust-SDK smoke for the AWS live tests: nanotest <write|read> <label> <count>
-// Seeds via NANOTEST_SEEDS ("host:port,host:port").
+// Addresses via NANOTEST_ADDRESSES ("host:port,host:port").
 use nanocached::{NanocachedClient, Options};
 
 #[tokio::main]
 async fn main() {
-    let seeds = std::env::var("NANOTEST_SEEDS").expect("NANOTEST_SEEDS not set");
-    let mut options = Options::new();
-    for part in seeds.split(',') {
-        let (host, port) = part.rsplit_once(':').expect("seed must be host:port");
-        options = options.host(host, port.parse().expect("bad port"));
-    }
+    let addresses = std::env::var("NANOTEST_ADDRESSES").expect("NANOTEST_ADDRESSES not set");
+    let addresses: Vec<(String, u16)> = addresses
+        .split(',')
+        .map(|part| {
+            let (host, port) = part.rsplit_once(':').expect("address must be host:port");
+            (host.to_string(), port.parse().expect("bad port"))
+        })
+        .collect();
+    let options = Options::new().addresses(addresses);
 
     let args: Vec<String> = std::env::args().collect();
     let (cmd, label) = (args[1].as_str(), args[2].as_str());
@@ -27,7 +30,7 @@ async fn main() {
         "write" => {
             for i in 0..count {
                 if let Err(error) = client
-                    .set(format!("x:{label}:{i}"), format!("v-{label}-{i}"), None)
+                    .set(format!("x:{label}:{i}"), format!("v-{label}-{i}"), 0)
                     .await
                 {
                     println!("set failed: {error}");
@@ -40,7 +43,7 @@ async fn main() {
             let mut bad = Vec::new();
             for i in 0..count {
                 match client.get(format!("x:{label}:{i}")).await {
-                    Ok(Some(value)) if value == format!("v-{label}-{i}").into_bytes() => {}
+                    Ok(Some(value)) if value == format!("v-{label}-{i}") => {}
                     _ => bad.push(i),
                 }
             }

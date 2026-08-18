@@ -22,11 +22,17 @@ final class Connection {
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
+    private final Runnable onClose;
     private volatile boolean closed = false;
     private volatile long lastUsedNanos = System.nanoTime();
 
-    Connection(Socket socket) throws IOException {
+    /** {@code onClose} fires exactly once, the first time this connection
+     * closes for any reason — used by {@link NanocachedClient} to keep its
+     * forgotten-close open-sockets tracker accurate without every call
+     * site remembering to decrement it by hand. */
+    Connection(Socket socket, Runnable onClose) throws IOException {
         this.socket = socket;
+        this.onClose = onClose;
         this.in = new BufferedInputStream(socket.getInputStream());
         this.out = new BufferedOutputStream(socket.getOutputStream());
     }
@@ -39,13 +45,18 @@ final class Connection {
         return System.nanoTime() - lastUsedNanos;
     }
 
-    void close() {
+    // Synchronized (shared with request()'s monitor) so a self-poisoning
+    // close() racing an external one (teardown, refresh, redial) can never
+    // fire onClose twice.
+    synchronized void close() {
+        if (closed) return;
         closed = true;
         try {
             socket.close();
         } catch (IOException ignored) {
             // Closing an already-broken socket is fine.
         }
+        onClose.run();
     }
 
     byte[] get(byte[] key) {

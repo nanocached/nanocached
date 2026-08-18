@@ -1,12 +1,17 @@
+import { readFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { Connection, ConnectionLostError, isConnectionError, WrongNodeError } from "./connection.js";
 import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
-import type { NanocachedTlsOptions } from "./socket.js";
 
-export type { NanocachedTlsOptions } from "./socket.js";
-export { WrongNodeError } from "./connection.js";
+export { ConnectionLostError, WrongNodeError } from "./connection.js";
+
+// A value decoded by get() must be exactly what set() would have encoded —
+// no silent U+FFFD replacement for bytes that aren't valid UTF-8. A single
+// shared instance is fine: decode() carries no state across calls unless
+// `stream: true` is passed, which this SDK never does.
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 /** Thrown by get/set/delete when called after close(). Not thrown by
  * close() itself, which is idempotent (see NanocachedClient.close). */
@@ -17,34 +22,38 @@ export class AlreadyClosedError extends Error {
   }
 }
 
-export interface NanocachedSeed {
+export interface NanocachedAddress {
   host: string;
   port: number;
 }
 
 export interface NanocachedClientOptions {
-  host?: string;
-  port?: number;
-  /** Discovery replicas (ADR-0010), tried in order — an alternative to
-   * `host`/`port` for clusters running more than one discovery server.
-   * Both the initial connect and every later node-list refresh walk this
-   * list until a seed provides a node list, so losing any one replica
-   * costs nothing. A seed that answers `B` (still inside its startup
+  /** Connect targets: one or more nanocached-node or nanocached-discovery
+   * addresses (ADR-0010), tried in order. A one-element list is the
+   * single-target case — there is no separate host/port shorthand. Both
+   * the initial connect and every later node-list refresh walk this list
+   * until one provides a node list, so losing any one discovery replica
+   * costs nothing. An address that answers `B` (still inside its startup
    * grace after a restart) is skipped the same way as an unreachable
    * one. */
-  seeds?: NanocachedSeed[];
+  addresses: NanocachedAddress[];
   /** Shared secret to authenticate with, matching NANOCACHED_AUTH_SECRET
    * on the server. Omit if the server has no secret configured. */
-  authSecret?: string | Uint8Array;
+  authSecret?: string;
   /** Connect over TLS instead of plaintext — required if the server was
    * started with --tls-cert/--tls-key. `boolean`, not just the literal
    * `true`, so a single config value (e.g. an env var) can toggle this
-   * across environments without an `x ? true : undefined` workaround: pass
-   * `true`/`false` to verify (or not) against Node's default, publicly-
-   * trusted CA store — the normal case either way — or `{ ca }` if the
-   * server is running a self-signed certificate with no CA-issued
-   * alternative available. */
-  tls?: boolean | NanocachedTlsOptions;
+   * across environments without an `x ? true : undefined` workaround. */
+  tls?: boolean;
+  /** Path to a PEM file of trusted root certificate(s) to use instead of
+   * Node's default, publicly-trusted CA store — for a server running a
+   * self-signed certificate with no CA-issued alternative available.
+   * Read once (synchronously) inside `connect()` and reused for every
+   * dial this client ever makes, including reconnects and node-list
+   * refreshes. Only meaningful when `tls` is true; silently ignored
+   * otherwise. An unreadable or unparseable file is a connect-time
+   * error. */
+  ca?: string;
 }
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
@@ -122,12 +131,12 @@ function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void 
 }
 
 /**
- * A client for nanocached: `host`/`port` may name either a single
- * nanocached-node or a nanocached-discovery server fronting a cluster —
- * `connect()` doesn't take a separate option or shape for either case, it
- * finds out from the server's own response to the connection handshake
- * (see doc/adr/0007-*.md). Callers never need to know or care which
- * they're talking to.
+ * A client for nanocached: each configured address may name either a
+ * single nanocached-node or a nanocached-discovery server fronting a
+ * cluster — `connect()` doesn't take a separate option or shape for either
+ * case, it finds out from the server's own response to the connection
+ * handshake (see doc/adr/0007-*.md). Callers never need to know or care
+ * which they're talking to.
  *
  * This establishes the connection(s) and routing table, and exposes
  * `get`/`set`/`delete`/`close`.
@@ -153,43 +162,49 @@ export class NanocachedClient {
 
   private constructor(
     private target: Target,
-    /** The seed that answered connect() — a node's own address in single
-     * mode (which is also what a lazy reconnect redials), the winning
-     * discovery server's address in cluster mode. */
+    /** The address that answered connect() — a node's own address in
+     * single mode (which is also what a lazy reconnect redials), the
+     * winning discovery server's address in cluster mode. */
     readonly url: string,
     nodeUrls: readonly string[],
-    /** Every configured discovery seed (ADR-0010) — what fetchNodeList
-     * walks on a refresh, not just the seed that happened to win the
-     * initial connect. */
-    private readonly seeds: readonly NanocachedSeed[],
-    private readonly authSecret: string | Uint8Array | undefined,
-    private readonly tls: boolean | NanocachedTlsOptions | undefined,
+    /** Every configured address (ADR-0010) — what fetchNodeList walks on a
+     * refresh, not just the address that happened to win the initial
+     * connect. */
+    private readonly addresses: readonly NanocachedAddress[],
+    private readonly authSecret: string | undefined,
+    private readonly tls: boolean | undefined,
+    /** PEM contents read once from `NanocachedClientOptions.ca` (if any)
+     * by connect(); reused for every dial this instance makes. */
+    private readonly ca: Buffer | undefined,
   ) {
     this.nodeUrls = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
   }
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
-    const seeds: NanocachedSeed[] =
-      options.seeds ??
-      (options.host !== undefined && options.port !== undefined
-        ? [{ host: options.host, port: options.port }]
-        : []);
-    if (seeds.length === 0) {
-      throw new Error("nanocached: connect() needs either host/port or a non-empty seeds list");
+    const addresses = options.addresses ?? [];
+    if (addresses.length === 0) {
+      throw new Error("nanocached: connect() needs a non-empty addresses list");
     }
 
-    // Walk the seeds in order until one yields a working target. A seed
-    // is skipped when it's unreachable, answers `B` (ADR-0010 startup
-    // grace), or knows no live nodes — the next replica may do better.
+    // ca is meaningful only paired with tls: true; a set ca with tls not
+    // enabled is silently ignored rather than an error. Read once here
+    // (not per-dial) and reused for every connection this instance ever
+    // opens, including reconnects and node-list refreshes.
+    const ca = options.tls === true && options.ca !== undefined ? readFileSync(options.ca) : undefined;
+
+    // Walk the addresses in order until one yields a working target. An
+    // address is skipped when it's unreachable, answers `B` (ADR-0010
+    // startup grace), or knows no live nodes — the next replica may do
+    // better.
     let lastError: Error | null = null;
 
-    for (const seed of seeds) {
-      const key = targetKey(seed);
-      // Only meaningful for a single explicit target: with a seeds list,
-      // another client instance legitimately holding connections to the
-      // same seed makes this heuristic false-positive (issue #12).
-      if (seeds.length === 1 && openTargets.has(key)) {
+    for (const address of addresses) {
+      const key = targetKey(address);
+      // Only meaningful for a single explicit target: with an addresses
+      // list, another client instance legitimately holding connections to
+      // the same address makes this heuristic false-positive (issue #12).
+      if (addresses.length === 1 && openTargets.has(key)) {
         console.warn(
           `nanocached: connect() called for ${key} while a previous connection to it is still open — was close() forgotten?`,
         );
@@ -197,24 +212,24 @@ export class NanocachedClient {
 
       let identified;
       try {
-        identified = await connectAndIdentify({ host: seed.host, port: seed.port, authSecret: options.authSecret, tls: options.tls });
+        identified = await connectAndIdentify({ host: address.host, port: address.port, authSecret: options.authSecret, tls: options.tls, ca });
       } catch (error) {
         lastError = error as Error;
         continue;
       }
 
       if (identified.kind === "node") {
-        if (seeds.length > 1) {
-          // Multiple seeds imply the caller expected redundancy, but a
+        if (addresses.length > 1) {
+          // Multiple addresses imply the caller expected redundancy, but a
           // node target pins the client to exactly this one server: the
-          // remaining seeds don't form a cluster, and a later death of
+          // remaining addresses don't form a cluster, and a later death of
           // this node is redialed, never failed over. Direct node targets
           // are for development or single-node deployments — clusters
-          // should seed discovery servers.
+          // should point addresses at discovery servers.
           console.warn(
             `nanocached: ${key} is a cache node, so this client is pinned to that single server — ` +
-              `the ${seeds.length - 1} remaining seed(s) will not be used. ` +
-              `Point seeds at discovery servers for cluster routing and failover.`,
+              `the ${addresses.length - 1} remaining address(es) will not be used. ` +
+              `Point addresses at discovery servers for cluster routing and failover.`,
           );
         }
 
@@ -223,9 +238,10 @@ export class NanocachedClient {
           { kind: "single", connection: new Connection(identified.socket) },
           key,
           [key],
-          seeds,
+          addresses,
           options.authSecret,
           options.tls,
+          ca,
         );
       }
 
@@ -240,7 +256,7 @@ export class NanocachedClient {
       try {
         for (const node of identified.nodes) {
           const { host, port } = splitHostPort(node.address);
-          const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls });
+          const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls, ca });
 
           if (nodeIdentified.kind !== "node") {
             throw new Error(`nanocached: discovery server returned a non-node address: ${node.address}`);
@@ -249,8 +265,8 @@ export class NanocachedClient {
           sockets.set(node.name, nodeIdentified.socket);
         }
       } catch (error) {
-        // A node (not the discovery seed) is the problem here; another
-        // seed would hand back the same node list, so don't try one.
+        // A node (not the discovery address) is the problem here; another
+        // address would hand back the same node list, so don't try one.
         for (const socket of sockets.values()) socket.destroy();
         throw error;
       }
@@ -271,13 +287,14 @@ export class NanocachedClient {
         },
         key,
         identified.nodes.map((node) => node.address),
-        seeds,
+        addresses,
         options.authSecret,
         options.tls,
+        ca,
       );
     }
 
-    throw lastError ?? new Error("nanocached: could not connect to any seed");
+    throw lastError ?? new Error("nanocached: could not connect to any address");
   }
 
   /** Whether close() has already been called on this instance. */
@@ -315,7 +332,18 @@ export class NanocachedClient {
     return this.target.kind === "cluster" ? this.target.replication : 1;
   }
 
-  async get(key: string | Uint8Array): Promise<Buffer | null> {
+  /** Resolves the value strictly decoded as UTF-8 — a value that isn't
+   * valid UTF-8 rejects (native `TypeError` from `TextDecoder`'s fatal
+   * mode), it is never silently replaced. Use `getBytes` for raw bytes,
+   * e.g. for values this client didn't itself write as a UTF-8 string. */
+  async get(key: string | Uint8Array): Promise<string | null> {
+    const value = await this.getBytes(key);
+    return value === null ? null : UTF8_DECODER.decode(value);
+  }
+
+  /** The raw-bytes companion to `get`: same routing/retry/cluster
+   * behavior, no decoding. */
+  async getBytes(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     return this.withWrongNodeRetry(() =>
@@ -325,13 +353,15 @@ export class NanocachedClient {
     );
   }
 
-  async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
+  /** `ttlSeconds` (whole seconds, default 0) is when the key expires; 0
+   * means no expiry. Must be a non-negative integer. */
+  async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     return this.withWrongNodeRetry(() =>
       this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.set(key, value, options))
-        : this.writeToOwners(key, (connection) => connection.set(key, value, options)),
+        ? this.singleConnection().then((connection) => connection.set(key, value, ttlSeconds))
+        : this.writeToOwners(key, (connection) => connection.set(key, value, ttlSeconds)),
     );
   }
 
@@ -479,7 +509,7 @@ export class NanocachedClient {
    * Per ADR-2, a discovery outage should degrade only topology updates,
    * not already-established cache traffic — so failure here (discovery
    * unreachable, or a specific new node failing to connect) never throws
-   * out to the get/set/delete call that triggered it. It logs a warning,
+   * out to the get/set/delete call that triggered it. It fails silently,
    * keeps the current target as-is (skipping just the node that failed to
    * connect, if only one did), and tries again on the next stale check. */
   private async refreshNodeList(): Promise<void> {
@@ -513,10 +543,12 @@ export class NanocachedClient {
       }
 
       try {
-        const nodeIdentified = await connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls });
+        const nodeIdentified = await connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
 
         if (nodeIdentified.kind !== "node") {
-          console.warn(`nanocached: discovery server returned a non-node address: ${node.address}, skipping`);
+          // Discovery returned an address that no longer identifies as a
+          // cache node — skip it silently, same as any other failure to
+          // connect here (see the doc comment above).
           continue;
         }
 
@@ -529,8 +561,9 @@ export class NanocachedClient {
 
         trackOpenTarget(this.url, [nodeIdentified.socket]);
         members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket) });
-      } catch (error) {
-        console.warn(`nanocached: could not connect to new node ${node.address}, will retry on the next refresh: ${(error as Error).message}`);
+      } catch {
+        // Connecting to this new node failed — skip it silently and retry
+        // on the next refresh (see the doc comment above).
       }
     }
 
@@ -551,37 +584,32 @@ export class NanocachedClient {
     this.lastNodeListFetch = Date.now();
   }
 
-  /** Walks every discovery seed (ADR-0010) in order for a fresh node
-   * list. Returns `null` — keep the last-known list — when no seed can
+  /** Walks every configured address (ADR-0010) in order for a fresh node
+   * list. Returns `null` — keep the last-known list — when none can
    * provide one: unreachable, still inside its startup grace (`B`), no
-   * longer a discovery server, or knowing no live nodes. */
+   * longer a discovery server, or knowing no live nodes. Fails silently;
+   * see the doc comment on refreshNodeList. */
   private async fetchNodeList(): Promise<{ nodes: DiscoveredNode[]; replication: number } | null> {
-    for (const seed of this.seeds) {
-      const key = targetKey(seed);
-
+    for (const address of this.addresses) {
       let identified;
       try {
-        identified = await connectAndIdentify({ host: seed.host, port: seed.port, authSecret: this.authSecret, tls: this.tls });
-      } catch (error) {
-        console.warn(`nanocached: could not refresh the node list from ${key}: ${(error as Error).message}`);
+        identified = await connectAndIdentify({ host: address.host, port: address.port, authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+      } catch {
         continue;
       }
 
       if (identified.kind !== "cluster") {
         identified.socket.destroy();
-        console.warn(`nanocached: ${key} no longer identifies as a discovery server, skipping`);
         continue;
       }
 
       if (identified.nodes.length === 0) {
-        console.warn(`nanocached: discovery server at ${key} returned no live nodes, skipping`);
         continue;
       }
 
       return identified;
     }
 
-    console.warn("nanocached: no discovery seed could provide a node list, keeping the last-known list");
     return null;
   }
 
@@ -654,7 +682,7 @@ export class NanocachedClient {
   }
 
   private async openNodeConnection(address: string): Promise<Connection> {
-    const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls });
+    const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
 
     if (identified.kind !== "node") {
       throw new Error(`nanocached: ${address} no longer identifies as a cache node`);

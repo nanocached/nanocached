@@ -14,10 +14,17 @@ categories = ["caching", "asynchronous"]
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pki-types = { version = "1", optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 [features]
-default = []
-tls = ["dep:tokio-rustls", "dep:rustls-pki-types"]
+default = ["tls"]
+tls = [
+  "dep:tokio-rustls",
+  "dep:rustls-pki-types",
+  "dep:rustls-pemfile",
+  "dep:rustls-native-certs",
+]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

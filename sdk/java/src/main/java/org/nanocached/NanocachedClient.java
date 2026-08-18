@@ -1,12 +1,27 @@
 package org.nanocached;
 
+import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.net.Socket;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -14,9 +29,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManagerFactory;
 
 /**
- * The public client. A host/port (or a seeds list) may name either a
+ * The public client. An address (or an addresses list) may name either a
  * single nanocached-node or discovery server(s) fronting a cluster —
  * {@code connect()} finds out from the server's own handshake response
  * (doc/adr/0007-*.md), so calling code is identical either way.
@@ -33,22 +49,19 @@ import javax.net.ssl.SSLContext;
  */
 public final class NanocachedClient implements AutoCloseable {
 
-    public record Seed(String host, int port) {}
+    public record Address(String host, int port) {}
 
     /** Options for {@link #connect(Options)}; build with {@link #builder()}. */
     public static final class Options {
-        private final List<Seed> seeds = new ArrayList<>();
+        private final List<Address> addresses = new ArrayList<>();
         private byte[] authSecret;
-        private SSLContext tls;
+        private boolean tls;
+        private Path ca;
 
-        public Options host(String host, int port) {
-            seeds.add(new Seed(host, port));
-            return this;
-        }
-
-        /** Discovery replicas (ADR-0010), tried in order for connect and every refresh. */
-        public Options seeds(List<Seed> seeds) {
-            this.seeds.addAll(seeds);
+        /** Discovery replicas (ADR-0010), tried in order for connect and every
+         * refresh; a one-element list is the single-target case. */
+        public Options addresses(List<Address> addresses) {
+            this.addresses.addAll(addresses);
             return this;
         }
 
@@ -58,13 +71,30 @@ public final class NanocachedClient implements AutoCloseable {
             return this;
         }
 
-        /** Connect over TLS with this context (use {@code SSLContext.getDefault()}
-         * for publicly-trusted CAs, or a custom context for a private CA). */
-        public Options tls(SSLContext context) {
-            this.tls = context;
+        /** Connect over TLS. Without {@link #ca}, verifies against the
+         * platform trust store; with it, a private CA replaces the default
+         * store. */
+        public Options tls(boolean enabled) {
+            this.tls = enabled;
             return this;
         }
 
+        /** A PEM file of trusted root certificate(s). Meaningful only when
+         * {@link #tls} is enabled — silently ignored otherwise. */
+        public Options ca(Path path) {
+            this.ca = path;
+            return this;
+        }
+
+        /** Convenience overload of {@link #ca(Path)}. */
+        public Options ca(String path) {
+            return ca(Path.of(path));
+        }
+
+        /** Convenience overload of {@link #ca(Path)}. */
+        public Options ca(File file) {
+            return ca(file.toPath());
+        }
     }
 
     public static Options builder() {
@@ -76,12 +106,34 @@ public final class NanocachedClient implements AutoCloseable {
     private static final byte[] KEEPALIVE_KEY = {0};
     static volatile long keepAliveIntervalMillis = 15_000;
 
+    // Tracks, per connect() target (not per instance — mirrors
+    // sdk/typescript/src/client.ts's openTargets), how many open sockets
+    // this process still holds for a given "host:port". Purely a
+    // programming-error guard: catches "connect() called again for the
+    // same target before the previous one was ever released" without
+    // affecting behavior — connecting again still works, this only warns.
+    private static final ConcurrentHashMap<String, Integer> OPEN_TARGETS = new ConcurrentHashMap<>();
+
+    private static void trackOpenTarget(String key) {
+        OPEN_TARGETS.merge(key, 1, Integer::sum);
+    }
+
+    private static void untrackOpenTarget(String key) {
+        OPEN_TARGETS.computeIfPresent(key, (ignoredKey, count) -> count <= 1 ? null : count - 1);
+    }
+
     private final Object stateLock = new Object();
     private final Object refreshLock = new Object();
     private final ConcurrentHashMap<String, Object> redialLocks = new ConcurrentHashMap<>();
-    private final List<Seed> seeds;
+    private final List<Address> addresses;
     private final byte[] authSecret;
     private final SSLContext tls;
+
+    /** The address that answered connect() — used both to redial in single
+     * mode and as the key for the open-sockets tracker in every mode
+     * (mirrors TypeScript's {@code this.url}). Set once, before this
+     * client ever opens a socket. */
+    private String targetKey;
 
     private volatile boolean closed = false;
     private Connection single;              // single-node mode
@@ -104,34 +156,42 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    private NanocachedClient(List<Seed> seeds, byte[] authSecret, SSLContext tls) {
-        this.seeds = List.copyOf(seeds);
+    private NanocachedClient(List<Address> addresses, byte[] authSecret, SSLContext tls) {
+        this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
     }
 
-    public static NanocachedClient connect(String host, int port) {
-        return connect(builder().host(host, port));
-    }
-
     public static NanocachedClient connect(Options options) {
-        if (options.seeds.isEmpty()) {
+        if (options.addresses.isEmpty()) {
             throw new IllegalArgumentException(
-                    "nanocached: connect() needs either host/port or a non-empty seeds list");
+                    "nanocached: connect() needs a non-empty addresses list");
         }
 
+        SSLContext sslContext = buildSslContext(options.tls, options.ca);
         NanocachedClient client =
-                new NanocachedClient(options.seeds, options.authSecret, options.tls);
+                new NanocachedClient(options.addresses, options.authSecret, sslContext);
 
-        // Walk the seeds until one yields a working target; a seed that is
-        // unreachable, warming up (B, ADR-0010), or knows no live nodes is
-        // skipped — the next replica may do better.
+        // Walk the addresses until one yields a working target; an address
+        // that is unreachable, warming up (B, ADR-0010), or knows no live
+        // nodes is skipped — the next replica may do better.
         RuntimeException lastError = null;
-        for (Seed seed : client.seeds) {
+        for (Address address : client.addresses) {
+            String key = address.host() + ":" + address.port();
+
+            // Only meaningful for a single explicit target: with an
+            // addresses list, another client instance legitimately holding
+            // connections to the same address makes this heuristic
+            // false-positive (issue #12).
+            if (client.addresses.size() == 1 && OPEN_TARGETS.containsKey(key)) {
+                System.err.println("nanocached: connect() called for " + key
+                        + " while a previous connection to it is still open — was close() forgotten?");
+            }
+
             Identify.Result identified;
             try {
                 identified = Identify.connectAndIdentify(
-                        seed.host(), seed.port(), client.authSecret, client.tls);
+                        address.host(), address.port(), client.authSecret, client.tls);
             } catch (IOException | RuntimeException error) {
                 lastError = error instanceof RuntimeException runtime
                         ? runtime
@@ -140,15 +200,18 @@ public final class NanocachedClient implements AutoCloseable {
             }
 
             try {
+                client.targetKey = key;
+
                 if (identified instanceof Identify.NodeTarget node) {
-                    if (client.seeds.size() > 1) {
-                        System.err.println("nanocached: " + seed.host() + ":" + seed.port()
+                    if (client.addresses.size() > 1) {
+                        System.err.println("nanocached: " + key
                                 + " is a cache node, so this client is pinned to that single server —"
-                                + " the remaining seed(s) will not be used. Point seeds at discovery"
-                                + " servers for cluster routing and failover.");
+                                + " the " + (client.addresses.size() - 1) + " remaining address(es)"
+                                + " will not be used. Point addresses at discovery servers for cluster"
+                                + " routing and failover.");
                     }
-                    client.single = new Connection(node.socket());
-                    client.singleAddress = seed.host() + ":" + seed.port();
+                    client.single = client.newTrackedConnection(node.socket());
+                    client.singleAddress = key;
                     client.startKeepAlive();
                     return client;
                 }
@@ -156,8 +219,7 @@ public final class NanocachedClient implements AutoCloseable {
                 Identify.ClusterTarget cluster = (Identify.ClusterTarget) identified;
                 if (cluster.nodes().isEmpty()) {
                     lastError = new NanocachedException(
-                            "nanocached: no live nodes registered with the discovery server at "
-                                    + seed.host() + ":" + seed.port());
+                            "nanocached: no live nodes registered with the discovery server at " + key);
                     continue;
                 }
 
@@ -175,7 +237,52 @@ public final class NanocachedClient implements AutoCloseable {
 
         throw lastError != null
                 ? lastError
-                : new NanocachedException("nanocached: could not connect to any seed");
+                : new NanocachedException("nanocached: could not connect to any address");
+    }
+
+    /** Builds the TLS context to dial with, or {@code null} for a plain
+     * connection. {@code ca} is silently ignored when {@code tlsEnabled} is
+     * false; an unreadable/unparseable CA file is a connect-time error. */
+    private static SSLContext buildSslContext(boolean tlsEnabled, Path ca) {
+        if (!tlsEnabled) return null;
+
+        if (ca == null) {
+            try {
+                return SSLContext.getDefault();
+            } catch (NoSuchAlgorithmException error) {
+                throw new NanocachedException(
+                        "nanocached: no default SSL context available: " + error.getMessage());
+            }
+        }
+
+        try {
+            CertificateFactory factory = CertificateFactory.getInstance("X.509");
+            Collection<? extends Certificate> certificates;
+            try (InputStream in = Files.newInputStream(ca)) {
+                certificates = factory.generateCertificates(in);
+            }
+            if (certificates.isEmpty()) {
+                throw new NanocachedException("nanocached: ca file " + ca + " contains no certificates");
+            }
+
+            KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
+            trustStore.load(null, null);
+            int index = 0;
+            for (Certificate certificate : certificates) {
+                trustStore.setCertificateEntry("ca-" + index++, certificate);
+            }
+
+            TrustManagerFactory trustManagerFactory =
+                    TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            trustManagerFactory.init(trustStore);
+
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, trustManagerFactory.getTrustManagers(), null);
+            return context;
+        } catch (IOException | GeneralSecurityException error) {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: could not load ca file " + ca + ": " + error.getMessage(), error);
+        }
     }
 
     private void openCluster(Identify.ClusterTarget cluster) throws IOException {
@@ -204,33 +311,64 @@ public final class NanocachedClient implements AutoCloseable {
         return closed;
     }
 
-    public byte[] get(String key) {
+    /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
+     * when the key is missing.
+     * @throws UncheckedIOException if the stored value is not valid UTF-8 */
+    public Optional<String> get(String key) {
         return get(key.getBytes(StandardCharsets.UTF_8));
     }
 
-    /** Returns the value, or {@code null} when the key is missing. */
-    public byte[] get(byte[] key) {
+    /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
+     * when the key is missing.
+     * @throws UncheckedIOException if the stored value is not valid UTF-8 */
+    public Optional<String> get(byte[] key) {
+        return getBytes(key).map(NanocachedClient::decodeUtf8Strict);
+    }
+
+    /** Returns the raw value, or {@code Optional.empty()} when the key is
+     * missing. */
+    public Optional<byte[]> getBytes(String key) {
+        return getBytes(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Returns the raw value, or {@code Optional.empty()} when the key is
+     * missing. */
+    public Optional<byte[]> getBytes(byte[] key) {
         beforeOperation();
-        return withWrongNodeRetry(() -> read(key, connection -> connection.get(key)));
+        return Optional.ofNullable(withWrongNodeRetry(() -> read(key, connection -> connection.get(key))));
+    }
+
+    private static String decodeUtf8Strict(byte[] bytes) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (CharacterCodingException malformed) {
+            throw new UncheckedIOException(malformed);
+        }
     }
 
     public void set(String key, String value) {
-        set(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), null);
+        set(key, value, 0L);
     }
 
     public void set(String key, String value, long ttlSeconds) {
         set(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
     }
 
-    public void set(byte[] key, byte[] value, Long ttlSeconds) {
-        if (ttlSeconds != null && ttlSeconds < 0) {
+    public void set(byte[] key, byte[] value) {
+        set(key, value, 0L);
+    }
+
+    /** {@code ttlSeconds == 0} means no expiry. */
+    public void set(byte[] key, byte[] value, long ttlSeconds) {
+        if (ttlSeconds < 0) {
             throw new IllegalArgumentException(
                     "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         beforeOperation();
+        Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
         withWrongNodeRetry(() -> {
             write(key, connection -> {
-                connection.set(key, value, ttlSeconds);
+                connection.set(key, value, wireTtlSeconds);
                 return null;
             });
             return null;
@@ -247,10 +385,15 @@ public final class NanocachedClient implements AutoCloseable {
         return withWrongNodeRetry(() -> write(key, connection -> connection.delete(key)));
     }
 
-    /** Idempotent; later get/set/delete throw {@link NanocachedException.AlreadyClosed}. */
+    /** Idempotent (later get/set/delete throw {@link NanocachedException.AlreadyClosed}),
+     * but a second call warns to stderr — usually a sign the caller lost
+     * track of this instance's lifecycle. */
     @Override
     public void close() {
-        if (closed) return;
+        if (closed) {
+            System.err.println("nanocached: close() called again on an already-closed client");
+            return;
+        }
         closed = true;
         if (keepAlive != null) keepAlive.shutdownNow();
         if (replicaWriters != null) replicaWriters.shutdown();
@@ -452,7 +595,17 @@ public final class NanocachedClient implements AutoCloseable {
             }
             throw new NanocachedException.AlreadyClosed();
         }
-        return new Connection(node.socket());
+        return newTrackedConnection(node.socket());
+    }
+
+    /** Wraps {@code socket} in a {@link Connection}, incrementing this
+     * client's open-sockets count under {@link #targetKey} and arranging
+     * for it to be decremented the moment that connection closes for any
+     * reason — self-poisoning on a protocol error, a refresh dropping the
+     * node, a lazy redial discarding it, or {@link #close()}. */
+    private Connection newTrackedConnection(Socket socket) throws IOException {
+        trackOpenTarget(targetKey);
+        return new Connection(socket, () -> untrackOpenTarget(targetKey));
     }
 
     // ── ノードリスト更新 ──────────────────────────────────────────
@@ -496,8 +649,9 @@ public final class NanocachedClient implements AutoCloseable {
                 try {
                     members.put(node.name(), new Member(node.address(), openNodeConnection(node.address())));
                 } catch (IOException | RuntimeException error) {
-                    System.err.println("nanocached: could not connect to new node "
-                            + node.address() + ", will retry: " + error.getMessage());
+                    // Kept silent by design (issue #12): behavior is
+                    // unchanged (this node is retried on the next refresh),
+                    // it just no longer narrates to stderr.
                 }
             }
 
@@ -506,15 +660,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Walks every seed (ADR-0010); {@code null} means keep the last-known list. */
+    /** Walks every address (ADR-0010); {@code null} means keep the
+     * last-known list. */
     private Identify.ClusterTarget fetchNodeList() {
-        for (Seed seed : seeds) {
+        for (Address address : addresses) {
             Identify.Result identified;
             try {
-                identified = Identify.connectAndIdentify(seed.host(), seed.port(), authSecret, tls);
+                identified = Identify.connectAndIdentify(address.host(), address.port(), authSecret, tls);
             } catch (IOException | RuntimeException error) {
-                System.err.println("nanocached: could not refresh the node list from "
-                        + seed.host() + ":" + seed.port() + ": " + error.getMessage());
                 continue;
             }
             if (identified instanceof Identify.NodeTarget node) {
@@ -523,19 +676,14 @@ public final class NanocachedClient implements AutoCloseable {
                 } catch (IOException ignored) {
                     // One-shot probe cleanup.
                 }
-                System.err.println("nanocached: " + seed.host() + ":" + seed.port()
-                        + " no longer identifies as a discovery server");
                 continue;
             }
             Identify.ClusterTarget cluster = (Identify.ClusterTarget) identified;
             if (cluster.nodes().isEmpty()) {
-                System.err.println("nanocached: discovery at " + seed.host() + ":" + seed.port()
-                        + " returned no live nodes, skipping");
                 continue;
             }
             return cluster;
         }
-        System.err.println("nanocached: no discovery seed could provide a node list, keeping the last-known list");
         return null;
     }
 

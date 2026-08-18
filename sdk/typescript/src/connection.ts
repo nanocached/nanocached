@@ -76,8 +76,8 @@ export class Connection {
     throw this.mismatch(response);
   }
 
-  async set(key: string | Uint8Array, value: string | Uint8Array, options?: { ttlSeconds?: number }): Promise<void> {
-    const response = await this.send(encodeSet(toBytes(key), toBytes(value), options?.ttlSeconds));
+  async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
+    const response = await this.send(encodeSet(toBytes(key), toBytes(value), ttlSeconds));
     if (response.kind === "wrongNode") throw new WrongNodeError();
     if (response.kind !== "stored") throw this.mismatch(response);
   }

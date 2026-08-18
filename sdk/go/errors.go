@@ -18,7 +18,7 @@ var (
 
 	// ErrDiscoveryBusy: a discovery server answered `L` with `B` — it is
 	// inside its startup grace (ADR-0010), re-learning membership after a
-	// restart. Try another seed, or retry shortly.
+	// restart. Try another address, or retry shortly.
 	ErrDiscoveryBusy = errors.New("nanocached: the discovery server is warming up after a restart")
 
 	// ErrConnectionLost wraps connection-level failures; the client

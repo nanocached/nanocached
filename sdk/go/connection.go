@@ -28,6 +28,11 @@ type connection struct {
 	reader   *bufio.Reader
 	closed   bool
 	lastUsed time.Time
+	// onClose, when set, fires exactly once — the moment this connection
+	// transitions from open to closed — so callers can keep an external
+	// open-connection count (the forgotten-close tracker in client.go)
+	// accurate no matter which of the several close() call sites fires.
+	onClose func()
 }
 
 func newConnection(conn net.Conn) *connection {
@@ -53,10 +58,18 @@ func (c *connection) isClosed() bool {
 
 func (c *connection) close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	c.closed = true
 	if c.conn != nil {
 		_ = c.conn.Close()
+	}
+	onClose := c.onClose
+	c.mu.Unlock()
+	if onClose != nil {
+		onClose()
 	}
 }
 

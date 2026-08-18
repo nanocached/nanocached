@@ -9,27 +9,20 @@ import { ConnectionLostError } from "./connection.js";
  * failing over. */
 export const CONNECT_DEADLINE_MS = 10_000;
 
-export interface NanocachedTlsOptions {
-  /** PEM-encoded certificate(s) to trust when the server has no
-   * CA-issued certificate available (e.g. local development, or a private
-   * cluster with no PKI of its own) and runs with a self-signed
-   * certificate instead. This *replaces* Node's default (publicly-trusted)
-   * CA store rather than adding to it — that's how Node's own
-   * `tls.connect` treats an explicit `ca`. Matches nanocached-node's own
-   * --tls-ca option. Leave unset/false (use `tls: true`) whenever the
-   * server's certificate is issued by a trusted CA. */
-  ca: string | Buffer | Array<string | Buffer>;
-}
-
 export interface ConnectSocketOptions {
   host: string;
   port: number;
-  /** `boolean`, not just the literal `true`, so a single config value
-   * (e.g. an env var) can toggle this across environments without an
-   * `x ? true : undefined` workaround. `true`/`false` verify (or not)
-   * against Node's default, publicly-trusted CA store; `{ ca }` trusts
-   * only a private/self-signed certificate instead. */
-  tls?: boolean | NanocachedTlsOptions;
+  /** Connect over TLS instead of plaintext. Plain `boolean` so a single
+   * config value (e.g. an env var) can toggle this across environments. */
+  tls?: boolean;
+  /** PEM-encoded trusted root certificate(s), already read from disk by
+   * the caller (see `NanocachedClientOptions.ca`) — this *replaces* Node's
+   * default (publicly-trusted) CA store rather than adding to it, matching
+   * how Node's own `tls.connect` treats an explicit `ca`. Only meaningful
+   * when `tls` is true; ignored otherwise. Leave unset to verify against
+   * Node's default, publicly-trusted CA store — the normal case whenever
+   * the server's certificate is issued by a trusted CA. */
+  ca?: Buffer;
   /** Bound on the dial (and TLS handshake); defaults to
    * `CONNECT_DEADLINE_MS`. Exposed for tests. */
   connectDeadlineMs?: number;
@@ -57,7 +50,7 @@ export async function connectSocket(options: ConnectSocketOptions): Promise<Sock
       ? tlsConnect({
           host: options.host,
           port: options.port,
-          ...(options.tls === true ? {} : { ca: options.tls.ca }),
+          ...(options.ca !== undefined ? { ca: options.ca } : {}),
         })
       : netConnect({ host: options.host, port: options.port });
 

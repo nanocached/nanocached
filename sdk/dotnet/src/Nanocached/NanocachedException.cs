@@ -29,7 +29,7 @@ public sealed class WrongNodeException : NanocachedException
 /// <summary>
 /// A discovery server answered <c>L</c> with <c>B</c> — it is inside its
 /// startup grace (ADR-0010), re-learning membership after a restart. Try
-/// another seed, or retry shortly.
+/// another address, or retry shortly.
 /// </summary>
 public sealed class DiscoveryBusyException : NanocachedException
 {

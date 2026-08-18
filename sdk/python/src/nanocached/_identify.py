@@ -58,11 +58,11 @@ async def connect_and_identify(
     host: str,
     port: int,
     auth_secret: bytes | None,
-    tls: bool | ssl_module.SSLContext,
+    ssl_context: ssl_module.SSLContext | None,
 ) -> NodeTarget | ClusterTarget:
     try:
         return await asyncio.wait_for(
-            _connect_and_identify(host, port, auth_secret, tls), CONNECT_DEADLINE
+            _connect_and_identify(host, port, auth_secret, ssl_context), CONNECT_DEADLINE
         )
     except TimeoutError as error:
         raise ConnectionError(
@@ -74,17 +74,9 @@ async def _connect_and_identify(
     host: str,
     port: int,
     auth_secret: bytes | None,
-    tls: bool | ssl_module.SSLContext,
+    ssl_context: ssl_module.SSLContext | None,
 ) -> NodeTarget | ClusterTarget:
-    ssl_arg: ssl_module.SSLContext | bool | None
-    if tls is True:
-        ssl_arg = ssl_module.create_default_context()
-    elif tls is False:
-        ssl_arg = None
-    else:
-        ssl_arg = tls
-
-    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_arg)
+    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
 
     try:
         secret = auth_secret if auth_secret is not None else _NO_SECRET_PLACEHOLDER

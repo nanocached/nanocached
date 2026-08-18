@@ -415,7 +415,7 @@ single-copy behavior.
 Discovery's registry is soft state, rebuilt from node announces, so it can
 run as several independent replicas with no coordination between them
 (`doc/adr/0010-*.md`): point every node's `--discovery` (and every SDK
-client's `seeds`) at the same list of replicas, and losing any one replica
+client's `addresses`) at the same list of replicas, and losing any one replica
 — including the primary — costs neither cache traffic nor client
 bootstrap. Only *joins* need the primary up. After a (re)start, a replica
 answers `L` with `B` (busy) for the liveness-timeout window while live

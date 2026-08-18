@@ -14,8 +14,12 @@ export function encodeGet(key: Uint8Array): Buffer {
   return Buffer.concat([toAscii(`G ${key.length}\n`), key]);
 }
 
-export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds?: number): Buffer {
-  if (ttlSeconds !== undefined && (!Number.isInteger(ttlSeconds) || ttlSeconds < 0)) {
+// 0 means no expiry (the default) and is sent on the wire by omitting the
+// TTL field entirely — exactly what an absent/undefined TTL meant before
+// this field existed; the server has no separate "explicit no-op TTL"
+// concept, so any other encoding would be a distinct thing.
+export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0): Buffer {
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
     // A non-integer/negative TTL (3.5, -1, NaN, Infinity) would serialize to a
     // frame the server rejects with no reply, closing the shared, pipelined
     // connection — taking every other in-flight request on it down too. Reject
@@ -24,7 +28,7 @@ export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds?: numbe
   }
 
   const header =
-    ttlSeconds === undefined
+    ttlSeconds === 0
       ? `S ${key.length} ${value.length}\n`
       : `S ${key.length} ${value.length} ${ttlSeconds}\n`;
   return Buffer.concat([toAscii(header), key, value]);

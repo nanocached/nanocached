@@ -3,10 +3,11 @@
 Minimal programs, one per SDK, for exercising a real discovery-fronted
 cluster from a test host — used for the AWS scenario tests (node join,
 node death, mid-migration death, queued joins) that verified v1.0.0.
-Every program reads its seeds from the same environment variable:
+Every program reads its target addresses from the same environment
+variable:
 
 ```sh
-export NANOTEST_SEEDS="10.0.0.1:8357,10.0.0.2:8357"   # discovery replicas, in order
+export NANOTEST_ADDRESSES="10.0.0.1:8357,10.0.0.2:8357"   # discovery replicas, in order
 ```
 
 ## The scenario driver (Python)
@@ -51,7 +52,7 @@ the working tree, not a published package.
 The 2026-08 test run used: ECS Fargate tasks (ARM64 images built from
 the repo `Dockerfile`, pushed to ECR) — two `nanocached-discovery`
 tasks started first so their private IPs could be passed to every
-node's `--discovery` (same list, same order) and to `NANOTEST_SEEDS`.
+node's `--discovery` (same list, same order) and to `NANOTEST_ADDRESSES`.
 (That run predated ADR-0012 and scraped each task's IP from the ECS
 metadata endpoint for `--advertise-addr`; nodes now need no address
 configuration at all.) The rest of the setup:

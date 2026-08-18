@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,42 @@ import (
 var testNames = []string{
 	"5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6",
 	"0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47",
+}
+
+// addr parses a "host:port" string (as returned by a mock listener's
+// Addr().String()) into an Address, for building Config.Addresses in
+// tests.
+func addr(hostPort string) Address {
+	host, portStr, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		panic(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		panic(err)
+	}
+	return Address{Host: host, Port: port}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// everything written to it. Tests in this package run sequentially (none
+// call t.Parallel), so swapping the package-level os.Stderr is safe.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = original
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	_ = r.Close()
+	return buf.String()
 }
 
 // ── モックノード ──────────────────────────────────────────────────
@@ -317,17 +354,17 @@ func waitFor(t *testing.T, condition func() bool, what string) {
 
 func TestRoundTripsSetGetDelete(t *testing.T) {
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("greeting", []byte("hello"), 0); err != nil {
+	if err := client.Set("greeting", "hello", 0); err != nil {
 		t.Fatal(err)
 	}
 	value, ok, err := client.Get("greeting")
-	if err != nil || !ok || string(value) != "hello" {
+	if err != nil || !ok || value != "hello" {
 		t.Fatalf("Get = %q, %v, %v", value, ok, err)
 	}
 	if existed, err := client.Delete("greeting"); err != nil || !existed {
@@ -344,39 +381,82 @@ func TestRoundTripsSetGetDelete(t *testing.T) {
 	}
 }
 
-func TestRejectsANegativeTtl(t *testing.T) {
+func TestGetBytesRoundTripsRawValues(t *testing.T) {
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("k", []byte("v"), -time.Second); err == nil {
+	raw := []byte{0x00, 0xff, 0x10, 0x80, 0x7f, 'h', 'i'}
+	if err := client.SetBytes("binary", raw, 0); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := client.GetBytes("binary")
+	if err != nil || !ok || !bytes.Equal(value, raw) {
+		t.Fatalf("GetBytes = %v, %v, %v", value, ok, err)
+	}
+}
+
+func TestRejectsANegativeTtl(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", -1); err == nil {
 		t.Fatal("negative ttl accepted")
 	}
-	if err := client.Set("k", []byte("v"), time.Minute); err != nil {
+	if err := client.SetBytes("k", []byte("v"), -1); err == nil {
+		t.Fatal("negative ttl accepted (SetBytes)")
+	}
+	if err := client.Set("k", "v", 60); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTtlZeroMeansNoExpiryAndAPositiveTtlIsSentAsIs(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.lastSetTTL.Load(); got != "none" {
+		t.Fatalf("zero TTL sent as %v, want none", got)
+	}
+	if err := client.Set("k", "v", 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.lastSetTTL.Load(); got != "2" {
+		t.Fatalf("2s TTL sent as %v, want \"2\"", got)
 	}
 }
 
 func TestAuthenticates(t *testing.T) {
 	node := startMockNode(t, []byte("s3cret"))
 
-	client, err := Connect(Config{Seeds: []string{node.address()}, AuthSecret: "s3cret"})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, AuthSecret: "s3cret"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Set("k", []byte("v"), 0); err != nil {
+	if err := client.Set("k", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	client.Close()
 
-	if _, err := Connect(Config{Seeds: []string{node.address()}}); err == nil ||
+	if _, err := Connect(Config{Addresses: []Address{addr(node.address())}}); err == nil ||
 		!strings.Contains(err.Error(), "requires authentication") {
 		t.Fatalf("missing-secret error = %v", err)
 	}
-	if _, err := Connect(Config{Seeds: []string{node.address()}, AuthSecret: "wrong"}); err == nil ||
+	if _, err := Connect(Config{Addresses: []Address{addr(node.address())}, AuthSecret: "wrong"}); err == nil ||
 		!strings.Contains(err.Error(), "authentication failed") {
 		t.Fatalf("wrong-secret error = %v", err)
 	}
@@ -384,7 +464,7 @@ func TestAuthenticates(t *testing.T) {
 
 func TestWrongNodePropagatesInSingleMode(t *testing.T) {
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +478,7 @@ func TestWrongNodePropagatesInSingleMode(t *testing.T) {
 
 func TestRejectsUseAfterClose(t *testing.T) {
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,37 +492,48 @@ func TestRejectsUseAfterClose(t *testing.T) {
 	}
 }
 
-// ── 遅延再接続と keep-alive ───────────────────────────────────────
-
-func TestSubSecondTtlRoundsUpToOneSecond(t *testing.T) {
-	// Regression for issue #9: 300ms must not truncate to an explicit
-	// 0-second TTL (near-immediate expiry).
+func TestClosingTwiceWarnsOnStderr(t *testing.T) {
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	client.Close()
 
-	if err := client.Set("k", []byte("v"), 300*time.Millisecond); err != nil {
-		t.Fatal(err)
+	output := captureStderr(t, func() {
+		client.Close()
+	})
+	if !strings.Contains(output, "close() called again on an already-closed client") {
+		t.Fatalf("expected double-close warning, got %q", output)
 	}
-	if got := node.lastSetTTL.Load(); got != "1" {
-		t.Fatalf("300ms TTL sent as %v, want \"1\"", got)
-	}
-	if err := client.Set("k", []byte("v"), 0); err != nil {
-		t.Fatal(err)
-	}
-	if got := node.lastSetTTL.Load(); got != "none" {
-		t.Fatalf("zero TTL sent as %v, want none", got)
-	}
-	if err := client.Set("k", []byte("v"), 2*time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if got := node.lastSetTTL.Load(); got != "2" {
-		t.Fatalf("2s TTL sent as %v, want \"2\"", got)
+	if !client.IsClosed() {
+		t.Fatal("not closed")
 	}
 }
+
+func TestConnectWarnsWhenAPreviousConnectionToTheSameAddressIsStillOpen(t *testing.T) {
+	node := startMockNode(t, nil)
+	first, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	var second *Client
+	output := captureStderr(t, func() {
+		second, err = Connect(Config{Addresses: []Address{addr(node.address())}})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	if !strings.Contains(output, "was close() forgotten") {
+		t.Fatalf("expected forgotten-close warning, got %q", output)
+	}
+}
+
+// ── 遅延再接続と keep-alive ───────────────────────────────────────
 
 func TestAMismatchedResponseKindPoisonsTheConnection(t *testing.T) {
 	// A well-formed response of the wrong kind (`S` answering a G) means
@@ -452,18 +543,18 @@ func TestAMismatchedResponseKindPoisonsTheConnection(t *testing.T) {
 	// error is healed by the built-in redial-and-retry-once — never by
 	// reusing the desynced stream.
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("k", []byte("v"), 0); err != nil {
+	if err := client.Set("k", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	node.storedToGetLeft.Add(1)
 	value, ok, err := client.Get("k")
-	if err != nil || !ok || string(value) != "v" {
+	if err != nil || !ok || value != "v" {
 		t.Fatalf("Get after mismatched response = %q, %v, %v", value, ok, err)
 	}
 	if got := node.connectionCount.Load(); got != 2 {
@@ -495,7 +586,7 @@ func TestConnectingToASilentServerFailsWithinTheDeadline(t *testing.T) {
 	defer func() { handshakeDeadline = original }()
 
 	started := time.Now()
-	_, err = Connect(Config{Seeds: []string{listener.Addr().String()}})
+	_, err = Connect(Config{Addresses: []Address{addr(listener.Addr().String())}})
 	if !errors.Is(err, ErrConnectionLost) {
 		t.Fatalf("Connect against a silent server = %v, want ErrConnectionLost", err)
 	}
@@ -509,18 +600,18 @@ func TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently(t *tes
 	// connection-classified, so the built-in redial-and-retry-once makes
 	// the same call succeed, never serving stray bytes.
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("k", []byte("v"), 0); err != nil {
+	if err := client.Set("k", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	node.malformedLeft.Add(1)
 	value, ok, err := client.Get("k")
-	if err != nil || !ok || string(value) != "v" {
+	if err != nil || !ok || value != "v" {
 		t.Fatalf("Get = %q, %v, %v", value, ok, err)
 	}
 	if node.connectionCount.Load() != 2 {
@@ -530,20 +621,20 @@ func TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently(t *tes
 
 func TestTransparentlyReconnectsAfterAServerFin(t *testing.T) {
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("k", []byte("v"), 0); err != nil {
+	if err := client.Set("k", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	node.dropConnections()
 	time.Sleep(50 * time.Millisecond) // let the FIN land
 
 	value, ok, err := client.Get("k")
-	if err != nil || !ok || string(value) != "v" {
+	if err != nil || !ok || value != "v" {
 		t.Fatalf("Get after FIN = %q, %v, %v", value, ok, err)
 	}
 	if node.connectionCount.Load() != 2 {
@@ -559,7 +650,7 @@ func TestKeepAlivePingsAnIdleConnection(t *testing.T) {
 	defer func() { keepAliveInterval = defaultInterval }()
 
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Seeds: []string{node.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,40 +662,40 @@ func TestKeepAlivePingsAnIdleConnection(t *testing.T) {
 	}
 }
 
-// ── seeds ─────────────────────────────────────────────────────────
+// ── addresses ─────────────────────────────────────────────────────
 
 func TestRejectsAMissingTarget(t *testing.T) {
 	if _, err := Connect(Config{}); err == nil {
-		t.Fatal("empty seeds accepted")
+		t.Fatal("empty addresses accepted")
 	}
 }
 
-func TestFailsOverToTheSecondSeed(t *testing.T) {
+func TestFailsOverToTheSecondAddress(t *testing.T) {
 	node := startMockNode(t, nil)
 	discovery := startMockDiscovery(t,
 		[]DiscoveredNode{{Name: testNames[0], Address: node.address()}}, 1)
 
-	client, err := Connect(Config{Seeds: []string{unusedPort(t), discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(unusedPort(t)), addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("k", []byte("v"), 0); err != nil {
+	if err := client.Set("k", "v", 0); err != nil {
 		t.Fatal(err)
 	}
-	if value, ok, err := client.Get("k"); err != nil || !ok || string(value) != "v" {
+	if value, ok, err := client.Get("k"); err != nil || !ok || value != "v" {
 		t.Fatalf("Get = %q, %v, %v", value, ok, err)
 	}
 }
 
-func TestRaisesBusyWhenEverySeedIsWarming(t *testing.T) {
+func TestRaisesBusyWhenEveryAddressIsWarming(t *testing.T) {
 	first := startMockDiscovery(t, nil, 1)
 	second := startMockDiscovery(t, nil, 1)
 	first.setWarming(true)
 	second.setWarming(true)
 
-	if _, err := Connect(Config{Seeds: []string{first.address(), second.address()}}); !errors.Is(err, ErrDiscoveryBusy) {
+	if _, err := Connect(Config{Addresses: []Address{addr(first.address()), addr(second.address())}}); !errors.Is(err, ErrDiscoveryBusy) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -630,20 +721,20 @@ func ownersOf(key string) []string {
 
 func TestRoutesAndReadsItsOwnWrites(t *testing.T) {
 	nodes, discovery := startCluster(t, 1)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
 	for i := 0; i < 50; i++ {
-		if err := client.Set(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("value-%d", i)), 0); err != nil {
+		if err := client.Set(fmt.Sprintf("key-%d", i), fmt.Sprintf("value-%d", i), 0); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := 0; i < 50; i++ {
 		value, ok, err := client.Get(fmt.Sprintf("key-%d", i))
-		if err != nil || !ok || string(value) != fmt.Sprintf("value-%d", i) {
+		if err != nil || !ok || value != fmt.Sprintf("value-%d", i) {
 			t.Fatalf("key-%d = %q, %v, %v", i, value, ok, err)
 		}
 	}
@@ -663,19 +754,19 @@ func TestRoutesAndReadsItsOwnWrites(t *testing.T) {
 
 func TestWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
 	nodes, discovery := startCluster(t, 1)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("some-key", []byte("v"), 0); err != nil {
+	if err := client.Set("some-key", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	owner := nodes[NewHashRing(testNames).Route([]byte("some-key"))]
 
 	owner.wrongNodeLeft.Add(1)
-	if value, ok, err := client.Get("some-key"); err != nil || !ok || string(value) != "v" {
+	if value, ok, err := client.Get("some-key"); err != nil || !ok || value != "v" {
 		t.Fatalf("Get after one W = %q, %v, %v", value, ok, err)
 	}
 
@@ -687,7 +778,7 @@ func TestWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
 
 func TestFansWritesOutToEveryOwner(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,7 +788,7 @@ func TestFansWritesOutToEveryOwner(t *testing.T) {
 		t.Fatalf("Replication = %d", client.Replication())
 	}
 	for i := 0; i < 20; i++ {
-		if err := client.Set(fmt.Sprintf("key-%d", i), []byte("v"), 0); err != nil {
+		if err := client.Set(fmt.Sprintf("key-%d", i), "v", 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -712,27 +803,27 @@ func TestFansWritesOutToEveryOwner(t *testing.T) {
 
 func TestReadsFailOverWhenThePrimaryDies(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("survives", []byte("still here"), 0); err != nil {
+	if err := client.Set("survives", "still here", 0); err != nil {
 		t.Fatal(err)
 	}
 	nodes[ownersOf("survives")[0]].close()
 	time.Sleep(50 * time.Millisecond)
 
 	value, ok, err := client.Get("survives")
-	if err != nil || !ok || string(value) != "still here" {
+	if err != nil || !ok || value != "still here" {
 		t.Fatalf("Get = %q, %v, %v", value, ok, err)
 	}
 }
 
 func TestADeadReplicaDoesNotFailWrites(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +833,7 @@ func TestADeadReplicaDoesNotFailWrites(t *testing.T) {
 	nodes[owners[1]].close()
 	time.Sleep(50 * time.Millisecond)
 
-	if err := client.Set("written-anyway", []byte("v"), 0); err != nil {
+	if err := client.Set("written-anyway", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	if !nodes[owners[0]].hasKey("written-anyway") {
@@ -752,7 +843,7 @@ func TestADeadReplicaDoesNotFailWrites(t *testing.T) {
 
 func TestWritesRouteAroundADeadPrimaryOnceDiscoveryDropsIt(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -768,23 +859,23 @@ func TestWritesRouteAroundADeadPrimaryOnceDiscoveryDropsIt(t *testing.T) {
 	discovery.setNodes([]DiscoveredNode{{Name: owners[1], Address: nodes[owners[1]].address()}})
 	time.Sleep(50 * time.Millisecond)
 
-	if err := client.Set(key, []byte("v"), 0); err != nil {
+	if err := client.Set(key, "v", 0); err != nil {
 		t.Fatal(err)
 	}
-	if value, ok, err := client.Get(key); err != nil || !ok || string(value) != "v" {
+	if value, ok, err := client.Get(key); err != nil || !ok || value != "v" {
 		t.Fatalf("Get = %q, %v, %v", value, ok, err)
 	}
 }
 
 func TestFansDeletesOutToEveryOwner(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
-	client, err := Connect(Config{Seeds: []string{discovery.address()}})
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.Set("gone-everywhere", []byte("v"), 0); err != nil {
+	if err := client.Set("gone-everywhere", "v", 0); err != nil {
 		t.Fatal(err)
 	}
 	if existed, err := client.Delete("gone-everywhere"); err != nil || !existed {

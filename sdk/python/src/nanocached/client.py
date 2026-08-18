@@ -1,7 +1,7 @@
-"""The public client. ``host``/``port`` (or a ``seeds`` list) may name
-either a single nanocached-node or discovery server(s) fronting a cluster —
-``connect()`` finds out from the server's own handshake response
-(doc/adr/0007-*.md), so calling code is identical either way.
+"""The public client. An ``addresses`` list may name either a single
+nanocached-node or discovery server(s) fronting a cluster — ``connect()``
+finds out from the server's own handshake response (doc/adr/0007-*.md), so
+calling code is identical either way.
 
 Cluster mode implements ADR-0011 client-side replication: writes fan out to
 each key's top-R owners (the primary's result decides; a dead replica never
@@ -14,9 +14,12 @@ server's 30s idle timeout.
 from __future__ import annotations
 
 import asyncio
+import os
 import ssl as ssl_module
 import sys
+import threading
 import time
+from collections.abc import Sequence
 
 from ._connection import Connection
 from ._errors import AlreadyClosedError, NanocachedError, WrongNodeError
@@ -48,6 +51,49 @@ def _to_bytes(value: str | bytes) -> bytes:
     return value.encode("utf-8") if isinstance(value, str) else bytes(value)
 
 
+def _build_ssl_context(tls: bool, ca: str | os.PathLike | None) -> ssl_module.SSLContext | None:
+    """``ca`` is meaningful only when ``tls`` is true — silently ignored
+    otherwise. An unreadable/unparseable CA file is a connect-time error
+    (raised synchronously, before any socket is opened)."""
+    if not tls:
+        return None
+    if ca is not None:
+        return ssl_module.create_default_context(cafile=ca)
+    return ssl_module.create_default_context()
+
+
+# Tracks, per connect() target ("host:port", not per client instance — see
+# NanocachedClient._target_key), how many live sockets are still open for
+# it. Purely a programming-error guard: catches "connect() called again for
+# the same target before the previous one was ever released" without
+# affecting behavior — connecting again still works, this only warns.
+# Mirrors the TypeScript SDK's module-level `openTargets` map
+# (sdk/typescript/src/client.ts); guarded by a lock since, unlike a single
+# JS event loop, nothing prevents this module from being used from more
+# than one thread.
+_open_targets: dict[str, int] = {}
+_open_targets_lock = threading.Lock()
+
+
+def _increment_open_target(key: str) -> None:
+    with _open_targets_lock:
+        _open_targets[key] = _open_targets.get(key, 0) + 1
+
+
+def _decrement_open_target(key: str) -> None:
+    with _open_targets_lock:
+        remaining = _open_targets.get(key, 1) - 1
+        if remaining <= 0:
+            _open_targets.pop(key, None)
+        else:
+            _open_targets[key] = remaining
+
+
+def _has_open_target(key: str) -> bool:
+    with _open_targets_lock:
+        return _open_targets.get(key, 0) > 0
+
+
 class _Member:
     """One cluster member: its last-known address (for lazy redials) and
     its current connection."""
@@ -65,9 +111,10 @@ class NanocachedClient:
         self._members: dict[str, _Member] = {}
         self._ring: HashRing | None = None
         self._replication = 1
-        self._seeds: list[tuple[str, int]] = []
+        self._addresses: list[tuple[str, int]] = []
         self._auth_secret: bytes | None = None
-        self._tls: bool | ssl_module.SSLContext = False
+        self._ssl_context: ssl_module.SSLContext | None = None
+        self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
         self._redials: dict[str, asyncio.Task[Connection]] = {}
@@ -78,56 +125,65 @@ class NanocachedClient:
     @classmethod
     async def connect(
         cls,
-        host: str | None = None,
-        port: int | None = None,
+        addresses: Sequence[tuple[str, int]],
         *,
-        seeds: list[tuple[str, int]] | None = None,
-        auth_secret: str | bytes | None = None,
-        tls: bool | ssl_module.SSLContext = False,
+        auth_secret: str | None = None,
+        tls: bool = False,
+        ca: str | os.PathLike | None = None,
     ) -> "NanocachedClient":
-        resolved_seeds = seeds if seeds is not None else (
-            [(host, port)] if host is not None and port is not None else []
-        )
-        if not resolved_seeds:
-            raise ValueError("nanocached: connect() needs either host/port or a non-empty seeds list")
+        if not addresses:
+            raise ValueError("nanocached: connect() needs a non-empty addresses list")
 
         client = cls()
-        client._seeds = list(resolved_seeds)
-        client._auth_secret = _to_bytes(auth_secret) if auth_secret is not None else None
-        client._tls = tls
+        client._addresses = list(addresses)
+        client._auth_secret = auth_secret.encode("utf-8") if auth_secret is not None else None
+        client._ssl_context = _build_ssl_context(tls, ca)
 
-        # Walk the seeds until one yields a working target; a seed that is
-        # unreachable, warming up (`B`, ADR-0010), or knows no live nodes
-        # is skipped — the next replica may do better.
+        # Walk the addresses until one yields a working target; an address
+        # that is unreachable, warming up (`B`, ADR-0010), or knows no live
+        # nodes is skipped — the next replica may do better.
         last_error: Exception | None = None
-        for seed_host, seed_port in client._seeds:
+        for address_host, address_port in client._addresses:
+            key = f"{address_host}:{address_port}"
+            # Only meaningful for a single explicit target: with a
+            # multi-address config, another client instance legitimately
+            # holding connections to the same address makes this heuristic
+            # false-positive (issue #12).
+            if len(client._addresses) == 1 and _has_open_target(key):
+                _warn(
+                    f"nanocached: connect() called for {key} while a previous connection to it "
+                    f"is still open — was close() forgotten?"
+                )
+
             try:
                 identified = await connect_and_identify(
-                    seed_host, seed_port, client._auth_secret, client._tls
+                    address_host, address_port, client._auth_secret, client._ssl_context
                 )
             except (NanocachedError, OSError) as error:
                 last_error = error
                 continue
 
             if isinstance(identified, NodeTarget):
-                if len(client._seeds) > 1:
+                if len(client._addresses) > 1:
                     _warn(
-                        f"nanocached: {seed_host}:{seed_port} is a cache node, so this client is "
-                        f"pinned to that single server — the remaining seed(s) will not be used. "
-                        f"Point seeds at discovery servers for cluster routing and failover."
+                        f"nanocached: {key} is a cache node, so this client is pinned to that "
+                        f"single server — the {len(client._addresses) - 1} remaining address(es) "
+                        f"will not be used. Point addresses at discovery servers for cluster "
+                        f"routing and failover."
                     )
-                client._single = Connection(identified.reader, identified.writer)
-                client._single_address = f"{seed_host}:{seed_port}"
+                client._target_key = key
+                client._single = client._new_connection(identified.reader, identified.writer)
+                client._single_address = key
                 client._start_keepalive()
                 return client
 
             if not identified.nodes:
                 last_error = NanocachedError(
-                    f"nanocached: no live nodes registered with the discovery server at "
-                    f"{seed_host}:{seed_port}"
+                    f"nanocached: no live nodes registered with the discovery server at {key}"
                 )
                 continue
 
+            client._target_key = key
             try:
                 await client._open_cluster(identified)
             except BaseException:
@@ -137,18 +193,27 @@ class NanocachedClient:
             return client
 
         raise last_error if last_error is not None else NanocachedError(
-            "nanocached: could not connect to any seed"
+            "nanocached: could not connect to any address"
         )
+
+    def _new_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Connection:
+        """Wraps a freshly identified node socket, tracking it against this
+        client's target key (§7 ③) until it closes — whether via close(),
+        redial replacement, or refresh reconciliation."""
+        assert self._target_key is not None
+        key = self._target_key
+        _increment_open_target(key)
+        return Connection(reader, writer, on_close=lambda: _decrement_open_target(key))
 
     async def _open_cluster(self, identified: ClusterTarget) -> None:
         for node in identified.nodes:
             node_host, node_port = split_host_port(node.address)
-            target = await connect_and_identify(node_host, node_port, self._auth_secret, self._tls)
+            target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
             if not isinstance(target, NodeTarget):
                 raise NanocachedError(
                     f"nanocached: discovery server returned a non-node address: {node.address}"
                 )
-            self._members[node.name] = _Member(node.address, Connection(target.reader, target.writer))
+            self._members[node.name] = _Member(node.address, self._new_connection(target.reader, target.writer))
 
         self._ring = HashRing([node.name for node in identified.nodes])
         self._replication = identified.replication
@@ -164,17 +229,28 @@ class NanocachedClient:
     def closed(self) -> bool:
         return self._closed
 
-    async def get(self, key: str | bytes) -> bytes | None:
+    async def get_bytes(self, key: str | bytes) -> bytes | None:
+        """The raw companion to get(): no UTF-8 decoding, so it never
+        raises on a value that isn't valid UTF-8."""
         key_bytes = _to_bytes(key)
         await self._before_operation()
         return await self._with_wrong_node_retry(
             lambda: self._read(key_bytes, lambda connection: connection.get(key_bytes))
         )
 
+    async def get(self, key: str | bytes) -> str | None:
+        """Strict UTF-8 decode of the stored value (bytes.decode()) — a
+        value that is not valid UTF-8 raises UnicodeDecodeError rather than
+        silently replacing it. Use get_bytes() for the raw bytes."""
+        value = await self.get_bytes(key)
+        return value.decode() if value is not None else None
+
     async def set(
-        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int | None = None
+        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
     ) -> None:
-        if ttl_seconds is not None and (not isinstance(ttl_seconds, int) or ttl_seconds < 0):
+        """``ttl_seconds`` is whole seconds; 0 (the default) means no
+        expiry. Negative values are rejected eagerly, before any I/O."""
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
             raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
         await self._before_operation()
@@ -193,13 +269,22 @@ class NanocachedClient:
         )
 
     def close(self) -> None:
-        """Idempotent; later get/set/delete raise AlreadyClosedError."""
+        """Idempotent; later get/set/delete raise AlreadyClosedError. A
+        second close() is usually a sign the caller lost track of this
+        instance's lifecycle, so — unlike the first — it warns."""
         if self._closed:
+            _warn("nanocached: close() called again on an already-closed client")
             return
         self._closed = True
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
         self._teardown()
+
+    async def __aenter__(self) -> "NanocachedClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def _teardown(self) -> None:
         if self._single is not None:
@@ -350,13 +435,13 @@ class NanocachedClient:
 
     async def _open_node_connection(self, address: str) -> Connection:
         node_host, node_port = split_host_port(address)
-        identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._tls)
+        identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
         if not isinstance(identified, NodeTarget):
             raise NanocachedError(f"nanocached: {address} no longer identifies as a cache node")
         if self._closed:
             identified.writer.close()
             raise AlreadyClosedError()
-        return Connection(identified.reader, identified.writer)
+        return self._new_connection(identified.reader, identified.writer)
 
     # ── ノードリスト更新 ────────────────────────────────────────────
 
@@ -390,18 +475,19 @@ class NanocachedClient:
                 continue
             try:
                 node_host, node_port = split_host_port(node.address)
-                target = await connect_and_identify(node_host, node_port, self._auth_secret, self._tls)
+                target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
                 if not isinstance(target, NodeTarget):
-                    _warn(f"nanocached: discovery returned a non-node address: {node.address}, skipping")
+                    # Refresh warnings are silent by design (§7 ②) —
+                    # behavior is unchanged, this node is just skipped.
                     continue
                 if self._closed:
                     # close() ran while we were dialing (issue #10):
                     # installing this socket now would leak it.
                     target.writer.close()
                     return
-                self._members[node.name] = _Member(node.address, Connection(target.reader, target.writer))
-            except (NanocachedError, OSError) as error:
-                _warn(f"nanocached: could not connect to new node {node.address}, will retry: {error}")
+                self._members[node.name] = _Member(node.address, self._new_connection(target.reader, target.writer))
+            except (NanocachedError, OSError):
+                pass
 
         if self._closed:
             self._teardown()
@@ -411,24 +497,22 @@ class NanocachedClient:
         self._replication = cluster.replication
 
     async def _fetch_node_list(self) -> ClusterTarget | None:
-        """Walks every seed (ADR-0010); None means keep the last-known list."""
-        for seed_host, seed_port in self._seeds:
+        """Walks every address (ADR-0010); None means keep the last-known
+        list. Failures here are silent by design (§7 ②) — behavior is
+        unchanged either way, it just happens without a warning."""
+        for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify(
-                    seed_host, seed_port, self._auth_secret, self._tls
+                    address_host, address_port, self._auth_secret, self._ssl_context
                 )
-            except (NanocachedError, OSError) as error:
-                _warn(f"nanocached: could not refresh the node list from {seed_host}:{seed_port}: {error}")
+            except (NanocachedError, OSError):
                 continue
             if isinstance(identified, NodeTarget):
                 identified.writer.close()
-                _warn(f"nanocached: {seed_host}:{seed_port} no longer identifies as a discovery server")
                 continue
             if not identified.nodes:
-                _warn(f"nanocached: discovery at {seed_host}:{seed_port} returned no live nodes, skipping")
                 continue
             return identified
-        _warn("nanocached: no discovery seed could provide a node list, keeping the last-known list")
         return None
 
     # ── keep-alive ─────────────────────────────────────────────────

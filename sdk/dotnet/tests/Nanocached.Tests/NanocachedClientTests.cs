@@ -13,6 +13,35 @@ public class NanocachedClientTests
 
     private static byte[] Bytes(string text) => Encoding.UTF8.GetBytes(text);
 
+    private static NanocachedClient.Options SingleAddress(string host, int port) =>
+        new() { Addresses = { (host, port) } };
+
+    private static NanocachedClient.Options ManyAddresses(params (string Host, int Port)[] addresses)
+    {
+        var options = new NanocachedClient.Options();
+        foreach (var address in addresses) options.Addresses.Add(address);
+        return options;
+    }
+
+    private static async Task<string> CaptureStderrAsync(Func<Task> action)
+    {
+        TextWriter original = Console.Error;
+        var captured = new StringWriter();
+        Console.SetError(captured);
+        try
+        {
+            await action();
+        }
+        finally
+        {
+            Console.SetError(original);
+        }
+        return captured.ToString();
+    }
+
+    private static int CountOccurrences(string haystack, string needle) =>
+        haystack.Split(needle, StringSplitOptions.None).Length - 1;
+
     private static async Task WaitForAsync(Func<bool> condition, string what)
     {
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
@@ -29,27 +58,55 @@ public class NanocachedClientTests
     public async Task RoundTripsSetGetDelete()
     {
         using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
         await client.SetAsync("greeting", "hello");
-        Assert.Equal(Bytes("hello"), await client.GetAsync("greeting"));
+        Assert.Equal("hello", await client.GetAsync("greeting"));
+        Assert.Equal(Bytes("hello"), await client.GetBytesAsync("greeting"));
         Assert.True(await client.DeleteAsync("greeting"));
         Assert.Null(await client.GetAsync("greeting"));
+        Assert.Null(await client.GetBytesAsync("greeting"));
         Assert.False(await client.DeleteAsync("greeting"));
         Assert.Equal(1, client.Replication);
     }
 
     [Fact]
-    public async Task ValidatesTtlSynchronously()
+    public async Task GetBytesRoundTripsRawByteValues()
     {
         using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] value = { 0, 1, 2, 254, 255 };
+        await client.SetAsync(Bytes("k"), value);
+        Assert.Equal(value, await client.GetBytesAsync("k"));
+        Assert.Equal(value, await client.GetBytesAsync(Bytes("k")));
+    }
+
+    [Fact]
+    public async Task GetRejectsANonUtf8ValueButGetBytesReturnsItRaw()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] invalid = { 0xFF, 0xFE, 0x00 };
+        node.Store[MockNode.KeyOf(Bytes("bad"))] = invalid;
+
+        await Assert.ThrowsAsync<DecoderFallbackException>(() => client.GetAsync("bad"));
+        Assert.Equal(invalid, await client.GetBytesAsync("bad"));
+    }
+
+    [Fact]
+    public async Task TtlZeroMeansNoExpiryAndNegativeTtlIsRejectedSynchronously()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
         await client.SetAsync("k", "v", 60);
+        await client.SetAsync("no-expiry", "v"); // ttlSeconds defaults to 0
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
             () => client.SetAsync(Bytes("k"), Bytes("v"), -1));
         // The rejected set must not have poisoned the connection.
-        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
     }
 
     [Fact]
@@ -58,19 +115,19 @@ public class NanocachedClientTests
         using var node = new MockNode(requiredSecret: "s3cret");
 
         using (NanocachedClient client = await NanocachedClient.ConnectAsync(
-                   new NanocachedClient.Options().Host("127.0.0.1", node.Port).AuthSecret("s3cret")))
+                   new NanocachedClient.Options { Addresses = { ("127.0.0.1", node.Port) }, AuthSecret = "s3cret" }))
         {
             await client.SetAsync("k", "v");
-            Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+            Assert.Equal("v", await client.GetAsync("k"));
         }
 
         NanocachedException missing = await Assert.ThrowsAsync<NanocachedException>(
-            () => NanocachedClient.ConnectAsync("127.0.0.1", node.Port));
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port)));
         Assert.Contains("requires authentication", missing.Message);
 
         NanocachedException wrong = await Assert.ThrowsAsync<NanocachedException>(
             () => NanocachedClient.ConnectAsync(
-                new NanocachedClient.Options().Host("127.0.0.1", node.Port).AuthSecret("wrong")));
+                new NanocachedClient.Options { Addresses = { ("127.0.0.1", node.Port) }, AuthSecret = "wrong" }));
         Assert.Contains("authentication failed", wrong.Message);
     }
 
@@ -78,7 +135,7 @@ public class NanocachedClientTests
     public async Task WrongNodePropagatesInSingleMode()
     {
         using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
         node.AnswerWrongNodeOnce();
         await Assert.ThrowsAsync<WrongNodeException>(() => client.GetAsync("k"));
     }
@@ -87,11 +144,74 @@ public class NanocachedClientTests
     public async Task RejectsUseAfterClose()
     {
         using var node = new MockNode();
-        NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
         client.Close();
         client.Close(); // idempotent
         Assert.True(client.IsClosed);
         await Assert.ThrowsAsync<AlreadyClosedException>(() => client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task WarnsOnceWhenCloseIsCalledASecondTime()
+    {
+        using var node = new MockNode();
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        string output = await CaptureStderrAsync(async () =>
+        {
+            client.Close();
+            client.Close();
+            await Task.CompletedTask;
+        });
+
+        Assert.Equal(
+            1, CountOccurrences(output, "nanocached: close() called again on an already-closed client"));
+    }
+
+    [Fact]
+    public async Task WarnsWhenConnectAsyncIsCalledAgainForAStillOpenSingleAddress()
+    {
+        using var node = new MockNode();
+        using NanocachedClient first = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedClient? second = null;
+        string output = await CaptureStderrAsync(async () =>
+        {
+            second = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        });
+
+        using (second)
+        {
+            Assert.Contains(
+                $"nanocached: connect() called for 127.0.0.1:{node.Port} while a previous connection "
+                + "to it is still open — was close() forgotten?",
+                output);
+        }
+    }
+
+    [Fact]
+    public async Task DoesNotWarnAboutAForgottenCloseForMultiAddressConfigs()
+    {
+        // Legitimate concurrent clients against the same discovery replica
+        // must not false-positive (issue #12).
+        using var node = new MockNode();
+        using var discovery = new MockDiscovery(new[] { (Names[0], node.Address) });
+        int dead = Wire.UnusedPort();
+
+        using NanocachedClient first = await NanocachedClient.ConnectAsync(
+            ManyAddresses(("127.0.0.1", dead), ("127.0.0.1", discovery.Port)));
+
+        NanocachedClient? second = null;
+        string output = await CaptureStderrAsync(async () =>
+        {
+            second = await NanocachedClient.ConnectAsync(
+                ManyAddresses(("127.0.0.1", dead), ("127.0.0.1", discovery.Port)));
+        });
+
+        using (second)
+        {
+            Assert.DoesNotContain("forgotten", output);
+        }
     }
 
     // ── 遅延再接続と keep-alive ───────────────────────────────────
@@ -103,11 +223,11 @@ public class NanocachedClientTests
         // connection-classified so the built-in redial-and-retry-once
         // makes the same call succeed, never serving stray bytes.
         using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
         await client.SetAsync("k", "v");
         node.AnswerMalformedValueOnce();
-        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
         Assert.Equal(2, node.ConnectionCount);
     }
 
@@ -121,11 +241,11 @@ public class NanocachedClientTests
         // connection-classified error is healed by the built-in
         // redial-and-retry-once — never by reusing the desynced stream.
         using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
         await client.SetAsync("k", "v");
         node.AnswerStoredToGetOnce();
-        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
         Assert.Equal(2, node.ConnectionCount);
     }
 
@@ -143,7 +263,7 @@ public class NanocachedClientTests
         try
         {
             await Assert.ThrowsAsync<ConnectionLostException>(
-                () => NanocachedClient.ConnectAsync("127.0.0.1", port));
+                () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", port)));
         }
         finally
         {
@@ -156,12 +276,12 @@ public class NanocachedClientTests
     public async Task TransparentlyReconnectsAfterAServerFin()
     {
         using var node = new MockNode();
-        using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
         await client.SetAsync("k", "v");
         node.DropConnections();
         await Task.Delay(50); // let the FIN land
-        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
         Assert.Equal(2, node.ConnectionCount);
     }
 
@@ -175,7 +295,7 @@ public class NanocachedClientTests
         try
         {
             using var node = new MockNode();
-            using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", node.Port);
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
             await WaitForAsync(() => node.GetCount >= 2, "keep-alive pings");
             Assert.Equal(1, node.ConnectionCount);
@@ -186,7 +306,7 @@ public class NanocachedClientTests
         }
     }
 
-    // ── seeds ─────────────────────────────────────────────────────
+    // ── addresses ─────────────────────────────────────────────────
 
     [Fact]
     public async Task RejectsAMissingTarget()
@@ -196,20 +316,20 @@ public class NanocachedClientTests
     }
 
     [Fact]
-    public async Task FailsOverToTheSecondSeed()
+    public async Task FailsOverToTheSecondAddress()
     {
         using var node = new MockNode();
         using var discovery = new MockDiscovery(new[] { (Names[0], node.Address) });
         int dead = Wire.UnusedPort();
 
         using NanocachedClient client = await NanocachedClient.ConnectAsync(
-            new NanocachedClient.Options().Host("127.0.0.1", dead).Host("127.0.0.1", discovery.Port));
+            ManyAddresses(("127.0.0.1", dead), ("127.0.0.1", discovery.Port)));
         await client.SetAsync("k", "v");
-        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
     }
 
     [Fact]
-    public async Task SkipsAWarmingUpSeed()
+    public async Task SkipsAWarmingUpAddress()
     {
         using var node = new MockNode();
         using var warming = new MockDiscovery(new[] { (Names[0], node.Address) });
@@ -217,15 +337,13 @@ public class NanocachedClientTests
         warming.WarmingUp = true;
 
         using NanocachedClient client = await NanocachedClient.ConnectAsync(
-            new NanocachedClient.Options()
-                .Host("127.0.0.1", warming.Port)
-                .Host("127.0.0.1", healthy.Port));
+            ManyAddresses(("127.0.0.1", warming.Port), ("127.0.0.1", healthy.Port)));
         await client.SetAsync("k", "v");
-        Assert.Equal(Bytes("v"), await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
     }
 
     [Fact]
-    public async Task RaisesBusyWhenEverySeedIsWarming()
+    public async Task RaisesBusyWhenEveryAddressIsWarming()
     {
         using var first = new MockDiscovery(Array.Empty<(string, string)>());
         using var second = new MockDiscovery(Array.Empty<(string, string)>());
@@ -233,9 +351,8 @@ public class NanocachedClientTests
         second.WarmingUp = true;
 
         await Assert.ThrowsAsync<DiscoveryBusyException>(
-            () => NanocachedClient.ConnectAsync(new NanocachedClient.Options()
-                .Host("127.0.0.1", first.Port)
-                .Host("127.0.0.1", second.Port)));
+            () => NanocachedClient.ConnectAsync(
+                ManyAddresses(("127.0.0.1", first.Port), ("127.0.0.1", second.Port))));
     }
 
     // ── クラスタと複製 ────────────────────────────────────────────
@@ -268,12 +385,12 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 1);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
 
         for (int i = 0; i < 50; i++) await client.SetAsync($"key-{i}", $"value-{i}");
         for (int i = 0; i < 50; i++)
         {
-            Assert.Equal(Bytes($"value-{i}"), await client.GetAsync($"key-{i}"));
+            Assert.Equal($"value-{i}", await client.GetAsync($"key-{i}"));
         }
 
         int[] sizes = cluster.Nodes.Values.Select(node => node.Store.Count).ToArray();
@@ -286,13 +403,13 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 1);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
 
         await client.SetAsync("some-key", "v");
         MockNode owner = cluster.Nodes[new HashRing(Names).Route(Bytes("some-key"))];
 
         owner.AnswerWrongNodeOnce();
-        Assert.Equal(Bytes("v"), await client.GetAsync("some-key"));
+        Assert.Equal("v", await client.GetAsync("some-key"));
 
         owner.AnswerWrongNodeOnce();
         owner.AnswerWrongNodeOnce();
@@ -304,7 +421,7 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
         Assert.Equal(2, client.Replication);
 
         for (int i = 0; i < 20; i++) await client.SetAsync($"key-{i}", "v");
@@ -323,13 +440,13 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
 
         await client.SetAsync("survives", "still here");
         cluster.Nodes[OwnersOf("survives")[0]].Dispose();
         await Task.Delay(50);
 
-        Assert.Equal(Bytes("still here"), await client.GetAsync("survives"));
+        Assert.Equal("still here", await client.GetAsync("survives"));
     }
 
     [Fact]
@@ -337,7 +454,7 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
 
         IReadOnlyList<string> owners = OwnersOf("written-anyway");
         cluster.Nodes[owners[1]].Dispose();
@@ -345,7 +462,7 @@ public class NanocachedClientTests
 
         await client.SetAsync("written-anyway", "v");
         Assert.True(cluster.Nodes[owners[0]].Store.ContainsKey(MockNode.KeyOf(Bytes("written-anyway"))));
-        Assert.Equal(Bytes("v"), await client.GetAsync("written-anyway"));
+        Assert.Equal("v", await client.GetAsync("written-anyway"));
     }
 
     [Fact]
@@ -353,7 +470,7 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
 
         const string key = "written-after-primary-death";
         IReadOnlyList<string> owners = OwnersOf(key);
@@ -366,7 +483,7 @@ public class NanocachedClientTests
         await Task.Delay(50);
 
         await client.SetAsync(key, "v");
-        Assert.Equal(Bytes("v"), await client.GetAsync(key));
+        Assert.Equal("v", await client.GetAsync(key));
     }
 
     [Fact]
@@ -374,7 +491,7 @@ public class NanocachedClientTests
     {
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client =
-            await NanocachedClient.ConnectAsync("127.0.0.1", cluster.Discovery.Port);
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
 
         await client.SetAsync("gone-everywhere", "v");
         Assert.True(await client.DeleteAsync("gone-everywhere"));

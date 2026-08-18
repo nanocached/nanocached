@@ -23,10 +23,10 @@ describe("NanocachedClient against a single node", () => {
   it("round-trips set/get/delete", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await client.set("greeting", "hello");
-        assert.deepEqual(await client.get("greeting"), Buffer.from("hello"));
+        assert.equal(await client.get("greeting"), "hello");
 
         assert.equal(await client.delete("greeting"), true);
         assert.equal(await client.get("greeting"), null);
@@ -39,18 +39,38 @@ describe("NanocachedClient against a single node", () => {
     }
   });
 
-  it("handles binary keys/values and empty values", async () => {
+  it("handles binary keys/values and empty values via getBytes", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         const key = Uint8Array.from([1, 2, 3]);
         const value = Uint8Array.from([0, 255, 10]);
         await client.set(key, value);
-        assert.deepEqual(await client.get(key), Buffer.from(value));
+        assert.deepEqual(await client.getBytes(key), Buffer.from(value));
 
         await client.set("empty", "");
-        assert.deepEqual(await client.get("empty"), Buffer.alloc(0));
+        assert.deepEqual(await client.getBytes("empty"), Buffer.alloc(0));
+        assert.equal(await client.get("empty"), "");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("get() strictly decodes UTF-8, rejecting a value that isn't valid UTF-8", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        // A lone continuation byte is never valid UTF-8 on its own.
+        const invalid = Uint8Array.from([0xff]);
+        await client.set("garbage", invalid);
+
+        assert.deepEqual(await client.getBytes("garbage"), Buffer.from(invalid));
+        await assert.rejects(client.get("garbage"), TypeError);
       } finally {
         client.close();
       }
@@ -62,14 +82,31 @@ describe("NanocachedClient against a single node", () => {
   it("stores with a TTL and rejects invalid TTLs before writing", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
-        await client.set("k", "v", { ttlSeconds: 60 });
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        await client.set("k", "v", 60);
+        assert.equal(await client.get("k"), "v");
 
-        await assert.rejects(client.set("k", "v", { ttlSeconds: -1 }), RangeError);
+        await assert.rejects(client.set("k", "v", -1), RangeError);
         // The rejected set must not have poisoned the shared connection.
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("ttlSeconds 0 (the default) means no expiry", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("no-ttl-explicit", "v", 0);
+        await client.set("no-ttl-default", "v");
+        assert.equal(await client.get("no-ttl-explicit"), "v");
+        assert.equal(await client.get("no-ttl-default"), "v");
       } finally {
         client.close();
       }
@@ -81,11 +118,11 @@ describe("NanocachedClient against a single node", () => {
   it("pipelines concurrent requests on one connection", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await Promise.all(Array.from({ length: 20 }, (_, i) => client.set(`key-${i}`, `value-${i}`)));
         const values = await Promise.all(Array.from({ length: 20 }, (_, i) => client.get(`key-${i}`)));
-        values.forEach((value, i) => assert.deepEqual(value, Buffer.from(`value-${i}`)));
+        values.forEach((value, i) => assert.equal(value, `value-${i}`));
       } finally {
         client.close();
       }
@@ -97,10 +134,13 @@ describe("NanocachedClient against a single node", () => {
   it("authenticates with a shared secret", async () => {
     const node = await startMockNode({ requiredSecret: "s3cret" });
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port, authSecret: "s3cret" });
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        authSecret: "s3cret",
+      });
       try {
         await client.set("k", "v");
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
       } finally {
         client.close();
       }
@@ -113,11 +153,14 @@ describe("NanocachedClient against a single node", () => {
     const node = await startMockNode({ requiredSecret: "s3cret" });
     try {
       await assert.rejects(
-        NanocachedClient.connect({ host: "127.0.0.1", port: node.port }),
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] }),
         /requires authentication/,
       );
       await assert.rejects(
-        NanocachedClient.connect({ host: "127.0.0.1", port: node.port, authSecret: "wrong" }),
+        NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: node.port }],
+          authSecret: "wrong",
+        }),
         /authentication failed/,
       );
     } finally {
@@ -128,7 +171,7 @@ describe("NanocachedClient against a single node", () => {
   it("propagates WrongNodeError in single mode (no discovery to refresh from)", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         node.answerWrongNodeOnce();
         await assert.rejects(client.get("k"), WrongNodeError);
@@ -143,13 +186,59 @@ describe("NanocachedClient against a single node", () => {
   it("rejects use after close, while close itself stays idempotent", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       client.close();
       assert.equal(client.isClosed(), true);
       await assert.rejects(client.get("k"), AlreadyClosedError);
       await assert.rejects(client.set("k", "v"), AlreadyClosedError);
       await assert.rejects(client.delete("k"), AlreadyClosedError);
     } finally {
+      await node.close();
+    }
+  });
+
+  it("warns exactly once on a second close(), while staying idempotent", async () => {
+    const node = await startMockNode();
+    const warn = mock.method(console, "warn", () => {});
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      client.close();
+      client.close();
+      client.close();
+
+      const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
+      const closeWarnings = messages.filter((message) =>
+        message.includes("close() called again on an already-closed client"),
+      );
+      assert.equal(closeWarnings.length, 2, JSON.stringify(messages));
+      assert.equal(client.isClosed(), true);
+    } finally {
+      warn.mock.restore();
+      await node.close();
+    }
+  });
+
+  it("warns when connect() is called again for an address with an open connection", async () => {
+    const node = await startMockNode();
+    const warn = mock.method(console, "warn", () => {});
+    try {
+      const first = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const second = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+        try {
+          const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
+          assert.ok(
+            messages.some((message) => message.includes("was close() forgotten?")),
+            `expected a forgotten-close warning, got: ${JSON.stringify(messages)}`,
+          );
+        } finally {
+          second.close();
+        }
+      } finally {
+        first.close();
+      }
+    } finally {
+      warn.mock.restore();
       await node.close();
     }
   });
@@ -165,20 +254,20 @@ function memberConnectionClosed(client: NanocachedClient, name: string): boolean
   return (client as any).target.members.get(name).connection.isClosed();
 }
 
-describe("NanocachedClient discovery seeds", () => {
+describe("NanocachedClient discovery addresses", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
-  it("rejects when neither host/port nor seeds are given", async () => {
-    await assert.rejects(NanocachedClient.connect({}), /needs either host\/port or a non-empty seeds list/);
+  it("rejects when addresses is empty", async () => {
+    await assert.rejects(NanocachedClient.connect({ addresses: [] }), /needs a non-empty addresses list/);
   });
 
-  it("connects through the second seed when the first is unreachable", async () => {
+  it("connects through the second address when the first is unreachable", async () => {
     const node = await startMockNode();
     const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
     const deadPort = await unusedPort();
     try {
       const client = await NanocachedClient.connect({
-        seeds: [
+        addresses: [
           { host: "127.0.0.1", port: deadPort },
           { host: "127.0.0.1", port: discovery.port },
         ],
@@ -186,7 +275,7 @@ describe("NanocachedClient discovery seeds", () => {
       try {
         assert.equal(client.url, `127.0.0.1:${discovery.port}`);
         await client.set("k", "v");
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
       } finally {
         client.close();
       }
@@ -195,7 +284,7 @@ describe("NanocachedClient discovery seeds", () => {
     }
   });
 
-  it("skips a warming-up discovery server and uses the next seed", async () => {
+  it("skips a warming-up discovery server and uses the next address", async () => {
     const node = await startMockNode();
     const [warming, healthy] = await Promise.all([
       startMockDiscovery([{ name: names[0], address: node.address }]),
@@ -204,7 +293,7 @@ describe("NanocachedClient discovery seeds", () => {
     warming.setWarmingUp(true);
     try {
       const client = await NanocachedClient.connect({
-        seeds: [
+        addresses: [
           { host: "127.0.0.1", port: warming.port },
           { host: "127.0.0.1", port: healthy.port },
         ],
@@ -212,7 +301,7 @@ describe("NanocachedClient discovery seeds", () => {
       try {
         assert.equal(client.url, `127.0.0.1:${healthy.port}`);
         await client.set("k", "v");
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
       } finally {
         client.close();
       }
@@ -221,14 +310,14 @@ describe("NanocachedClient discovery seeds", () => {
     }
   });
 
-  it("rejects with DiscoveryBusyError when every seed is warming up", async () => {
+  it("rejects with DiscoveryBusyError when every address is warming up", async () => {
     const [first, second] = await Promise.all([startMockDiscovery([]), startMockDiscovery([])]);
     first.setWarmingUp(true);
     second.setWarmingUp(true);
     try {
       await assert.rejects(
         NanocachedClient.connect({
-          seeds: [
+          addresses: [
             { host: "127.0.0.1", port: first.port },
             { host: "127.0.0.1", port: second.port },
           ],
@@ -240,13 +329,13 @@ describe("NanocachedClient discovery seeds", () => {
     }
   });
 
-  it("warns when multiple seeds resolve to a single pinned node", async () => {
+  it("warns when multiple addresses resolve to a single pinned node", async () => {
     const node = await startMockNode();
     const deadPort = await unusedPort();
     const warn = mock.method(console, "warn", () => {});
     try {
       const client = await NanocachedClient.connect({
-        seeds: [
+        addresses: [
           { host: "127.0.0.1", port: node.port },
           { host: "127.0.0.1", port: deadPort },
         ],
@@ -264,11 +353,11 @@ describe("NanocachedClient discovery seeds", () => {
     }
   });
 
-  it("does not warn when a single host/port intentionally targets a node", async () => {
+  it("does not warn when a single address intentionally targets a node", async () => {
     const node = await startMockNode();
     const warn = mock.method(console, "warn", () => {});
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       client.close();
       assert.equal(warn.mock.calls.length, 0, JSON.stringify(warn.mock.calls.map((c) => c.arguments)));
     } finally {
@@ -277,7 +366,7 @@ describe("NanocachedClient discovery seeds", () => {
     }
   });
 
-  it("refreshes the node list through the next seed when the first stops answering", async () => {
+  it("refreshes the node list through the next address when the first stops answering", async () => {
     const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
     const nodes = [
       { name: names[0], address: nodeA.address },
@@ -286,7 +375,7 @@ describe("NanocachedClient discovery seeds", () => {
     const [primary, standby] = await Promise.all([startMockDiscovery(nodes), startMockDiscovery(nodes)]);
     try {
       const client = await NanocachedClient.connect({
-        seeds: [
+        addresses: [
           { host: "127.0.0.1", port: primary.port },
           { host: "127.0.0.1", port: standby.port },
         ],
@@ -303,7 +392,7 @@ describe("NanocachedClient discovery seeds", () => {
         const owner = ring.route(Buffer.from(key)) === names[0] ? nodeA : nodeB;
         owner.answerWrongNodeOnce();
 
-        assert.deepEqual(await client.get(key), Buffer.from("v"));
+        assert.equal(await client.get(key), "v");
       } finally {
         client.close();
       }
@@ -317,7 +406,7 @@ describe("NanocachedClient reconnect-on-use", () => {
   it("transparently reconnects after the server closes an idle connection", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await client.set("k", "v");
 
@@ -325,7 +414,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         node.dropConnections();
         await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
 
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
         client.close();
@@ -338,14 +427,14 @@ describe("NanocachedClient reconnect-on-use", () => {
   it("shares one reconnect between concurrent requests", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await client.set("k", "v");
         node.dropConnections();
         await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
 
         const values = await Promise.all(Array.from({ length: 10 }, () => client.get("k")));
-        for (const value of values) assert.deepEqual(value, Buffer.from("v"));
+        for (const value of values) assert.equal(value, "v");
         assert.equal(node.connectionCount(), 2, "concurrent requests dialed more than one reconnect");
       } finally {
         client.close();
@@ -362,13 +451,13 @@ describe("NanocachedClient reconnect-on-use", () => {
     // The connection is poisoned; the next request transparently redials.
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await client.set("k", "v");
         node.answerStoredToGetOnce();
         await assert.rejects(client.get("k"), /does not match the request/);
 
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
         client.close();
@@ -414,7 +503,7 @@ describe("NanocachedClient reconnect-on-use", () => {
     // so the next request transparently redials.
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await client.set("k", "v");
         node.answerMalformedValueOnce();
@@ -422,7 +511,7 @@ describe("NanocachedClient reconnect-on-use", () => {
 
         // The poisoned connection is replaced lazily; no stray bytes leak
         // into this response.
-        assert.deepEqual(await client.get("k"), Buffer.from("v"));
+        assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
         client.close();
@@ -441,7 +530,7 @@ describe("NanocachedClient reconnect-on-use", () => {
       { name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address },
     ]);
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
       const before = node.connectionCount();
       client.close();
       await (client as any).refreshNodeList();
@@ -453,7 +542,7 @@ describe("NanocachedClient reconnect-on-use", () => {
 
   it("propagates the dial error when the node is gone for good", async () => {
     const node = await startMockNode();
-    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
     try {
       await node.close();
       await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
@@ -471,7 +560,7 @@ describe("NanocachedClient reconnect-on-use", () => {
       { name: names[1], address: nodeB.address },
     ]);
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
       try {
         const key = "some-key";
         await client.set(key, "v");
@@ -484,7 +573,7 @@ describe("NanocachedClient reconnect-on-use", () => {
         owner.dropConnections();
         await waitFor(() => memberConnectionClosed(client, ownerName), "the client to see the FIN");
 
-        assert.deepEqual(await client.get(key), Buffer.from("v"));
+        assert.equal(await client.get(key), "v");
         assert.equal(owner.connectionCount(), 2);
         assert.equal(other.connectionCount(), 1, "reconnected a member whose connection never died");
       } finally {
@@ -509,8 +598,7 @@ describe("NanocachedClient keep-alive", () => {
     try {
       KEEPALIVE_TUNING.intervalMs = 40;
       const client = await NanocachedClient.connect({
-        host: "127.0.0.1",
-        port: node.port,
+        addresses: [{ host: "127.0.0.1", port: node.port }],
       });
       try {
         await waitFor(() => node.getCount() >= 2, "keep-alive pings to arrive");
@@ -529,8 +617,7 @@ describe("NanocachedClient keep-alive", () => {
     try {
       KEEPALIVE_TUNING.intervalMs = 20;
       const client = await NanocachedClient.connect({
-        host: "127.0.0.1",
-        port: node.port,
+        addresses: [{ host: "127.0.0.1", port: node.port }],
       });
       await waitFor(() => node.getCount() >= 1, "a keep-alive ping to arrive");
       client.close();
@@ -548,8 +635,7 @@ describe("NanocachedClient keep-alive", () => {
     try {
       KEEPALIVE_TUNING.intervalMs = 60;
       const client = await NanocachedClient.connect({
-        host: "127.0.0.1",
-        port: node.port,
+        addresses: [{ host: "127.0.0.1", port: node.port }],
       });
       try {
         for (let i = 0; i < 10; i++) {
@@ -602,7 +688,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
   it("learns R from discovery and fans writes out to every owner", async () => {
     const cluster = await startReplicatedCluster();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
         assert.equal(client.replication, 2);
 
@@ -625,7 +711,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
 
   it("serves reads from the replica when the primary node dies", async () => {
     const cluster = await startReplicatedCluster();
-    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
     try {
       const key = "survives-a-node-death";
       await client.set(key, "still here");
@@ -635,7 +721,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
       await primary.mock.close();
       await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
 
-      assert.deepEqual(await client.get(key), Buffer.from("still here"));
+      assert.equal(await client.get(key), "still here");
     } finally {
       client.close();
       await cluster.close().catch(() => {});
@@ -644,7 +730,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
 
   it("does not fail a write when a replica is down", async () => {
     const cluster = await startReplicatedCluster();
-    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
     try {
       const key = "written-despite-dead-replica";
       const { primary, replica } = cluster.ownerOf(key);
@@ -654,7 +740,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
 
       await client.set(key, "v");
       assert.ok(primary.mock.store.has(key));
-      assert.deepEqual(await client.get(key), Buffer.from("v"));
+      assert.equal(await client.get(key), "v");
     } finally {
       client.close();
       await cluster.close().catch(() => {});
@@ -663,7 +749,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
 
   it("routes writes around a dead primary once discovery drops it", async () => {
     const cluster = await startReplicatedCluster();
-    const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
     try {
       const key = "written-after-primary-death";
       const { primary, replica } = cluster.ownerOf(key);
@@ -676,7 +762,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
       await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
 
       await client.set(key, "v");
-      assert.deepEqual(await client.get(key), Buffer.from("v"));
+      assert.equal(await client.get(key), "v");
       assert.ok(replica.mock.store.has(key));
     } finally {
       client.close();
@@ -687,7 +773,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
   it("fans deletes out to every owner", async () => {
     const cluster = await startReplicatedCluster();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
         const key = "deleted-everywhere";
         await client.set(key, "v");
@@ -708,7 +794,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
   it("reports replication 1 against a single node", async () => {
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: node.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         assert.equal(client.replication, 1);
       } finally {
@@ -749,14 +835,14 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
   it("routes keys across the cluster and reads its own writes", async () => {
     const cluster = await startCluster();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
         assert.equal(client.nodeUrls.length, 2);
 
         const keys = Array.from({ length: 50 }, (_, i) => `key-${i}`);
         await Promise.all(keys.map((key) => client.set(key, `value of ${key}`)));
         for (const key of keys) {
-          assert.deepEqual(await client.get(key), Buffer.from(`value of ${key}`));
+          assert.equal(await client.get(key), `value of ${key}`);
         }
 
         // With 50 keys over 2 nodes, both stores must have received some —
@@ -775,7 +861,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
   it("agrees with the shared hash ring about which node owns a key", async () => {
     const cluster = await startCluster();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
         const ring = new HashRing(cluster.nodes.map(({ name }) => name));
 
@@ -796,7 +882,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
   it("retries once through a node-list refresh when a node answers W", async () => {
     const cluster = await startCluster();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
         const key = "some-key";
         const ring = new HashRing(cluster.nodes.map(({ name }) => name));
@@ -805,7 +891,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
         await client.set(key, "v");
 
         owner.mock.answerWrongNodeOnce();
-        assert.deepEqual(await client.get(key), Buffer.from("v"));
+        assert.equal(await client.get(key), "v");
       } finally {
         client.close();
       }
@@ -817,7 +903,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
   it("propagates WrongNodeError when a node still answers W after a refresh", async () => {
     const cluster = await startCluster();
     try {
-      const client = await NanocachedClient.connect({ host: "127.0.0.1", port: cluster.discovery.port });
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
         const key = "some-key";
         const ring = new HashRing(cluster.nodes.map(({ name }) => name));
@@ -838,7 +924,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
     const discovery = await startMockDiscovery([]);
     try {
       await assert.rejects(
-        NanocachedClient.connect({ host: "127.0.0.1", port: discovery.port }),
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] }),
         /no live nodes/,
       );
     } finally {

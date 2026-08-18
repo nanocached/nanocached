@@ -21,12 +21,13 @@ from nanocached import NanocachedClient
 
 async def main():
     # Point at a single node, or at a discovery server fronting a
-    # cluster — same call either way.
-    client = await NanocachedClient.connect("127.0.0.1", 8357)
+    # cluster — same call either way. `addresses` always takes a list;
+    # a one-element list is the single-target case.
+    client = await NanocachedClient.connect([("127.0.0.1", 8357)])
 
     await client.set("greeting", "hello", ttl_seconds=60)
-    value = await client.get("greeting")   # bytes | None
-    print(value)                           # b"hello"
+    value = await client.get("greeting")   # str | None
+    print(value)                           # hello
     existed = await client.delete("greeting")  # bool
 
     client.close()
@@ -34,19 +35,30 @@ async def main():
 asyncio.run(main())
 ```
 
-Keys and values may be `str` (encoded as UTF-8) or `bytes`; values always
-come back as `bytes` (`None` when the key is missing).
+Or use it as an async context manager, which closes the client for you:
+
+```python
+async with await NanocachedClient.connect([("127.0.0.1", 8357)]) as client:
+    await client.set("greeting", "hello")
+    print(await client.get("greeting"))
+```
+
+Keys may be `str` (encoded as UTF-8) or `bytes`; values may likewise be
+`str` or `bytes` on the way in. `get(key)` strictly decodes the stored
+value as UTF-8 and returns `str | None` — a value that isn't valid UTF-8
+raises `UnicodeDecodeError` rather than silently mangling it. Use
+`get_bytes(key) -> bytes | None` for the raw bytes.
 
 ## Discovery replicas
 
-When the cluster runs more than one discovery server, pass them all as
-`seeds`; both the initial connect and every node-list refresh try them in
-order. A seed that is warming up after a restart (answers `B`) is skipped
-like an unreachable one; if every seed is warming up, `connect()` raises
-`DiscoveryBusyError` — retry shortly.
+When the cluster runs more than one discovery server, pass them all in
+`addresses`; both the initial connect and every node-list refresh try them
+in order. An address that is warming up after a restart (answers `B`) is
+skipped like an unreachable one; if every address is warming up, `connect()`
+raises `DiscoveryBusyError` — retry shortly.
 
 ```python
-client = await NanocachedClient.connect(seeds=[("10.0.0.1", 8357), ("10.0.0.2", 8357)])
+client = await NanocachedClient.connect([("10.0.0.1", 8357), ("10.0.0.2", 8357)])
 ```
 
 ## Replication
@@ -70,19 +82,25 @@ operations are idempotent). There is nothing to configure.
 
 ```python
 client = await NanocachedClient.connect(
-    "cache.internal", 8357,
+    [("cache.internal", 8357)],
     auth_secret="change-me",   # NANOCACHED_AUTH_SECRET on the server
-    tls=True,                  # or an ssl.SSLContext for a private CA
+    tls=True,                  # verifies against the platform trust store
 )
 ```
 
-For a self-signed or private-CA server, build the context yourself:
+For a self-signed or private-CA server, pass `ca` — a PEM file of trusted
+root certificate(s), which replaces the default trust store:
 
 ```python
-import ssl
-context = ssl.create_default_context(cafile="cluster-ca.pem")
-client = await NanocachedClient.connect("cache.internal", 8357, tls=context)
+client = await NanocachedClient.connect(
+    [("cache.internal", 8357)],
+    tls=True,
+    ca="cluster-ca.pem",
+)
 ```
+
+`ca` is only meaningful when `tls=True`; if `tls=False` it is silently
+ignored. An unreadable or unparseable CA file is a connect-time error.
 
 ## Notes
 
@@ -92,6 +110,13 @@ client = await NanocachedClient.connect("cache.internal", 8357, tls=context)
   throughput per connection.
 - This SDK speaks the current wire protocol (rendezvous hashing,
   replication-aware `L`/`W`); it requires an up-to-date server.
+- `close()` is idempotent, but calling it again on an already-closed
+  client prints a warning to stderr — usually a sign the client's
+  lifecycle was mismanaged. Likewise, calling `connect()` again for the
+  same single address while a previous connection to it is still open
+  prints a warning ("was close() forgotten?"); this check is skipped for
+  multi-address configs, where concurrent clients sharing an address list
+  are legitimate.
 
 ## License
 

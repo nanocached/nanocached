@@ -27,6 +27,9 @@ struct NodeState {
     stored_to_get_replies: AtomicUsize,
     get_delay_ms: AtomicUsize,
     required_secret: Option<Vec<u8>>,
+    /// The raw `S ...` header most recently received, so tests can assert
+    /// whether the ttl field was present on the wire.
+    last_set_header: Mutex<Option<String>>,
 }
 
 struct MockNode {
@@ -140,6 +143,7 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             "S" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
                 let value = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+                *state.last_set_header.lock().unwrap() = Some(header.clone());
                 let reply: &[u8] = if take_wrong_node(&state) {
                     b"W\n"
                 } else {
@@ -284,7 +288,7 @@ async fn read_exact(stream: &mut BufReader<TcpStream>, length: usize) -> Vec<u8>
 }
 
 fn options(port: u16) -> Options {
-    Options::new().host("127.0.0.1", port)
+    Options::new().addresses([("127.0.0.1", port)])
 }
 
 // ── 単一ノード ────────────────────────────────────────────────────
@@ -294,15 +298,76 @@ async fn round_trips_set_get_delete() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
-    client.set("greeting", "hello", None).await.unwrap();
+    client.set("greeting", "hello", 0).await.unwrap();
     assert_eq!(
         client.get("greeting").await.unwrap(),
-        Some(b"hello".to_vec())
+        Some("hello".to_string())
     );
     assert!(client.delete("greeting").await.unwrap());
     assert_eq!(client.get("greeting").await.unwrap(), None);
     assert!(!client.delete("greeting").await.unwrap());
     assert_eq!(client.replication().await, 1);
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_bytes_round_trips_non_utf8_values() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let value: Vec<u8> = vec![0xff, 0xfe, 0x00, 0xff];
+    client.set("binary", value.clone(), 0).await.unwrap();
+    assert_eq!(client.get_bytes("binary").await.unwrap(), Some(value));
+    assert_eq!(client.get_bytes("missing").await.unwrap(), None);
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_rejects_a_non_utf8_value_with_strict_decoding() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("binary", vec![0xff, 0xfe], 0).await.unwrap();
+    let result = client.get("binary").await;
+    assert!(
+        matches!(result, Err(Error::InvalidUtf8(_))),
+        "expected InvalidUtf8, got {result:?}"
+    );
+    // get_bytes still returns the raw value.
+    assert_eq!(
+        client.get_bytes("binary").await.unwrap(),
+        Some(vec![0xff, 0xfe])
+    );
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn ttl_zero_means_no_expiry_and_omits_the_ttl_field_on_the_wire() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let header = node.state.last_set_header.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        header.split(' ').count(),
+        3,
+        "ttl_seconds=0 must omit the ttl field: {header:?}"
+    );
+
+    client.set("k", "v", 60).await.unwrap();
+    let header = node.state.last_set_header.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        header.split(' ').count(),
+        4,
+        "a nonzero ttl must be sent as a third field: {header:?}"
+    );
+    assert!(header.ends_with(" 60"), "{header:?}");
 
     client.close();
     node.stop();
@@ -319,8 +384,8 @@ async fn authenticates() {
     let client = NanocachedClient::connect(options(node.port).auth_secret("s3cret"))
         .await
         .unwrap();
-    client.set("k", "v", None).await.unwrap();
-    assert_eq!(client.get("k").await.unwrap(), Some(b"v".to_vec()));
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
     client.close();
 
     let missing = NanocachedClient::connect(options(node.port)).await;
@@ -354,10 +419,25 @@ async fn rejects_use_after_close() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
     client.close();
-    client.close(); // idempotent
+    client.close(); // idempotent (also warns on stderr — see
+                    // close_called_twice_warns_once_on_stderr, which
+                    // captures that separately since this harness
+                    // doesn't otherwise observe it).
     assert!(client.is_closed());
     assert!(matches!(client.get("k").await, Err(Error::AlreadyClosed)));
     node.stop();
+}
+
+#[tokio::test]
+async fn rejects_an_empty_addresses_list() {
+    let result = NanocachedClient::connect(Options::new()).await;
+    let error = result.err().expect("connect() with no addresses must fail");
+    match error {
+        Error::InvalidArgument(message) => {
+            assert!(message.contains("non-empty addresses list"), "{message:?}");
+        }
+        other => panic!("expected InvalidArgument, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -369,7 +449,7 @@ async fn a_malformed_value_length_poisons_the_connection_and_retries_transparent
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
-    client.set("k", "v", None).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
     node.state
         .malformed_value_replies
         .fetch_add(1, Ordering::SeqCst);
@@ -381,7 +461,7 @@ async fn a_malformed_value_length_poisons_the_connection_and_retries_transparent
     );
 
     let value = client.get("k").await.unwrap();
-    assert_eq!(value, Some(b"v".to_vec()));
+    assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
     client.close();
@@ -396,7 +476,7 @@ async fn a_mismatched_response_kind_poisons_the_connection() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
-    client.set("k", "v", None).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
     node.state
         .stored_to_get_replies
         .fetch_add(1, Ordering::SeqCst);
@@ -405,7 +485,7 @@ async fn a_mismatched_response_kind_poisons_the_connection() {
     // error is healed by the client's single transparent redial-and-retry
     // — but never by reusing the desynced stream.
     let value = client.get("k").await.unwrap();
-    assert_eq!(value, Some(b"v".to_vec()));
+    assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
     client.close();
@@ -421,7 +501,7 @@ async fn an_abandoned_request_future_poisons_the_connection() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
-    client.set("k", "v", None).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
     node.state.get_delay_ms.store(30_000, Ordering::SeqCst);
 
     let abandoned =
@@ -429,7 +509,7 @@ async fn an_abandoned_request_future_poisons_the_connection() {
     assert!(abandoned.is_err(), "expected the outer timeout to fire");
 
     let value = client.get("k").await.unwrap();
-    assert_eq!(value, Some(b"v".to_vec()));
+    assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
     client.close();
@@ -440,7 +520,7 @@ async fn an_abandoned_request_future_poisons_the_connection() {
 async fn transparently_reconnects_after_a_server_fin() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
-    client.set("k", "v", None).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
 
     node.stop(); // FIN every connection, listener keeps... no — restart below
     let node2 = MockNode::start_with(NodeState::default()).await;
@@ -484,10 +564,10 @@ async fn keep_alive_pings_an_idle_connection() {
     node.stop();
 }
 
-// ── seeds ─────────────────────────────────────────────────────────
+// ── addresses ─────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn fails_over_to_the_second_seed() {
+async fn fails_over_to_the_second_address() {
     let node = MockNode::start().await;
     let discovery = MockDiscovery::start(vec![(NAMES[0].to_string(), node.address())], 1).await;
     let dead = {
@@ -496,30 +576,26 @@ async fn fails_over_to_the_second_seed() {
     };
 
     let client = NanocachedClient::connect(
-        Options::new()
-            .host("127.0.0.1", dead)
-            .host("127.0.0.1", discovery.port),
+        Options::new().addresses([("127.0.0.1", dead), ("127.0.0.1", discovery.port)]),
     )
     .await
     .unwrap();
-    client.set("k", "v", None).await.unwrap();
-    assert_eq!(client.get("k").await.unwrap(), Some(b"v".to_vec()));
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
     client.close();
     discovery.stop();
     node.stop();
 }
 
 #[tokio::test]
-async fn raises_busy_when_every_seed_is_warming() {
+async fn raises_busy_when_every_address_is_warming() {
     let first = MockDiscovery::start(vec![], 1).await;
     let second = MockDiscovery::start(vec![], 1).await;
     *first.warming.lock().unwrap() = true;
     *second.warming.lock().unwrap() = true;
 
     let result = NanocachedClient::connect(
-        Options::new()
-            .host("127.0.0.1", first.port)
-            .host("127.0.0.1", second.port),
+        Options::new().addresses([("127.0.0.1", first.port), ("127.0.0.1", second.port)]),
     )
     .await;
     assert!(matches!(result, Err(Error::DiscoveryBusy)));
@@ -561,14 +637,14 @@ async fn routes_and_reads_its_own_writes() {
 
     for i in 0..50 {
         client
-            .set(format!("key-{i}"), format!("value-{i}"), None)
+            .set(format!("key-{i}"), format!("value-{i}"), 0)
             .await
             .unwrap();
     }
     for i in 0..50 {
         assert_eq!(
             client.get(format!("key-{i}")).await.unwrap(),
-            Some(format!("value-{i}").into_bytes())
+            Some(format!("value-{i}"))
         );
     }
     let sizes: Vec<usize> = nodes
@@ -592,7 +668,7 @@ async fn wrong_node_triggers_refresh_and_one_retry() {
         .await
         .unwrap();
 
-    client.set("some-key", "v", None).await.unwrap();
+    client.set("some-key", "v", 0).await.unwrap();
     let primary = owners_of("some-key")[0].clone();
     let owner = &nodes.iter().find(|(name, _)| *name == primary).unwrap().1;
 
@@ -600,7 +676,7 @@ async fn wrong_node_triggers_refresh_and_one_retry() {
         .state
         .wrong_node_replies
         .fetch_add(1, Ordering::SeqCst);
-    assert_eq!(client.get("some-key").await.unwrap(), Some(b"v".to_vec()));
+    assert_eq!(client.get("some-key").await.unwrap(), Some("v".to_string()));
 
     owner
         .state
@@ -627,7 +703,7 @@ async fn fans_writes_out_to_every_owner() {
     assert_eq!(client.replication().await, 2);
 
     for i in 0..20 {
-        client.set(format!("key-{i}"), "v", None).await.unwrap();
+        client.set(format!("key-{i}"), "v", 0).await.unwrap();
     }
     for i in 0..20 {
         let key = format!("key-{i}").into_bytes();
@@ -653,7 +729,7 @@ async fn reads_fail_over_when_the_primary_dies() {
         .await
         .unwrap();
 
-    client.set("survives", "still here", None).await.unwrap();
+    client.set("survives", "still here", 0).await.unwrap();
     let primary = owners_of("survives")[0].clone();
     nodes
         .iter()
@@ -665,7 +741,7 @@ async fn reads_fail_over_when_the_primary_dies() {
 
     assert_eq!(
         client.get("survives").await.unwrap(),
-        Some(b"still here".to_vec())
+        Some("still here".to_string())
     );
 
     client.close();
@@ -691,7 +767,7 @@ async fn a_dead_replica_does_not_fail_writes() {
         .stop();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    client.set("written-anyway", "v", None).await.unwrap();
+    client.set("written-anyway", "v", 0).await.unwrap();
     let primary = &nodes.iter().find(|(name, _)| *name == owners[0]).unwrap().1;
     assert!(primary
         .state
@@ -735,14 +811,76 @@ async fn writes_route_around_a_dead_primary_once_discovery_drops_it() {
     *discovery.nodes.lock().unwrap() = vec![(owners[1].clone(), replica_address)];
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    client.set(key, "v", None).await.unwrap();
-    assert_eq!(client.get(key).await.unwrap(), Some(b"v".to_vec()));
+    client.set(key, "v", 0).await.unwrap();
+    assert_eq!(client.get(key).await.unwrap(), Some("v".to_string()));
 
     client.close();
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+// ── 警告 (stderr) ─────────────────────────────────────────────────
+//
+// This harness's own test process runs many tests concurrently and
+// doesn't otherwise capture stderr, so each of these re-executes just
+// itself in a child process (the standard `cargo test` trick for
+// asserting on a process's own stderr) rather than trying to intercept
+// `eprintln!` output inline.
+
+/// Re-runs the current test binary filtered to exactly `test_name`, with
+/// `child_env` set so the test body takes its "do the real work" branch
+/// instead of spawning another child. Returns the captured stderr.
+fn run_as_child(test_name: &str, child_env: &str) -> String {
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([test_name, "--exact", "--nocapture"])
+        .env(child_env, "1")
+        .output()
+        .expect("failed to run child test process");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[tokio::test]
+async fn close_called_twice_warns_once_on_stderr() {
+    const CHILD_ENV: &str = "NANOCACHED_TEST_CHILD_DOUBLE_CLOSE";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let node = MockNode::start().await;
+        let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+        client.close();
+        client.close(); // the second call must warn, exactly once
+        node.stop();
+        return;
+    }
+
+    let stderr = run_as_child("close_called_twice_warns_once_on_stderr", CHILD_ENV);
+    let occurrences = stderr
+        .matches("nanocached: close() called again on an already-closed client")
+        .count();
+    assert_eq!(occurrences, 1, "stderr:\n{stderr}");
+}
+
+#[tokio::test]
+async fn connect_after_forgetting_close_warns_on_stderr() {
+    const CHILD_ENV: &str = "NANOCACHED_TEST_CHILD_FORGOTTEN_CLOSE";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let node = MockNode::start().await;
+        let first = NanocachedClient::connect(options(node.port)).await.unwrap();
+        // `first` is deliberately never closed before reconnecting to the
+        // same single address.
+        let second = NanocachedClient::connect(options(node.port)).await.unwrap();
+        second.close();
+        first.close();
+        node.stop();
+        return;
+    }
+
+    let stderr = run_as_child("connect_after_forgetting_close_warns_on_stderr", CHILD_ENV);
+    assert!(
+        stderr.contains("while a previous connection to it is still open — was close() forgotten?"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[tokio::test]
@@ -752,7 +890,7 @@ async fn fans_deletes_out_to_every_owner() {
         .await
         .unwrap();
 
-    client.set("gone-everywhere", "v", None).await.unwrap();
+    client.set("gone-everywhere", "v", 0).await.unwrap();
     assert!(client.delete("gone-everywhere").await.unwrap());
     for (_, node) in &nodes {
         assert!(!node

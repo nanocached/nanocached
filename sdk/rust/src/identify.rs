@@ -78,12 +78,92 @@ impl AsyncWrite for Stream {
     }
 }
 
-/// TLS configuration: absent (plaintext) or a rustls client config the
-/// caller built (system roots, a private CA — their choice).
+/// TLS configuration, resolved once at `connect()` time from
+/// `Options::tls`/`Options::ca` and reused for every dial (initial
+/// connect, lazy reconnects, node-list refreshes).
 #[cfg(feature = "tls")]
-pub type TlsConfig = std::sync::Arc<tokio_rustls::rustls::ClientConfig>;
+pub(crate) type TlsConfig = std::sync::Arc<tokio_rustls::rustls::ClientConfig>;
 #[cfg(not(feature = "tls"))]
-pub type TlsConfig = std::convert::Infallible;
+pub(crate) type TlsConfig = std::convert::Infallible;
+
+/// Resolves `Options::tls`/`Options::ca` into a `TlsConfig` to reuse for
+/// every dial this client makes. `ca` is meaningful only when `tls` is
+/// true — a `ca` set with `tls(false)` is silently ignored, matching
+/// every other nanocached SDK.
+#[cfg(feature = "tls")]
+pub(crate) fn resolve_tls(tls: bool, ca: Option<&std::path::Path>) -> Result<Option<TlsConfig>> {
+    if !tls {
+        return Ok(None);
+    }
+    build_tls_config(ca).map(Some)
+}
+
+#[cfg(not(feature = "tls"))]
+pub(crate) fn resolve_tls(tls: bool, _ca: Option<&std::path::Path>) -> Result<Option<TlsConfig>> {
+    if tls {
+        return Err(Error::InvalidArgument(
+            "nanocached: tls(true) requires the `tls` feature".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+/// Builds a rustls `ClientConfig`: a `ca` PEM file's certificate(s) as
+/// the sole trusted roots (replacing the default store, today's
+/// semantics), or the platform's native trust store when `ca` is absent
+/// (mirrors src/server.rs's `load_tls_connector`, minus the private-CA
+/// requirement).
+#[cfg(feature = "tls")]
+fn build_tls_config(ca: Option<&std::path::Path>) -> Result<TlsConfig> {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    let mut roots = RootCertStore::empty();
+    match ca {
+        Some(path) => {
+            let file = std::fs::File::open(path).map_err(|error| {
+                Error::InvalidArgument(format!(
+                    "nanocached: could not read CA file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let certs: std::result::Result<Vec<_>, _> =
+                rustls_pemfile::certs(&mut std::io::BufReader::new(file)).collect();
+            let certs = certs.map_err(|error| {
+                Error::InvalidArgument(format!(
+                    "nanocached: could not parse CA file {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if certs.is_empty() {
+                return Err(Error::InvalidArgument(format!(
+                    "nanocached: no certificates found in CA file {}",
+                    path.display()
+                )));
+            }
+            for cert in certs {
+                roots.add(cert).map_err(|error| {
+                    Error::InvalidArgument(format!(
+                        "nanocached: invalid certificate in CA file {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            }
+        }
+        None => {
+            // Best-effort, like every other nanocached SDK's default-store
+            // path: a platform cert store entry that fails to parse is
+            // skipped rather than failing the whole connect.
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = roots.add(cert);
+            }
+        }
+    }
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(std::sync::Arc::new(config))
+}
 
 pub(crate) enum Identified {
     Node(Stream),
@@ -298,5 +378,98 @@ mod tests {
             started.elapsed()
         );
         holder.abort();
+    }
+
+    #[cfg(feature = "tls")]
+    mod tls_config {
+        use super::*;
+        use std::path::Path;
+
+        // A throwaway self-signed CA cert (openssl req -x509 ..., 10-year
+        // validity) — only its shape as a parseable PEM matters here, not
+        // its trust chain.
+        const VALID_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDGzCCAgOgAwIBAgIUX0/ng0j0ArO5ai+E6DgpHNW3YTEwDQYJKoZIhvcNAQEL\n\
+BQAwHTEbMBkGA1UEAwwSbmFub2NhY2hlZC10ZXN0LWNhMB4XDTI2MDgxODExNDgx\n\
+M1oXDTM2MDgxNTExNDgxM1owHTEbMBkGA1UEAwwSbmFub2NhY2hlZC10ZXN0LWNh\n\
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAy/Tq6ODLh7BqdocDSMnS\n\
+JksOlQxDzKuuTfNRBqqKfUWy0s4qzdoB5xKHYXn5/kZchjdRn5gVAH+sdU0R3H4C\n\
+GDF2j8D+uz9Fwhhxfi0wkkuXEUPXXYg9ijBS/vbtXMrhXxmOJawqAVaCVTXfrl3q\n\
+D3S0sLNMGUOxiJ2YWmEfYC6793SUFO5dtLfq6reeus9BpRzdR6pOnF0FFEB+da9D\n\
+lwrP5klSQT2syDX6b4eGMDZ4EV9zN7qRddVk3u2ZewyvxJcJoeoPFBpzR4UgaHJp\n\
+opHdLsUoYUzgO4ERR1vx+XVFrFUU0wz4BmJa3In1j/MwDE/oEm4Oqz8snAxoTgUS\n\
+gwIDAQABo1MwUTAdBgNVHQ4EFgQUO+aV67u+OtyFvjsDE0sZwzeLjUMwHwYDVR0j\n\
+BBgwFoAUO+aV67u+OtyFvjsDE0sZwzeLjUMwDwYDVR0TAQH/BAUwAwEB/zANBgkq\n\
+hkiG9w0BAQsFAAOCAQEADX3fPsL6E7o5+Q58FhN0yoHgGHv+DY/DERrsk8g4VVSH\n\
+GfzWp94+a/0C6h7i0BMDQObI2as88oBABPv2wC9vd2Xrfd7lO2uwI4SDtHEfEH6w\n\
+qDyoPLENs480WNUOQbt/C4V3IJ+yCpYAD9VDi2xYKBMRKs4fHajPRwO+OVO0o9Om\n\
+JMSzHNNqXFVYW+L8hErch9Zv+yThLnjDyoI7CJe9/iv/YsVnw+dgGWJHIkQOhH7U\n\
+MHU16fgEz9h08NOh9MJYpE+kz1LpQ56m8+9U1t5rLI/z1rDoDgSONupQ0A2mJkzJ\n\
+ValXM/4meyTDFmbKUiHWzNkElZZ8lEhjxHccD4X23w==\n\
+-----END CERTIFICATE-----\n";
+
+        fn write_pem(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+
+        #[test]
+        fn tls_false_silently_ignores_ca() {
+            // Even a nonexistent CA file must not error when tls is off.
+            let result = resolve_tls(false, Some(Path::new("/no/such/ca.pem")));
+            assert!(matches!(result, Ok(None)));
+        }
+
+        #[test]
+        fn tls_true_without_ca_resolves_to_the_default_trust_store() {
+            assert!(resolve_tls(true, None).unwrap().is_some());
+        }
+
+        #[test]
+        fn tls_true_with_a_valid_ca_file_replaces_the_default_store() {
+            let dir = std::env::temp_dir();
+            let path = write_pem(&dir, "nanocached-test-valid-ca.pem", VALID_CA_PEM);
+            let result = resolve_tls(true, Some(&path));
+            std::fs::remove_file(&path).ok();
+            assert!(result.unwrap().is_some());
+        }
+
+        #[test]
+        fn tls_true_with_an_unreadable_ca_file_is_a_connect_time_error() {
+            let result = resolve_tls(true, Some(Path::new("/no/such/ca.pem")));
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "expected InvalidArgument, got {result:?}"
+            );
+        }
+
+        #[test]
+        fn tls_true_with_a_ca_file_containing_no_certificates_is_a_connect_time_error() {
+            let dir = std::env::temp_dir();
+            let path = write_pem(&dir, "nanocached-test-empty-ca.pem", "not a certificate\n");
+            let result = resolve_tls(true, Some(&path));
+            std::fs::remove_file(&path).ok();
+            assert!(
+                matches!(result, Err(Error::InvalidArgument(_))),
+                "expected InvalidArgument, got {result:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn tls_true_without_the_feature_is_a_connect_time_error() {
+        let result = resolve_tls(true, None);
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "expected InvalidArgument, got {result:?}"
+        );
+    }
+
+    #[cfg(not(feature = "tls"))]
+    #[test]
+    fn tls_false_is_fine_without_the_feature() {
+        assert!(matches!(resolve_tls(false, None), Ok(None)));
     }
 }

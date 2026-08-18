@@ -44,7 +44,7 @@ in the SDK — so the data path has no extra hop.</p>
   </tbody>
 </table>
 </div>
-<p>An SDK bootstraps by connecting to any seed. The server's handshake
+<p>An SDK bootstraps by connecting to any configured address. The server's handshake
 reply says whether it is a node or a discovery server; against a
 discovery server the client fetches the node list (which carries the
 replication factor R) and then talks to nodes directly.</p>
@@ -107,14 +107,15 @@ with <em>zero coordination</em> — no consensus, no leader election, no
 shared storage:</p>
 <ul>
   <li>Every node and client is configured with the same replica list.
-  Nodes heartbeat to all replicas; clients try seeds in order.</li>
+  Nodes heartbeat to all replicas; clients try their configured
+  addresses in order.</li>
   <li>Losing any replica — including the first-listed primary — costs
   neither cache traffic nor client bootstrap. Only <em>joins</em>
   pause until the primary is back, because exactly one orchestrator
   keeps handoffs simple.</li>
   <li>A restarted replica answers <code>B</code> (busy) during a startup
   grace while live members re-announce, so clients never bootstrap from
-  a half-recovered list; SDKs skip a busy seed like a dead one.</li>
+  a half-recovered list; SDKs skip a busy replica like a dead one.</li>
 </ul>
 <p>Pair this with a supervisor that restarts a dead replica (systemd,
 Kubernetes) and two replicas make discovery effectively always

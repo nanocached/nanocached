@@ -81,7 +81,7 @@ final class Identify {
     private static Socket open(String host, int port, SSLContext tls) throws IOException {
         // Both paths bound the TCP connect (issue #11): the TLS factory's
         // own connect(host, port) has no timeout, so an unresponsive
-        // (packet-dropping) seed would hang connect()/refresh forever
+        // (packet-dropping) address would hang connect()/refresh forever
         // instead of failing over. Layer SSL over a pre-connected,
         // timeout-bounded plain socket instead, and bound the handshake
         // with a read timeout.
