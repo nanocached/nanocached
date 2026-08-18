@@ -24,7 +24,11 @@ use uuid::Uuid;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
-const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// Default for `--max-memory` (issue #19): the cap was previously a fixed
+/// constant with no way to tune it, even though the capacity planner
+/// (`tools/capacity-planner.html`) already modeled capacity as a function
+/// of it.
+pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long after this node's own handoff completes it keeps forwarding
 /// concurrent writes to the joiner (issue #3) — matches discovery's
@@ -304,6 +308,7 @@ pub(crate) async fn run(
     heartbeat: Option<HeartbeatConfig>,
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
+    max_memory_bytes: usize,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
@@ -312,7 +317,7 @@ pub(crate) async fn run(
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let cache_task = tokio::spawn(run_cache(request_rx));
+    let cache_task = tokio::spawn(run_cache(request_rx, max_memory_bytes));
 
     // Shared with `node_context` (when this node has one) so `run_sweep`
     // can tell whether an ADR-0008 handoff this node is the source for is
@@ -794,8 +799,8 @@ async fn handle_connection(
     }
 }
 
-async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>) {
-    let mut cache = Cache::new(MAX_CACHE_MEMORY_BYTES);
+async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>, max_memory_bytes: usize) {
+    let mut cache = Cache::new(max_memory_bytes);
 
     while let Some(request) = request_rx.recv().await {
         let response = request.command.execute(&mut cache);
@@ -1733,7 +1738,7 @@ mod tests {
     async fn run_cache_stores_and_retrieves_a_value() {
         let (request_tx, request_rx) = mpsc::channel(1);
 
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         let set_response = send_command(
             &request_tx,
@@ -1768,7 +1773,7 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(1);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
             request_tx.clone(),
@@ -1836,7 +1841,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
 
-        let error = run(&address, None, None, None).await.unwrap_err();
+        let error = run(&address, None, None, None, MAX_CACHE_MEMORY_BYTES)
+            .await
+            .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
@@ -2097,7 +2104,7 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(1);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
             request_tx.clone(),
@@ -2134,7 +2141,7 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(1);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
             request_tx.clone(),
@@ -2209,7 +2216,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn migrate_with_replication_marks_displaced_copies_and_keeps_the_senders() {
         let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         // Chosen (ready-node / other-node / joiner-0, R=2) so both
         // ADR-0011 roles land on this node at once:
@@ -2437,7 +2444,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn migrate_command_transfers_matching_keys_and_reports_completion() {
         let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         send_command(
             &request_tx,
@@ -2568,7 +2575,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn migrate_command_cancelled_mid_transfer_rolls_back_marks_and_skips_completion() {
         let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         send_command(
             &request_tx,
@@ -2707,7 +2714,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn migrate_command_reuses_one_connection_for_every_key() {
         let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         send_command(
             &request_tx,
@@ -2864,7 +2871,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn migrate_command_gives_up_and_rolls_back_after_permanent_transfer_failure() {
         let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         send_command(
             &request_tx,
@@ -3320,7 +3327,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
 
         let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx));
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_limit = Arc::new(Semaphore::new(1));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 

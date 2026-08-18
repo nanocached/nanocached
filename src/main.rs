@@ -30,6 +30,7 @@ struct Args {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
+    max_memory: usize,
 }
 
 impl Default for Args {
@@ -41,6 +42,7 @@ impl Default for Args {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            max_memory: server::MAX_CACHE_MEMORY_BYTES,
         }
     }
 }
@@ -64,6 +66,12 @@ fn parse_args() -> Result<Args, String> {
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
+            "--max-memory" => {
+                let raw_max_memory = value()?;
+                args.max_memory = raw_max_memory
+                    .parse()
+                    .map_err(|_| format!("invalid value for --max-memory: {raw_max_memory}"))?;
+            }
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
         }
@@ -77,7 +85,8 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn usage() -> String {
-    "\
+    format!(
+        "\
 Usage: nanocached-node [options]
 
   --host <addr>               bind address (default 127.0.0.1)
@@ -94,8 +103,14 @@ Usage: nanocached-node [options]
   --tls-key <path>            PEM private key matching --tls-cert
   --tls-ca <path>             PEM CA certificate(s) to trust when
                                connecting to a TLS-secured discovery server
-                               for heartbeats (see --discovery)"
-        .to_string()
+                               for heartbeats (see --discovery)
+  --max-memory <bytes>        cache memory budget in bytes, approximately
+                               the sum of stored key+value bytes plus a
+                               small per-entry accounting overhead
+                               (default {} — 256 MiB); least-recently-used
+                               entries are evicted first once over budget",
+        server::MAX_CACHE_MEMORY_BYTES,
+    )
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -160,7 +175,15 @@ async fn main() -> ExitCode {
         None => None,
     };
 
-    if let Err(err) = server::run(&address, heartbeat, auth_secret, tls_acceptor).await {
+    if let Err(err) = server::run(
+        &address,
+        heartbeat,
+        auth_secret,
+        tls_acceptor,
+        args.max_memory,
+    )
+    .await
+    {
         eprintln!("nanocached-node: {err}");
         return ExitCode::FAILURE;
     }

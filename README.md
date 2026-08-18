@@ -428,8 +428,10 @@ half-recovered node list.
 
 - Maximum request size: 1 MiB
 - Maximum concurrent connections: 1,024
-- Maximum cache memory usage: 256 MiB (approximate: sum of stored key and
-  value bytes), least-recently-used entries evicted first
+- Maximum cache memory usage: 256 MiB by default, configurable with
+  `--max-memory <bytes>` (approximate: sum of stored key and value bytes
+  plus a small per-entry accounting overhead), least-recently-used
+  entries evicted first
 - Idle connection timeout: 60 seconds
 
 ### nanocached-discovery

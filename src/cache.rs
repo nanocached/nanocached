@@ -14,6 +14,14 @@ use std::time::{Duration, Instant};
 /// removals lets client commands interleave between `sweep` calls instead.
 pub(crate) const SWEEP_BUDGET: usize = 2_000;
 
+/// Added to `used_bytes` per stored entry, on top of its key+value bytes,
+/// to approximate the `HashMap` bucket and intrusive LRU list node
+/// `LruCache` allocates for it — invisible to plain key+value accounting,
+/// but real RSS a small-value workload pays for every entry. A rough,
+/// documented estimate rather than a measured constant (issue #19); if a
+/// closer figure is measured later, this is the only place to change it.
+const ENTRY_OVERHEAD_BYTES: usize = 100;
+
 struct Entry {
     value: Bytes,
     expires_at: Option<Instant>,
@@ -88,11 +96,11 @@ impl Cache {
         // A fresh write is not the value a handoff transferred: a stale
         // `migrated` mark left over from an earlier value must not condemn
         // this one to the next sweep (it would silently delete it).
-        self.migrated.remove(&key[..]);
+        self.clear_migrated_mark(&key[..]);
 
         match self.entries.put(key, entry) {
             Some(replaced) => self.used_bytes = self.used_bytes - replaced.value.len() + value_len,
-            None => self.used_bytes += key_len + value_len,
+            None => self.used_bytes += key_len + value_len + ENTRY_OVERHEAD_BYTES,
         }
 
         // Evict least-recently-used entries until the cache fits its memory
@@ -105,10 +113,10 @@ impl Cache {
                 .pop_lru()
                 .expect("len() > 1 guarantees an entry to evict");
 
-            self.used_bytes -= evicted_key.len() + evicted_entry.value.len();
+            self.used_bytes -= evicted_key.len() + evicted_entry.value.len() + ENTRY_OVERHEAD_BYTES;
             // The marked value is gone; a future entry under this key is a
             // different value and must not inherit the mark.
-            self.migrated.remove(&evicted_key[..]);
+            self.clear_migrated_mark(&evicted_key[..]);
         }
     }
 
@@ -139,11 +147,20 @@ impl Cache {
 
     fn remove_entry(&mut self, key: &[u8]) -> Option<Entry> {
         let entry = self.entries.pop(key)?;
-        self.used_bytes -= key.len() + entry.value.len();
+        self.used_bytes -= key.len() + entry.value.len() + ENTRY_OVERHEAD_BYTES;
         // The mark referred to this entry's value; whatever is stored
         // under the key later is a different value.
-        self.migrated.remove(key);
+        self.clear_migrated_mark(key);
         Some(entry)
+    }
+
+    /// Removes any mark for `key` from `migrated`, crediting `used_bytes`
+    /// back for the duplicate key copy `mark_migrated` stored there — a
+    /// no-op, memory accounting included, if `key` wasn't marked.
+    fn clear_migrated_mark(&mut self, key: &[u8]) {
+        if self.migrated.remove(key) {
+            self.used_bytes -= key.len();
+        }
     }
 
     /// A point-in-time snapshot of every non-expired entry, each with its
@@ -202,10 +219,14 @@ impl Cache {
 
     /// Marks `key` as handed off during an ADR-0008 migration this node
     /// was the source for. A no-op if the key is already marked or no
-    /// longer present; `sweep` reclaims marked entries later.
+    /// longer present; `sweep` reclaims marked entries later. `migrated`
+    /// holds its own copy of the key bytes (see its field docs), so a
+    /// freshly marked key costs `used_bytes` an extra `key.len()` — the
+    /// audit behind issue #19 flagged this duplicate as otherwise
+    /// invisible to the memory limit.
     pub fn mark_migrated(&mut self, key: &[u8]) {
-        if self.entries.contains(key) {
-            self.migrated.insert(Bytes::copy_from_slice(key));
+        if self.entries.contains(key) && self.migrated.insert(Bytes::copy_from_slice(key)) {
+            self.used_bytes += key.len();
         }
     }
 
@@ -217,7 +238,7 @@ impl Cache {
     /// `migration_in_progress` keeps `sweep` paused, so nothing this node
     /// marks can have reached `pending_removal` yet.
     pub fn unmark_migrated(&mut self, key: &[u8]) {
-        self.migrated.remove(key);
+        self.clear_migrated_mark(key);
     }
 
     /// ADR-0008's active-deletion facility: reclaims entries marked by
@@ -450,8 +471,9 @@ mod tests {
 
     #[test]
     fn evicts_least_recently_used_entry_when_over_memory_limit() {
-        // Each entry costs 2 (key) + 4 (value) = 6 bytes; room for exactly two.
-        let mut cache = Cache::new(12);
+        // Each entry costs 2 (key) + 4 (value) + ENTRY_OVERHEAD_BYTES;
+        // room for exactly two.
+        let mut cache = Cache::new(2 * (2 + 4 + ENTRY_OVERHEAD_BYTES));
 
         cache.set(Bytes::from_static(b"k1"), Bytes::from_static(b"vvvv"));
         cache.set(Bytes::from_static(b"k2"), Bytes::from_static(b"vvvv"));
@@ -464,7 +486,7 @@ mod tests {
 
     #[test]
     fn get_protects_an_entry_from_eviction_by_marking_it_recently_used() {
-        let mut cache = Cache::new(12);
+        let mut cache = Cache::new(2 * (2 + 4 + ENTRY_OVERHEAD_BYTES));
 
         cache.set(Bytes::from_static(b"k1"), Bytes::from_static(b"vvvv"));
         cache.set(Bytes::from_static(b"k2"), Bytes::from_static(b"vvvv"));
@@ -480,7 +502,7 @@ mod tests {
 
     #[test]
     fn overwriting_a_key_does_not_double_count_memory_usage() {
-        let mut cache = Cache::new(12);
+        let mut cache = Cache::new(2 * (2 + 4 + ENTRY_OVERHEAD_BYTES));
 
         cache.set(Bytes::from_static(b"k1"), Bytes::from_static(b"vvvv"));
         cache.set(Bytes::from_static(b"k1"), Bytes::from_static(b"vvvv"));
@@ -492,12 +514,15 @@ mod tests {
 
     #[test]
     fn overwrite_accounts_for_a_shrinking_value_precisely() {
-        let mut cache = Cache::new(10);
+        // Post-eviction, "a" (shrunk to 1+1=2 data bytes) and "c" (1+5=6)
+        // must fit (8 data bytes + 2 entries' overhead); "a"+"b"+"c"
+        // together (12 data bytes + 3 entries' overhead) must not.
+        let mut cache = Cache::new(2 * ENTRY_OVERHEAD_BYTES + 10);
 
-        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4, used 4
-        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XXX")); // size 4, used 8
-        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"Z")); // shrinks to size 2, used 6
-        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"WWWWW")); // size 6, used 12 > 10: evicts LRU "b"
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4, used 4 + overhead
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XXX")); // size 4, used 8 + 2*overhead
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"Z")); // shrinks to size 2, used 6 + 2*overhead
+        cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"WWWWW")); // size 6, used 12 + 3*overhead: evicts LRU "b"
 
         assert_eq!(cache.get(b"b"), None);
         assert_eq!(cache.get(b"a"), Some(Bytes::from_static(b"Z")));
@@ -506,7 +531,7 @@ mod tests {
 
     #[test]
     fn eviction_loop_accounts_for_freed_bytes_precisely() {
-        let mut cache = Cache::new(7);
+        let mut cache = Cache::new(7 + 2 * ENTRY_OVERHEAD_BYTES);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"X")); // size 2, used 2
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"X")); // size 2, used 4
@@ -521,7 +546,7 @@ mod tests {
 
     #[test]
     fn delete_frees_the_deleted_entrys_exact_byte_count() {
-        let mut cache = Cache::new(10);
+        let mut cache = Cache::new(10 + 2 * ENTRY_OVERHEAD_BYTES);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XXX")); // size 4, used 8
@@ -534,7 +559,7 @@ mod tests {
 
     #[test]
     fn delete_does_not_under_report_freed_bytes() {
-        let mut cache = Cache::new(6);
+        let mut cache = Cache::new(6 + 2 * ENTRY_OVERHEAD_BYTES);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XXX")); // size 4
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"X")); // size 2, used 6
@@ -543,6 +568,21 @@ mod tests {
 
         assert_eq!(cache.get(b"b"), None);
         assert_eq!(cache.get(b"c"), Some(Bytes::from_static(b"WWWW")));
+    }
+
+    #[test]
+    fn per_entry_overhead_counts_toward_the_memory_limit_even_for_tiny_values() {
+        // Two 2-byte entries (1-byte key + 1-byte value each) total 4 raw
+        // data bytes — well under a 4-byte budget's raw accounting, but
+        // each also costs ENTRY_OVERHEAD_BYTES of invisible bookkeeping,
+        // so the second insert must evict the first.
+        let mut cache = Cache::new(4);
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+
+        assert_eq!(cache.get(b"a"), None);
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"2")));
     }
 
     #[test]
@@ -622,7 +662,7 @@ mod tests {
 
     #[test]
     fn entries_does_not_disturb_lru_order() {
-        let mut cache = Cache::new(8);
+        let mut cache = Cache::new(7 + 2 * ENTRY_OVERHEAD_BYTES);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XX")); // used 3
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XX")); // used 6
@@ -679,7 +719,7 @@ mod tests {
 
     #[test]
     fn peek_entry_does_not_disturb_lru_order() {
-        let mut cache = Cache::new(8);
+        let mut cache = Cache::new(7 + 2 * ENTRY_OVERHEAD_BYTES);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XX"));
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XX"));
@@ -709,6 +749,53 @@ mod tests {
         cache.mark_migrated(b"name");
 
         assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn mark_migrated_counts_the_marked_keys_duplicate_bytes_toward_the_limit() {
+        // "a" (2 data bytes) then "b" (2 data bytes) together cost exactly
+        // 2*(2+ENTRY_OVERHEAD_BYTES) — this budget leaves no slack.
+        // Marking "a" first adds one more byte (its key, duplicated into
+        // `migrated`) that a boundary this tight cannot absorb, so
+        // inserting "b" must evict "a". Without the mark, both would fit.
+        let mut cache = Cache::new(2 * (2 + ENTRY_OVERHEAD_BYTES));
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+        cache.mark_migrated(b"a");
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+
+        assert_eq!(cache.get(b"a"), None);
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn unmark_migrated_credits_back_the_marked_keys_duplicate_bytes() {
+        // Same tight budget as above, but the mark is reversed before "b"
+        // is inserted — both must now fit.
+        let mut cache = Cache::new(2 * (2 + ENTRY_OVERHEAD_BYTES));
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+        cache.mark_migrated(b"a");
+        cache.unmark_migrated(b"a");
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+
+        assert_eq!(cache.get(b"a"), Some(Bytes::from_static(b"1")));
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn marking_an_already_marked_key_does_not_double_count_its_bytes() {
+        let mut cache = Cache::new(2 * (2 + ENTRY_OVERHEAD_BYTES));
+
+        cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
+        cache.mark_migrated(b"a");
+        cache.mark_migrated(b"a"); // already marked — must not charge twice
+        cache.unmark_migrated(b"a"); // one unmark fully reverses one mark
+
+        cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
+
+        assert_eq!(cache.get(b"a"), Some(Bytes::from_static(b"1")));
+        assert_eq!(cache.get(b"b"), Some(Bytes::from_static(b"2")));
     }
 
     #[test]
