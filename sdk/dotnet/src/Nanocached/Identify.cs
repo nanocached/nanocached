@@ -32,7 +32,7 @@ internal static class Identify
     // cloud instance) blackholes the TCP connect and a caller hangs for
     // the kernel's own timeout — minutes — instead of failing over.
     // Internal and mutable only so tests can shorten it.
-    internal static TimeSpan ConnectDeadline = TimeSpan.FromSeconds(10);
+    internal static TimeSpan ConnectDeadline = TimeSpan.FromSeconds(5);
 
     internal abstract record Result;
 

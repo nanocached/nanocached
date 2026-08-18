@@ -54,7 +54,7 @@ class Connection:
 
     @property
     def closed(self) -> bool:
-        # A peer close (e.g. the server's 30s idle timeout) is only
+        # A peer close (e.g. the server's 60s idle timeout) is only
         # observed on the next read, so also probe the transport.
         return self._closed or self._writer.is_closing() or self._reader.at_eof()
 

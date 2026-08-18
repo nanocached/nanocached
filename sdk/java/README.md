@@ -66,9 +66,9 @@ failed attempt forces a node-list refresh and one retry.
 
 ## Reconnect and keep-alive
 
-`nanocached-node` closes connections idle for 30 seconds; the SDK keeps
+`nanocached-node` closes connections idle for 60 seconds; the SDK keeps
 its connections warm automatically, pinging any connection that real
-traffic has left idle for 15 seconds — so an idle timeout never severs a
+traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
 operations are idempotent). There is nothing to configure.

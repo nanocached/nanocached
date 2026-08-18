@@ -12,7 +12,7 @@
 // the next owner only when the holder is unreachable. Dead connections
 // are redialed lazily on use (with one transparent retry — a socket only
 // learns of a peer FIN on I/O, and every operation is idempotent), and an
-// opt-in keep-alive can hold connections open across the server's 30s
+// opt-in keep-alive can hold connections open across the server's 60s
 // idle timeout.
 //
 // The Client is safe for concurrent use. Requests are serialized per
@@ -68,9 +68,9 @@ type Config struct {
 }
 
 // keepAliveInterval is the always-on keep-alive cadence (issue #27):
-// half the server's 30s idle timeout, so it never severs a healthy
+// half the server's 60s idle timeout, so it never severs a healthy
 // client. A variable only so tests can shorten it.
-var keepAliveInterval = 15 * time.Second
+var keepAliveInterval = 30 * time.Second
 
 type member struct {
 	address    string
@@ -439,7 +439,7 @@ func (c *Client) ownerNames(key []byte) []string {
 
 // applyReconnecting runs op against the slot's connection, retrying once
 // on a connection-level failure: a socket only learns of a peer FIN (e.g.
-// the server's 30s idle timeout) on I/O, so lazy reconnect-on-use means
+// the server's 60s idle timeout) on I/O, so lazy reconnect-on-use means
 // the failed request poisons the connection, the redial replaces it, and
 // the operation runs again. Safe because Get/Set/Delete are idempotent.
 // slot is "" in single mode.

@@ -25,7 +25,7 @@ use uuid::Uuid;
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long after this node's own handoff completes it keeps forwarding
 /// concurrent writes to the joiner (issue #3) — matches discovery's
 /// default --migration-timeout, by which time the join has either

@@ -76,7 +76,7 @@ final class Identify {
         }
     }
 
-    private static final int CONNECT_TIMEOUT_MS = 10_000;
+    private static final int CONNECT_TIMEOUT_MS = 5_000;
 
     private static Socket open(String host, int port, SSLContext tls) throws IOException {
         // Both paths bound the TCP connect (issue #11): the TLS factory's

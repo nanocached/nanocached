@@ -139,7 +139,7 @@ const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// `X` to roll back, exactly as it does when a node's connection dies
 /// outright (patterns 1/2).
 const DEFAULT_MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds every outbound dial and ack read this process makes toward a

@@ -23,7 +23,7 @@ _NO_SECRET_PLACEHOLDER = b"\x00"
 # node whose IP has been reclaimed (a stopped container, a dead cloud
 # instance) blackholes the TCP connect and a caller hangs for the kernel's
 # own timeout — minutes — instead of failing over.
-CONNECT_DEADLINE = 10.0
+CONNECT_DEADLINE = 5.0
 
 
 @dataclass(frozen=True)

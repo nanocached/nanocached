@@ -42,7 +42,7 @@ import javax.net.ssl.TrustManagerFactory;
  * replica never fails a write), reads ask the primary and fall over to
  * the next owner only when the holder is unreachable. Dead connections
  * are redialed lazily on use, and an opt-in keep-alive can hold
- * connections open across the server's 30s idle timeout.
+ * connections open across the server's 60s idle timeout.
  *
  * <p>Thread-safe. Requests are serialized per connection (see
  * {@link Connection}); concurrent callers queue.
@@ -104,7 +104,7 @@ public final class NanocachedClient implements AutoCloseable {
     private static final Duration NODE_LIST_STALE_AFTER = Duration.ofSeconds(30);
     // The server rejects empty keys, so the keep-alive G needs one byte.
     private static final byte[] KEEPALIVE_KEY = {0};
-    static volatile long keepAliveIntervalMillis = 15_000;
+    static volatile long keepAliveIntervalMillis = 30_000;
 
     // Tracks, per connect() target (not per instance — mirrors
     // sdk/typescript/src/client.ts's openTargets), how many open sockets
@@ -446,7 +446,7 @@ public final class NanocachedClient implements AutoCloseable {
     /**
      * Runs {@code op} against {@code source}'s connection, retrying once
      * on a connection-level failure. Unlike Node or Python, a Java socket
-     * doesn't learn about a peer FIN (e.g. the server's 30s idle timeout)
+     * doesn't learn about a peer FIN (e.g. the server's 60s idle timeout)
      * until an I/O call fails — so lazy reconnect-on-use here means: the
      * failed request poisons the connection, {@code source} redials, and
      * the operation runs again. Safe because get/set/delete are all
@@ -691,7 +691,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     private void startKeepAlive() {
         // Always on, with an internal interval (issue #27): half the
-        // server's 30s idle timeout, so it never severs a healthy
+        // server's 60s idle timeout, so it never severs a healthy
         // client. Package-visible only so tests can shorten it.
         Duration interval = Duration.ofMillis(keepAliveIntervalMillis);
 
