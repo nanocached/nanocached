@@ -9,13 +9,23 @@
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
 //!
-//!   H <name-length>\n<name>   Heartbeat, identified by name (a random
+//!   H <name-length> <r>\n<name>   Heartbeat, identified by name (a random
 //!                             per-process identity, ADR-0009 — not the
 //!                             node's address, which carries no identity
 //!                             meaning and was already established by
 //!                             `J` on this connection). Only valid for a
 //!                             node already `Joined` (see below) —
-//!                             refreshes its liveness. Response: `A\n`.
+//!                             refreshes its liveness. `r` is the
+//!                             replication factor this node currently
+//!                             believes (issue #30) — learned from a `M`
+//!                             this node has sent as an ADR-0011 handoff
+//!                             source, or `0` if it hasn't sent one yet
+//!                             and so has no belief to report. When `r` is
+//!                             nonzero and disagrees with this replica's
+//!                             own `--replication-factor`, the mismatch is
+//!                             logged loudly (not rejected — see ADR-0010,
+//!                             replicas never reconcile configuration with
+//!                             each other). Response: `A\n`.
 //!
 //!   L\n                       List currently `Joined` nodes. Response:
 //!                             `N <count>\n` followed by `count` lines,
@@ -536,8 +546,13 @@ enum DiscoveryCommand {
     Auth(Bytes),
     /// A refresh from an already-`Joined` node, identified by its name
     /// (ADR-0009) — its address was already established by `Join` on this
-    /// same connection.
-    Heartbeat(String),
+    /// same connection. `replication` (issue #30) is the replication
+    /// factor this node currently believes, or `None` if it doesn't know
+    /// yet (the wire's `0` sentinel — see the module docs).
+    Heartbeat {
+        name: String,
+        replication: Option<usize>,
+    },
     List,
     /// ADR-0008: a node asking to join, identified by its name (ADR-0009)
     /// and the port it serves on — the reachable address is composed from
@@ -625,15 +640,23 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
         b"H" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let replication = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
 
             let name_length = parse_length(name_length)?;
+            // `0` is the wire sentinel for "no belief yet" (issue #30) —
+            // not a real replication factor (nodes validate >= 1 the same
+            // way this replica's own `--replication-factor` does).
+            let replication = match parse_length(replication)? {
+                0 => None,
+                r => Some(r),
+            };
             let name = parse_string_field(input, header_end, name_length)?;
 
-            Ok(DiscoveryCommand::Heartbeat(name))
+            Ok(DiscoveryCommand::Heartbeat { name, replication })
         }
 
         b"C" => {
@@ -1662,7 +1685,7 @@ async fn handle_connection(
                     "command sent before authenticating",
                 ));
             }
-            Ok(DiscoveryCommand::Heartbeat(name)) => {
+            Ok(DiscoveryCommand::Heartbeat { name, replication }) => {
                 let refreshed = {
                     let mut guard = lock(&registry);
                     match guard.get_mut(&name) {
@@ -1679,6 +1702,28 @@ async fn handle_connection(
                         io::ErrorKind::InvalidData,
                         "heartbeat from a node that has not joined",
                     ));
+                }
+
+                // Issue #30: the node's own belief (learned from a `M` it
+                // sent as an ADR-0011 handoff source) may disagree with
+                // this replica's configured value — every discovery
+                // replica takes its own `--replication-factor` flag and
+                // nothing else validates they agree (ADR-0010 deliberately
+                // keeps replicas from talking to each other). Loud,
+                // repeated logging is the whole mechanism: the mismatch
+                // isn't rejected, since a stale replica can't tell which
+                // side is actually wrong.
+                if let Some(reported) = replication
+                    && reported != config.replication
+                {
+                    eprintln!(
+                        "WARN node {name} reports replication factor {reported}, but this \
+                         discovery replica is configured with --replication-factor \
+                         {} — every replica must agree (see doc/adr/0010-*.md); a client \
+                         or node that learned R from a different replica may be running \
+                         with a different fan-out/failover width right now",
+                        config.replication
+                    );
                 }
 
                 stream.write_all(b"A\n").await?;
@@ -1888,25 +1933,55 @@ mod tests {
 
     #[test]
     fn parse_reports_incomplete_before_the_header_is_fully_buffered() {
-        let mut input = BytesMut::from(&b"H 5"[..]);
+        let mut input = BytesMut::from(&b"H 9 2"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn parse_reports_incomplete_while_the_field_body_is_still_arriving() {
-        let mut input = BytesMut::from(&b"H 9\n1.2.3"[..]);
+        let mut input = BytesMut::from(&b"H 9 2\n1.2.3"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn parse_reads_a_heartbeat_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"H 9\nsome-nameL\n"[..]);
+        let mut input = BytesMut::from(&b"H 9 2\nsome-nameL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
-            DiscoveryCommand::Heartbeat("some-name".to_string())
+            DiscoveryCommand::Heartbeat {
+                name: "some-name".to_string(),
+                replication: Some(2),
+            }
         );
         assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_reads_a_heartbeat_with_zero_replication_as_unknown() {
+        // `0` is the wire sentinel for "this node has no belief yet"
+        // (issue #30) — never a real replication factor.
+        let mut input = BytesMut::from(&b"H 9 0\nsome-name"[..]);
+        let command = parse(&mut input).unwrap();
+        assert_eq!(
+            command,
+            DiscoveryCommand::Heartbeat {
+                name: "some-name".to_string(),
+                replication: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_heartbeat_missing_the_replication_field() {
+        let mut input = BytesMut::from(&b"H 9\nsome-name"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_rejects_a_heartbeat_with_trailing_arguments() {
+        let mut input = BytesMut::from(&b"H 9 2 extra\nsome-name"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
@@ -1966,7 +2041,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_an_empty_field() {
-        let mut input = BytesMut::from(&b"H 0\n"[..]);
+        let mut input = BytesMut::from(&b"H 0 2\n"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
 
@@ -1980,13 +2055,13 @@ mod tests {
 
     #[test]
     fn parse_rejects_a_non_numeric_length() {
-        let mut input = BytesMut::from(&b"H x\n"[..]);
+        let mut input = BytesMut::from(&b"H x 2\n"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
     fn parse_rejects_invalid_utf8_fields() {
-        let mut input = BytesMut::from(&b"H 2\n\xff\xfe"[..]);
+        let mut input = BytesMut::from(&b"H 2 2\n\xff\xfe"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidUtf8));
     }
 
@@ -2062,7 +2137,7 @@ mod tests {
         // With no Joined nodes yet, this is the bootstrap case: the join
         // is accepted with nothing to hand off, so promotion is immediate.
         client
-            .write_all(b"J 6 8356\nnode-aH 6\nnode-aL\n")
+            .write_all(b"J 6 8356\nnode-aH 6 0\nnode-aL\n")
             .await
             .unwrap();
 
@@ -2070,6 +2145,62 @@ mod tests {
         // may observe them coalesced into a single read, so accumulate
         // until the expected byte count has arrived instead of assuming
         // read boundaries.
+        let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 64];
+
+        while received.len() < expected.len() {
+            let bytes_read = client.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response arrived");
+            received.extend_from_slice(&chunk[..bytes_read]);
+        }
+
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_reporting_a_mismatched_replication_factor_is_still_acked() {
+        // Issue #30: a mismatch is logged, not rejected — this replica has
+        // no way to tell which side is actually misconfigured (ADR-0010
+        // keeps replicas from reconciling with each other), so the node
+        // must stay `Joined` and keep heartbeating normally.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_registry = Arc::clone(&registry);
+        let server_current_join = Arc::clone(&current_join);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_connection(
+                MaybeTls::Plain(stream),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                server_registry,
+                server_current_join,
+                ConnectionConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    list_ready_at: Instant::now(),
+                    replication: 2,
+                    auth_secret: None,
+                    tls_acceptor: None,
+                    tls_connector: None,
+                },
+                shutdown_rx,
+                Arc::new(std::sync::Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        // This replica is configured with R=2 (above); the node here
+        // reports R=1 on its heartbeat — a disagreement.
+        client
+            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-aL\n")
+            .await
+            .unwrap();
+
         let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
@@ -2133,7 +2264,7 @@ mod tests {
         // heartbeating (A), and visible in L — with no ADR-0008 join
         // machinery involved.
         client
-            .write_all(b"P 6 8356\nnode-aH 6\nnode-aL\n")
+            .write_all(b"P 6 8356\nnode-aH 6 0\nnode-aL\n")
             .await
             .unwrap();
 

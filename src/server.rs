@@ -250,7 +250,7 @@ struct NodeContext {
     /// too. `None` until this node's first successful handoff — a lone
     /// or freshly-bootstrapped node has no membership to reject against
     /// yet.
-    known_ring: Arc<Mutex<Option<Arc<Membership>>>>,
+    known_ring: KnownRing,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -331,6 +331,11 @@ pub(crate) async fn run(
         shutdown_rx.clone(),
     ));
 
+    // Shared with `node_context` so the heartbeat tasks can report the
+    // replication factor half of this node's belief to discovery (issue
+    // #30), the same belief `wrong_node` rejects client requests against.
+    let known_ring: KnownRing = Arc::new(Mutex::new(None));
+
     // Generated once and kept for this process's lifetime (ADR-0009): a
     // restarted node has no data to reclaim its old identity for, so
     // there's nothing a stable name would preserve across a restart that
@@ -342,7 +347,7 @@ pub(crate) async fn run(
         // matching where `J` was sent.
         discovery_addr: config.discovery_addrs[0].clone(),
         active_migration: Arc::clone(&active_migration),
-        known_ring: Arc::new(Mutex::new(None)),
+        known_ring: Arc::clone(&known_ring),
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
@@ -352,6 +357,7 @@ pub(crate) async fn run(
         (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
             config,
             node_context.name.clone(),
+            Arc::clone(&known_ring),
             shutdown_rx.clone(),
         ))),
         _ => None,
@@ -832,8 +838,13 @@ fn announce_message(name: &str, port: u16) -> Vec<u8> {
 /// Only valid once this node has been promoted to `Joined` (ADR-0008); the
 /// address was already established by `join_message` on this connection,
 /// so a heartbeat only needs to carry `name` to refresh liveness.
-fn heartbeat_message(name: &str) -> Vec<u8> {
-    let mut message = format!("H {}\n", name.len()).into_bytes();
+/// `replication` is this node's current belief about the cluster's
+/// replication factor (issue #30), encoded as `0` when it doesn't have
+/// one yet — never a real replication factor (discovery validates every
+/// `--replication-factor` is at least 1), so it's an unambiguous "unknown"
+/// sentinel on the wire.
+fn heartbeat_message(name: &str, replication: Option<usize>) -> Vec<u8> {
+    let mut message = format!("H {} {}\n", name.len(), replication.unwrap_or(0)).into_bytes();
     message.extend_from_slice(name.as_bytes());
     message
 }
@@ -894,6 +905,7 @@ enum DiscoveryRole {
 async fn send_heartbeats(
     config: HeartbeatConfig,
     name: String,
+    known_ring: KnownRing,
     shutdown_rx: watch::Receiver<bool>,
 ) {
     let (promoted_tx, promoted_rx) = watch::channel(false);
@@ -914,6 +926,7 @@ async fn send_heartbeats(
             config.auth_secret.clone(),
             config.tls_connector.clone(),
             name.clone(),
+            Arc::clone(&known_ring),
             role,
             shutdown_rx.clone(),
         ));
@@ -935,12 +948,12 @@ async fn register_with_discovery(
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     name: String,
+    known_ring: KnownRing,
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let join = join_message(&name, port);
     let announce = announce_message(&name, port);
-    let heartbeat = heartbeat_message(&name);
 
     // A standby must not announce a node the primary hasn't promoted yet:
     // that would make it visible in the standby's `L` before its ADR-0008
@@ -1014,6 +1027,18 @@ async fn register_with_discovery(
                         }
 
                         loop {
+                            // Rebuilt every tick, not precomputed once:
+                            // this node's belief starts unknown and is set
+                            // only once it has sent its own first ADR-0011
+                            // handoff `M` (issue #30) — a stale precomputed
+                            // buffer would keep reporting "unknown" forever.
+                            let replication = known_ring
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .as_ref()
+                                .map(|membership| membership.replication);
+                            let heartbeat = heartbeat_message(&name, replication);
+
                             if stream.write_all(&heartbeat).await.is_err() {
                                 break;
                             }
@@ -1100,6 +1125,12 @@ struct Membership {
     ring: Arc<HashRing>,
     replication: usize,
 }
+
+/// Shared handle to a node's current `Membership` belief, if it has one
+/// yet (see `NodeContext::known_ring`) — also handed to the heartbeat
+/// tasks so they can report the replication factor half of it to
+/// discovery (issue #30).
+type KnownRing = Arc<Mutex<Option<Arc<Membership>>>>;
 
 /// A `run_migration` in flight: which handoff it's for, where the joining
 /// node is, the ring this handoff computed (so a concurrent client write
@@ -2371,7 +2402,18 @@ mod tests {
 
     #[test]
     fn heartbeat_message_declares_the_name_length_before_the_name() {
-        assert_eq!(heartbeat_message("some-name"), b"H 9\nsome-name".to_vec());
+        assert_eq!(
+            heartbeat_message("some-name", Some(2)),
+            b"H 9 2\nsome-name".to_vec()
+        );
+    }
+
+    #[test]
+    fn heartbeat_message_encodes_an_unknown_replication_belief_as_zero() {
+        assert_eq!(
+            heartbeat_message("some-name", None),
+            b"H 9 0\nsome-name".to_vec()
+        );
     }
 
     #[test]
@@ -2981,7 +3023,9 @@ mod tests {
     /// whose shape the test doesn't already know, since its name is a
     /// random UUID generated inside `send_heartbeats`) and asserts every
     /// subsequent message in `received` is the matching
-    /// `H <name-length>\n<name>` heartbeat for that same name.
+    /// `H <name-length> <r>\n<name>` heartbeat for that same name — `r=0`
+    /// (unknown), since none of these tests give it a `KnownRing` with a
+    /// membership belief set.
     fn assert_join_then_heartbeats(received: &[Vec<u8>], port: u16) {
         assert!(
             received.len() >= 4,
@@ -3003,7 +3047,7 @@ mod tests {
         let name = &body[..name_length];
         assert_eq!(body.len(), name_length);
 
-        let expected_heartbeat = format!("H {}\n{name}", name.len());
+        let expected_heartbeat = format!("H {} 0\n{name}", name.len());
         for message in &received[1..] {
             assert_eq!(message, expected_heartbeat.as_bytes());
         }
@@ -3022,6 +3066,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         )
         .await;
@@ -3073,6 +3118,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -3083,6 +3129,93 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_reports_the_replication_factor_once_known_ring_is_set() {
+        // Issue #30: the belief starts unknown (`r=0`) and, once this node
+        // has sent its own first ADR-0011 handoff `M`, every heartbeat
+        // after that must carry the real value — not the buffer built at
+        // connection time, which would keep reporting "unknown" forever.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+
+        let received: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fake_discovery_received = Arc::clone(&received);
+
+        let fake_discovery = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 128];
+            let mut first = true;
+
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(bytes_read) => {
+                        fake_discovery_received
+                            .lock()
+                            .unwrap()
+                            .push(buffer[..bytes_read].to_vec());
+
+                        let ack: &[u8] = if first { b"R\n" } else { b"A\n" };
+                        first = false;
+
+                        if connection.write_all(ack).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            "test-node".to_string(),
+            Arc::clone(&known_ring),
+            shutdown_rx,
+        ));
+
+        // Let at least one "unknown" heartbeat go out before this node
+        // learns a replication factor.
+        sleep(Duration::from_millis(60)).await;
+        *known_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(Membership {
+            ring: Arc::new(HashRing::new(vec!["test-node".to_string()])),
+            replication: 3,
+        }));
+        sleep(Duration::from_millis(100)).await;
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
+
+        let received = received.lock().unwrap();
+        let heartbeats: Vec<&Vec<u8>> = received[1..].iter().collect();
+
+        assert!(
+            heartbeats
+                .iter()
+                .any(|message| message.starts_with(b"H 9 0\n")),
+            "expected at least one heartbeat reporting the unknown (0) belief before \
+             known_ring was set, got {heartbeats:?}"
+        );
+        assert!(
+            heartbeats
+                .iter()
+                .any(|message| message.starts_with(b"H 9 3\n")),
+            "expected at least one heartbeat reporting the newly known replication factor \
+             (3) after known_ring was set, got {heartbeats:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3140,6 +3273,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -3226,6 +3360,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -3267,6 +3402,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -3418,6 +3554,7 @@ mod tests {
                 tls_connector: Some(connector),
             },
             "test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 

@@ -422,6 +422,11 @@ answers `L` with `B` (busy) for the liveness-timeout window while live
 members re-announce themselves, so a bootstrapping client never sees a
 half-recovered node list.
 
+Every replica must be started with the same `--replication-factor`; nothing
+enforces this at startup (replicas don't coordinate), but a node reports the
+replication factor it has learned on every heartbeat, and a replica logs a
+loud `WARN` if that disagrees with its own configured value.
+
 ## Current limits
 
 ### nanocached-node

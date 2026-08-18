@@ -103,6 +103,11 @@ neither cache traffic nor client bootstrap; only <em>joins</em> need the
 primary up. A restarted replica answers <code>B</code> (busy) for the
 liveness-timeout window while live members re-announce, so a
 bootstrapping client never sees a half-recovered node list.</p>
+<p>Every replica must be started with the same
+<code>--replication-factor</code> — nothing enforces this at startup, since
+replicas never talk to each other, but a node reports the replication
+factor it has learned on every heartbeat, and a replica logs a loud
+<code>WARN</code> if that disagrees with its own configured value.</p>
 
 <h2>Authentication</h2>
 <p>Set <code>NANOCACHED_AUTH_SECRET</code> to require clients to
