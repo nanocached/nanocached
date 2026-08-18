@@ -157,6 +157,13 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// never answers freezes the single sweep task — and with it all
 /// liveness eviction — and can hang shutdown indefinitely.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// ADR-0008 known gap (issue #20): a ready node that never received `M` —
+/// a transient connect/write/ack failure, not a rejection — never hands
+/// off and never sweeps, stalling the join until `--migration-timeout`
+/// reaps it. Retrying the send absorbs exactly that class of hiccup,
+/// mirroring `run_migration`'s own `KEY_TRANSFER_ATTEMPTS` on the node
+/// side (same fixed-attempt-count, fresh-connection-each-time shape).
+const MIGRATE_SEND_ATTEMPTS: u32 = 3;
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 
 /// A registered node's place in the ADR-0008 join lifecycle: `Waiting`
@@ -875,7 +882,8 @@ async fn try_begin_next_join(
         let joined_roster = joined.clone();
 
         sends.spawn(async move {
-            let result = send_migrate(
+            let result = send_migrate_with_retry(
+                &ready_name,
                 &ready_addr,
                 &auth_secret,
                 &tls_connector,
@@ -894,16 +902,68 @@ async fn try_begin_next_join(
     while let Some(outcome) = sends.join_next().await {
         match outcome {
             Ok((ready_name, Err(error))) => {
-                // ADR-0008 doesn't yet define a retry/timeout policy for
-                // this: a ready node that never got (or never acted on)
-                // `M` just never sends `C`, and this join stalls — a
-                // known, recorded gap (see ADR-0008's Consequences).
-                eprintln!("WARN failed to send M to {ready_name}: {error}");
+                // Every individual attempt (see `send_migrate_with_retry`)
+                // was already logged; this is the final, permanent
+                // failure. ADR-0008 still doesn't define recovery beyond
+                // this point (issue #20's second gap) — the join stalls
+                // until discovery's own `--migration-timeout` reaps it.
+                eprintln!(
+                    "WARN permanently failed to send M to {ready_name} after \
+                     {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
+                );
             }
             Ok((_, Ok(()))) => {}
             Err(error) => eprintln!("WARN a task sending M panicked: {error}"),
         }
     }
+}
+
+/// Bounded retry for `M`'s delivery (issue #20 / ADR-0008 Consequences):
+/// tries up to `MIGRATE_SEND_ATTEMPTS` times, logging each failed attempt,
+/// with a fresh connection every time (`send_migrate` owns its own
+/// connect) since a failed write/read leaves the previous connection's
+/// state unknown. This only bounds the *send* — the handoff itself,
+/// reported back asynchronously via `C`, stays a separate, unretried
+/// concern (see `send_migrate`'s own docs).
+#[allow(clippy::too_many_arguments)]
+async fn send_migrate_with_retry(
+    ready_name: &str,
+    address: &str,
+    auth_secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
+    joining_name: &str,
+    joining_addr: &str,
+    joined: &[(String, String)],
+    replication: usize,
+    io_timeout: Duration,
+) -> io::Result<()> {
+    let mut last_error = None;
+
+    for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
+        match send_migrate(
+            address,
+            auth_secret,
+            tls_connector,
+            joining_name,
+            joining_addr,
+            joined,
+            replication,
+            io_timeout,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                eprintln!(
+                    "WARN failed to send M to {ready_name} (attempt \
+                     {attempt}/{MIGRATE_SEND_ATTEMPTS}): {error}"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.expect("the loop above runs at least once"))
 }
 
 /// Connects to `address` (a `Joined` node) as a client, sends `M` with the
@@ -3205,6 +3265,83 @@ mod tests {
         expected.extend_from_slice(b"joining-node");
         expected.extend_from_slice(b"127.0.0.1:9");
         assert_eq!(*received.lock().unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_recovers_from_a_transient_failure() {
+        // Issue #20: the first attempt is a transient failure (the "node"
+        // accepts the connection then drops it without acking); the
+        // second succeeds. The whole call must still return `Ok`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let node_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(b"A\n").await.unwrap();
+        });
+
+        let result = send_migrate_with_retry(
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            &[],
+            2,
+            OUTBOUND_IO_TIMEOUT,
+        )
+        .await;
+
+        assert!(result.is_ok(), "expected recovery on retry, got {result:?}");
+        node_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_gives_up_after_exhausting_every_attempt() {
+        // Every attempt fails the same way (connection accepted then
+        // dropped without acking) — the call must give up after exactly
+        // `MIGRATE_SEND_ATTEMPTS` tries, not retry forever.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let server_attempts = Arc::clone(&attempts);
+        let node_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                server_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let result = send_migrate_with_retry(
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            &[],
+            2,
+            OUTBOUND_IO_TIMEOUT,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MIGRATE_SEND_ATTEMPTS
+        );
+
+        node_task.abort();
     }
 
     #[tokio::test(flavor = "current_thread")]
