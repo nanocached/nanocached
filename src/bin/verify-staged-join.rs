@@ -16,6 +16,16 @@
 //!   really wait (serialize) behind the first, rather than both being
 //!   promoted together?
 //!
+//! ADR-0011 (client-side replication via rendezvous hashing) means this
+//! harness cannot assume single-owner semantics: with the server's
+//! default `--replication-factor 2`, a node rejects `G`/`S` for any key
+//! outside its own top-R with `W` (see `wrong_node` in `src/server.rs`).
+//! So this harness carries its own byte-for-byte port of the HRW ring
+//! (`Ring`, below — the same algorithm `src/hash_ring.rs`, `bench.rs`, and
+//! the SDKs each implement independently) and routes every seed write,
+//! workload op, and post-join check to a key's actual owners instead of
+//! to a fixed node.
+//!
 //! Scenarios: `1-to-2`, `2-to-3`, `1-to-3-waiting` (two nodes join at
 //! once; the second must wait behind the first). Pass `--scenario <name>`
 //! to run one, or omit it to run all three in sequence.
@@ -29,7 +39,7 @@
 //! add it if/when AWS verification needs it.
 
 use bytes::BytesMut;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -39,6 +49,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -46,6 +57,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BUCKET_WIDTH: Duration = Duration::from_millis(250);
+
+/// A node's name paired with its dialable address.
+type Roster = Vec<(String, String)>;
 
 struct Args {
     scenario: Option<String>,
@@ -321,20 +335,97 @@ async fn read_exact_into(
     Ok(())
 }
 
-/// Fetches the current `Joined` node list from discovery, in the
-/// ADR-0009 `<name-length> <addr-length>\n<name><addr>` shape.
-async fn fetch_joined(discovery_addr: &str) -> io::Result<Vec<(String, String)>> {
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// MurmurHash3's 64-bit finalizer, matching `src/hash_ring.rs` exactly.
+fn fmix64(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51afd7ed558ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ceb9fe1a85ec53);
+    hash ^= hash >> 33;
+    hash
+}
+
+/// A byte-for-byte port of `src/hash_ring.rs`'s HRW ring, independently
+/// implemented the way any other ADR-0011 participant (node, SDK, bench)
+/// must — see this file's module docs. Only what this harness needs:
+/// computing a key's top-R owners, in score order, from a roster snapshot.
+struct Ring<'a> {
+    nodes: &'a [(String, String)],
+    node_hashes: Vec<u64>,
+}
+
+impl<'a> Ring<'a> {
+    fn new(nodes: &'a [(String, String)]) -> Self {
+        let node_hashes = nodes
+            .iter()
+            .map(|(name, _)| fnv1a(name.as_bytes()))
+            .collect();
+        Self { nodes, node_hashes }
+    }
+
+    /// The key's owners: the `replicas` highest-scoring nodes, primary
+    /// first. Fewer than `replicas` when the roster is smaller.
+    fn owners(&self, key: &[u8], replicas: usize) -> Roster {
+        let key_hash = fnv1a(key);
+
+        let mut scored: Vec<(u64, &(String, String))> = self
+            .node_hashes
+            .iter()
+            .zip(self.nodes)
+            .map(|(node_hash, node)| (fmix64(node_hash ^ key_hash), node))
+            .collect();
+
+        // Descending by score; ties toward the lexicographically smaller
+        // name — same total order every implementation agrees on.
+        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
+        scored.truncate(replicas);
+
+        scored.into_iter().map(|(_, node)| node.clone()).collect()
+    }
+}
+
+/// Fetches the current `Joined` node list and replication factor from
+/// discovery, in the ADR-0009 `<name-length> <addr-length>\n<name><addr>`
+/// shape.
+async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
     let mut stream = TcpStream::connect(discovery_addr).await?;
     stream.write_all(b"L\n").await?;
 
     let mut buf = BytesMut::new();
     let header = read_line(&mut stream, &mut buf).await?;
-    // `N <count> <r>\n` since ADR-0011 (the replication factor rides
-    // along for clients; this harness doesn't need it).
-    let count: usize = header
+    // `N <count> <r>\n` since ADR-0011: the replication factor rides
+    // along so every client (this harness included) can route by top-R
+    // instead of assuming single ownership.
+    let mut header_parts = header
         .strip_prefix("N ")
-        .and_then(|rest| rest.split(' ').next())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad L header: {header:?}"),
+            )
+        })?
+        .split(' ');
+    let count: usize = header_parts
+        .next()
         .and_then(|count| count.parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad L header: {header:?}"),
+            )
+        })?;
+    let replication: usize = header_parts
+        .next()
+        .and_then(|r| r.parse().ok())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -367,7 +458,7 @@ async fn fetch_joined(discovery_addr: &str) -> io::Result<Vec<(String, String)>>
         nodes.push((name, addr));
     }
 
-    Ok(nodes)
+    Ok((nodes, replication))
 }
 
 async fn set(
@@ -385,7 +476,48 @@ async fn set(
     Ok(line == "S")
 }
 
-async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Result<bool> {
+/// A `G` response: a hit, a miss, or `W` — ADR-0011's "your topology view
+/// is stale" signal, which the workload treats differently from either
+/// (see `workload_get`) rather than lumping it in with a malformed reply.
+enum GetReply {
+    Hit,
+    Miss,
+    WrongNode,
+}
+
+async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Result<GetReply> {
+    let mut message = format!("G {}\n", key.len()).into_bytes();
+    message.extend_from_slice(key);
+    stream.write_all(&message).await?;
+
+    let line = read_line(stream, buf).await?;
+
+    match line.as_str() {
+        "N" => Ok(GetReply::Miss),
+        "W" => Ok(GetReply::WrongNode),
+        _ => {
+            let length: usize = line
+                .strip_prefix("V ")
+                .and_then(|rest| rest.parse().ok())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("bad G response: {line:?}"),
+                    )
+                })?;
+
+            read_exact_into(stream, buf, length).await?;
+            let _ = buf.split_to(length);
+            Ok(GetReply::Hit)
+        }
+    }
+}
+
+/// Like `get`, but distinguishes hit from miss instead of collapsing both
+/// into "the operation succeeded" — the workload only needs the latter,
+/// but `verify_handoff` needs to know whether a key it expects a node to
+/// hold is actually there.
+async fn get_value(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Result<bool> {
     let mut message = format!("G {}\n", key.len()).into_bytes();
     message.extend_from_slice(key);
     stream.write_all(&message).await?;
@@ -393,7 +525,7 @@ async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Resu
     let line = read_line(stream, buf).await?;
 
     if line == "N" {
-        return Ok(true);
+        return Ok(false);
     }
 
     let length: usize = line
@@ -409,6 +541,20 @@ async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Resu
     read_exact_into(stream, buf, length).await?;
     let _ = buf.split_to(length);
     Ok(true)
+}
+
+/// Reuses a per-owner connection across calls, dialing lazily the first
+/// time a given address is addressed.
+async fn get_or_connect<'a>(
+    conns: &'a mut HashMap<String, (TcpStream, BytesMut)>,
+    addr: &str,
+) -> io::Result<&'a mut (TcpStream, BytesMut)> {
+    if !conns.contains_key(addr) {
+        let stream = TcpStream::connect(addr).await?;
+        conns.insert(addr.to_string(), (stream, BytesMut::new()));
+    }
+
+    Ok(conns.get_mut(addr).unwrap())
 }
 
 /// A small, dependency-free PRNG (xorshift64*) — this workload just needs
@@ -525,73 +671,225 @@ impl Stats {
     }
 }
 
-/// Runs `concurrency` workers, each holding one persistent connection to
-/// a randomly chosen node from `targets` (fixed for the worker's
-/// lifetime — this deliberately measures whether an *existing*
-/// connection to an *existing* node sees degraded service while that
-/// node is busy migrating data elsewhere, not whether new connections
-/// get routed around it), issuing GET (mostly) / SET as fast as
-/// possible against `--keys` keys until `stop` fires.
-async fn run_workload(
-    targets: Vec<String>,
+/// One GET, following the SDK's fallback rule: ask the primary; only on a
+/// connection-level failure fall through to the next owner in rank order.
+/// A `W` from the primary is neither of those — ADR-0011 defines it as
+/// "your topology view is stale", so it's handled by refreshing the
+/// roster from discovery and retrying exactly once (`refresh_and_retry`),
+/// not by treating it as a failed operation.
+async fn workload_get(
+    discovery_addr: &str,
+    conns: &mut HashMap<String, (TcpStream, BytesMut)>,
+    owners: &[(String, String)],
+    key: &[u8],
+) -> (bool, Option<io::Error>) {
+    let mut last_error = None;
+
+    for (_, addr) in owners {
+        match get_or_connect(conns, addr).await {
+            Ok((stream, buf)) => match get(stream, buf, key).await {
+                Ok(GetReply::Hit | GetReply::Miss) => return (true, None),
+                Ok(GetReply::WrongNode) => {
+                    return refresh_and_retry_get(discovery_addr, conns, key).await;
+                }
+                Err(error) => {
+                    conns.remove(addr);
+                    last_error = Some(error);
+                }
+            },
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    (false, last_error)
+}
+
+/// ADR-0011's documented recovery for a `W`: "topology stale → refresh
+/// and retry once". Fetches the current roster/replication straight from
+/// discovery (bypassing the periodic poller, which may not have caught up
+/// yet) and retries against the freshly computed primary — exactly once,
+/// not by falling through further owners.
+async fn refresh_and_retry_get(
+    discovery_addr: &str,
+    conns: &mut HashMap<String, (TcpStream, BytesMut)>,
+    key: &[u8],
+) -> (bool, Option<io::Error>) {
+    let (roster, replication) = match fetch_joined(discovery_addr).await {
+        Ok(update) => update,
+        Err(error) => return (false, Some(error)),
+    };
+
+    let owners = Ring::new(&roster).owners(key, replication);
+    let Some((_, addr)) = owners.first() else {
+        return (
+            false,
+            Some(io::Error::other("no owners for key after refresh")),
+        );
+    };
+
+    match get_or_connect(conns, addr).await {
+        Ok((stream, buf)) => match get(stream, buf, key).await {
+            Ok(GetReply::Hit | GetReply::Miss) => (true, None),
+            Ok(GetReply::WrongNode) => (
+                false,
+                Some(io::Error::other("still WrongNode after refresh-and-retry")),
+            ),
+            Err(error) => {
+                conns.remove(addr);
+                (false, Some(error))
+            }
+        },
+        Err(error) => (false, Some(error)),
+    }
+}
+
+/// One SET, following the SDK's fan-out rule: write to every owner
+/// (sequentially here, not truly in parallel — this is a verification
+/// harness, not a throughput benchmark); the primary's result is the
+/// operation's result, and a replica failure is swallowed.
+async fn workload_set(
+    conns: &mut HashMap<String, (TcpStream, BytesMut)>,
+    owners: &[(String, String)],
+    key: &[u8],
+    value: &[u8],
+) -> (bool, Option<io::Error>) {
+    let mut primary_ok = false;
+    let mut primary_error = None;
+
+    for (index, (_, addr)) in owners.iter().enumerate() {
+        let result = match get_or_connect(conns, addr).await {
+            Ok((stream, buf)) => set(stream, buf, key, value).await,
+            Err(error) => Err(error),
+        };
+
+        match result {
+            Ok(ok) if index == 0 => primary_ok = ok,
+            Err(error) => {
+                conns.remove(addr);
+                if index == 0 {
+                    primary_error = Some(error);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (primary_ok, primary_error)
+}
+
+/// Per-worker fixed configuration, bundled so `run_worker` stays under
+/// clippy's argument-count lint.
+#[derive(Clone)]
+struct WorkerContext {
+    discovery_addr: String,
+    keys: usize,
+    value_size: usize,
+}
+
+/// One workload worker: owns its own connection pool (one socket per
+/// owner it has talked to so far) and, per operation, recomputes the
+/// key's owners from the latest roster snapshot it has seen — the roster
+/// changes mid-test as a node joins, so a worker started before a join
+/// must route differently after one.
+async fn run_worker(
+    worker_id: usize,
+    ctx: WorkerContext,
+    stats: std::sync::Arc<Stats>,
+    test_start: Instant,
+    roster_rx: watch::Receiver<(Roster, usize)>,
+    stop: watch::Receiver<bool>,
+) {
+    let mut rng = Rng::new(0x9E3779B97F4A7C15 ^ worker_id as u64);
+    let mut conns: HashMap<String, (TcpStream, BytesMut)> = HashMap::new();
+    let value = vec![b'x'; ctx.value_size];
+
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+
+        let (roster, replication) = roster_rx.borrow().clone();
+        if roster.is_empty() {
+            sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+
+        let ring = Ring::new(&roster);
+        let key = format!("verify-key-{}", rng.below(ctx.keys));
+        let is_get = rng.below(10) < 8;
+        let owners = ring.owners(key.as_bytes(), replication);
+
+        let (ok, error) = if is_get {
+            workload_get(&ctx.discovery_addr, &mut conns, &owners, key.as_bytes()).await
+        } else {
+            workload_set(&mut conns, &owners, key.as_bytes(), &value).await
+        };
+
+        let elapsed = test_start.elapsed();
+
+        if let Some(error) = error {
+            eprintln!("worker {worker_id} error against {}: {error}", owners[0].1);
+        }
+
+        stats.record(elapsed, ok);
+    }
+}
+
+/// The subset of `Args` a workload run needs, bundled so `run_workload`
+/// stays under clippy's argument-count lint.
+#[derive(Clone, Copy)]
+struct WorkloadConfig {
     keys: usize,
     value_size: usize,
     concurrency: usize,
+}
+
+/// Runs `config.concurrency` workload workers plus a background poller
+/// that keeps their view of the roster (and replication factor) current,
+/// so a worker started before a join routes correctly to the joining
+/// node once it's actually in the cluster.
+async fn run_workload(
+    discovery_addr: String,
+    config: WorkloadConfig,
     stats: std::sync::Arc<Stats>,
     test_start: Instant,
-    mut stop: tokio::sync::watch::Receiver<bool>,
+    initial_roster: (Roster, usize),
+    mut stop: watch::Receiver<bool>,
 ) {
-    let mut workers = Vec::new();
+    let (roster_tx, roster_rx) = watch::channel(initial_roster);
 
-    for worker_id in 0..concurrency {
-        let targets = targets.clone();
-        let stats = std::sync::Arc::clone(&stats);
-        let stop = stop.clone();
-
-        workers.push(tokio::spawn(async move {
-            let mut rng = Rng::new(0x9E3779B97F4A7C15 ^ worker_id as u64);
-            let target = &targets[rng.below(targets.len())];
-
-            let mut stream = match TcpStream::connect(target).await {
-                Ok(stream) => stream,
-                Err(_) => return,
-            };
-            let mut buf = BytesMut::new();
-            let value = vec![b'x'; value_size];
-
-            loop {
-                if *stop.borrow() {
-                    return;
-                }
-
-                let key = format!("verify-key-{}", rng.below(keys));
-                let is_get = rng.below(10) < 8;
-
-                let result = if is_get {
-                    get(&mut stream, &mut buf, key.as_bytes()).await
-                } else {
-                    set(&mut stream, &mut buf, key.as_bytes(), &value).await
-                };
-
-                let elapsed = test_start.elapsed();
-
-                match result {
-                    Ok(ok) => stats.record(elapsed, ok),
-                    Err(error) => {
-                        eprintln!("worker {worker_id} error against {target}: {error}");
-                        stats.record(elapsed, false);
-                        // Reconnect to the same target and keep going —
-                        // a transient error here is itself part of what
-                        // this harness wants to observe, not a reason to
-                        // give up on the worker.
-                        stream = match TcpStream::connect(target).await {
-                            Ok(stream) => stream,
-                            Err(_) => return,
-                        };
+    let mut poller_stop = stop.clone();
+    let poller_addr = discovery_addr.clone();
+    let poller = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sleep(POLL_INTERVAL) => {
+                    if let Ok(update) = fetch_joined(&poller_addr).await {
+                        let _ = roster_tx.send(update);
                     }
                 }
+                _ = poller_stop.changed() => return,
             }
-        }));
+        }
+    });
+
+    let ctx = WorkerContext {
+        discovery_addr: discovery_addr.clone(),
+        keys: config.keys,
+        value_size: config.value_size,
+    };
+    let mut workers = Vec::new();
+
+    for worker_id in 0..config.concurrency {
+        let stats = std::sync::Arc::clone(&stats);
+        workers.push(tokio::spawn(run_worker(
+            worker_id,
+            ctx.clone(),
+            stats,
+            test_start,
+            roster_rx.clone(),
+            stop.clone(),
+        )));
     }
 
     let _ = stop.changed().await;
@@ -599,39 +897,118 @@ async fn run_workload(
     for worker in workers {
         let _ = worker.await;
     }
+    let _ = poller.await;
 }
 
-async fn seed_keys(target: &str, keys: usize, value_size: usize) -> io::Result<()> {
-    let mut stream = TcpStream::connect(target).await?;
-    let mut buf = BytesMut::new();
+/// Seeds `keys` sequential keys, writing each to every one of its
+/// ADR-0011 top-R owners (as the SDK's fan-out would) rather than to a
+/// single fixed node.
+async fn seed_keys(
+    roster: &Roster,
+    replication: usize,
+    keys: usize,
+    value_size: usize,
+) -> io::Result<()> {
+    let ring = Ring::new(roster);
+    let mut conns: HashMap<String, (TcpStream, BytesMut)> = HashMap::new();
     let value = vec![b'x'; value_size];
 
     for index in 0..keys {
         let key = format!("verify-key-{index}");
-        if !set(&mut stream, &mut buf, key.as_bytes(), &value).await? {
-            return Err(io::Error::other("seed SET was not acknowledged"));
+
+        for (_, addr) in ring.owners(key.as_bytes(), replication) {
+            let (stream, buf) = get_or_connect(&mut conns, &addr).await?;
+            if !set(stream, buf, key.as_bytes(), &value).await? {
+                return Err(io::Error::other(format!(
+                    "seed SET for {key} to {addr} was not acknowledged"
+                )));
+            }
         }
     }
 
     Ok(())
 }
 
+/// Confirms the node that just appeared in `L` actually holds a copy of
+/// every seeded key its post-join top-R membership says it should — the
+/// direct, wire-observable half of "does a newly joined node actually
+/// receive the keys it should" (see the module docs). The other half —
+/// that a *displaced* copy elsewhere gets swept — isn't observable this
+/// way: as soon as a node applies the same `M`, its own top-R check
+/// (`wrong_node` in `src/server.rs`) already answers `W` for a displaced
+/// key regardless of whether the sweep has physically reclaimed it yet,
+/// so that half stays unit-tested only.
+async fn verify_handoff(
+    roster: &Roster,
+    replication: usize,
+    new_node_name: &str,
+    keys: usize,
+) -> io::Result<()> {
+    let new_node_addr = roster
+        .iter()
+        .find(|(name, _)| name == new_node_name)
+        .map(|(_, addr)| addr.clone())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{new_node_name} missing from its own post-join roster"
+            ))
+        })?;
+
+    let ring = Ring::new(roster);
+    let mut stream = TcpStream::connect(&new_node_addr).await?;
+    let mut buf = BytesMut::new();
+    let mut expected = 0usize;
+    let mut missing = Vec::new();
+
+    for index in 0..keys {
+        let key = format!("verify-key-{index}");
+
+        if !ring
+            .owners(key.as_bytes(), replication)
+            .iter()
+            .any(|(name, _)| name == new_node_name)
+        {
+            continue;
+        }
+
+        expected += 1;
+        if !get_value(&mut stream, &mut buf, key.as_bytes()).await? {
+            missing.push(key);
+        }
+    }
+
+    if missing.is_empty() {
+        println!("  handoff check: {new_node_name} holds all {expected} of its owned keys");
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{new_node_name} is missing {}/{expected} keys it should own after joining \
+             (first few: {:?})",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        )))
+    }
+}
+
 /// Polls discovery's `L` until a node whose name isn't in `already_known`
-/// appears, returning how long that took and that node's name. Used to
-/// measure one join's handoff duration without needing to know the new
-/// node's random ADR-0009 name in advance.
+/// appears, returning the roster and replication factor at that moment,
+/// the new node's name, and how long the wait took. Used to measure one
+/// join's handoff duration without needing to know the new node's random
+/// ADR-0009 name in advance.
 async fn wait_for_new_joined_node(
     discovery_addr: &str,
     already_known: &HashSet<String>,
     started_at: Instant,
-) -> io::Result<(String, Duration)> {
+) -> io::Result<(Roster, usize, String, Duration)> {
     timeout(JOIN_TIMEOUT, async {
         loop {
-            if let Ok(nodes) = fetch_joined(discovery_addr).await
-                && let Some((name, _)) =
-                    nodes.iter().find(|(name, _)| !already_known.contains(name))
+            if let Ok((roster, replication)) = fetch_joined(discovery_addr).await
+                && let Some(name) = roster
+                    .iter()
+                    .find(|(name, _)| !already_known.contains(name))
+                    .map(|(name, _)| name.clone())
             {
-                return (name.clone(), started_at.elapsed());
+                return (roster, replication, name, started_at.elapsed());
             }
 
             sleep(POLL_INTERVAL).await;
@@ -665,23 +1042,31 @@ async fn run_simple_join(
         nodes.push(node);
     }
 
-    let known_before: HashSet<String> = wait_for_all_joined(&discovery.addr, initial_nodes).await?;
+    let (roster_before, replication) = wait_for_all_joined(&discovery.addr, initial_nodes).await?;
+    let known_before: HashSet<String> =
+        roster_before.iter().map(|(name, _)| name.clone()).collect();
 
-    seed_keys(&nodes[0].addr, args.keys, args.value_size).await?;
-    println!("  seeded {} keys on {}", args.keys, nodes[0].addr);
+    seed_keys(&roster_before, replication, args.keys, args.value_size).await?;
+    println!(
+        "  seeded {} keys across {} node(s) (R={replication})",
+        args.keys,
+        roster_before.len()
+    );
 
-    let targets: Vec<String> = nodes.iter().map(|node| node.addr.clone()).collect();
     let stats = std::sync::Arc::new(Stats::default());
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let test_start = Instant::now();
 
     let workload = tokio::spawn(run_workload(
-        targets,
-        args.keys,
-        args.value_size,
-        args.concurrency,
+        discovery.addr.clone(),
+        WorkloadConfig {
+            keys: args.keys,
+            value_size: args.value_size,
+            concurrency: args.concurrency,
+        },
         std::sync::Arc::clone(&stats),
         test_start,
+        (roster_before, replication),
         stop_rx,
     ));
 
@@ -697,9 +1082,11 @@ async fn run_simple_join(
     )?;
     wait_until_connectable(&joining_node.addr).await?;
 
-    let (new_name, join_duration) =
+    let (roster_after, replication_after, new_name, join_duration) =
         wait_for_new_joined_node(&discovery.addr, &known_before, Instant::now()).await?;
     println!("  node {new_name} joined in {join_duration:?}");
+
+    verify_handoff(&roster_after, replication_after, &new_name, args.keys).await?;
 
     // A brief "after" window to see recovery.
     sleep(Duration::from_millis(1000)).await;
@@ -725,23 +1112,27 @@ async fn run_waiting_join(
 
     let first = spawn_node(node_bin, log_dir, base_port + 1, &discovery.addr)?;
     wait_until_connectable(&first.addr).await?;
-    let known_before = wait_for_all_joined(&discovery.addr, 1).await?;
+    let (roster_before, replication) = wait_for_all_joined(&discovery.addr, 1).await?;
+    let known_before: HashSet<String> =
+        roster_before.iter().map(|(name, _)| name.clone()).collect();
 
-    seed_keys(&first.addr, args.keys, args.value_size).await?;
+    seed_keys(&roster_before, replication, args.keys, args.value_size).await?;
     println!("  seeded {} keys on {}", args.keys, first.addr);
 
-    let targets = vec![first.addr.clone()];
     let stats = std::sync::Arc::new(Stats::default());
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
     let test_start = Instant::now();
 
     let workload = tokio::spawn(run_workload(
-        targets,
-        args.keys,
-        args.value_size,
-        args.concurrency,
+        discovery.addr.clone(),
+        WorkloadConfig {
+            keys: args.keys,
+            value_size: args.value_size,
+            concurrency: args.concurrency,
+        },
         std::sync::Arc::clone(&stats),
         test_start,
+        (roster_before, replication),
         stop_rx,
     ));
 
@@ -758,13 +1149,28 @@ async fn run_waiting_join(
     wait_until_connectable(&third.addr).await?;
 
     let poll_start = Instant::now();
-    let (first_new, first_duration) =
+    let (roster_after_first, replication_after_first, first_new, first_duration) =
         wait_for_new_joined_node(&discovery.addr, &known_before, poll_start).await?;
+    verify_handoff(
+        &roster_after_first,
+        replication_after_first,
+        &first_new,
+        args.keys,
+    )
+    .await?;
+
     let mut known_after_first = known_before.clone();
     known_after_first.insert(first_new.clone());
 
-    let (second_new, second_duration) =
+    let (roster_after_second, replication_after_second, second_new, second_duration) =
         wait_for_new_joined_node(&discovery.addr, &known_after_first, poll_start).await?;
+    verify_handoff(
+        &roster_after_second,
+        replication_after_second,
+        &second_new,
+        args.keys,
+    )
+    .await?;
 
     println!("  first new node ({first_new}) joined in {first_duration:?}");
     println!("  second new node ({second_new}) joined in {second_duration:?}");
@@ -791,13 +1197,13 @@ async fn run_waiting_join(
     Ok(())
 }
 
-async fn wait_for_all_joined(discovery_addr: &str, expected: usize) -> io::Result<HashSet<String>> {
+async fn wait_for_all_joined(discovery_addr: &str, expected: usize) -> io::Result<(Roster, usize)> {
     timeout(JOIN_TIMEOUT, async {
         loop {
-            if let Ok(nodes) = fetch_joined(discovery_addr).await
-                && nodes.len() >= expected
+            if let Ok((roster, replication)) = fetch_joined(discovery_addr).await
+                && roster.len() >= expected
             {
-                return nodes.into_iter().map(|(name, _)| name).collect();
+                return (roster, replication);
             }
 
             sleep(POLL_INTERVAL).await;
@@ -805,4 +1211,52 @@ async fn wait_for_all_joined(discovery_addr: &str, expected: usize) -> io::Resul
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "nodes never all appeared in L"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pinned outputs of the full score pipeline
+    /// (`fmix64(fnv1a(name) ^ fnv1a(key))`) — `src/hash_ring.rs` and the
+    /// TypeScript SDK assert these same exact values, so this harness's
+    /// independent port must agree byte-for-byte or one of these tests
+    /// fails.
+    #[test]
+    fn matches_the_cross_implementation_score_vectors() {
+        assert_eq!(fmix64(0), 0);
+        assert_eq!(fmix64(1), 0xb456bcfc34c2cb2c);
+        assert_eq!(fmix64(0xcbf29ce484222325), 0xefd01f60ba992926);
+
+        let nodes: Roster = ["node-a", "node-b", "node-c"]
+            .into_iter()
+            .map(|name| (name.to_string(), String::new()))
+            .collect();
+        let ring = Ring::new(&nodes);
+        let names =
+            |roster: Roster| -> Vec<String> { roster.into_iter().map(|(name, _)| name).collect() };
+
+        assert_eq!(
+            names(ring.owners(b"alpha", 3)),
+            vec!["node-c", "node-b", "node-a"]
+        );
+        assert_eq!(
+            names(ring.owners(b"beta", 3)),
+            vec!["node-a", "node-c", "node-b"]
+        );
+        assert_eq!(
+            names(ring.owners(b"", 3)),
+            vec!["node-a", "node-b", "node-c"]
+        );
+    }
+
+    #[test]
+    fn owners_are_capped_by_roster_size() {
+        let nodes: Roster = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| (name.to_string(), String::new()))
+            .collect();
+        let ring = Ring::new(&nodes);
+        assert_eq!(ring.owners(b"some-key", 10).len(), 3);
+    }
 }
