@@ -1031,7 +1031,9 @@ async fn register_with_discovery(
                 }
             }
             Err(error) => {
-                eprintln!("WARN failed to connect to discovery server at {discovery_addr}: {error}");
+                eprintln!(
+                    "WARN failed to connect to discovery server at {discovery_addr}: {error}"
+                );
             }
         }
 
