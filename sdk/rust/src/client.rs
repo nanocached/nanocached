@@ -1,5 +1,5 @@
-//! The public client. A host/port (or a seeds list) may name either a
-//! single nanocached-node or discovery server(s) fronting a cluster —
+//! The public client. `Options::addresses` may name either a single
+//! nanocached-node or discovery server(s) fronting a cluster —
 //! `connect()` finds out from the server's own handshake response
 //! (doc/adr/0007-*.md), so calling code is identical either way.
 //!
@@ -23,8 +23,9 @@ use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::hash_ring::HashRing;
 use crate::identify::{
-    connect_and_identify, split_host_port, Identified, TlsConfig, CONNECT_DEADLINE,
+    connect_and_identify, resolve_tls, split_host_port, Identified, TlsConfig, CONNECT_DEADLINE,
 };
+use crate::open_targets;
 
 // How long the node list may go without a re-fetch from discovery before
 // get/set/delete refreshes it first (checked lazily on use).
@@ -41,9 +42,10 @@ pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
 /// Options for [`NanocachedClient::connect`].
 #[derive(Default)]
 pub struct Options {
-    seeds: Vec<(String, u16)>,
-    auth_secret: Option<Vec<u8>>,
-    tls: Option<TlsConfig>,
+    addresses: Vec<(String, u16)>,
+    auth_secret: Option<String>,
+    tls: bool,
+    ca: Option<std::path::PathBuf>,
 }
 
 impl Options {
@@ -51,24 +53,48 @@ impl Options {
         Self::default()
     }
 
-    /// Adds a target; call repeatedly to list discovery replicas
-    /// (ADR-0010), tried in order for connect and every refresh.
-    pub fn host(mut self, host: impl Into<String>, port: u16) -> Self {
-        self.seeds.push((host.into(), port));
+    /// The connect targets, tried in order for connect and every
+    /// refresh: a single-node deployment is a one-element list, a
+    /// cluster's discovery replicas (ADR-0010) a longer one.
+    ///
+    /// ```no_run
+    /// # use nanocached::Options;
+    /// let single = Options::new().addresses([("127.0.0.1", 8357)]);
+    /// let replicas = Options::new().addresses([("10.0.0.1", 8357), ("10.0.0.2", 8357)]);
+    /// ```
+    pub fn addresses<I, H>(mut self, addrs: I) -> Self
+    where
+        I: IntoIterator<Item = (H, u16)>,
+        H: Into<String>,
+    {
+        self.addresses = addrs
+            .into_iter()
+            .map(|(host, port)| (host.into(), port))
+            .collect();
         self
     }
 
     /// Shared secret matching NANOCACHED_AUTH_SECRET on the server.
-    pub fn auth_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+    pub fn auth_secret(mut self, secret: impl Into<String>) -> Self {
         self.auth_secret = Some(secret.into());
         self
     }
 
-    /// Connect over TLS with this rustls client config (built by the
-    /// caller: system roots, a private CA — their choice). Requires the
-    /// `tls` feature.
-    pub fn tls(mut self, config: TlsConfig) -> Self {
-        self.tls = Some(config);
+    /// Connect over TLS. Requires the `tls` feature (a default feature —
+    /// disable it with `default-features = false` to opt out); without
+    /// it, `tls(true)` fails at `connect()` time instead of failing to
+    /// compile.
+    pub fn tls(mut self, enabled: bool) -> Self {
+        self.tls = enabled;
+        self
+    }
+
+    /// A PEM file of trusted root certificate(s), replacing the platform
+    /// trust store `tls(true)` verifies against by default. Meaningful
+    /// only when `tls(true)`; silently ignored otherwise. An
+    /// unreadable/unparseable file is a `connect()`-time error.
+    pub fn ca(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.ca = Some(path.into());
         self
     }
 }
@@ -93,15 +119,37 @@ enum Target {
 struct Inner {
     state: Mutex<State>,
     redials: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    seeds: Vec<(String, u16)>,
-    auth_secret: Option<Vec<u8>>,
+    addresses: Vec<(String, u16)>,
+    auth_secret: Option<String>,
     tls: Option<TlsConfig>,
+    /// The address that answered `connect()` ("host:port") — every socket
+    /// this client ever opens is counted against this one open-targets
+    /// key, whichever node it actually dials (mirrors the TypeScript
+    /// SDK's `this.url`).
+    tracking_key: String,
     closed: AtomicBool,
+}
+
+impl Inner {
+    fn auth_secret_bytes(&self) -> Option<&[u8]> {
+        self.auth_secret.as_deref().map(str::as_bytes)
+    }
 }
 
 struct State {
     target: Target,
     last_fetch: Instant,
+}
+
+fn close_all_connections(target: &Target) {
+    match target {
+        Target::Single { connection, .. } => connection.close(),
+        Target::Cluster { members, .. } => {
+            for member in members.values() {
+                member.connection.close();
+            }
+        }
+    }
 }
 
 /// A cheaply cloneable handle; all clones share one set of connections.
@@ -113,74 +161,116 @@ pub struct NanocachedClient {
 
 impl NanocachedClient {
     pub async fn connect(options: Options) -> Result<Self> {
-        if options.seeds.is_empty() {
+        if options.addresses.is_empty() {
             return Err(Error::InvalidArgument(
-                "nanocached: connect() needs at least one host/port".to_string(),
+                "nanocached: connect() needs a non-empty addresses list".to_string(),
             ));
         }
-        // Walk the seeds until one yields a working target; a seed that is
-        // unreachable, warming up (`B`, ADR-0010), or knows no live nodes
-        // is skipped — the next replica may do better.
+
+        let tls = resolve_tls(options.tls, options.ca.as_deref())?;
+        let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
+
+        // Walk the addresses until one yields a working target; an
+        // address that is unreachable, warming up (`B`, ADR-0010), or
+        // knows no live nodes is skipped — the next replica may do
+        // better.
         let mut last_error: Option<Error> = None;
         let mut target: Option<Target> = None;
+        let mut tracking_key = String::new();
 
-        for (host, port) in &options.seeds {
-            match connect_and_identify(
-                host,
-                *port,
-                options.auth_secret.as_deref(),
-                options.tls.as_ref(),
-                CONNECT_DEADLINE,
-            )
-            .await
+        for (host, port) in &options.addresses {
+            let key = format!("{host}:{port}");
+
+            // Only meaningful for a single explicit target: with an
+            // addresses list, another client instance legitimately
+            // holding connections to the same address makes this
+            // heuristic false-positive (issue #12).
+            if options.addresses.len() == 1 && open_targets::has_open(&key) {
+                eprintln!(
+                    "nanocached: connect() called for {key} while a previous connection to it is \
+                     still open — was close() forgotten?"
+                );
+            }
+
+            match connect_and_identify(host, *port, auth_secret, tls.as_ref(), CONNECT_DEADLINE)
+                .await
             {
                 Err(error) => last_error = Some(error),
                 Ok(Identified::Node(stream)) => {
-                    if options.seeds.len() > 1 {
+                    if options.addresses.len() > 1 {
+                        let remaining = options.addresses.len() - 1;
                         eprintln!(
-                            "nanocached: {host}:{port} is a cache node, so this client is pinned to \
-                             that single server — the remaining seed(s) will not be used. Point \
-                             seeds at discovery servers for cluster routing and failover."
+                            "nanocached: {key} is a cache node, so this client is pinned to that \
+                             single server — the {remaining} remaining address(es) will not be \
+                             used. Point addresses at discovery servers for cluster routing and \
+                             failover."
                         );
                     }
                     target = Some(Target::Single {
-                        address: format!("{host}:{port}"),
-                        connection: Arc::new(Connection::new(stream)),
+                        address: key.clone(),
+                        connection: Arc::new(Connection::new(stream, key.clone())),
                     });
+                    tracking_key = key;
                     break;
                 }
                 Ok(Identified::Cluster { nodes, replication }) => {
                     if nodes.is_empty() {
                         last_error = Some(Error::Protocol(format!(
-                            "nanocached: no live nodes registered with the discovery server at {host}:{port}"
+                            "nanocached: no live nodes registered with the discovery server at {key}"
                         )));
                         continue;
                     }
 
                     let mut members = HashMap::new();
+                    let mut dial_error = None;
                     for node in &nodes {
-                        let (node_host, node_port) = split_host_port(&node.address)?;
-                        let identified = connect_and_identify(
-                            &node_host,
-                            node_port,
-                            options.auth_secret.as_deref(),
-                            options.tls.as_ref(),
-                            CONNECT_DEADLINE,
-                        )
-                        .await?;
-                        let Identified::Node(stream) = identified else {
-                            return Err(Error::Protocol(format!(
-                                "nanocached: discovery server returned a non-node address: {}",
-                                node.address
-                            )));
-                        };
-                        members.insert(
-                            node.name.clone(),
-                            Member {
-                                address: node.address.clone(),
-                                connection: Arc::new(Connection::new(stream)),
-                            },
-                        );
+                        let outcome: Result<_> = async {
+                            let (node_host, node_port) = split_host_port(&node.address)?;
+                            let identified = connect_and_identify(
+                                &node_host,
+                                node_port,
+                                auth_secret,
+                                tls.as_ref(),
+                                CONNECT_DEADLINE,
+                            )
+                            .await?;
+                            match identified {
+                                Identified::Node(stream) => Ok(stream),
+                                Identified::Cluster { .. } => Err(Error::Protocol(format!(
+                                    "nanocached: discovery server returned a non-node address: {}",
+                                    node.address
+                                ))),
+                            }
+                        }
+                        .await;
+
+                        match outcome {
+                            Ok(stream) => {
+                                members.insert(
+                                    node.name.clone(),
+                                    Member {
+                                        address: node.address.clone(),
+                                        connection: Arc::new(Connection::new(stream, key.clone())),
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                dial_error = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(error) = dial_error {
+                        // A node (not the discovery address) is the
+                        // problem here; another address would hand back
+                        // the same node list, so don't try one — but
+                        // close whatever members already connected so
+                        // they aren't leaked (and stay counted forever in
+                        // open_targets).
+                        for member in members.values() {
+                            member.connection.close();
+                        }
+                        return Err(error);
                     }
 
                     target = Some(Target::Cluster {
@@ -188,6 +278,7 @@ impl NanocachedClient {
                         members,
                         replication,
                     });
+                    tracking_key = key;
                     break;
                 }
             }
@@ -195,7 +286,7 @@ impl NanocachedClient {
 
         let Some(target) = target else {
             return Err(last_error.unwrap_or_else(|| {
-                Error::ConnectionLost("nanocached: could not connect to any seed".to_string())
+                Error::ConnectionLost("nanocached: could not connect to any address".to_string())
             }));
         };
 
@@ -205,9 +296,10 @@ impl NanocachedClient {
                 last_fetch: Instant::now(),
             }),
             redials: Mutex::new(HashMap::new()),
-            seeds: options.seeds,
+            addresses: options.addresses,
             auth_secret: options.auth_secret,
-            tls: options.tls,
+            tls,
+            tracking_key,
             closed: AtomicBool::new(false),
         });
 
@@ -262,17 +354,47 @@ impl NanocachedClient {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
-    /// Idempotent; later get/set/delete return `Error::AlreadyClosed`.
+    /// Idempotent — but a second call warns (stderr), since it's usually
+    /// a sign the caller lost track of this instance's lifecycle.
     pub fn close(&self) {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
+            eprintln!("nanocached: close() called again on an already-closed client");
             return;
         }
         if let Some(keepalive) = &self.keepalive {
             keepalive.abort();
         }
+
+        // Close every connection now rather than waiting for the last
+        // `NanocachedClient` clone (and so `Inner`) to drop, both to
+        // release the sockets promptly and to keep open_targets accurate
+        // (see Connection::close). `state` is a tokio::sync::Mutex, so a
+        // request that's mid-flight (holding it only long enough to clone
+        // an `Arc<Connection>` out — see `slot_connection`) could very
+        // briefly contend it; rather than block this synchronous method,
+        // fall back to closing them once it's free, same as the native
+        // socket "close" event the TypeScript SDK relies on landing on a
+        // later tick.
+        match self.inner.state.try_lock() {
+            Ok(state) => close_all_connections(&state.target),
+            Err(_) => {
+                let inner = Arc::clone(&self.inner);
+                tokio::spawn(async move {
+                    let state = inner.state.lock().await;
+                    close_all_connections(&state.target);
+                });
+            }
+        }
     }
 
-    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {
+        match self.get_bytes(key).await? {
+            Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(Error::InvalidUtf8)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         self.before_operation().await?;
         self.with_cluster_retry(|| {
@@ -281,11 +403,12 @@ impl NanocachedClient {
         .await
     }
 
+    /// `ttl_seconds == 0` means no expiry.
     pub async fn set(
         &self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
-        ttl_seconds: Option<u64>,
+        ttl_seconds: u64,
     ) -> Result<()> {
         let (key, value) = (key.as_ref(), value.as_ref());
         self.before_operation().await?;
@@ -500,7 +623,10 @@ impl NanocachedClient {
             }
         }
 
-        let connection = Arc::new(Connection::new(self.open_node_stream(&address).await?));
+        let connection = Arc::new(Connection::new(
+            self.open_node_stream(&address).await?,
+            self.inner.tracking_key.clone(),
+        ));
 
         let mut state = self.inner.state.lock().await;
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -523,6 +649,11 @@ impl NanocachedClient {
                 if let Some(member) = members.get_mut(name) {
                     member.connection = Arc::clone(&connection);
                 } else {
+                    // The refresh that dropped this member from the
+                    // cluster already reconciled without this dial, so
+                    // installing it now would leak the socket (and leave
+                    // it counted forever in open_targets).
+                    connection.close();
                     return Err(Error::ConnectionLost(format!(
                         "nanocached: {name} left the cluster while reconnecting"
                     )));
@@ -538,7 +669,7 @@ impl NanocachedClient {
         let identified = connect_and_identify(
             &host,
             port,
-            self.inner.auth_secret.as_deref(),
+            self.inner.auth_secret_bytes(),
             self.inner.tls.as_ref(),
             CONNECT_DEADLINE,
         )
@@ -593,9 +724,15 @@ impl NanocachedClient {
                 );
             }
         }
-        // Nodes no longer listed: their connections drop here. Newly
-        // listed nodes are dialed lazily on first use (slot_connection),
-        // which keeps this refresh free of network I/O under the lock.
+        // Nodes no longer listed: close their connections now — both to
+        // release the sockets immediately and to keep open_targets
+        // accurate (see Connection::close) — rather than waiting for
+        // `members` to drop here. Newly listed nodes are dialed lazily on
+        // first use (slot_connection), which keeps this refresh free of
+        // network I/O under the lock.
+        for member in members.values() {
+            member.connection.close();
+        }
         for node in &nodes {
             fresh.entry(node.name.clone()).or_insert_with(|| Member {
                 address: node.address.clone(),
@@ -618,41 +755,28 @@ impl NanocachedClient {
         redials.retain(|slot, _| slot.is_empty() || live.contains(slot));
     }
 
-    /// Walks every seed (ADR-0010); `None` means keep the last-known list.
+    /// Walks every address (ADR-0010). Returns `None` — keep the
+    /// last-known list — when none can provide one: unreachable, still
+    /// inside its startup grace (`B`), no longer a discovery server, or
+    /// knowing no live nodes. Silent by design (issue #12's noisy
+    /// refresh-failure logging was removed): none of this changes
+    /// behavior, so it isn't worth a warning on every stale check.
     async fn fetch_node_list(&self) -> Option<(Vec<crate::identify::DiscoveredNode>, usize)> {
-        for (host, port) in &self.inner.seeds {
-            match connect_and_identify(
+        for (host, port) in &self.inner.addresses {
+            if let Ok(Identified::Cluster { nodes, replication }) = connect_and_identify(
                 host,
                 *port,
-                self.inner.auth_secret.as_deref(),
+                self.inner.auth_secret_bytes(),
                 self.inner.tls.as_ref(),
                 CONNECT_DEADLINE,
             )
             .await
             {
-                Ok(Identified::Cluster { nodes, replication }) if !nodes.is_empty() => {
+                if !nodes.is_empty() {
                     return Some((nodes, replication));
-                }
-                Ok(Identified::Cluster { .. }) => {
-                    eprintln!(
-                        "nanocached: discovery at {host}:{port} returned no live nodes, skipping"
-                    );
-                }
-                Ok(Identified::Node(_)) => {
-                    eprintln!(
-                        "nanocached: {host}:{port} no longer identifies as a discovery server"
-                    );
-                }
-                Err(error) => {
-                    eprintln!(
-                        "nanocached: could not refresh the node list from {host}:{port}: {error}"
-                    );
                 }
             }
         }
-        eprintln!(
-            "nanocached: no discovery seed could provide a node list, keeping the last-known list"
-        );
         None
     }
 }

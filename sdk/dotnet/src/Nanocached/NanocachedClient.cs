@@ -1,11 +1,14 @@
+using System.Collections.Concurrent;
 using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace Nanocached;
 
 /// <summary>
-/// The public client. A host/port (or a seeds list) may name either a
-/// single nanocached-node or discovery server(s) fronting a cluster —
+/// The public client. An address list names either a single
+/// nanocached-node or discovery server(s) fronting a cluster —
 /// <see cref="ConnectAsync(Options)"/> finds out from the server's own handshake
 /// response (doc/adr/0007-*.md), so calling code is identical either way.
 ///
@@ -26,34 +29,26 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>Options for <see cref="ConnectAsync(Options)"/>.</summary>
     public sealed class Options
     {
-        internal List<(string Host, int Port)> Seeds { get; } = new();
-        internal byte[]? AuthSecretBytes { get; private set; }
-        internal SslClientAuthenticationOptions? TlsOptions { get; private set; }
-
-        /// <summary>Adds a target; call repeatedly to list discovery
-        /// replicas (ADR-0010), tried in order for connect and every
-        /// refresh.</summary>
-        public Options Host(string host, int port)
-        {
-            Seeds.Add((host, port));
-            return this;
-        }
+        /// <summary>Targets to try, in order — a one-element list is the
+        /// single-target case. Everything is either a single
+        /// nanocached-node or a discovery replica (ADR-0010) fronting a
+        /// cluster; both the initial connect and every later node-list
+        /// refresh walk this list until one yields a working target.</summary>
+        public List<(string Host, int Port)> Addresses { get; } = new();
 
         /// <summary>Shared secret matching NANOCACHED_AUTH_SECRET on the server.</summary>
-        public Options AuthSecret(string secret)
-        {
-            AuthSecretBytes = Encoding.UTF8.GetBytes(secret);
-            return this;
-        }
+        public string? AuthSecret { get; set; }
 
-        /// <summary>Connect over TLS with these options (system trust by
-        /// default; set a validation callback for a private CA).</summary>
-        public Options Tls(SslClientAuthenticationOptions options)
-        {
-            TlsOptions = options;
-            return this;
-        }
+        /// <summary>Connect over TLS. Defaults to the platform/system
+        /// trust store; set <see cref="Ca"/> for a private CA. Ignored
+        /// (silently) when false, even if <see cref="Ca"/> is set.</summary>
+        public bool Tls { get; set; }
 
+        /// <summary>Path to a PEM file of trusted root certificate(s),
+        /// replacing the default trust store. Only meaningful when
+        /// <see cref="Tls"/> is true; an unreadable or unparseable file is
+        /// a connect-time error.</summary>
+        public string? Ca { get; set; }
     }
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -72,10 +67,26 @@ public sealed class NanocachedClient : IDisposable
         internal Connection Connection { get; set; }
     }
 
+    // Process-global: how many open sockets exist right now for a given
+    // connect target ("host:port"), across every NanocachedClient instance
+    // in this process. Purely a programming-error guard (issue #12) — it
+    // never affects behavior, only whether connect()/close() warn. Mirrors
+    // sdk/typescript/src/client.ts's openTargets.
+    private static readonly ConcurrentDictionary<string, int> OpenTargets = new();
+
+    private static bool HasOpenTarget(string key) =>
+        OpenTargets.TryGetValue(key, out int count) && count > 0;
+
+    private static void IncrementOpenTarget(string key) =>
+        OpenTargets.AddOrUpdate(key, 1, (_, count) => count + 1);
+
+    private static void DecrementOpenTarget(string key) =>
+        OpenTargets.AddOrUpdate(key, 0, (_, count) => Math.Max(0, count - 1));
+
     private readonly object _stateLock = new();
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly Dictionary<string, SemaphoreSlim> _redialGates = new();
-    private readonly List<(string Host, int Port)> _seeds;
+    private readonly List<(string Host, int Port)> _addresses;
     private readonly byte[]? _authSecret;
     private readonly SslClientAuthenticationOptions? _tls;
     private readonly CancellationTokenSource _lifetime = new();
@@ -88,32 +99,85 @@ public sealed class NanocachedClient : IDisposable
     private int _replication = 1;
     private DateTime _lastFetch = DateTime.UtcNow;
 
+    // The address that answered connect() — a node's own address in
+    // single mode, the winning discovery server's address in cluster
+    // mode. Fixed for the client's lifetime; keys every socket this
+    // client ever opens in OpenTargets (mirrors TS's `this.url`).
+    private string? _targetKey;
+
     private NanocachedClient(Options options)
     {
-        _seeds = options.Seeds.ToList();
-        _authSecret = options.AuthSecretBytes;
-        _tls = options.TlsOptions;
+        _addresses = options.Addresses.ToList();
+        _authSecret = options.AuthSecret is null ? null : Encoding.UTF8.GetBytes(options.AuthSecret);
+        _tls = BuildTlsOptions(options);
     }
 
-    public static Task<NanocachedClient> ConnectAsync(string host, int port) =>
-        ConnectAsync(new Options().Host(host, port));
+    /// <summary>Builds the internal TLS options for every dial this client
+    /// makes. <c>null</c> means plaintext. <see cref="Options.Ca"/> is
+    /// silently ignored when <see cref="Options.Tls"/> is false; an
+    /// unreadable/unparseable CA file when true is a connect-time
+    /// error.</summary>
+    private static SslClientAuthenticationOptions? BuildTlsOptions(Options options)
+    {
+        if (!options.Tls) return null;
+        if (options.Ca is null) return new SslClientAuthenticationOptions();
+
+        X509Certificate2Collection roots;
+        try
+        {
+            roots = new X509Certificate2Collection();
+            roots.ImportFromPemFile(options.Ca);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or CryptographicException)
+        {
+            throw new NanocachedException(
+                $"nanocached: could not read CA file {options.Ca}: {error.Message}", error);
+        }
+
+        return new SslClientAuthenticationOptions
+        {
+            RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+            {
+                if (certificate is null) return false;
+                using var chain = new X509Chain();
+                chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+                chain.ChainPolicy.CustomTrustStore.Clear();
+                chain.ChainPolicy.CustomTrustStore.AddRange(roots);
+                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+                using var leaf = new X509Certificate2(certificate);
+                return chain.Build(leaf);
+            },
+        };
+    }
 
     public static async Task<NanocachedClient> ConnectAsync(Options options)
     {
-        if (options.Seeds.Count == 0)
+        if (options.Addresses.Count == 0)
         {
             throw new ArgumentException(
-                "nanocached: ConnectAsync() needs at least one host/port", nameof(options));
+                "nanocached: connect() needs a non-empty addresses list", nameof(options));
         }
 
         var client = new NanocachedClient(options);
 
-        // Walk the seeds until one yields a working target; a seed that is
-        // unreachable, warming up (B, ADR-0010), or knows no live nodes is
-        // skipped — the next replica may do better.
+        // Walk the addresses until one yields a working target; an
+        // address that is unreachable, warming up (B, ADR-0010), or knows
+        // no live nodes is skipped — the next replica may do better.
         Exception? lastError = null;
-        foreach (var (host, port) in client._seeds)
+        foreach (var (host, port) in client._addresses)
         {
+            string key = $"{host}:{port}";
+            // Only meaningful for a single configured address: with
+            // multiple addresses, another client instance legitimately
+            // holding connections to the same address makes this
+            // heuristic false-positive (issue #12).
+            if (client._addresses.Count == 1 && HasOpenTarget(key))
+            {
+                Console.Error.WriteLine(
+                    $"nanocached: connect() called for {key} while a previous connection to it "
+                    + "is still open — was close() forgotten?");
+            }
+
             Identify.Result identified;
             try
             {
@@ -132,15 +196,17 @@ public sealed class NanocachedClient : IDisposable
                 switch (identified)
                 {
                     case Identify.NodeTarget node:
-                        if (client._seeds.Count > 1)
+                        if (client._addresses.Count > 1)
                         {
                             Console.Error.WriteLine(
                                 $"nanocached: {host}:{port} is a cache node, so this client is pinned "
-                                + "to that single server — the remaining seed(s) will not be used. "
-                                + "Point seeds at discovery servers for cluster routing and failover.");
+                                + $"to that single server — the {client._addresses.Count - 1} remaining "
+                                + "address(es) will not be used. Point addresses at discovery servers "
+                                + "for cluster routing and failover.");
                         }
-                        client._single = new Connection(node.Stream);
-                        client._singleAddress = $"{host}:{port}";
+                        client._targetKey = key;
+                        client._single = client.NewConnection(node.Stream);
+                        client._singleAddress = key;
                         client.StartKeepAlive();
                         return client;
 
@@ -150,6 +216,7 @@ public sealed class NanocachedClient : IDisposable
                         continue;
 
                     case Identify.ClusterTarget cluster:
+                        client._targetKey = key;
                         await client.OpenClusterAsync(cluster).ConfigureAwait(false);
                         client.StartKeepAlive();
                         return client;
@@ -162,7 +229,21 @@ public sealed class NanocachedClient : IDisposable
             }
         }
 
-        throw lastError ?? new NanocachedException("nanocached: could not connect to any seed");
+        throw lastError ?? new NanocachedException("nanocached: could not connect to any address");
+    }
+
+    /// <summary>Wraps a freshly identified node stream into a tracked
+    /// <see cref="Connection"/>: increments <see cref="OpenTargets"/> for
+    /// this client's <see cref="_targetKey"/> now, and decrements it
+    /// exactly once whenever this connection eventually closes — however
+    /// that happens (client.Close(), a refresh reconciling a departed
+    /// node, a dead-connection replacement, or discarding a redial that
+    /// raced a concurrent Close()).</summary>
+    private Connection NewConnection(Stream stream)
+    {
+        string key = _targetKey!;
+        IncrementOpenTarget(key);
+        return new Connection(stream, () => DecrementOpenTarget(key));
     }
 
     private async Task OpenClusterAsync(Identify.ClusterTarget cluster)
@@ -183,22 +264,40 @@ public sealed class NanocachedClient : IDisposable
 
     public bool IsClosed => _closed;
 
-    public Task<byte[]?> GetAsync(string key) => GetAsync(Encoding.UTF8.GetBytes(key));
+    // Strict — never silently replaces a malformed byte with U+FFFD; a
+    // non-UTF-8 value raises DecoderFallbackException instead.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
-    /// <summary>Returns the value, or <c>null</c> when the key is missing.</summary>
-    public async Task<byte[]?> GetAsync(byte[] key)
+    public Task<string?> GetAsync(string key) => GetAsync(Encoding.UTF8.GetBytes(key));
+
+    /// <summary>Returns the value decoded as UTF-8, or <c>null</c> when
+    /// the key is missing. A value that is not valid UTF-8 raises
+    /// <see cref="System.Text.DecoderFallbackException"/> — use
+    /// <see cref="GetBytesAsync(byte[])"/> for the raw bytes instead.</summary>
+    public async Task<string?> GetAsync(byte[] key)
+    {
+        byte[]? value = await GetBytesAsync(key).ConfigureAwait(false);
+        return value is null ? null : StrictUtf8.GetString(value);
+    }
+
+    public Task<byte[]?> GetBytesAsync(string key) => GetBytesAsync(Encoding.UTF8.GetBytes(key));
+
+    /// <summary>Returns the raw value, or <c>null</c> when the key is missing.</summary>
+    public async Task<byte[]?> GetBytesAsync(byte[] key)
     {
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
             () => ReadAsync(key, connection => connection.GetAsync(key))).ConfigureAwait(false);
     }
 
-    public Task SetAsync(string key, string value, long? ttlSeconds = null) =>
+    /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
+    public Task SetAsync(string key, string value, long ttlSeconds = 0) =>
         SetAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
 
-    public async Task SetAsync(byte[] key, byte[] value, long? ttlSeconds = null)
+    /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
+    public async Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0)
     {
-        if (ttlSeconds is < 0)
+        if (ttlSeconds < 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(ttlSeconds), $"nanocached: ttlSeconds must be non-negative, got {ttlSeconds}");
@@ -225,10 +324,16 @@ public sealed class NanocachedClient : IDisposable
             () => WriteAsync(key, connection => connection.DeleteAsync(key))).ConfigureAwait(false);
     }
 
-    /// <summary>Idempotent; later operations throw <see cref="AlreadyClosedException"/>.</summary>
+    /// <summary>Idempotent; later operations throw <see cref="AlreadyClosedException"/>.
+    /// A second call warns to stderr instead of erroring — usually a sign
+    /// the caller lost track of this instance's lifecycle.</summary>
     public void Close()
     {
-        if (_closed) return;
+        if (_closed)
+        {
+            Console.Error.WriteLine("nanocached: close() called again on an already-closed client");
+            return;
+        }
         _closed = true;
         _lifetime.Cancel();
         Teardown();
@@ -471,7 +576,7 @@ public sealed class NanocachedClient : IDisposable
             node.Stream.Dispose();
             throw new AlreadyClosedException();
         }
-        return new Connection(node.Stream);
+        return NewConnection(node.Stream);
     }
 
     // ── ノードリスト更新 ──────────────────────────────────────────
@@ -543,10 +648,10 @@ public sealed class NanocachedClient : IDisposable
                     _members[node.Name] = new Member(node.Address, connection);
                 }
             }
-            catch (Exception error) when (error is NanocachedException)
+            catch (NanocachedException)
             {
-                Console.Error.WriteLine(
-                    $"nanocached: could not connect to new node {node.Address}, will retry: {error.Message}");
+                // Left out of the ring for now; the next refresh retries
+                // it. Silent by design (§7 ②) — behavior is unaffected.
             }
         }
 
@@ -557,10 +662,11 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    /// <summary>Walks every seed (ADR-0010); <c>null</c> means keep the last-known list.</summary>
+    /// <summary>Walks every configured address (ADR-0010); <c>null</c>
+    /// means keep the last-known list.</summary>
     private async Task<Identify.ClusterTarget?> FetchNodeListAsync()
     {
-        foreach (var (host, port) in _seeds)
+        foreach (var (host, port) in _addresses)
         {
             try
             {
@@ -572,24 +678,17 @@ public sealed class NanocachedClient : IDisposable
                     case Identify.ClusterTarget cluster when cluster.Nodes.Count > 0:
                         return cluster;
                     case Identify.ClusterTarget:
-                        Console.Error.WriteLine(
-                            $"nanocached: discovery at {host}:{port} returned no live nodes, skipping");
                         continue;
                     case Identify.NodeTarget node:
                         node.Stream.Dispose();
-                        Console.Error.WriteLine(
-                            $"nanocached: {host}:{port} no longer identifies as a discovery server");
                         continue;
                 }
             }
             catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
             {
-                Console.Error.WriteLine(
-                    $"nanocached: could not refresh the node list from {host}:{port}: {error.Message}");
+                // Silent by design (§7 ②) — the next refresh retries.
             }
         }
-        Console.Error.WriteLine(
-            "nanocached: no discovery seed could provide a node list, keeping the last-known list");
         return null;
     }
 

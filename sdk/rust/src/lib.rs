@@ -8,6 +8,7 @@ mod connection;
 mod error;
 mod hash_ring;
 mod identify;
+mod open_targets;
 
 #[doc(hidden)]
 pub use client::KEEPALIVE_INTERVAL_MS;
@@ -15,5 +16,3 @@ pub use client::{NanocachedClient, Options};
 pub use error::{Error, Result};
 pub use hash_ring::HashRing;
 pub use identify::DiscoveredNode;
-#[cfg(feature = "tls")]
-pub use identify::TlsConfig;

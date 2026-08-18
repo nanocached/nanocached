@@ -21,11 +21,19 @@ internal sealed class Connection
     private readonly Stream _stream;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
+    private readonly Action? _onClosed;
     private volatile bool _closed;
 
-    internal Connection(Stream stream)
+    /// <summary><paramref name="onClosed"/>, when given, fires exactly
+    /// once — the first time this connection actually closes — no matter
+    /// how many call sites call <see cref="Close"/> on it. Lets the client
+    /// hook every place it closes or discards a connection (issue #12's
+    /// forgotten-close tracking) without each call site worrying about
+    /// double-counting.</summary>
+    internal Connection(Stream stream, Action? onClosed = null)
     {
         _stream = stream;
+        _onClosed = onClosed;
     }
 
     internal bool IsClosed => _closed;
@@ -34,8 +42,10 @@ internal sealed class Connection
 
     internal void Close()
     {
+        if (_closed) return;
         _closed = true;
         _stream.Dispose();
+        _onClosed?.Invoke();
     }
 
     internal async Task<byte[]?> GetAsync(byte[] key)
@@ -51,9 +61,11 @@ internal sealed class Connection
         };
     }
 
-    internal async Task SetAsync(byte[] key, byte[] value, long? ttlSeconds)
+    /// <summary><paramref name="ttlSeconds"/> of 0 means no expiry, mapped
+    /// on the wire exactly as the old absent-TTL header was.</summary>
+    internal async Task SetAsync(byte[] key, byte[] value, long ttlSeconds)
     {
-        string header = ttlSeconds is null
+        string header = ttlSeconds == 0
             ? $"S {key.Length} {value.Length}\n"
             : $"S {key.Length} {value.Length} {ttlSeconds}\n";
         var (marker, _) = await RequestAsync(Frame(header, key, value)).ConfigureAwait(false);

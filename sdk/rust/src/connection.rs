@@ -33,6 +33,10 @@ pub(crate) struct Connection {
     /// keep-alive timer checks against its interval.
     last_used_ms: AtomicU64,
     epoch: Instant,
+    /// The open-targets key this connection was counted against (see
+    /// `open_targets`) — `None` for the pre-poisoned `dead()` placeholder,
+    /// which never opened a socket and so was never counted.
+    tracking_key: Option<String>,
 }
 
 pub(crate) enum ResponseKind {
@@ -43,13 +47,19 @@ pub(crate) enum ResponseKind {
 }
 
 impl Connection {
-    pub(crate) fn new(stream: Stream) -> Self {
+    /// `tracking_key` is the client's winning connect address ("host:port"
+    /// of whichever configured address answered `connect()`) — every
+    /// socket the client ever opens, regardless of which node it dials,
+    /// is counted against that one key (see `open_targets`).
+    pub(crate) fn new(stream: Stream, tracking_key: String) -> Self {
+        crate::open_targets::increment(&tracking_key);
         Self {
             stream: Mutex::new(Some(BufReader::new(stream))),
             closed: AtomicBool::new(false),
             in_flight: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
+            tracking_key: Some(tracking_key),
         }
     }
 
@@ -62,6 +72,7 @@ impl Connection {
             in_flight: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
+            tracking_key: None,
         }
     }
 
@@ -71,8 +82,15 @@ impl Connection {
 
     pub(crate) fn close(&self) {
         // Dropping the TCP stream happens when the Connection is dropped;
-        // marking closed is what keeps further requests off it.
-        self.closed.store(true, Ordering::SeqCst);
+        // marking closed is what keeps further requests off it. Only the
+        // false→true transition decrements the open-targets count, so
+        // close() stays safe to call more than once (and dead() — already
+        // closed, never counted — never decrements at all).
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            if let Some(key) = &self.tracking_key {
+                crate::open_targets::decrement(key);
+            }
+        }
     }
 
     pub(crate) fn idle(&self) -> Duration {
@@ -92,15 +110,13 @@ impl Connection {
         }
     }
 
-    pub(crate) async fn set(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        ttl_seconds: Option<u64>,
-    ) -> Result<()> {
-        let header = match ttl_seconds {
-            Some(ttl) => format!("S {} {} {}\n", key.len(), value.len(), ttl),
-            None => format!("S {} {}\n", key.len(), value.len()),
+    /// `ttl_seconds == 0` means no expiry — mapped to the wire exactly as
+    /// the absent-TTL frame always was.
+    pub(crate) async fn set(&self, key: &[u8], value: &[u8], ttl_seconds: u64) -> Result<()> {
+        let header = if ttl_seconds == 0 {
+            format!("S {} {}\n", key.len(), value.len())
+        } else {
+            format!("S {} {} {}\n", key.len(), value.len(), ttl_seconds)
         };
         let mut frame = header.into_bytes();
         frame.extend_from_slice(key);

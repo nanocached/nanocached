@@ -14,7 +14,7 @@ pub enum Error {
     WrongNode,
     /// A discovery server answered `L` with `B` — it is inside its
     /// startup grace (ADR-0010), re-learning membership after a restart.
-    /// Try another seed, or retry shortly.
+    /// Try another address, or retry shortly.
     DiscoveryBusy,
     /// A connection-level failure; the client redials lazily on the next
     /// use, and in cluster mode retries once through a node-list refresh.
@@ -23,6 +23,10 @@ pub enum Error {
     Protocol(String),
     /// The caller passed something that could never be meant.
     InvalidArgument(String),
+    /// `get` decodes the value as UTF-8 with a strict decoder; a value
+    /// that isn't valid UTF-8 raises this instead of lossily replacing
+    /// the invalid bytes. Use `get_bytes` for the raw value.
+    InvalidUtf8(std::string::FromUtf8Error),
 }
 
 impl fmt::Display for Error {
@@ -38,11 +42,21 @@ impl fmt::Display for Error {
             ),
             Error::ConnectionLost(message) | Error::Protocol(message) => write!(f, "{message}"),
             Error::InvalidArgument(message) => write!(f, "{message}"),
+            Error::InvalidUtf8(error) => {
+                write!(f, "nanocached: value is not valid UTF-8: {error}")
+            }
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::InvalidUtf8(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {

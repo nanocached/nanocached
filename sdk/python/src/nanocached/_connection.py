@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 
 from ._errors import NanocachedError, WrongNodeError
 
@@ -25,8 +26,10 @@ def _encode_get(key: bytes) -> bytes:
     return b"G %d\n%b" % (len(key), key)
 
 
-def _encode_set(key: bytes, value: bytes, ttl_seconds: int | None) -> bytes:
-    if ttl_seconds is None:
+def _encode_set(key: bytes, value: bytes, ttl_seconds: int) -> bytes:
+    # 0 means no expiry — omitted from the wire exactly as the old
+    # None/absent TTL was.
+    if ttl_seconds == 0:
         return b"S %d %d\n%b%b" % (len(key), len(value), key, value)
     return b"S %d %d %d\n%b%b" % (len(key), len(value), ttl_seconds, key, value)
 
@@ -36,12 +39,18 @@ def _encode_delete(key: bytes) -> bytes:
 
 
 class Connection:
-    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        on_close: Callable[[], None] | None = None,
+    ) -> None:
         self._reader = reader
         self._writer = writer
         self._lock = asyncio.Lock()
         self._closed = False
         self._last_used = time.monotonic()
+        self._on_close = on_close
 
     @property
     def closed(self) -> bool:
@@ -53,8 +62,15 @@ class Connection:
         return time.monotonic() - self._last_used
 
     def close(self) -> None:
+        # Idempotent, and on_close fires at most once per connection — the
+        # forgotten-close open-socket count (§7 ③) must never be
+        # double-decremented for one socket.
+        if self._closed:
+            return
         self._closed = True
         self._writer.close()
+        if self._on_close is not None:
+            self._on_close()
 
     async def get(self, key: bytes) -> bytes | None:
         marker, value = await self._request(_encode_get(key))
@@ -66,7 +82,7 @@ class Connection:
             raise WrongNodeError()
         raise self._mismatch(marker)
 
-    async def set(self, key: bytes, value: bytes, ttl_seconds: int | None) -> None:
+    async def set(self, key: bytes, value: bytes, ttl_seconds: int) -> None:
         marker, _ = await self._request(_encode_set(key, value, ttl_seconds))
         if marker == b"W":
             raise WrongNodeError()

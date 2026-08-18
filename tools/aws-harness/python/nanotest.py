@@ -1,7 +1,7 @@
 """Cluster-scenario driver for the AWS live tests.
 
-Uses the Python SDK against a discovery-fronted cluster. Seeds come from
-the NANOTEST_SEEDS env var ("host:port,host:port").
+Uses the Python SDK against a discovery-fronted cluster. Addresses come
+from the NANOTEST_ADDRESSES env var ("host:port,host:port").
 
 Commands:
   write <label> <count>          write x:<label>:<i> = v-<label>-<i>
@@ -10,7 +10,7 @@ Commands:
   preload <count>                write bulk:<i> (~100-byte values)
   verify <count>                 read every bulk key, report missing
   churn <seconds> <outfile>      continuous get/set, log failures as JSON
-  nodes                          raw L query against the first seed
+  nodes                          raw L query against the first address
 """
 
 import asyncio
@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "sd
 from nanocached import NanocachedClient  # noqa: E402
 
 
-def seeds():
-    raw = os.environ["NANOTEST_SEEDS"]
+def addresses():
+    raw = os.environ["NANOTEST_ADDRESSES"]
     out = []
     for part in raw.split(","):
         host, port = part.rsplit(":", 1)
@@ -38,7 +38,7 @@ def bulk_value(i: int) -> bytes:
 
 
 async def cmd_write(label: str, count: int) -> int:
-    client = await NanocachedClient.connect(seeds=seeds())
+    client = await NanocachedClient.connect(addresses())
     for i in range(count):
         await client.set(f"x:{label}:{i}", f"v-{label}-{i}")
     client.close()
@@ -47,11 +47,11 @@ async def cmd_write(label: str, count: int) -> int:
 
 
 async def cmd_read(label: str, count: int) -> int:
-    client = await NanocachedClient.connect(seeds=seeds())
+    client = await NanocachedClient.connect(addresses())
     bad = []
     for i in range(count):
         value = await client.get(f"x:{label}:{i}")
-        if value != f"v-{label}-{i}".encode():
+        if value != f"v-{label}-{i}":
             bad.append(i)
     client.close()
     if bad:
@@ -69,7 +69,7 @@ async def cmd_readall(labels: str, count: int) -> int:
 
 
 async def cmd_preload(count: int) -> int:
-    client = await NanocachedClient.connect(seeds=seeds())
+    client = await NanocachedClient.connect(addresses())
     for start in range(0, count, 100):
         await asyncio.gather(
             *(client.set(f"bulk:{i}", bulk_value(i)) for i in range(start, min(start + 100, count)))
@@ -80,11 +80,11 @@ async def cmd_preload(count: int) -> int:
 
 
 async def cmd_verify(count: int) -> int:
-    client = await NanocachedClient.connect(seeds=seeds())
+    client = await NanocachedClient.connect(addresses())
     missing, wrong = [], []
 
     async def check(i: int):
-        value = await client.get(f"bulk:{i}")
+        value = await client.get_bytes(f"bulk:{i}")
         if value is None:
             missing.append(i)
         elif value != bulk_value(i):
@@ -103,7 +103,7 @@ async def cmd_verify(count: int) -> int:
 
 
 async def cmd_churn(seconds: float, outfile: str) -> int:
-    client = await NanocachedClient.connect(seeds=seeds())
+    client = await NanocachedClient.connect(addresses())
     t0 = time.monotonic()
     events = []
     ops = fails = 0
@@ -140,7 +140,7 @@ async def cmd_churn(seconds: float, outfile: str) -> int:
 
 
 async def cmd_nodes() -> int:
-    host, port = seeds()[0]
+    host, port = addresses()[0]
     reader, writer = await asyncio.open_connection(host, port)
     writer.write(b"A 1\n\x00")
     await writer.drain()

@@ -1,14 +1,19 @@
 // Java-SDK smoke for the AWS live tests: java Main <write|read> <label> <count>
-// Seeds via NANOTEST_SEEDS ("host:port,host:port"). Compile against the SDK sources.
+// Addresses via NANOTEST_ADDRESSES ("host:port,host:port"). Compile against the SDK sources.
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import org.nanocached.NanocachedClient;
+import org.nanocached.NanocachedClient.Address;
 
 public final class Main {
     public static void main(String[] args) throws Exception {
-        NanocachedClient.Options options = NanocachedClient.builder();
-        for (String part : System.getenv("NANOTEST_SEEDS").split(",")) {
+        List<Address> addresses = new ArrayList<>();
+        for (String part : System.getenv("NANOTEST_ADDRESSES").split(",")) {
             int idx = part.lastIndexOf(':');
-            options = options.host(part.substring(0, idx), Integer.parseInt(part.substring(idx + 1)));
+            addresses.add(new Address(part.substring(0, idx), Integer.parseInt(part.substring(idx + 1))));
         }
+        NanocachedClient.Options options = NanocachedClient.builder().addresses(addresses);
 
         String cmd = args[0];
         String label = args[1];
@@ -23,9 +28,9 @@ public final class Main {
             } else if (cmd.equals("read")) {
                 int bad = 0;
                 for (int i = 0; i < count; i++) {
-                    byte[] value = client.get("x:" + label + ":" + i);
+                    Optional<String> value = client.get("x:" + label + ":" + i);
                     String expected = "v-" + label + "-" + i;
-                    if (value == null || !new String(value).equals(expected)) {
+                    if (value.isEmpty() || !value.get().equals(expected)) {
                         bad++;
                     }
                 }

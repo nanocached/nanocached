@@ -1,8 +1,8 @@
 // TS-SDK smoke for the AWS live tests: node main.mjs <write|read> <label> <count>
-// Seeds via NANOTEST_SEEDS ("host:port,host:port"); imports the built dist.
+// Addresses via NANOTEST_ADDRESSES ("host:port,host:port"); imports the built dist.
 import { NanocachedClient } from "../../../sdk/typescript/dist/index.js";
 
-const seeds = process.env.NANOTEST_SEEDS.split(",").map((part) => {
+const addresses = process.env.NANOTEST_ADDRESSES.split(",").map((part) => {
   const idx = part.lastIndexOf(":");
   return { host: part.slice(0, idx), port: Number(part.slice(idx + 1)) };
 });
@@ -10,7 +10,7 @@ const seeds = process.env.NANOTEST_SEEDS.split(",").map((part) => {
 const [cmd, label, countRaw] = process.argv.slice(2);
 const count = Number(countRaw);
 
-const client = await NanocachedClient.connect({ seeds });
+const client = await NanocachedClient.connect({ addresses });
 let rc = 0;
 
 if (cmd === "write") {
@@ -22,7 +22,7 @@ if (cmd === "write") {
   const bad = [];
   for (let i = 0; i < count; i++) {
     const value = await client.get(`x:${label}:${i}`);
-    if (value?.toString() !== `v-${label}-${i}`) bad.push(i);
+    if (value !== `v-${label}-${i}`) bad.push(i);
   }
   if (bad.length > 0) {
     console.log(`label ${label}: ${bad.length}/${count} BAD (sample ${bad.slice(0, 5)})`);

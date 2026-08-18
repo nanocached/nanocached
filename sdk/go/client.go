@@ -1,10 +1,10 @@
 // Package nanocached is the Go client SDK for nanocached, a tiny
 // distributed cache with client-side replication.
 //
-// A Config's Seeds may name either a single nanocached-node or discovery
-// server(s) fronting a cluster — Connect finds out from the server's own
-// handshake response (doc/adr/0007-*.md), so calling code is identical
-// either way.
+// A Config's Addresses may name either a single nanocached-node or
+// discovery server(s) fronting a cluster — Connect finds out from the
+// server's own handshake response (doc/adr/0007-*.md), so calling code
+// is identical either way.
 //
 // Cluster mode implements ADR-0011 client-side replication: writes fan
 // out to each key's top-R owners (the primary's result decides; a dead
@@ -21,9 +21,12 @@ package nanocached
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -37,17 +40,31 @@ const nodeListStaleAfter = 30 * time.Second
 // one byte; a single NUL stays out of any real key space.
 var keepaliveKey = []byte{0}
 
+// Address is a "host:port" connect target: a single nanocached-node, or
+// one discovery replica (ADR-0010) fronting a cluster.
+type Address struct {
+	Host string
+	Port int
+}
+
+func (a Address) String() string {
+	return net.JoinHostPort(a.Host, strconv.Itoa(a.Port))
+}
+
 // Config configures Connect.
 type Config struct {
-	// Seeds lists "host:port" targets, tried in order — one entry for a
+	// Addresses lists connect targets, tried in order — one entry for a
 	// single node, or every discovery replica (ADR-0010) for a cluster.
-	Seeds []string
+	Addresses []Address
 	// AuthSecret matches NANOCACHED_AUTH_SECRET on the server; empty
 	// means no authentication configured.
 	AuthSecret string
-	// TLS, when non-nil, connects every socket over TLS with this config
-	// (system roots by default; set RootCAs for a private CA).
-	TLS *tls.Config
+	// TLS connects every socket over TLS when true (plaintext otherwise).
+	TLS bool
+	// CA names a PEM file of trusted root certificate(s), replacing the
+	// platform/system trust store. Only meaningful when TLS is true; a
+	// set CA is silently ignored when TLS is false.
+	CA string
 }
 
 // keepAliveInterval is the always-on keep-alive cadence (issue #27):
@@ -67,9 +84,17 @@ type Client struct {
 	redialMu    sync.Mutex
 	redialGates map[string]*sync.Mutex
 
-	seeds      []string
+	addresses  []Address
 	authSecret []byte
 	tlsConfig  *tls.Config
+
+	// targetKey is the address this client's connect() ultimately settled
+	// on — a node's own address in single mode, the winning discovery
+	// server's address in cluster mode. Every socket this client ever
+	// opens (initial connect, lazy reconnect, newly discovered members)
+	// is tracked in openTargets under this one key, mirroring the
+	// TypeScript SDK's `this.url`.
+	targetKey string
 
 	closed        bool
 	stopKeepalive chan struct{}
@@ -82,16 +107,67 @@ type Client struct {
 	lastFetch     time.Time
 }
 
-// Connect dials the first working seed and returns a ready client.
+// ── open-connection tracking (forgotten-close detection) ────────────
+//
+// A process-global count of open SDK sockets per target address, purely
+// a programming-error guard: it catches "connect() called again for the
+// same address before the previous client's close() was ever called"
+// without affecting behavior — connecting again still works, this only
+// warns. Mirrors sdk/typescript/src/client.ts's openTargets.
+var (
+	openTargetsMu sync.Mutex
+	openTargets   = map[string]int{}
+)
+
+func trackOpenTarget(key string) {
+	openTargetsMu.Lock()
+	openTargets[key]++
+	openTargetsMu.Unlock()
+}
+
+func untrackOpenTarget(key string) {
+	openTargetsMu.Lock()
+	if openTargets[key] <= 1 {
+		delete(openTargets, key)
+	} else {
+		openTargets[key]--
+	}
+	openTargetsMu.Unlock()
+}
+
+func openTargetCount(key string) int {
+	openTargetsMu.Lock()
+	defer openTargetsMu.Unlock()
+	return openTargets[key]
+}
+
+// trackedConnection wraps netConn, counting it against this client's
+// targetKey until it closes (whichever of the several close() call
+// sites — Close(), refresh reconciliation, dead-connection replacement —
+// eventually fires).
+func (c *Client) trackedConnection(netConn net.Conn) *connection {
+	key := c.targetKey
+	trackOpenTarget(key)
+	conn := newConnection(netConn)
+	conn.onClose = func() { untrackOpenTarget(key) }
+	return conn
+}
+
+// Connect dials the first working address and returns a ready client.
 func Connect(config Config) (*Client, error) {
-	if len(config.Seeds) == 0 {
-		return nil, fmt.Errorf("nanocached: Connect needs at least one seed")
+	if len(config.Addresses) == 0 {
+		return nil, fmt.Errorf("nanocached: connect() needs a non-empty addresses list")
+	}
+
+	tlsConfig, err := buildTLSConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	client := &Client{
 		redialGates:   map[string]*sync.Mutex{},
-		seeds:         append([]string(nil), config.Seeds...),
-		tlsConfig:     config.TLS,
+		addresses:     append([]Address(nil), config.Addresses...),
+		tlsConfig:     tlsConfig,
 		members:       map[string]*member{},
 		replication:   1,
 		lastFetch:     time.Now(),
@@ -101,33 +177,48 @@ func Connect(config Config) (*Client, error) {
 		client.authSecret = []byte(config.AuthSecret)
 	}
 
-	// Walk the seeds until one yields a working target; a seed that is
-	// unreachable, warming up (B, ADR-0010), or knows no live nodes is
-	// skipped — the next replica may do better.
+	// Walk the addresses until one yields a working target; an address
+	// that is unreachable, warming up (B, ADR-0010), or knows no live
+	// nodes is skipped — the next replica may do better.
 	var lastError error
-	for _, seed := range client.seeds {
-		result, err := connectAndIdentify(seed, client.authSecret, client.tlsConfig)
+	for _, addr := range client.addresses {
+		key := addr.String()
+
+		// Only meaningful for a single explicit target: with an
+		// addresses list, another client instance legitimately holding
+		// connections to the same address makes this heuristic a false
+		// positive (issue #12).
+		if len(client.addresses) == 1 && openTargetCount(key) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"nanocached: connect() called for %s while a previous connection to it is "+
+					"still open — was close() forgotten?\n", key)
+		}
+
+		result, err := connectAndIdentify(key, client.authSecret, client.tlsConfig)
 		if err != nil {
 			lastError = err
 			continue
 		}
 
+		client.targetKey = key
+
 		if result.conn != nil {
-			if len(client.seeds) > 1 {
+			if len(client.addresses) > 1 {
 				fmt.Fprintf(os.Stderr,
 					"nanocached: %s is a cache node, so this client is pinned to that single "+
-						"server — the remaining seed(s) will not be used. Point seeds at "+
-						"discovery servers for cluster routing and failover.\n", seed)
+						"server — the %d remaining address(es) will not be used. Point addresses "+
+						"at discovery servers for cluster routing and failover.\n",
+					key, len(client.addresses)-1)
 			}
-			client.single = newConnection(result.conn)
-			client.singleAddress = seed
+			client.single = client.trackedConnection(result.conn)
+			client.singleAddress = key
 			client.startKeepalive(keepAliveInterval)
 			return client, nil
 		}
 
 		if len(result.nodes) == 0 {
 			lastError = fmt.Errorf(
-				"nanocached: no live nodes registered with the discovery server at %s", seed)
+				"nanocached: no live nodes registered with the discovery server at %s", key)
 			continue
 		}
 
@@ -140,9 +231,30 @@ func Connect(config Config) (*Client, error) {
 	}
 
 	if lastError == nil {
-		lastError = fmt.Errorf("nanocached: could not connect to any seed")
+		lastError = fmt.Errorf("nanocached: could not connect to any address")
 	}
 	return nil, lastError
+}
+
+// buildTLSConfig turns Config.TLS/CA into a *tls.Config, or nil for
+// plaintext. CA is meaningful only when TLS is true — when TLS is false
+// it is silently ignored, matching every other SDK's semantics.
+func buildTLSConfig(config Config) (*tls.Config, error) {
+	if !config.TLS {
+		return nil, nil
+	}
+	if config.CA == "" {
+		return &tls.Config{}, nil // system/platform trust store
+	}
+	pemBytes, err := os.ReadFile(config.CA)
+	if err != nil {
+		return nil, fmt.Errorf("nanocached: could not read CA file %s: %w", config.CA, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("nanocached: no valid certificates found in CA file %s", config.CA)
+	}
+	return &tls.Config{RootCAs: pool}, nil
 }
 
 func (c *Client) openCluster(result *identified) error {
@@ -180,8 +292,21 @@ func (c *Client) IsClosed() bool {
 	return c.closed
 }
 
-// Get returns the key's value; ok is false when the key is missing.
-func (c *Client) Get(key string) (value []byte, ok bool, err error) {
+// Get returns the key's value as a string; ok is false when the key is
+// missing. string(bytes) is a lossless conversion in Go, so unlike some
+// other nanocached SDKs there is no decode-failure error path — use
+// GetBytes for the raw bytes if the value isn't meant to be text.
+func (c *Client) Get(key string) (value string, ok bool, err error) {
+	raw, ok, err := c.GetBytes(key)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	return string(raw), true, nil
+}
+
+// GetBytes returns the key's raw value; ok is false when the key is
+// missing.
+func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	if err := c.beforeOperation(); err != nil {
 		return nil, false, err
 	}
@@ -196,26 +321,29 @@ func (c *Client) Get(key string) (value []byte, ok bool, err error) {
 	return value, ok, err
 }
 
-// Set stores the value under the key. A zero ttl means no expiry.
-func (c *Client) Set(key string, value []byte, ttl time.Duration) error {
-	if ttl < 0 {
-		return fmt.Errorf("nanocached: ttl must not be negative, got %v", ttl)
+// Set stores the string value under the key. ttlSeconds is a whole
+// number of seconds; 0 means no expiry, negative is rejected.
+func (c *Client) Set(key, value string, ttlSeconds int64) error {
+	return c.SetBytes(key, []byte(value), ttlSeconds)
+}
+
+// SetBytes stores the raw value under the key. ttlSeconds is a whole
+// number of seconds; 0 means no expiry, negative is rejected.
+func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
+	if ttlSeconds < 0 {
+		return fmt.Errorf("nanocached: ttlSeconds must not be negative, got %d", ttlSeconds)
 	}
 	if err := c.beforeOperation(); err != nil {
 		return err
 	}
-	ttlSeconds := int64(-1) // no expiry
-	if ttl > 0 {
-		// Round sub-second TTLs UP (issue #9): truncation turned e.g.
-		// 300ms into an explicit 0-second TTL — near-immediate expiry —
-		// silently changing the caller's intent. TTL granularity on the
-		// wire is whole seconds.
-		ttlSeconds = int64((ttl + time.Second - 1) / time.Second)
+	wireTTL := int64(-1) // no expiry
+	if ttlSeconds > 0 {
+		wireTTL = ttlSeconds
 	}
 	keyBytes := []byte(key)
 	return c.withClusterRetry(func() error {
-		return c.write(keyBytes, func(conn *connection) error {
-			return conn.set(keyBytes, value, ttlSeconds)
+		return c.write(keyBytes, func(conn *connection, _ bool) error {
+			return conn.set(keyBytes, value, wireTTL)
 		})
 	})
 }
@@ -227,20 +355,29 @@ func (c *Client) Delete(key string) (existed bool, err error) {
 	}
 	keyBytes := []byte(key)
 	err = c.withClusterRetry(func() error {
-		return c.write(keyBytes, func(conn *connection) error {
-			var opErr error
-			existed, opErr = conn.delete(keyBytes)
+		return c.write(keyBytes, func(conn *connection, primary bool) error {
+			e, opErr := conn.delete(keyBytes)
+			// Only the primary's answer decides (ADR-0011) — and only the
+			// primary leg may touch `existed`: the replica legs run on
+			// other goroutines, so writing it there would both race and
+			// let a replica's answer overwrite the primary's.
+			if primary {
+				existed = e
+			}
 			return opErr
 		})
 	})
 	return existed, err
 }
 
-// Close is idempotent; later Get/Set/Delete return ErrClosed.
+// Close is idempotent; later Get/Set/Delete return ErrClosed. Calling
+// Close a second time is harmless but warns to stderr — it usually
+// signals the caller lost track of this client's lifecycle.
 func (c *Client) Close() {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		fmt.Fprintln(os.Stderr, "nanocached: close() called again on an already-closed client")
 		return
 	}
 	c.closed = true
@@ -353,12 +490,17 @@ func (c *Client) read(key []byte, op func(*connection) error) error {
 	return lastError
 }
 
-func (c *Client) write(key []byte, op func(*connection) error) error {
+// write runs op against every owner of the key; op's second argument
+// reports whether this leg is the primary, whose outcome alone decides
+// the operation's result — replica legs run on their own goroutines, so
+// an op that captures outer variables must only write them when primary.
+func (c *Client) write(key []byte, op func(conn *connection, primary bool) error) error {
 	c.mu.Lock()
 	single := c.ring == nil
 	c.mu.Unlock()
+	primaryOp := func(conn *connection) error { return op(conn, true) }
 	if single {
-		return c.applyReconnecting("", op)
+		return c.applyReconnecting("", primaryOp)
 	}
 
 	names := c.ownerNames(key)
@@ -376,11 +518,11 @@ func (c *Client) write(key []byte, op func(*connection) error) error {
 		replicas.Add(1)
 		go func(replica string) {
 			defer replicas.Done()
-			_ = c.applyReconnecting(replica, op)
+			_ = c.applyReconnecting(replica, func(conn *connection) error { return op(conn, false) })
 		}(name)
 	}
 
-	err := c.applyReconnecting(names[0], op)
+	err := c.applyReconnecting(names[0], primaryOp)
 	replicas.Wait()
 	return err
 }
@@ -467,7 +609,7 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 		_ = result.conn.Close()
 		return nil, ErrClosed
 	}
-	return newConnection(result.conn), nil
+	return c.trackedConnection(result.conn), nil
 }
 
 // ── ノードリスト更新 ──────────────────────────────────────────────
@@ -539,27 +681,23 @@ func (c *Client) refreshNodeList() {
 	c.redialMu.Unlock()
 }
 
-// fetchNodeList walks every seed (ADR-0010); ok=false means keep the
-// last-known list.
+// fetchNodeList walks every configured address (ADR-0010); ok=false
+// means keep the last-known list.
 func (c *Client) fetchNodeList() ([]DiscoveredNode, int, bool) {
-	for _, seed := range c.seeds {
-		result, err := connectAndIdentify(seed, c.authSecret, c.tlsConfig)
+	for _, addr := range c.addresses {
+		result, err := connectAndIdentify(addr.String(), c.authSecret, c.tlsConfig)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "nanocached: could not refresh the node list from %s: %v\n", seed, err)
 			continue
 		}
 		if result.conn != nil {
 			_ = result.conn.Close()
-			fmt.Fprintf(os.Stderr, "nanocached: %s no longer identifies as a discovery server\n", seed)
 			continue
 		}
 		if len(result.nodes) == 0 {
-			fmt.Fprintf(os.Stderr, "nanocached: discovery at %s returned no live nodes, skipping\n", seed)
 			continue
 		}
 		return result.nodes, result.replication, true
 	}
-	fmt.Fprintln(os.Stderr, "nanocached: no discovery seed could provide a node list, keeping the last-known list")
 	return nil, 0, false
 }
 

@@ -29,7 +29,7 @@ class WrongNodeError(NanocachedError):
 class DiscoveryBusyError(NanocachedError):
     """A discovery server answered ``L`` with ``B`` — it is inside its
     startup grace (ADR-0010), re-learning membership after a restart. Try
-    another seed, or retry shortly."""
+    another address, or retry shortly."""
 
     def __init__(self) -> None:
         super().__init__("nanocached: the discovery server is warming up after a restart")

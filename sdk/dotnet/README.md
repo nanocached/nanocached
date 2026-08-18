@@ -14,30 +14,43 @@ using Nanocached;
 
 // Point at a single node, or at a discovery server fronting a
 // cluster — same call either way.
-using NanocachedClient client = await NanocachedClient.ConnectAsync("127.0.0.1", 8357);
+using NanocachedClient client = await NanocachedClient.ConnectAsync(
+    new NanocachedClient.Options { Addresses = { ("127.0.0.1", 8357) } });
 
 await client.SetAsync("greeting", "hello", ttlSeconds: 60);
-byte[]? value = await client.GetAsync("greeting");   // null when missing
+string? value = await client.GetAsync("greeting");   // null when missing, strict UTF-8 decode
 bool existed = await client.DeleteAsync("greeting");
 ```
 
-Keys and values are `byte[]`, with `string` convenience overloads
-(encoded as UTF-8). The client is thread-safe; requests are serialized
-per connection (concurrent callers queue).
+`GetAsync` decodes the value as UTF-8 with a strict decoder — a value
+that isn't valid UTF-8 throws `DecoderFallbackException` instead of
+silently replacing bad bytes. Use `GetBytesAsync` for the raw bytes:
 
-## Discovery replicas
+```csharp
+byte[]? raw = await client.GetBytesAsync("greeting");
+```
 
-When the cluster runs more than one discovery server, list them all;
-both the initial connect and every node-list refresh try them in order.
-A seed that is warming up after a restart (answers `B`) is skipped like
-an unreachable one; if every seed is warming up, `ConnectAsync()` throws
+Keys and values accept `string` (UTF-8 encoded) everywhere, with `byte[]`
+overloads of `GetAsync`/`GetBytesAsync`/`SetAsync`/`DeleteAsync` for raw
+bytes. The client is thread-safe; requests are serialized per connection
+(concurrent callers queue).
+
+## Addresses and discovery replicas
+
+`Options.Addresses` is a list of `(string Host, int Port)` targets, tried
+in order — a single-element list is the common case. When the cluster
+runs more than one discovery server, list them all; both the initial
+connect and every node-list refresh try them in order. An address that
+is warming up after a restart (answers `B`) is skipped like an
+unreachable one; if every address is warming up, `ConnectAsync()` throws
 `DiscoveryBusyException` — retry shortly.
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(
-    new NanocachedClient.Options()
-        .Host("10.0.0.1", 8357)
-        .Host("10.0.0.2", 8357));
+    new NanocachedClient.Options
+    {
+        Addresses = { ("10.0.0.1", 8357), ("10.0.0.2", 8357) },
+    });
 ```
 
 ## Replication
@@ -45,11 +58,12 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
 The cluster's replication factor R rides along with the node list, so
 the SDK needs no configuration: `SetAsync`/`DeleteAsync` fan out to all
 R owners of a key (the primary's result decides; a dead replica never
-fails a write), and `GetAsync` asks the primary, falling over to the
-next owner only when the holder is unreachable. `client.Replication`
-exposes the factor in use. A write whose primary just died recovers
-automatically once discovery drops the node (bounded by its liveness
-timeout): the failed attempt forces a node-list refresh and one retry.
+fails a write), and `GetAsync`/`GetBytesAsync` ask the primary, falling
+over to the next owner only when the holder is unreachable.
+`client.Replication` exposes the factor in use. A write whose primary
+just died recovers automatically once discovery drops the node (bounded
+by its liveness timeout): the failed attempt forces a node-list refresh
+and one retry.
 
 ## Reconnect and keep-alive
 
@@ -64,11 +78,40 @@ operations are idempotent). There is nothing to configure.
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(
-    new NanocachedClient.Options()
-        .Host("cache.internal", 8357)
-        .AuthSecret("change-me")                       // NANOCACHED_AUTH_SECRET on the server
-        .Tls(new SslClientAuthenticationOptions()));   // system trust; customize for a private CA
+    new NanocachedClient.Options
+    {
+        Addresses = { ("cache.internal", 8357) },
+        AuthSecret = "change-me",   // NANOCACHED_AUTH_SECRET on the server
+        Tls = true,                 // system trust store
+    });
 ```
+
+For a private CA, point `Ca` at a PEM file of trusted root certificate(s)
+— it replaces the default trust store and is only consulted when `Tls`
+is true (a set `Ca` is silently ignored when `Tls` is false; an
+unreadable or unparseable CA file when `Tls` is true is a connect-time
+error):
+
+```csharp
+using NanocachedClient client = await NanocachedClient.ConnectAsync(
+    new NanocachedClient.Options
+    {
+        Addresses = { ("cache.internal", 8357) },
+        Tls = true,
+        Ca = "/etc/nanocached/ca.pem",
+    });
+```
+
+## close()
+
+`client.Close()` (or `Dispose()`/`using`) is idempotent; calling it a
+second time is harmless but writes a warning to stderr, since it usually
+means the caller lost track of the client's lifecycle. Likewise,
+`ConnectAsync()` warns to stderr if it's called again for the same
+single configured address while a previous connection to it is still
+open — a sign `close()` was forgotten. Neither warning fires for
+multi-address configs, since legitimate concurrent clients would make
+that a false positive.
 
 ## Build
 

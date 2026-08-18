@@ -1,13 +1,16 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { ConnectionLostError } from "./connection.js";
-import { CONNECT_DEADLINE_MS, connectSocket, type NanocachedTlsOptions } from "./socket.js";
+import { CONNECT_DEADLINE_MS, connectSocket } from "./socket.js";
 
 export interface IdentifyOptions {
   host: string;
   port: number;
-  authSecret?: string | Uint8Array;
-  tls?: boolean | NanocachedTlsOptions;
+  authSecret?: string;
+  tls?: boolean;
+  /** PEM-encoded trusted root certificate(s), already read from disk once
+   * by the caller. See `ConnectSocketOptions.ca`. */
+  ca?: Buffer;
   /** Bound on each phase of connecting (dial, handshake read); defaults
    * to `CONNECT_DEADLINE_MS`. Exposed for tests. */
   connectDeadlineMs?: number;
@@ -39,10 +42,6 @@ export type IdentifyResult =
   // many nodes hold each key. It rides the `L` response so clients can't
   // skew from the cluster's setting.
   | { kind: "cluster"; nodes: DiscoveredNode[]; replication: number };
-
-function toBytes(value: string | Uint8Array): Buffer {
-  return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
-}
 
 // Sent as the `A` secret when the caller didn't configure an authSecret.
 // A server with no secret configured accepts any non-empty secret without
@@ -139,7 +138,7 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
 /** Thrown when a discovery server answers `L` with `B` — it is inside its
  * startup grace (ADR-0010), re-learning cluster membership after a
  * restart, and refuses to serve a possibly-partial node list. The caller
- * should try another seed, or retry shortly. */
+ * should try another address, or retry shortly. */
 export class DiscoveryBusyError extends Error {
   constructor() {
     super("nanocached: the discovery server is warming up after a restart");
@@ -233,7 +232,7 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
   const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
   const socket = await connectSocket(options);
 
-  const secret = options.authSecret !== undefined ? toBytes(options.authSecret) : NO_SECRET_PLACEHOLDER;
+  const secret = options.authSecret !== undefined ? Buffer.from(options.authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
   const authFrame = Buffer.concat([Buffer.from(`A ${secret.length}\n`, "ascii"), secret]);
 
   let identity: AuthIdentity;

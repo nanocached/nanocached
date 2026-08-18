@@ -12,32 +12,45 @@ Requires Java 17+. No runtime dependencies. Group/artifact:
 
 ```java
 import org.nanocached.NanocachedClient;
+import org.nanocached.NanocachedClient.Address;
+
+import java.util.List;
+import java.util.Optional;
 
 // Point at a single node, or at a discovery server fronting a
 // cluster — same call either way.
-try (NanocachedClient client = NanocachedClient.connect("127.0.0.1", 8357)) {
-    client.set("greeting", "hello", 60);          // TTL in seconds (optional)
-    byte[] value = client.get("greeting");        // null when missing
+NanocachedClient.Options options = NanocachedClient.builder()
+        .addresses(List.of(new Address("127.0.0.1", 8357)));
+
+try (NanocachedClient client = NanocachedClient.connect(options)) {
+    client.set("greeting", "hello", 60);          // TTL in seconds, 0 = no expiry
+    Optional<String> value = client.get("greeting");   // empty when missing
     boolean existed = client.delete("greeting");
 }
 ```
 
 Keys and values are `byte[]`, with `String` convenience overloads
-(encoded as UTF-8). The client is thread-safe; requests are serialized
-per connection (concurrent callers queue).
+(encoded as UTF-8). `get`/`get(byte[])` decode the value as strict UTF-8
+and return `Optional<String>` (a value that isn't valid UTF-8 throws
+`java.io.UncheckedIOException`); `getBytes`/`getBytes(byte[])` return the
+raw `Optional<byte[]>` without decoding. The client is thread-safe;
+requests are serialized per connection (concurrent callers queue).
 
-## Discovery replicas
+## Addresses and discovery replicas
 
-When the cluster runs more than one discovery server, list them all;
-both the initial connect and every node-list refresh try them in order.
-A seed that is warming up after a restart (answers `B`) is skipped like
-an unreachable one; if every seed is warming up, `connect()` throws
-`NanocachedException.DiscoveryBusy` — retry shortly.
+`addresses` is a list of `Address(host, port)` pairs. A one-element list
+is the single-target case; when the cluster runs more than one discovery
+server, list them all — both the initial connect and every node-list
+refresh try them in order. An address that is warming up after a restart
+(answers `B`) is skipped like an unreachable one; if every address is
+warming up, `connect()` throws `NanocachedException.DiscoveryBusy` — retry
+shortly.
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
-        .host("10.0.0.1", 8357)
-        .host("10.0.0.2", 8357));
+        .addresses(List.of(
+                new Address("10.0.0.1", 8357),
+                new Address("10.0.0.2", 8357))));
 ```
 
 ## Replication
@@ -64,10 +77,26 @@ operations are idempotent). There is nothing to configure.
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
-        .host("cache.internal", 8357)
-        .authSecret("change-me")            // NANOCACHED_AUTH_SECRET on the server
-        .tls(SSLContext.getDefault()));     // or a context trusting a private CA
+        .addresses(List.of(new Address("cache.internal", 8357)))
+        .authSecret("change-me")   // NANOCACHED_AUTH_SECRET on the server
+        .tls(true)                 // verifies against the platform trust store
+        .ca("/etc/nanocached/ca.pem")); // optional: trust this PEM CA instead
 ```
+
+`tls` is a plain boolean, default `false`. `ca` names a PEM file of
+trusted root certificate(s) — it's meaningful only when `tls` is `true`
+(silently ignored otherwise), and an unreadable or unparseable CA file is
+a connect-time error. `ca` accepts a `java.nio.file.Path`, or a `String`
+path / `java.io.File` via convenience overloads.
+
+## close()
+
+`close()` is idempotent; a second call still succeeds but prints a
+warning to stderr (`nanocached: close() called again on an
+already-closed client`) since it usually means the caller lost track of
+this client's lifecycle. Likewise, calling `connect()` again for the
+same single address while a previous connection to it is still open
+warns to stderr — `was close() forgotten?`.
 
 ## Build
 
