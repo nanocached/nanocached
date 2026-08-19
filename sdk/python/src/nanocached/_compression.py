@@ -18,6 +18,13 @@ _MARKER_DEFLATE = 0x01
 # was chosen over a zlib/gzip wrapper.
 _WBITS_RAW_DEFLATE = -15
 
+# Bounds a DEFLATE value's expanded output. The wire cap
+# (_MAX_VALUE_LENGTH) bounds only the compressed bytes received; without
+# this, a small, highly-repetitive value written by a compromised node
+# could expand to gigabytes and exhaust client memory on a plain get (a
+# decompression bomb). Far above any realistic cache value.
+_MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024
+
 
 class DecompressionError(NanocachedError):
     """Raised by get/get_bytes when a value with ``compress`` enabled
@@ -63,7 +70,16 @@ def decompress_value(value: bytes) -> bytes:
     if marker == _MARKER_DEFLATE:
         try:
             decompressor = zlib.decompressobj(_WBITS_RAW_DEFLATE)
-            return decompressor.decompress(body) + decompressor.flush()
+            # max_length caps output; a non-empty unconsumed_tail (or an
+            # over-cap result) means more would follow — a bomb — so we stop
+            # rather than let flush() expand the rest into memory.
+            out = decompressor.decompress(body, _MAX_DECOMPRESSED_LENGTH + 1)
+            if decompressor.unconsumed_tail or len(out) > _MAX_DECOMPRESSED_LENGTH:
+                raise DecompressionError(
+                    "nanocached: decompressed value exceeds the maximum size — "
+                    "possible decompression bomb"
+                )
+            return out + decompressor.flush()
         except zlib.error as error:
             raise DecompressionError(
                 "nanocached: failed to decompress a value marked as compressed — "

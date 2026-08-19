@@ -25,6 +25,14 @@ _NO_SECRET_PLACEHOLDER = b"\x00"
 # own timeout — minutes — instead of failing over.
 CONNECT_DEADLINE = 5.0
 
+# Bound a discovery `N` response before allocation, mirroring
+# `_MAX_VALUE_LENGTH` on the `V` path: a malicious or MITM'd discovery
+# server must not be able to make the client buffer arbitrary memory, and
+# a negative length must fail cleanly rather than silently mis-slice the
+# body via Python's negative-index semantics.
+_MAX_NODE_COUNT = 1 << 16
+_MAX_NODE_FIELD_LENGTH = 64 * 1024
+
 
 @dataclass(frozen=True)
 class DiscoveredNode:
@@ -125,6 +133,8 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
     count, replication = int(fields[0]), int(fields[1])
     if replication < 1:
         raise NanocachedError("nanocached: invalid replication factor in discovery response")
+    if count < 0 or count > _MAX_NODE_COUNT:
+        raise NanocachedError("nanocached: invalid node count in discovery response")
 
     nodes: list[DiscoveredNode] = []
     for _ in range(count):
@@ -133,6 +143,13 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         if len(lengths) != 2:
             raise NanocachedError("nanocached: invalid node entry header in discovery response")
         name_length, addr_length = int(lengths[0]), int(lengths[1])
+        if (
+            name_length < 0
+            or addr_length < 0
+            or name_length > _MAX_NODE_FIELD_LENGTH
+            or addr_length > _MAX_NODE_FIELD_LENGTH
+        ):
+            raise NanocachedError("nanocached: invalid node entry lengths in discovery response")
 
         body = await reader.readexactly(name_length + addr_length + 1)  # +1: trailing '\n'
         if body[-1:] != b"\n":

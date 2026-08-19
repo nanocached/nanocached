@@ -39,6 +39,14 @@ mod deflate {
     const MARKER_RAW: u8 = 0x00;
     const MARKER_DEFLATE: u8 = 0x01;
 
+    /// Bounds a DEFLATE value's expanded output. The wire cap
+    /// (`MAX_VALUE_LENGTH`) bounds only the compressed bytes received;
+    /// without this, a small, highly-repetitive value written by a
+    /// compromised node could expand to gigabytes and exhaust client
+    /// memory on a plain `get` (a decompression bomb). Far above any
+    /// realistic cache value.
+    const MAX_DECOMPRESSED_LENGTH: u64 = 64 * 1024 * 1024;
+
     /// Below `threshold`, or when compressing doesn't actually shrink the
     /// value (incompressible data), the marker byte alone is added and
     /// the value is stored unchanged. Always returns a value with the
@@ -79,15 +87,25 @@ mod deflate {
         match marker {
             MARKER_RAW => Ok(body.to_vec()),
             MARKER_DEFLATE => {
-                let mut decoder = DeflateDecoder::new(body);
+                let decoder = DeflateDecoder::new(body);
+                // +1 so an output of exactly the cap still reads, letting a
+                // value that exceeds it be detected, not silently truncated.
+                let mut limited = decoder.take(MAX_DECOMPRESSED_LENGTH + 1);
                 let mut out = Vec::new();
-                decoder.read_to_end(&mut out).map_err(|error| {
+                limited.read_to_end(&mut out).map_err(|error| {
                     Error::Decompression(format!(
                         "nanocached: failed to decompress a value marked as compressed — did \
                          every client sharing this key enable compress (doc/adr/0013-*.md)? \
                          ({error})"
                     ))
                 })?;
+                if out.len() as u64 > MAX_DECOMPRESSED_LENGTH {
+                    return Err(Error::Decompression(
+                        "nanocached: decompressed value exceeds the maximum size — possible \
+                         decompression bomb"
+                            .to_string(),
+                    ));
+                }
                 Ok(out)
             }
             other => Err(Error::Decompression(format!(

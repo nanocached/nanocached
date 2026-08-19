@@ -146,6 +146,15 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.reader.Read(p)
 }
 
+// maxNodeCount and maxNodeFieldLength bound a discovery `N` response
+// before allocation, mirroring maxValueLength on the `V` path: a
+// malicious or MITM'd discovery server must not be able to make the
+// client pre-allocate arbitrary memory from an unverified length prefix.
+const (
+	maxNodeCount       = 1 << 16
+	maxNodeFieldLength = 64 * 1024
+)
+
 func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 	header, err := reader.ReadString('\n')
 	if err != nil {
@@ -167,7 +176,7 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 		return nil, 0, fmt.Errorf("nanocached: invalid node-list header in discovery response")
 	}
 	count, err := strconv.Atoi(fields[0])
-	if err != nil || count < 0 {
+	if err != nil || count < 0 || count > maxNodeCount {
 		return nil, 0, fmt.Errorf("nanocached: invalid node count in discovery response")
 	}
 	replication, err := strconv.Atoi(fields[1])
@@ -187,7 +196,8 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 		}
 		nameLength, err1 := strconv.Atoi(lengths[0])
 		addrLength, err2 := strconv.Atoi(lengths[1])
-		if err1 != nil || err2 != nil || nameLength < 0 || addrLength < 0 {
+		if err1 != nil || err2 != nil || nameLength < 0 || addrLength < 0 ||
+			nameLength > maxNodeFieldLength || addrLength > maxNodeFieldLength {
 			return nil, 0, fmt.Errorf("nanocached: invalid node entry lengths in discovery response")
 		}
 

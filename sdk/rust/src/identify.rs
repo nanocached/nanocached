@@ -19,6 +19,14 @@ use crate::error::{Error, Result};
 // requires a real secret correctly rejects this placeholder.
 const NO_SECRET_PLACEHOLDER: &[u8] = &[0];
 
+/// Bound a discovery `N` response before allocation, mirroring
+/// `MAX_VALUE_LENGTH` on the `V` path: a malicious or MITM'd discovery
+/// server must not be able to make the client pre-allocate (and
+/// `handle_alloc_error`-abort on) arbitrary memory from an unverified
+/// length prefix.
+const MAX_NODE_COUNT: usize = 1 << 16;
+const MAX_NODE_FIELD_LENGTH: usize = 64 * 1024;
+
 /// A node's hash-ring identity (a random per-process UUID) and its
 /// network address — two different things since doc/adr/0009-*.md.
 #[derive(Debug, Clone)]
@@ -286,6 +294,9 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
             "nanocached: invalid replication factor in discovery response".to_string(),
         ));
     }
+    if count > MAX_NODE_COUNT {
+        return Err(bad_header(()));
+    }
 
     let mut nodes = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
@@ -298,6 +309,9 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
             ),
             _ => return Err(bad_header(())),
         };
+        if name_length > MAX_NODE_FIELD_LENGTH || addr_length > MAX_NODE_FIELD_LENGTH {
+            return Err(bad_header(()));
+        }
 
         let mut body = vec![0u8; name_length + addr_length + 1]; // +1: trailing '\n'
         stream.read_exact(&mut body).await?;

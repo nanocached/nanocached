@@ -8,6 +8,13 @@ import { deflateRawSync, inflateRawSync } from "node:zlib";
 const MARKER_RAW = 0x00;
 const MARKER_DEFLATE = 0x01;
 
+// Bounds a DEFLATE value's expanded output. The wire cap (MAX_VALUE_LENGTH)
+// bounds only the compressed bytes received; without this, a small,
+// highly-repetitive value written by a compromised node could expand to
+// gigabytes and exhaust client memory on a plain get (a decompression
+// bomb). Far above any realistic cache value.
+const MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024;
+
 /** Thrown by get/getBytes when a value with `compress` enabled can't be
  * interpreted — almost always a `compress` mismatch between clients
  * sharing this key (see doc/adr/0013-*.md's compatibility caveat: every
@@ -56,7 +63,8 @@ export function decompressValue(value: Buffer): Buffer {
 
   if (marker === MARKER_DEFLATE) {
     try {
-      return inflateRawSync(body);
+      // maxOutputLength makes zlib throw rather than allocate past the cap.
+      return inflateRawSync(body, { maxOutputLength: MAX_DECOMPRESSED_LENGTH });
     } catch (error) {
       throw new DecompressionError(
         `nanocached: failed to decompress a value marked as compressed — did every client ` +

@@ -61,6 +61,16 @@ fn forwarding_grace(entries_sent: usize) -> Duration {
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds every outbound dial, write, and ack read this node makes toward
+/// another node — the migration handoff (`run_migration`) and the
+/// concurrent forwarding of client `S`/`D` to a joiner
+/// (`set_on_joining_node`/`delete_on_joining_node`). Without it, a joiner
+/// that accepts TCP but never answers (crashed-but-socket-open, a
+/// blackholed route, no keepalive configured) blocks the forwarding call
+/// forever while it still holds a `MAX_CONNECTIONS` permit; enough such
+/// requests during one stalled migration exhaust every permit. Mirrors
+/// discovery's own `OUTBOUND_IO_TIMEOUT`.
+const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK_SIZE: usize = 1024;
 /// How many times `run_migration` tries to transfer a single key to the
 /// joining node (reconnecting between tries) before giving up on the
@@ -975,7 +985,9 @@ async fn connect_client_stream(
     addr: &str,
     tls_connector: Option<&TlsConnector>,
 ) -> io::Result<ClientStream> {
-    let stream = TcpStream::connect(addr).await?;
+    let stream = timeout(OUTBOUND_IO_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound connect timed out"))??;
     let _ = stream.set_nodelay(true);
 
     match tls_connector {
@@ -1093,13 +1105,17 @@ async fn register_with_discovery(
                 let authenticated = match &auth_secret {
                     Some(secret) => {
                         let auth = auth_message(secret);
-                        match stream.write_all(&auth).await {
-                            Ok(()) => {
-                                let mut ack = [0u8; 3];
-                                stream.read_exact(&mut ack).await.is_ok() && &ack == b"Od\n"
-                            }
-                            Err(_) => false,
-                        }
+                        // Bounded so a discovery server that accepts TCP but
+                        // never drains can't wedge this task forever (and,
+                        // via `heartbeat_task.await`, hang shutdown).
+                        timeout(OUTBOUND_IO_TIMEOUT, async {
+                            stream.write_all(&auth).await?;
+                            let mut ack = [0u8; 3];
+                            stream.read_exact(&mut ack).await?;
+                            io::Result::Ok(&ack == b"Od\n")
+                        })
+                        .await
+                        .is_ok_and(|result| result.unwrap_or(false))
                     }
                     None => true,
                 };
@@ -1114,7 +1130,12 @@ async fn register_with_discovery(
                 );
                 let registration = if sending_join { &join } else { &announce };
 
-                if authenticated && stream.write_all(registration).await.is_ok() {
+                let registration_sent = authenticated
+                    && matches!(
+                        timeout(OUTBOUND_IO_TIMEOUT, stream.write_all(registration)).await,
+                        Ok(Ok(()))
+                    );
+                if registration_sent {
                     // For `J`, ADR-0008: this connection is held open by
                     // discovery (no idle timeout applies) until this node
                     // is promoted, which may take an unbounded amount of
@@ -1150,7 +1171,10 @@ async fn register_with_discovery(
                                 .map(|membership| membership.replication);
                             let heartbeat = heartbeat_message(&name, replication);
 
-                            if stream.write_all(&heartbeat).await.is_err() {
+                            if !matches!(
+                                timeout(OUTBOUND_IO_TIMEOUT, stream.write_all(&heartbeat)).await,
+                                Ok(Ok(()))
+                            ) {
                                 break;
                             }
 
@@ -1813,17 +1837,22 @@ async fn connect_and_authenticate(
     let mut stream = connect_client_stream(addr, node_context.tls_connector.as_ref()).await?;
 
     if let Some(secret) = &node_context.auth_secret {
-        stream.write_all(&auth_message(secret)).await?;
+        timeout(OUTBOUND_IO_TIMEOUT, async {
+            stream.write_all(&auth_message(secret)).await?;
 
-        let mut ack = [0u8; 3];
-        stream.read_exact(&mut ack).await?;
+            let mut ack = [0u8; 3];
+            stream.read_exact(&mut ack).await?;
 
-        if &ack != b"On\n" {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "joining node rejected the auth secret",
-            ));
-        }
+            if &ack != b"On\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "joining node rejected the auth secret",
+                ));
+            }
+            io::Result::Ok(())
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound auth timed out"))??;
     }
 
     Ok(stream)
@@ -1835,19 +1864,22 @@ async fn send_set(
     value: &[u8],
     ttl: Option<Duration>,
 ) -> io::Result<()> {
-    stream.write_all(&set_message(key, value, ttl)).await?;
+    timeout(OUTBOUND_IO_TIMEOUT, async {
+        stream.write_all(&set_message(key, value, ttl)).await?;
 
-    let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
+        let mut ack = [0u8; 2];
+        stream.read_exact(&mut ack).await?;
 
-    if &ack != b"S\n" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "joining node did not acknowledge the transferred key",
-        ));
-    }
-
-    Ok(())
+        if &ack != b"S\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "joining node did not acknowledge the transferred key",
+            ));
+        }
+        io::Result::Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound set timed out"))?
 }
 
 async fn set_on_joining_node(
@@ -1925,19 +1957,22 @@ async fn delete_on_joining_node(
 ) -> io::Result<()> {
     let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
 
-    stream.write_all(&delete_message(key)).await?;
+    timeout(OUTBOUND_IO_TIMEOUT, async {
+        stream.write_all(&delete_message(key)).await?;
 
-    let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
+        let mut ack = [0u8; 2];
+        stream.read_exact(&mut ack).await?;
 
-    if &ack != b"D\n" && &ack != b"N\n" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "joining node did not acknowledge the forwarded delete",
-        ));
-    }
-
-    Ok(())
+        if &ack != b"D\n" && &ack != b"N\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "joining node did not acknowledge the forwarded delete",
+            ));
+        }
+        io::Result::Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound delete timed out"))?
 }
 
 async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::Result<()> {
