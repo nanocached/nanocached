@@ -130,8 +130,10 @@ jobs:
           ver="${GITHUB_REF_NAME#sdk/typescript/v}"
           test "$(node -p 'require("./sdk/typescript/package.json").version')" = "$ver"
 
-      # pnpm version comes from the packageManager field in package.json
+      # pnpm version comes from the packageManager field in the SDK's package.json
       - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: sdk/typescript/package.json
 
       - uses: actions/setup-node@v7
         with:
