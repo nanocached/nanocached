@@ -3,6 +3,7 @@
 See https://github.com/nanocached/nanocached for the server and protocol.
 """
 
+from ._compression import DecompressionError
 from ._errors import (
     AlreadyClosedError,
     DiscoveryBusyError,
@@ -15,6 +16,7 @@ from .client import NanocachedClient
 
 __all__ = [
     "AlreadyClosedError",
+    "DecompressionError",
     "DiscoveredNode",
     "DiscoveryBusyError",
     "HashRing",

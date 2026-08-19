@@ -190,6 +190,90 @@ class NanocachedClientTest {
         }
     }
 
+    // ── 値の圧縮 (doc/adr/0013-*.md) ────────────────────────────────
+
+    @Test
+    void wireFormatIsUntouchedWhenCompressIsOff() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                String value = "x".repeat(1000);
+                client.set("k", value);
+                assertArrayEquals(value.getBytes(StandardCharsets.UTF_8), node.store.get("k"));
+                assertEquals(Optional.of(value), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void compressesAtOrAboveTheThresholdAndDecompressesBack() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(single("127.0.0.1", node.port())
+                    .compress(true)
+                    .compressionThreshold(64))) {
+                String value = "x".repeat(1000);
+                client.set("k", value);
+
+                byte[] stored = node.store.get("k");
+                assertEquals(0x01, stored[0]);
+                assertTrue(stored.length < value.length());
+
+                assertEquals(Optional.of(value), client.get("k"));
+                assertArrayEquals(value.getBytes(StandardCharsets.UTF_8), client.getBytes("k").orElseThrow());
+            }
+        }
+    }
+
+    @Test
+    void belowThresholdValueIsPrefixedButNotCompressed() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(single("127.0.0.1", node.port())
+                    .compress(true)
+                    .compressionThreshold(256))) {
+                client.set("k", "short");
+                byte[] expected = new byte[6];
+                expected[0] = 0x00;
+                System.arraycopy("short".getBytes(StandardCharsets.UTF_8), 0, expected, 1, 5);
+                assertArrayEquals(expected, node.store.get("k"));
+                assertEquals(Optional.of("short"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void incompressibleDataPassesThroughUnbloated() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(single("127.0.0.1", node.port())
+                    .compress(true)
+                    .compressionThreshold(16))) {
+                byte[] value = new byte[512];
+                new java.security.SecureRandom().nextBytes(value);
+                client.set("k".getBytes(StandardCharsets.UTF_8), value);
+
+                byte[] stored = node.store.get("k");
+                assertEquals(0x00, stored[0]);
+                assertArrayEquals(value, client.getBytes("k").orElseThrow());
+            }
+        }
+    }
+
+    @Test
+    void readingALegacyValueWithCompressEnabledThrowsClearly() throws Exception {
+        try (MockNode node = new MockNode()) {
+            // A legacy/uncompressed writer's value whose first byte happens
+            // to collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+            // documented hazard of enabling compress against a keyspace
+            // other clients still touch without it.
+            try (NanocachedClient writer = connect("127.0.0.1", node.port())) {
+                writer.set("k".getBytes(StandardCharsets.UTF_8), new byte[] {0x01, 2, 3, 4});
+            }
+
+            try (NanocachedClient reader = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true))) {
+                assertThrows(NanocachedException.DecompressionFailed.class, () -> reader.getBytes("k"));
+            }
+        }
+    }
+
     // ── 遅延再接続と keep-alive ───────────────────────────────────
 
     @Test

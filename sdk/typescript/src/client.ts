@@ -4,8 +4,10 @@ import type { TLSSocket } from "node:tls";
 import { Connection, ConnectionLostError, isConnectionError, WrongNodeError } from "./connection.js";
 import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
+import { compressValue, decompressValue } from "./compression.js";
 
 export { ConnectionLostError, WrongNodeError } from "./connection.js";
+export { DecompressionError } from "./compression.js";
 
 // A value decoded by get() must be exactly what set() would have encoded —
 // no silent U+FFFD replacement for bytes that aren't valid UTF-8. A single
@@ -54,7 +56,21 @@ export interface NanocachedClientOptions {
    * otherwise. An unreadable or unparseable file is a connect-time
    * error. */
   ca?: string;
+  /** Transparently compress values above `compressionThreshold` on `set`
+   * and decompress them on `get`/`getBytes` (doc/adr/0013-*.md). Off by
+   * default. **Every client that reads or writes a given set of keys must
+   * agree on this setting** — it is a per-keyspace format decision, not a
+   * per-client preference; see the ADR's Consequences before enabling
+   * this against an existing keyspace another client may still touch
+   * with `compress` off. */
+  compress?: boolean;
+  /** Values shorter than this (in bytes) are never compressed — the
+   * per-value overhead of attempting it outweighs the savings. Only
+   * meaningful when `compress` is true. Default 256. */
+  compressionThreshold?: number;
 }
+
+const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
  * lightweight request goes out on each connection real traffic has left
@@ -176,6 +192,8 @@ export class NanocachedClient {
     /** PEM contents read once from `NanocachedClientOptions.ca` (if any)
      * by connect(); reused for every dial this instance makes. */
     private readonly ca: Buffer | undefined,
+    private readonly compress: boolean,
+    private readonly compressionThreshold: number,
   ) {
     this.nodeUrls = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
@@ -192,6 +210,8 @@ export class NanocachedClient {
     // (not per-dial) and reused for every connection this instance ever
     // opens, including reconnects and node-list refreshes.
     const ca = options.tls === true && options.ca !== undefined ? readFileSync(options.ca) : undefined;
+    const compress = options.compress === true;
+    const compressionThreshold = options.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD;
 
     // Walk the addresses in order until one yields a working target. An
     // address is skipped when it's unreachable, answers `B` (ADR-0010
@@ -242,6 +262,8 @@ export class NanocachedClient {
           options.authSecret,
           options.tls,
           ca,
+          compress,
+          compressionThreshold,
         );
       }
 
@@ -291,6 +313,8 @@ export class NanocachedClient {
         options.authSecret,
         options.tls,
         ca,
+        compress,
+        compressionThreshold,
       );
     }
 
@@ -342,26 +366,34 @@ export class NanocachedClient {
   }
 
   /** The raw-bytes companion to `get`: same routing/retry/cluster
-   * behavior, no decoding. */
+   * behavior, no decoding. Transparently decompresses when `compress` is
+   * enabled (doc/adr/0013-*.md). */
   async getBytes(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.withWrongNodeRetry(() =>
+    const value = await this.withWrongNodeRetry(() =>
       this.target.kind === "single"
         ? this.singleConnection().then((connection) => connection.get(key))
         : this.readFromOwners(key, (connection) => connection.get(key)),
     );
+    if (value === null || !this.compress) return value;
+    return decompressValue(value);
   }
 
   /** `ttlSeconds` (whole seconds, default 0) is when the key expires; 0
-   * means no expiry. Must be a non-negative integer. */
+   * means no expiry. Must be a non-negative integer. Transparently
+   * compresses values at or above `compressionThreshold` when `compress`
+   * is enabled (doc/adr/0013-*.md). */
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
+    const outgoing = this.compress
+      ? compressValue(typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value), this.compressionThreshold)
+      : value;
     return this.withWrongNodeRetry(() =>
       this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.set(key, value, ttlSeconds))
-        : this.writeToOwners(key, (connection) => connection.set(key, value, ttlSeconds)),
+        ? this.singleConnection().then((connection) => connection.set(key, outgoing, ttlSeconds))
+        : this.writeToOwners(key, (connection) => connection.set(key, outgoing, ttlSeconds)),
     );
   }
 

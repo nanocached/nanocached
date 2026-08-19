@@ -49,6 +49,22 @@ public sealed class NanocachedClient : IDisposable
         /// <see cref="Tls"/> is true; an unreadable or unparseable file is
         /// a connect-time error.</summary>
         public string? Ca { get; set; }
+
+        /// <summary>Transparently compress values above
+        /// <see cref="CompressionThreshold"/> on set and decompress them
+        /// on get/getBytes (doc/adr/0013-*.md). Off by default. <b>Every
+        /// client that reads or writes a given set of keys must agree on
+        /// this setting</b> — it is a per-keyspace format decision, not a
+        /// per-client preference; see the ADR's Consequences before
+        /// enabling this against an existing keyspace another client may
+        /// still touch with <see cref="Compress"/> off.</summary>
+        public bool Compress { get; set; }
+
+        /// <summary>Values shorter than this (in bytes) are never
+        /// compressed — the per-value overhead of attempting it outweighs
+        /// the savings. Only meaningful when <see cref="Compress"/> is
+        /// true. Default 256.</summary>
+        public int CompressionThreshold { get; set; } = 256;
     }
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -89,6 +105,8 @@ public sealed class NanocachedClient : IDisposable
     private readonly List<(string Host, int Port)> _addresses;
     private readonly byte[]? _authSecret;
     private readonly SslClientAuthenticationOptions? _tls;
+    private readonly bool _compress;
+    private readonly int _compressionThreshold;
     private readonly CancellationTokenSource _lifetime = new();
 
     private volatile bool _closed;
@@ -110,6 +128,8 @@ public sealed class NanocachedClient : IDisposable
         _addresses = options.Addresses.ToList();
         _authSecret = options.AuthSecret is null ? null : Encoding.UTF8.GetBytes(options.AuthSecret);
         _tls = BuildTlsOptions(options);
+        _compress = options.Compress;
+        _compressionThreshold = options.CompressionThreshold;
     }
 
     /// <summary>Builds the internal TLS options for every dial this client
@@ -282,19 +302,25 @@ public sealed class NanocachedClient : IDisposable
 
     public Task<byte[]?> GetBytesAsync(string key) => GetBytesAsync(Encoding.UTF8.GetBytes(key));
 
-    /// <summary>Returns the raw value, or <c>null</c> when the key is missing.</summary>
+    /// <summary>Returns the raw value, or <c>null</c> when the key is
+    /// missing. Transparently decompresses when <c>Compress</c> is
+    /// enabled (doc/adr/0013-*.md).</summary>
     public async Task<byte[]?> GetBytesAsync(byte[] key)
     {
         await BeforeOperationAsync().ConfigureAwait(false);
-        return await WithClusterRetryAsync(
+        byte[]? value = await WithClusterRetryAsync(
             () => ReadAsync(key, connection => connection.GetAsync(key))).ConfigureAwait(false);
+        return value is null || !_compress ? value : Compression.DecompressValue(value);
     }
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
     public Task SetAsync(string key, string value, long ttlSeconds = 0) =>
         SetAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
 
-    /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
+    /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no
+    /// expiry. Transparently compresses values at or above
+    /// <c>CompressionThreshold</c> when <c>Compress</c> is enabled
+    /// (doc/adr/0013-*.md).</summary>
     public async Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0)
     {
         if (ttlSeconds < 0)
@@ -302,12 +328,13 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(ttlSeconds), $"nanocached: ttlSeconds must be non-negative, got {ttlSeconds}");
         }
+        byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
         await BeforeOperationAsync().ConfigureAwait(false);
         await WithClusterRetryAsync<object?>(async () =>
         {
             await WriteAsync<object?>(key, async connection =>
             {
-                await connection.SetAsync(key, value, ttlSeconds).ConfigureAwait(false);
+                await connection.SetAsync(key, outgoing, ttlSeconds).ConfigureAwait(false);
                 return null;
             }).ConfigureAwait(false);
             return null;

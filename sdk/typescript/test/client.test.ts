@@ -1,5 +1,6 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
 import { KEEPALIVE_TUNING } from "../src/client.js";
@@ -239,6 +240,122 @@ describe("NanocachedClient against a single node", () => {
       }
     } finally {
       warn.mock.restore();
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient value compression (doc/adr/0013-*.md)", () => {
+  it("does not touch the wire format when compress is off (the default)", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const value = "x".repeat(1000);
+        await client.set("k", value);
+        assert.deepEqual(node.store.get("k"), Buffer.from(value, "utf8"));
+        assert.equal(await client.get("k"), value);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("compresses a value at or above compressionThreshold and decompresses it back", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 64,
+      });
+      try {
+        const value = "x".repeat(1000);
+        await client.set("k", value);
+
+        const stored = node.store.get("k")!;
+        assert.equal(stored[0], 0x01, "expected the DEFLATE marker byte on the wire");
+        assert.ok(stored.length < value.length, "a highly repetitive value must actually shrink on the wire");
+
+        assert.equal(await client.get("k"), value);
+        assert.deepEqual(await client.getBytes("k"), Buffer.from(value, "utf8"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("leaves a value below compressionThreshold unmarked-but-prefixed on the wire", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 256,
+      });
+      try {
+        await client.set("k", "short");
+        const stored = node.store.get("k")!;
+        assert.deepEqual(stored, Buffer.concat([Buffer.from([0x00]), Buffer.from("short", "utf8")]));
+        assert.equal(await client.get("k"), "short");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("passes incompressible data through unmarked-but-prefixed rather than bloating it", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 16,
+      });
+      try {
+        const value = randomBytes(512);
+        await client.set("k", value);
+        const stored = node.store.get("k")!;
+        assert.deepEqual(stored, Buffer.concat([Buffer.from([0x00]), value]));
+        assert.deepEqual(await client.getBytes("k"), value);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("rejects a value written by a compress-disabled client with a clear error, not silent corruption", async () => {
+    const node = await startMockNode();
+    try {
+      const writer = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        // A legacy/uncompressed writer's value whose first byte happens to
+        // collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+        // documented hazard of enabling compress against a keyspace other
+        // clients still touch without it.
+        await writer.set("k", Uint8Array.from([0x01, 2, 3, 4]));
+      } finally {
+        writer.close();
+      }
+
+      const reader = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        await assert.rejects(() => reader.getBytes("k"), /decompress|marker/);
+      } finally {
+        reader.close();
+      }
+    } finally {
       await node.close();
     }
   });

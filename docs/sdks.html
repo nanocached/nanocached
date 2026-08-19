@@ -37,10 +37,11 @@ code.</p>
 <p>Every SDK ships the full feature set: authentication, TLS, discovery
 replica lists, replication-aware routing (reads fail over, writes fan out
 to all R owners), transparent reconnect with a single retry, always-on
-keep-alive, and the same rendezvous-hashing pipeline verified against
-shared cross-language test vectors. Values are strings first: every
-<code>get</code> returns a string (strict UTF-8), with a
-<code>get_bytes</code>-style companion for raw byte values.</p>
+keep-alive, opt-in transparent value compression, and the same
+rendezvous-hashing pipeline verified against shared cross-language test
+vectors. Values are strings first: every <code>get</code> returns a
+string (strict UTF-8), with a <code>get_bytes</code>-style companion for
+raw byte values.</p>
 
 <div class="table-wrap">
 <table>
@@ -160,6 +161,11 @@ existed, err := client.Delete("greeting")</code></pre>
   keep-alive), and redial transparently if one does die.</li>
   <li><b>Concurrency</b> — every client is safe for concurrent use;
   requests are serialized per connection.</li>
+  <li><b>Value compression</b> — off by default; when enabled, values at
+  or above a configurable threshold are transparently DEFLATE-compressed
+  on write and decompressed on read. Every client touching a given
+  keyspace must agree on the setting (<a
+  href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0013-transparent-opt-in-value-compression-in-the-sdks.md">ADR-0013</a>).</li>
 </ul>
 
 </main>

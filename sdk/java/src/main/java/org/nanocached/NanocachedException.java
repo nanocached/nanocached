@@ -47,4 +47,21 @@ public class NanocachedException extends RuntimeException {
             super(message, cause);
         }
     }
+
+    /**
+     * Raised by get/getBytes when a value with {@code compress} enabled
+     * can't be interpreted — almost always a {@code compress} mismatch
+     * between clients sharing this key (doc/adr/0013-*.md's compatibility
+     * caveat: every client touching a given keyspace must agree on
+     * {@code compress}), not a transient failure.
+     */
+    public static final class DecompressionFailed extends NanocachedException {
+        public DecompressionFailed(String message) {
+            super(message);
+        }
+
+        public DecompressionFailed(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
 }

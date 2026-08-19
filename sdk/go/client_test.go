@@ -6,6 +6,7 @@ package nanocached
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"
@@ -530,6 +531,158 @@ func TestConnectWarnsWhenAPreviousConnectionToTheSameAddressIsStillOpen(t *testi
 
 	if !strings.Contains(output, "was close() forgotten") {
 		t.Fatalf("expected forgotten-close warning, got %q", output)
+	}
+}
+
+// ── 値の圧縮 (doc/adr/0013-*.md) ────────────────────────────────────
+
+func TestWireFormatIsUntouchedWhenCompressIsOff(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value := strings.Repeat("x", 1000)
+	if err := client.Set("k", value, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, ok := node.store.Load("k")
+	if !ok || !bytes.Equal(stored.([]byte), []byte(value)) {
+		t.Fatalf("stored = %v, %v", stored, ok)
+	}
+	got, ok, err := client.Get("k")
+	if err != nil || !ok || got != value {
+		t.Fatalf("Get = %q, %v, %v", got, ok, err)
+	}
+}
+
+func TestCompressesAtOrAboveTheThresholdAndDecompressesBack(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{
+		Addresses:            []Address{addr(node.address())},
+		Compress:             true,
+		CompressionThreshold: 64,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value := strings.Repeat("x", 1000)
+	if err := client.Set("k", value, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	storedAny, ok := node.store.Load("k")
+	if !ok {
+		t.Fatal("value not stored")
+	}
+	stored := storedAny.([]byte)
+	if stored[0] != compressionMarkerDeflate {
+		t.Fatalf("marker = %d, want %d", stored[0], compressionMarkerDeflate)
+	}
+	if len(stored) >= len(value) {
+		t.Fatalf("compressed length %d >= original length %d", len(stored), len(value))
+	}
+
+	got, ok, err := client.Get("k")
+	if err != nil || !ok || got != value {
+		t.Fatalf("Get = %q, %v, %v", got, ok, err)
+	}
+	gotBytes, ok, err := client.GetBytes("k")
+	if err != nil || !ok || !bytes.Equal(gotBytes, []byte(value)) {
+		t.Fatalf("GetBytes = %v, %v, %v", gotBytes, ok, err)
+	}
+}
+
+func TestBelowThresholdValueIsPrefixedButNotCompressed(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{
+		Addresses: []Address{addr(node.address())},
+		Compress:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "short", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	storedAny, ok := node.store.Load("k")
+	if !ok {
+		t.Fatal("value not stored")
+	}
+	want := append([]byte{compressionMarkerRaw}, []byte("short")...)
+	if !bytes.Equal(storedAny.([]byte), want) {
+		t.Fatalf("stored = %v, want %v", storedAny, want)
+	}
+
+	got, ok, err := client.Get("k")
+	if err != nil || !ok || got != "short" {
+		t.Fatalf("Get = %q, %v, %v", got, ok, err)
+	}
+}
+
+func TestIncompressibleDataPassesThroughUnbloatedIntegration(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{
+		Addresses:            []Address{addr(node.address())},
+		Compress:             true,
+		CompressionThreshold: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value := make([]byte, 512)
+	if _, err := rand.Read(value); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetBytes("k", value, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	storedAny, ok := node.store.Load("k")
+	if !ok {
+		t.Fatal("value not stored")
+	}
+	want := append([]byte{compressionMarkerRaw}, value...)
+	if !bytes.Equal(storedAny.([]byte), want) {
+		t.Fatalf("stored = %v, want %v", storedAny, want)
+	}
+
+	got, ok, err := client.GetBytes("k")
+	if err != nil || !ok || !bytes.Equal(got, value) {
+		t.Fatalf("GetBytes = %v, %v, %v", got, ok, err)
+	}
+}
+
+func TestReadingALegacyValueWithCompressEnabledErrorsClearly(t *testing.T) {
+	node := startMockNode(t, nil)
+
+	// A legacy/uncompressed writer's value whose first byte happens to
+	// collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+	// documented hazard of enabling Compress against a keyspace other
+	// clients still touch without it. The remaining bytes are chosen to
+	// reliably fail DEFLATE decoding (raw DEFLATE has no checksum, so not
+	// every garbage body does — see compression_test.go's own pinned
+	// test).
+	node.store.Store("k", []byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF})
+
+	reader, err := Connect(Config{Addresses: []Address{addr(node.address())}, Compress: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	if _, _, err := reader.GetBytes("k"); !errors.Is(err, ErrDecompression) {
+		t.Fatalf("err = %v, want ErrDecompression", err)
 	}
 }
 

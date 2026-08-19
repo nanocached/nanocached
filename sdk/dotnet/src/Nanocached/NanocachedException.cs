@@ -44,3 +44,17 @@ public sealed class ConnectionLostException : NanocachedException
 
     public ConnectionLostException(string message, Exception inner) : base(message, inner) { }
 }
+
+/// <summary>
+/// Raised by GetAsync/GetBytesAsync when a value with <c>Compress</c>
+/// enabled can't be interpreted — almost always a <c>Compress</c>
+/// mismatch between clients sharing this key (doc/adr/0013-*.md's
+/// compatibility caveat: every client touching a given keyspace must
+/// agree on <c>Compress</c>), not a transient failure.
+/// </summary>
+public sealed class DecompressionException : NanocachedException
+{
+    public DecompressionException(string message) : base(message) { }
+
+    public DecompressionException(string message, Exception inner) : base(message, inner) { }
+}

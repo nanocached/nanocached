@@ -89,6 +89,34 @@ trusted root certificate(s) — it's meaningful only when `tls` is `true`
 a connect-time error. `ca` accepts a `java.nio.file.Path`, or a `String`
 path / `java.io.File` via convenience overloads.
 
+## Value compression
+
+Off by default. When enabled, values at or above `compressionThreshold`
+bytes are transparently DEFLATE-compressed on `set` and decompressed on
+`get`/`getBytes` (doc/adr/0013-\*.md):
+
+```java
+NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+        .addresses(List.of(new Address("cache.internal", 8357)))
+        .compress(true)
+        .compressionThreshold(256)); // default; bytes, below which values are stored as-is
+```
+
+**Every client that reads or writes a given set of keys must agree on
+`compress`.** This is a per-keyspace format decision, not a per-client
+preference — enabling it prefixes every value this client writes with a
+one-byte marker, so a client with `compress(false)` reading one of those
+values gets the marker byte back as if it were part of the value (wrong,
+silently), and a client with `compress(true)` reading a value written
+before compression was enabled anywhere risks misreading that value's
+first byte as the marker (a `NanocachedException.DecompressionFailed`, or
+— if that byte happens to be the "uncompressed" marker by chance — a
+silently wrong read). There is no dual-mode migration path: only turn
+this on for a fresh keyspace, or only after every client touching an
+existing one has upgraded and enabled it together. Incompressible data
+(already-compressed media, random bytes) is passed through unchanged
+rather than bloated.
+
 ## close()
 
 `close()` is idempotent; a second call still succeeds but prints a

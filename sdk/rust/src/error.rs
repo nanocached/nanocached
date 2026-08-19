@@ -27,6 +27,13 @@ pub enum Error {
     /// that isn't valid UTF-8 raises this instead of lossily replacing
     /// the invalid bytes. Use `get_bytes` for the raw value.
     InvalidUtf8(std::string::FromUtf8Error),
+    /// `get`/`get_bytes` when a value with `compress` enabled can't be
+    /// interpreted — almost always a `compress` mismatch between clients
+    /// sharing this key (doc/adr/0013-*.md's compatibility caveat: every
+    /// client touching a given keyspace must agree on `compress`), not a
+    /// transient failure.
+    #[cfg(feature = "compression")]
+    Decompression(String),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +52,8 @@ impl fmt::Display for Error {
             Error::InvalidUtf8(error) => {
                 write!(f, "nanocached: value is not valid UTF-8: {error}")
             }
+            #[cfg(feature = "compression")]
+            Error::Decompression(message) => write!(f, "{message}"),
         }
     }
 }

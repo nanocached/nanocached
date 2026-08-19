@@ -21,6 +21,7 @@ import threading
 import time
 from collections.abc import Sequence
 
+from ._compression import compress_value, decompress_value
 from ._connection import Connection
 from ._errors import AlreadyClosedError, NanocachedError, WrongNodeError
 from ._hashring import HashRing
@@ -30,6 +31,11 @@ from ._identify import (
     connect_and_identify,
     split_host_port,
 )
+
+# doc/adr/0013-*.md: values shorter than this (bytes) are never
+# compressed — the per-value overhead of attempting it outweighs the
+# savings. Only meaningful when compress=True.
+_DEFAULT_COMPRESSION_THRESHOLD = 256
 
 # How long the node list may go without a re-fetch from discovery before
 # get/set/delete refreshes it first (checked lazily on use).
@@ -114,6 +120,8 @@ class NanocachedClient:
         self._addresses: list[tuple[str, int]] = []
         self._auth_secret: bytes | None = None
         self._ssl_context: ssl_module.SSLContext | None = None
+        self._compress: bool = False
+        self._compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -130,6 +138,8 @@ class NanocachedClient:
         auth_secret: str | None = None,
         tls: bool = False,
         ca: str | os.PathLike | None = None,
+        compress: bool = False,
+        compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
@@ -138,6 +148,8 @@ class NanocachedClient:
         client._addresses = list(addresses)
         client._auth_secret = auth_secret.encode("utf-8") if auth_secret is not None else None
         client._ssl_context = _build_ssl_context(tls, ca)
+        client._compress = compress
+        client._compression_threshold = compression_threshold
 
         # Walk the addresses until one yields a working target; an address
         # that is unreachable, warming up (`B`, ADR-0010), or knows no live
@@ -231,12 +243,16 @@ class NanocachedClient:
 
     async def get_bytes(self, key: str | bytes) -> bytes | None:
         """The raw companion to get(): no UTF-8 decoding, so it never
-        raises on a value that isn't valid UTF-8."""
+        raises on a value that isn't valid UTF-8. Transparently
+        decompresses when ``compress`` is enabled (doc/adr/0013-*.md)."""
         key_bytes = _to_bytes(key)
         await self._before_operation()
-        return await self._with_wrong_node_retry(
+        value = await self._with_wrong_node_retry(
             lambda: self._read(key_bytes, lambda connection: connection.get(key_bytes))
         )
+        if value is None or not self._compress:
+            return value
+        return decompress_value(value)
 
     async def get(self, key: str | bytes) -> str | None:
         """Strict UTF-8 decode of the stored value (bytes.decode()) — a
@@ -249,10 +265,15 @@ class NanocachedClient:
         self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
     ) -> None:
         """``ttl_seconds`` is whole seconds; 0 (the default) means no
-        expiry. Negative values are rejected eagerly, before any I/O."""
+        expiry. Negative values are rejected eagerly, before any I/O.
+        Transparently compresses values at or above
+        ``compression_threshold`` when ``compress`` is enabled
+        (doc/adr/0013-*.md)."""
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
             raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
+        if self._compress:
+            value_bytes = compress_value(value_bytes, self._compression_threshold)
         await self._before_operation()
         await self._with_wrong_node_retry(
             lambda: self._write(

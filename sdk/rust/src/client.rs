@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
+use crate::compression::resolve_compression;
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::hash_ring::HashRing;
@@ -39,13 +40,32 @@ const KEEPALIVE_KEY: &[u8] = &[0];
 pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(30_000);
 
+/// doc/adr/0013-*.md: values shorter than this (bytes) are never
+/// compressed — the per-value overhead of attempting it outweighs the
+/// savings. Only meaningful when `compress(true)`.
+const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
+
 /// Options for [`NanocachedClient::connect`].
-#[derive(Default)]
 pub struct Options {
     addresses: Vec<(String, u16)>,
     auth_secret: Option<String>,
     tls: bool,
     ca: Option<std::path::PathBuf>,
+    compress: bool,
+    compression_threshold: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            addresses: Vec::new(),
+            auth_secret: None,
+            tls: false,
+            ca: None,
+            compress: false,
+            compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
+        }
+    }
 }
 
 impl Options {
@@ -97,6 +117,30 @@ impl Options {
         self.ca = Some(path.into());
         self
     }
+
+    /// Transparently compress values above [`Self::compression_threshold`]
+    /// on `set` and decompress them on `get`/`get_bytes`
+    /// (doc/adr/0013-*.md). Off by default. Requires the `compression`
+    /// feature (a default feature — disable it with `default-features =
+    /// false` to opt out); without it, `compress(true)` fails at
+    /// `connect()` time instead of failing to compile. **Every client
+    /// that reads or writes a given set of keys must agree on this
+    /// setting** — it is a per-keyspace format decision, not a
+    /// per-client preference; see the ADR's Consequences before enabling
+    /// this against an existing keyspace another client may still touch
+    /// with `compress` off.
+    pub fn compress(mut self, enabled: bool) -> Self {
+        self.compress = enabled;
+        self
+    }
+
+    /// Values shorter than this (in bytes) are never compressed — the
+    /// per-value overhead of attempting it outweighs the savings. Only
+    /// meaningful when [`Self::compress`] is enabled. Default 256.
+    pub fn compression_threshold(mut self, bytes: usize) -> Self {
+        self.compression_threshold = bytes;
+        self
+    }
 }
 
 struct Member {
@@ -128,6 +172,8 @@ struct Inner {
     /// SDK's `this.url`).
     tracking_key: String,
     closed: AtomicBool,
+    compress: bool,
+    compression_threshold: usize,
 }
 
 impl Inner {
@@ -168,6 +214,7 @@ impl NanocachedClient {
         }
 
         let tls = resolve_tls(options.tls, options.ca.as_deref())?;
+        let compress = resolve_compression(options.compress)?;
         let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
 
         // Walk the addresses until one yields a working target; an
@@ -301,6 +348,8 @@ impl NanocachedClient {
             tls,
             tracking_key,
             closed: AtomicBool::new(false),
+            compress,
+            compression_threshold: options.compression_threshold,
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -394,23 +443,44 @@ impl NanocachedClient {
         }
     }
 
+    /// Transparently decompresses when `compress` is enabled
+    /// (doc/adr/0013-*.md).
     pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         self.before_operation().await?;
-        self.with_cluster_retry(|| {
-            self.read(key, |connection| async move { connection.get(key).await })
-        })
-        .await
+        let value = self
+            .with_cluster_retry(|| {
+                self.read(key, |connection| async move { connection.get(key).await })
+            })
+            .await?;
+        match value {
+            Some(bytes) if self.inner.compress => {
+                Ok(Some(crate::compression::decompress_value(&bytes)?))
+            }
+            other => Ok(other),
+        }
     }
 
-    /// `ttl_seconds == 0` means no expiry.
+    /// `ttl_seconds == 0` means no expiry. Transparently compresses
+    /// values at or above `compression_threshold` when `compress` is
+    /// enabled (doc/adr/0013-*.md).
     pub async fn set(
         &self,
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
         ttl_seconds: u64,
     ) -> Result<()> {
-        let (key, value) = (key.as_ref(), value.as_ref());
+        let key = key.as_ref();
+        let owned_compressed;
+        let value: &[u8] = if self.inner.compress {
+            owned_compressed = crate::compression::compress_value(
+                value.as_ref(),
+                self.inner.compression_threshold,
+            );
+            &owned_compressed
+        } else {
+            value.as_ref()
+        };
         self.before_operation().await?;
         self.with_cluster_retry(|| {
             self.write(key, move |connection| async move {

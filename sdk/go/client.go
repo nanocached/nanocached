@@ -65,7 +65,24 @@ type Config struct {
 	// platform/system trust store. Only meaningful when TLS is true; a
 	// set CA is silently ignored when TLS is false.
 	CA string
+	// Compress transparently DEFLATE-compresses values at or above
+	// CompressionThreshold on Set/SetBytes and decompresses them on
+	// Get/GetBytes (doc/adr/0013-*.md). Off by default. Every client that
+	// reads or writes a given set of keys must agree on Compress — it is
+	// a per-keyspace format decision, not a per-client preference.
+	Compress bool
+	// CompressionThreshold is the byte length at or above which Compress
+	// actually compresses a value; below it (or when compressing doesn't
+	// shrink the value) the value is stored as-is behind the marker
+	// byte, to avoid bloating small values with compression overhead.
+	// Zero means DefaultCompressionThreshold. Only meaningful when
+	// Compress is true.
+	CompressionThreshold int
 }
+
+// DefaultCompressionThreshold is the CompressionThreshold used when
+// Config.CompressionThreshold is left at zero.
+const DefaultCompressionThreshold = 256
 
 // keepAliveInterval is the always-on keep-alive cadence (issue #27):
 // half the server's 60s idle timeout, so it never severs a healthy
@@ -87,6 +104,9 @@ type Client struct {
 	addresses  []Address
 	authSecret []byte
 	tlsConfig  *tls.Config
+
+	compress             bool
+	compressionThreshold int
 
 	// targetKey is the address this client's connect() ultimately settled
 	// on — a node's own address in single mode, the winning discovery
@@ -164,14 +184,21 @@ func Connect(config Config) (*Client, error) {
 		return nil, err
 	}
 
+	compressionThreshold := config.CompressionThreshold
+	if compressionThreshold == 0 {
+		compressionThreshold = DefaultCompressionThreshold
+	}
+
 	client := &Client{
-		redialGates:   map[string]*sync.Mutex{},
-		addresses:     append([]Address(nil), config.Addresses...),
-		tlsConfig:     tlsConfig,
-		members:       map[string]*member{},
-		replication:   1,
-		lastFetch:     time.Now(),
-		stopKeepalive: make(chan struct{}),
+		redialGates:          map[string]*sync.Mutex{},
+		addresses:            append([]Address(nil), config.Addresses...),
+		tlsConfig:            tlsConfig,
+		members:              map[string]*member{},
+		replication:          1,
+		lastFetch:            time.Now(),
+		stopKeepalive:        make(chan struct{}),
+		compress:             config.Compress,
+		compressionThreshold: compressionThreshold,
 	}
 	if config.AuthSecret != "" {
 		client.authSecret = []byte(config.AuthSecret)
@@ -305,7 +332,8 @@ func (c *Client) Get(key string) (value string, ok bool, err error) {
 }
 
 // GetBytes returns the key's raw value; ok is false when the key is
-// missing.
+// missing. Transparently decompresses when Config.Compress is enabled
+// (doc/adr/0013-*.md).
 func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	if err := c.beforeOperation(); err != nil {
 		return nil, false, err
@@ -318,6 +346,10 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 			return opErr
 		})
 	})
+	if err != nil || !ok || !c.compress {
+		return value, ok, err
+	}
+	value, err = decompressValue(value)
 	return value, ok, err
 }
 
@@ -329,6 +361,8 @@ func (c *Client) Set(key, value string, ttlSeconds int64) error {
 
 // SetBytes stores the raw value under the key. ttlSeconds is a whole
 // number of seconds; 0 means no expiry, negative is rejected.
+// Transparently compresses values at or above Config.CompressionThreshold
+// when Config.Compress is enabled (doc/adr/0013-*.md).
 func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 	if ttlSeconds < 0 {
 		return fmt.Errorf("nanocached: ttlSeconds must not be negative, got %d", ttlSeconds)
@@ -340,10 +374,14 @@ func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 	if ttlSeconds > 0 {
 		wireTTL = ttlSeconds
 	}
+	outgoing := value
+	if c.compress {
+		outgoing = compressValue(value, c.compressionThreshold)
+	}
 	keyBytes := []byte(key)
 	return c.withClusterRetry(func() error {
 		return c.write(keyBytes, func(conn *connection, _ bool) error {
-			return conn.set(keyBytes, value, wireTTL)
+			return conn.set(keyBytes, outgoing, wireTTL)
 		})
 	})
 }

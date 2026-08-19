@@ -95,6 +95,36 @@ raw, ok, err := client.GetBytes("k")           // []byte
 `ttlSeconds` is a whole number of seconds; `0` means no expiry. A
 negative `ttlSeconds` is rejected before any network call.
 
+## Value compression
+
+Off by default. When enabled, values at or above `CompressionThreshold`
+bytes are transparently DEFLATE-compressed on `Set`/`SetBytes` and
+decompressed on `Get`/`GetBytes` (doc/adr/0013-\*.md):
+
+```go
+client, err := nanocached.Connect(nanocached.Config{
+    Addresses:            []nanocached.Address{{Host: "cache.internal", Port: 8357}},
+    Compress:             true,
+    CompressionThreshold: 256, // default; bytes, below which values are stored as-is
+})
+```
+
+**Every client that reads or writes a given set of keys must agree on
+`Compress`.** This is a per-keyspace format decision, not a per-client
+preference — enabling it prefixes every value this client writes with a
+one-byte marker, so a client with `Compress: false` reading one of those
+values gets the marker byte back as if it were part of the value
+(wrong, silently), and a client with `Compress: true` reading a value
+written before compression was enabled anywhere risks misreading that
+value's first byte as the marker (an `ErrDecompression`, or — if that
+byte happens to be the "uncompressed" marker by chance, or the decoder
+doesn't reject the garbage that follows it — a silently wrong read; raw
+DEFLATE has no checksum). There is no dual-mode migration path: only
+turn this on for a fresh keyspace, or only after every client touching
+an existing one has upgraded and enabled it together. Incompressible
+data (already-compressed media, random bytes) is passed through
+unchanged rather than bloated.
+
 ## Notes
 
 - This SDK speaks the current wire protocol (rendezvous hashing,

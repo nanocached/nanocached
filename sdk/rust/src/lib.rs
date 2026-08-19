@@ -4,6 +4,7 @@
 //! protocol, and this crate's README for usage.
 
 mod client;
+mod compression;
 mod connection;
 mod error;
 mod hash_ring;

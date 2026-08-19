@@ -1,11 +1,13 @@
 import asyncio
 import contextlib
 import io
+import os
 import ssl
 import unittest
 
 from nanocached import (
     AlreadyClosedError,
+    DecompressionError,
     DiscoveryBusyError,
     HashRing,
     NanocachedClient,
@@ -160,6 +162,81 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(client.replication, 1)
         finally:
             client.close()
+
+
+class CompressionTests(unittest.IsolatedAsyncioTestCase):
+    """doc/adr/0013-*.md."""
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_wire_format_is_untouched_when_compress_is_off(self):
+        client = await self.connect()
+        try:
+            value = "x" * 1000
+            await client.set("k", value)
+            self.assertEqual(self.node.store[b"k"], value.encode("utf-8"))
+            self.assertEqual(await client.get("k"), value)
+        finally:
+            client.close()
+
+    async def test_compresses_at_or_above_the_threshold_and_decompresses_back(self):
+        client = await self.connect(compress=True, compression_threshold=64)
+        try:
+            value = "x" * 1000
+            await client.set("k", value)
+
+            stored = self.node.store[b"k"]
+            self.assertEqual(stored[0], 0x01)
+            self.assertLess(len(stored), len(value))
+
+            self.assertEqual(await client.get("k"), value)
+            self.assertEqual(await client.get_bytes("k"), value.encode("utf-8"))
+        finally:
+            client.close()
+
+    async def test_below_threshold_value_is_prefixed_but_not_compressed(self):
+        client = await self.connect(compress=True, compression_threshold=256)
+        try:
+            await client.set("k", "short")
+            self.assertEqual(self.node.store[b"k"], bytes([0x00]) + b"short")
+            self.assertEqual(await client.get("k"), "short")
+        finally:
+            client.close()
+
+    async def test_incompressible_data_passes_through_unbloated(self):
+        client = await self.connect(compress=True, compression_threshold=16)
+        try:
+            value = os.urandom(512)
+            await client.set("k", value)
+            self.assertEqual(self.node.store[b"k"], bytes([0x00]) + value)
+            self.assertEqual(await client.get_bytes("k"), value)
+        finally:
+            client.close()
+
+    async def test_reading_a_legacy_value_with_compress_enabled_raises_clearly(self):
+        writer = await self.connect()
+        try:
+            # A legacy/uncompressed writer's value whose first byte happens
+            # to collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+            # documented hazard of enabling compress against a keyspace
+            # other clients still touch without it.
+            await writer.set("k", bytes([0x01, 2, 3, 4]))
+        finally:
+            writer.close()
+
+        reader = await self.connect(compress=True)
+        try:
+            with self.assertRaises(DecompressionError):
+                await reader.get_bytes("k")
+        finally:
+            reader.close()
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):

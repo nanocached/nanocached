@@ -112,6 +112,40 @@ let options = Options::new()
     .ca("/etc/nanocached/ca.pem");            // a private CA instead
 ```
 
+## Value compression
+
+Off by default. When enabled, values at or above `compression_threshold`
+bytes are transparently DEFLATE-compressed on `set` and decompressed on
+`get`/`get_bytes` (doc/adr/0013-\*.md). Behind the `compression` feature,
+enabled by default alongside `tls`:
+
+```rust
+let options = Options::new()
+    .addresses([("cache.internal", 8357)])
+    .compress(true)
+    .compression_threshold(256); // default; bytes, below which values are stored as-is
+```
+
+Without the `compression` feature, `compress(true)` is a `connect()`-time
+error instead of a compile error — same shape as `tls(true)` without the
+`tls` feature.
+
+**Every client that reads or writes a given set of keys must agree on
+`compress`.** This is a per-keyspace format decision, not a per-client
+preference — enabling it prefixes every value this client writes with a
+one-byte marker, so a client with `compress(false)` reading one of those
+values gets the marker byte back as if it were part of the value (wrong,
+silently), and a client with `compress(true)` reading a value written
+before compression was enabled anywhere risks misreading that value's
+first byte as the marker (an `Error::Decompression`, or — if that byte
+happens to be the "uncompressed" marker by chance, or the decoder doesn't
+reject the garbage that follows it — a silently wrong read; raw DEFLATE
+has no checksum). There is no dual-mode migration path: only turn this on
+for a fresh keyspace, or only after every client touching an existing one
+has upgraded and enabled it together. Incompressible data
+(already-compressed media, random bytes) is passed through unchanged
+rather than bloated.
+
 ## Notes
 
 - This SDK speaks the current wire protocol (rendezvous hashing,

@@ -57,6 +57,8 @@ public final class NanocachedClient implements AutoCloseable {
         private byte[] authSecret;
         private boolean tls;
         private Path ca;
+        private boolean compress;
+        private int compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD;
 
         /** Discovery replicas (ADR-0010), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -95,7 +97,30 @@ public final class NanocachedClient implements AutoCloseable {
         public Options ca(File file) {
             return ca(file.toPath());
         }
+
+        /** Transparently compress values above {@link #compressionThreshold}
+         * on set and decompress them on get/getBytes (doc/adr/0013-*.md).
+         * Off by default. <b>Every client that reads or writes a given set
+         * of keys must agree on this setting</b> — it is a per-keyspace
+         * format decision, not a per-client preference; see the ADR's
+         * Consequences before enabling this against an existing keyspace
+         * another client may still touch with {@code compress} off. */
+        public Options compress(boolean enabled) {
+            this.compress = enabled;
+            return this;
+        }
+
+        /** Values shorter than this (in bytes) are never compressed — the
+         * per-value overhead of attempting it outweighs the savings. Only
+         * meaningful when {@link #compress} is enabled. Default {@value
+         * #DEFAULT_COMPRESSION_THRESHOLD}. */
+        public Options compressionThreshold(int bytes) {
+            this.compressionThreshold = bytes;
+            return this;
+        }
     }
+
+    private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
 
     public static Options builder() {
         return new Options();
@@ -128,6 +153,8 @@ public final class NanocachedClient implements AutoCloseable {
     private final List<Address> addresses;
     private final byte[] authSecret;
     private final SSLContext tls;
+    private final boolean compress;
+    private final int compressionThreshold;
 
     /** The address that answered connect() — used both to redial in single
      * mode and as the key for the open-sockets tracker in every mode
@@ -156,10 +183,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    private NanocachedClient(List<Address> addresses, byte[] authSecret, SSLContext tls) {
+    private NanocachedClient(
+            List<Address> addresses, byte[] authSecret, SSLContext tls,
+            boolean compress, int compressionThreshold) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
+        this.compress = compress;
+        this.compressionThreshold = compressionThreshold;
     }
 
     public static NanocachedClient connect(Options options) {
@@ -169,8 +200,9 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
-        NanocachedClient client =
-                new NanocachedClient(options.addresses, options.authSecret, sslContext);
+        NanocachedClient client = new NanocachedClient(
+                options.addresses, options.authSecret, sslContext,
+                options.compress, options.compressionThreshold);
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, ADR-0010), or knows no live
@@ -332,10 +364,13 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /** Returns the raw value, or {@code Optional.empty()} when the key is
-     * missing. */
+     * missing. Transparently decompresses when {@code compress} is
+     * enabled (doc/adr/0013-*.md). */
     public Optional<byte[]> getBytes(byte[] key) {
         beforeOperation();
-        return Optional.ofNullable(withWrongNodeRetry(() -> read(key, connection -> connection.get(key))));
+        byte[] value = withWrongNodeRetry(() -> read(key, connection -> connection.get(key)));
+        if (value == null) return Optional.empty();
+        return Optional.of(compress ? Compression.decompressValue(value) : value);
     }
 
     private static String decodeUtf8Strict(byte[] bytes) {
@@ -358,17 +393,20 @@ public final class NanocachedClient implements AutoCloseable {
         set(key, value, 0L);
     }
 
-    /** {@code ttlSeconds == 0} means no expiry. */
+    /** {@code ttlSeconds == 0} means no expiry. Transparently compresses
+     * values at or above {@code compressionThreshold} when {@code
+     * compress} is enabled (doc/adr/0013-*.md). */
     public void set(byte[] key, byte[] value, long ttlSeconds) {
         if (ttlSeconds < 0) {
             throw new IllegalArgumentException(
                     "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         beforeOperation();
+        byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
         withWrongNodeRetry(() -> {
             write(key, connection -> {
-                connection.set(key, value, wireTtlSeconds);
+                connection.set(key, outgoing, wireTtlSeconds);
                 return null;
             });
             return null;

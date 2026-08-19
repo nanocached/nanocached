@@ -312,6 +312,142 @@ async fn round_trips_set_get_delete() {
     node.stop();
 }
 
+// ── 値の圧縮 (doc/adr/0013-*.md) ────────────────────────────────────
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn wire_format_is_untouched_when_compress_is_off() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let value = "x".repeat(1000);
+    client.set("k", value.as_str(), 0).await.unwrap();
+    assert_eq!(
+        node.state.store.lock().unwrap().get(b"k".as_slice()),
+        Some(&value.clone().into_bytes())
+    );
+    assert_eq!(client.get("k").await.unwrap(), Some(value));
+
+    client.close();
+    node.stop();
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn compresses_at_or_above_the_threshold_and_decompresses_back() {
+    let node = MockNode::start().await;
+    let client =
+        NanocachedClient::connect(options(node.port).compress(true).compression_threshold(64))
+            .await
+            .unwrap();
+
+    let value = "x".repeat(1000);
+    client.set("k", value.as_str(), 0).await.unwrap();
+
+    let stored = node
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .get(b"k".as_slice())
+        .unwrap()
+        .clone();
+    assert_eq!(stored[0], 0x01);
+    assert!(stored.len() < value.len());
+
+    assert_eq!(client.get("k").await.unwrap(), Some(value.clone()));
+    assert_eq!(
+        client.get_bytes("k").await.unwrap(),
+        Some(value.into_bytes())
+    );
+
+    client.close();
+    node.stop();
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn below_threshold_value_is_prefixed_but_not_compressed() {
+    let node = MockNode::start().await;
+    let client =
+        NanocachedClient::connect(options(node.port).compress(true).compression_threshold(256))
+            .await
+            .unwrap();
+
+    client.set("k", "short", 0).await.unwrap();
+    let mut expected = vec![0x00u8];
+    expected.extend_from_slice(b"short");
+    assert_eq!(
+        node.state.store.lock().unwrap().get(b"k".as_slice()),
+        Some(&expected)
+    );
+    assert_eq!(client.get("k").await.unwrap(), Some("short".to_string()));
+
+    client.close();
+    node.stop();
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn incompressible_data_passes_through_unbloated() {
+    let node = MockNode::start().await;
+    let client =
+        NanocachedClient::connect(options(node.port).compress(true).compression_threshold(16))
+            .await
+            .unwrap();
+
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545F4914F6CDD1D)
+    };
+    let value: Vec<u8> = (0..512).map(|_| next() as u8).collect();
+
+    client.set("k", value.clone(), 0).await.unwrap();
+    let mut expected = vec![0x00u8];
+    expected.extend_from_slice(&value);
+    assert_eq!(
+        node.state.store.lock().unwrap().get(b"k".as_slice()),
+        Some(&expected)
+    );
+    assert_eq!(client.get_bytes("k").await.unwrap(), Some(value));
+
+    client.close();
+    node.stop();
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn reading_a_legacy_value_with_compress_enabled_errors_clearly() {
+    let node = MockNode::start().await;
+
+    // A legacy/uncompressed writer's value whose first byte happens to
+    // collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+    // documented hazard of enabling compress against a keyspace other
+    // clients still touch without it. The remaining bytes are chosen to
+    // reliably fail DEFLATE decoding (raw DEFLATE has no checksum, so not
+    // every garbage body does — see compression.rs's own pinned test).
+    let writer = NanocachedClient::connect(options(node.port)).await.unwrap();
+    writer
+        .set("k", vec![0x01u8, 0xFF, 0xFF, 0xFF, 0xFF], 0)
+        .await
+        .unwrap();
+    writer.close();
+
+    let reader = NanocachedClient::connect(options(node.port).compress(true))
+        .await
+        .unwrap();
+    assert!(matches!(
+        reader.get_bytes("k").await,
+        Err(Error::Decompression(_))
+    ));
+
+    reader.close();
+    node.stop();
+}
+
 #[tokio::test]
 async fn get_bytes_round_trips_non_utf8_values() {
     let node = MockNode::start().await;

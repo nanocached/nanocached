@@ -102,6 +102,38 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
     });
 ```
 
+## Value compression
+
+Off by default. When enabled, values at or above `CompressionThreshold`
+bytes are transparently DEFLATE-compressed on `Set`/`SetAsync` and
+decompressed on `Get`/`GetAsync`/`GetBytesAsync` (doc/adr/0013-\*.md):
+
+```csharp
+using NanocachedClient client = await NanocachedClient.ConnectAsync(
+    new NanocachedClient.Options
+    {
+        Addresses = { ("cache.internal", 8357) },
+        Compress = true,
+        CompressionThreshold = 256, // default; bytes, below which values are stored as-is
+    });
+```
+
+**Every client that reads or writes a given set of keys must agree on
+`Compress`.** This is a per-keyspace format decision, not a per-client
+preference — enabling it prefixes every value this client writes with a
+one-byte marker, so a client with `Compress = false` reading one of
+those values gets the marker byte back as if it were part of the value
+(wrong, silently), and a client with `Compress = true` reading a value
+written before compression was enabled anywhere risks misreading that
+value's first byte as the marker (a `DecompressionException`, or — if
+that byte happens to be the "uncompressed" marker by chance, or the
+decoder doesn't reject the garbage that follows it — a silently wrong
+read; raw DEFLATE has no checksum). There is no dual-mode migration
+path: only turn this on for a fresh keyspace, or only after every
+client touching an existing one has upgraded and enabled it together.
+Incompressible data (already-compressed media, random bytes) is passed
+through unchanged rather than bloated.
+
 ## close()
 
 `client.Close()` (or `Dispose()`/`using`) is idempotent; calling it a

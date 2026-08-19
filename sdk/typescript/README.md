@@ -75,6 +75,34 @@ const client = await NanocachedClient.connect({
 `false` is silently ignored. An unreadable or unparseable CA file is a
 connect-time error.
 
+## Value compression
+
+Off by default. When enabled, values at or above `compressionThreshold`
+bytes are transparently DEFLATE-compressed on `set` and decompressed on
+`get`/`getBytes` (doc/adr/0013-\*.md):
+
+```ts
+const client = await NanocachedClient.connect({
+  addresses,
+  compress: true,
+  compressionThreshold: 256, // default; bytes, below which values are stored as-is
+});
+```
+
+**Every client that reads or writes a given set of keys must agree on
+`compress`.** This is a per-keyspace format decision, not a per-client
+preference — enabling it prefixes every value this client writes with a
+one-byte marker, so a client with `compress` off reading one of those
+values gets the marker byte back as if it were part of the value (wrong,
+silently), and a client with `compress` on reading a value written before
+compression was enabled anywhere risks misreading that value's first byte
+as the marker (a `DecompressionError`, or — if that byte happens to be
+the "uncompressed" marker by chance — a silently wrong read). There is no
+dual-mode migration path: only turn this on for a fresh keyspace, or only
+after every client touching an existing one has upgraded and enabled it
+together. Incompressible data (already-compressed media, random bytes) is
+passed through unchanged rather than bloated.
+
 ## Cluster behavior
 
 When `connect()` reaches a discovery server, the SDK fetches the node list,
@@ -142,8 +170,9 @@ operations are idempotent). There is nothing to configure.
 ## API
 
 - `NanocachedClient.connect(options)` —
-  `options: { addresses, authSecret?, tls?, ca? }` (`addresses` is a
-  required, non-empty `NanocachedAddress[]`, each `{ host, port }`)
+  `options: { addresses, authSecret?, tls?, ca?, compress?, compressionThreshold? }`
+  (`addresses` is a required, non-empty `NanocachedAddress[]`, each
+  `{ host, port }`)
 - `client.get(key)` — resolves `string | null`, strictly decoded as UTF-8
   (rejects with a `TypeError` if the value isn't valid UTF-8)
 - `client.getBytes(key)` — resolves `Buffer | null`, the raw bytes

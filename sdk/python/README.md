@@ -102,6 +102,34 @@ client = await NanocachedClient.connect(
 `ca` is only meaningful when `tls=True`; if `tls=False` it is silently
 ignored. An unreadable or unparseable CA file is a connect-time error.
 
+## Value compression
+
+Off by default. When enabled, values at or above `compression_threshold`
+bytes are transparently DEFLATE-compressed on `set` and decompressed on
+`get`/`get_bytes` (doc/adr/0013-\*.md):
+
+```python
+client = await NanocachedClient.connect(
+    [("cache.internal", 8357)],
+    compress=True,
+    compression_threshold=256,  # default; bytes, below which values are stored as-is
+)
+```
+
+**Every client that reads or writes a given set of keys must agree on
+`compress`.** This is a per-keyspace format decision, not a per-client
+preference — enabling it prefixes every value this client writes with a
+one-byte marker, so a client with `compress=False` reading one of those
+values gets the marker byte back as if it were part of the value (wrong,
+silently), and a client with `compress=True` reading a value written
+before compression was enabled anywhere risks misreading that value's
+first byte as the marker (a `DecompressionError`, or — if that byte
+happens to be the "uncompressed" marker by chance — a silently wrong
+read). There is no dual-mode migration path: only turn this on for a
+fresh keyspace, or only after every client touching an existing one has
+upgraded and enabled it together. Incompressible data (already-compressed
+media, random bytes) is passed through unchanged rather than bloated.
+
 ## Notes
 
 - Requests are serialized per connection (one in flight at a time);

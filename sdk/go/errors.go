@@ -25,6 +25,13 @@ var (
 	// redials lazily on the next use, and in cluster mode retries once
 	// through a node-list refresh.
 	ErrConnectionLost = errors.New("nanocached: connection lost")
+
+	// ErrDecompression is returned by Get/GetBytes when a value with
+	// Config.Compress enabled can't be interpreted — almost always a
+	// Compress mismatch between clients sharing this key
+	// (doc/adr/0013-*.md's compatibility caveat: every client touching a
+	// given keyspace must agree on Compress), not a transient failure.
+	ErrDecompression = errors.New("nanocached: failed to decompress a value")
 )
 
 func connectionLost(context string, cause error) error {
@@ -32,4 +39,8 @@ func connectionLost(context string, cause error) error {
 		return errors.Join(ErrConnectionLost, errors.New(context+": "+cause.Error()))
 	}
 	return errors.Join(ErrConnectionLost, errors.New(context))
+}
+
+func decompressionFailed(context string) error {
+	return errors.Join(ErrDecompression, errors.New(context))
 }

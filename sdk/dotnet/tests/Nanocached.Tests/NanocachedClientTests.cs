@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using Xunit;
 
@@ -500,5 +501,92 @@ public class NanocachedClientTests
         {
             Assert.False(node.Store.ContainsKey(stored));
         }
+    }
+
+    // ── 値の圧縮 (doc/adr/0013-*.md) ──────────────────────────────
+
+    private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>
+        new()
+        {
+            Addresses = { ("127.0.0.1", port) },
+            Compress = true,
+            CompressionThreshold = threshold,
+        };
+
+    [Fact]
+    public async Task WireFormatIsUntouchedWhenCompressIsOff()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        string value = new string('x', 1000);
+        await client.SetAsync("k", value);
+
+        Assert.Equal(Bytes(value), node.Store[MockNode.KeyOf(Bytes("k"))]);
+        Assert.Equal(value, await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task CompressesAtOrAboveTheThresholdAndDecompressesBack()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port, 64));
+
+        string value = new string('x', 1000);
+        await client.SetAsync("k", value);
+
+        byte[] stored = node.Store[MockNode.KeyOf(Bytes("k"))];
+        Assert.Equal(0x01, stored[0]);
+        Assert.True(stored.Length < Bytes(value).Length);
+
+        Assert.Equal(value, await client.GetAsync("k"));
+        Assert.Equal(Bytes(value), await client.GetBytesAsync("k"));
+    }
+
+    [Fact]
+    public async Task BelowThresholdValueIsPrefixedButNotCompressed()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+
+        await client.SetAsync("k", "short");
+
+        byte[] expected = new byte[] { 0x00 }.Concat(Bytes("short")).ToArray();
+        Assert.Equal(expected, node.Store[MockNode.KeyOf(Bytes("k"))]);
+        Assert.Equal("short", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task IncompressibleDataPassesThroughUnbloated()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port, 16));
+
+        byte[] value = new byte[512];
+        RandomNumberGenerator.Fill(value);
+
+        await client.SetAsync(Bytes("k"), value);
+
+        byte[] expected = new byte[] { 0x00 }.Concat(value).ToArray();
+        Assert.Equal(expected, node.Store[MockNode.KeyOf(Bytes("k"))]);
+        Assert.Equal(value, await client.GetBytesAsync("k"));
+    }
+
+    [Fact]
+    public async Task ReadingALegacyValueWithCompressEnabledErrorsClearly()
+    {
+        using var node = new MockNode();
+
+        // A legacy/uncompressed writer's value whose first byte happens to
+        // collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+        // documented hazard of enabling Compress against a keyspace other
+        // clients still touch without it. The remaining bytes are chosen
+        // to reliably fail DEFLATE decoding (raw DEFLATE has no checksum,
+        // so not every garbage body does — see CompressionTests' own
+        // pinned test).
+        node.Store[MockNode.KeyOf(Bytes("k"))] = new byte[] { 0x01, 0xFF, 0xFF, 0xFF, 0xFF };
+
+        using NanocachedClient reader = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+        await Assert.ThrowsAsync<DecompressionException>(() => reader.GetBytesAsync("k"));
     }
 }
