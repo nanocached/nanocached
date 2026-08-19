@@ -30,12 +30,26 @@ const MAX_CONNECTIONS: usize = 1024;
 /// of it.
 pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-/// How long after this node's own handoff completes it keeps forwarding
-/// concurrent writes to the joiner (issue #3) — matches discovery's
-/// default --migration-timeout, by which time the join has either
-/// completed cluster-wide (the joiner is in `L`, clients route to it
-/// directly) or been abandoned (an `X` cleared the slot).
-const FORWARDING_GRACE: Duration = Duration::from_secs(60);
+/// Base and per-entry components of how long after this node's own
+/// handoff completes it keeps forwarding concurrent writes to the joiner
+/// (issue #3) — sized the same way, and for the same reason, as
+/// discovery's own size-derived migration timeout (doc/adr/0017-*.md):
+/// by the time it elapses the join has either completed cluster-wide
+/// (the joiner is in `L`, clients route to it directly) or been
+/// abandoned (an `X` cleared the slot), and a bigger handoff needs more
+/// of either to happen. See `forwarding_grace`.
+const FORWARDING_GRACE_BASE: Duration = Duration::from_secs(60);
+const FORWARDING_GRACE_PER_ENTRY: Duration = Duration::from_millis(5);
+
+/// This node's own size-derived forwarding grace (doc/adr/0017-*.md),
+/// computed from how many entries `run_migration` actually sent as part
+/// of the handoff `entries_sent` came from — never anything reported by
+/// another ready node. Saturates rather than overflows for a
+/// pathologically large count.
+fn forwarding_grace(entries_sent: usize) -> Duration {
+    FORWARDING_GRACE_BASE
+        + FORWARDING_GRACE_PER_ENTRY.saturating_mul(entries_sent.min(u32::MAX as usize) as u32)
+}
 /// How often the ADR-0008 active-deletion sweep runs. See `run_sweep`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -619,8 +633,18 @@ async fn handle_connection(
                     ));
                 };
 
+                // doc/adr/0017-*.md: sizes discovery's migration timeout.
+                // A cache task that's already gone (shutting down) can't
+                // answer this count; 0 is a safe default here since
+                // `run_migration` below will independently discover the
+                // same unavailability and abort on its own.
+                let entries_to_send =
+                    count_entries_to_send(&node_context, &joining_name, &joined, replication)
+                        .await
+                        .unwrap_or(0);
+
                 stream
-                    .write_all(&Response::MigrationAccepted.encode())
+                    .write_all(&Response::MigrationAccepted(entries_to_send).encode())
                     .await?;
 
                 // Handed to `run`'s own loop rather than spawned here
@@ -1152,10 +1176,15 @@ struct ActiveMigration {
     /// keep forwarding concurrent writes to the joiner after its own
     /// share is done — a still-stale client that can't see the joiner in
     /// `L` yet would otherwise write to this node without the joiner ever
-    /// learning of it. The window is bounded by `FORWARDING_GRACE`
+    /// learning of it. The window is bounded by `forwarding_grace`
     /// (matching discovery's migration timeout: past it the join has
     /// either completed cluster-wide or been abandoned).
     completed_at: Option<Instant>,
+    /// This handoff's own size-derived grace window (`forwarding_grace`),
+    /// set together with `completed_at` — not a shared constant, since
+    /// different handoffs move different amounts of data. Meaningless
+    /// (left at `Duration::ZERO`) until `completed_at` is `Some`.
+    forwarding_grace: Duration,
     abort_requested: Arc<AtomicBool>,
 }
 
@@ -1186,6 +1215,7 @@ impl<'a> MigrationGuard<'a> {
             after_ring,
             replication,
             completed_at: None,
+            forwarding_grace: Duration::ZERO,
             abort_requested: Arc::clone(&abort_requested),
         });
 
@@ -1198,9 +1228,11 @@ impl<'a> MigrationGuard<'a> {
     /// Consumes the guard after a successful transfer: instead of
     /// clearing the slot (which would close the write-forwarding window
     /// the moment THIS node finishes — issue #3), it stamps the
-    /// completion time so `migration_target_for` keeps forwarding until
-    /// `FORWARDING_GRACE` passes or the slot is replaced/cancelled.
-    fn completed(self) {
+    /// completion time and this handoff's own size-derived grace (from
+    /// `entries_sent`, doc/adr/0017-*.md) so `migration_target_for` keeps
+    /// forwarding until that grace passes or the slot is
+    /// replaced/cancelled.
+    fn completed(self, entries_sent: usize) {
         if let Some(active) = self
             .slot
             .lock()
@@ -1208,6 +1240,7 @@ impl<'a> MigrationGuard<'a> {
             .as_mut()
         {
             active.completed_at = Some(Instant::now());
+            active.forwarding_grace = forwarding_grace(entries_sent);
         }
         std::mem::forget(self);
     }
@@ -1220,6 +1253,44 @@ impl Drop for MigrationGuard<'_> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
+}
+
+/// doc/adr/0017-*.md: counts how many of this node's entries it will
+/// actually send to the joining node, mirroring the sender/displaced
+/// predicate `run_migration` computes for real (the old primary for a
+/// key is the one designated sender — a key can be affected by the join
+/// without this node being the one that sends it). Called once, before
+/// acknowledging `M`, purely to size discovery's migration timeout — not
+/// a transfer plan. `None` if the cache task is already unavailable;
+/// `run_migration` will independently discover the same thing and abort.
+async fn count_entries_to_send(
+    node_context: &NodeContext,
+    joining_name: &str,
+    joined: &[(String, String)],
+    replication: usize,
+) -> Option<usize> {
+    let mut before_members: Vec<String> = joined.iter().map(|(name, _)| name.clone()).collect();
+    if !before_members.iter().any(|name| name == &node_context.name) {
+        before_members.push(node_context.name.clone());
+    }
+    let mut after_members = before_members.clone();
+    after_members.push(joining_name.to_string());
+
+    let before_ring = HashRing::new(before_members);
+    let after_ring = HashRing::new(after_members);
+    let self_name = node_context.name.as_str();
+
+    let entries = list_entries(&node_context.request_tx).await?;
+
+    Some(
+        entries
+            .iter()
+            .filter(|(key, _, _)| {
+                after_ring.is_owner(key, joining_name, replication)
+                    && before_ring.owners(key, replication).first() == Some(&self_name)
+            })
+            .count(),
+    )
 }
 
 /// ADR-0008 (generalized by ADR-0011): triggered by an incoming `M`.
@@ -1252,10 +1323,11 @@ impl Drop for MigrationGuard<'_> {
 /// gives up on the whole migration: it rolls back every mark from this
 /// run (same as the `abort_requested` path below) and returns without
 /// flipping `known_ring` or reporting `C`, leaving discovery's own
-/// `--migration-timeout` to reap the stalled join rather than have this
-/// node claim success over a joining node that's missing data. A lost
-/// discovery connection for the final `C` is a separate, already-
-/// terminal failure (the transfer itself succeeded) and is just logged.
+/// size-derived migration timeout (doc/adr/0017-*.md) to reap the
+/// stalled join rather than have this node claim success over a joining
+/// node that's missing data. A lost discovery connection for the final
+/// `C` is a separate, already-terminal failure (the transfer itself
+/// succeeded) and is just logged.
 async fn run_migration(
     node_context: NodeContext,
     joining_name: String,
@@ -1429,7 +1501,7 @@ async fn run_migration(
         "INFO migration completed: {joining_name} (sent {sent_count} keys, marked {} dead \
          copies; forwarding writes for {}s)",
         marked_this_run.len(),
-        FORWARDING_GRACE.as_secs()
+        forwarding_grace(sent_count).as_secs()
     );
 
     if let Err(error) = report_complete(&node_context, &joining_name).await {
@@ -1441,7 +1513,7 @@ async fn run_migration(
 
     // Keep the write-forwarding window open past this node's own share
     // (issue #3) — see `MigrationGuard::completed`.
-    migration_guard.completed();
+    migration_guard.completed(sent_count);
 }
 
 async fn list_entries(
@@ -1678,7 +1750,7 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String
     let expired = slot.as_ref().is_some_and(|active| {
         active
             .completed_at
-            .is_some_and(|completed_at| completed_at.elapsed() >= FORWARDING_GRACE)
+            .is_some_and(|completed_at| completed_at.elapsed() >= active.forwarding_grace)
     });
     if expired {
         *slot = None;
@@ -2450,9 +2522,9 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_completed_forwarding_window_expires_after_the_grace() {
-        // Issue #3: the lingering entry forwards only within
-        // FORWARDING_GRACE; past it, migration_target_for clears the slot
-        // and stops forwarding.
+        // Issue #3: the lingering entry forwards only within its own
+        // forwarding_grace (doc/adr/0017-*.md); past it,
+        // migration_target_for clears the slot and stops forwarding.
         let (request_tx, _request_rx) = mpsc::channel(1);
         let node_context = NodeContext {
             name: "ready-node".to_string(),
@@ -2472,7 +2544,8 @@ mod tests {
                 "joiner-0".to_string(),
             ])),
             replication: 2,
-            completed_at: Some(Instant::now() - FORWARDING_GRACE - Duration::from_secs(1)),
+            completed_at: Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1)),
+            forwarding_grace: forwarding_grace(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
         });
 
@@ -2581,9 +2654,9 @@ mod tests {
 
         client.write_all(&migrate_message).await.unwrap();
 
-        let mut ack = [0u8; 2];
+        let mut ack = [0u8; 4];
         client.read_exact(&mut ack).await.unwrap();
-        assert_eq!(&ack, b"A\n");
+        assert_eq!(&ack, b"A 1\n");
 
         for _ in 0..1000 {
             if !discovery_received.lock().unwrap().is_empty() {
@@ -2697,9 +2770,9 @@ mod tests {
 
         client.write_all(&migrate_message).await.unwrap();
 
-        let mut ack = [0u8; 2];
+        let mut ack = [0u8; 4];
         client.read_exact(&mut ack).await.unwrap();
-        assert_eq!(&ack, b"A\n");
+        assert_eq!(&ack, b"A 1\n");
 
         // The joining node has the SET in hand but hasn't acked it yet, so
         // `run_migration` is still blocked on that ack — send the cancel
@@ -2870,9 +2943,9 @@ mod tests {
 
         client.write_all(&migrate_message).await.unwrap();
 
-        let mut ack = [0u8; 2];
+        let mut ack = [0u8; 4];
         client.read_exact(&mut ack).await.unwrap();
-        assert_eq!(&ack, b"A\n");
+        assert_eq!(&ack, b"A 2\n");
 
         for _ in 0..1000 {
             if !discovery_received.lock().unwrap().is_empty() {
@@ -2983,9 +3056,9 @@ mod tests {
 
         client.write_all(&migrate_message).await.unwrap();
 
-        let mut ack = [0u8; 2];
+        let mut ack = [0u8; 4];
         client.read_exact(&mut ack).await.unwrap();
-        assert_eq!(&ack, b"A\n");
+        assert_eq!(&ack, b"A 1\n");
 
         // Nothing should ever connect to "discovery".
         let no_completion_reported =

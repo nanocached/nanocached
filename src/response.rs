@@ -13,7 +13,11 @@ pub enum Response {
     /// ADR-0008: acknowledges an `M` (migrate) request was received and
     /// parsed — not that the handoff it kicks off has finished. That
     /// completion is reported separately, node-to-discovery, via `C`.
-    MigrationAccepted,
+    /// Carries how many of this node's entries it's the designated
+    /// sender for (doc/adr/0017-*.md) — a one-off count taken before any
+    /// transfer starts, purely so discovery can size its migration
+    /// timeout, not a transfer plan.
+    MigrationAccepted(usize),
     /// ADR-0008: acknowledges an `X` (cancel migration) request was
     /// received and parsed — not that any in-progress handoff it names
     /// was actually found and aborted (a cancel for an already-finished
@@ -47,7 +51,7 @@ impl Response {
             Self::Busy => b"B\n".to_vec(),
             Self::AuthOk => b"On\n".to_vec(),
             Self::Unauthorized => b"En\n".to_vec(),
-            Self::MigrationAccepted => b"A\n".to_vec(),
+            Self::MigrationAccepted(entries) => format!("A {entries}\n").into_bytes(),
             Self::MigrationCancelled => b"A\n".to_vec(),
             Self::WrongNode => b"W\n".to_vec(),
 
@@ -109,8 +113,9 @@ mod tests {
     }
 
     #[test]
-    fn encodes_migration_accepted_response() {
-        assert_eq!(Response::MigrationAccepted.encode(), b"A\n");
+    fn encodes_migration_accepted_response_with_its_entry_count() {
+        assert_eq!(Response::MigrationAccepted(0).encode(), b"A 0\n");
+        assert_eq!(Response::MigrationAccepted(42).encode(), b"A 42\n");
     }
 
     #[test]

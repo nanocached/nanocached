@@ -147,8 +147,21 @@ const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// "stuck" (a lost ack, a bug), so this is a plain timeout. Past it,
 /// `abandon_current_join` scraps the join and sends every ready node an
 /// `X` to roll back, exactly as it does when a node's connection dies
-/// outright (patterns 1/2).
-const DEFAULT_MIGRATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// outright (patterns 1/2). Size-derived rather than flat
+/// (doc/adr/0017-*.md): a large, legitimate join shouldn't get reaped
+/// just for being large, so the bound scales with the largest entry
+/// count any ready node reported acknowledging its `M`
+/// (`PendingJoin::max_entries`). Both constants are hardcoded, not
+/// configurable — `--migration-timeout` no longer exists. See
+/// `migration_timeout_for`.
+const MIGRATION_TIMEOUT_BASE: Duration = Duration::from_secs(60);
+const MIGRATION_TIMEOUT_PER_ENTRY: Duration = Duration::from_millis(5);
+
+/// Saturates rather than overflows for a pathologically large count.
+fn migration_timeout_for(max_entries: usize) -> Duration {
+    MIGRATION_TIMEOUT_BASE
+        + MIGRATION_TIMEOUT_PER_ENTRY.saturating_mul(max_entries.min(u32::MAX as usize) as u32)
+}
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -159,7 +172,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// ADR-0008 known gap (issue #20): a ready node that never received `M` —
 /// a transient connect/write/ack failure, not a rejection — never hands
-/// off and never sweeps, stalling the join until `--migration-timeout`
+/// off and never sweeps, stalling the join until `migration_timeout_for`
 /// reaps it. Retrying the send absorbs exactly that class of hiccup,
 /// mirroring `run_migration`'s own `KEY_TRANSFER_ATTEMPTS` on the node
 /// side (same fixed-attempt-count, fresh-connection-each-time shape).
@@ -220,12 +233,17 @@ type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
 /// handoff via `C`; once it covers all of `expected`, the joining node is
 /// promoted. `started_at` backs the timeout that catches a ready node
 /// that's alive but never reports in (see `abandon_current_join`,
-/// `MIGRATION_TIMEOUT`).
+/// `migration_timeout_for`), sized from `max_entries` — the largest
+/// entry count any ready node has reported acknowledging its `M` so far
+/// (doc/adr/0017-*.md), updated as each of `try_begin_next_join`'s
+/// parallel sends resolves. Starts at 0 (the bound is just
+/// `MIGRATION_TIMEOUT_BASE` until the first ack arrives).
 struct PendingJoin {
     joining_name: String,
     expected: HashSet<String>,
     completed: HashSet<String>,
     started_at: Instant,
+    max_entries: usize,
 }
 
 type CurrentJoin = Arc<Mutex<Option<PendingJoin>>>;
@@ -442,7 +460,6 @@ struct Args {
     host: String,
     port: u16,
     liveness_timeout: Duration,
-    migration_timeout: Duration,
     /// ADR-0010: how long after startup `L` keeps answering `B\n` while
     /// the registry re-fills from announces. `None` (the default) means
     /// "same as the liveness timeout".
@@ -461,7 +478,6 @@ impl Default for Args {
             host: "127.0.0.1".to_string(),
             port: 8357,
             liveness_timeout: DEFAULT_LIVENESS_TIMEOUT,
-            migration_timeout: DEFAULT_MIGRATION_TIMEOUT,
             replication_factor: 2,
             tls_cert: None,
             tls_key: None,
@@ -491,13 +507,6 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("invalid value for --liveness-timeout: {raw_secs}"))?;
                 args.liveness_timeout = Duration::from_secs(secs);
-            }
-            "--migration-timeout" => {
-                let raw_secs = value()?;
-                let secs: u64 = raw_secs
-                    .parse()
-                    .map_err(|_| format!("invalid value for --migration-timeout: {raw_secs}"))?;
-                args.migration_timeout = Duration::from_secs(secs);
             }
             "--replication-factor" => {
                 let raw = value()?;
@@ -532,9 +541,6 @@ Usage: nanocached-discovery [options]
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
                                  a heartbeat (default 15)
-  --migration-timeout <secs>    abandon a join if a ready node hasn't
-                                 reported completion after this many
-                                 seconds (default 60)
   --replication-factor <n>      how many nodes hold each key (ADR-0011);
                                  distributed to clients via L and to nodes
                                  via M (default 2, min 1)
@@ -862,6 +868,7 @@ async fn try_begin_next_join(
             expected,
             completed: HashSet::new(),
             started_at: Instant::now(),
+            max_entries: 0,
         });
 
         (name, joining_addr, joined)
@@ -906,13 +913,27 @@ async fn try_begin_next_join(
                 // was already logged; this is the final, permanent
                 // failure. ADR-0008 still doesn't define recovery beyond
                 // this point (issue #20's second gap) — the join stalls
-                // until discovery's own `--migration-timeout` reaps it.
+                // until discovery's own size-derived migration timeout
+                // (doc/adr/0017-*.md) reaps it.
                 eprintln!(
                     "WARN permanently failed to send M to {ready_name} after \
                      {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
                 );
             }
-            Ok((_, Ok(()))) => {}
+            Ok((_, Ok(entries))) => {
+                // doc/adr/0017-*.md: sizes the migration timeout by the
+                // largest handoff any ready node reported — a report for
+                // a since-abandoned/replaced join (this one's slot
+                // already moved on to a different `joining_name`) must
+                // not be credited here, mirroring `handle_complete`'s own
+                // guard.
+                let mut join_guard = lock_current_join(current_join);
+                if let Some(pending) = join_guard.as_mut()
+                    && pending.joining_name == name
+                {
+                    pending.max_entries = pending.max_entries.max(entries);
+                }
+            }
             Err(error) => eprintln!("WARN a task sending M panicked: {error}"),
         }
     }
@@ -936,7 +957,7 @@ async fn send_migrate_with_retry(
     joined: &[(String, String)],
     replication: usize,
     io_timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let mut last_error = None;
 
     for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
@@ -952,7 +973,7 @@ async fn send_migrate_with_retry(
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(entries) => return Ok(entries),
             Err(error) => {
                 eprintln!(
                     "WARN failed to send M to {ready_name} (attempt \
@@ -968,10 +989,12 @@ async fn send_migrate_with_retry(
 
 /// Connects to `address` (a `Joined` node) as a client, sends `M` with the
 /// joining node's identity and the full `joined` roster (ADR-0009 names +
-/// addresses), and waits for the `A\n` acknowledgment — confirmation that
-/// `M` was received and parsed, not that the handoff it kicks off (which
-/// happens asynchronously on the node's side) has finished; that's
-/// reported separately, node-to-discovery, via `C`.
+/// addresses), and waits for the `A <entries>\n` acknowledgment —
+/// confirmation that `M` was received and parsed, not that the handoff it
+/// kicks off (which happens asynchronously on the node's side) has
+/// finished; that's reported separately, node-to-discovery, via `C`.
+/// Returns the entry count the ack reports, purely for sizing this join's
+/// migration timeout (doc/adr/0017-*.md) — not otherwise used here.
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate(
     address: &str,
@@ -982,7 +1005,7 @@ async fn send_migrate(
     joined: &[(String, String)],
     replication: usize,
     io_timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<usize> {
     let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
 
     if let Some(secret) = auth_secret {
@@ -1020,17 +1043,13 @@ async fn send_migrate(
 
     stream.write_all(&message).await?;
 
-    let mut ack = [0u8; 2];
-    read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
+    let line = read_line_timed(&mut stream, io_timeout).await?;
+    let entries = line
+        .strip_prefix("A ")
+        .and_then(|rest| rest.parse::<usize>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "node did not acknowledge M"))?;
 
-    if &ack != b"A\n" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "node did not acknowledge M",
-        ));
-    }
-
-    Ok(())
+    Ok(entries)
 }
 
 /// `read_exact` bounded by `io_timeout` — see `OUTBOUND_IO_TIMEOUT`.
@@ -1043,6 +1062,36 @@ async fn read_exact_timed(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ack read timed out"))??;
     Ok(())
+}
+
+/// Reads up to (and consuming) the next `\n`, bounded overall by
+/// `io_timeout` — used for `M`'s `A <entries>\n` ack, whose length
+/// varies with the reported entry count (unlike every other ack on this
+/// connection, which is a fixed number of bytes). Bails out past
+/// `MAX_ACK_LINE_LENGTH` rather than growing `line` without bound on a
+/// desynced or malicious peer.
+const MAX_ACK_LINE_LENGTH: usize = 64;
+
+async fn read_line_timed(stream: &mut ClientStream, io_timeout: Duration) -> io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        read_exact_timed(stream, &mut byte, io_timeout).await?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= MAX_ACK_LINE_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ack line too long",
+            ));
+        }
+        line.push(byte[0]);
+    }
+
+    String::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "ack was not valid utf-8"))
 }
 
 /// Connects to `address` (a ready node) as a client and sends `X`, telling
@@ -1457,7 +1506,6 @@ async fn shutdown_signal() -> io::Result<()> {
 async fn run(
     address: &str,
     liveness_timeout: Duration,
-    migration_timeout: Duration,
     startup_grace: Duration,
     replication: usize,
     auth_secret: Option<Bytes>,
@@ -1493,7 +1541,6 @@ async fn run(
         tls_connector,
         replication,
         liveness_timeout,
-        migration_timeout,
         shutdown_rx.clone(),
     ));
 
@@ -1651,7 +1698,6 @@ async fn sweep_expired(
     tls_connector: Option<TlsConnector>,
     replication: usize,
     liveness_timeout: Duration,
-    migration_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let sweep_interval = (liveness_timeout / 4)
@@ -1684,10 +1730,12 @@ async fn sweep_expired(
                 }
 
                 // ADR-0008 pattern 3: a ready node alive but never
-                // reporting `C` (see `DEFAULT_MIGRATION_TIMEOUT`).
+                // reporting `C` (see `migration_timeout_for`).
                 let timed_out = lock_current_join(&current_join)
                     .as_ref()
-                    .is_some_and(|pending| pending.started_at.elapsed() >= migration_timeout);
+                    .is_some_and(|pending| {
+                        pending.started_at.elapsed() >= migration_timeout_for(pending.max_entries)
+                    });
 
                 if timed_out {
                     abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication, "migration timeout").await;
@@ -1967,7 +2015,6 @@ async fn main() -> ExitCode {
     if let Err(err) = run(
         &address,
         args.liveness_timeout,
-        args.migration_timeout,
         // The startup grace (ADR-0010) is the liveness window by
         // definition: it exists so every live member has had time to
         // re-announce before L is served, and that time IS the liveness
@@ -2792,7 +2839,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend_from_slice(&buffer[..bytes_read]);
-            connection.write_all(b"A\n").await.unwrap();
+            connection.write_all(b"A 0\n").await.unwrap();
         });
 
         // Node A joins first (bootstrap: no ready nodes yet), registered
@@ -3107,7 +3154,6 @@ mod tests {
             None,
             2,
             Duration::from_secs(1),
-            Duration::from_secs(60),
             shutdown_rx,
         ));
 
@@ -3241,7 +3287,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend_from_slice(&buffer[..bytes_read]);
-            tls.write_all(b"A\n").await.unwrap();
+            tls.write_all(b"A 0\n").await.unwrap();
         });
 
         // A plaintext-only `send_migrate` call would never complete a TLS
@@ -3282,7 +3328,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut buffer = [0u8; 256];
             let _ = stream.read(&mut buffer).await.unwrap();
-            stream.write_all(b"A\n").await.unwrap();
+            stream.write_all(b"A 0\n").await.unwrap();
         });
 
         let result = send_migrate_with_retry(
@@ -3427,6 +3473,7 @@ mod tests {
                 .collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
+            max_entries: 0,
         })));
 
         // Node A's connection to discovery dies (ADR-0008 pattern: a ready
@@ -3479,6 +3526,7 @@ mod tests {
             expected: ["node-a".to_string()].into_iter().collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
+            max_entries: 0,
         })));
 
         // Node B (the joining node itself) disconnects before being
@@ -3513,6 +3561,7 @@ mod tests {
             expected: ["node-a".to_string()].into_iter().collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
+            max_entries: 0,
         })));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -3523,16 +3572,63 @@ mod tests {
             None,
             2,
             Duration::from_secs(60),
-            Duration::from_secs(2),
             shutdown_rx,
         ));
 
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::advance(MIGRATION_TIMEOUT_BASE + Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
 
         assert!(lock_current_join(&current_join).is_none());
         assert!(!lock(&registry).contains_key("node-b"));
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
+    }
+
+    // doc/adr/0017-*.md: the whole point of the size-derived timeout — a
+    // join moving a lot of data must not be abandoned just for taking
+    // longer than the old flat default would have allowed.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_join_with_many_entries_is_not_abandoned_at_the_base_timeout() {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: ["node-a".to_string()].into_iter().collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 100_000,
+        })));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        // Past the old flat default, but nowhere near
+        // migration_timeout_for(100_000) — still in progress.
+        tokio::time::advance(MIGRATION_TIMEOUT_BASE + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert!(lock_current_join(&current_join).is_some());
+        assert!(lock(&registry).contains_key("node-b"));
 
         shutdown_tx.send_replace(true);
         sweep_task.await.unwrap();
