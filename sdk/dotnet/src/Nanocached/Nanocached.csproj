@@ -8,7 +8,7 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
 
     <PackageId>Nanocached</PackageId>
-    <Version>1.0.0</Version>
+    <Version>0.1.1</Version>
     <Authors>Takashi Yamashina</Authors>
     <Description>Async client SDK for nanocached, a tiny distributed cache with client-side replication.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
