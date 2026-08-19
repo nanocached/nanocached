@@ -13,6 +13,9 @@ jobs:
     if: startsWith(github.ref_name, 'sdk/rust/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -21,16 +24,24 @@ jobs:
           ver="${GITHUB_REF_NAME#sdk/rust/v}"
           grep -q "^version = \"$ver\"$" sdk/rust/Cargo.toml
 
+      # Trusted Publishing: exchanges the workflow's OIDC token for a
+      # short-lived crates.io token; no long-lived secret involved.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       - name: Publish to crates.io
         working-directory: sdk/rust
         run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   python:
     if: startsWith(github.ref_name, 'sdk/python/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -45,11 +56,10 @@ jobs:
         working-directory: sdk/python
         run: uv build
 
+      # uv detects PyPI Trusted Publishing from the Actions OIDC context.
       - name: Publish to PyPI
         working-directory: sdk/python
-        run: uv publish --token "$PYPI_API_TOKEN"
-        env:
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish
 
   go:
     if: startsWith(github.ref_name, 'sdk/go/v')
@@ -109,6 +119,9 @@ jobs:
     if: startsWith(github.ref_name, 'sdk/typescript/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -125,14 +138,15 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # prepublishOnly runs test + build
+      # npm Trusted Publishing needs npm >= 11.5.1; node 22 bundles npm 10.
+      - run: npm install -g npm@latest
+
+      # prepublishOnly runs test + build; npm publish authenticates via OIDC.
       - name: Build and publish to npm
         working-directory: sdk/typescript
         run: |
           pnpm install --frozen-lockfile
-          pnpm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          npm publish --access public
 
   dotnet:
     if: startsWith(github.ref_name, 'sdk/dotnet/v')
