@@ -30,6 +30,9 @@ export interface MockNode extends MockServerBase {
   /** Server-side close of every currently open connection (a FIN, like
    * nanocached-node's own idle timeout), leaving the server listening. */
   dropConnections(): void;
+  /** Makes every future `S` reply wait `ms` first — for tests proving a
+   * caller isn't blocked on a slow replica leg (doc/adr/0014-*.md). */
+  delaySets(ms: number): void;
 }
 
 export interface MockDiscovery extends MockServerBase {
@@ -91,6 +94,7 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
   let storedToGetReplies = 0;
   let connections = 0;
   let gets = 0;
+  let setDelayMs = 0;
 
   const server = createServer((socket) => {
     connections++;
@@ -171,7 +175,11 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
             }
 
             store.set(key, value);
-            socket.write("S\n");
+            if (setDelayMs > 0) {
+              setTimeout(() => socket.write("S\n"), setDelayMs);
+            } else {
+              socket.write("S\n");
+            }
             break;
           }
 
@@ -219,6 +227,9 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
     getCount: () => gets,
     dropConnections: () => {
       for (const socket of sockets) socket.end();
+    },
+    delaySets: (ms) => {
+      setDelayMs = ms;
     },
     close,
   };

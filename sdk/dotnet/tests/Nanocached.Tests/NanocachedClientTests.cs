@@ -503,6 +503,102 @@ public class NanocachedClientTests
         }
     }
 
+    // ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────
+
+    [Fact]
+    public async Task ByDefaultAWriteStillWaitsForTheReplicaLeg()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].DelaySets(80);
+
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await client.SetAsync("k", "v");
+        Assert.True(stopwatch.ElapsedMilliseconds >= 80, "SetAsync should have waited for the replica");
+    }
+
+    [Fact]
+    public async Task FireAndForgetReplicasReturnsAsSoonAsThePrimaryAcks()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].DelaySets(200);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            FireAndForgetReplicas = true,
+        });
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await client.SetAsync("k", "v");
+        Assert.True(stopwatch.ElapsedMilliseconds < 200, "SetAsync should not have waited for the replica");
+
+        string stored = MockNode.KeyOf(Bytes("k"));
+        await WaitForAsync(
+            () => cluster.Nodes[owners[1]].Store.ContainsKey(stored),
+            "the background write to land on the replica");
+    }
+
+    [Fact]
+    public async Task FireAndForgetReplicasFallsBackToSynchronousPastTheCap()
+    {
+        int defaultCap = NanocachedClient.MaxInFlightBackgroundReplicaWrites;
+        NanocachedClient.MaxInFlightBackgroundReplicaWrites = 2;
+        try
+        {
+            using Cluster cluster = StartCluster(replication: 2);
+            IReadOnlyList<string> owners = OwnersOf("k");
+            cluster.Nodes[owners[1]].DelaySets(150);
+
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+                FireAndForgetReplicas = true,
+            });
+
+            Task<long>[] tasks = Enumerable.Range(0, 3).Select(async _ =>
+            {
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                await client.SetAsync("k", "v");
+                return stopwatch.ElapsedMilliseconds;
+            }).ToArray();
+            long[] elapsed = await Task.WhenAll(tasks);
+
+            Assert.True(elapsed.Any(ms => ms >= 150), $"expected at least one call to fall back to synchronous, got [{string.Join(",", elapsed)}]");
+            Assert.True(elapsed.Any(ms => ms < 150), $"expected at least one call to return fast, got [{string.Join(",", elapsed)}]");
+        }
+        finally
+        {
+            NanocachedClient.MaxInFlightBackgroundReplicaWrites = defaultCap;
+        }
+    }
+
+    [Fact]
+    public async Task CloseDrainsInFlightBackgroundReplicaWrites()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].DelaySets(80);
+
+        NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            FireAndForgetReplicas = true,
+        });
+
+        await client.SetAsync("k", "v");
+        client.Close(); // should block until the still-in-flight replica write lands
+
+        string stored = MockNode.KeyOf(Bytes("k"));
+        Assert.True(
+            cluster.Nodes[owners[1]].Store.ContainsKey(stored),
+            "Close() returned before the background replica write finished");
+    }
+
     // ── 値の圧縮 (doc/adr/0013-*.md) ──────────────────────────────
 
     private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>

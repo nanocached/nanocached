@@ -58,6 +58,29 @@ exposes the factor in use. A write whose primary just died recovers
 automatically once discovery drops the node (bounded by its liveness
 timeout): the failed attempt forces a node-list refresh and one retry.
 
+## Fire-and-forget replica writes
+
+Off by default. `Set`/`SetBytes`/`Delete` normally wait for every
+replica leg to finish, same as the primary. Enabling
+`FireAndForgetReplicas` returns as soon as the primary acks, letting
+replica legs finish in the background (doc/adr/0014-*.md):
+
+```go
+client, err := nanocached.Connect(nanocached.Config{
+    Addresses:             []nanocached.Address{{Host: "cache.internal", Port: 8357}},
+    FireAndForgetReplicas: true,
+})
+```
+
+Unlike `Compress`, this is a pure latency/durability trade for this
+client's own writes — it carries no wire format, and different clients
+may use different settings freely. At most 32 replica writes across the
+whole client run in the background at once; past that cap, further
+replica legs run synchronously exactly as with the option off (a
+graceful degrade, not a queue or a drop). `Close()` waits for any
+still-in-flight background replica writes before tearing down
+connections.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps

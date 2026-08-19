@@ -24,6 +24,7 @@ public sealed class MockNode : IDisposable
     private int _wrongNodeReplies;
     private int _malformedValueReplies;
     private int _storedToGetReplies;
+    private volatile int _setDelayMillis;
 
     public MockNode(string? requiredSecret = null)
     {
@@ -45,6 +46,11 @@ public sealed class MockNode : IDisposable
     /// <summary>Reply <c>S</c> to the next G — a well-formed frame of the
     /// wrong kind, as a desynced (off-by-one) stream would produce.</summary>
     public void AnswerStoredToGetOnce() => Interlocked.Increment(ref _storedToGetReplies);
+
+    /// <summary>Holds every future S reply for <paramref name="millis"/>
+    /// first — for tests proving a caller isn't blocked on a slow replica
+    /// leg (doc/adr/0014-*.md).</summary>
+    public void DelaySets(int millis) => _setDelayMillis = millis;
 
     /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
     public void DropConnections()
@@ -131,6 +137,10 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         byte[] value = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        if (_setDelayMillis > 0)
+                        {
+                            await Task.Delay(_setDelayMillis);
+                        }
                         if (TakeWrongNode())
                         {
                             await Wire.WriteAsync(stream, "W\n");

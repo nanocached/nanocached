@@ -65,6 +65,15 @@ public sealed class NanocachedClient : IDisposable
         /// the savings. Only meaningful when <see cref="Compress"/> is
         /// true. Default 256.</summary>
         public int CompressionThreshold { get; set; } = 256;
+
+        /// <summary>Let SetAsync/DeleteAsync return as soon as the primary
+        /// owner acks, letting replica legs finish in the background
+        /// instead of waiting for them too (doc/adr/0014-*.md). Off by
+        /// default. Unlike <see cref="Compress"/>, this is a pure
+        /// latency/durability trade for this client's own writes — it
+        /// carries no wire format and needs no agreement with other
+        /// clients.</summary>
+        public bool FireAndForgetReplicas { get; set; }
     }
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -107,6 +116,11 @@ public sealed class NanocachedClient : IDisposable
     private readonly SslClientAuthenticationOptions? _tls;
     private readonly bool _compress;
     private readonly int _compressionThreshold;
+    private readonly bool _fireAndForgetReplicas;
+    // doc/adr/0014-*.md: bounds in-flight background replica writes and
+    // lets Close() drain them before tearing down connections.
+    private readonly SemaphoreSlim _backgroundReplicaPermits;
+    private readonly ConcurrentDictionary<Task, byte> _backgroundReplicaWrites = new();
     private readonly CancellationTokenSource _lifetime = new();
 
     private volatile bool _closed;
@@ -130,6 +144,8 @@ public sealed class NanocachedClient : IDisposable
         _tls = BuildTlsOptions(options);
         _compress = options.Compress;
         _compressionThreshold = options.CompressionThreshold;
+        _fireAndForgetReplicas = options.FireAndForgetReplicas;
+        _backgroundReplicaPermits = new SemaphoreSlim(MaxInFlightBackgroundReplicaWrites, MaxInFlightBackgroundReplicaWrites);
     }
 
     /// <summary>Builds the internal TLS options for every dial this client
@@ -363,6 +379,11 @@ public sealed class NanocachedClient : IDisposable
         }
         _closed = true;
         _lifetime.Cancel();
+        // doc/adr/0014-*.md: give background replica writes a chance to
+        // finish before their connections are torn out from under them.
+        // Bounded by MaxInFlightBackgroundReplicaWrites, so this is a
+        // short wait in practice.
+        Task.WaitAll(_backgroundReplicaWrites.Keys.ToArray());
         Teardown();
     }
 
@@ -488,7 +509,7 @@ public sealed class NanocachedClient : IDisposable
         // design (ADR-0011) — a dead or disagreeing replica leaves the key
         // under-replicated until the next node-list refresh, never fails
         // the write.
-        var replicaWrites = names.Skip(1).Select(async name =>
+        async Task ReplicaWriteAsync(string name)
         {
             try
             {
@@ -498,7 +519,32 @@ public sealed class NanocachedClient : IDisposable
             {
                 // Swallowed by design — see above.
             }
-        }).ToList();
+        }
+
+        var replicaWrites = new List<Task>();
+        foreach (string name in names.Skip(1))
+        {
+            // doc/adr/0014-*.md: with FireAndForgetReplicas, up to
+            // MaxInFlightBackgroundReplicaWrites legs run in the
+            // background instead of being waited for below — past that
+            // cap, further legs fall back to the synchronous path exactly
+            // as with the option off.
+            if (_fireAndForgetReplicas && _backgroundReplicaPermits.Wait(0))
+            {
+                Task background = Task.Run(() => ReplicaWriteAsync(name));
+                _backgroundReplicaWrites[background] = 0;
+                _ = background.ContinueWith(
+                    completed =>
+                    {
+                        _backgroundReplicaWrites.TryRemove(completed, out _);
+                        _backgroundReplicaPermits.Release();
+                    },
+                    TaskScheduler.Default);
+                continue;
+            }
+
+            replicaWrites.Add(ReplicaWriteAsync(name));
+        }
 
         try
         {
@@ -725,6 +771,15 @@ public sealed class NanocachedClient : IDisposable
     // server's 60s idle timeout, so it never severs a healthy client.
     // Internal and mutable only so tests can shorten it.
     internal static TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
+
+    // doc/adr/0014-*.md: bounds how many replica writes a single client
+    // may have running in the background at once when
+    // FireAndForgetReplicas is enabled — once the cap is reached, further
+    // replica legs fall back to running synchronously, the same as with
+    // the option off. Internal and mutable only so tests can shrink it,
+    // mirroring KeepAliveInterval. Read once per constructor call, so
+    // tests must set it before ConnectAsync().
+    internal static int MaxInFlightBackgroundReplicaWrites = 32;
 
     private void StartKeepAlive()
     {

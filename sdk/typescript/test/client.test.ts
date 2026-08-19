@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
-import { KEEPALIVE_TUNING } from "../src/client.js";
+import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING } from "../src/client.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -919,6 +919,132 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
       }
     } finally {
       await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  afterEach(() => {
+    FIRE_AND_FORGET_TUNING.maxInFlight = 32;
+  });
+
+  it("by default, a write still waits for the replica leg", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.delaySets(80);
+
+      const start = Date.now();
+      await client.set("k", "v");
+      assert.ok(Date.now() - start >= 80, "set() should have waited for the replica");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("returns as soon as the primary acks when enabled", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.delaySets(200);
+
+      const start = Date.now();
+      await client.set("k", "v");
+      assert.ok(Date.now() - start < 200, "set() should not have waited for the replica");
+
+      await waitFor(() => replica.mock.store.has("k"), "the background write to land on the replica");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("falls back to synchronous past the in-flight cap", async () => {
+    FIRE_AND_FORGET_TUNING.maxInFlight = 2;
+
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.delaySets(150);
+
+      const elapsed = await Promise.all(
+        Array.from({ length: 3 }, async () => {
+          const start = Date.now();
+          await client.set("k", "v");
+          return Date.now() - start;
+        }),
+      );
+
+      assert.ok(
+        elapsed.some((ms) => ms >= 150),
+        `expected at least one call to fall back to synchronous, got ${elapsed}`,
+      );
+      assert.ok(
+        elapsed.some((ms) => ms < 150),
+        `expected at least one call to return fast, got ${elapsed}`,
+      );
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("close() drains in-flight background replica writes", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.delaySets(80);
+
+      await client.set("k", "v");
+      client.close(); // should not abandon the still-in-flight replica write
+
+      await waitFor(() => replica.mock.store.has("k"), "Close() to drain the background replica write");
+    } finally {
+      await cluster.close();
     }
   });
 });

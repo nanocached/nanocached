@@ -48,6 +48,13 @@ _KEEPALIVE_KEY = b"\x00"
 # so tests can shorten it.
 _KEEPALIVE_INTERVAL = 30.0
 
+# doc/adr/0014-*.md: bounds how many replica writes a single client may
+# have running in the background at once when fire_and_forget_replicas is
+# enabled — once the cap is reached, further replica legs fall back to
+# running synchronously, the same as with the option off. Mutable only so
+# tests can shrink it, mirroring _KEEPALIVE_INTERVAL.
+_MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
+
 
 def _warn(message: str) -> None:
     print(message, file=sys.stderr)
@@ -122,6 +129,8 @@ class NanocachedClient:
         self._ssl_context: ssl_module.SSLContext | None = None
         self._compress: bool = False
         self._compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD
+        self._fire_and_forget_replicas: bool = False
+        self._background_replica_writes: set[asyncio.Task[None]] = set()
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -140,6 +149,7 @@ class NanocachedClient:
         ca: str | os.PathLike | None = None,
         compress: bool = False,
         compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD,
+        fire_and_forget_replicas: bool = False,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
@@ -150,6 +160,7 @@ class NanocachedClient:
         client._ssl_context = _build_ssl_context(tls, ca)
         client._compress = compress
         client._compression_threshold = compression_threshold
+        client._fire_and_forget_replicas = fire_and_forget_replicas
 
         # Walk the addresses until one yields a working target; an address
         # that is unreachable, warming up (`B`, ADR-0010), or knows no live
@@ -299,6 +310,21 @@ class NanocachedClient:
         self._closed = True
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
+
+        # doc/adr/0014-*.md: give background replica writes a chance to
+        # finish before their connections are torn out from under them —
+        # close() stays synchronous, so the teardown itself is deferred
+        # via a scheduled coroutine rather than awaited here.
+        if self._background_replica_writes:
+            pending = list(self._background_replica_writes)
+
+            async def _drain_then_teardown() -> None:
+                await asyncio.gather(*pending, return_exceptions=True)
+                self._teardown()
+
+            asyncio.ensure_future(_drain_then_teardown())
+            return
+
         self._teardown()
 
     async def __aenter__(self) -> "NanocachedClient":
@@ -385,7 +411,23 @@ class NanocachedClient:
                 # node-list refresh, never fails the write.
                 pass
 
-        replica_tasks = [asyncio.ensure_future(replica_write(name)) for name in replicas]
+        replica_tasks = []
+        for name in replicas:
+            # doc/adr/0014-*.md: with fire_and_forget_replicas, up to
+            # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES legs run in the
+            # background instead of being waited for below — past that
+            # cap, further legs fall back to the synchronous path exactly
+            # as with the option off.
+            if (
+                self._fire_and_forget_replicas
+                and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+            ):
+                task = asyncio.ensure_future(replica_write(name))
+                self._background_replica_writes.add(task)
+                task.add_done_callback(self._background_replica_writes.discard)
+                continue
+            replica_tasks.append(asyncio.ensure_future(replica_write(name)))
+
         try:
             return await op(await self._member_connection(primary))
         finally:

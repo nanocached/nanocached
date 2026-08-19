@@ -30,6 +30,7 @@ final class MockServers {
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
+        private volatile long setDelayMillis = 0;
         private final byte[] requiredSecret;
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
@@ -69,6 +70,13 @@ final class MockServers {
          * wrong kind, as a desynced (off-by-one) stream would produce. */
         void answerStoredToGetOnce() {
             storedToGetReplies.incrementAndGet();
+        }
+
+        /** Holds every future S reply for {@code millis} first — for tests
+         * proving a caller isn't blocked on a slow replica leg
+         * (doc/adr/0014-*.md). */
+        void delaySets(long millis) {
+            setDelayMillis = millis;
         }
 
         /** Server-side FIN on every open connection, like the idle timeout. */
@@ -149,6 +157,14 @@ final class MockServers {
                         case "S" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             byte[] value = in.readNBytes(Integer.parseInt(parts[2]));
+                            if (setDelayMillis > 0) {
+                                try {
+                                    Thread.sleep(setDelayMillis);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
                             if (takeWrongNode()) {
                                 out.write("W\n".getBytes(StandardCharsets.US_ASCII));
                             } else {

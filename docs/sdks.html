@@ -37,11 +37,11 @@ code.</p>
 <p>Every SDK ships the full feature set: authentication, TLS, discovery
 replica lists, replication-aware routing (reads fail over, writes fan out
 to all R owners), transparent reconnect with a single retry, always-on
-keep-alive, opt-in transparent value compression, and the same
-rendezvous-hashing pipeline verified against shared cross-language test
-vectors. Values are strings first: every <code>get</code> returns a
-string (strict UTF-8), with a <code>get_bytes</code>-style companion for
-raw byte values.</p>
+keep-alive, opt-in transparent value compression, opt-in fire-and-forget
+replica writes, and the same rendezvous-hashing pipeline verified against
+shared cross-language test vectors. Values are strings first: every
+<code>get</code> returns a string (strict UTF-8), with a
+<code>get_bytes</code>-style companion for raw byte values.</p>
 
 <div class="table-wrap">
 <table>
@@ -166,6 +166,12 @@ existed, err := client.Delete("greeting")</code></pre>
   on write and decompressed on read. Every client touching a given
   keyspace must agree on the setting (<a
   href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0013-transparent-opt-in-value-compression-in-the-sdks.md">ADR-0013</a>).</li>
+  <li><b>Fire-and-forget replica writes</b> — off by default; when
+  enabled, a write returns as soon as the primary owner acks instead of
+  also waiting for replica legs, which finish in the background (bounded,
+  with a synchronous fallback past the bound). A per-client latency
+  trade-off, not a format decision — clients may mix settings freely (<a
+  href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0014-optional-fire-and-forget-replica-writes-in-the-sdks.md">ADR-0014</a>).</li>
 </ul>
 
 </main>

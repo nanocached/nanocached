@@ -13,11 +13,11 @@
 //! across the server's 60s idle timeout.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::compression::resolve_compression;
 use crate::connection::Connection;
@@ -45,6 +45,15 @@ pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
 /// savings. Only meaningful when `compress(true)`.
 const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
 
+/// doc/adr/0014-*.md: bounds how many replica writes a single client may
+/// have running in the background at once when `fire_and_forget_replicas`
+/// is enabled — once the cap is reached, further replica legs fall back
+/// to running synchronously, the same as with the option off. Read once
+/// per `connect`; public-but-hidden purely as a test hook, mirroring
+/// `KEEPALIVE_INTERVAL_MS`.
+#[doc(hidden)]
+pub static MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES: AtomicUsize = AtomicUsize::new(32);
+
 /// Options for [`NanocachedClient::connect`].
 pub struct Options {
     addresses: Vec<(String, u16)>,
@@ -53,6 +62,7 @@ pub struct Options {
     ca: Option<std::path::PathBuf>,
     compress: bool,
     compression_threshold: usize,
+    fire_and_forget_replicas: bool,
 }
 
 impl Default for Options {
@@ -64,6 +74,7 @@ impl Default for Options {
             ca: None,
             compress: false,
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
+            fire_and_forget_replicas: false,
         }
     }
 }
@@ -141,11 +152,49 @@ impl Options {
         self.compression_threshold = bytes;
         self
     }
+
+    /// Let `set`/`delete` return as soon as the primary owner acks,
+    /// letting replica legs finish in the background instead of waiting
+    /// for them too (doc/adr/0014-*.md). Off by default. Unlike
+    /// [`Self::compress`], this is a pure latency/durability trade for
+    /// this client's own writes — it carries no wire format and needs no
+    /// agreement with other clients.
+    pub fn fire_and_forget_replicas(mut self, enabled: bool) -> Self {
+        self.fire_and_forget_replicas = enabled;
+        self
+    }
 }
 
 struct Member {
     address: String,
     connection: Arc<Connection>,
+}
+
+/// What `write` should replay for a replica leg that ends up running
+/// detached (doc/adr/0014-*.md) — the synchronous path keeps using the
+/// borrowed `op` closure unchanged; this only exists to let a background
+/// `tokio::spawn` task own its own copy of the data, since `op` typically
+/// borrows from the caller's stack frame (see `set`/`delete`).
+enum WriteBody<'a> {
+    Set { value: &'a [u8], ttl_seconds: u64 },
+    Delete,
+}
+
+impl WriteBody<'_> {
+    fn to_owned(&self) -> OwnedWriteBody {
+        match self {
+            WriteBody::Set { value, ttl_seconds } => OwnedWriteBody::Set {
+                value: value.to_vec(),
+                ttl_seconds: *ttl_seconds,
+            },
+            WriteBody::Delete => OwnedWriteBody::Delete,
+        }
+    }
+}
+
+enum OwnedWriteBody {
+    Set { value: Vec<u8>, ttl_seconds: u64 },
+    Delete,
 }
 
 enum Target {
@@ -174,6 +223,13 @@ struct Inner {
     closed: AtomicBool,
     compress: bool,
     compression_threshold: usize,
+    fire_and_forget_replicas: bool,
+    /// doc/adr/0014-*.md: bounds in-flight background replica writes.
+    /// Also close()'s drain primitive — acquiring every permit blocks
+    /// until every currently in-flight background write has released
+    /// its own, i.e. finished.
+    background_replica_permits: Arc<Semaphore>,
+    background_replica_cap: usize,
 }
 
 impl Inner {
@@ -337,6 +393,7 @@ impl NanocachedClient {
             }));
         };
 
+        let background_replica_cap = MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES.load(Ordering::SeqCst);
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 target,
@@ -350,6 +407,9 @@ impl NanocachedClient {
             closed: AtomicBool::new(false),
             compress,
             compression_threshold: options.compression_threshold,
+            fire_and_forget_replicas: options.fire_and_forget_replicas,
+            background_replica_permits: Arc::new(Semaphore::new(background_replica_cap)),
+            background_replica_cap,
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -412,6 +472,28 @@ impl NanocachedClient {
         }
         if let Some(keepalive) = &self.keepalive {
             keepalive.abort();
+        }
+
+        // doc/adr/0014-*.md: give background replica writes a chance to
+        // finish before their connections are torn out from under them.
+        // Every in-flight background write holds one permit and releases
+        // it on completion, so acquiring all of them blocks until every
+        // one has finished — bounded by background_replica_cap, so this
+        // is a short wait in practice. Skipped entirely when nothing is
+        // in flight (the common case), which also keeps close() on its
+        // existing fast, non-blocking path then.
+        if self.inner.background_replica_permits.available_permits()
+            < self.inner.background_replica_cap
+        {
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                let _ = Arc::clone(&inner.background_replica_permits)
+                    .acquire_many_owned(inner.background_replica_cap as u32)
+                    .await;
+                let state = inner.state.lock().await;
+                close_all_connections(&state.target);
+            });
+            return;
         }
 
         // Close every connection now rather than waiting for the last
@@ -483,9 +565,11 @@ impl NanocachedClient {
         };
         self.before_operation().await?;
         self.with_cluster_retry(|| {
-            self.write(key, move |connection| async move {
-                connection.set(key, value, ttl_seconds).await
-            })
+            self.write(
+                key,
+                WriteBody::Set { value, ttl_seconds },
+                move |connection| async move { connection.set(key, value, ttl_seconds).await },
+            )
         })
         .await
     }
@@ -495,10 +579,9 @@ impl NanocachedClient {
         let key = key.as_ref();
         self.before_operation().await?;
         self.with_cluster_retry(|| {
-            self.write(
-                key,
-                |connection| async move { connection.delete(key).await },
-            )
+            self.write(key, WriteBody::Delete, |connection| async move {
+                connection.delete(key).await
+            })
         })
         .await
     }
@@ -580,7 +663,7 @@ impl NanocachedClient {
         }))
     }
 
-    async fn write<T, F, Fut>(&self, key: &[u8], op: F) -> Result<T>
+    async fn write<T, F, Fut>(&self, key: &[u8], body: WriteBody<'_>, op: F) -> Result<T>
     where
         F: Fn(Arc<Connection>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -604,9 +687,45 @@ impl NanocachedClient {
         // primary's outcome decides; replica failures are swallowed by
         // design (ADR-0011) — a dead or disagreeing replica leaves the key
         // under-replicated until the next node-list refresh, never fails
-        // the write.
+        // the write. doc/adr/0014-*.md: with fire_and_forget_replicas, up
+        // to background_replica_cap legs run detached on their own tokio
+        // task instead of being awaited below — past that cap, further
+        // legs fall back to the synchronous path exactly as with the
+        // option off.
         let replica_writes = async {
             for name in replicas {
+                if self.inner.fire_and_forget_replicas {
+                    if let Ok(permit) =
+                        Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
+                    {
+                        let client = self.clone();
+                        let name = name.clone();
+                        let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
+                        let owned_body = body.to_owned();
+                        tokio::spawn(async move {
+                            let _permit = permit; // held until this task finishes
+                            match owned_body {
+                                OwnedWriteBody::Set { value, ttl_seconds } => {
+                                    let value: Arc<[u8]> = Arc::from(value);
+                                    let op = move |connection: Arc<Connection>| {
+                                        let key = Arc::clone(&owned_key);
+                                        let value = Arc::clone(&value);
+                                        async move { connection.set(&key, &value, ttl_seconds).await }
+                                    };
+                                    let _ = client.apply_reconnecting(Some(&name), &op).await;
+                                }
+                                OwnedWriteBody::Delete => {
+                                    let op = move |connection: Arc<Connection>| {
+                                        let key = Arc::clone(&owned_key);
+                                        async move { connection.delete(&key).await }
+                                    };
+                                    let _ = client.apply_reconnecting(Some(&name), &op).await;
+                                }
+                            }
+                        });
+                        continue;
+                    }
+                }
                 let _ = self.apply_reconnecting(Some(name), &op).await;
             }
         };

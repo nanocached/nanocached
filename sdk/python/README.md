@@ -69,6 +69,29 @@ key (the primary's result decides; a dead replica never fails a write),
 and `get` asks the primary, falling over to the next owner only when the
 holder is unreachable. `client.replication` exposes the factor in use.
 
+## Fire-and-forget replica writes
+
+Off by default. `set`/`delete` normally wait for every replica leg to
+finish, same as the primary. Enabling `fire_and_forget_replicas` returns
+as soon as the primary acks, letting replica legs finish in the
+background (doc/adr/0014-*.md):
+
+```python
+client = await NanocachedClient.connect(
+    [("cache.internal", 8357)],
+    fire_and_forget_replicas=True,
+)
+```
+
+Unlike `compress`, this is a pure latency/durability trade for this
+client's own writes — it carries no wire format, and different clients
+may use different settings freely. At most 32 replica writes across the
+whole client run in the background at once; past that cap, further
+replica legs run synchronously exactly as with the option off (a
+graceful degrade, not a queue or a drop). `close()` gives any
+still-in-flight background replica writes a chance to finish before
+tearing down their connections.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps

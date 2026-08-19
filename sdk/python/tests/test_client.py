@@ -768,5 +768,124 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
+    # doc/adr/0014-*.md
+
+    def setUp(self):
+        from nanocached import client as client_module
+
+        self._client_module = client_module
+        self._default_cap = client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+
+    def tearDown(self):
+        self._client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = self._default_cap
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_by_default_a_write_still_waits_for_the_replica_leg(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                _, replica = self.owners_of("k")
+                nodes[replica].delay_sets(0.08)
+
+                start = asyncio.get_running_loop().time()
+                await client.set("k", "v")
+                elapsed = asyncio.get_running_loop().time() - start
+                self.assertGreaterEqual(elapsed, 0.08)
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_returns_as_soon_as_the_primary_acks_when_enabled(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+            )
+            try:
+                _, replica = self.owners_of("k")
+                nodes[replica].delay_sets(0.2)
+
+                start = asyncio.get_running_loop().time()
+                await client.set("k", "v")
+                elapsed = asyncio.get_running_loop().time() - start
+                self.assertLess(elapsed, 0.2)
+
+                await wait_for(
+                    lambda: b"k" in nodes[replica].store,
+                    "the background write to land on the replica",
+                )
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_falls_back_to_synchronous_past_the_cap(self):
+        self._client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 2
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+            )
+            try:
+                _, replica = self.owners_of("k")
+                nodes[replica].delay_sets(0.15)
+
+                async def timed_set() -> float:
+                    start = asyncio.get_running_loop().time()
+                    await client.set("k", "v")
+                    return asyncio.get_running_loop().time() - start
+
+                elapsed = await asyncio.gather(*(timed_set() for _ in range(3)))
+
+                self.assertTrue(any(e >= 0.15 for e in elapsed), elapsed)
+                self.assertTrue(any(e < 0.15 for e in elapsed), elapsed)
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_close_drains_in_flight_background_replica_writes(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+            )
+            _, replica = self.owners_of("k")
+            nodes[replica].delay_sets(0.08)
+
+            await client.set("k", "v")
+            client.close()  # should not abandon the still-in-flight replica write
+
+            await wait_for(
+                lambda: b"k" in nodes[replica].store,
+                "close() to drain the background replica write",
+            )
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
 if __name__ == "__main__":
     unittest.main()

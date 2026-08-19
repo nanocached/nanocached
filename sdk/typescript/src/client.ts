@@ -68,9 +68,24 @@ export interface NanocachedClientOptions {
    * per-value overhead of attempting it outweighs the savings. Only
    * meaningful when `compress` is true. Default 256. */
   compressionThreshold?: number;
+  /** Let `set`/`delete` return as soon as the primary owner acks,
+   * letting replica legs finish in the background instead of waiting
+   * for them too (doc/adr/0014-*.md). Off by default. Unlike `compress`,
+   * this is a pure latency/durability trade for this client's own
+   * writes — it carries no wire format and needs no agreement with other
+   * clients. */
+  fireAndForgetReplicas?: boolean;
 }
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
+
+/** Bounds how many replica writes a single client may have running in
+ * the background at once when `fireAndForgetReplicas` is enabled
+ * (doc/adr/0014-*.md) — once the cap is reached, further replica legs
+ * fall back to running synchronously, the same as with the option off.
+ * A mutable object only so tests can shrink it, mirroring
+ * KEEPALIVE_TUNING. */
+export const FIRE_AND_FORGET_TUNING = { maxInFlight: 32 };
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
  * lightweight request goes out on each connection real traffic has left
@@ -194,10 +209,16 @@ export class NanocachedClient {
     private readonly ca: Buffer | undefined,
     private readonly compress: boolean,
     private readonly compressionThreshold: number,
+    private readonly fireAndForgetReplicas: boolean,
   ) {
     this.nodeUrls = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
   }
+
+  /** doc/adr/0014-*.md: replica writes currently running in the
+   * background (fireAndForgetReplicas) — close() drains these before
+   * tearing down connections instead of abandoning them. */
+  private readonly backgroundReplicaWrites = new Set<Promise<void>>();
 
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
     const addresses = options.addresses ?? [];
@@ -264,6 +285,7 @@ export class NanocachedClient {
           ca,
           compress,
           compressionThreshold,
+          options.fireAndForgetReplicas === true,
         );
       }
 
@@ -315,6 +337,7 @@ export class NanocachedClient {
         ca,
         compress,
         compressionThreshold,
+        options.fireAndForgetReplicas === true,
       );
     }
 
@@ -342,6 +365,18 @@ export class NanocachedClient {
       this.keepAliveTimer = null;
     }
 
+    // doc/adr/0014-*.md: give background replica writes a chance to
+    // finish before their connections are torn out from under them —
+    // close() stays synchronous (it already can't block on this
+    // runtime), so the teardown itself is just deferred, not awaited.
+    if (this.backgroundReplicaWrites.size > 0) {
+      void Promise.allSettled([...this.backgroundReplicaWrites]).then(() => this.teardownConnections());
+      return;
+    }
+    this.teardownConnections();
+  }
+
+  private teardownConnections(): void {
     if (this.target.kind === "single") {
       this.target.connection.close();
       return;
@@ -465,20 +500,35 @@ export class NanocachedClient {
       throw new ConnectionLostError("nanocached: no owner is reachable for this key");
     }
 
-    const replicaWrites = replicaNames.map(async (name) => {
+    const replicaWrite = async (name: string): Promise<void> => {
       try {
         const connection = await this.memberConnection(name);
         await op(connection);
       } catch {
         // Swallowed by design — see the doc comment.
       }
+    };
+
+    // doc/adr/0014-*.md: with fireAndForgetReplicas, up to
+    // FIRE_AND_FORGET_TUNING.maxInFlight replica legs run in the
+    // background instead of being waited for below — past that cap,
+    // further legs fall back to the synchronous path exactly as with the
+    // option off.
+    const synchronousReplicaWrites = replicaNames.map((name) => {
+      if (this.fireAndForgetReplicas && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        const background = replicaWrite(name);
+        this.backgroundReplicaWrites.add(background);
+        background.finally(() => this.backgroundReplicaWrites.delete(background));
+        return Promise.resolve();
+      }
+      return replicaWrite(name);
     });
 
     try {
       const connection = await this.memberConnection(primaryName);
       return await op(connection);
     } finally {
-      await Promise.all(replicaWrites);
+      await Promise.all(synchronousReplicaWrites);
     }
   }
 

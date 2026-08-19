@@ -78,11 +78,25 @@ type Config struct {
 	// Zero means DefaultCompressionThreshold. Only meaningful when
 	// Compress is true.
 	CompressionThreshold int
+	// FireAndForgetReplicas lets Set/SetBytes/Delete return as soon as
+	// the primary owner acks, letting replica legs finish in the
+	// background instead of waiting for them too (doc/adr/0014-*.md).
+	// Off by default. Unlike Compress, this is a pure latency/durability
+	// trade for this client's own writes — it carries no wire format and
+	// needs no agreement with other clients.
+	FireAndForgetReplicas bool
 }
 
 // DefaultCompressionThreshold is the CompressionThreshold used when
 // Config.CompressionThreshold is left at zero.
 const DefaultCompressionThreshold = 256
+
+// maxInFlightBackgroundReplicaWrites bounds how many replica writes a
+// single client may have running in the background at once when
+// FireAndForgetReplicas is enabled (doc/adr/0014-*.md) — once the cap is
+// reached, further replica legs fall back to running synchronously, the
+// same as with the option off. A variable only so tests can shrink it.
+var maxInFlightBackgroundReplicaWrites = 32
 
 // keepAliveInterval is the always-on keep-alive cadence (issue #27):
 // half the server's 60s idle timeout, so it never severs a healthy
@@ -107,6 +121,13 @@ type Client struct {
 
 	compress             bool
 	compressionThreshold int
+
+	fireAndForgetReplicas bool
+	// backgroundReplicaSem bounds in-flight background replica writes;
+	// backgroundReplicaWG lets Close() drain them before tearing down
+	// connections (doc/adr/0014-*.md).
+	backgroundReplicaSem chan struct{}
+	backgroundReplicaWG  sync.WaitGroup
 
 	// targetKey is the address this client's connect() ultimately settled
 	// on — a node's own address in single mode, the winning discovery
@@ -190,15 +211,17 @@ func Connect(config Config) (*Client, error) {
 	}
 
 	client := &Client{
-		redialGates:          map[string]*sync.Mutex{},
-		addresses:            append([]Address(nil), config.Addresses...),
-		tlsConfig:            tlsConfig,
-		members:              map[string]*member{},
-		replication:          1,
-		lastFetch:            time.Now(),
-		stopKeepalive:        make(chan struct{}),
-		compress:             config.Compress,
-		compressionThreshold: compressionThreshold,
+		redialGates:           map[string]*sync.Mutex{},
+		addresses:             append([]Address(nil), config.Addresses...),
+		tlsConfig:             tlsConfig,
+		members:               map[string]*member{},
+		replication:           1,
+		lastFetch:             time.Now(),
+		stopKeepalive:         make(chan struct{}),
+		compress:              config.Compress,
+		compressionThreshold:  compressionThreshold,
+		fireAndForgetReplicas: config.FireAndForgetReplicas,
+		backgroundReplicaSem:  make(chan struct{}, maxInFlightBackgroundReplicaWrites),
 	}
 	if config.AuthSecret != "" {
 		client.authSecret = []byte(config.AuthSecret)
@@ -421,6 +444,11 @@ func (c *Client) Close() {
 	c.closed = true
 	close(c.stopKeepalive)
 	c.mu.Unlock()
+	// doc/adr/0014-*.md: give background replica writes (if any) a chance
+	// to finish before their connections are torn out from under them.
+	// Bounded by maxInFlightBackgroundReplicaWrites, so this is a short
+	// wait in practice.
+	c.backgroundReplicaWG.Wait()
 	c.teardown()
 }
 
@@ -551,12 +579,34 @@ func (c *Client) write(key []byte, op func(conn *connection, primary bool) error
 	// (ADR-0011) — a dead or disagreeing replica leaves the key
 	// under-replicated until the next node-list refresh, never fails the
 	// write.
+	replicaWrite := func(replica string) {
+		_ = c.applyReconnecting(replica, func(conn *connection) error { return op(conn, false) })
+	}
+
 	var replicas sync.WaitGroup
 	for _, name := range names[1:] {
+		// doc/adr/0014-*.md: with FireAndForgetReplicas, try to run this
+		// leg in the background instead of waiting for it — but only up
+		// to maxInFlightBackgroundReplicaWrites; past that cap, fall back
+		// to the synchronous path below exactly as with the option off.
+		if c.fireAndForgetReplicas {
+			select {
+			case c.backgroundReplicaSem <- struct{}{}:
+				c.backgroundReplicaWG.Add(1)
+				go func(replica string) {
+					defer c.backgroundReplicaWG.Done()
+					defer func() { <-c.backgroundReplicaSem }()
+					replicaWrite(replica)
+				}(name)
+				continue
+			default:
+			}
+		}
+
 		replicas.Add(1)
 		go func(replica string) {
 			defer replicas.Done()
-			_ = c.applyReconnecting(replica, func(conn *connection) error { return op(conn, false) })
+			replicaWrite(replica)
 		}(name)
 	}
 

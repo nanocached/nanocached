@@ -26,6 +26,10 @@ struct NodeState {
     malformed_value_replies: AtomicUsize,
     stored_to_get_replies: AtomicUsize,
     get_delay_ms: AtomicUsize,
+    /// Holds every future S reply this long — for tests proving a caller
+    /// isn't blocked on a slow replica leg (doc/adr/0014-*.md). Unlike
+    /// get_delay_ms, persistent rather than one-shot.
+    set_delay_ms: AtomicUsize,
     required_secret: Option<Vec<u8>>,
     /// The raw `S ...` header most recently received, so tests can assert
     /// whether the ttl field was present on the wire.
@@ -143,6 +147,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             "S" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
                 let value = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+                let delay = state.set_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                }
                 *state.last_set_header.lock().unwrap() = Some(header.clone());
                 let reply: &[u8] = if take_wrong_node(&state) {
                     b"W\n"
@@ -1038,6 +1046,167 @@ async fn fans_deletes_out_to_every_owner() {
     }
 
     client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────────
+
+fn node_by_name<'a>(nodes: &'a [(String, MockNode)], name: &str) -> &'a MockNode {
+    &nodes.iter().find(|(n, _)| n == name).unwrap().1
+}
+
+#[tokio::test]
+async fn by_default_a_write_still_waits_for_the_replica_leg() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .set_delay_ms
+        .store(80, Ordering::SeqCst);
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let start = tokio::time::Instant::now();
+    client.set("k", "v", 0).await.unwrap();
+    assert!(
+        start.elapsed() >= Duration::from_millis(80),
+        "set() should have waited for the replica"
+    );
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn fire_and_forget_replicas_returns_as_soon_as_the_primary_acks() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .set_delay_ms
+        .store(200, Ordering::SeqCst);
+
+    let client = NanocachedClient::connect(options(discovery.port).fire_and_forget_replicas(true))
+        .await
+        .unwrap();
+
+    let start = tokio::time::Instant::now();
+    client.set("k", "v", 0).await.unwrap();
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "set() should not have waited for the replica"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let replica = node_by_name(&nodes, &owners[1]);
+    while !replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(&b"k".to_vec())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the background write never landed on the replica"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn fire_and_forget_replicas_falls_back_to_synchronous_past_the_cap() {
+    let default_cap = nanocached::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES.load(Ordering::SeqCst);
+    nanocached::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES.store(2, Ordering::SeqCst);
+
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .set_delay_ms
+        .store(150, Ordering::SeqCst);
+
+    let client = NanocachedClient::connect(options(discovery.port).fire_and_forget_replicas(true))
+        .await
+        .unwrap();
+    nanocached::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES.store(default_cap, Ordering::SeqCst);
+
+    let mut tasks = Vec::new();
+    for _ in 0..3 {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            client.set("k", "v", 0).await.unwrap();
+            start.elapsed()
+        }));
+    }
+    let mut elapsed = Vec::new();
+    for task in tasks {
+        elapsed.push(task.await.unwrap());
+    }
+
+    assert!(
+        elapsed.iter().any(|e| *e >= Duration::from_millis(150)),
+        "expected at least one call to fall back to synchronous past the cap: {elapsed:?}"
+    );
+    assert!(
+        elapsed.iter().any(|e| *e < Duration::from_millis(150)),
+        "expected at least one call to return fast (below the cap): {elapsed:?}"
+    );
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn close_drains_in_flight_background_replica_writes() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .set_delay_ms
+        .store(80, Ordering::SeqCst);
+
+    let client = NanocachedClient::connect(options(discovery.port).fire_and_forget_replicas(true))
+        .await
+        .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    client.close(); // should not abandon the still-in-flight replica write
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let replica = node_by_name(&nodes, &owners[1]);
+    while !replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(&b"k".to_vec())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "close() returned before the background replica write finished"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
     discovery.stop();
     for (_, node) in nodes {
         node.stop();

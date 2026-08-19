@@ -130,6 +130,29 @@ the SDK refreshes the node list and retries that operation once. A discovery
 outage degrades only topology updates: existing connections keep serving
 traffic on the last-known node list.
 
+### Fire-and-forget replica writes
+
+Off by default. `set`/`delete` normally wait for every replica leg to
+finish, same as the primary. Enabling `fireAndForgetReplicas` returns as
+soon as the primary acks, letting replica legs finish in the background
+(doc/adr/0014-*.md):
+
+```ts
+const client = await NanocachedClient.connect({
+  addresses: [{ host: "cache.internal", port: 8357 }],
+  fireAndForgetReplicas: true,
+});
+```
+
+Unlike `compress`, this is a pure latency/durability trade for this
+client's own writes — it carries no wire format, and different clients
+may use different settings freely. At most 32 replica writes across the
+whole client run in the background at once; past that cap, further
+replica legs run synchronously exactly as with the option off (a
+graceful degrade, not a queue or a drop). `close()` gives any
+still-in-flight background replica writes a chance to finish before
+tearing down their connections.
+
 ### Discovery replicas
 
 When the cluster runs more than one discovery server, list them all in

@@ -542,4 +542,101 @@ class NanocachedClientTest {
             }
         }
     }
+
+    // ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────
+
+    private static NanocachedClient connectFireAndForget(int port) {
+        return NanocachedClient.connect(NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", port)))
+                .fireAndForgetReplicas(true));
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void resetMaxInFlightBackgroundReplicaWrites() {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 32;
+    }
+
+    @Test
+    void byDefaultAWriteStillWaitsForTheReplicaLeg() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            cluster.nodes().get(replica).delaySets(80);
+
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                long start = System.nanoTime();
+                client.set("k", "v");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+                assertTrue(elapsedMillis >= 80, "set() should have waited for the replica, took " + elapsedMillis + "ms");
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetReplicasReturnsAsSoonAsThePrimaryAcks() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            cluster.nodes().get(replica).delaySets(200);
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                long start = System.nanoTime();
+                client.set("k", "v");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+                assertTrue(elapsedMillis < 200, "set() should not have waited for the replica, took " + elapsedMillis + "ms");
+
+                String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
+                waitFor(() -> cluster.nodes().get(replica).store.containsKey(stored),
+                        "the background write to land on the replica");
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetReplicasFallsBackToSynchronousPastTheCap() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 2;
+
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            cluster.nodes().get(replica).delaySets(150);
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                long[] elapsedMillis = new long[3];
+                Thread[] threads = new Thread[3];
+                for (int i = 0; i < threads.length; i++) {
+                    int index = i;
+                    threads[i] = new Thread(() -> {
+                        long start = System.nanoTime();
+                        client.set("k", "v");
+                        elapsedMillis[index] = (System.nanoTime() - start) / 1_000_000;
+                    });
+                    threads[i].start();
+                }
+                for (Thread thread : threads) thread.join();
+
+                boolean anySlow = false;
+                boolean anyFast = false;
+                for (long ms : elapsedMillis) {
+                    if (ms >= 150) anySlow = true;
+                    else anyFast = true;
+                }
+                assertTrue(anySlow, "expected at least one call to fall back to synchronous past the cap");
+                assertTrue(anyFast, "expected at least one call to return fast (below the cap)");
+            }
+        }
+    }
+
+    @Test
+    void closeDrainsInFlightBackgroundReplicaWrites() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            cluster.nodes().get(replica).delaySets(80);
+
+            NanocachedClient client = connectFireAndForget(cluster.discovery().port());
+            client.set("k", "v");
+            client.close(); // should block until the still-in-flight replica write lands
+
+            String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
+            assertTrue(cluster.nodes().get(replica).store.containsKey(stored),
+                    "close() returned before the background replica write finished");
+        }
+    }
 }

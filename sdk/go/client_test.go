@@ -72,8 +72,14 @@ type mockNode struct {
 	malformedLeft   atomic.Int32
 	storedToGetLeft atomic.Int32
 	lastSetTTL      atomic.Value // string: the TTL field of the last S, or "none"
+	setDelay        atomic.Int64 // nanoseconds; sleep this long before every S reply
 	conns           sync.Map     // net.Conn -> struct{}
 }
+
+// delaySets makes every future S reply from this node wait d first — for
+// tests proving a caller isn't blocked on a slow replica leg
+// (doc/adr/0014-*.md).
+func (m *mockNode) delaySets(d time.Duration) { m.setDelay.Store(int64(d)) }
 
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
 	t.Helper()
@@ -186,6 +192,9 @@ func (m *mockNode) serve(conn net.Conn) {
 				m.lastSetTTL.Store(parts[3])
 			} else {
 				m.lastSetTTL.Store("none")
+			}
+			if delay := time.Duration(m.setDelay.Load()); delay > 0 {
+				time.Sleep(delay)
 			}
 			reply := "S\n"
 			if m.takeWrongNode() {
@@ -1039,4 +1048,142 @@ func TestFansDeletesOutToEveryOwner(t *testing.T) {
 			t.Errorf("still present on %s", name)
 		}
 	}
+}
+
+// ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────────
+
+func TestByDefaultAWriteStillWaitsForTheReplicaLeg(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].delaySets(80 * time.Millisecond)
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	start := time.Now()
+	if err := client.Set(key, "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 80*time.Millisecond {
+		t.Fatalf("Set returned after %v, want >= 80ms (should have waited for the replica)", elapsed)
+	}
+}
+
+func TestFireAndForgetReplicasReturnsAsSoonAsThePrimaryAcks(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].delaySets(200 * time.Millisecond)
+
+	client, err := Connect(Config{
+		Addresses:             []Address{addr(discovery.address())},
+		FireAndForgetReplicas: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	start := time.Now()
+	if err := client.Set(key, "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed >= 200*time.Millisecond {
+		t.Fatalf("Set returned after %v, want well under the replica's 200ms delay", elapsed)
+	}
+
+	// The background write still lands eventually.
+	if !waitUntil(t, 2*time.Second, func() bool { return nodes[owners[1]].hasKey(key) }) {
+		t.Fatal("replica never received the background write")
+	}
+}
+
+func TestFireAndForgetReplicasFallsBackToSynchronousPastTheCap(t *testing.T) {
+	original := maxInFlightBackgroundReplicaWrites
+	maxInFlightBackgroundReplicaWrites = 2
+	defer func() { maxInFlightBackgroundReplicaWrites = original }()
+
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].delaySets(150 * time.Millisecond)
+
+	client, err := Connect(Config{
+		Addresses:             []Address{addr(discovery.address())},
+		FireAndForgetReplicas: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	elapsed := make([]time.Duration, 3)
+	var wg sync.WaitGroup
+	for i := range elapsed {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			start := time.Now()
+			if err := client.Set(key, "v", 0); err != nil {
+				t.Error(err)
+			}
+			elapsed[i] = time.Since(start)
+		}(i)
+	}
+	wg.Wait()
+
+	fast, slow := 0, 0
+	for _, e := range elapsed {
+		if e >= 150*time.Millisecond {
+			slow++
+		} else {
+			fast++
+		}
+	}
+	if slow == 0 {
+		t.Fatal("expected at least one call to fall back to synchronous past the cap")
+	}
+	if fast == 0 {
+		t.Fatal("expected at least one call to return fast (below the cap)")
+	}
+}
+
+func TestCloseDrainsInFlightBackgroundReplicaWrites(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].delaySets(80 * time.Millisecond)
+
+	client, err := Connect(Config{
+		Addresses:             []Address{addr(discovery.address())},
+		FireAndForgetReplicas: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.Set(key, "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	client.Close() // should block until the still-in-flight replica write lands
+
+	if !nodes[owners[1]].hasKey(key) {
+		t.Fatal("Close() returned before the background replica write finished")
+	}
+}
+
+func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return condition()
 }

@@ -59,6 +59,7 @@ public final class NanocachedClient implements AutoCloseable {
         private Path ca;
         private boolean compress;
         private int compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD;
+        private boolean fireAndForgetReplicas;
 
         /** Discovery replicas (ADR-0010), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -118,6 +119,17 @@ public final class NanocachedClient implements AutoCloseable {
             this.compressionThreshold = bytes;
             return this;
         }
+
+        /** Let set/delete return as soon as the primary owner acks, letting
+         * replica legs finish in the background instead of waiting for them
+         * too (doc/adr/0014-*.md). Off by default. Unlike {@link #compress},
+         * this is a pure latency/durability trade for this client's own
+         * writes — it carries no wire format and needs no agreement with
+         * other clients. */
+        public Options fireAndForgetReplicas(boolean enabled) {
+            this.fireAndForgetReplicas = enabled;
+            return this;
+        }
     }
 
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
@@ -130,6 +142,13 @@ public final class NanocachedClient implements AutoCloseable {
     // The server rejects empty keys, so the keep-alive G needs one byte.
     private static final byte[] KEEPALIVE_KEY = {0};
     static volatile long keepAliveIntervalMillis = 30_000;
+    // doc/adr/0014-*.md: bounds how many replica writes a single client
+    // may have running in the background at once when
+    // fireAndForgetReplicas is enabled — once the cap is reached, further
+    // replica legs fall back to running synchronously, the same as with
+    // the option off. Mutable only so tests can shrink it, mirroring
+    // keepAliveIntervalMillis.
+    static volatile int maxInFlightBackgroundReplicaWrites = 32;
 
     // Tracks, per connect() target (not per instance — mirrors
     // sdk/typescript/src/client.ts's openTargets), how many open sockets
@@ -155,6 +174,10 @@ public final class NanocachedClient implements AutoCloseable {
     private final SSLContext tls;
     private final boolean compress;
     private final int compressionThreshold;
+    private final boolean fireAndForgetReplicas;
+    private final java.util.Set<CompletableFuture<Void>> backgroundReplicaWrites =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
 
     /** The address that answered connect() — used both to redial in single
      * mode and as the key for the open-sockets tracker in every mode
@@ -185,12 +208,13 @@ public final class NanocachedClient implements AutoCloseable {
 
     private NanocachedClient(
             List<Address> addresses, byte[] authSecret, SSLContext tls,
-            boolean compress, int compressionThreshold) {
+            boolean compress, int compressionThreshold, boolean fireAndForgetReplicas) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
         this.compress = compress;
         this.compressionThreshold = compressionThreshold;
+        this.fireAndForgetReplicas = fireAndForgetReplicas;
     }
 
     public static NanocachedClient connect(Options options) {
@@ -202,7 +226,7 @@ public final class NanocachedClient implements AutoCloseable {
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
         NanocachedClient client = new NanocachedClient(
                 options.addresses, options.authSecret, sslContext,
-                options.compress, options.compressionThreshold);
+                options.compress, options.compressionThreshold, options.fireAndForgetReplicas);
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, ADR-0010), or knows no live
@@ -325,6 +349,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
         ring = new HashRing(names);
         replication = cluster.replication();
+        backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(maxInFlightBackgroundReplicaWrites);
         replicaWriters = Executors.newCachedThreadPool(runnable -> {
             Thread thread = new Thread(runnable, "nanocached-replica-writer");
             thread.setDaemon(true);
@@ -434,6 +459,13 @@ public final class NanocachedClient implements AutoCloseable {
         }
         closed = true;
         if (keepAlive != null) keepAlive.shutdownNow();
+        // doc/adr/0014-*.md: give background replica writes a chance to
+        // finish before their connections are torn out from under them.
+        // Bounded by maxInFlightBackgroundReplicaWrites, so this is a
+        // short wait in practice.
+        for (CompletableFuture<Void> pending : List.copyOf(backgroundReplicaWrites)) {
+            pending.join();
+        }
         if (replicaWriters != null) replicaWriters.shutdown();
         teardown();
     }
@@ -534,7 +566,7 @@ public final class NanocachedClient implements AutoCloseable {
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (int i = 1; i < names.size(); i++) {
             String replica = names.get(i);
-            replicaWrites.add(CompletableFuture.runAsync(() -> {
+            Runnable replicaWrite = () -> {
                 try {
                     applyReconnecting(() -> memberConnection(replica), op);
                 } catch (RuntimeException ignored) {
@@ -542,7 +574,24 @@ public final class NanocachedClient implements AutoCloseable {
                     // replica leaves the key under-replicated until the next
                     // node-list refresh, never fails the write.
                 }
-            }, replicaWriters));
+            };
+
+            // doc/adr/0014-*.md: with fireAndForgetReplicas, up to
+            // maxInFlightBackgroundReplicaWrites legs run in the
+            // background instead of being waited for below — past that
+            // cap, further legs fall back to the synchronous path exactly
+            // as with the option off.
+            if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
+                CompletableFuture<Void> background = CompletableFuture.runAsync(replicaWrite, replicaWriters);
+                backgroundReplicaWrites.add(background);
+                background.whenComplete((ignoredResult, ignoredError) -> {
+                    backgroundReplicaWritePermits.release();
+                    backgroundReplicaWrites.remove(background);
+                });
+                continue;
+            }
+
+            replicaWrites.add(CompletableFuture.runAsync(replicaWrite, replicaWriters));
         }
 
         try {
