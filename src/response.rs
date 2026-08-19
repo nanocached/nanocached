@@ -18,6 +18,14 @@ pub enum Response {
     /// transfer starts, purely so discovery can size its migration
     /// timeout, not a transfer plan.
     MigrationAccepted(usize),
+    /// An `M` arrived while this node's single migration slot was already
+    /// occupied by another active (not merely stale-and-unswept) handoff
+    /// — see `MigrationGuard::new`. Deliberately doesn't parse as
+    /// `MigrationAccepted`'s `A <entries>\n` ack, so `send_migrate`
+    /// (`src/bin/nanocached-discovery.rs`) treats it as a failed send and
+    /// retries via the existing `send_migrate_with_retry` path instead of
+    /// being told the handoff started when it never did.
+    MigrationRejected,
     /// ADR-0008: acknowledges an `X` (cancel migration) request was
     /// received and parsed — not that any in-progress handoff it names
     /// was actually found and aborted (a cancel for an already-finished
@@ -52,6 +60,7 @@ impl Response {
             Self::AuthOk => b"On\n".to_vec(),
             Self::Unauthorized => b"En\n".to_vec(),
             Self::MigrationAccepted(entries) => format!("A {entries}\n").into_bytes(),
+            Self::MigrationRejected => b"R\n".to_vec(),
             Self::MigrationCancelled => b"A\n".to_vec(),
             Self::WrongNode => b"W\n".to_vec(),
 
@@ -116,6 +125,11 @@ mod tests {
     fn encodes_migration_accepted_response_with_its_entry_count() {
         assert_eq!(Response::MigrationAccepted(0).encode(), b"A 0\n");
         assert_eq!(Response::MigrationAccepted(42).encode(), b"A 42\n");
+    }
+
+    #[test]
+    fn encodes_migration_rejected_response() {
+        assert_eq!(Response::MigrationRejected.encode(), b"R\n");
     }
 
     #[test]

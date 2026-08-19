@@ -30,6 +30,13 @@ const MAX_CONNECTIONS: usize = 1024;
 /// of it.
 pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds a response write (issue #4) — see `write_response`. Shorter
+/// than `IDLE_TIMEOUT`: that one tolerates a normal gap between a
+/// client's requests, but a peer that has simply stopped draining its
+/// receive buffer is a distinct failure that shouldn't get to hold a
+/// `MAX_CONNECTIONS` permit for as long as an idle-but-otherwise-fine
+/// connection is allowed to sit.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Base and per-entry components of how long after this node's own
 /// handoff completes it keeps forwarding concurrent writes to the joiner
 /// (issue #3) — sized the same way, and for the same reason, as
@@ -604,11 +611,12 @@ async fn execute_command(
 /// side already has `IDLE_TIMEOUT`, but an unbounded `write_all` let a peer
 /// that stops reading (without closing the TCP connection — e.g. a full
 /// receive buffer) hold this connection's `MAX_CONNECTIONS` permit forever.
-/// Reuses `IDLE_TIMEOUT` rather than adding a second constant, since a
-/// stalled write is the same kind of stuck-peer condition a stalled read
-/// already covers.
+/// Uses `WRITE_TIMEOUT` rather than reusing `IDLE_TIMEOUT`: the two are
+/// different failure modes (a normal gap between requests vs. a peer that
+/// isn't draining its receive buffer at all), and reusing the 60s read
+/// timeout let a stuck write hold a permit far longer than necessary.
 async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()> {
-    timeout(IDLE_TIMEOUT, stream.write_all(data))
+    timeout(WRITE_TIMEOUT, stream.write_all(data))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
@@ -664,6 +672,28 @@ async fn handle_connection(
                     ));
                 };
 
+                let (before_ring, after_ring) =
+                    migration_rings(&node_context, &joining_name, &joined);
+                let after_ring = Arc::new(after_ring);
+
+                // Reserved *before* acknowledging `M`, not inside
+                // `run_migration` after the fact: only this ordering lets
+                // a conflicting `M` (issue #3 — this node's single
+                // migration slot already occupied) be reported as
+                // `MigrationRejected` on the same ack, instead of telling
+                // the sender `MigrationAccepted` and then silently doing
+                // nothing.
+                let Some(migration_guard) = MigrationGuard::new(
+                    Arc::clone(&node_context.active_migration),
+                    joining_name.clone(),
+                    joining_addr.clone(),
+                    Arc::clone(&after_ring),
+                    replication,
+                ) else {
+                    write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
+                    continue;
+                };
+
                 // doc/adr/0017-*.md: sizes discovery's migration timeout.
                 // A cache task that's already gone (shutting down) can't
                 // answer this count; 0 is a safe default here since
@@ -694,8 +724,10 @@ async fn handle_connection(
                         node_context,
                         joining_name,
                         joining_addr,
-                        joined,
                         replication,
+                        before_ring,
+                        after_ring,
+                        migration_guard,
                     )))
                     .await;
 
@@ -835,11 +867,18 @@ async fn handle_connection(
             return Ok(());
         }
 
-        // Issue #7: release an oversized buffer once it's fully drained,
-        // instead of carrying that capacity for the rest of the
-        // connection's life.
-        if received.is_empty() && received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD {
-            received = BytesMut::new();
+        // Issue #7: release an oversized buffer once its unparsed
+        // remainder drops back under the threshold, instead of only when
+        // it's exactly empty — a connection whose next command's lead
+        // byte always lands in the same read as the previous command's
+        // tail would otherwise never hit an exact-empty check and carry
+        // the oversized allocation for the rest of the connection's life.
+        if received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD
+            && received.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
+        {
+            let mut shrunk = BytesMut::with_capacity(received.len());
+            shrunk.extend_from_slice(&received);
+            received = shrunk;
         }
 
         received.reserve(READ_CHUNK_SIZE);
@@ -1241,27 +1280,38 @@ struct ActiveMigration {
 /// so `run_sweep` can tell to pause, an incoming `X` can find this
 /// handoff to cancel it, and a concurrent client write can find it to
 /// forward. Exposes `abort_requested` so `run_migration` can poll it
-/// directly without re-locking `slot` on every entry.
-struct MigrationGuard<'a> {
-    slot: &'a Mutex<Option<ActiveMigration>>,
+/// directly without re-locking `slot` on every entry. Holds an owned
+/// clone of `NodeContext::active_migration`'s `Arc` (rather than
+/// borrowing `NodeContext`) so `handle_connection` can create and hold
+/// this guard *before* handing the migration off to `run_migration` —
+/// see the accept/reject ordering note on `Response::MigrationRejected`.
+struct MigrationGuard {
+    slot: Arc<Mutex<Option<ActiveMigration>>>,
     abort_requested: Arc<AtomicBool>,
 }
 
-impl<'a> MigrationGuard<'a> {
-    /// `None` if `slot` is already occupied by another migration (issue
-    /// #3): unconditionally overwriting it would clobber that migration's
-    /// `completed_at`/`forwarding_grace`/`abort_requested` out from under
-    /// its own still-running `run_migration` task (or its post-completion
-    /// forwarding window), corrupting `migration_target_for` and
-    /// `X`/`C` matching for whichever migration loses the slot. A second
-    /// `M` for the same `joining_name` — a discovery retry after a lost
-    /// ack (`send_migrate_with_retry`) — is the expected way to hit this;
-    /// an `M` for a *different* `joining_name` while one is already
+impl MigrationGuard {
+    /// `None` if `slot` is already occupied by another *active* migration
+    /// (issue #3): unconditionally overwriting it would clobber that
+    /// migration's `completed_at`/`forwarding_grace`/`abort_requested` out
+    /// from under its own still-running `run_migration` task (or its
+    /// post-completion forwarding window), corrupting `migration_target_for`
+    /// and `X`/`C` matching for whichever migration loses the slot. A
+    /// second `M` for the same `joining_name` — a discovery retry after a
+    /// lost ack (`send_migrate_with_retry`) — is the expected way to hit
+    /// this; an `M` for a *different* `joining_name` while one is already
     /// active shouldn't happen given discovery's single-join-at-a-time
     /// invariant, but is handled the same defensive way regardless of
     /// cause.
+    ///
+    /// Reuses `migration_target_for`'s lazy-expiry check first: a slot
+    /// left by a prior handoff that finished *and* whose forwarding grace
+    /// has already elapsed is stale, not "still active" — without this, a
+    /// completed slot that no client `GET`/`SET` has touched since (the
+    /// only other place that lazily clears it) would wrongly block the
+    /// very next join.
     fn new(
-        slot: &'a Mutex<Option<ActiveMigration>>,
+        slot: Arc<Mutex<Option<ActiveMigration>>>,
         joining_name: String,
         joining_addr: String,
         after_ring: Arc<HashRing>,
@@ -1269,10 +1319,25 @@ impl<'a> MigrationGuard<'a> {
     ) -> Option<Self> {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        let expired = guard.as_ref().is_some_and(|active| {
+            active
+                .completed_at
+                .is_some_and(|completed_at| completed_at.elapsed() >= active.forwarding_grace)
+        });
+        if expired {
+            *guard = None;
+        }
+
         if let Some(existing) = guard.as_ref() {
+            let conflicting_joining_name = existing.joining_name.clone();
+            // Dropped before logging (unlike the lock this replaced,
+            // which held it across the `eprintln!`) since `slot` is also
+            // locked by `migration_target_for` on every GET/SET — a
+            // backpressured stderr shouldn't stall the hot path.
+            drop(guard);
             eprintln!(
-                "WARN ignoring M for {joining_name}: a migration to {} is already active",
-                existing.joining_name
+                "WARN ignoring M for {joining_name}: a migration to \
+                 {conflicting_joining_name} is already active"
             );
             return None;
         }
@@ -1317,7 +1382,7 @@ impl<'a> MigrationGuard<'a> {
     }
 }
 
-impl Drop for MigrationGuard<'_> {
+impl Drop for MigrationGuard {
     fn drop(&mut self) {
         *self
             .slot
@@ -1326,20 +1391,19 @@ impl Drop for MigrationGuard<'_> {
     }
 }
 
-/// doc/adr/0017-*.md: counts how many of this node's entries it will
-/// actually send to the joining node, mirroring the sender/displaced
-/// predicate `run_migration` computes for real (the old primary for a
-/// key is the one designated sender — a key can be affected by the join
-/// without this node being the one that sends it). Called once, before
-/// acknowledging `M`, purely to size discovery's migration timeout — not
-/// a transfer plan. `None` if the cache task is already unavailable;
-/// `run_migration` will independently discover the same thing and abort.
-async fn count_entries_to_send(
+/// Computes this handoff's before/after hash rings from `joined` +
+/// `joining_name`, folding this node's own name into the "before" set —
+/// discovery always lists this node in the roster (it only sends `M` to
+/// `Joined` members), but the sender/displaced computations downstream
+/// are meaningless without self in the "before" set, so this makes that
+/// structural rather than trusted. Shared by `count_entries_to_send`,
+/// `handle_connection` (to reserve `MigrationGuard` before acknowledging
+/// `M` — see `Response::MigrationRejected`), and `run_migration`.
+fn migration_rings(
     node_context: &NodeContext,
     joining_name: &str,
     joined: &[(String, String)],
-    replication: usize,
-) -> Option<usize> {
+) -> (HashRing, HashRing) {
     let mut before_members: Vec<String> = joined.iter().map(|(name, _)| name.clone()).collect();
     if !before_members.iter().any(|name| name == &node_context.name) {
         before_members.push(node_context.name.clone());
@@ -1347,8 +1411,25 @@ async fn count_entries_to_send(
     let mut after_members = before_members.clone();
     after_members.push(joining_name.to_string());
 
-    let before_ring = HashRing::new(before_members);
-    let after_ring = HashRing::new(after_members);
+    (HashRing::new(before_members), HashRing::new(after_members))
+}
+
+/// doc/adr/0017-*.md: counts how many of this node's entries it will
+/// actually send to the joining node, mirroring the sender/displaced
+/// predicate `run_migration` computes for real (the old primary for a
+/// key is the one designated sender — a key can be affected by the join
+/// without this node being the one that sends it). Called once, after
+/// `M` reserves a `MigrationGuard`, purely to size discovery's migration
+/// timeout — not a transfer plan. `None` if the cache task is already
+/// unavailable; `run_migration` will independently discover the same
+/// thing and abort.
+async fn count_entries_to_send(
+    node_context: &NodeContext,
+    joining_name: &str,
+    joined: &[(String, String)],
+    replication: usize,
+) -> Option<usize> {
+    let (before_ring, after_ring) = migration_rings(node_context, joining_name, joined);
     let self_name = node_context.name.as_str();
 
     let entries = list_entries(&node_context.request_tx).await?;
@@ -1399,37 +1480,22 @@ async fn count_entries_to_send(
 /// node that's missing data. A lost discovery connection for the final
 /// `C` is a separate, already-terminal failure (the transfer itself
 /// succeeded) and is just logged.
+///
+/// Takes `migration_guard` (and the `before_ring`/`after_ring` it was
+/// created from) already reserved by `handle_connection`, rather than
+/// reserving them itself: the guard has to exist *before* `M` is
+/// acknowledged, so a rejection (see `Response::MigrationRejected`) can
+/// be reported on the same ack instead of the caller being told
+/// `MigrationAccepted` and then silently getting nothing.
 async fn run_migration(
     node_context: NodeContext,
     joining_name: String,
     joining_addr: String,
-    joined: Vec<(String, String)>,
     replication: usize,
+    before_ring: HashRing,
+    after_ring: Arc<HashRing>,
+    migration_guard: MigrationGuard,
 ) {
-    let mut before_members: Vec<String> = joined.into_iter().map(|(name, _)| name).collect();
-    // Discovery always lists this node in the roster (it only sends `M` to
-    // `Joined` members), but the sender/displaced computations below are
-    // meaningless without self in the "before" set — make it structural
-    // rather than trusted.
-    if !before_members.iter().any(|name| name == &node_context.name) {
-        before_members.push(node_context.name.clone());
-    }
-    let mut after_members = before_members.clone();
-    after_members.push(joining_name.clone());
-
-    let before_ring = HashRing::new(before_members);
-    let after_ring = Arc::new(HashRing::new(after_members));
-
-    let Some(migration_guard) = MigrationGuard::new(
-        &node_context.active_migration,
-        joining_name.clone(),
-        joining_addr.clone(),
-        Arc::clone(&after_ring),
-        replication,
-    ) else {
-        return;
-    };
-
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 
     let entries = match list_entries(&node_context.request_tx).await {
@@ -2460,15 +2526,29 @@ mod tests {
             request_tx: request_tx.clone(),
         };
 
+        let joined = vec![
+            ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+            ("other-node".to_string(), "127.0.0.1:1".to_string()),
+        ];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner-0", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            joining_addr.clone(),
+            Arc::clone(&after_ring),
+            2,
+        )
+        .unwrap();
+
         run_migration(
             node_context.clone(),
             "joiner-0".to_string(),
             joining_addr.clone(),
-            vec![
-                ("ready-node".to_string(), "127.0.0.1:1".to_string()),
-                ("other-node".to_string(), "127.0.0.1:1".to_string()),
-            ],
             2,
+            before_ring,
+            after_ring,
+            migration_guard,
         )
         .await;
 
@@ -2626,6 +2706,83 @@ mod tests {
         assert!(
             node_context.active_migration.lock().unwrap().is_none(),
             "an expired forwarding entry should be cleared lazily"
+        );
+    }
+
+    #[test]
+    fn migration_guard_reuses_a_stale_completed_slot_instead_of_rejecting_a_new_join() {
+        // `MigrationGuard::new` must apply the same lazy-expiry check
+        // `migration_target_for` does — a slot left by a fully-completed
+        // prior handoff whose forwarding grace already elapsed shouldn't
+        // block the very next join just because no client GET/SET
+        // happened along to clear it first.
+        let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            completed_at: Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1)),
+            forwarding_grace: forwarding_grace(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+        })));
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-1".to_string(),
+        ]));
+        let guard = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-1".to_string(),
+            "127.0.0.1:10".to_string(),
+            after_ring,
+            2,
+        );
+
+        assert!(guard.is_some(), "an expired slot must not block a new join");
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().joining_name,
+            "joiner-1"
+        );
+    }
+
+    #[test]
+    fn migration_guard_rejects_a_still_active_conflicting_migration() {
+        let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            completed_at: None,
+            forwarding_grace: Duration::ZERO,
+            abort_requested: Arc::new(AtomicBool::new(false)),
+        })));
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-1".to_string(),
+        ]));
+        let guard = MigrationGuard::new(
+            Arc::clone(&slot),
+            "joiner-1".to_string(),
+            "127.0.0.1:10".to_string(),
+            after_ring,
+            2,
+        );
+
+        assert!(
+            guard.is_none(),
+            "a still-active migration must not be clobbered"
+        );
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().joining_name,
+            "joiner-0",
+            "the original migration must be left untouched"
         );
     }
 
