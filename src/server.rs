@@ -59,6 +59,15 @@ const READ_CHUNK_SIZE: usize = 1024;
 /// joining node (reconnecting between tries) before giving up on the
 /// whole migration. See `run_migration`'s own doc comment.
 const KEY_TRANSFER_ATTEMPTS: u32 = 3;
+/// Issue #7: `handle_connection`'s read buffer grows (via `reserve`) to fit
+/// whatever request it's mid-receiving, up to `MAX_REQUEST_SIZE`, but never
+/// shrinks back on its own — a connection that ever sent one large request
+/// keeps that capacity allocated for the rest of its (possibly long) life.
+/// Once the buffer is fully drained (empty) and its capacity exceeds this,
+/// it's reallocated back down rather than kept around on the chance of
+/// another large request. Well above ordinary command sizes so typical
+/// traffic never churns an allocation on every drained buffer.
+const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -513,7 +522,41 @@ fn dispatch_connection(
     // otherwise block `run`'s `select!`, freezing new-connection accepts,
     // shutdown detection, and task reaping for the whole server.
     connection_tasks.spawn(async move {
-        let mut stream: ServerStream = match &config.tls_acceptor {
+        // Issue #5: acquired *before* the TLS handshake (previously
+        // after), so a peer can't spend handshake CPU/fds past
+        // `MAX_CONNECTIONS` just by dialing and stalling — only a
+        // permit-holding connection ever performs one.
+        let permit = match connection_limit.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // A TLS-configured server has no plaintext channel to
+                // answer "Busy" on before the handshake completes
+                // (ADR-0006: no plaintext fallback once TLS is set) — it
+                // just closes. A plaintext server can still reply on the
+                // raw stream.
+                if config.tls_acceptor.is_none() {
+                    let busy = Response::Busy.encode();
+                    let mut stream = stream;
+
+                    // Bound the write: a peer that never reads must not
+                    // leak this task by leaving the write pending
+                    // indefinitely.
+                    match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(&busy)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("WARN failed to send busy response to {address}: {error}");
+                        }
+                        Err(_) => {
+                            eprintln!("WARN sending busy response to {address} timed out");
+                        }
+                    }
+                }
+
+                return;
+            }
+        };
+
+        let stream: ServerStream = match &config.tls_acceptor {
             Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                 Ok(Ok(tls_stream)) => ServerStream::Tls(Box::new(tls_stream)),
                 Ok(Err(error)) => {
@@ -526,27 +569,6 @@ fn dispatch_connection(
                 }
             },
             None => ServerStream::Plain(stream),
-        };
-
-        let permit = match connection_limit.try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                let busy = Response::Busy.encode();
-
-                // Bound the write: a peer that never reads must not leak this
-                // task by leaving the write pending indefinitely.
-                match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(&busy)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        eprintln!("WARN failed to send busy response to {address}: {error}");
-                    }
-                    Err(_) => {
-                        eprintln!("WARN sending busy response to {address} timed out");
-                    }
-                }
-
-                return;
-            }
         };
 
         println!("INFO accepted connection from {address}");
@@ -578,6 +600,19 @@ async fn execute_command(
         .map_err(|_| io::Error::other("cache task dropped response"))
 }
 
+/// Bounds every response write in `handle_connection` (issue #4): the read
+/// side already has `IDLE_TIMEOUT`, but an unbounded `write_all` let a peer
+/// that stops reading (without closing the TCP connection — e.g. a full
+/// receive buffer) hold this connection's `MAX_CONNECTIONS` permit forever.
+/// Reuses `IDLE_TIMEOUT` rather than adding a second constant, since a
+/// stalled write is the same kind of stuck-peer condition a stalled read
+/// already covers.
+async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()> {
+    timeout(IDLE_TIMEOUT, stream.write_all(data))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+}
+
 async fn handle_connection(
     mut stream: ServerStream,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -590,10 +625,6 @@ async fn handle_connection(
     let mut authenticated = config.auth_secret.is_none();
 
     loop {
-        if *shutdown_rx.borrow() {
-            return Ok(());
-        }
-
         match parse(&mut received) {
             Ok(Command::Auth { secret }) => {
                 let accepted = match &config.auth_secret {
@@ -603,18 +634,18 @@ async fn handle_connection(
 
                 if accepted {
                     authenticated = true;
-                    stream.write_all(&Response::AuthOk.encode()).await?;
+                    write_response(&mut stream, &Response::AuthOk.encode()).await?;
                     continue;
                 }
 
-                stream.write_all(&Response::Unauthorized.encode()).await?;
+                write_response(&mut stream, &Response::Unauthorized.encode()).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "invalid auth secret",
                 ));
             }
             Ok(_) if !authenticated => {
-                stream.write_all(&Response::Unauthorized.encode()).await?;
+                write_response(&mut stream, &Response::Unauthorized.encode()).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "command sent before authenticating",
@@ -643,9 +674,11 @@ async fn handle_connection(
                         .await
                         .unwrap_or(0);
 
-                stream
-                    .write_all(&Response::MigrationAccepted(entries_to_send).encode())
-                    .await?;
+                write_response(
+                    &mut stream,
+                    &Response::MigrationAccepted(entries_to_send).encode(),
+                )
+                .await?;
 
                 // Handed to `run`'s own loop rather than spawned here
                 // directly, so it ends up tracked by `connection_tasks` —
@@ -697,9 +730,7 @@ async fn handle_connection(
                     }
                 }
 
-                stream
-                    .write_all(&Response::MigrationCancelled.encode())
-                    .await?;
+                write_response(&mut stream, &Response::MigrationCancelled.encode()).await?;
 
                 continue;
             }
@@ -707,12 +738,12 @@ async fn handle_connection(
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
                 {
-                    stream.write_all(&Response::WrongNode.encode()).await?;
+                    write_response(&mut stream, &Response::WrongNode.encode()).await?;
                     continue;
                 }
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
-                stream.write_all(&response.encode()).await?;
+                write_response(&mut stream, &response.encode()).await?;
 
                 continue;
             }
@@ -720,7 +751,7 @@ async fn handle_connection(
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
                 {
-                    stream.write_all(&Response::WrongNode.encode()).await?;
+                    write_response(&mut stream, &Response::WrongNode.encode()).await?;
                     continue;
                 }
 
@@ -733,7 +764,7 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                stream.write_all(&response.encode()).await?;
+                write_response(&mut stream, &response.encode()).await?;
 
                 // ADR-0008: this key may be one an in-progress handoff is
                 // moving to a joining node — see `migration_target_for`.
@@ -754,13 +785,13 @@ async fn handle_connection(
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
                 {
-                    stream.write_all(&Response::WrongNode.encode()).await?;
+                    write_response(&mut stream, &Response::WrongNode.encode()).await?;
                     continue;
                 }
 
                 let response =
                     execute_command(&request_tx, Command::Delete { key: key.clone() }).await?;
-                stream.write_all(&response.encode()).await?;
+                write_response(&mut stream, &response.encode()).await?;
 
                 if let Some(node_context) = &config.node_context
                     && let Some(joining_addr) = migration_target_for(node_context, &key)
@@ -781,7 +812,7 @@ async fn handle_connection(
                 // server-side tasks, never by `parse()` — this arm exists
                 // only so the match stays exhaustive.
                 let response = execute_command(&request_tx, command).await?;
-                stream.write_all(&response.encode()).await?;
+                write_response(&mut stream, &response.encode()).await?;
 
                 continue;
             }
@@ -792,6 +823,23 @@ async fn handle_connection(
                     format!("{error:?}"),
                 ));
             }
+        }
+
+        // Issue #6: checked here — only once `parse` has drained every
+        // complete command already buffered (an `Incomplete` result means
+        // there isn't one) — rather than at the top of the loop, so a
+        // shutdown signal that arrives mid-pipeline doesn't silently drop
+        // a second/third request that arrived in the same read as the
+        // first and needs no further I/O to answer.
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
+        // Issue #7: release an oversized buffer once it's fully drained,
+        // instead of carrying that capacity for the rest of the
+        // connection's life.
+        if received.is_empty() && received.capacity() > REQUEST_BUFFER_SHRINK_THRESHOLD {
+            received = BytesMut::new();
         }
 
         received.reserve(READ_CHUNK_SIZE);
@@ -1200,16 +1248,38 @@ struct MigrationGuard<'a> {
 }
 
 impl<'a> MigrationGuard<'a> {
+    /// `None` if `slot` is already occupied by another migration (issue
+    /// #3): unconditionally overwriting it would clobber that migration's
+    /// `completed_at`/`forwarding_grace`/`abort_requested` out from under
+    /// its own still-running `run_migration` task (or its post-completion
+    /// forwarding window), corrupting `migration_target_for` and
+    /// `X`/`C` matching for whichever migration loses the slot. A second
+    /// `M` for the same `joining_name` — a discovery retry after a lost
+    /// ack (`send_migrate_with_retry`) — is the expected way to hit this;
+    /// an `M` for a *different* `joining_name` while one is already
+    /// active shouldn't happen given discovery's single-join-at-a-time
+    /// invariant, but is handled the same defensive way regardless of
+    /// cause.
     fn new(
         slot: &'a Mutex<Option<ActiveMigration>>,
         joining_name: String,
         joining_addr: String,
         after_ring: Arc<HashRing>,
         replication: usize,
-    ) -> Self {
+    ) -> Option<Self> {
+        let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(existing) = guard.as_ref() {
+            eprintln!(
+                "WARN ignoring M for {joining_name}: a migration to {} is already active",
+                existing.joining_name
+            );
+            return None;
+        }
+
         let abort_requested = Arc::new(AtomicBool::new(false));
 
-        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ActiveMigration {
+        *guard = Some(ActiveMigration {
             joining_name,
             joining_addr,
             after_ring,
@@ -1218,11 +1288,12 @@ impl<'a> MigrationGuard<'a> {
             forwarding_grace: Duration::ZERO,
             abort_requested: Arc::clone(&abort_requested),
         });
+        drop(guard);
 
-        Self {
+        Some(Self {
             slot,
             abort_requested,
-        }
+        })
     }
 
     /// Consumes the guard after a successful transfer: instead of
@@ -1349,13 +1420,15 @@ async fn run_migration(
     let before_ring = HashRing::new(before_members);
     let after_ring = Arc::new(HashRing::new(after_members));
 
-    let migration_guard = MigrationGuard::new(
+    let Some(migration_guard) = MigrationGuard::new(
         &node_context.active_migration,
         joining_name.clone(),
         joining_addr.clone(),
         Arc::clone(&after_ring),
         replication,
-    );
+    ) else {
+        return;
+    };
 
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 

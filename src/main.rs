@@ -47,7 +47,22 @@ impl Default for Args {
     }
 }
 
-fn parse_args() -> Result<Args, String> {
+/// Distinguishes `-h`/`--help` (a normal request, printed to stdout with
+/// exit code 0) from an actual parsing error (printed to stderr with exit
+/// code 1) — both previously took the same `Err` path, so `--help` looked
+/// like a failure to shell scripts and CLI conventions alike.
+enum ArgsError {
+    Help(String),
+    Invalid(String),
+}
+
+impl From<String> for ArgsError {
+    fn from(message: String) -> Self {
+        ArgsError::Invalid(message)
+    }
+}
+
+fn parse_args() -> Result<Args, ArgsError> {
     let mut args = Args::default();
     let mut raw = std::env::args().skip(1);
 
@@ -72,13 +87,20 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("invalid value for --max-memory: {raw_max_memory}"))?;
             }
-            "-h" | "--help" => return Err(usage()),
-            other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
+            "-h" | "--help" => return Err(ArgsError::Help(usage())),
+            other => {
+                return Err(ArgsError::Invalid(format!(
+                    "unknown flag: {other}\n\n{}",
+                    usage()
+                )));
+            }
         }
     }
 
     if args.tls_cert.is_some() != args.tls_key.is_some() {
-        return Err("--tls-cert and --tls-key must be set together".to_string());
+        return Err(ArgsError::Invalid(
+            "--tls-cert and --tls-key must be set together".to_string(),
+        ));
     }
 
     Ok(args)
@@ -121,7 +143,11 @@ async fn main() -> ExitCode {
 
     let args = match parse_args() {
         Ok(args) => args,
-        Err(message) => {
+        Err(ArgsError::Help(message)) => {
+            println!("{message}");
+            return ExitCode::SUCCESS;
+        }
+        Err(ArgsError::Invalid(message)) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
         }

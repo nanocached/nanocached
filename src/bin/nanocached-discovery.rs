@@ -486,7 +486,22 @@ impl Default for Args {
     }
 }
 
-fn parse_args() -> Result<Args, String> {
+/// Distinguishes `-h`/`--help` (a normal request, printed to stdout with
+/// exit code 0) from an actual parsing error (printed to stderr with exit
+/// code 1) — both previously took the same `Err` path, so `--help` looked
+/// like a failure to shell scripts and CLI conventions alike.
+enum ArgsError {
+    Help(String),
+    Invalid(String),
+}
+
+impl From<String> for ArgsError {
+    fn from(message: String) -> Self {
+        ArgsError::Invalid(message)
+    }
+}
+
+fn parse_args() -> Result<Args, ArgsError> {
     let mut args = Args::default();
     let mut raw = std::env::args().skip(1);
 
@@ -514,20 +529,29 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("invalid value for --replication-factor: {raw}"))?;
                 if factor == 0 {
-                    return Err("--replication-factor must be at least 1".to_string());
+                    return Err(ArgsError::Invalid(
+                        "--replication-factor must be at least 1".to_string(),
+                    ));
                 }
                 args.replication_factor = factor;
             }
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
-            "-h" | "--help" => return Err(usage()),
-            other => return Err(format!("unknown flag: {other}\n\n{}", usage())),
+            "-h" | "--help" => return Err(ArgsError::Help(usage())),
+            other => {
+                return Err(ArgsError::Invalid(format!(
+                    "unknown flag: {other}\n\n{}",
+                    usage()
+                )));
+            }
         }
     }
 
     if args.tls_cert.is_some() != args.tls_key.is_some() {
-        return Err("--tls-cert and --tls-key must be set together".to_string());
+        return Err(ArgsError::Invalid(
+            "--tls-cert and --tls-key must be set together".to_string(),
+        ));
     }
 
     Ok(args)
@@ -1276,12 +1300,21 @@ async fn handle_complete(
 /// hiccup — reconnecting for the next heartbeat, say — shouldn't evict it
 /// (this fires once per connection, not once per heartbeat).
 ///
-/// If `name` turns out to matter to the current join — it *was* that
-/// join's Waiting/Joining node (pattern: joining node dies mid-handoff),
-/// or it's a ready node `current_join` is still waiting on a `C` from
-/// (pattern: a ready node dies mid-handoff) — the whole join is
-/// abandoned via `abandon_current_join`. An ordinary `Joined` node with
-/// no bearing on any in-progress join is left alone here.
+/// If `name` turns out to be the current join's own Waiting/Joining
+/// node — it died mid-handoff, its only liveness signal gone — the whole
+/// join is abandoned via `abandon_current_join`. A ready member's
+/// heartbeat connection dying does *not* abandon the join on its own
+/// (issue #10): `C` (handoff complete) is reported over its own
+/// short-lived connection (`report_complete`), never the heartbeat one,
+/// so a heartbeat hiccup says nothing about that ready member's actual
+/// handoff progress — a live node reconnects within one heartbeat
+/// interval regardless. A ready member that's truly gone (crashed, or
+/// genuinely stuck) is instead caught by `sweep_expired`'s size-derived
+/// `migration_timeout_for` — the same size-aware grace
+/// doc/adr/0017-*.md introduced so a large, legitimate join doesn't get
+/// reaped just for being large; abandoning here too would bypass that
+/// grace entirely and reintroduce the flat-timeout failure mode the
+/// size-derived design replaced.
 async fn on_node_connection_ended(
     registry: &Registry,
     current_join: &CurrentJoin,
@@ -1290,41 +1323,48 @@ async fn on_node_connection_ended(
     replication: usize,
     name: &str,
 ) {
-    let was_waiting_or_joining = lock(registry)
-        .get(name)
-        .is_some_and(|info| info.state != NodeState::Joined);
+    let removed = {
+        let mut guard = lock(registry);
+        let was_waiting_or_joining = guard
+            .get(name)
+            .is_some_and(|info| info.state != NodeState::Joined);
 
-    if was_waiting_or_joining {
-        lock(registry).remove(name);
+        if was_waiting_or_joining {
+            guard.remove(name)
+        } else {
+            None
+        }
+    };
+
+    if let Some(info) = removed {
+        // Issue #9: a duplicate `J` under the same name (sharing this
+        // `NodeInfo`'s `Notify`, see `start_join`) may have a second
+        // connection still parked in `wait_for_promotion` on this same
+        // `Notify`. Removing the entry without waking it stranded that
+        // connection forever — nothing else would ever tell it the entry
+        // is gone. Wake it exactly like `abandon_current_join` already
+        // does for its own removal, so `wait_for_promotion`'s re-check
+        // observes `None` and errors the connection closed (the node's
+        // heartbeat loop redials and re-`J`s).
+        info.promoted.notify_waiters();
+        info.promoted.notify_one();
     }
 
-    // `was_waiting_or_joining` only tells us this node wasn't `Joined` — which
-    // is true for *any* queued `Waiting` node, not just the one this join is
-    // about. Abandoning on that alone lets an unrelated queued node's
-    // disconnect tear down (and de-register) the current join's joining node,
-    // stranding it forever in `wait_for_promotion`. The join only actually
-    // matters if `name` is its joining node, or a ready node it still awaits a
-    // `C` from.
-    let abandon_reason = lock_current_join(current_join)
+    // Only the current join's own Waiting/Joining node dying abandons it
+    // here — see this function's doc comment for why a ready member's
+    // connection dying deliberately does not.
+    let is_current_joining_node = lock_current_join(current_join)
         .as_ref()
-        .and_then(|pending| {
-            if pending.joining_name == name {
-                Some("joining node disconnected".to_string())
-            } else if pending.expected.contains(name) {
-                Some(format!("ready member {name} disconnected"))
-            } else {
-                None
-            }
-        });
+        .is_some_and(|pending| pending.joining_name == name);
 
-    if let Some(reason) = abandon_reason {
+    if is_current_joining_node {
         abandon_current_join(
             registry,
             current_join,
             auth_secret,
             tls_connector,
             replication,
-            &reason,
+            "joining node disconnected",
         )
         .await;
     }
@@ -1983,7 +2023,11 @@ async fn main() -> ExitCode {
 
     let args = match parse_args() {
         Ok(args) => args,
-        Err(message) => {
+        Err(ArgsError::Help(message)) => {
+            println!("{message}");
+            return ExitCode::SUCCESS;
+        }
+        Err(ArgsError::Invalid(message)) => {
             eprintln!("{message}");
             return ExitCode::FAILURE;
         }
@@ -2658,6 +2702,87 @@ mod tests {
                 .unwrap();
             assert_eq!(&response, b"R\n");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_node_connection_ended_wakes_a_surviving_duplicate_j_connection() {
+        // Regression for issue #9: `on_node_connection_ended`'s registry
+        // removal for a Waiting/Joining node used to skip the `Notify`
+        // that `abandon_current_join`'s own removal already fires. A
+        // duplicate `J` under the same name (issue #7) shares that
+        // `Notify` across two parked connections; without waking it, the
+        // connection that wasn't the one reported ended would hang in
+        // `wait_for_promotion` forever.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        // A different join already in progress, so node-b's own `J`
+        // leaves it parked at `Waiting` rather than immediately becoming
+        // the current join's own joining node (which `abandon_current_join`
+        // already handles correctly, see the sibling tests above).
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-x".to_string(),
+            expected: ["node-a".to_string()].into_iter().collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+        };
+
+        let (mut node_b_first, server_first) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_first),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_b_first.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await; // let it park
+
+        let (mut node_b_second, server_second) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_second),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_b_second.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await; // let it park too
+
+        assert!(lock(&registry).contains_key("node-b"));
+
+        // Simulate the *first* connection dying, as `run`'s connection-task
+        // wrapper would report it.
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b").await;
+
+        // The still-open second connection must observe the registry
+        // entry is gone and close, not hang forever.
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), node_b_second.read(&mut byte))
+            .await
+            .expect("the surviving duplicate connection was stranded");
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "expected the connection to close, not data"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3432,34 +3557,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_ready_nodes_connection_dying_mid_join_abandons_the_join_and_cancels_other_ready_nodes()
-     {
+    async fn a_ready_nodes_connection_dying_mid_join_does_not_abandon_the_join() {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
-
-        // A fake still-alive ready node, standing in for node B: expects
-        // an `X` naming the abandoned join and acks it.
-        let other_ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let other_ready_addr = other_ready_listener.local_addr().unwrap().to_string();
-        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let received_task = Arc::clone(&received);
-        let other_ready_task = tokio::spawn(async move {
-            let (mut connection, _) = other_ready_listener.accept().await.unwrap();
-            let mut buffer = [0u8; 256];
-            let bytes_read = connection.read(&mut buffer).await.unwrap();
-            received_task
-                .lock()
-                .unwrap()
-                .extend_from_slice(&buffer[..bytes_read]);
-            connection.write_all(b"A\n").await.unwrap();
-        });
 
         lock(&registry).insert(
             "node-a".to_string(),
             NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
-        );
-        lock(&registry).insert(
-            "node-b".to_string(),
-            NodeInfo::new(other_ready_addr, NodeState::Joined),
         );
         lock(&registry).insert(
             "node-c".to_string(),
@@ -3468,29 +3571,35 @@ mod tests {
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-c".to_string(),
-            expected: ["node-a".to_string(), "node-b".to_string()]
-                .into_iter()
-                .collect(),
+            expected: ["node-a".to_string()].into_iter().collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
         })));
 
-        // Node A's connection to discovery dies (ADR-0008 pattern: a ready
-        // node dies mid-handoff).
+        // Node A's *heartbeat* connection to discovery dies (a transient
+        // hiccup) while it's a ready member of an in-progress join.
+        // Unlike the joining node's own connection (see the sibling test
+        // below), this must not abandon the join: `C` (handoff complete)
+        // is reported over its own short-lived connection
+        // (`report_complete`), never the heartbeat one, so this event
+        // says nothing about node A's actual handoff progress — only
+        // `sweep_expired`'s size-derived `migration_timeout_for` should
+        // ever reap a ready node that's truly gone (issue #10).
         on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-a").await;
 
-        other_ready_task.await.unwrap();
-
-        assert!(lock_current_join(&current_join).is_none());
         assert!(
-            !lock(&registry).contains_key("node-c"),
-            "the abandoned joining node must not linger in the registry"
+            lock_current_join(&current_join).is_some(),
+            "a ready node's heartbeat connection dying must not abandon the join"
         );
-
-        let mut expected_cancel = b"X 6\n".to_vec();
-        expected_cancel.extend_from_slice(b"node-c");
-        assert_eq!(*received.lock().unwrap(), expected_cancel);
+        assert!(
+            lock(&registry).contains_key("node-c"),
+            "the joining node must still be waiting for promotion"
+        );
+        // Node A is a `Joined` node, so this event leaves its own
+        // registry entry alone too — only `sweep_expired`'s liveness
+        // timeout evicts it.
+        assert!(lock(&registry).contains_key("node-a"));
     }
 
     #[tokio::test(flavor = "current_thread")]
