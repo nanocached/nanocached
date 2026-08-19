@@ -152,6 +152,9 @@ jobs:
     if: startsWith(github.ref_name, 'sdk/dotnet/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
 
@@ -164,12 +167,18 @@ jobs:
           ver="${GITHUB_REF_NAME#sdk/dotnet/v}"
           grep -q "<Version>$ver</Version>" sdk/dotnet/src/Nanocached/Nanocached.csproj
 
+      # Trusted Publishing: exchanges the workflow's OIDC token for a
+      # short-lived nuget.org API key; no long-lived secret involved.
+      - uses: NuGet/login@v1
+        id: login
+        with:
+          user: t0k0sh1
+
       - name: Pack and publish to NuGet
         working-directory: sdk/dotnet
         run: |
           ver="${GITHUB_REF_NAME#sdk/dotnet/v}"
           dotnet pack src/Nanocached/Nanocached.csproj -c Release -o out
           dotnet nuget push "out/Nanocached.$ver.nupkg" \
-            --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json
