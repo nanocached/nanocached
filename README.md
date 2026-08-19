@@ -422,6 +422,21 @@ answers `L` with `B` (busy) for the liveness-timeout window while live
 members re-announce themselves, so a bootstrapping client never sees a
 half-recovered node list.
 
+**Each replica needs its own stable, individually addressable name (or a
+stable IP) — this is an operational requirement the system does not
+verify.** ADR-0010's contract is that every node and client holds the
+*same list of replicas in the same order*; a single DNS name that
+round-robins across several replicas (or a multi-value discovery service,
+e.g. AWS Cloud Map's multi-value routing) breaks that, since which
+replica a resolution lands on — and in what order — becomes
+nondeterministic per resolver, per lookup. A bare task/pod IP has the
+same problem in a different shape: it works until that replica restarts
+with a new one, at which point every `--discovery` list silently loses
+it. Give each replica a stable identity instead — on ECS, one Cloud Map
+service (or ALB target group) per replica rather than one round-robin
+service in front of all of them; on Kubernetes, a headless
+Service-per-replica or a StatefulSet's stable per-pod DNS names.
+
 Every replica must be started with the same `--replication-factor`; nothing
 enforces this at startup (replicas don't coordinate), but a node reports the
 replication factor it has learned on every heartbeat, and a replica logs a
