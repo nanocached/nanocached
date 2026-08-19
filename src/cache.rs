@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use lru::LruCache;
-use rustc_hash::FxBuildHasher;
+use std::collections::hash_map::RandomState;
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,13 @@ struct Entry {
 }
 
 pub struct Cache {
-    entries: LruCache<Bytes, Entry, FxBuildHasher>,
+    // Keyed with the std default `RandomState` (SipHash, seeded randomly
+    // per process) rather than a fast fixed hasher like FxHash: cache keys
+    // are fully attacker-controlled, and a non-randomized hash lets a
+    // client precompute colliding keys offline and degrade every lookup to
+    // O(n) — a hash-flooding CPU-exhaustion DoS. This is the same reason
+    // std's HashMap defaults to SipHash.
+    entries: LruCache<Bytes, Entry, RandomState>,
     used_bytes: usize,
     max_memory_bytes: usize,
     /// Keys handed off to another node during an ADR-0008 migration this
@@ -51,7 +57,7 @@ impl Entry {
 impl Cache {
     pub fn new(max_memory_bytes: usize) -> Self {
         Self {
-            entries: LruCache::unbounded_with_hasher(FxBuildHasher),
+            entries: LruCache::unbounded_with_hasher(RandomState::new()),
             used_bytes: 0,
             max_memory_bytes,
             migrated: HashSet::new(),

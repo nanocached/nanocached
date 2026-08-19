@@ -643,13 +643,28 @@ func (c *Client) write(key []byte, op func(conn *connection, primary bool) error
 		if c.fireAndForgetReplicas {
 			select {
 			case c.backgroundReplicaSem <- struct{}{}:
-				c.backgroundReplicaWG.Add(1)
-				go func(replica string) {
-					defer c.backgroundReplicaWG.Done()
-					defer func() { <-c.backgroundReplicaSem }()
-					replicaWrite(replica)
-				}(name)
-				continue
+				// Register the background leg under c.mu, rechecking
+				// c.closed: Close() sets c.closed under the same lock and
+				// only then calls backgroundReplicaWG.Wait(), so this
+				// ordering guarantees every Add happens-before that Wait.
+				// Without it, a Set racing Close can call Add(1) just as
+				// Wait() observes the counter at zero — which Go panics on
+				// ("Add called concurrently with Wait"), crashing the
+				// process. If Close already won, fall back to the
+				// synchronous path so the write still completes.
+				c.mu.Lock()
+				if !c.closed {
+					c.backgroundReplicaWG.Add(1)
+					c.mu.Unlock()
+					go func(replica string) {
+						defer c.backgroundReplicaWG.Done()
+						defer func() { <-c.backgroundReplicaSem }()
+						replicaWrite(replica)
+					}(name)
+					continue
+				}
+				c.mu.Unlock()
+				<-c.backgroundReplicaSem
 			default:
 			}
 		}

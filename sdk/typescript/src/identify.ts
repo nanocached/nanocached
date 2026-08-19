@@ -50,6 +50,12 @@ export type IdentifyResult =
 // same as it would reject any other wrong secret.
 const NO_SECRET_PLACEHOLDER = Buffer.from([0]);
 
+// Bound a discovery `N` response, mirroring MAX_VALUE_LENGTH on the `V`
+// path: a malicious or MITM'd discovery server must not be able to make
+// the client buffer arbitrary memory from an unverified length prefix.
+const MAX_NODE_COUNT = 1 << 16;
+const MAX_NODE_FIELD_LENGTH = 64 * 1024;
+
 /** Reads from `socket` until `tryParse` returns non-null, resolving with
  * that value. One-shot: meant for a single request/response, not a
  * long-lived connection matching multiple in-flight requests. */
@@ -170,7 +176,7 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
   }
 
   const count = Number(header[0]);
-  if (!Number.isInteger(count) || count < 0) {
+  if (!Number.isInteger(count) || count < 0 || count > MAX_NODE_COUNT) {
     throw new Error("nanocached: invalid node count in discovery response");
   }
 
@@ -193,7 +199,14 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
 
     const nameLength = Number(lengths[0]);
     const addrLength = Number(lengths[1]);
-    if (!Number.isInteger(nameLength) || nameLength < 0 || !Number.isInteger(addrLength) || addrLength < 0) {
+    if (
+      !Number.isInteger(nameLength) ||
+      nameLength < 0 ||
+      nameLength > MAX_NODE_FIELD_LENGTH ||
+      !Number.isInteger(addrLength) ||
+      addrLength < 0 ||
+      addrLength > MAX_NODE_FIELD_LENGTH
+    ) {
       throw new Error("nanocached: invalid node entry lengths in discovery response");
     }
 

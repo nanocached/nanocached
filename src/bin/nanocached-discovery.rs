@@ -140,6 +140,14 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
 const MAX_CONNECTIONS: usize = 1024;
+/// Upper bound on distinct registered node names. `J` (Join) holds one
+/// connection open per node, so it's already bounded by `MAX_CONNECTIONS`,
+/// but `P` (Announce) does not hold its connection — a single connection
+/// can insert unlimited distinct `Joined` entries as fast as it sends
+/// ~20-byte messages, growing the registry (and every `L` response built
+/// from it) without bound until liveness sweep catches up. This caps that.
+/// Far above any realistic cluster size, so legitimate nodes never hit it.
+const MAX_REGISTRY_SIZE: usize = 1 << 16;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// ADR-0008 pattern-3 guard: a ready node can be alive (heartbeating
 /// normally) yet never report `C` for a handoff it's mid-`Migrate` for —
@@ -156,11 +164,23 @@ const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// `migration_timeout_for`.
 const MIGRATION_TIMEOUT_BASE: Duration = Duration::from_secs(60);
 const MIGRATION_TIMEOUT_PER_ENTRY: Duration = Duration::from_millis(5);
+/// Ceiling on the size-derived timeout. `max_entries` comes from a ready
+/// node's `A <entries>` ack, which is untrusted: a malicious or buggy
+/// node can claim `u32::MAX` and then never send `C`, inflating the
+/// abandon deadline to ~248 days. Since only one join runs cluster-wide
+/// at a time (`try_begin_next_join`), that would stall every future join
+/// for the life of the process. Clamp so the reaper always fires within a
+/// bounded window — well above any legitimate handoff (1M entries ≈ 83min
+/// uncapped), so honest large joins are unaffected.
+const MIGRATION_TIMEOUT_MAX: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// Saturates rather than overflows for a pathologically large count.
+/// Saturates rather than overflows for a pathologically large count, then
+/// clamps to `MIGRATION_TIMEOUT_MAX` so an untrusted ack can't push the
+/// deadline arbitrarily far out.
 fn migration_timeout_for(max_entries: usize) -> Duration {
-    MIGRATION_TIMEOUT_BASE
-        + MIGRATION_TIMEOUT_PER_ENTRY.saturating_mul(max_entries.min(u32::MAX as usize) as u32)
+    let scaled = MIGRATION_TIMEOUT_BASE
+        + MIGRATION_TIMEOUT_PER_ENTRY.saturating_mul(max_entries.min(u32::MAX as usize) as u32);
+    scaled.min(MIGRATION_TIMEOUT_MAX)
 }
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1215,7 +1235,13 @@ fn promote_to_joined(registry: &Registry, name: &str) {
 /// Registers `name` as `Waiting` with `address` (a no-op if it's already
 /// registered — this must not downgrade a node already past `Waiting`)
 /// and attempts to start it toward `Joined` immediately. Returns the
-/// `Notify` its connection should hold open and wait on for promotion.
+/// `Notify` its connection should hold open and wait on for promotion, or
+/// `None` if the name is already `Joined` — a `J` for an
+/// already-promoted node is spurious (a correct node re-registers with
+/// `P`, never `J`) and must be rejected rather than parked: its `Notify`
+/// was already consumed by the original promotion, so `wait_for_promotion`
+/// would block on it forever, holding a `MAX_CONNECTIONS` permit until the
+/// process exits. Repeated, that exhausts the connection semaphore.
 #[allow(clippy::too_many_arguments)]
 async fn start_join(
     registry: &Registry,
@@ -1225,9 +1251,15 @@ async fn start_join(
     replication: usize,
     name: &str,
     address: String,
-) -> Arc<Notify> {
+) -> Option<Arc<Notify>> {
     let promoted = {
         let mut guard = lock(registry);
+        if guard
+            .get(name)
+            .is_some_and(|info| info.state == NodeState::Joined)
+        {
+            return None;
+        }
         if !guard.contains_key(name) {
             println!("INFO node registered: {name} at {address} (waiting to join)");
         }
@@ -1246,7 +1278,7 @@ async fn start_join(
     )
     .await;
 
-    promoted
+    Some(promoted)
 }
 
 /// Records a ready node's completion report for the in-progress join. If
@@ -1928,9 +1960,6 @@ async fn handle_connection(
             }
             Ok(DiscoveryCommand::Join { name, port }) => {
                 let addr = format!("{peer_ip}:{port}");
-                *connection_name
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
 
                 let promoted = start_join(
                     &registry,
@@ -1942,6 +1971,23 @@ async fn handle_connection(
                     addr,
                 )
                 .await;
+
+                // A spurious `J` for an already-`Joined` name: reject
+                // rather than park forever. `connection_name` is left unset
+                // so this connection's teardown can't run cleanup against
+                // the real node still registered under that name.
+                let Some(promoted) = promoted else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "join for a node that is already joined",
+                    ));
+                };
+
+                // Only now that the join is staged does this connection own
+                // `name`, so its death runs `on_node_connection_ended`.
+                *connection_name
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
 
                 wait_for_promotion(&mut stream, &registry, &name, promoted, shutdown_rx.clone())
                     .await?;
@@ -1956,31 +2002,32 @@ async fn handle_connection(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
 
-                let accepted = {
+                let rejection = {
                     let mut guard = lock(&registry);
+                    let at_capacity = guard.len() >= MAX_REGISTRY_SIZE;
                     match guard.get_mut(&name) {
                         // A name mid-join announcing would corrupt the
                         // ADR-0008 join bookkeeping, and no correct node
                         // does it (announces only happen after promotion).
-                        Some(info) if info.state != NodeState::Joined => false,
+                        Some(info) if info.state != NodeState::Joined => {
+                            Some("announce for a node that is mid-join")
+                        }
                         Some(info) => {
                             info.address = addr;
                             info.last_heartbeat = Instant::now();
-                            true
+                            None
                         }
+                        None if at_capacity => Some("registry is full"),
                         None => {
                             println!("INFO node announced: {name} at {addr} (re-registered)");
                             guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined));
-                            true
+                            None
                         }
                     }
                 };
 
-                if !accepted {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "announce for a node that is mid-join",
-                    ));
+                if let Some(reason) = rejection {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
                 }
 
                 stream.write_all(b"R\n").await?;

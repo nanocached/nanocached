@@ -19,6 +19,13 @@ const (
 	compressionMarkerDeflate = 0x01
 )
 
+// maxDecompressedLength bounds a DEFLATE value's expanded output. The wire
+// cap (maxValueLength) bounds only the compressed bytes received; without
+// this, a small, highly-repetitive value written by a compromised node
+// could expand to gigabytes and exhaust client memory on a plain Get (a
+// decompression bomb). Far above any realistic cache value.
+const maxDecompressedLength = 64 * 1024 * 1024
+
 // compressValue: below threshold, or when compressing doesn't actually
 // shrink the value (incompressible data), the marker byte alone is added
 // and the value is stored unchanged. Always returns a value with the
@@ -58,11 +65,17 @@ func decompressValue(value []byte) ([]byte, error) {
 	case compressionMarkerDeflate:
 		reader := flate.NewReader(bytes.NewReader(body))
 		defer reader.Close()
-		out, err := io.ReadAll(reader)
+		// +1 so an output of exactly the cap still reads, letting a value
+		// that exceeds it be detected rather than silently truncated.
+		out, err := io.ReadAll(io.LimitReader(reader, maxDecompressedLength+1))
 		if err != nil {
 			return nil, decompressionFailed(
 				"failed to decompress a value marked as compressed — did every client sharing " +
 					"this key enable compress (doc/adr/0013-*.md)?: " + err.Error())
+		}
+		if len(out) > maxDecompressedLength {
+			return nil, decompressionFailed(
+				"decompressed value exceeds the maximum size — possible decompression bomb")
 		}
 		return out, nil
 	default:
