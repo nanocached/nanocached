@@ -27,7 +27,9 @@ value as UTF-8 with a strict decoder — a value that isn't valid UTF-8
 returns `Error::InvalidUtf8` rather than lossily replacing the invalid
 bytes; use `get_bytes` when a value might not be text. The client is a
 cheaply cloneable handle — clones share one set of connections. Requests
-are serialized per connection (concurrent callers queue).
+are pipelined per connection (doc/adr/0016-*.md) — concurrent callers on
+the same connection each pay only their own network latency, not
+everyone else's ahead of them.
 
 ## Addresses and discovery replicas
 

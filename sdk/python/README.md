@@ -177,10 +177,9 @@ media, random bytes) is passed through unchanged rather than bloated.
 
 ## Notes
 
-- Requests are serialized per connection (one in flight at a time);
-  concurrent callers queue. This is a deliberate v1 simplification over
-  the TypeScript SDK's pipelining — identical semantics, lower peak
-  throughput per connection.
+- Requests are pipelined per connection (doc/adr/0016-*.md), matching
+  the TypeScript SDK: concurrent callers on the same connection each pay
+  only their own network latency, not everyone else's ahead of them.
 - This SDK speaks the current wire protocol (rendezvous hashing,
   replication-aware `L`/`W`); it requires an up-to-date server.
 - `close()` is idempotent, but calling it again on an already-closed

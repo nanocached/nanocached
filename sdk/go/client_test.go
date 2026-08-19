@@ -450,6 +450,61 @@ func TestTtlZeroMeansNoExpiryAndAPositiveTtlIsSentAsIs(t *testing.T) {
 	}
 }
 
+// TestPipelinesConcurrentRequestsOnOneConnection is the same shape as
+// the TypeScript SDK's own pipelining test: N concurrent requests on a
+// single connection, each independently verified to round-trip its own
+// value (doc/adr/0016-*.md) — a bug in matching responses to the right
+// caller in send order would show up as swapped or wrong values here.
+func TestPipelinesConcurrentRequestsOnOneConnection(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("key-%d", i)
+			value := fmt.Sprintf("value-%d", i)
+			if err := client.Set(key, value, 0); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	errs := make([]error, n)
+	values := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			value, ok, err := client.Get(fmt.Sprintf("key-%d", i))
+			if err != nil || !ok {
+				errs[i] = fmt.Errorf("Get key-%d: value=%q ok=%v err=%v", i, value, ok, err)
+				return
+			}
+			values[i] = value
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Error(errs[i])
+			continue
+		}
+		if want := fmt.Sprintf("value-%d", i); values[i] != want {
+			t.Errorf("key-%d = %q, want %q", i, values[i], want)
+		}
+	}
+}
+
 func TestAuthenticates(t *testing.T) {
 	node := startMockNode(t, []byte("s3cret"))
 

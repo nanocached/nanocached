@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 
@@ -7,10 +8,15 @@ namespace Nanocached;
 /// One already-identified connection to a single nanocached-node, speaking
 /// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c> — the <c>A</c> identify
 /// exchange happens in <see cref="Identify"/> before a Connection exists).
-/// Requests are serialized per connection (a semaphore around each round
-/// trip) — a deliberate v1 simplification over the TypeScript SDK's
-/// pipelining: nanocached-node answers in arrival order, so serializing is
-/// always correct, just less concurrent. Concurrent callers queue.
+/// Requests are pipelined onto the socket and matched to responses in send
+/// order (doc/adr/0016-*.md): a dedicated read loop, started in the
+/// constructor, consumes responses and dispatches each to the oldest
+/// still-pending request, since nanocached-node itself only ever answers in
+/// the order it received requests. <see cref="Stream"/> supports one
+/// concurrent reader and one concurrent writer safely, so the read loop
+/// never contends with writers. Enqueuing the pending slot and writing the
+/// frame happen under one semaphore, so concurrent callers' queue order
+/// always matches the order their frames actually hit the wire.
 /// </summary>
 internal sealed class Connection
 {
@@ -19,7 +25,8 @@ internal sealed class Connection
     private const int MaxValueLength = 2 * 1024 * 1024;
 
     private readonly Stream _stream;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly SemaphoreSlim _writeGate = new(1, 1);
+    private readonly ConcurrentQueue<TaskCompletionSource<(byte Marker, byte[]? Value)>> _pending = new();
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
     private readonly Action? _onClosed;
     private volatile bool _closed;
@@ -34,18 +41,27 @@ internal sealed class Connection
     {
         _stream = stream;
         _onClosed = onClosed;
+        _ = ReadLoopAsync();
     }
 
     internal bool IsClosed => _closed;
 
     internal TimeSpan Idle => _sinceLastUse.Elapsed;
 
+    /// <summary>Idempotent. Rejects every request still pending with a
+    /// connection-closed error — the read loop's own exit path (a failed
+    /// read) also routes through here, so this is the single place
+    /// draining ever happens.</summary>
     internal void Close()
     {
         if (_closed) return;
         _closed = true;
         _stream.Dispose();
         _onClosed?.Invoke();
+        while (_pending.TryDequeue(out var tcs))
+        {
+            tcs.TrySetException(new ConnectionLostException("nanocached: connection closed"));
+        }
     }
 
     internal async Task<byte[]?> GetAsync(byte[] key)
@@ -100,7 +116,11 @@ internal sealed class Connection
     /// means the request/response streams are misaligned — every later
     /// response would answer the wrong request, silently returning other
     /// keys' data. Poison the connection, and classify as connection-lost
-    /// so the client's retry layer redials and retries once.
+    /// so the client's retry layer redials and retries once. Requests
+    /// still pending behind this one may already have been resolved with
+    /// misaligned data by the time this runs — an inherent limitation of
+    /// matching-by-order pipelining shared with the TypeScript SDK's
+    /// Connection (doc/adr/0016-*.md), not something this SDK introduces.
     /// </summary>
     private ConnectionLostException Mismatch(byte marker)
     {
@@ -109,6 +129,18 @@ internal sealed class Connection
             $"nanocached: response '{(char)marker}' does not match the request (connection desynced)");
     }
 
+    /// <summary>Enqueues a pending slot and writes <paramref name="frame"/>
+    /// under one semaphore — see the class doc comment — then awaits its
+    /// own <see cref="TaskCompletionSource{TResult}"/>, not the stream.
+    /// Nothing here needs to guard against the caller abandoning this
+    /// await (e.g. racing it with a timeout): unlike some other SDKs'
+    /// ports of this design, this method never receives a
+    /// <see cref="CancellationToken"/> to pass into the underlying
+    /// <see cref="Stream"/> calls, so the write, once started, always
+    /// runs to completion regardless of what the caller does
+    /// afterward — and completing an abandoned
+    /// <see cref="TaskCompletionSource{TResult}"/> that nothing is
+    /// awaiting anymore is harmless.</summary>
     private async Task<(byte Marker, byte[]? Value)> RequestAsync(byte[] frame)
     {
         if (_closed)
@@ -116,24 +148,86 @@ internal sealed class Connection
             throw new ConnectionLostException("nanocached: connection is closed");
         }
 
-        await _gate.WaitAsync().ConfigureAwait(false);
+        var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await _writeGate.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (_closed)
+            {
+                throw new ConnectionLostException("nanocached: connection is closed");
+            }
             _sinceLastUse.Restart();
+            _pending.Enqueue(tcs);
             await _stream.WriteAsync(frame).ConfigureAwait(false);
             await _stream.FlushAsync().ConfigureAwait(false);
-            return await ReadResponseAsync().ConfigureAwait(false);
         }
-        catch (Exception error) when (error is IOException or ObjectDisposedException or EndOfStreamException)
+        catch (Exception error) when (error is IOException or ObjectDisposedException)
         {
-            // The stream state after a failed round trip is unknown —
-            // poison the connection so the client redials lazily.
+            // The stream state after a failed write is unknown — poison
+            // the connection so the client redials lazily.
             Close();
             throw new ConnectionLostException($"nanocached: connection failed: {error.Message}", error);
         }
         finally
         {
-            _gate.Release();
+            _writeGate.Release();
+        }
+
+        return await tcs.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>This connection's only reader, for its whole lifetime —
+    /// nothing else may read from <see cref="_stream"/>. Consumes
+    /// responses off the wire and dispatches each to the oldest pending
+    /// request (FIFO — doc/adr/0016-*.md), until a read fails.</summary>
+    private async Task ReadLoopAsync()
+    {
+        while (true)
+        {
+            (byte Marker, byte[]? Value) response;
+            try
+            {
+                response = await ReadResponseAsync().ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is IOException or ObjectDisposedException or EndOfStreamException
+                or ConnectionLostException)
+            {
+                // error belongs to whichever request has been waiting
+                // longest — this loop only ever reads one response at a
+                // time, in order, so a failure here is always about the
+                // oldest pending request specifically, not the
+                // connection in general; Close() drains everyone else
+                // with a generic "connection closed" instead, since
+                // their responses were never received at all.
+                if (_pending.TryDequeue(out var failed))
+                {
+                    failed.TrySetException(error);
+                }
+                Close();
+                return;
+            }
+
+            bool wasEmpty = _pending.IsEmpty;
+            _pending.TryDequeue(out var tcs);
+
+            // An unsolicited "busy" response means the server hit its
+            // connection limit right after accept and is about to close
+            // the connection; it isn't an answer to anything we sent
+            // (mirrors the TypeScript SDK's Connection.onData).
+            if (response.Marker == (byte)'B' && wasEmpty)
+            {
+                Close();
+                return;
+            }
+            if (tcs is null)
+            {
+                // Unsolicited and not the known busy case — desync.
+                Close();
+                return;
+            }
+            tcs.TrySetResult(response);
         }
     }
 
@@ -153,7 +247,6 @@ internal sealed class Connection
                     || length < 0
                     || length > MaxValueLength)
                 {
-                    Close();
                     throw new ConnectionLostException("nanocached: invalid value length in response");
                 }
                 var value = new byte[length];
@@ -164,18 +257,13 @@ internal sealed class Connection
             case (byte)'D':
             case (byte)'N':
             case (byte)'W':
+            case (byte)'B':
                 await ReadByteAsync().ConfigureAwait(false); // the trailing '\n'
                 return (marker, null);
-            case (byte)'B':
-                // Unsolicited busy: connection-limit rejection, server closing.
-                Close();
-                throw new ConnectionLostException(
-                    "nanocached: server rejected the connection (connection limit reached)");
             default:
                 // A garbage marker means the stream is desynced; poison
                 // and classify as connection-level (issue #8) so the
                 // retry layer redials instead of failing the op outright.
-                Close();
                 throw new ConnectionLostException(
                     $"nanocached: unexpected response from server: {(char)marker}");
         }

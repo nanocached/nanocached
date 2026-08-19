@@ -32,8 +32,9 @@ byte[]? raw = await client.GetBytesAsync("greeting");
 
 Keys and values accept `string` (UTF-8 encoded) everywhere, with `byte[]`
 overloads of `GetAsync`/`GetBytesAsync`/`SetAsync`/`DeleteAsync` for raw
-bytes. The client is thread-safe; requests are serialized per connection
-(concurrent callers queue).
+bytes. The client is thread-safe; requests are pipelined per connection
+(doc/adr/0016-*.md) — concurrent callers on the same connection each pay
+only their own network latency, not everyone else's ahead of them.
 
 ## Addresses and discovery replicas
 

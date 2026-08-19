@@ -13,20 +13,31 @@ import (
 // connection is one already-identified connection to a single
 // nanocached-node, speaking the cache protocol (G/S/D — the A identify
 // exchange happens in identify.go before a connection exists). Requests
-// are serialized per connection (a mutex around each round trip) — a
-// deliberate v1 simplification over the TypeScript SDK's pipelining:
-// nanocached-node answers in arrival order, so serializing is always
-// correct, just less concurrent. Concurrent callers queue on the mutex.
+// are pipelined onto the socket and matched to responses in send order
+// (doc/adr/0016-*.md): a dedicated read loop consumes responses and
+// dispatches each to the oldest still-pending request, since
+// nanocached-node itself only ever answers in the order it received
+// requests. mu also serializes the push-onto-pending-queue-and-write
+// sequence across concurrent callers, so queue order always matches wire
+// send order.
 // maxValueLength bounds a `V <len>` response before allocation: the
 // server never stores values above its 1 MiB request limit, so anything
 // larger is a corrupt or malicious frame.
 const maxValueLength = 2 * 1024 * 1024
 
+type roundTripResult struct {
+	marker byte
+	value  []byte
+	err    error
+}
+
 type connection struct {
 	mu       sync.Mutex
 	conn     net.Conn // nil only for the pre-poisoned placeholder
 	reader   *bufio.Reader
+	pending  []chan roundTripResult
 	closed   bool
+	lastErr  error
 	lastUsed time.Time
 	// onClose, when set, fires exactly once — the moment this connection
 	// transitions from open to closed — so callers can keep an external
@@ -35,12 +46,18 @@ type connection struct {
 	onClose func()
 }
 
-func newConnection(conn net.Conn) *connection {
-	return &connection{
+// onClose is taken here, not assigned afterward, so it's fully set
+// before the read loop goroutine — started before newConnection even
+// returns — can possibly read it in poison().
+func newConnection(conn net.Conn, onClose func()) *connection {
+	c := &connection{
 		conn:     conn,
 		reader:   bufio.NewReader(conn),
 		lastUsed: time.Now(),
+		onClose:  onClose,
 	}
+	go c.readLoop()
+	return c
 }
 
 // deadConnection is a pre-poisoned placeholder for a newly discovered
@@ -57,20 +74,7 @@ func (c *connection) isClosed() bool {
 }
 
 func (c *connection) close() {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return
-	}
-	c.closed = true
-	if c.conn != nil {
-		_ = c.conn.Close()
-	}
-	onClose := c.onClose
-	c.mu.Unlock()
-	if onClose != nil {
-		onClose()
-	}
+	c.poison(connectionLost("connection closed", nil))
 }
 
 func (c *connection) idle() time.Duration {
@@ -142,37 +146,120 @@ func (c *connection) delete(key []byte) (bool, error) {
 // later response would answer the wrong request, silently returning
 // other keys' data. Poison the connection, and classify as
 // connection-lost so the client's retry layer redials and retries once.
+// Requests still pending behind this one may already have been resolved
+// with misaligned data by the time this runs (the read loop doesn't wait
+// for a caller to notice a mismatch before dispatching the next parsed
+// response) — an inherent limitation of matching-by-order pipelining
+// shared with the TypeScript SDK's Connection, not something this
+// SDK introduces.
 func (c *connection) mismatch(marker byte) error {
-	c.close()
-	return connectionLost(
+	err := connectionLost(
 		fmt.Sprintf("response %q does not match the request (connection desynced)", marker), nil)
+	c.poison(err)
+	return err
 }
 
-func (c *connection) request(frame []byte) (byte, []byte, error) {
+// poison marks the connection closed, closes the socket, and rejects
+// every still-pending request with err. Safe to call more than once —
+// from a writer noticing a failed Write, the read loop noticing a failed
+// Read, or an explicit close() — only the first call has any effect.
+func (c *connection) poison(err error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.lastErr = err
+	pending := c.pending
+	c.pending = nil
+	onClose := c.onClose
+	c.mu.Unlock()
 
-	if c.closed || c.conn == nil {
-		return 0, nil, connectionLost("connection is closed", nil)
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
+	for _, ch := range pending {
+		ch <- roundTripResult{err: err}
+	}
+	if onClose != nil {
+		onClose()
+	}
+}
+
+// request sends frame and waits for its matched response. Pushing onto
+// the pending queue and writing the frame happen under the same lock, so
+// concurrent callers' queue order always matches the order their frames
+// actually hit the wire — required for the read loop's FIFO dispatch to
+// stay correct.
+func (c *connection) request(frame []byte) (byte, []byte, error) {
+	resultCh := make(chan roundTripResult, 1)
+
+	c.mu.Lock()
+	if c.closed {
+		err := c.lastErr
+		c.mu.Unlock()
+		if err == nil {
+			err = connectionLost("connection is closed", nil)
+		}
+		return 0, nil, err
 	}
 	c.lastUsed = time.Now()
+	c.pending = append(c.pending, resultCh)
+	_, writeErr := c.conn.Write(frame)
+	c.mu.Unlock()
 
-	marker, value, err := c.roundTrip(frame)
-	if err != nil {
-		// The stream state after a failed round trip is unknown — poison
-		// the connection so the client redials lazily.
-		c.closed = true
-		_ = c.conn.Close()
-		return 0, nil, connectionLost("connection failed", err)
-	}
-	return marker, value, nil
-}
-
-func (c *connection) roundTrip(frame []byte) (byte, []byte, error) {
-	if _, err := c.conn.Write(frame); err != nil {
+	if writeErr != nil {
+		err := connectionLost("connection failed", writeErr)
+		c.poison(err)
 		return 0, nil, err
 	}
 
+	result := <-resultCh
+	if result.err != nil {
+		return 0, nil, result.err
+	}
+	return result.marker, result.value, nil
+}
+
+// readLoop consumes responses off the wire for as long as the connection
+// stays open, dispatching each to the oldest pending request (FIFO —
+// doc/adr/0016-*.md). It is this connection's only reader; nothing else
+// may read from conn.
+func (c *connection) readLoop() {
+	for {
+		marker, value, err := c.readOneResponse()
+		if err != nil {
+			c.poison(connectionLost("connection failed", err))
+			return
+		}
+
+		c.mu.Lock()
+		wasEmpty := len(c.pending) == 0
+		var ch chan roundTripResult
+		if !wasEmpty {
+			ch = c.pending[0]
+			c.pending = c.pending[1:]
+		}
+		c.mu.Unlock()
+
+		// An unsolicited "busy" response means the server hit its
+		// connection limit right after accept and is about to close the
+		// connection; it isn't an answer to anything we sent (mirrors
+		// the TypeScript SDK's Connection.onData).
+		if marker == 'B' && wasEmpty {
+			c.poison(fmt.Errorf("nanocached: server rejected the connection (connection limit reached)"))
+			return
+		}
+		if ch == nil {
+			c.poison(fmt.Errorf("nanocached: unsolicited response %q from server (connection desynced)", marker))
+			return
+		}
+		ch <- roundTripResult{marker: marker, value: value}
+	}
+}
+
+func (c *connection) readOneResponse() (byte, []byte, error) {
 	marker, err := c.reader.ReadByte()
 	if err != nil {
 		return 0, nil, err
@@ -195,14 +282,11 @@ func (c *connection) roundTrip(frame []byte) (byte, []byte, error) {
 			return 0, nil, err
 		}
 		return marker, value, nil
-	case 'S', 'D', 'N', 'W':
+	case 'S', 'D', 'N', 'W', 'B':
 		if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
 			return 0, nil, err
 		}
 		return marker, nil, nil
-	case 'B':
-		// Unsolicited busy: connection-limit rejection, server closing.
-		return 0, nil, fmt.Errorf("server rejected the connection (connection limit reached)")
 	default:
 		return 0, nil, fmt.Errorf("unexpected response from server: %c", marker)
 	}

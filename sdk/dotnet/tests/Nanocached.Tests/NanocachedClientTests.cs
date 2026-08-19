@@ -111,6 +111,27 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task PipelinesConcurrentRequestsOnOneConnection()
+    {
+        // Same shape as the TypeScript SDK's own pipelining test: N
+        // concurrent requests on a single connection, each independently
+        // verified to round-trip its own value (doc/adr/0016-*.md) — a
+        // bug in matching responses to the right caller in send order
+        // would show up as swapped or wrong values here.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        const int n = 20;
+        await Task.WhenAll(Enumerable.Range(0, n).Select(i => client.SetAsync($"key-{i}", $"value-{i}")));
+
+        string?[] values = await Task.WhenAll(Enumerable.Range(0, n).Select(i => client.GetAsync($"key-{i}")));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.Equal($"value-{i}", values[i]);
+        }
+    }
+
+    [Fact]
     public async Task Authenticates()
     {
         using var node = new MockNode(requiredSecret: "s3cret");

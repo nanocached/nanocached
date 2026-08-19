@@ -2,17 +2,20 @@
 the cache protocol (``G``/``S``/``D`` — the ``A`` identify exchange happens
 in ``_identify`` before a Connection exists).
 
-Unlike the TypeScript SDK, requests are *serialized* per connection (an
-asyncio lock around each request/response round trip) rather than
-pipelined — a deliberate v1 simplification: nanocached-node answers in
-arrival order, so serializing is always correct, just less concurrent.
-Concurrent callers queue on the lock.
+Requests are pipelined onto the socket and matched to responses in send
+order (doc/adr/0016-*.md): a dedicated read loop task consumes responses
+and dispatches each to the oldest still-pending request, since
+nanocached-node itself only ever answers in the order it received
+requests. Pushing onto the pending queue and writing the frame happen
+under one lock, so concurrent callers' queue order always matches the
+order their frames actually hit the wire.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Callable
 
 from ._errors import NanocachedError, WrongNodeError
@@ -47,10 +50,15 @@ class Connection:
     ) -> None:
         self._reader = reader
         self._writer = writer
-        self._lock = asyncio.Lock()
+        # Serializes "enqueue the pending slot, then write the frame" —
+        # not the whole round trip — across concurrent callers, so queue
+        # order always matches wire order for the dedicated reader below.
+        self._write_lock = asyncio.Lock()
+        self._pending: deque[asyncio.Future[tuple[bytes, bytes | None]]] = deque()
         self._closed = False
         self._last_used = time.monotonic()
         self._on_close = on_close
+        self._read_task: asyncio.Task[None] = asyncio.ensure_future(self._read_loop())
 
     @property
     def closed(self) -> bool:
@@ -62,15 +70,7 @@ class Connection:
         return time.monotonic() - self._last_used
 
     def close(self) -> None:
-        # Idempotent, and on_close fires at most once per connection — the
-        # forgotten-close open-socket count (§7 ③) must never be
-        # double-decremented for one socket.
-        if self._closed:
-            return
-        self._closed = True
-        self._writer.close()
-        if self._on_close is not None:
-            self._on_close()
+        self._poison(ConnectionError("nanocached: connection closed"))
 
     async def get(self, key: bytes) -> bytes | None:
         marker, value = await self._request(_encode_get(key))
@@ -105,35 +105,104 @@ class Connection:
         # response would answer the wrong request, silently returning
         # other keys' data. Poison the connection, and classify as a
         # connection error so the retry layer redials and retries once.
-        self.close()
-        return ConnectionError(
+        # Requests still pending behind this one may already have been
+        # resolved with misaligned data by the time this runs — an
+        # inherent limitation of matching-by-order pipelining shared with
+        # the TypeScript SDK's Connection (doc/adr/0016-*.md), not
+        # something this SDK introduces.
+        error = ConnectionError(
             f"nanocached: response {marker!r} does not match the request (connection desynced)"
         )
+        self._poison(error)
+        return error
+
+    def _poison(self, error: Exception) -> None:
+        """Marks the connection closed, closes the writer, and rejects
+        every still-pending request with error. Safe to call more than
+        once — from a writer noticing a failed write, the read loop
+        noticing a failed read, or an explicit close() — only the first
+        call has any effect."""
+        if self._closed:
+            return
+        self._closed = True
+        pending = list(self._pending)
+        self._pending.clear()
+        self._writer.close()
+        for future in pending:
+            if not future.cancelled():
+                future.set_exception(error)
+        if self._on_close is not None:
+            self._on_close()
 
     async def _request(self, frame: bytes) -> tuple[bytes, bytes | None]:
         if self.closed:
             raise ConnectionError("nanocached: connection is closed")
 
-        async with self._lock:
+        future: asyncio.Future[tuple[bytes, bytes | None]] = asyncio.get_running_loop().create_future()
+        async with self._write_lock:
+            if self.closed:
+                raise ConnectionError("nanocached: connection is closed")
             self._last_used = time.monotonic()
+            self._pending.append(future)
             try:
                 self._writer.write(frame)
                 await self._writer.drain()
-                return await self._read_response()
-            except (asyncio.IncompleteReadError, OSError) as error:
-                # The stream state after a failed round trip is unknown —
-                # poison the connection so the client redials lazily.
-                self.close()
-                raise ConnectionError(f"nanocached: connection failed: {error}") from error
+            except OSError as error:
+                wrapped = ConnectionError(f"nanocached: connection failed: {error}")
+                wrapped.__cause__ = error
+                self._poison(wrapped)
             except asyncio.CancelledError:
-                # The caller abandoned this request (asyncio.wait_for and
-                # friends) after bytes may already be on the wire; a later
-                # request would read THIS request's response and desync the
-                # stream. The connection cannot be reused.
-                self.close()
+                # Cancelled mid-write: the frame may be only partially on
+                # the wire, desyncing every request queued behind this
+                # one too — unlike cancellation while awaiting the
+                # response (below), this can't be scoped to just this
+                # one request.
+                self._poison(ConnectionError("nanocached: connection failed: cancelled mid-write"))
                 raise
 
-    async def _read_response(self) -> tuple[bytes, bytes | None]:
+        # If cancelled here, the write already fully completed — the
+        # response is still coming from the server and must still be
+        # matched to this slot by the read loop, so the future is left
+        # in _pending (cancelled(), unretrieved) rather than removed,
+        # keeping queue order aligned with wire order for every request
+        # behind it (doc/adr/0016-*.md). Mirrors the TypeScript SDK's
+        # Connection, whose plain Promises can't be cancelled out from
+        # under `pending` at all.
+        return await future
+
+    async def _read_loop(self) -> None:
+        while True:
+            try:
+                marker, value = await self._read_one_response()
+            except (ConnectionError, NanocachedError) as error:
+                self._poison(error)
+                return
+            except (asyncio.IncompleteReadError, OSError) as error:
+                self._poison(ConnectionError(f"nanocached: connection failed: {error}"))
+                return
+
+            was_empty = not self._pending
+
+            # An unsolicited "busy" response means the server hit its
+            # connection limit right after accept and is about to close
+            # the connection; it isn't an answer to anything we sent
+            # (mirrors the TypeScript SDK's Connection.onData).
+            if marker == b"B" and was_empty:
+                self._poison(
+                    ConnectionError("nanocached: server rejected the connection (connection limit reached)")
+                )
+                return
+            if was_empty:
+                self._poison(
+                    ConnectionError(f"nanocached: unsolicited response {marker!r} from server (connection desynced)")
+                )
+                return
+
+            future = self._pending.popleft()
+            if not future.cancelled():
+                future.set_result((marker, value))
+
+    async def _read_one_response(self) -> tuple[bytes, bytes | None]:
         marker = await self._reader.readexactly(1)
 
         if marker == b"V":
@@ -149,20 +218,12 @@ class Connection:
             # be connection-classified so the retry layer handles it
             # (issue #8).
             if length < 0 or length > _MAX_VALUE_LENGTH:
-                self.close()
                 raise ConnectionError("nanocached: invalid value length in response")
             value = await self._reader.readexactly(length)
             return marker, value
 
-        if marker in (b"S", b"D", b"N", b"W"):
+        if marker in (b"S", b"D", b"N", b"W", b"B"):
             await self._reader.readexactly(1)  # the trailing '\n'
             return marker, None
 
-        if marker == b"B":
-            # An unsolicited busy: the server hit its connection limit and
-            # is closing this connection.
-            self.close()
-            raise ConnectionError("nanocached: server rejected the connection (connection limit reached)")
-
-        self.close()
         raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")

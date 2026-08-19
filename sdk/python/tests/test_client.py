@@ -101,6 +101,21 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             client.close()
 
+    async def test_pipelines_concurrent_requests_on_one_connection(self):
+        # Same shape as the TypeScript SDK's own pipelining test: N
+        # concurrent requests on a single connection, each independently
+        # verified to round-trip its own value (doc/adr/0016-*.md) — a
+        # bug in matching responses to the right caller in send order
+        # would show up as swapped or wrong values here.
+        client = await self.connect()
+        try:
+            await asyncio.gather(*(client.set(f"key-{i}", f"value-{i}") for i in range(20)))
+            values = await asyncio.gather(*(client.get(f"key-{i}") for i in range(20)))
+            for i, value in enumerate(values):
+                self.assertEqual(value, f"value-{i}")
+        finally:
+            client.close()
+
     async def test_ttl_validation_is_synchronous(self):
         client = await self.connect()
         try:
@@ -320,22 +335,27 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
-    async def test_a_cancelled_request_poisons_the_connection(self):
-        # A caller abandoning an in-flight request (asyncio.wait_for)
-        # leaves its response unread on the wire; reusing the connection
-        # would desync the stream, silently answering later requests with
-        # earlier responses. The cancel must poison the connection.
+    async def test_a_cancelled_request_does_not_poison_the_connection(self):
+        # doc/adr/0016-*.md: pipelining leaves an abandoned request
+        # (asyncio.wait_for) in the pending queue rather than removing
+        # it — its still-coming response is discarded by the read loop
+        # once the future is seen to be cancelled, and every request
+        # queued behind it (including the next one this test makes) is
+        # matched to its own response normally. No reconnect needed.
         node = await MockNode().start()
         try:
             client = await NanocachedClient.connect([("127.0.0.1", node.port)])
             try:
                 await client.set("k", "v")
-                node.delay_next_get(30.0)
+                # The mock serves one connection's requests strictly in
+                # order, so the second get() below can't get its answer
+                # until this delayed one is served — keep this short.
+                node.delay_next_get(0.15)
                 with self.assertRaises(asyncio.TimeoutError):
-                    await asyncio.wait_for(client.get("k"), timeout=0.05)
+                    await asyncio.wait_for(client.get("k"), timeout=0.02)
 
                 self.assertEqual(await client.get("k"), "v")
-                self.assertEqual(node.connection_count, 2)
+                self.assertEqual(node.connection_count, 1)
             finally:
                 client.close()
         finally:

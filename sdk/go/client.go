@@ -15,8 +15,10 @@
 // opt-in keep-alive can hold connections open across the server's 60s
 // idle timeout.
 //
-// The Client is safe for concurrent use. Requests are serialized per
-// connection; concurrent callers queue.
+// The Client is safe for concurrent use. Requests are pipelined per
+// connection (doc/adr/0016-*.md): concurrent callers on the same
+// connection each pay only their own network latency, not everyone
+// else's ahead of them.
 package nanocached
 
 import (
@@ -196,9 +198,7 @@ func openTargetCount(key string) int {
 func (c *Client) trackedConnection(netConn net.Conn) *connection {
 	key := c.targetKey
 	trackOpenTarget(key)
-	conn := newConnection(netConn)
-	conn.onClose = func() { untrackOpenTarget(key) }
-	return conn
+	return newConnection(netConn, func() { untrackOpenTarget(key) })
 }
 
 // Connect dials the first working address and returns a ready client.

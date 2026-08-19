@@ -34,7 +34,9 @@ Keys and values are `byte[]`, with `String` convenience overloads
 and return `Optional<String>` (a value that isn't valid UTF-8 throws
 `java.io.UncheckedIOException`); `getBytes`/`getBytes(byte[])` return the
 raw `Optional<byte[]>` without decoding. The client is thread-safe;
-requests are serialized per connection (concurrent callers queue).
+requests are pipelined per connection (doc/adr/0016-*.md) — concurrent
+callers on the same connection each pay only their own network latency,
+not everyone else's ahead of them.
 
 ## Addresses and discovery replicas
 

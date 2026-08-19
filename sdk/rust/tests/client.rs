@@ -518,6 +518,44 @@ async fn ttl_zero_means_no_expiry_and_omits_the_ttl_field_on_the_wire() {
 }
 
 #[tokio::test]
+async fn pipelines_concurrent_requests_on_one_connection() {
+    // Same shape as the TypeScript SDK's own pipelining test: N
+    // concurrent requests on a single connection, each independently
+    // verified to round-trip its own value (doc/adr/0016-*.md) — a bug
+    // in matching responses to the right caller in send order would
+    // show up as swapped or wrong values here.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let mut sets = Vec::new();
+    for i in 0..20 {
+        let client = client.clone();
+        sets.push(tokio::spawn(async move {
+            client
+                .set(format!("key-{i}"), format!("value-{i}"), 0)
+                .await
+        }));
+    }
+    for task in sets {
+        task.await.unwrap().unwrap();
+    }
+
+    let mut gets = Vec::new();
+    for i in 0..20 {
+        let client = client.clone();
+        gets.push(tokio::spawn(
+            async move { client.get(format!("key-{i}")).await },
+        ));
+    }
+    for (i, task) in gets.into_iter().enumerate() {
+        assert_eq!(task.await.unwrap().unwrap(), Some(format!("value-{i}")));
+    }
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
 async fn authenticates() {
     let node = MockNode::start_with(NodeState {
         required_secret: Some(b"s3cret".to_vec()),
@@ -637,24 +675,29 @@ async fn a_mismatched_response_kind_poisons_the_connection() {
 }
 
 #[tokio::test]
-async fn an_abandoned_request_future_poisons_the_connection() {
-    // A caller dropping an in-flight request (tokio::time::timeout and
-    // friends) leaves its response unread on the wire; reusing the
-    // connection would silently answer later requests with earlier
-    // responses. The next request must poison and redial instead.
+async fn an_abandoned_request_future_does_not_poison_the_connection() {
+    // doc/adr/0016-*.md: pipelining leaves an abandoned request
+    // (tokio::time::timeout) in the pending queue rather than removing
+    // it — its still-coming response is simply dropped (no receiver
+    // listening) once the read task dispatches it, and every request
+    // queued behind it (including the next one this test makes) is
+    // matched to its own response normally. No reconnect needed.
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
     client.set("k", "v", 0).await.unwrap();
-    node.state.get_delay_ms.store(30_000, Ordering::SeqCst);
+    // The mock serves one connection's requests strictly in order, so
+    // the second get() below can't get its answer until this delayed
+    // one is served — keep this short.
+    node.state.get_delay_ms.store(150, Ordering::SeqCst);
 
     let abandoned =
-        tokio::time::timeout(std::time::Duration::from_millis(50), client.get("k")).await;
+        tokio::time::timeout(std::time::Duration::from_millis(20), client.get("k")).await;
     assert!(abandoned.is_err(), "expected the outer timeout to fire");
 
     let value = client.get("k").await.unwrap();
     assert_eq!(value, Some("v".to_string()));
-    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
 
     client.close();
     node.stop();

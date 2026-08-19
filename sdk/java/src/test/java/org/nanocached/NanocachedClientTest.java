@@ -10,9 +10,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.nanocached.MockServers.MockDiscovery;
@@ -115,6 +119,40 @@ class NanocachedClientTest {
                                 "v".getBytes(StandardCharsets.UTF_8), -1L));
                 // The rejected set must not have poisoned the connection.
                 assertEquals(Optional.of("v"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void pipelinesConcurrentRequestsOnOneConnection() throws Exception {
+        // Same shape as the TypeScript SDK's own pipelining test: N
+        // concurrent requests on a single connection, each independently
+        // verified to round-trip its own value (doc/adr/0016-*.md) — a
+        // bug in matching responses to the right caller in send order
+        // would show up as swapped or wrong values here.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int n = 20;
+                ExecutorService pool = Executors.newFixedThreadPool(n);
+                try {
+                    List<Future<?>> sets = new ArrayList<>();
+                    for (int i = 0; i < n; i++) {
+                        int index = i;
+                        sets.add(pool.submit(() -> client.set("key-" + index, "value-" + index)));
+                    }
+                    for (Future<?> future : sets) future.get();
+
+                    List<Future<Optional<String>>> gets = new ArrayList<>();
+                    for (int i = 0; i < n; i++) {
+                        int index = i;
+                        gets.add(pool.submit(() -> client.get("key-" + index)));
+                    }
+                    for (int i = 0; i < n; i++) {
+                        assertEquals(Optional.of("value-" + i), gets.get(i).get());
+                    }
+                } finally {
+                    pool.shutdown();
+                }
             }
         }
     }

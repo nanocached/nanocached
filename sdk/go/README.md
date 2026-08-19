@@ -35,8 +35,10 @@ Keys are `string`. Values are `string` via `Get`/`Set`, or raw `[]byte`
 via `GetBytes`/`SetBytes` for binary data — `Get` decodes with a plain
 `string(bytes)` conversion, which in Go is always lossless, so unlike
 some other nanocached SDKs there is no decode-failure case to handle.
-The client is safe for concurrent use; requests are serialized per
-connection (concurrent callers queue).
+The client is safe for concurrent use; requests are pipelined per
+connection (doc/adr/0016-*.md) — concurrent callers on the same
+connection each pay only their own network latency, not everyone
+else's ahead of them.
 
 ## Discovery replicas
 

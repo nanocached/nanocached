@@ -8,21 +8,31 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /**
  * One already-identified connection to a single nanocached-node, speaking
  * the cache protocol ({@code G}/{@code S}/{@code D} — the {@code A}
  * identify exchange happens in {@link Identify} before a Connection
- * exists). Requests are serialized (synchronized) per connection — a
- * deliberate v1 simplification over the TypeScript SDK's pipelining:
- * nanocached-node answers in arrival order, so serializing is always
- * correct, just less concurrent. Concurrent callers queue on the monitor.
+ * exists). Requests are pipelined onto the socket and matched to
+ * responses in send order (doc/adr/0016-*.md): a dedicated reader thread
+ * consumes responses and dispatches each to the oldest still-pending
+ * request, since nanocached-node itself only ever answers in the order it
+ * received requests. Enqueuing the pending slot and writing the frame
+ * happen under one monitor, so concurrent callers' queue order always
+ * matches the order their frames actually hit the wire.
  */
 final class Connection {
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
     private final Runnable onClose;
+    private final Deque<CompletableFuture<Response>> pending = new ArrayDeque<>();
     private volatile boolean closed = false;
     private volatile long lastUsedNanos = System.nanoTime();
 
@@ -35,6 +45,9 @@ final class Connection {
         this.onClose = onClose;
         this.in = new BufferedInputStream(socket.getInputStream());
         this.out = new BufferedOutputStream(socket.getOutputStream());
+        Thread reader = new Thread(this::readLoop, "nanocached-connection-reader");
+        reader.setDaemon(true);
+        reader.start();
     }
 
     boolean isClosed() {
@@ -45,18 +58,8 @@ final class Connection {
         return System.nanoTime() - lastUsedNanos;
     }
 
-    // Synchronized (shared with request()'s monitor) so a self-poisoning
-    // close() racing an external one (teardown, refresh, redial) can never
-    // fire onClose twice.
-    synchronized void close() {
-        if (closed) return;
-        closed = true;
-        try {
-            socket.close();
-        } catch (IOException ignored) {
-            // Closing an already-broken socket is fine.
-        }
-        onClose.run();
+    void close() {
+        poison(new NanocachedException.ConnectionFailed("nanocached: connection closed", null));
     }
 
     byte[] get(byte[] key) {
@@ -94,13 +97,44 @@ final class Connection {
      * means the request/response streams are misaligned — every later
      * response would answer the wrong request, silently returning other
      * keys' data. Poison the connection, and classify as connection-level
-     * so the client's retry layer redials and retries once.
+     * so the client's retry layer redials and retries once. Requests
+     * still pending behind this one may already have been resolved with
+     * misaligned data by the time this runs — an inherent limitation of
+     * matching-by-order pipelining shared with the TypeScript SDK's
+     * Connection (doc/adr/0016-*.md), not something this SDK introduces.
      */
     private NanocachedException mismatch(int marker) {
-        close();
-        return new NanocachedException.ConnectionFailed(
+        NanocachedException error = new NanocachedException.ConnectionFailed(
                 "nanocached: response '" + (char) marker + "' does not match the request (connection desynced)",
                 null);
+        poison(error);
+        return error;
+    }
+
+    /**
+     * Marks the connection closed, closes the socket, and rejects every
+     * still-pending request with error. Safe to call more than once —
+     * from a writer noticing a failed write, the reader thread noticing a
+     * failed read, or an explicit close() — only the first call has any
+     * effect.
+     */
+    private void poison(NanocachedException error) {
+        List<CompletableFuture<Response>> drained;
+        synchronized (this) {
+            if (closed) return;
+            closed = true;
+            drained = new ArrayList<>(pending);
+            pending.clear();
+        }
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Closing an already-broken socket is fine.
+        }
+        for (CompletableFuture<Response> future : drained) {
+            future.completeExceptionally(error);
+        }
+        onClose.run();
     }
 
     private static byte[] frame(String header, byte[] key, byte[] value) {
@@ -116,28 +150,89 @@ final class Connection {
 
     private record Response(int marker, byte[] value) {}
 
-    private synchronized Response request(byte[] frame) {
+    /** Enqueues a pending slot and writes frame under one monitor — see
+     * the class doc comment — then blocks this caller's own thread on
+     * its own future, not the socket. */
+    private Response request(byte[] frame) {
         if (isClosed()) {
             throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
         }
 
-        lastUsedNanos = System.nanoTime();
+        CompletableFuture<Response> future = new CompletableFuture<>();
+        synchronized (this) {
+            if (isClosed()) {
+                throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
+            }
+            lastUsedNanos = System.nanoTime();
+            pending.addLast(future);
+            try {
+                out.write(frame);
+                out.flush();
+            } catch (IOException error) {
+                // The stream state after a failed write is unknown —
+                // poison the connection so the client redials lazily.
+                poison(new NanocachedException.ConnectionFailed(
+                        "nanocached: connection failed: " + error.getMessage(), error));
+            }
+        }
+
         try {
-            out.write(frame);
-            out.flush();
-            return readResponse();
-        } catch (IOException error) {
-            // The stream state after a failed round trip is unknown —
-            // poison the connection so the client redials lazily.
-            close();
-            throw new NanocachedException.ConnectionFailed(
-                    "nanocached: connection failed: " + error.getMessage(), error);
+            return future.join();
+        } catch (CompletionException wrapped) {
+            Throwable cause = wrapped.getCause();
+            if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
+            throw new NanocachedException.ConnectionFailed("nanocached: connection failed", cause);
         }
     }
 
     // The server never stores values above its 1 MiB request limit, so a
     // claimed length beyond this is a corrupt or malicious frame.
     private static final int MAX_VALUE_LENGTH = 2 * 1024 * 1024;
+
+    /** This connection's only reader, for its whole lifetime — nothing
+     * else may read from {@code in}. Consumes responses off the wire and
+     * dispatches each to the oldest pending request (FIFO —
+     * doc/adr/0016-*.md). */
+    private void readLoop() {
+        while (true) {
+            Response response;
+            try {
+                response = readResponse();
+            } catch (IOException error) {
+                poison(new NanocachedException.ConnectionFailed(
+                        "nanocached: connection failed: " + error.getMessage(), error));
+                return;
+            } catch (NanocachedException error) {
+                poison(error);
+                return;
+            }
+
+            CompletableFuture<Response> future;
+            boolean wasEmpty;
+            synchronized (this) {
+                wasEmpty = pending.isEmpty();
+                future = wasEmpty ? null : pending.pollFirst();
+            }
+
+            // An unsolicited "busy" response means the server hit its
+            // connection limit right after accept and is about to close
+            // the connection; it isn't an answer to anything we sent
+            // (mirrors the TypeScript SDK's Connection.onData).
+            if (response.marker == 'B' && wasEmpty) {
+                poison(new NanocachedException.ConnectionFailed(
+                        "nanocached: server rejected the connection (connection limit reached)", null));
+                return;
+            }
+            if (future == null) {
+                poison(new NanocachedException.ConnectionFailed(
+                        "nanocached: unsolicited response '" + (char) response.marker
+                                + "' from server (connection desynced)",
+                        null));
+                return;
+            }
+            future.complete(response);
+        }
+    }
 
     private Response readResponse() throws IOException {
         int marker = readByte();
@@ -154,30 +249,17 @@ final class Connection {
                     length = -1;
                 }
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
-                    close();
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value length in response", null);
                 }
                 return new Response(marker, readExactly(length));
             }
-            case 'S', 'D', 'N', 'W' -> {
+            case 'S', 'D', 'N', 'W', 'B' -> {
                 readByte(); // the trailing '\n'
                 return new Response(marker, null);
             }
-            case 'B' -> {
-                // Unsolicited busy: connection-limit rejection, server closing.
-                close();
-                throw new NanocachedException.ConnectionFailed(
-                        "nanocached: server rejected the connection (connection limit reached)", null);
-            }
-            default -> {
-                // A garbage marker means the stream is desynced; poison
-                // and classify as connection-level (issue #8) so the
-                // retry layer redials instead of failing the op outright.
-                close();
-                throw new NanocachedException.ConnectionFailed(
-                        "nanocached: unexpected response from server: " + (char) marker, null);
-            }
+            default -> throw new NanocachedException.ConnectionFailed(
+                    "nanocached: unexpected response from server: " + (char) marker, null);
         }
     }
 
