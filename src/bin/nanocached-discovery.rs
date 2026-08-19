@@ -860,24 +860,38 @@ async fn try_begin_next_join(
             return;
         }
 
-        let next_waiting = lock(registry)
-            .iter()
-            .find(|(_, info)| info.state == NodeState::Waiting)
-            .map(|(name, info)| (name.clone(), info.address.clone()));
+        let (name, joining_addr, joined) = {
+            let mut reg = lock(registry);
 
-        let Some((name, joining_addr)) = next_waiting else {
-            return;
+            let next_waiting = reg
+                .iter()
+                .find(|(_, info)| info.state == NodeState::Waiting)
+                .map(|(name, info)| (name.clone(), info.address.clone()));
+
+            let Some((name, joining_addr)) = next_waiting else {
+                return;
+            };
+
+            let joined: Vec<(String, String)> = reg
+                .iter()
+                .filter(|(_, info)| info.state == NodeState::Joined)
+                .map(|(name, info)| (name.clone(), info.address.clone()))
+                .collect();
+
+            // Flip the state within the same lock acquisition used to find
+            // and snapshot it, so a concurrent disconnect (which removes
+            // the registry entry under this same lock, see
+            // `on_node_connection_ended`) can't sneak in between "found"
+            // and "marked Joining" and leave a ghost `PendingJoin` naming
+            // a node nobody will ever hear from again — see the
+            // `try_begin_next_join` liveness bug fix.
+            match reg.get_mut(&name) {
+                Some(info) => info.state = NodeState::Joining,
+                None => return,
+            }
+
+            (name, joining_addr, joined)
         };
-
-        let joined: Vec<(String, String)> = lock(registry)
-            .iter()
-            .filter(|(_, info)| info.state == NodeState::Joined)
-            .map(|(name, info)| (name.clone(), info.address.clone()))
-            .collect();
-
-        if let Some(info) = lock(registry).get_mut(&name) {
-            info.state = NodeState::Joining;
-        }
 
         if joined.is_empty() {
             drop(join_guard);
@@ -1648,7 +1662,7 @@ async fn run(
 }
 
 async fn dispatch_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     address: SocketAddr,
     cluster_state: ClusterState,
     connection_limit: Arc<Semaphore>,
@@ -1658,7 +1672,30 @@ async fn dispatch_connection(
 ) -> bool {
     let _ = stream.set_nodelay(true);
 
-    let mut stream: ServerStream = match &config.tls_acceptor {
+    // Checked before the (potentially expensive) TLS handshake below, not
+    // after: gating on the connection limit only once a handshake has
+    // already been paid for defeats its purpose as a resource-exhaustion
+    // guard under overload, since an unbounded number of handshakes could
+    // run concurrently while every one of them is ultimately rejected
+    // anyway.
+    let permit = match connection_limit.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            // A plain connection can still be told "busy" politely. A TLS
+            // client expects a handshake, not plaintext, on this socket —
+            // performing that handshake just to say "busy" is exactly the
+            // cost this early check exists to avoid, so just drop it.
+            if config.tls_acceptor.is_none()
+                && let Err(error) = stream.write_all(b"B\n").await
+            {
+                eprintln!("WARN failed to send busy response to {address}: {error}");
+            }
+
+            return false;
+        }
+    };
+
+    let stream: ServerStream = match &config.tls_acceptor {
         Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
             Ok(Err(error)) => {
@@ -1671,17 +1708,6 @@ async fn dispatch_connection(
             }
         },
         None => MaybeTls::Plain(stream),
-    };
-
-    let permit = match connection_limit.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            if let Err(error) = stream.write_all(b"B\n").await {
-                eprintln!("WARN failed to send busy response to {address}: {error}");
-            }
-
-            return false;
-        }
     };
 
     connection_tasks.spawn(async move {

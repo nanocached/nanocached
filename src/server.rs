@@ -1288,6 +1288,9 @@ struct ActiveMigration {
 struct MigrationGuard {
     slot: Arc<Mutex<Option<ActiveMigration>>>,
     abort_requested: Arc<AtomicBool>,
+    /// Set by `completed()` so `Drop` leaves the slot's completion info
+    /// (stamped by `completed()` itself) intact instead of clearing it.
+    completed: bool,
 }
 
 impl MigrationGuard {
@@ -1358,6 +1361,7 @@ impl MigrationGuard {
         Some(Self {
             slot,
             abort_requested,
+            completed: false,
         })
     }
 
@@ -1368,7 +1372,7 @@ impl MigrationGuard {
     /// `entries_sent`, doc/adr/0017-*.md) so `migration_target_for` keeps
     /// forwarding until that grace passes or the slot is
     /// replaced/cancelled.
-    fn completed(self, entries_sent: usize) {
+    fn completed(mut self, entries_sent: usize) {
         if let Some(active) = self
             .slot
             .lock()
@@ -1378,12 +1382,15 @@ impl MigrationGuard {
             active.completed_at = Some(Instant::now());
             active.forwarding_grace = forwarding_grace(entries_sent);
         }
-        std::mem::forget(self);
+        self.completed = true;
     }
 }
 
 impl Drop for MigrationGuard {
     fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
         *self
             .slot
             .lock()
