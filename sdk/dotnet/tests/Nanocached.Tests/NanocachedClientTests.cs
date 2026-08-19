@@ -599,6 +599,56 @@ public class NanocachedClientTests
             "Close() returned before the background replica write finished");
     }
 
+    // ── read repair (doc/adr/0015-*.md) ────────────────────────────
+
+    [Fact]
+    public async Task ByDefaultACleanMissOnThePrimaryIsNotRepaired()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Store[MockNode.KeyOf(Bytes("k"))] = Bytes("from-replica");
+
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        Assert.Null(await client.GetBytesAsync("k"));
+        Assert.False(cluster.Nodes[owners[0]].Store.ContainsKey(MockNode.KeyOf(Bytes("k"))));
+    }
+
+    [Fact]
+    public async Task FindsAValueOnAReplicaAndRepairsThePrimary()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Store[MockNode.KeyOf(Bytes("k"))] = Bytes("from-replica");
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+
+        Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
+
+        string stored = MockNode.KeyOf(Bytes("k"));
+        await WaitForAsync(
+            () => cluster.Nodes[owners[0]].Store.ContainsKey(stored),
+            "the primary to be repaired");
+    }
+
+    [Fact]
+    public async Task StaysACleanMissWhenNoOwnerHasTheValue()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+
+        Assert.Null(await client.GetBytesAsync("nowhere"));
+    }
+
     // ── 値の圧縮 (doc/adr/0013-*.md) ──────────────────────────────
 
     private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>

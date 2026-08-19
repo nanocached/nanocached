@@ -63,6 +63,7 @@ pub struct Options {
     compress: bool,
     compression_threshold: usize,
     fire_and_forget_replicas: bool,
+    read_repair: bool,
 }
 
 impl Default for Options {
@@ -75,6 +76,7 @@ impl Default for Options {
             compress: false,
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             fire_and_forget_replicas: false,
+            read_repair: false,
         }
     }
 }
@@ -163,6 +165,16 @@ impl Options {
         self.fire_and_forget_replicas = enabled;
         self
     }
+
+    /// On a clean miss (the key's first-reached owner reports it
+    /// missing), probe the remaining owners before accepting that, and
+    /// repair the primary in the background if one still has the value
+    /// (doc/adr/0015-*.md). Off by default. Costs extra reads only on
+    /// the misses this actually applies to.
+    pub fn read_repair(mut self, enabled: bool) -> Self {
+        self.read_repair = enabled;
+        self
+    }
 }
 
 struct Member {
@@ -230,6 +242,7 @@ struct Inner {
     /// its own, i.e. finished.
     background_replica_permits: Arc<Semaphore>,
     background_replica_cap: usize,
+    read_repair: bool,
 }
 
 impl Inner {
@@ -410,6 +423,7 @@ impl NanocachedClient {
             fire_and_forget_replicas: options.fire_and_forget_replicas,
             background_replica_permits: Arc::new(Semaphore::new(background_replica_cap)),
             background_replica_cap,
+            read_repair: options.read_repair,
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -526,21 +540,66 @@ impl NanocachedClient {
     }
 
     /// Transparently decompresses when `compress` is enabled
-    /// (doc/adr/0013-*.md).
+    /// (doc/adr/0013-*.md). With `read_repair`, a clean miss probes the
+    /// remaining owners before being accepted as final (doc/adr/0015-*.md).
     pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         self.before_operation().await?;
-        let value = self
+        let mut value = self
             .with_cluster_retry(|| {
                 self.read(key, |connection| async move { connection.get(key).await })
             })
             .await?;
+        if value.is_none() && self.inner.read_repair {
+            let clustered = matches!(self.inner.state.lock().await.target, Target::Cluster { .. });
+            if clustered {
+                value = self.try_read_repair(key).await;
+            }
+        }
         match value {
             Some(bytes) if self.inner.compress => {
                 Ok(Some(crate::compression::decompress_value(&bytes)?))
             }
             other => Ok(other),
         }
+    }
+
+    /// doc/adr/0015-*.md: probes every owner of `key`, in rank order, for
+    /// a value the normal read path already reported missing. The first
+    /// owner that has it wins: its value is returned, and — detached, not
+    /// awaited, no tracking — that same value repairs the true primary in
+    /// the background, with no TTL. Every failure along the way
+    /// (connection lost, WrongNode, another miss) is swallowed; nothing
+    /// here may turn an already-accepted miss into an error.
+    async fn try_read_repair(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let owners = {
+            let state = self.inner.state.lock().await;
+            Self::owner_names(&state, key)
+        };
+
+        for name in &owners {
+            let probe = |connection: Arc<Connection>| async move { connection.get(key).await };
+            let Ok(Some(value)) = self.apply_reconnecting(Some(name), &probe).await else {
+                continue;
+            };
+
+            if let Some(primary) = owners.first() {
+                let client = self.clone();
+                let primary = primary.clone();
+                let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
+                let owned_value: Arc<[u8]> = Arc::from(value.clone());
+                tokio::spawn(async move {
+                    let op = move |connection: Arc<Connection>| {
+                        let key = Arc::clone(&owned_key);
+                        let value = Arc::clone(&owned_value);
+                        async move { connection.set(&key, &value, 0).await }
+                    };
+                    let _ = client.apply_reconnecting(Some(&primary), &op).await;
+                });
+            }
+            return Some(value);
+        }
+        None
     }
 
     /// `ttl_seconds == 0` means no expiry. Transparently compresses

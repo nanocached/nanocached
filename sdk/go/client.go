@@ -85,6 +85,11 @@ type Config struct {
 	// trade for this client's own writes — it carries no wire format and
 	// needs no agreement with other clients.
 	FireAndForgetReplicas bool
+	// ReadRepair probes the remaining owners on a clean primary miss and
+	// repairs the gap in the background if one still holds the value
+	// (doc/adr/0015-*.md). Off by default. Costs extra reads only on the
+	// misses it actually applies to.
+	ReadRepair bool
 }
 
 // DefaultCompressionThreshold is the CompressionThreshold used when
@@ -128,6 +133,8 @@ type Client struct {
 	// connections (doc/adr/0014-*.md).
 	backgroundReplicaSem chan struct{}
 	backgroundReplicaWG  sync.WaitGroup
+
+	readRepair bool
 
 	// targetKey is the address this client's connect() ultimately settled
 	// on — a node's own address in single mode, the winning discovery
@@ -222,6 +229,7 @@ func Connect(config Config) (*Client, error) {
 		compressionThreshold:  compressionThreshold,
 		fireAndForgetReplicas: config.FireAndForgetReplicas,
 		backgroundReplicaSem:  make(chan struct{}, maxInFlightBackgroundReplicaWrites),
+		readRepair:            config.ReadRepair,
 	}
 	if config.AuthSecret != "" {
 		client.authSecret = []byte(config.AuthSecret)
@@ -356,7 +364,9 @@ func (c *Client) Get(key string) (value string, ok bool, err error) {
 
 // GetBytes returns the key's raw value; ok is false when the key is
 // missing. Transparently decompresses when Config.Compress is enabled
-// (doc/adr/0013-*.md).
+// (doc/adr/0013-*.md). With Config.ReadRepair, a clean miss probes the
+// remaining owners before being accepted as final, repairing the gap in
+// the background if one still holds the value (doc/adr/0015-*.md).
 func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	if err := c.beforeOperation(); err != nil {
 		return nil, false, err
@@ -369,10 +379,51 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 			return opErr
 		})
 	})
+	if err == nil && !ok && c.readRepair {
+		value, ok = c.tryReadRepair(keyBytes)
+	}
 	if err != nil || !ok || !c.compress {
 		return value, ok, err
 	}
 	value, err = decompressValue(value)
+	return value, ok, err
+}
+
+// tryReadRepair probes every owner of key, in rank order, for a value the
+// normal read path already reported missing. The first owner that has it
+// wins: its value is returned, and a best-effort, fully detached write
+// repairs the primary in the background (doc/adr/0015-*.md) — no TTL
+// (G's response carries none to preserve), no bounding, no close()
+// draining, since losing this write costs nothing beyond staying in the
+// window this feature narrows for one more read. Every failure along the
+// way (connection lost, WrongNode, another miss) is swallowed; nothing
+// here may turn an already-accepted miss into an error.
+func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
+	names := c.ownerNames(key)
+	for _, name := range names {
+		v, found, err := c.get(name, key)
+		if err != nil || !found {
+			continue
+		}
+		if len(names) > 0 {
+			primary := names[0]
+			go func() {
+				_ = c.applyReconnecting(primary, func(conn *connection) error {
+					return conn.set(key, v, -1)
+				})
+			}()
+		}
+		return v, true
+	}
+	return nil, false
+}
+
+func (c *Client) get(slot string, key []byte) (value []byte, ok bool, err error) {
+	err = c.applyReconnecting(slot, func(conn *connection) error {
+		var opErr error
+		value, ok, opErr = conn.get(key)
+		return opErr
+	})
 	return value, ok, err
 }
 

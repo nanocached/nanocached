@@ -38,10 +38,10 @@ code.</p>
 replica lists, replication-aware routing (reads fail over, writes fan out
 to all R owners), transparent reconnect with a single retry, always-on
 keep-alive, opt-in transparent value compression, opt-in fire-and-forget
-replica writes, and the same rendezvous-hashing pipeline verified against
-shared cross-language test vectors. Values are strings first: every
-<code>get</code> returns a string (strict UTF-8), with a
-<code>get_bytes</code>-style companion for raw byte values.</p>
+replica writes, opt-in read repair, and the same rendezvous-hashing
+pipeline verified against shared cross-language test vectors. Values are
+strings first: every <code>get</code> returns a string (strict UTF-8),
+with a <code>get_bytes</code>-style companion for raw byte values.</p>
 
 <div class="table-wrap">
 <table>
@@ -172,6 +172,13 @@ existed, err := client.Delete("greeting")</code></pre>
   with a synchronous fallback past the bound). A per-client latency
   trade-off, not a format decision — clients may mix settings freely (<a
   href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0014-optional-fire-and-forget-replica-writes-in-the-sdks.md">ADR-0014</a>).</li>
+  <li><b>Read repair</b> — off by default; when enabled, a clean miss
+  probes the remaining owners before being accepted as final, repairing
+  the primary in the background (no TTL) if one still holds the value.
+  Closes the post-restart window client-side replication otherwise
+  leaves open, at the cost of extra reads on the misses it applies to
+  (<a
+  href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0015-optional-read-repair-in-the-sdks.md">ADR-0015</a>).</li>
 </ul>
 
 </main>

@@ -75,6 +75,12 @@ export interface NanocachedClientOptions {
    * writes — it carries no wire format and needs no agreement with other
    * clients. */
   fireAndForgetReplicas?: boolean;
+  /** On a clean miss (the key's first-reached owner reports it missing),
+   * probe the remaining owners before accepting that, and repair the
+   * primary in the background if one still has the value
+   * (doc/adr/0015-*.md). Off by default. Costs extra reads only on the
+   * misses this actually applies to. */
+  readRepair?: boolean;
 }
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
@@ -210,6 +216,7 @@ export class NanocachedClient {
     private readonly compress: boolean,
     private readonly compressionThreshold: number,
     private readonly fireAndForgetReplicas: boolean,
+    private readonly readRepair: boolean,
   ) {
     this.nodeUrls = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
@@ -286,6 +293,7 @@ export class NanocachedClient {
           compress,
           compressionThreshold,
           options.fireAndForgetReplicas === true,
+          options.readRepair === true,
         );
       }
 
@@ -338,6 +346,7 @@ export class NanocachedClient {
         compress,
         compressionThreshold,
         options.fireAndForgetReplicas === true,
+        options.readRepair === true,
       );
     }
 
@@ -402,17 +411,55 @@ export class NanocachedClient {
 
   /** The raw-bytes companion to `get`: same routing/retry/cluster
    * behavior, no decoding. Transparently decompresses when `compress` is
-   * enabled (doc/adr/0013-*.md). */
+   * enabled (doc/adr/0013-*.md). With `readRepair`, a clean miss probes
+   * the remaining owners before being accepted as final
+   * (doc/adr/0015-*.md). */
   async getBytes(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    const value = await this.withWrongNodeRetry(() =>
+    let value = await this.withWrongNodeRetry(() =>
       this.target.kind === "single"
         ? this.singleConnection().then((connection) => connection.get(key))
         : this.readFromOwners(key, (connection) => connection.get(key)),
     );
+    if (value === null && this.readRepair && this.target.kind === "cluster") {
+      value = await this.tryReadRepair(key);
+    }
     if (value === null || !this.compress) return value;
     return decompressValue(value);
+  }
+
+  /** doc/adr/0015-*.md: probes every owner of `key`, in rank order, for a
+   * value the normal read path already reported missing. The first
+   * owner that has it wins: its value is returned, and — detached, not
+   * awaited, no tracking — that same value repairs `names[0]` (the true
+   * primary) in the background, with no TTL. Every failure along the way
+   * (connection lost, WrongNode, another miss) is swallowed; nothing
+   * here may turn an already-accepted miss into an error. */
+  private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
+    const names = this.ownerNames(key);
+    for (const name of names) {
+      let value: Buffer | null;
+      try {
+        const connection = await this.memberConnection(name);
+        value = await connection.get(key);
+      } catch {
+        continue;
+      }
+      if (value === null) continue;
+
+      const primaryName = names[0];
+      const repairValue = value;
+      if (primaryName !== undefined) {
+        void this.memberConnection(primaryName)
+          .then((connection) => connection.set(key, repairValue, 0))
+          .catch(() => {
+            // Swallowed by design — see the doc comment.
+          });
+      }
+      return value;
+    }
+    return null;
   }
 
   /** `ttlSeconds` (whole seconds, default 0) is when the key expires; 0

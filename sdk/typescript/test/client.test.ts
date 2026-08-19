@@ -1049,6 +1049,85 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
   });
 });
 
+describe("NanocachedClient read repair (doc/adr/0015-*.md)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("by default, a clean miss on the primary is not repaired", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const { primary, replica } = cluster.ownerOf("k");
+      replica.mock.store.set("k", Buffer.from("from-replica"));
+
+      assert.equal(await client.get("k"), null);
+      assert.ok(!primary.mock.store.has("k"), "primary was repaired despite readRepair being off");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("finds a value on a replica and repairs the primary", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readRepair: true,
+    });
+    try {
+      const { primary, replica } = cluster.ownerOf("k");
+      replica.mock.store.set("k", Buffer.from("from-replica"));
+
+      assert.equal(await client.get("k"), "from-replica");
+      await waitFor(() => primary.mock.store.has("k"), "the primary to be repaired");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("stays a clean miss when no owner has the value", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readRepair: true,
+    });
+    try {
+      assert.equal(await client.get("nowhere"), null);
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+});
+
 describe("NanocachedClient against a discovery-fronted cluster", () => {
   async function startCluster(): Promise<{
     nodes: Array<{ name: string; mock: MockNode }>;

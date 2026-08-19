@@ -131,6 +131,7 @@ class NanocachedClient:
         self._compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD
         self._fire_and_forget_replicas: bool = False
         self._background_replica_writes: set[asyncio.Task[None]] = set()
+        self._read_repair: bool = False
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -150,6 +151,7 @@ class NanocachedClient:
         compress: bool = False,
         compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD,
         fire_and_forget_replicas: bool = False,
+        read_repair: bool = False,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
@@ -161,6 +163,7 @@ class NanocachedClient:
         client._compress = compress
         client._compression_threshold = compression_threshold
         client._fire_and_forget_replicas = fire_and_forget_replicas
+        client._read_repair = read_repair
 
         # Walk the addresses until one yields a working target; an address
         # that is unreachable, warming up (`B`, ADR-0010), or knows no live
@@ -255,15 +258,51 @@ class NanocachedClient:
     async def get_bytes(self, key: str | bytes) -> bytes | None:
         """The raw companion to get(): no UTF-8 decoding, so it never
         raises on a value that isn't valid UTF-8. Transparently
-        decompresses when ``compress`` is enabled (doc/adr/0013-*.md)."""
+        decompresses when ``compress`` is enabled (doc/adr/0013-*.md).
+        With ``read_repair``, a clean miss probes the remaining owners
+        before being accepted as final (doc/adr/0015-*.md)."""
         key_bytes = _to_bytes(key)
         await self._before_operation()
         value = await self._with_wrong_node_retry(
             lambda: self._read(key_bytes, lambda connection: connection.get(key_bytes))
         )
+        if value is None and self._read_repair and self._ring is not None:
+            value = await self._try_read_repair(key_bytes)
         if value is None or not self._compress:
             return value
         return decompress_value(value)
+
+    async def _try_read_repair(self, key: bytes) -> bytes | None:
+        """doc/adr/0015-*.md: probes every owner of ``key``, in rank
+        order, for a value the normal read path already reported
+        missing. The first owner that has it wins: its value is
+        returned, and — detached, not awaited, no tracking — that same
+        value repairs the true primary in the background, with no TTL.
+        Every failure along the way is swallowed; nothing here may turn
+        an already-accepted miss into an error."""
+        names = self._owner_names(key)
+        for name in names:
+            try:
+                connection = await self._member_connection(name)
+                value = await connection.get(key)
+            except Exception:
+                continue
+            if value is None:
+                continue
+
+            if names:
+                primary = names[0]
+
+                async def repair(primary: str = primary, value: bytes = value) -> None:
+                    try:
+                        connection = await self._member_connection(primary)
+                        await connection.set(key, value, 0)
+                    except Exception:
+                        pass  # Swallowed by design — see the docstring.
+
+                asyncio.ensure_future(repair())
+            return value
+        return None
 
     async def get(self, key: str | bytes) -> str | None:
         """Strict UTF-8 decode of the stored value (bytes.decode()) — a

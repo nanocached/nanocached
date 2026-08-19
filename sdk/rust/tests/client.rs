@@ -1212,3 +1212,94 @@ async fn close_drains_in_flight_background_replica_writes() {
         node.stop();
     }
 }
+
+// ── read repair (doc/adr/0015-*.md) ──────────────────────────────────
+
+#[tokio::test]
+async fn by_default_a_clean_miss_on_the_primary_is_not_repaired() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"k".to_vec(), b"from-replica".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    assert_eq!(client.get_bytes("k").await.unwrap(), None);
+    assert!(!node_by_name(&nodes, &owners[0])
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(b"k".as_slice()));
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"k".to_vec(), b"from-replica".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port).read_repair(true))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client.get_bytes("k").await.unwrap(),
+        Some(b"from-replica".to_vec())
+    );
+
+    let primary = node_by_name(&nodes, &owners[0]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(b"k".as_slice())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the primary was never repaired"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn stays_a_clean_miss_when_no_owner_has_the_value() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port).read_repair(true))
+        .await
+        .unwrap();
+
+    assert_eq!(client.get_bytes("nowhere").await.unwrap(), None);
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}

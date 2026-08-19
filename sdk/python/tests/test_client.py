@@ -887,5 +887,72 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
+    # doc/adr/0015-*.md
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_by_default_a_clean_miss_on_the_primary_is_not_repaired(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[replica].store[b"k"] = b"from-replica"
+
+                self.assertIsNone(await client.get_bytes("k"))
+                self.assertNotIn(b"k", nodes[primary].store)
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_finds_a_value_on_a_replica_and_repairs_the_primary(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[replica].store[b"k"] = b"from-replica"
+
+                self.assertEqual(await client.get_bytes("k"), b"from-replica")
+                await wait_for(lambda: b"k" in nodes[primary].store, "the primary to be repaired")
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_stays_a_clean_miss_when_no_owner_has_the_value(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            try:
+                self.assertIsNone(await client.get_bytes("nowhere"))
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
 if __name__ == "__main__":
     unittest.main()

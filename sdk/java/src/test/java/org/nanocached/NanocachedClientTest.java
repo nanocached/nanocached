@@ -639,4 +639,56 @@ class NanocachedClientTest {
                     "close() returned before the background replica write finished");
         }
     }
+
+    // ── read repair (doc/adr/0015-*.md) ────────────────────────────
+
+    private static NanocachedClient connectWithReadRepair(int port) {
+        return NanocachedClient.connect(NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", port)))
+                .readRepair(true));
+    }
+
+    @Test
+    void byDefaultACleanMissOnThePrimaryIsNotRepaired() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            cluster.nodes().get(owners.get(1)).store.put(
+                    MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
+                    "from-replica".getBytes(StandardCharsets.UTF_8));
+
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                assertEquals(Optional.empty(), client.getBytes("k"));
+                assertFalse(cluster.nodes().get(owners.get(0)).store
+                        .containsKey(MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8))));
+            }
+        }
+    }
+
+    @Test
+    void findsAValueOnAReplicaAndRepairsThePrimary() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            cluster.nodes().get(owners.get(1)).store.put(
+                    MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
+                    "from-replica".getBytes(StandardCharsets.UTF_8));
+
+            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+                assertArrayEquals("from-replica".getBytes(StandardCharsets.UTF_8),
+                        client.getBytes("k").orElseThrow());
+
+                String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
+                waitFor(() -> cluster.nodes().get(owners.get(0)).store.containsKey(stored),
+                        "the primary to be repaired");
+            }
+        }
+    }
+
+    @Test
+    void staysACleanMissWhenNoOwnerHasTheValue() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+                assertEquals(Optional.empty(), client.getBytes("nowhere"));
+            }
+        }
+    }
 }

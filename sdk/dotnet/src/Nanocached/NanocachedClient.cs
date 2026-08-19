@@ -74,6 +74,13 @@ public sealed class NanocachedClient : IDisposable
         /// carries no wire format and needs no agreement with other
         /// clients.</summary>
         public bool FireAndForgetReplicas { get; set; }
+
+        /// <summary>On a clean miss (the key's first-reached owner reports
+        /// it missing), probe the remaining owners before accepting that,
+        /// and repair the primary in the background if one still has the
+        /// value (doc/adr/0015-*.md). Off by default. Costs extra reads
+        /// only on the misses this actually applies to.</summary>
+        public bool ReadRepair { get; set; }
     }
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -117,6 +124,7 @@ public sealed class NanocachedClient : IDisposable
     private readonly bool _compress;
     private readonly int _compressionThreshold;
     private readonly bool _fireAndForgetReplicas;
+    private readonly bool _readRepair;
     // doc/adr/0014-*.md: bounds in-flight background replica writes and
     // lets Close() drain them before tearing down connections.
     private readonly SemaphoreSlim _backgroundReplicaPermits;
@@ -146,6 +154,7 @@ public sealed class NanocachedClient : IDisposable
         _compressionThreshold = options.CompressionThreshold;
         _fireAndForgetReplicas = options.FireAndForgetReplicas;
         _backgroundReplicaPermits = new SemaphoreSlim(MaxInFlightBackgroundReplicaWrites, MaxInFlightBackgroundReplicaWrites);
+        _readRepair = options.ReadRepair;
     }
 
     /// <summary>Builds the internal TLS options for every dial this client
@@ -320,13 +329,69 @@ public sealed class NanocachedClient : IDisposable
 
     /// <summary>Returns the raw value, or <c>null</c> when the key is
     /// missing. Transparently decompresses when <c>Compress</c> is
-    /// enabled (doc/adr/0013-*.md).</summary>
+    /// enabled (doc/adr/0013-*.md). With <c>ReadRepair</c>, a clean miss
+    /// probes the remaining owners before being accepted as final
+    /// (doc/adr/0015-*.md).</summary>
     public async Task<byte[]?> GetBytesAsync(byte[] key)
     {
         await BeforeOperationAsync().ConfigureAwait(false);
         byte[]? value = await WithClusterRetryAsync(
             () => ReadAsync(key, connection => connection.GetAsync(key))).ConfigureAwait(false);
+        if (value is null && _readRepair && _ring is not null)
+        {
+            value = await TryReadRepairAsync(key).ConfigureAwait(false);
+        }
         return value is null || !_compress ? value : Compression.DecompressValue(value);
+    }
+
+    /// <summary>doc/adr/0015-*.md: probes every owner of <paramref
+    /// name="key"/>, in rank order, for a value the normal read path
+    /// already reported missing. The first owner that has it wins: its
+    /// value is returned, and — detached, not awaited, no tracking —
+    /// that same value repairs the true primary in the background, with
+    /// no TTL. Every failure along the way (connection lost, WrongNode,
+    /// another miss) is swallowed; nothing here may turn an
+    /// already-accepted miss into an error.</summary>
+    private async Task<byte[]?> TryReadRepairAsync(byte[] key)
+    {
+        IReadOnlyList<string> names = OwnerNames(key);
+        foreach (string name in names)
+        {
+            byte[]? value;
+            try
+            {
+                value = await ApplyReconnectingAsync(name, connection => connection.GetAsync(key))
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+            if (value is null) continue;
+
+            if (names.Count > 0)
+            {
+                string primary = names[0];
+                byte[] repairValue = value;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await ApplyReconnectingAsync<object?>(primary, async connection =>
+                        {
+                            await connection.SetAsync(key, repairValue, 0).ConfigureAwait(false);
+                            return null;
+                        }).ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        // Swallowed by design — see the doc comment.
+                    }
+                });
+            }
+            return value;
+        }
+        return null;
     }
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>

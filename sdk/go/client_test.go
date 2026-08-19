@@ -1176,6 +1176,65 @@ func TestCloseDrainsInFlightBackgroundReplicaWrites(t *testing.T) {
 	}
 }
 
+// ── read repair (doc/adr/0015-*.md) ────────────────────────────────
+
+func TestByDefaultACleanMissOnThePrimaryIsNotRepaired(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].store.Store(key, []byte("from-replica"))
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	_, ok, err := client.GetBytes(key)
+	if err != nil || ok {
+		t.Fatalf("GetBytes = ok=%v err=%v, want a clean miss", ok, err)
+	}
+	if nodes[owners[0]].hasKey(key) {
+		t.Fatal("primary was repaired despite ReadRepair being off")
+	}
+}
+
+func TestReadRepairFindsAValueOnAReplicaAndRepairsThePrimary(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].store.Store(key, []byte("from-replica"))
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value, ok, err := client.GetBytes(key)
+	if err != nil || !ok || string(value) != "from-replica" {
+		t.Fatalf("GetBytes = %q, %v, %v", value, ok, err)
+	}
+
+	if !waitUntil(t, 2*time.Second, func() bool { return nodes[owners[0]].hasKey(key) }) {
+		t.Fatal("the primary was never repaired")
+	}
+}
+
+func TestReadRepairStaysACleanMissWhenNoOwnerHasTheValue(t *testing.T) {
+	_, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	_, ok, err := client.GetBytes("nowhere")
+	if err != nil || ok {
+		t.Fatalf("GetBytes = ok=%v err=%v, want a clean miss", ok, err)
+	}
+}
+
 func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

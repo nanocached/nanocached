@@ -60,6 +60,7 @@ public final class NanocachedClient implements AutoCloseable {
         private boolean compress;
         private int compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD;
         private boolean fireAndForgetReplicas;
+        private boolean readRepair;
 
         /** Discovery replicas (ADR-0010), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -130,6 +131,16 @@ public final class NanocachedClient implements AutoCloseable {
             this.fireAndForgetReplicas = enabled;
             return this;
         }
+
+        /** On a clean miss (the key's first-reached owner reports it
+         * missing), probe the remaining owners before accepting that, and
+         * repair the primary in the background if one still has the value
+         * (doc/adr/0015-*.md). Off by default. Costs extra reads only on
+         * the misses this actually applies to. */
+        public Options readRepair(boolean enabled) {
+            this.readRepair = enabled;
+            return this;
+        }
     }
 
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
@@ -175,6 +186,7 @@ public final class NanocachedClient implements AutoCloseable {
     private final boolean compress;
     private final int compressionThreshold;
     private final boolean fireAndForgetReplicas;
+    private final boolean readRepair;
     private final java.util.Set<CompletableFuture<Void>> backgroundReplicaWrites =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
     private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
@@ -208,13 +220,15 @@ public final class NanocachedClient implements AutoCloseable {
 
     private NanocachedClient(
             List<Address> addresses, byte[] authSecret, SSLContext tls,
-            boolean compress, int compressionThreshold, boolean fireAndForgetReplicas) {
+            boolean compress, int compressionThreshold, boolean fireAndForgetReplicas,
+            boolean readRepair) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
         this.compress = compress;
         this.compressionThreshold = compressionThreshold;
         this.fireAndForgetReplicas = fireAndForgetReplicas;
+        this.readRepair = readRepair;
     }
 
     public static NanocachedClient connect(Options options) {
@@ -226,7 +240,8 @@ public final class NanocachedClient implements AutoCloseable {
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
         NanocachedClient client = new NanocachedClient(
                 options.addresses, options.authSecret, sslContext,
-                options.compress, options.compressionThreshold, options.fireAndForgetReplicas);
+                options.compress, options.compressionThreshold, options.fireAndForgetReplicas,
+                options.readRepair);
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, ADR-0010), or knows no live
@@ -390,12 +405,54 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** Returns the raw value, or {@code Optional.empty()} when the key is
      * missing. Transparently decompresses when {@code compress} is
-     * enabled (doc/adr/0013-*.md). */
+     * enabled (doc/adr/0013-*.md). With {@code readRepair}, a clean miss
+     * probes the remaining owners before being accepted as final
+     * (doc/adr/0015-*.md). */
     public Optional<byte[]> getBytes(byte[] key) {
         beforeOperation();
         byte[] value = withWrongNodeRetry(() -> read(key, connection -> connection.get(key)));
+        if (value == null && readRepair && ring != null) {
+            value = tryReadRepair(key);
+        }
         if (value == null) return Optional.empty();
         return Optional.of(compress ? Compression.decompressValue(value) : value);
+    }
+
+    /** doc/adr/0015-*.md: probes every owner of {@code key}, in rank
+     * order, for a value the normal read path already reported missing.
+     * The first owner that has it wins: its value is returned, and —
+     * detached, not awaited, no tracking — that same value repairs the
+     * true primary in the background, with no TTL. Every failure along
+     * the way (connection lost, WrongNode, another miss) is swallowed;
+     * nothing here may turn an already-accepted miss into an error. */
+    private byte[] tryReadRepair(byte[] key) {
+        List<String> names = ownerNames(key);
+        for (String name : names) {
+            byte[] value;
+            try {
+                value = applyReconnecting(() -> memberConnection(name), connection -> connection.get(key));
+            } catch (RuntimeException ignored) {
+                continue;
+            }
+            if (value == null) continue;
+
+            if (!names.isEmpty()) {
+                String primary = names.get(0);
+                byte[] repairValue = value;
+                replicaWriters.execute(() -> {
+                    try {
+                        applyReconnecting(() -> memberConnection(primary), connection -> {
+                            connection.set(key, repairValue, null);
+                            return null;
+                        });
+                    } catch (RuntimeException ignored) {
+                        // Swallowed by design — see the doc comment.
+                    }
+                });
+            }
+            return value;
+        }
+        return null;
     }
 
     private static String decodeUtf8Strict(byte[] bytes) {

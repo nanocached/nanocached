@@ -86,6 +86,27 @@ graceful degrade, not a queue or a drop). `close()` waits for any
 still-in-flight background replica writes before tearing down
 connections.
 
+## Read repair
+
+Off by default. A clean miss (the key's first-reached owner reports it
+missing) is normally accepted as-is. Enabling `readRepair` probes the
+remaining owners before accepting that, and repairs the primary in the
+background if one still has the value (doc/adr/0015-*.md):
+
+```java
+NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+        .addresses(List.of(new Address("cache.internal", 8357)))
+        .readRepair(true));
+```
+
+Closes the narrow window after a primary restart where a replica still
+holds a key its (fresh) primary doesn't, at the cost of extra reads only
+on the misses that hit that window. The repair write carries no TTL —
+the wire protocol's `G` response never returns one to preserve — and,
+unlike fire-and-forget replica writes, is uncapped and not drained on
+`close()`: this only fires on an already-rare clean miss, and losing one
+costs nothing beyond staying in the window for one more read.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
