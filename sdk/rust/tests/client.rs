@@ -1101,6 +1101,15 @@ fn node_by_name<'a>(nodes: &'a [(String, MockNode)], name: &str) -> &'a MockNode
     &nodes.iter().find(|(n, _)| n == name).unwrap().1
 }
 
+/// A "did it wait for the mock's delay" assertion can't compare the
+/// measured elapsed time against the delay exactly: tokio's timer wheel
+/// only guarantees firing *at* or after the deadline, but scheduling
+/// jitter around the boundary makes an exact-equality-style check flaky
+/// in spirit even when it's technically one-sided. Slacks the lower
+/// bound by this much rather than asserting on the boundary; still miles
+/// away from the ~0ms an immediate return would show.
+const TIMING_TOLERANCE: Duration = Duration::from_millis(20);
+
 #[tokio::test]
 async fn by_default_a_write_still_waits_for_the_replica_leg() {
     let (nodes, discovery) = start_cluster(2).await;
@@ -1117,7 +1126,7 @@ async fn by_default_a_write_still_waits_for_the_replica_leg() {
     let start = tokio::time::Instant::now();
     client.set("k", "v", 0).await.unwrap();
     assert!(
-        start.elapsed() >= Duration::from_millis(80),
+        start.elapsed() >= Duration::from_millis(80) - TIMING_TOLERANCE,
         "set() should have waited for the replica"
     );
 
@@ -1203,7 +1212,9 @@ async fn fire_and_forget_replicas_falls_back_to_synchronous_past_the_cap() {
     }
 
     assert!(
-        elapsed.iter().any(|e| *e >= Duration::from_millis(150)),
+        elapsed
+            .iter()
+            .any(|e| *e >= Duration::from_millis(150) - TIMING_TOLERANCE),
         "expected at least one call to fall back to synchronous past the cap: {elapsed:?}"
     );
     assert!(

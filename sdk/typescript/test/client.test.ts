@@ -926,6 +926,14 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
 describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
+  // A "did it wait for the mock's delay" assertion can't compare the
+  // measured elapsed time against the delay exactly: setTimeout's firing
+  // clock and Date.now() aren't the same clock, so an 80ms delay can be
+  // observed as 79ms. Slack the lower bound by this much rather than
+  // asserting on the boundary; still miles away from the ~0ms an
+  // immediate return would show.
+  const TIMING_TOLERANCE_MS = 20;
+
   async function startReplicatedCluster() {
     const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
     const nodes = [
@@ -967,7 +975,10 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
 
       const start = Date.now();
       await client.set("k", "v");
-      assert.ok(Date.now() - start >= 80, "set() should have waited for the replica");
+      assert.ok(
+        Date.now() - start >= 80 - TIMING_TOLERANCE_MS,
+        "set() should have waited for the replica",
+      );
     } finally {
       client.close();
       await cluster.close();
@@ -1016,7 +1027,7 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
       );
 
       assert.ok(
-        elapsed.some((ms) => ms >= 150),
+        elapsed.some((ms) => ms >= 150 - TIMING_TOLERANCE_MS),
         `expected at least one call to fall back to synchronous, got ${elapsed}`,
       );
       assert.ok(

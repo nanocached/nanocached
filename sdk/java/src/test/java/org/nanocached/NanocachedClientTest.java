@@ -589,6 +589,14 @@ class NanocachedClientTest {
                 .fireAndForgetReplicas(true));
     }
 
+    // A "did it wait for the mock's delay" assertion can't compare the
+    // measured elapsed time against the delay exactly: Thread.sleep()'s
+    // wakeup is only approximate and nanoTime()/1_000_000 truncates, so an
+    // 80ms delay can be observed as 79ms. Slack the lower bound by this
+    // much rather than asserting on the boundary; still miles away from
+    // the ~0ms an immediate return would show.
+    private static final long TIMING_TOLERANCE_MILLIS = 20;
+
     @org.junit.jupiter.api.AfterEach
     void resetMaxInFlightBackgroundReplicaWrites() {
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 32;
@@ -604,7 +612,7 @@ class NanocachedClientTest {
                 long start = System.nanoTime();
                 client.set("k", "v");
                 long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
-                assertTrue(elapsedMillis >= 80, "set() should have waited for the replica, took " + elapsedMillis + "ms");
+                assertTrue(elapsedMillis >= 80 - TIMING_TOLERANCE_MILLIS, "set() should have waited for the replica, took " + elapsedMillis + "ms");
             }
         }
     }
@@ -653,7 +661,7 @@ class NanocachedClientTest {
                 boolean anySlow = false;
                 boolean anyFast = false;
                 for (long ms : elapsedMillis) {
-                    if (ms >= 150) anySlow = true;
+                    if (ms >= 150 - TIMING_TOLERANCE_MILLIS) anySlow = true;
                     else anyFast = true;
                 }
                 assertTrue(anySlow, "expected at least one call to fall back to synchronous past the cap");

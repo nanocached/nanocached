@@ -526,6 +526,14 @@ public class NanocachedClientTests
 
     // ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────
 
+    // A "did it wait for the mock's delay" assertion can't compare the
+    // measured elapsed time against the delay exactly: Task.Delay's timer
+    // tick and Stopwatch.ElapsedMilliseconds's truncation can each shave a
+    // little off, so an 80ms delay can be observed as under 80ms. Slack
+    // the lower bound by this much rather than asserting on the boundary;
+    // still miles away from the ~0ms an immediate return would show.
+    private const long TimingToleranceMillis = 20;
+
     [Fact]
     public async Task ByDefaultAWriteStillWaitsForTheReplicaLeg()
     {
@@ -538,7 +546,7 @@ public class NanocachedClientTests
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         await client.SetAsync("k", "v");
-        Assert.True(stopwatch.ElapsedMilliseconds >= 80, "SetAsync should have waited for the replica");
+        Assert.True(stopwatch.ElapsedMilliseconds >= 80 - TimingToleranceMillis, "SetAsync should have waited for the replica");
     }
 
     [Fact]
@@ -589,7 +597,7 @@ public class NanocachedClientTests
             }).ToArray();
             long[] elapsed = await Task.WhenAll(tasks);
 
-            Assert.True(elapsed.Any(ms => ms >= 150), $"expected at least one call to fall back to synchronous, got [{string.Join(",", elapsed)}]");
+            Assert.True(elapsed.Any(ms => ms >= 150 - TimingToleranceMillis), $"expected at least one call to fall back to synchronous, got [{string.Join(",", elapsed)}]");
             Assert.True(elapsed.Any(ms => ms < 150), $"expected at least one call to return fast, got [{string.Join(",", elapsed)}]");
         }
         finally

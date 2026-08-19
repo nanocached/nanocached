@@ -791,6 +791,15 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
 class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
     # doc/adr/0014-*.md
 
+    # A "did it wait for the mock's delay" assertion can't compare the
+    # measured elapsed time against the delay exactly: asyncio.sleep()'s
+    # wakeup and loop.time()'s measurement can land within one
+    # clock_resolution of each other, so a 0.08s delay can be observed as
+    # slightly under 0.08s. Slack the lower bound by this much rather than
+    # asserting on the boundary; still miles away from the ~0s an
+    # immediate return would show.
+    TIMING_TOLERANCE_S = 0.02
+
     def setUp(self):
         from nanocached import client as client_module
 
@@ -823,7 +832,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                 start = asyncio.get_running_loop().time()
                 await client.set("k", "v")
                 elapsed = asyncio.get_running_loop().time() - start
-                self.assertGreaterEqual(elapsed, 0.08)
+                self.assertGreaterEqual(elapsed, 0.08 - self.TIMING_TOLERANCE_S)
             finally:
                 client.close()
         finally:
@@ -876,7 +885,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
 
                 elapsed = await asyncio.gather(*(timed_set() for _ in range(3)))
 
-                self.assertTrue(any(e >= 0.15 for e in elapsed), elapsed)
+                self.assertTrue(any(e >= 0.15 - self.TIMING_TOLERANCE_S for e in elapsed), elapsed)
                 self.assertTrue(any(e < 0.15 for e in elapsed), elapsed)
             finally:
                 client.close()
