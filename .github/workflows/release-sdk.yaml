@@ -1,0 +1,161 @@
+name: Release SDK
+
+on:
+  push:
+    tags:
+      - 'sdk/*/v*'
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    if: startsWith(github.ref_name, 'sdk/rust/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches manifest version
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/rust/v}"
+          grep -q "^version = \"$ver\"$" sdk/rust/Cargo.toml
+
+      - name: Publish to crates.io
+        working-directory: sdk/rust
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  python:
+    if: startsWith(github.ref_name, 'sdk/python/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches manifest version
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/python/v}"
+          grep -q "^version = \"$ver\"$" sdk/python/pyproject.toml
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Build
+        working-directory: sdk/python
+        run: uv build
+
+      - name: Publish to PyPI
+        working-directory: sdk/python
+        run: uv publish --token "$PYPI_API_TOKEN"
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+
+  go:
+    if: startsWith(github.ref_name, 'sdk/go/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: sdk/go/go.mod
+
+      - name: Verify module
+        working-directory: sdk/go
+        run: |
+          go vet ./...
+          go test ./...
+
+      # Publishing a Go module IS the tag push; this just asks the module
+      # proxy to fetch and index the new version so it is immediately usable.
+      - name: Trigger proxy indexing
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/go/}"
+          GOPROXY=https://proxy.golang.org GONOSUMCHECK=1 \
+            go mod download "github.com/nanocached/nanocached/sdk/go@$ver" || true
+          curl -sf "https://proxy.golang.org/github.com/nanocached/nanocached/sdk/go/@v/$ver.info"
+
+  java:
+    if: startsWith(github.ref_name, 'sdk/java/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches manifest version
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/java/v}"
+          grep -q "^version = '$ver'$" sdk/java/build.gradle
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Publish to Maven Central
+        working-directory: sdk/java
+        run: gradle publishToMavenCentral --no-daemon
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_SIGNING_KEY_PASSWORD }}
+
+  typescript:
+    if: startsWith(github.ref_name, 'sdk/typescript/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify tag matches manifest version
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/typescript/v}"
+          test "$(node -p 'require("./sdk/typescript/package.json").version')" = "$ver"
+
+      # pnpm version comes from the packageManager field in package.json
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # prepublishOnly runs test + build
+      - name: Build and publish to npm
+        working-directory: sdk/typescript
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm publish --access public --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  dotnet:
+    if: startsWith(github.ref_name, 'sdk/dotnet/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.x
+
+      - name: Verify tag matches manifest version
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/dotnet/v}"
+          grep -q "<Version>$ver</Version>" sdk/dotnet/src/Nanocached/Nanocached.csproj
+
+      - name: Pack and publish to NuGet
+        working-directory: sdk/dotnet
+        run: |
+          ver="${GITHUB_REF_NAME#sdk/dotnet/v}"
+          dotnet pack src/Nanocached/Nanocached.csproj -c Release -o out
+          dotnet nuget push "out/Nanocached.$ver.nupkg" \
+            --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

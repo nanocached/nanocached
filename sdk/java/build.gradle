@@ -1,16 +1,43 @@
 plugins {
     id 'java-library'
+    id 'com.vanniktech.maven.publish' version '0.34.0'
 }
 
 group = 'org.nanocached'
-version = '1.0.0'
+version = '0.1.1'
+
+mavenPublishing {
+    publishToMavenCentral(true)
+    signAllPublications()
+    coordinates('org.nanocached', 'nanocached', version.toString())
+    pom {
+        name = 'nanocached'
+        description = 'Java client SDK for nanocached, a tiny distributed cache with client-side replication'
+        url = 'https://nanocached.org'
+        licenses {
+            license {
+                name = 'MIT License'
+                url = 'https://github.com/nanocached/nanocached/blob/main/LICENSE'
+            }
+        }
+        developers {
+            developer {
+                id = 't0k0sh1'
+                name = 'Takashi Yamashina'
+            }
+        }
+        scm {
+            url = 'https://github.com/nanocached/nanocached'
+            connection = 'scm:git:git://github.com/nanocached/nanocached.git'
+            developerConnection = 'scm:git:ssh://git@github.com/nanocached/nanocached.git'
+        }
+    }
+}
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
     }
-    withSourcesJar()
-    withJavadocJar()
 }
 
 repositories {
