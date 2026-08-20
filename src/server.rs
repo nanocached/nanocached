@@ -2274,39 +2274,48 @@ async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::
     )
     .await?;
 
-    if let Some(secret) = &node_context.auth_secret {
-        stream.write_all(&auth_message(secret)).await?;
+    timeout(OUTBOUND_IO_TIMEOUT, async {
+        if let Some(secret) = &node_context.auth_secret {
+            stream.write_all(&auth_message(secret)).await?;
 
-        let mut ack = [0u8; 3];
+            let mut ack = [0u8; 3];
+            stream.read_exact(&mut ack).await?;
+
+            if &ack != b"Od\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "discovery server rejected the auth secret",
+                ));
+            }
+        }
+
+        stream
+            .write_all(&complete_message(
+                &node_context.name,
+                joining_name,
+                &node_context.token,
+            ))
+            .await?;
+
+        let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
 
-        if &ack != b"Od\n" {
+        if &ack != b"A\n" {
             return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "discovery server rejected the auth secret",
+                io::ErrorKind::InvalidData,
+                "discovery server did not acknowledge C",
             ));
         }
-    }
 
-    stream
-        .write_all(&complete_message(
-            &node_context.name,
-            joining_name,
-            &node_context.token,
-        ))
-        .await?;
-
-    let mut ack = [0u8; 2];
-    stream.read_exact(&mut ack).await?;
-
-    if &ack != b"A\n" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "discovery server did not acknowledge C",
-        ));
-    }
-
-    Ok(())
+        io::Result::Ok(())
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "reporting migration completion to discovery timed out",
+        )
+    })?
 }
 
 #[cfg(test)]
