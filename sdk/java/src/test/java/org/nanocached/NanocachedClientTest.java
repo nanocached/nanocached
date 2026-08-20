@@ -167,11 +167,13 @@ class NanocachedClientTest {
                 assertEquals(Optional.of("v"), client.get("k"));
             }
 
-            NanocachedException missing = assertThrows(NanocachedException.class,
+            // Both shapes are matchable as AuthenticationFailed (issue
+            // #47 item 5), not just by message.
+            NanocachedException missing = assertThrows(NanocachedException.AuthenticationFailed.class,
                     () -> connect("127.0.0.1", node.port()));
             assertTrue(missing.getMessage().contains("requires authentication"));
 
-            NanocachedException wrong = assertThrows(NanocachedException.class,
+            NanocachedException wrong = assertThrows(NanocachedException.AuthenticationFailed.class,
                     () -> NanocachedClient.connect(
                             single("127.0.0.1", node.port()).authSecret("wrong")));
             assertTrue(wrong.getMessage().contains("authentication failed"));

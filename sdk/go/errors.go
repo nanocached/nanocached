@@ -26,6 +26,12 @@ var (
 	// through a node-list refresh.
 	ErrConnectionLost = errors.New("nanocached: connection lost")
 
+	// ErrAuthenticationFailed: the server rejected the A handshake's
+	// secret — either no AuthSecret was configured for a server that
+	// requires one, or the configured secret is wrong. Never transient:
+	// retrying with the same configuration cannot succeed (issue #47).
+	ErrAuthenticationFailed = errors.New("nanocached: authentication failed")
+
 	// ErrDecompression is returned by Get/GetBytes when a value with
 	// Config.Compress enabled can't be interpreted — almost always a
 	// Compress mismatch between clients sharing this key

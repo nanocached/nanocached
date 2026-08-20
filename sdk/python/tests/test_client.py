@@ -7,6 +7,7 @@ import unittest
 
 from nanocached import (
     AlreadyClosedError,
+    AuthenticationError,
     ClientStats,
     DecompressionError,
     DiscoveryBusyError,
@@ -142,9 +143,11 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 client.close()
 
-            with self.assertRaisesRegex(Exception, "requires authentication"):
+            # Both shapes are matchable as AuthenticationError (issue #47
+            # item 5), not just by message.
+            with self.assertRaisesRegex(AuthenticationError, "requires authentication"):
                 await NanocachedClient.connect([("127.0.0.1", secure.port)])
-            with self.assertRaisesRegex(Exception, "authentication failed"):
+            with self.assertRaisesRegex(AuthenticationError, "authentication failed"):
                 await NanocachedClient.connect([("127.0.0.1", secure.port)], auth_secret="wrong")
         finally:
             await secure.close()

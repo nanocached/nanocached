@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import {
   AlreadyClosedError,
+  AuthenticationError,
   ConnectionLostError,
   DecompressionError,
   DiscoveryBusyError,
@@ -162,16 +163,20 @@ describe("NanocachedClient against a single node", () => {
   it("reports a missing secret differently from a wrong one", async () => {
     const node = await startMockNode({ requiredSecret: "s3cret" });
     try {
+      // Both shapes are matchable as AuthenticationError (issue #47
+      // item 5), not just by message.
       await assert.rejects(
         NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] }),
-        /requires authentication/,
+        (error: unknown) =>
+          error instanceof AuthenticationError && /requires authentication/.test(error.message),
       );
       await assert.rejects(
         NanocachedClient.connect({
           addresses: [{ host: "127.0.0.1", port: node.port }],
           authSecret: "wrong",
         }),
-        /authentication failed/,
+        (error: unknown) =>
+          error instanceof AuthenticationError && /authentication failed/.test(error.message),
       );
     } finally {
       await node.close();

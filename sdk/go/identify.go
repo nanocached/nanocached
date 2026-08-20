@@ -197,10 +197,10 @@ func identify(conn net.Conn, address string, authSecret []byte, requestTags bool
 
 	if ack[0] == 'E' {
 		if authSecret == nil {
-			return nil, fmt.Errorf(
-				"nanocached: %s requires authentication, but no AuthSecret was given", address)
+			return nil, errors.Join(ErrAuthenticationFailed, fmt.Errorf(
+				"nanocached: %s requires authentication, but no AuthSecret was given", address))
 		}
-		return nil, fmt.Errorf("nanocached: authentication failed")
+		return nil, ErrAuthenticationFailed
 	}
 
 	if ack[1] == 'n' {

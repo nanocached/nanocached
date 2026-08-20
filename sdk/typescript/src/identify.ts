@@ -176,6 +176,17 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   throw new NanocachedError("nanocached: unexpected response to A");
 }
 
+/** Thrown when the server rejects the `A` handshake's secret — either no
+ * `authSecret` was configured for a server that requires one, or the
+ * configured secret is wrong. Never transient: retrying with the same
+ * configuration cannot succeed. */
+export class AuthenticationError extends NanocachedError {
+  constructor(message: string) {
+    super(message);
+    this.name = "AuthenticationError";
+  }
+}
+
 /** Thrown when a discovery server answers `L` with `B` — it is inside its
  * startup grace (ADR-0010), re-learning cluster membership after a
  * restart, and refuses to serve a possibly-partial node list. The caller
@@ -342,11 +353,11 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Pro
   if (!identity.accepted) {
     socket.destroy();
     if (options.authSecret === undefined) {
-      throw new NanocachedError(
+      throw new AuthenticationError(
         `nanocached: ${options.host}:${options.port} requires authentication, but no authSecret was provided`,
       );
     }
-    throw new NanocachedError("nanocached: authentication failed");
+    throw new AuthenticationError("nanocached: authentication failed");
   }
 
   if (identity.kind === "node") {

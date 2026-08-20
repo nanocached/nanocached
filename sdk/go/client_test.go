@@ -810,12 +810,13 @@ func TestAuthenticates(t *testing.T) {
 	}
 	client.Close()
 
-	if _, err := Connect(Config{Addresses: []Address{addr(node.address())}}); err == nil ||
+	// Both shapes are matchable via ErrAuthenticationFailed (issue #47
+	// item 5), not just by message.
+	if _, err := Connect(Config{Addresses: []Address{addr(node.address())}}); !errors.Is(err, ErrAuthenticationFailed) ||
 		!strings.Contains(err.Error(), "requires authentication") {
 		t.Fatalf("missing-secret error = %v", err)
 	}
-	if _, err := Connect(Config{Addresses: []Address{addr(node.address())}, AuthSecret: "wrong"}); err == nil ||
-		!strings.Contains(err.Error(), "authentication failed") {
+	if _, err := Connect(Config{Addresses: []Address{addr(node.address())}, AuthSecret: "wrong"}); !errors.Is(err, ErrAuthenticationFailed) {
 		t.Fatalf("wrong-secret error = %v", err)
 	}
 }

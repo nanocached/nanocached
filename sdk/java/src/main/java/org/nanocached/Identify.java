@@ -88,10 +88,10 @@ final class Identify {
 
             if (!identity.accepted()) {
                 if (authSecret == null) {
-                    throw new NanocachedException("nanocached: " + host + ":" + port
+                    throw new NanocachedException.AuthenticationFailed("nanocached: " + host + ":" + port
                             + " requires authentication, but no authSecret was given");
                 }
-                throw new NanocachedException("nanocached: authentication failed");
+                throw new NanocachedException.AuthenticationFailed("nanocached: authentication failed");
             }
 
             if (identity.kind() == 'n') {

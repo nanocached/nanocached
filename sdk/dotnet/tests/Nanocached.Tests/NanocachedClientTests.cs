@@ -144,11 +144,13 @@ public class NanocachedClientTests
             Assert.Equal("v", await client.GetAsync("k"));
         }
 
-        NanocachedException missing = await Assert.ThrowsAsync<NanocachedException>(
+        // Both shapes are matchable as AuthenticationFailedException
+        // (issue #47 item 5), not just by message.
+        AuthenticationFailedException missing = await Assert.ThrowsAsync<AuthenticationFailedException>(
             () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port)));
         Assert.Contains("requires authentication", missing.Message);
 
-        NanocachedException wrong = await Assert.ThrowsAsync<NanocachedException>(
+        AuthenticationFailedException wrong = await Assert.ThrowsAsync<AuthenticationFailedException>(
             () => NanocachedClient.ConnectAsync(
                 new NanocachedClient.Options { Addresses = { ("127.0.0.1", node.Port) }, AuthSecret = "wrong" }));
         Assert.Contains("authentication failed", wrong.Message);
