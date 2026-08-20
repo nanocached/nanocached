@@ -37,7 +37,10 @@ export interface DiscoveredNode {
  * take the exact same options for either.
  */
 export type IdentifyResult =
-  | { kind: "node"; socket: Socket | TLSSocket }
+  // `tagged` (ADR-0019): the node accepted the extended `A ... T`, so
+  // this socket's `G`/`S`/`D` traffic must carry tags and its responses
+  // echo them; false means an older node answered the plain-`A` fallback.
+  | { kind: "node"; socket: Socket | TLSSocket; tagged: boolean }
   // `replication` (ADR-0011) is discovery's replication factor R — how
   // many nodes hold each key. It rides the `L` response so clients can't
   // skew from the cluster's setting.
@@ -132,29 +135,43 @@ function readFrame<T>(
 interface AuthIdentity {
   accepted: boolean;
   kind: "node" | "cluster";
+  /** ADR-0019: the server echoed the tag capability (`OnT\n`/`OdT\n`). */
+  tagged: boolean;
 }
 
-/** Parses the fixed 3-byte reply to `A`: `On\n`/`En\n` from a cache node,
- * `Od\n`/`Ed\n` from a discovery server (see doc/adr/0007-*.md). The
- * second byte is what identifies which kind of server this is — it isn't
- * an accident of the auth outcome, it's present whether accepted or
+/** Parses the reply to `A`: `On\n`/`En\n` from a cache node, `Od\n`/`Ed\n`
+ * from a discovery server (see doc/adr/0007-*.md), each stretched to four
+ * bytes by a `T` before the LF when the server is echoing the tag
+ * capability our extended `A` asked for (doc/adr/0019-*.md). The second
+ * byte is what identifies which kind of server this is — it isn't an
+ * accident of the auth outcome, it's present whether accepted or
  * rejected. */
 function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   if (buf.length < 3) return null;
 
   const status = buf[0];
   const type = buf[1];
-  if (buf[2] !== 0x0a /* '\n' */) {
-    throw new Error("nanocached: unexpected response to A");
-  }
 
   const accepted = status === 0x4f /* 'O' */;
   if (!accepted && status !== 0x45 /* 'E' */) {
     throw new Error("nanocached: unexpected response to A");
   }
 
-  if (type === 0x6e /* 'n' */) return { accepted, kind: "node" };
-  if (type === 0x64 /* 'd' */) return { accepted, kind: "cluster" };
+  let tagged: boolean;
+  if (buf[2] === 0x0a /* '\n' */) {
+    tagged = false;
+  } else if (buf[2] === 0x54 /* 'T' */) {
+    if (buf.length < 4) return null;
+    if (buf[3] !== 0x0a) {
+      throw new Error("nanocached: unexpected response to A");
+    }
+    tagged = true;
+  } else {
+    throw new Error("nanocached: unexpected response to A");
+  }
+
+  if (type === 0x6e /* 'n' */) return { accepted, kind: "node", tagged };
+  if (type === 0x64 /* 'd' */) return { accepted, kind: "cluster", tagged };
   throw new Error("nanocached: unexpected response to A");
 }
 
@@ -281,11 +298,36 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
  * (matching its one-shot fetch-then-close role elsewhere in this SDK).
  */
 export async function connectAndIdentify(options: IdentifyOptions): Promise<IdentifyResult> {
+  try {
+    return await identifyOnce(options, true);
+  } catch (error) {
+    if (!isLegacyServerSignal(error)) throw error;
+    // ADR-0019 transparent fallback: a pre-0019 server rejects the
+    // extended `A ... T` as a parse error and closes without replying —
+    // redial once with the plain form and run the connection untagged
+    // (the pre-0019 behavior, desync window included).
+    return identifyOnce(options, false);
+  }
+}
+
+/** Whether an identify failure looks like a pre-0019 server slamming the
+ * door on the extended `A` (close/reset before any reply) — the only
+ * failures worth retrying with the plain form. A timeout is not one: the
+ * server kept the connection open, it just didn't answer. */
+function isLegacyServerSignal(error: unknown): boolean {
+  if (error instanceof Error && error.message === "nanocached: connection closed before the expected response arrived") {
+    return true;
+  }
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code === "ECONNRESET" || code === "EPIPE";
+}
+
+async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Promise<IdentifyResult> {
   const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
   const socket = await connectSocket(options);
 
   const secret = options.authSecret !== undefined ? Buffer.from(options.authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
-  const authFrame = Buffer.concat([Buffer.from(`A ${secret.length}\n`, "ascii"), secret]);
+  const authFrame = Buffer.concat([Buffer.from(`A ${secret.length}${requestTags ? " T" : ""}\n`, "ascii"), secret]);
 
   let identity: AuthIdentity;
   try {
@@ -307,7 +349,7 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
   }
 
   if (identity.kind === "node") {
-    return { kind: "node", socket };
+    return { kind: "node", socket, tagged: identity.tagged };
   }
 
   try {

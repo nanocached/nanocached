@@ -23,18 +23,29 @@ public sealed class MockNode : IDisposable
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
+    /// <summary>Speak ADR-0019: acknowledge `A ... T` with `OnT\n` and echo
+    /// tags on that connection's replies. Off by default so the bulk of
+    /// the suite keeps exercising the legacy untagged path.</summary>
+    private readonly bool _supportTags;
+    /// <summary>Behave like a pre-ADR-0019 server: an extended `A ... T`
+    /// is a parse error — close the connection without replying.</summary>
+    private readonly bool _closeOnExtendedAuth;
     private int _connectionCount;
     private int _getCount;
     private int _wrongNodeReplies;
+    private int _wrongTagReplies;
+    private int _swallowedGets;
     private int _malformedValueReplies;
     private int _storedToGetReplies;
     private int _wrongNodeOnSetReplies;
     private volatile int _setDelayMillis;
     private long _lastSetTtl;
 
-    public MockNode(string? requiredSecret = null)
+    public MockNode(string? requiredSecret = null, bool supportTags = false, bool closeOnExtendedAuth = false)
     {
         _requiredSecret = requiredSecret is null ? null : Encoding.UTF8.GetBytes(requiredSecret);
+        _supportTags = supportTags;
+        _closeOnExtendedAuth = closeOnExtendedAuth;
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
         _ = AcceptLoopAsync();
@@ -45,6 +56,16 @@ public sealed class MockNode : IDisposable
     public string Address => $"127.0.0.1:{Port}";
 
     public void AnswerWrongNodeOnce() => Interlocked.Increment(ref _wrongNodeReplies);
+
+    /// <summary>Queue a one-off reply for the next G request on a tagged
+    /// connection that echoes the WRONG tag (the request's tag + 1) — the
+    /// desync a pre-ADR-0019 stream misalignment would produce.</summary>
+    public void AnswerWrongTagOnce() => Interlocked.Increment(ref _wrongTagReplies);
+
+    /// <summary>Swallow the next G request entirely (no reply) — the
+    /// off-by-one stream desync where every later response answers the
+    /// previous request.</summary>
+    public void SwallowGetOnce() => Interlocked.Increment(ref _swallowedGets);
 
     /// <summary>Queue a one-off garbage V header for the next G request.</summary>
     public void AnswerMalformedValueOnce() => Interlocked.Increment(ref _malformedValueReplies);
@@ -100,18 +121,33 @@ public sealed class MockNode : IDisposable
         try
         {
             NetworkStream stream = client.GetStream();
+            // ADR-0019: set when this connection's `A ... T` was
+            // acknowledged — its requests then carry a trailing tag the
+            // replies must echo.
+            bool tagged = false;
             while (true)
             {
                 string[] parts = (await Wire.ReadLineAsync(stream)).Split(' ');
+                // On a tagged connection every request's last header field
+                // is its tag, echoed back as each reply's own last field.
+                string tag = tagged ? $" {parts[^1]}" : "";
+
                 switch (parts[0])
                 {
                     case "A":
                     {
+                        if (parts.Length > 2 && _closeOnExtendedAuth)
+                        {
+                            client.Close();
+                            return;
+                        }
+
                         byte[] secret = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         bool accepted = _requiredSecret is null
                             ? secret.Length > 0
                             : secret.AsSpan().SequenceEqual(_requiredSecret);
-                        await Wire.WriteAsync(stream, accepted ? "On\n" : "En\n");
+                        tagged = accepted && _supportTags && parts.Length > 2 && parts[2] == "T";
+                        await Wire.WriteAsync(stream, accepted ? (tagged ? "OnT\n" : "On\n") : "En\n");
                         if (!accepted) return;
                         break;
                     }
@@ -119,6 +155,15 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         Interlocked.Increment(ref _getCount);
+                        if (TakeOne(ref _swallowedGets))
+                        {
+                            break;
+                        }
+                        if (tagged && TakeOne(ref _wrongTagReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"N {int.Parse(parts[^1]) + 1}\n");
+                            break;
+                        }
                         if (TakeMalformedValue())
                         {
                             await Wire.WriteAsync(stream, "V x\n");
@@ -126,21 +171,21 @@ public sealed class MockNode : IDisposable
                         }
                         if (TakeOne(ref _storedToGetReplies))
                         {
-                            await Wire.WriteAsync(stream, "S\n");
+                            await Wire.WriteAsync(stream, $"S{tag}\n");
                             break;
                         }
                         if (TakeWrongNode())
                         {
-                            await Wire.WriteAsync(stream, "W\n");
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
                         }
                         else if (Store.TryGetValue(KeyOf(key), out byte[]? value))
                         {
-                            await Wire.WriteAsync(stream, $"V {value.Length}\n");
+                            await Wire.WriteAsync(stream, $"V {value.Length}{tag}\n");
                             await stream.WriteAsync(value);
                         }
                         else
                         {
-                            await Wire.WriteAsync(stream, "N\n");
+                            await Wire.WriteAsync(stream, $"N{tag}\n");
                         }
                         break;
                     }
@@ -148,21 +193,24 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         byte[] value = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
-                        // parts[3], when present, is the TTL (omitted on
-                        // the wire means "no expiry", i.e. 0).
-                        _lastSetTtl = parts.Length > 3 ? long.Parse(parts[3]) : 0;
+                        // The TTL, when present, is the field after the
+                        // two lengths (omitted on the wire means "no
+                        // expiry", i.e. 0); on a tagged connection the tag
+                        // sits after it as the last field.
+                        int ttlFieldCount = parts.Length - (tagged ? 4 : 3);
+                        _lastSetTtl = ttlFieldCount > 0 ? long.Parse(parts[3]) : 0;
                         if (_setDelayMillis > 0)
                         {
                             await Task.Delay(_setDelayMillis);
                         }
                         if (TakeOne(ref _wrongNodeOnSetReplies) || TakeWrongNode())
                         {
-                            await Wire.WriteAsync(stream, "W\n");
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
                         }
                         else
                         {
                             Store[KeyOf(key)] = value;
-                            await Wire.WriteAsync(stream, "S\n");
+                            await Wire.WriteAsync(stream, $"S{tag}\n");
                         }
                         break;
                     }
@@ -171,11 +219,11 @@ public sealed class MockNode : IDisposable
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         if (TakeWrongNode())
                         {
-                            await Wire.WriteAsync(stream, "W\n");
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
                         }
                         else
                         {
-                            await Wire.WriteAsync(stream, Store.TryRemove(KeyOf(key), out _) ? "D\n" : "N\n");
+                            await Wire.WriteAsync(stream, Store.TryRemove(KeyOf(key), out _) ? $"D{tag}\n" : $"N{tag}\n");
                         }
                         break;
                     }

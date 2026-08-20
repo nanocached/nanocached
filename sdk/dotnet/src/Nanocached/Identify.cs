@@ -36,17 +36,61 @@ internal static class Identify
 
     internal abstract record Result;
 
-    internal sealed record NodeTarget(Stream Stream) : Result;
+    // `Tagged` (ADR-0019): the node accepted the extended `A ... T`, so
+    // this stream's `G`/`S`/`D` traffic must carry tags and its responses
+    // echo them; false means an older node answered the plain-`A` fallback.
+    internal sealed record NodeTarget(Stream Stream, bool Tagged) : Result;
 
     internal sealed record ClusterTarget(IReadOnlyList<DiscoveredNode> Nodes, int Replication) : Result;
 
+    /// <summary>
+    /// Always dials with the extended <c>A ... T</c> first (doc/adr/0019-*.md),
+    /// so a 0019+ server tags this connection from the start. Only when the
+    /// extended form itself signals a pre-0019 server — the connection
+    /// closed/EOF/reset before any reply arrived, never a timeout or a
+    /// malformed-but-present reply — does this transparently redial once
+    /// with the plain <c>A</c> form and run the connection untagged, the
+    /// same as before ADR-0019 existed.
+    /// </summary>
     internal static async Task<Result> ConnectAndIdentifyAsync(
         string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls)
+    {
+        try
+        {
+            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: true)
+                .ConfigureAwait(false);
+        }
+        catch (Exception error) when (IsLegacyServerSignal(error))
+        {
+            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: false)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Whether an identify failure looks like a pre-0019 server
+    /// slamming the door on the extended <c>A</c> (close/reset before any
+    /// reply) — the only failures worth retrying with the plain form. A
+    /// timeout is not one: the server kept the connection open, it just
+    /// didn't answer (and is handled by its own catch in
+    /// <see cref="ConnectAndIdentifyWithDeadlineAsync"/>, never reaching
+    /// here). A malformed-but-present reply is not one either — that's a
+    /// real protocol error, not a legacy server's silence.</summary>
+    private static bool IsLegacyServerSignal(Exception error) =>
+        error is EndOfStreamException
+        || IsConnectionResetOrAborted(error as SocketException)
+        || IsConnectionResetOrAborted((error as IOException)?.InnerException as SocketException);
+
+    private static bool IsConnectionResetOrAborted(SocketException? error) =>
+        error is not null
+        && error.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted;
+
+    private static async Task<Result> ConnectAndIdentifyWithDeadlineAsync(
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags)
     {
         using var deadline = new CancellationTokenSource(ConnectDeadline);
         try
         {
-            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, deadline.Token)
+            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, requestTags, deadline.Token)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
@@ -57,26 +101,45 @@ internal static class Identify
     }
 
     private static async Task<Result> ConnectAndIdentifyAsync(
-        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls,
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags,
         CancellationToken cancel)
     {
         Stream stream = await OpenAsync(host, port, tls, cancel).ConfigureAwait(false);
         try
         {
             byte[] secret = authSecret ?? NoSecretPlaceholder;
-            byte[] header = Encoding.ASCII.GetBytes($"A {secret.Length}\n");
+            byte[] header = Encoding.ASCII.GetBytes($"A {secret.Length}{(requestTags ? " T" : "")}\n");
             await stream.WriteAsync(header, cancel).ConfigureAwait(false);
             await stream.WriteAsync(secret, cancel).ConfigureAwait(false);
             await stream.FlushAsync(cancel).ConfigureAwait(false);
 
+            // Read the reply's first 3 bytes: a pre-0019 shape ends the
+            // reply right there (`On\n`/`En\n`/`Od\n`/`Ed\n`, byte[2] ==
+            // '\n', untagged); doc/adr/0019-*.md stretches it to 4 bytes
+            // with a `T` before the final '\n' when the server echoes the
+            // tag capability our extended `A` asked for.
             var ack = new byte[3];
             await stream.ReadExactlyAsync(ack, cancel).ConfigureAwait(false);
-            bool shaped = ack[2] == (byte)'\n'
-                && ack[0] is (byte)'O' or (byte)'E'
-                && ack[1] is (byte)'n' or (byte)'d';
-            if (!shaped)
+            bool shapedPrefix = ack[0] is (byte)'O' or (byte)'E' && ack[1] is (byte)'n' or (byte)'d';
+            if (!shapedPrefix || (ack[2] != (byte)'\n' && ack[2] != (byte)'T'))
             {
                 throw new NanocachedException("nanocached: unexpected response to A");
+            }
+
+            bool tagged;
+            if (ack[2] == (byte)'\n')
+            {
+                tagged = false;
+            }
+            else
+            {
+                var trailer = new byte[1];
+                await stream.ReadExactlyAsync(trailer, cancel).ConfigureAwait(false);
+                if (trailer[0] != (byte)'\n')
+                {
+                    throw new NanocachedException("nanocached: unexpected response to A");
+                }
+                tagged = true;
             }
 
             if (ack[0] == (byte)'E')
@@ -89,10 +152,15 @@ internal static class Identify
 
             if (ack[1] == (byte)'n')
             {
-                return new NodeTarget(stream);
+                return new NodeTarget(stream, tagged);
             }
 
             // A discovery server: one-shot L, then this connection is done.
+            // Tags carry no meaning for discovery (ADR-0019) — L is a
+            // single request/response with nothing to desync — but the
+            // `OdT\n` ack still had to be parsed above since the client
+            // sends the extended `A` before knowing which kind of server
+            // answered.
             await stream.WriteAsync("L\n"u8.ToArray(), cancel).ConfigureAwait(false);
             await stream.FlushAsync(cancel).ConfigureAwait(false);
             ClusterTarget cluster = await ReadNodeListAsync(stream, cancel).ConfigureAwait(false);

@@ -14,6 +14,7 @@ import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.function.Function;
 
 /**
  * One already-identified connection to a single nanocached-node, speaking
@@ -32,7 +33,12 @@ final class Connection {
     private final InputStream in;
     private final OutputStream out;
     private final Runnable onClose;
-    private final Deque<CompletableFuture<Response>> pending = new ArrayDeque<>();
+    /** ADR-0019: negotiated during identify — when true, every request
+     * carries a tag the server echoes, and {@link #readLoop} verifies the
+     * echo against the oldest pending request before dispatching it. */
+    private final boolean tagged;
+    private int nextTag = 0;
+    private final Deque<Pending> pending = new ArrayDeque<>();
     private volatile boolean closed = false;
     private volatile long lastUsedNanos = System.nanoTime();
 
@@ -40,8 +46,9 @@ final class Connection {
      * closes for any reason — used by {@link NanocachedClient} to keep its
      * forgotten-close open-sockets tracker accurate without every call
      * site remembering to decrement it by hand. */
-    Connection(Socket socket, Runnable onClose) throws IOException {
+    Connection(Socket socket, boolean tagged, Runnable onClose) throws IOException {
         this.socket = socket;
+        this.tagged = tagged;
         this.onClose = onClose;
         this.in = new BufferedInputStream(socket.getInputStream());
         this.out = new BufferedOutputStream(socket.getOutputStream());
@@ -63,8 +70,7 @@ final class Connection {
     }
 
     byte[] get(byte[] key) {
-        byte[] frame = frame("G " + key.length + "\n", key, null);
-        Response response = request(frame);
+        Response response = request(tag -> frame("G " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
             case 'V' -> response.value;
             case 'N' -> null;
@@ -74,22 +80,32 @@ final class Connection {
     }
 
     void set(byte[] key, byte[] value, Long ttlSeconds) {
-        String header = ttlSeconds == null
-                ? "S " + key.length + " " + value.length + "\n"
-                : "S " + key.length + " " + value.length + " " + ttlSeconds + "\n";
-        Response response = request(frame(header, key, value));
+        Response response = request(tag -> {
+            String header = ttlSeconds == null
+                    ? "S " + key.length + " " + value.length + tagSuffix(tag) + "\n"
+                    : "S " + key.length + " " + value.length + " " + ttlSeconds + tagSuffix(tag) + "\n";
+            return frame(header, key, value);
+        });
         if (response.marker == 'W') throw new NanocachedException.WrongNode();
         if (response.marker != 'S') throw mismatch(response.marker);
     }
 
     boolean delete(byte[] key) {
-        Response response = request(frame("D " + key.length + "\n", key, null));
+        Response response = request(tag -> frame("D " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
             case 'W' -> throw new NanocachedException.WrongNode();
             default -> throw mismatch(response.marker);
         };
+    }
+
+    // ADR-0019: on a tagged-mode connection every request header carries
+    // the client's tag as its last field, and the server echoes it in the
+    // response — `tag == null` is the untagged (pre-0019) form, which
+    // must serialize byte-for-byte as it always has.
+    private static String tagSuffix(Integer tag) {
+        return tag == null ? "" : " " + Integer.toUnsignedString(tag);
     }
 
     /**
@@ -119,7 +135,7 @@ final class Connection {
      * effect.
      */
     private void poison(NanocachedException error) {
-        List<CompletableFuture<Response>> drained;
+        List<Pending> drained;
         synchronized (this) {
             if (closed) return;
             closed = true;
@@ -131,8 +147,8 @@ final class Connection {
         } catch (IOException ignored) {
             // Closing an already-broken socket is fine.
         }
-        for (CompletableFuture<Response> future : drained) {
-            future.completeExceptionally(error);
+        for (Pending p : drained) {
+            p.future().completeExceptionally(error);
         }
         onClose.run();
     }
@@ -148,12 +164,19 @@ final class Connection {
         return frame;
     }
 
-    private record Response(int marker, byte[] value) {}
+    private record Response(int marker, byte[] value, int tag) {}
+
+    /** A pending request's future paired with the tag its response must
+     * echo (ADR-0019) — meaningless (and never compared) on an untagged
+     * connection. */
+    private record Pending(CompletableFuture<Response> future, int tag) {}
 
     /** Enqueues a pending slot and writes frame under one monitor — see
      * the class doc comment — then blocks this caller's own thread on
-     * its own future, not the socket. */
-    private Response request(byte[] frame) {
+     * its own future, not the socket. {@code build} receives this
+     * request's claimed tag ({@code null} on an untagged connection) and
+     * must return the frame to write. */
+    private Response request(Function<Integer, byte[]> build) {
         if (isClosed()) {
             throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
         }
@@ -164,7 +187,16 @@ final class Connection {
                 throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
             }
             lastUsedNanos = System.nanoTime();
-            pending.addLast(future);
+            // ADR-0019: the tag is claimed in the same synchronous span
+            // that enqueues the pending slot and writes the frame
+            // (doc/adr/0016-*.md's enqueue+write atomicity), so tag order
+            // can never skew from queue/wire order. Built before
+            // enqueueing: a builder that fails (e.g. an invalid TTL) must
+            // fail with nothing queued, or the next response would
+            // resolve an orphaned slot and desync the stream.
+            Integer tag = tagged ? claimTag() : null;
+            byte[] frame = build.apply(tag);
+            pending.addLast(new Pending(future, tag == null ? -1 : tag));
             try {
                 out.write(frame);
                 out.flush();
@@ -183,6 +215,19 @@ final class Connection {
             if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
             throw new NanocachedException.ConnectionFailed("nanocached: connection failed", cause);
         }
+    }
+
+    /** A connection-scoped u32 wrapping counter (ADR-0019), 0-based —
+     * only ever called from within the {@code synchronized (this)} block
+     * in {@link #request}, so no separate synchronization is needed here.
+     * Encoded/decoded as unsigned decimal text (see {@link #tagSuffix}
+     * and {@link #parseTag}) since a Java {@code int} wraps at the same
+     * 2^32 width as the wire's u32, just with a different sign
+     * interpretation. */
+    private int claimTag() {
+        int tag = nextTag;
+        nextTag++;
+        return tag;
     }
 
     // The server's own request cap is 1 MiB; this constant doubles that
@@ -208,11 +253,11 @@ final class Connection {
                 return;
             }
 
-            CompletableFuture<Response> future;
+            Pending waiter;
             boolean wasEmpty;
             synchronized (this) {
                 wasEmpty = pending.isEmpty();
-                future = wasEmpty ? null : pending.pollFirst();
+                waiter = wasEmpty ? null : pending.pollFirst();
             }
 
             // An unsolicited "busy" response means the server hit its
@@ -224,14 +269,32 @@ final class Connection {
                         "nanocached: server rejected the connection (connection limit reached)", null));
                 return;
             }
-            if (future == null) {
+            if (waiter == null) {
                 poison(new NanocachedException.ConnectionFailed(
                         "nanocached: unsolicited response '" + (char) response.marker
                                 + "' from server (connection desynced)",
                         null));
                 return;
             }
-            future.complete(response);
+
+            // ADR-0019: verify the echoed tag against the request this
+            // response is about to answer — *before* it can reach any
+            // caller. A mismatch means the streams are misaligned; unlike
+            // the caller-side kind check (mismatch()), catching it here
+            // stops the misdelivery instead of merely noticing it later.
+            if (tagged && response.tag != waiter.tag()) {
+                NanocachedException error = new NanocachedException.ConnectionFailed(
+                        "nanocached: response tag " + response.tag + " does not answer request tag "
+                                + waiter.tag() + " (connection desynced)",
+                        null);
+                poison(error);
+                // The polled waiter is no longer in `pending`, so poison()
+                // won't reach it — complete it here; the rest drain there.
+                waiter.future().completeExceptionally(error);
+                return;
+            }
+
+            waiter.future().complete(response);
         }
     }
 
@@ -239,13 +302,19 @@ final class Connection {
         int marker = readByte();
         switch (marker) {
             case 'V' -> {
+                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019).
+                String[] fields = readLine().split(" ");
+                if (fields.length != (tagged ? 2 : 1)) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid value header in response", null);
+                }
                 // A non-numeric, negative, or absurd length is protocol
                 // garbage: the connection is desynced mid-frame and must
                 // be poisoned, and the error must be connection-classified
                 // so the redial/retry layer handles it (issue #8).
                 int length;
                 try {
-                    length = Integer.parseInt(readLine());
+                    length = Integer.parseInt(fields[0]);
                 } catch (NumberFormatException malformed) {
                     length = -1;
                 }
@@ -253,14 +322,38 @@ final class Connection {
                     throw new NanocachedException.ConnectionFailed(
                             "nanocached: invalid value length in response", null);
                 }
-                return new Response(marker, readExactly(length));
+                int tag = tagged ? parseTag(fields[1]) : -1;
+                return new Response(marker, readExactly(length), tag);
             }
-            case 'S', 'D', 'N', 'W', 'B' -> {
+            // Busy is always bare (ADR-0019): it's an unsolicited
+            // pre-auth response, never an answer to a tagged request.
+            case 'B' -> {
                 readByte(); // the trailing '\n'
-                return new Response(marker, null);
+                return new Response(marker, null, -1);
+            }
+            case 'S', 'D', 'N', 'W' -> {
+                if (!tagged) {
+                    readByte(); // the trailing '\n'
+                    return new Response(marker, null, -1);
+                }
+                return new Response(marker, null, parseTag(readLine()));
             }
             default -> throw new NanocachedException.ConnectionFailed(
                     "nanocached: unexpected response from server: " + (char) marker, null);
+        }
+    }
+
+    /** Parses a tag field (ADR-0019) as unsigned decimal text, matching
+     * the wire's u32 width — see {@link #claimTag}/{@link #tagSuffix}. A
+     * non-numeric or out-of-range field is protocol garbage: the
+     * connection is desynced and must be poisoned, connection-classified
+     * so the redial/retry layer handles it. */
+    private static int parseTag(String field) {
+        try {
+            return Integer.parseUnsignedInt(field);
+        } catch (NumberFormatException malformed) {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: invalid response tag", null);
         }
     }
 

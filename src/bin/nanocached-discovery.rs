@@ -689,7 +689,15 @@ Usage: nanocached-discovery [options]
 
 #[derive(Debug, PartialEq, Eq)]
 enum DiscoveryCommand {
-    Auth(Bytes),
+    /// `tagging` (ADR-0019): the client sent `A <len> T\n`, asking for
+    /// echoed response tags. Discovery never tags anything (its post-auth
+    /// traffic is the one-shot `L`), but must accept and echo the flag,
+    /// because a client doesn't know which kind of server it dialed until
+    /// `A`'s reply.
+    Auth {
+        secret: Bytes,
+        tagging: bool,
+    },
     /// A refresh from an already-`Joined` node, identified by its name
     /// (ADR-0009) — its address was already established by `Join` on this
     /// same connection. `replication` (issue #30) is the replication
@@ -758,6 +766,13 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
         b"A" => {
             let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
+            // ADR-0019: an optional literal `T` requests tagged mode.
+            let tagging = match parts.next() {
+                None => false,
+                Some(b"T") => true,
+                Some(_) => return Err(ParseError::InvalidCommand),
+            };
+
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
@@ -780,7 +795,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let frame = input.split_to(secret_end).freeze();
             let secret = frame.slice(secret_start..secret_end);
 
-            Ok(DiscoveryCommand::Auth(secret))
+            Ok(DiscoveryCommand::Auth { secret, tagging })
         }
 
         b"L" => {
@@ -2086,19 +2101,28 @@ async fn handle_connection(
 
     loop {
         match parse(&mut received) {
-            Ok(DiscoveryCommand::Auth(secret)) => {
+            Ok(DiscoveryCommand::Auth { secret, tagging }) => {
                 let accepted = match &config.auth_secret {
                     Some(expected) => constant_time_eq(&secret, expected),
                     None => true,
                 };
 
+                // ADR-0019: echo the tag capability only to a client that
+                // asked — a plain `A` keeps the exact three-byte reply
+                // older SDKs hard-read.
+                let (ok, err): (&[u8], &[u8]) = if tagging {
+                    (b"OdT\n", b"EdT\n")
+                } else {
+                    (b"Od\n", b"Ed\n")
+                };
+
                 if accepted {
                     authenticated = true;
-                    stream.write_all(b"Od\n").await?;
+                    stream.write_all(ok).await?;
                     continue;
                 }
 
-                stream.write_all(b"Ed\n").await?;
+                stream.write_all(err).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "invalid auth secret",
@@ -2669,7 +2693,10 @@ mod tests {
         let mut input = BytesMut::from(&b"A 6\nsecretL\n"[..]);
         assert_eq!(
             parse(&mut input),
-            Ok(DiscoveryCommand::Auth(Bytes::from_static(b"secret")))
+            Ok(DiscoveryCommand::Auth {
+                secret: Bytes::from_static(b"secret"),
+                tagging: false,
+            })
         );
         assert_eq!(&input[..], b"L\n");
     }
@@ -4196,6 +4223,44 @@ mod tests {
         client.shutdown().await.unwrap();
 
         let expected = b"Od\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_echoes_the_tag_capability_in_the_auth_reply() {
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        // ADR-0019: discovery never tags anything, but a client doesn't
+        // know which kind of server it dialed until `A`'s reply — so the
+        // capability must still be accepted and echoed here.
+        client.write_all(b"A 8 T\nanything").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"OdT\n";
         let mut response = vec![0_u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);

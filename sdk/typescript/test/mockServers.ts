@@ -17,6 +17,14 @@ export interface MockNode extends MockServerBase {
   store: Map<string, Buffer>;
   /** Queue a one-off `W` reply for the next G/S/D request. */
   answerWrongNodeOnce(): void;
+  /** Queue a one-off reply for the next G request on a tagged connection
+   * that echoes the WRONG tag (the request's tag + 1) — the desync a
+   * pre-ADR-0019 stream misalignment would produce. */
+  answerWrongTagOnce(): void;
+  /** Swallow the next G request entirely (no reply) — the off-by-one
+   * stream desync where every later response answers the previous
+   * request. */
+  swallowGetOnce(): void;
   /** Queue a one-off garbage `V` header for the next G request. */
   answerMalformedValueOnce(): void;
   /** Queue a one-off `V` reply for the next G request whose header is
@@ -108,9 +116,22 @@ function trackAndClose(server: Server): { sockets: Set<Socket>; close: () => Pro
   };
 }
 
-export async function startMockNode(options: { requiredSecret?: string } = {}): Promise<MockNode> {
+export async function startMockNode(
+  options: {
+    requiredSecret?: string;
+    /** Speak ADR-0019: acknowledge `A ... T` with `OnT\n` and echo tags
+     * on that connection's replies. Off by default so the bulk of the
+     * suite keeps exercising the legacy untagged path. */
+    supportTags?: boolean;
+    /** Behave like a pre-ADR-0019 server: an extended `A ... T` is a
+     * parse error — close the connection without replying. */
+    closeOnExtendedAuth?: boolean;
+  } = {},
+): Promise<MockNode> {
   const store = new Map<string, Buffer>();
   let wrongNodeReplies = 0;
+  let wrongTagReplies = 0;
+  let swallowedGets = 0;
   let malformedValueReplies = 0;
   let unterminatedValueReplies = 0;
   let unterminatedBytesSent = 0;
@@ -123,6 +144,9 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
   const server = createServer((socket) => {
     connections++;
     let buffer = Buffer.alloc(0);
+    // ADR-0019: set when this connection's `A ... T` was acknowledged —
+    // its requests then carry a trailing tag the replies must echo.
+    let tagged = false;
 
     socket.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
@@ -133,9 +157,17 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
 
         const parts = buffer.subarray(0, lf).toString("ascii").split(" ");
         const bodyStart = lf + 1;
+        // On a tagged connection every request's last header field is its
+        // tag, echoed back as each reply's own last field.
+        const tag = tagged ? ` ${parts[parts.length - 1]}` : "";
 
         switch (parts[0]) {
           case "A": {
+            if (parts.length > 2 && options.closeOnExtendedAuth) {
+              socket.destroy();
+              return;
+            }
+
             const secretLength = Number(parts[1]);
             if (buffer.length < bodyStart + secretLength) return;
             const secret = buffer.subarray(bodyStart, bodyStart + secretLength);
@@ -145,7 +177,8 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
               options.requiredSecret === undefined
                 ? secret.length > 0
                 : secret.equals(Buffer.from(options.requiredSecret, "utf8"));
-            socket.write(accepted ? "On\n" : "En\n");
+            tagged = accepted && options.supportTags === true && parts[2] === "T";
+            socket.write(accepted ? (tagged ? "OnT\n" : "On\n") : "En\n");
             if (!accepted) socket.end();
             break;
           }
@@ -156,6 +189,17 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + keyLength);
             gets++;
+
+            if (swallowedGets > 0) {
+              swallowedGets--;
+              break;
+            }
+
+            if (wrongTagReplies > 0 && tagged) {
+              wrongTagReplies--;
+              socket.write(`N ${Number(parts[2]) + 1}\n`);
+              break;
+            }
 
             if (malformedValueReplies > 0) {
               malformedValueReplies--;
@@ -186,21 +230,21 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
 
             if (storedToGetReplies > 0) {
               storedToGetReplies--;
-              socket.write("S\n");
+              socket.write(`S${tag}\n`);
               break;
             }
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
-              socket.write("W\n");
+              socket.write(`W${tag}\n`);
               break;
             }
 
             const value = store.get(key);
             if (value === undefined) {
-              socket.write("N\n");
+              socket.write(`N${tag}\n`);
             } else {
-              socket.write(Buffer.concat([Buffer.from(`V ${value.length}\n`), value]));
+              socket.write(Buffer.concat([Buffer.from(`V ${value.length}${tag}\n`), value]));
             }
             break;
           }
@@ -212,21 +256,24 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             const value = Buffer.from(buffer.subarray(bodyStart + keyLength, bodyStart + keyLength + valueLength));
             buffer = buffer.subarray(bodyStart + keyLength + valueLength);
-            // parts[3], when present, is the TTL (omitted on the wire
-            // means "no expiry", i.e. 0 — see encodeSet's doc comment).
-            lastSetTtl = parts.length > 3 ? Number(parts[3]) : 0;
+            // The TTL, when present, is the field after the two lengths
+            // (omitted on the wire means "no expiry", i.e. 0 — see
+            // encodeSet's doc comment); on a tagged connection the tag
+            // sits after it as the last field.
+            const ttlFieldCount = parts.length - (tagged ? 4 : 3);
+            lastSetTtl = ttlFieldCount > 0 ? Number(parts[3]) : 0;
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
-              socket.write("W\n");
+              socket.write(`W${tag}\n`);
               break;
             }
 
             store.set(key, value);
             if (setDelayMs > 0) {
-              setTimeout(() => socket.write("S\n"), setDelayMs);
+              setTimeout(() => socket.write(`S${tag}\n`), setDelayMs);
             } else {
-              socket.write("S\n");
+              socket.write(`S${tag}\n`);
             }
             break;
           }
@@ -239,11 +286,11 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
-              socket.write("W\n");
+              socket.write(`W${tag}\n`);
               break;
             }
 
-            socket.write(store.delete(key) ? "D\n" : "N\n");
+            socket.write(store.delete(key) ? `D${tag}\n` : `N${tag}\n`);
             break;
           }
 
@@ -264,6 +311,12 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
     store,
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
+    },
+    answerWrongTagOnce: () => {
+      wrongTagReplies++;
+    },
+    swallowGetOnce: () => {
+      swallowedGets++;
     },
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
@@ -319,7 +372,9 @@ export async function startMockDiscovery(
             const secretLength = Number(parts[1]);
             if (buffer.length < bodyStart + secretLength) return;
             buffer = buffer.subarray(bodyStart + secretLength);
-            socket.write("Od\n");
+            // ADR-0019: echo the tag capability — clients send the
+            // extended A before knowing which kind of server answered.
+            socket.write(parts[2] === "T" ? "OdT\n" : "Od\n");
             break;
           }
 

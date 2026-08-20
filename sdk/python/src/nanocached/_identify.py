@@ -53,12 +53,26 @@ class DiscoveredNode:
 class NodeTarget:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
+    # ADR-0019: whether the node accepted the extended `A ... T` — when
+    # true, this connection's `G`/`S`/`D` traffic must carry tags and its
+    # responses echo them; false means an older node answered the plain-`A`
+    # fallback.
+    tagged: bool = False
 
 
 @dataclass
 class ClusterTarget:
     nodes: list[DiscoveredNode]
     replication: int
+
+
+class _LegacyServerSignal(Exception):
+    """Internal-only: raised when the extended `A ... T` auth attempt hit a
+    connection-closed-shaped failure while reading the identify response —
+    the signal a pre-ADR-0019 server gives by treating the extended form as
+    a parse error and closing without replying. Caught by
+    connect_and_identify to trigger the transparent untagged fallback
+    (doc/adr/0019-*.md); never escapes this module."""
 
 
 def split_host_port(address: str) -> tuple[str, int]:
@@ -75,8 +89,25 @@ async def connect_and_identify(
     ssl_context: ssl_module.SSLContext | None,
 ) -> NodeTarget | ClusterTarget:
     try:
+        return await _connect_and_identify_with_deadline(host, port, auth_secret, ssl_context, request_tags=True)
+    except _LegacyServerSignal:
+        # ADR-0019 transparent fallback: a pre-0019 server treats the
+        # extended `A ... T` as a parse error and closes without replying
+        # — redial once with the plain form and run the connection
+        # untagged (the pre-0019 behavior, desync window included).
+        return await _connect_and_identify_with_deadline(host, port, auth_secret, ssl_context, request_tags=False)
+
+
+async def _connect_and_identify_with_deadline(
+    host: str,
+    port: int,
+    auth_secret: bytes | None,
+    ssl_context: ssl_module.SSLContext | None,
+    request_tags: bool,
+) -> NodeTarget | ClusterTarget:
+    try:
         return await asyncio.wait_for(
-            _connect_and_identify(host, port, auth_secret, ssl_context), CONNECT_DEADLINE
+            _connect_and_identify(host, port, auth_secret, ssl_context, request_tags), CONNECT_DEADLINE
         )
     except TimeoutError as error:
         raise ConnectionError(
@@ -89,17 +120,47 @@ async def _connect_and_identify(
     port: int,
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
+    request_tags: bool,
 ) -> NodeTarget | ClusterTarget:
     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
 
     try:
         secret = auth_secret if auth_secret is not None else _NO_SECRET_PLACEHOLDER
-        writer.write(b"A %d\n%b" % (len(secret), secret))
+        tag_field = b" T" if request_tags else b""
+        writer.write(b"A %d%b\n%b" % (len(secret), tag_field, secret))
         await writer.drain()
 
-        ack = await reader.readexactly(3)
-        if ack[2:3] != b"\n" or ack[0:1] not in (b"O", b"E") or ack[1:2] not in (b"n", b"d"):
-            raise NanocachedError("nanocached: unexpected response to A")
+        # ADR-0019: read 3 bytes first. `byte[2] == '\n'` is the
+        # traditional fixed-width ack (`On\n`/`En\n`/`Od\n`/`Ed\n`),
+        # tagging disabled. `byte[2] == 'T'` means one more byte follows,
+        # which must be `\n` (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`), tagging
+        # enabled. Anything else is a protocol error, same as before this
+        # field existed.
+        try:
+            ack = await reader.readexactly(3)
+            if ack[0:1] not in (b"O", b"E") or ack[1:2] not in (b"n", b"d"):
+                raise NanocachedError("nanocached: unexpected response to A")
+
+            if ack[2:3] == b"\n":
+                tagged = False
+            elif ack[2:3] == b"T":
+                fourth = await reader.readexactly(1)
+                if fourth != b"\n":
+                    raise NanocachedError("nanocached: unexpected response to A")
+                tagged = True
+            else:
+                raise NanocachedError("nanocached: unexpected response to A")
+        except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError) as error:
+            # Only a request_tags=True attempt can fall back further — the
+            # transparent fallback itself must fail like any other
+            # connection error. A timeout is not this: the server kept the
+            # connection open, it just didn't answer (handled by the
+            # asyncio.wait_for wrapper instead), and a malformed-but-present
+            # reply is not this either — both are real protocol errors, not
+            # a legacy server's silent door-slam.
+            if request_tags:
+                raise _LegacyServerSignal() from error
+            raise
 
         if ack[0:1] == b"E":
             if auth_secret is None:
@@ -109,7 +170,7 @@ async def _connect_and_identify(
             raise NanocachedError("nanocached: authentication failed")
 
         if ack[1:2] == b"n":
-            return NodeTarget(reader=reader, writer=writer)
+            return NodeTarget(reader=reader, writer=writer, tagged=tagged)
 
         # A discovery server: one-shot `L`, then this connection is done.
         writer.write(b"L\n")

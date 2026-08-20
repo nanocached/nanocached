@@ -126,3 +126,46 @@ describe("tryParseResponse", () => {
     assert.throws(() => tryParseResponse(Buffer.from("Z\n")), /unexpected response/);
   });
 });
+
+describe("tagged frames (doc/adr/0019-*.md)", () => {
+  it("appends the tag as the last request header field", () => {
+    assert.deepEqual(encodeGet(Buffer.from("key"), 7), Buffer.from("G 3 7\nkey"));
+    assert.deepEqual(encodeDelete(Buffer.from("key"), 8), Buffer.from("D 3 8\nkey"));
+    assert.deepEqual(encodeSet(Buffer.from("k"), Buffer.from("v"), 0, 9), Buffer.from("S 1 1 9\nkv"));
+    assert.deepEqual(encodeSet(Buffer.from("k"), Buffer.from("v"), 60, 9), Buffer.from("S 1 1 60 9\nkv"));
+  });
+
+  it("parses tagged status responses", () => {
+    assert.deepEqual(tryParseResponse(Buffer.from("S 7\n"), true), {
+      response: { kind: "stored", tag: 7 },
+      consumed: 4,
+    });
+    assert.deepEqual(tryParseResponse(Buffer.from("N 4294967295\n"), true), {
+      response: { kind: "notFound", tag: 4294967295 },
+      consumed: 13,
+    });
+  });
+
+  it("parses a tagged value response", () => {
+    assert.deepEqual(tryParseResponse(Buffer.from("V 5 9\nAlice"), true), {
+      response: { kind: "value", value: Buffer.from("Alice"), tag: 9 },
+      consumed: 11,
+    });
+  });
+
+  it("waits for the rest of a tagged status frame", () => {
+    assert.equal(tryParseResponse(Buffer.from("S 12"), true), null);
+  });
+
+  it("throws when a tagged response is missing its tag", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("S\n"), true), /missing its tag/);
+    assert.throws(() => tryParseResponse(Buffer.from("V 5\nAlice"), true), /invalid value header/);
+  });
+
+  it("keeps the unsolicited busy response bare in tagged mode", () => {
+    assert.deepEqual(tryParseResponse(Buffer.from("B\n"), true), {
+      response: { kind: "busy" },
+      consumed: 2,
+    });
+  });
+});

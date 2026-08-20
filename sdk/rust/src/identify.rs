@@ -181,7 +181,14 @@ fn build_tls_config(ca: Option<&std::path::Path>) -> Result<TlsConfig> {
 }
 
 pub(crate) enum Identified {
-    Node(Stream),
+    Node {
+        stream: Stream,
+        /// ADR-0019: the node accepted the extended `A ... T`, so this
+        /// socket's `G`/`S`/`D` traffic must carry tags and its responses
+        /// echo them; `false` means an older node answered the plain-`A`
+        /// fallback (see `connect_and_identify`).
+        tagged: bool,
+    },
     Cluster {
         nodes: Vec<DiscoveredNode>,
         replication: usize,
@@ -201,16 +208,79 @@ pub(crate) async fn connect_and_identify(
     tls: Option<&TlsConfig>,
     deadline: std::time::Duration,
 ) -> Result<Identified> {
+    match run_identify_attempt(host, port, auth_secret, tls, deadline, true).await {
+        Ok(identified) => Ok(identified),
+        Err(AuthFailure::LegacyServer) => {
+            // ADR-0019 transparent fallback: a pre-0019 server treats the
+            // extended `A ... T` as a parse error and closes without
+            // replying — redial once with the plain form and run the
+            // connection untagged (the pre-0019 behavior, desync window
+            // included).
+            run_identify_attempt(host, port, auth_secret, tls, deadline, false)
+                .await
+                .map_err(AuthFailure::into_error)
+        }
+        Err(failure) => Err(failure.into_error()),
+    }
+}
+
+async fn run_identify_attempt(
+    host: &str,
+    port: u16,
+    auth_secret: Option<&[u8]>,
+    tls: Option<&TlsConfig>,
+    deadline: std::time::Duration,
+    request_tags: bool,
+) -> std::result::Result<Identified, AuthFailure> {
     match tokio::time::timeout(
         deadline,
-        do_connect_and_identify(host, port, auth_secret, tls),
+        do_connect_and_identify(host, port, auth_secret, tls, request_tags),
     )
     .await
     {
         Ok(result) => result,
-        Err(_) => Err(Error::ConnectionLost(format!(
+        Err(_) => Err(AuthFailure::Other(Error::ConnectionLost(format!(
             "nanocached: connecting to {host}:{port} timed out after {deadline:?}"
-        ))),
+        )))),
+    }
+}
+
+/// Distinguishes a pre-0019 server slamming the door on the extended `A`
+/// (connection closed/reset/broken before any reply) from every other
+/// identify failure — only the former is worth retrying with the plain
+/// form; a timeout is not one, since the server kept the connection open,
+/// it just didn't answer (mirrors the TypeScript SDK's
+/// `isLegacyServerSignal`).
+enum AuthFailure {
+    LegacyServer,
+    Other(Error),
+}
+
+impl AuthFailure {
+    fn into_error(self) -> Error {
+        match self {
+            AuthFailure::LegacyServer => Error::ConnectionLost(
+                "nanocached: connection closed before the expected response arrived".to_string(),
+            ),
+            AuthFailure::Other(error) => error,
+        }
+    }
+}
+
+/// Classifies an I/O error from writing/reading the `A` exchange: a clean
+/// EOF, reset, or broken pipe before any reply is the legacy-server
+/// signature above; anything else (DNS, refused, etc.) is just an
+/// ordinary connect-time failure.
+fn classify_auth_io_error(error: std::io::Error) -> AuthFailure {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+    ) {
+        AuthFailure::LegacyServer
+    } else {
+        AuthFailure::Other(error.into())
     }
 }
 
@@ -219,39 +289,93 @@ async fn do_connect_and_identify(
     port: u16,
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
-) -> Result<Identified> {
-    let stream = open(host, port, tls).await?;
+    request_tags: bool,
+) -> std::result::Result<Identified, AuthFailure> {
+    let stream = open(host, port, tls).await.map_err(AuthFailure::Other)?;
     let mut stream = BufReader::new(stream);
 
     let secret = auth_secret.unwrap_or(NO_SECRET_PLACEHOLDER);
-    let mut auth = format!("A {}\n", secret.len()).into_bytes();
+    // ADR-0019: always send the extended form — a `T` after the secret
+    // length asks the server to echo tags on this connection's G/S/D
+    // traffic. A pre-0019 server can't parse this and slams the door
+    // (see `classify_auth_io_error`/`connect_and_identify`'s fallback).
+    let mut auth = format!(
+        "A {}{}\n",
+        secret.len(),
+        if request_tags { " T" } else { "" }
+    )
+    .into_bytes();
     auth.extend_from_slice(secret);
-    stream.get_mut().write_all(&auth).await?;
+    stream
+        .get_mut()
+        .write_all(&auth)
+        .await
+        .map_err(classify_auth_io_error)?;
 
+    // Read the fixed 3-byte ack first: `On\n`/`En\n`/`Od\n`/`Ed\n` — the
+    // pre-0019 shape. A `T` as the third byte instead of `\n` means the
+    // server understood the extended `A` and is about to echo tags on
+    // this connection; read one more byte to confirm its `\n` terminator
+    // (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`).
     let mut ack = [0u8; 3];
-    stream.read_exact(&mut ack).await?;
-    if ack[2] != b'\n' || !matches!(ack[0], b'O' | b'E') || !matches!(ack[1], b'n' | b'd') {
-        return Err(Error::Protocol(
+    stream
+        .read_exact(&mut ack)
+        .await
+        .map_err(classify_auth_io_error)?;
+
+    let tagged = if ack[2] == b'\n' {
+        false
+    } else if ack[2] == b'T' {
+        let mut terminator = [0u8; 1];
+        stream
+            .read_exact(&mut terminator)
+            .await
+            .map_err(classify_auth_io_error)?;
+        if terminator[0] != b'\n' {
+            return Err(AuthFailure::Other(Error::Protocol(
+                "nanocached: unexpected response to A".to_string(),
+            )));
+        }
+        true
+    } else {
+        return Err(AuthFailure::Other(Error::Protocol(
             "nanocached: unexpected response to A".to_string(),
-        ));
+        )));
+    };
+
+    if !matches!(ack[0], b'O' | b'E') || !matches!(ack[1], b'n' | b'd') {
+        return Err(AuthFailure::Other(Error::Protocol(
+            "nanocached: unexpected response to A".to_string(),
+        )));
     }
     if ack[0] == b'E' {
-        return Err(if auth_secret.is_none() {
+        return Err(AuthFailure::Other(if auth_secret.is_none() {
             Error::Protocol(format!(
                 "nanocached: {host}:{port} requires authentication, but no auth_secret was given"
             ))
         } else {
             Error::Protocol("nanocached: authentication failed".to_string())
-        });
+        }));
     }
 
     if ack[1] == b'n' {
-        return Ok(Identified::Node(stream.into_inner()));
+        return Ok(Identified::Node {
+            stream: stream.into_inner(),
+            tagged,
+        });
     }
 
     // A discovery server: one-shot `L`, then this connection is done.
-    stream.get_mut().write_all(b"L\n").await?;
-    read_node_list(&mut stream).await
+    // Tags have no meaning on a discovery connection (a single `L` and
+    // done), but the extended ack still had to be parsed above.
+    stream
+        .get_mut()
+        .write_all(b"L\n")
+        .await
+        .map_err(|error| AuthFailure::Other(error.into()))?;
+    read_node_list(&mut stream)
+        .await
+        .map_err(AuthFailure::Other)
 }
 
 async fn open(host: &str, port: u16, tls: Option<&TlsConfig>) -> Result<Stream> {

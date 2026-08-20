@@ -3,10 +3,13 @@ package nanocached
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -29,6 +32,11 @@ type identified struct {
 	conn        net.Conn
 	nodes       []DiscoveredNode
 	replication int
+	// tagged (doc/adr/0019-*.md): the node accepted the extended `A ... T`,
+	// so this connection's G/S/D traffic must carry tags and its
+	// responses echo them; false means an older node answered the plain-`A`
+	// fallback. Meaningless on a cluster result.
+	tagged bool
 }
 
 // connectAndIdentify dials host:port, authenticates, and figures out from
@@ -50,10 +58,27 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 	}
 
 	_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
-	result, err := identify(conn, address, authSecret)
+	result, err := identify(conn, address, authSecret, true)
 	if err != nil {
 		_ = conn.Close()
-		return nil, err
+		if !isLegacyServerSignal(err) {
+			return nil, err
+		}
+		// doc/adr/0019-*.md transparent fallback: a pre-0019 server rejects
+		// the extended `A ... T` as a parse error and closes without
+		// replying — redial once with the plain form and run the
+		// connection untagged (the pre-0019 behavior, desync window
+		// included).
+		conn, err = open(address, tlsConfig)
+		if err != nil {
+			return nil, connectionLost("could not connect to "+address, err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
+		result, err = identify(conn, address, authSecret, false)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 	}
 	if result.conn != nil {
 		// The deadline only bounds the handshake; a live node connection
@@ -61,6 +86,18 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 		_ = result.conn.SetDeadline(time.Time{})
 	}
 	return result, nil
+}
+
+// isLegacyServerSignal reports whether err looks like a pre-doc/adr/0019-*.md
+// server slamming the door on the extended `A ... T` — closing, EOF, or
+// resetting the connection before any reply — the only failure worth
+// retrying with the plain form. A timeout is not one: the server kept the
+// connection open, it just didn't answer. identify only ever returns a raw
+// (unwrapped) error of this shape from the tagged handshake's write/read
+// step, so checking it here can't misclassify an unrelated connectionLost-
+// wrapped failure (e.g. a later L/node-list read) as a legacy signal.
+func isLegacyServerSignal(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 func open(address string, tlsConfig *tls.Config) (net.Conn, error) {
@@ -87,27 +124,65 @@ func open(address string, tlsConfig *tls.Config) (net.Conn, error) {
 	return tls.DialWithDialer(&dialer, "tcp", address, config)
 }
 
-func identify(conn net.Conn, address string, authSecret []byte) (*identified, error) {
+// identify runs the `A` handshake on conn. requestTags (doc/adr/0019-*.md)
+// says whether to send the extended form (`A <len> T\n<secret>`), asking
+// the server to echo tags on this connection's G/S/D traffic; the client
+// always tries this first (connectAndIdentify falls back to the plain form
+// on the legacy-server signal below). A write or read failure on the ack
+// itself is returned raw (not connectionLost-wrapped) when requestTags is
+// true, so the caller can tell a pre-0019 server's closed/EOF/reset door
+// apart from an ordinary connection failure and retry untagged.
+func identify(conn net.Conn, address string, authSecret []byte, requestTags bool) (*identified, error) {
 	secret := authSecret
 	if secret == nil {
 		secret = noSecretPlaceholder
 	}
-	frame := append([]byte(fmt.Sprintf("A %d\n", len(secret))), secret...)
+	tagSuffix := ""
+	if requestTags {
+		tagSuffix = " T"
+	}
+	frame := append([]byte(fmt.Sprintf("A %d%s\n", len(secret), tagSuffix)), secret...)
 	if _, err := conn.Write(frame); err != nil {
+		if requestTags && isLegacyServerSignal(err) {
+			return nil, err
+		}
 		return nil, connectionLost("handshake write failed", err)
 	}
 
 	reader := bufio.NewReader(conn)
 	ack := make([]byte, 3)
 	if _, err := readFull(reader, ack); err != nil {
+		if requestTags && isLegacyServerSignal(err) {
+			return nil, err
+		}
 		return nil, connectionLost("handshake read failed", err)
 	}
-	shaped := ack[2] == '\n' &&
-		(ack[0] == 'O' || ack[0] == 'E') &&
-		(ack[1] == 'n' || ack[1] == 'd')
-	if !shaped {
+	shapedPrefix := (ack[0] == 'O' || ack[0] == 'E') && (ack[1] == 'n' || ack[1] == 'd')
+	if !shapedPrefix {
 		return nil, fmt.Errorf("nanocached: unexpected response to A")
 	}
+
+	// doc/adr/0019-*.md stretches the reply to four bytes by a `T` before
+	// the LF when the server is echoing the tag capability our extended
+	// `A` asked for (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`); a bare `\n` in that
+	// third position is the traditional, untagged reply.
+	var tagged bool
+	switch ack[2] {
+	case '\n':
+		tagged = false
+	case 'T':
+		fourth := make([]byte, 1)
+		if _, err := readFull(reader, fourth); err != nil {
+			return nil, connectionLost("handshake read failed", err)
+		}
+		if fourth[0] != '\n' {
+			return nil, fmt.Errorf("nanocached: unexpected response to A")
+		}
+		tagged = true
+	default:
+		return nil, fmt.Errorf("nanocached: unexpected response to A")
+	}
+
 	if ack[0] == 'E' {
 		if authSecret == nil {
 			return nil, fmt.Errorf(
@@ -119,10 +194,12 @@ func identify(conn net.Conn, address string, authSecret []byte) (*identified, er
 	if ack[1] == 'n' {
 		// Hand the live node connection over, buffered reader included:
 		// the buffer may already hold bytes that must not be lost.
-		return &identified{conn: &bufferedConn{Conn: conn, reader: reader}}, nil
+		return &identified{conn: &bufferedConn{Conn: conn, reader: reader}, tagged: tagged}, nil
 	}
 
-	// A discovery server: one-shot L, then this connection is done.
+	// A discovery server: one-shot L, then this connection is done. Tags
+	// have no meaning here (discovery is a single L per connection), but
+	// the reply above still had to be parsed either way.
 	if _, err := conn.Write([]byte("L\n")); err != nil {
 		return nil, connectionLost("L write failed", err)
 	}

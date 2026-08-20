@@ -254,7 +254,7 @@ class NanocachedClient:
                         f"routing and failover."
                     )
                 client._target_key = key
-                client._single = client._new_connection(identified.reader, identified.writer)
+                client._single = client._new_connection(identified.reader, identified.writer, identified.tagged)
                 client._single_address = key
                 client._start_keepalive()
                 return client
@@ -278,16 +278,20 @@ class NanocachedClient:
             "nanocached: could not connect to any address"
         )
 
-    def _new_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Connection:
+    def _new_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tagged: bool
+    ) -> Connection:
         """Wraps a freshly identified node socket, incrementing this
         client's target key in _open_targets (the forgotten-close warning
         above) and decrementing it again via on_close whenever the
         connection eventually closes — whether via close(), redial
-        replacement, or refresh reconciliation."""
+        replacement, or refresh reconciliation. ``tagged`` is the identify
+        exchange's own ADR-0019 negotiation result, threaded straight
+        through to Connection."""
         assert self._target_key is not None
         key = self._target_key
         _increment_open_target(key)
-        return Connection(reader, writer, on_close=lambda: _decrement_open_target(key))
+        return Connection(reader, writer, on_close=lambda: _decrement_open_target(key), tagged=tagged)
 
     async def _open_cluster(self, identified: ClusterTarget) -> None:
         for node in identified.nodes:
@@ -297,7 +301,9 @@ class NanocachedClient:
                 raise NanocachedError(
                     f"nanocached: discovery server returned a non-node address: {node.address}"
                 )
-            self._members[node.name] = _Member(node.address, self._new_connection(target.reader, target.writer))
+            self._members[node.name] = _Member(
+                node.address, self._new_connection(target.reader, target.writer, target.tagged)
+            )
 
         self._ring = HashRing([node.name for node in identified.nodes])
         self._replication = identified.replication
@@ -630,7 +636,7 @@ class NanocachedClient:
         if self._closed:
             identified.writer.close()
             raise AlreadyClosedError()
-        return self._new_connection(identified.reader, identified.writer)
+        return self._new_connection(identified.reader, identified.writer, identified.tagged)
 
     # ── ノードリスト更新 ────────────────────────────────────────────
 
@@ -677,7 +683,9 @@ class NanocachedClient:
                     # installing this socket now would leak it.
                     target.writer.close()
                     return
-                self._members[node.name] = _Member(node.address, self._new_connection(target.reader, target.writer))
+                self._members[node.name] = _Member(
+                    node.address, self._new_connection(target.reader, target.writer, target.tagged)
+                )
             except _SWALLOWABLE_ERRORS:
                 # Same rationale as above: never fail the caller over a
                 # refresh-time connect failure. A genuine programming

@@ -92,6 +92,44 @@ impl Response {
             }
         }
     }
+
+    /// ADR-0019: tagged-mode encoding — echoes the request's tag as the
+    /// response's last header field, so the client's read loop can verify
+    /// request/response alignment before dispatching to a caller. Only
+    /// responses to `G`/`S`/`D` (the pipelined commands) have a tagged
+    /// form; everything else stays on `encode`.
+    pub fn encode_with_tag(&self, tag: u32) -> Vec<u8> {
+        match self {
+            Self::Stored => format!("S {tag}\n").into_bytes(),
+            Self::Deleted => format!("D {tag}\n").into_bytes(),
+            Self::NotFound => format!("N {tag}\n").into_bytes(),
+            Self::WrongNode => format!("W {tag}\n").into_bytes(),
+
+            Self::Value(value) => {
+                let header = format!("V {} {tag}\n", value.len());
+
+                let mut encoded = Vec::with_capacity(header.len() + value.len());
+                encoded.extend_from_slice(header.as_bytes());
+                encoded.extend_from_slice(value);
+
+                encoded
+            }
+
+            _ => unreachable!("only G/S/D responses have a tagged form (ADR-0019)"),
+        }
+    }
+
+    /// ADR-0019: identity reply to an extended `A <len> T` — echoes the
+    /// tag capability as a `T` between the server-type byte and the LF
+    /// (`OnT\n`/`EnT\n`), sent only to clients that asked, so a plain `A`
+    /// keeps the exact three-byte reply older SDKs hard-read.
+    pub fn encode_identity_tagged(&self) -> Vec<u8> {
+        match self {
+            Self::AuthOk => b"OnT\n".to_vec(),
+            Self::Unauthorized => b"EnT\n".to_vec(),
+            _ => unreachable!("only identity replies have a tag-capability form (ADR-0019)"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +194,29 @@ mod tests {
         let response = Response::Value(Bytes::from(vec![0xff, 0x00, b'\r', b'\n']));
 
         assert_eq!(response.encode(), b"V 4\n\xff\x00\r\n",);
+    }
+
+    #[test]
+    fn encodes_tagged_fixed_responses_with_the_echoed_tag() {
+        assert_eq!(Response::Stored.encode_with_tag(7), b"S 7\n");
+        assert_eq!(Response::Deleted.encode_with_tag(0), b"D 0\n");
+        assert_eq!(Response::NotFound.encode_with_tag(42), b"N 42\n");
+        assert_eq!(
+            Response::WrongNode.encode_with_tag(u32::MAX),
+            b"W 4294967295\n"
+        );
+    }
+
+    #[test]
+    fn encodes_tagged_value_response_with_the_tag_after_the_length() {
+        let response = Response::Value(Bytes::from_static(b"Alice"));
+
+        assert_eq!(response.encode_with_tag(9), b"V 5 9\nAlice");
+    }
+
+    #[test]
+    fn encodes_tagged_identity_replies() {
+        assert_eq!(Response::AuthOk.encode_identity_tagged(), b"OnT\n");
+        assert_eq!(Response::Unauthorized.encode_identity_tagged(), b"EnT\n");
     }
 }

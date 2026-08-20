@@ -340,7 +340,7 @@ public final class NanocachedClient implements AutoCloseable {
                                 + " will not be used. Point addresses at discovery servers for cluster"
                                 + " routing and failover.");
                     }
-                    client.single = client.newTrackedConnection(node.socket());
+                    client.single = client.newTrackedConnection(node.socket(), node.tagged());
                     client.singleAddress = key;
                     client.startKeepAlive();
                     return client;
@@ -841,7 +841,7 @@ public final class NanocachedClient implements AutoCloseable {
             }
             throw new NanocachedException.AlreadyClosed();
         }
-        return newTrackedConnection(node.socket());
+        return newTrackedConnection(node.socket(), node.tagged());
     }
 
     /** Wraps {@code socket} in a {@link Connection}, incrementing this
@@ -859,10 +859,10 @@ public final class NanocachedClient implements AutoCloseable {
      * built. On that failure, undo the tracking and close the socket
      * (suppressing a close error — the constructor's is the interesting
      * one) before rethrowing. */
-    private Connection newTrackedConnection(Socket socket) throws IOException {
+    private Connection newTrackedConnection(Socket socket, boolean tagged) throws IOException {
         trackOpenTarget(targetKey);
         try {
-            return new Connection(socket, () -> untrackOpenTarget(targetKey));
+            return new Connection(socket, tagged, () -> untrackOpenTarget(targetKey));
         } catch (IOException | RuntimeException error) {
             untrackOpenTarget(targetKey);
             try {

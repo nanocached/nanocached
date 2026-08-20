@@ -27,28 +27,62 @@ final class Identify {
 
     sealed interface Result permits NodeTarget, ClusterTarget {}
 
-    record NodeTarget(Socket socket) implements Result {}
+    // `tagged` (ADR-0019): the node accepted the extended `A ... T`, so
+    // this socket's G/S/D traffic must carry tags and its responses echo
+    // them; false means an older node answered the plain-`A` fallback.
+    record NodeTarget(Socket socket, boolean tagged) implements Result {}
 
     record ClusterTarget(List<DiscoveredNode> nodes, int replication) implements Result {}
 
     private Identify() {}
 
+    /** Thrown only when writing/reading the extended {@code A ... T}
+     * exchange fails in a way that looks like a pre-ADR-0019 server
+     * slamming the connection shut without replying (close/EOF/RST,
+     * never a malformed-but-present reply) — the one case
+     * {@link #connectAndIdentify} retries with the plain form. Never
+     * escapes this class. */
+    private static final class LegacyServerSignal extends IOException {
+        LegacyServerSignal(IOException cause) {
+            super(cause);
+        }
+    }
+
     static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls)
+            throws IOException {
+        try {
+            return identifyOnce(host, port, authSecret, tls, true);
+        } catch (LegacyServerSignal signal) {
+            // ADR-0019 transparent fallback: a pre-0019 server treats the
+            // extended `A ... T` as a parse error and closes/resets
+            // without replying — redial once with the plain form and run
+            // the connection untagged (the pre-0019 behavior).
+            return identifyOnce(host, port, authSecret, tls, false);
+        }
+    }
+
+    private static Result identifyOnce(String host, int port, byte[] authSecret, SSLContext tls, boolean requestTags)
             throws IOException {
         Socket socket = open(host, port, tls);
         try {
             byte[] secret = authSecret != null ? authSecret : NO_SECRET_PLACEHOLDER;
             OutputStream out = socket.getOutputStream();
-            out.write(("A " + secret.length + "\n").getBytes(StandardCharsets.US_ASCII));
-            out.write(secret);
-            out.flush();
 
-            InputStream in = socket.getInputStream();
-            byte[] ack = readExactly(in, 3);
-            if (ack[2] != '\n' || (ack[0] != 'O' && ack[0] != 'E') || (ack[1] != 'n' && ack[1] != 'd')) {
-                throw new NanocachedException("nanocached: unexpected response to A");
+            AuthIdentity identity;
+            try {
+                out.write(("A " + secret.length + (requestTags ? " T" : "") + "\n")
+                        .getBytes(StandardCharsets.US_ASCII));
+                out.write(secret);
+                out.flush();
+                identity = readIdentity(socket.getInputStream());
+            } catch (IOException error) {
+                // Only the extended attempt is worth retrying untagged —
+                // a failure while already running untagged is a real
+                // failure.
+                throw requestTags ? new LegacyServerSignal(error) : error;
             }
-            if (ack[0] == 'E') {
+
+            if (!identity.accepted()) {
                 if (authSecret == null) {
                     throw new NanocachedException("nanocached: " + host + ":" + port
                             + " requires authentication, but no authSecret was given");
@@ -56,14 +90,14 @@ final class Identify {
                 throw new NanocachedException("nanocached: authentication failed");
             }
 
-            if (ack[1] == 'n') {
-                return new NodeTarget(socket);
+            if (identity.kind() == 'n') {
+                return new NodeTarget(socket, identity.tagged());
             }
 
             // A discovery server: one-shot L, then this connection is done.
             out.write("L\n".getBytes(StandardCharsets.US_ASCII));
             out.flush();
-            ClusterTarget cluster = readNodeList(in);
+            ClusterTarget cluster = readNodeList(socket.getInputStream());
             socket.close();
             return cluster;
         } catch (IOException | RuntimeException error) {
@@ -74,6 +108,42 @@ final class Identify {
             }
             throw error;
         }
+    }
+
+    private record AuthIdentity(boolean accepted, char kind, boolean tagged) {}
+
+    /** Parses the reply to `A`: {@code On\n}/{@code En\n} from a cache
+     * node, {@code Od\n}/{@code Ed\n} from a discovery server (see
+     * doc/adr/0007-*.md), each stretched to four bytes by a {@code T}
+     * before the LF when the server is echoing the tag capability our
+     * extended {@code A} asked for (doc/adr/0019-*.md). The second byte
+     * is what identifies which kind of server this is — it isn't an
+     * accident of the auth outcome, it's present whether accepted or
+     * rejected. */
+    private static AuthIdentity readIdentity(InputStream in) throws IOException {
+        byte[] ack = readExactly(in, 3);
+        boolean accepted = ack[0] == 'O';
+        if (!accepted && ack[0] != 'E') {
+            throw new NanocachedException("nanocached: unexpected response to A");
+        }
+        if (ack[1] != 'n' && ack[1] != 'd') {
+            throw new NanocachedException("nanocached: unexpected response to A");
+        }
+
+        boolean tagged;
+        if (ack[2] == '\n') {
+            tagged = false;
+        } else if (ack[2] == 'T') {
+            byte[] rest = readExactly(in, 1);
+            if (rest[0] != '\n') {
+                throw new NanocachedException("nanocached: unexpected response to A");
+            }
+            tagged = true;
+        } else {
+            throw new NanocachedException("nanocached: unexpected response to A");
+        }
+
+        return new AuthIdentity(accepted, (char) ack[1], tagged);
     }
 
     private static final int CONNECT_TIMEOUT_MS = 5_000;

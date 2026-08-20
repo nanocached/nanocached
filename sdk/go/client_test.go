@@ -65,6 +65,7 @@ func captureStderr(t *testing.T, fn func()) string {
 type mockNode struct {
 	listener         net.Listener
 	requiredSecret   []byte
+	opts             mockNodeOpts
 	store            sync.Map // string -> []byte
 	connectionCount  atomic.Int32
 	getCount         atomic.Int32
@@ -72,10 +73,27 @@ type mockNode struct {
 	setWrongNodeLeft atomic.Int32 // like wrongNodeLeft, but only consumed by S (for isolating a repair write's failure from an unrelated G)
 	malformedLeft    atomic.Int32
 	storedToGetLeft  atomic.Int32
+	wrongTagLeft     atomic.Int32 // doc/adr/0019-*.md: echo the wrong tag on the next G on a tagged connection
+	swallowLeft      atomic.Int32 // doc/adr/0019-*.md: swallow the next G entirely (no reply)
 	lastSetTTL       atomic.Value // string: the TTL field of the last S, or "none"
 	setDelay         atomic.Int64 // nanoseconds; sleep this long before every S reply
 	conns            sync.Map     // net.Conn -> struct{}
 	silent           atomic.Bool  // once true, every G/S/D is read but never answered
+}
+
+// mockNodeOpts configures a startMockNode server's doc/adr/0019-*.md
+// (response tags) behavior. Immutable for the server's whole lifetime —
+// set once at construction, like requiredSecret — so acceptLoop's
+// goroutine never races a test goroutine mutating it later.
+type mockNodeOpts struct {
+	// supportTags: acknowledge an extended `A ... T` with `OnT\n` and echo
+	// tags on that connection's G/S/D replies. Off by default so the bulk
+	// of the suite keeps exercising the legacy untagged path.
+	supportTags bool
+	// closeOnExtendedAuth: behave like a pre-doc/adr/0019-*.md server — an
+	// extended `A ... T` is a parse error, so close the connection without
+	// replying.
+	closeOnExtendedAuth bool
 }
 
 // delaySets makes every future S reply from this node wait d first — for
@@ -90,13 +108,27 @@ func (m *mockNode) delaySets(d time.Duration) { m.setDelay.Store(int64(d)) }
 // request-level I/O timeout (issue tracked alongside doc/adr/0016-*.md).
 func (m *mockNode) goSilentAfterHandshake() { m.silent.Store(true) }
 
+// answerWrongTagOnce queues a one-off reply for the next G request on a
+// tagged connection that echoes the wrong tag (the request's tag + 1) —
+// the desync a pre-doc/adr/0019-*.md stream misalignment would produce.
+func (m *mockNode) answerWrongTagOnce() { m.wrongTagLeft.Add(1) }
+
+// swallowGetOnce swallows the next G request entirely (no reply) — the
+// off-by-one stream desync where every later response answers the
+// previous request.
+func (m *mockNode) swallowGetOnce() { m.swallowLeft.Add(1) }
+
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
+	return startMockNodeOpts(t, requiredSecret, mockNodeOpts{})
+}
+
+func startMockNodeOpts(t *testing.T, requiredSecret []byte, opts mockNodeOpts) *mockNode {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	node := &mockNode{listener: listener, requiredSecret: requiredSecret}
+	node := &mockNode{listener: listener, requiredSecret: requiredSecret, opts: opts}
 	go node.acceptLoop()
 	t.Cleanup(node.close)
 	return node
@@ -145,22 +177,38 @@ func (m *mockNode) serve(conn net.Conn) {
 		_ = conn.Close()
 	}()
 	reader := bufio.NewReader(conn)
+	// doc/adr/0019-*.md: set once this connection's `A ... T` is
+	// acknowledged — its requests then carry a trailing tag the replies
+	// must echo.
+	tagged := false
 	for {
 		header, err := reader.ReadString('\n')
 		if err != nil {
 			return
 		}
 		parts := strings.Split(strings.TrimSuffix(header, "\n"), " ")
+		// On a tagged connection every request's last header field is its
+		// tag, echoed back as each reply's own last field.
+		tagSuffix := ""
+		if tagged {
+			tagSuffix = " " + parts[len(parts)-1]
+		}
 		switch parts[0] {
 		case "A":
+			if len(parts) > 2 && m.opts.closeOnExtendedAuth {
+				return
+			}
 			secret := mustRead(reader, atoiOrPanic(parts[1]))
 			accepted := len(secret) > 0
 			if m.requiredSecret != nil {
 				accepted = bytes.Equal(secret, m.requiredSecret)
 			}
+			tagged = accepted && m.opts.supportTags && len(parts) > 2 && parts[2] == "T"
 			reply := "On\n"
 			if !accepted {
 				reply = "En\n"
+			} else if tagged {
+				reply = "OnT\n"
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil || !accepted {
 				return
@@ -171,6 +219,19 @@ func (m *mockNode) serve(conn net.Conn) {
 				continue
 			}
 			m.getCount.Add(1)
+			if m.takeOne(&m.swallowLeft) {
+				continue // no reply at all — the off-by-one desync injection
+			}
+			if tagged && m.takeOne(&m.wrongTagLeft) {
+				// Echo the wrong tag (the request's tag + 1) — the desync
+				// a pre-doc/adr/0019-*.md stream misalignment would
+				// produce.
+				requestTag := atoiOrPanic(parts[len(parts)-1])
+				if _, err := conn.Write([]byte(fmt.Sprintf("N %d\n", requestTag+1))); err != nil {
+					return
+				}
+				continue
+			}
 			if m.takeOne(&m.malformedLeft) {
 				if _, err := conn.Write([]byte("V x\n")); err != nil {
 					return
@@ -180,19 +241,19 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.takeOne(&m.storedToGetLeft) {
 				// A well-formed frame of the wrong kind, as a desynced
 				// (off-by-one) stream would produce.
-				if _, err := conn.Write([]byte("S\n")); err != nil {
+				if _, err := conn.Write([]byte("S" + tagSuffix + "\n")); err != nil {
 					return
 				}
 				continue
 			}
 			var reply []byte
 			if m.takeWrongNode() {
-				reply = []byte("W\n")
+				reply = []byte("W" + tagSuffix + "\n")
 			} else if value, ok := m.store.Load(key); ok {
 				stored := value.([]byte)
-				reply = append([]byte(fmt.Sprintf("V %d\n", len(stored))), stored...)
+				reply = append([]byte(fmt.Sprintf("V %d%s\n", len(stored), tagSuffix)), stored...)
 			} else {
-				reply = []byte("N\n")
+				reply = []byte("N" + tagSuffix + "\n")
 			}
 			if _, err := conn.Write(reply); err != nil {
 				return
@@ -203,7 +264,14 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.silent.Load() {
 				continue
 			}
-			if len(parts) == 4 {
+			// The TTL, when present, is the field after the two lengths
+			// (omitted on the wire means "no expiry", i.e. 0); on a
+			// tagged connection the tag sits after it as the last field.
+			ttlBase := 3
+			if tagged {
+				ttlBase = 4
+			}
+			if len(parts) > ttlBase {
 				m.lastSetTTL.Store(parts[3])
 			} else {
 				m.lastSetTTL.Store("none")
@@ -211,9 +279,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			if delay := time.Duration(m.setDelay.Load()); delay > 0 {
 				time.Sleep(delay)
 			}
-			reply := "S\n"
+			reply := "S" + tagSuffix + "\n"
 			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
-				reply = "W\n"
+				reply = "W" + tagSuffix + "\n"
 			} else {
 				m.store.Store(key, value)
 			}
@@ -225,11 +293,11 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.silent.Load() {
 				continue
 			}
-			reply := "N\n"
+			reply := "N" + tagSuffix + "\n"
 			if m.takeWrongNode() {
-				reply = "W\n"
+				reply = "W" + tagSuffix + "\n"
 			} else if _, existed := m.store.LoadAndDelete(key); existed {
-				reply = "D\n"
+				reply = "D" + tagSuffix + "\n"
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
 				return
@@ -314,7 +382,15 @@ func (m *mockDiscovery) serve(conn net.Conn) {
 		switch parts[0] {
 		case "A":
 			mustRead(reader, atoiOrPanic(parts[1]))
-			if _, err := conn.Write([]byte("Od\n")); err != nil {
+			// doc/adr/0019-*.md: echo the tag capability — clients send
+			// the extended A before knowing which kind of server
+			// answered. Discovery itself never uses tags (a single L per
+			// connection), but still has to parse this reply either way.
+			reply := "Od\n"
+			if len(parts) > 2 && parts[2] == "T" {
+				reply = "OdT\n"
+			}
+			if _, err := conn.Write([]byte(reply)); err != nil {
 				return
 			}
 		case "L":
@@ -520,6 +596,205 @@ func TestPipelinesConcurrentRequestsOnOneConnection(t *testing.T) {
 		if want := fmt.Sprintf("value-%d", i); values[i] != want {
 			t.Errorf("key-%d = %q, want %q", i, values[i], want)
 		}
+	}
+}
+
+// ── doc/adr/0019-*.md 応答タグ ───────────────────────────────────────
+
+// TestPipelinesConcurrentRequestsOnOneConnectionTagged is
+// TestPipelinesConcurrentRequestsOnOneConnection's shape against a
+// tag-supporting node: N concurrent set/get on one tagged connection each
+// independently round-trip their own value, verifying the tag-echo check
+// doesn't itself misdispatch a busy pipeline.
+func TestPipelinesConcurrentRequestsOnOneConnectionTagged(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("key-%d", i)
+			value := fmt.Sprintf("value-%d", i)
+			if err := client.Set(key, value, 0); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	errs := make([]error, n)
+	values := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			value, ok, err := client.Get(fmt.Sprintf("key-%d", i))
+			if err != nil || !ok {
+				errs[i] = fmt.Errorf("Get key-%d: value=%q ok=%v err=%v", i, value, ok, err)
+				return
+			}
+			values[i] = value
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Error(errs[i])
+			continue
+		}
+		if want := fmt.Sprintf("value-%d", i); values[i] != want {
+			t.Errorf("key-%d = %q, want %q", i, values[i], want)
+		}
+	}
+
+	if existed, err := client.Delete("key-0"); err != nil || !existed {
+		t.Fatalf("Delete key-0 = %v, %v, want true, nil", existed, err)
+	}
+	if existed, err := client.Delete("key-0"); err != nil || existed {
+		t.Fatalf("Delete key-0 (again) = %v, %v, want false, nil", existed, err)
+	}
+}
+
+// TestASwallowedResponseDesyncsAndIsCaughtBeforeDispatchTagged is the
+// exact misdelivery doc/adr/0016-*.md left open: the server never answers
+// the first GET (swallowGetOnce), so the second GET's response arrives at
+// the first GET's pending slot. Without tags the first caller would
+// receive the second's value as a plausible, exception-free wrong answer;
+// the tag check must poison the connection before either caller sees
+// anything, and the next request must transparently redial and succeed.
+// This is exercised directly against a *connection* (this package's
+// internal, unexported per-socket type — this test file is part of package
+// nanocached), not through Client: Client's Get/Set/Delete redial and
+// retry once on any connection-classified failure (see
+// TestAMismatchedResponseKindPoisonsTheConnection), which would silently
+// absorb the very desync this test exists to catch before that retry ever
+// gets a chance to mask it.
+func TestASwallowedResponseDesyncsAndIsCaughtBeforeDispatchTagged(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+
+	result, err := connectAndIdentify(node.address(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.tagged {
+		t.Fatal("expected the mock node to negotiate tags")
+	}
+	conn := newConnection(result.conn, func() {}, result.tagged)
+	defer conn.close()
+
+	if err := conn.set([]byte("k"), []byte("v"), -1); err != nil {
+		t.Fatal(err)
+	}
+
+	node.swallowGetOnce()
+
+	type getResult struct {
+		value []byte
+		ok    bool
+		err   error
+	}
+	firstCh := make(chan getResult, 1)
+	secondCh := make(chan getResult, 1)
+	go func() {
+		value, ok, err := conn.get([]byte("a"))
+		firstCh <- getResult{value, ok, err}
+	}()
+	// Give the first GET a moment to actually hit the wire before the
+	// second is sent, so the server sees them in this order (the swallow
+	// only ever consumes the next G, whichever arrives first).
+	time.Sleep(20 * time.Millisecond)
+	go func() {
+		value, ok, err := conn.get([]byte("k"))
+		secondCh <- getResult{value, ok, err}
+	}()
+
+	first := <-firstCh
+	second := <-secondCh
+	if first.err == nil || !strings.Contains(first.err.Error(), "desynced") {
+		t.Fatalf("first get error = %v, want a desynced error", first.err)
+	}
+	if second.err == nil || !strings.Contains(second.err.Error(), "desynced") {
+		t.Fatalf("second get error = %v, want a desynced error", second.err)
+	}
+	if !conn.isClosed() {
+		t.Fatal("expected the tag mismatch to have poisoned (closed) the connection")
+	}
+
+	// A fresh connection round-trips the real value correctly — the
+	// desync above never touched the store.
+	result2, err := connectAndIdentify(node.address(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn2 := newConnection(result2.conn, func() {}, result2.tagged)
+	defer conn2.close()
+	value, ok, err := conn2.get([]byte("k"))
+	if err != nil || !ok || string(value) != "v" {
+		t.Fatalf("get after desync = %q, %v, %v, want \"v\", true, nil", value, ok, err)
+	}
+	if got := node.connectionCount.Load(); got != 2 {
+		t.Fatalf("connectionCount = %d, want 2", got)
+	}
+}
+
+// TestAWrongResponseTagPoisonsTheConnection mirrors
+// TestAMismatchedResponseKindPoisonsTheConnection's wrong-kind desync, but
+// for a tagged connection whose response echoes the wrong tag outright —
+// caught by the tag-echo check itself rather than the caller-side kind
+// check. Like that test, the connection-classified failure is healed
+// transparently by Client's built-in redial-and-retry-once.
+func TestAWrongResponseTagPoisonsTheConnection(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.answerWrongTagOnce()
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get after wrong-tag response = %q, %v, %v, want \"v\", true, nil", value, ok, err)
+	}
+	if got := node.connectionCount.Load(); got != 2 {
+		t.Fatalf("connectionCount = %d, want 2 (poison + redial)", got)
+	}
+}
+
+// TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer: an old
+// (pre-doc/adr/0019-*.md) server treats the extended `A ... T` as a parse
+// error and closes without replying; the client must redial once with the
+// plain form and run untagged — transparently, with the same results.
+func TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{closeOnExtendedAuth: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v, want \"v\", true, nil", value, ok, err)
+	}
+	// Two dials: the extended attempt the server slammed shut, then the
+	// plain fallback that stuck.
+	if got := node.connectionCount.Load(); got != 2 {
+		t.Fatalf("connectionCount = %d, want 2 (extended attempt + plain fallback)", got)
 	}
 }
 
