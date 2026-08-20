@@ -1,10 +1,10 @@
 //! Standalone cluster-membership registry for nanocached cache nodes.
 //!
-//! This binary has no dependency on the cache server's own modules (see
-//! `src/bin/bench.rs` for the same independence rule and rationale); its
-//! protocol is unrelated to nanocached's cache protocol, so nothing is
-//! shared. Run it via `ncd discovery start`, or directly as
-//! `nanocached-discovery`.
+//! This binary has no dependency on the cache server's own modules —
+//! `nanocached-node` and `nanocached-discovery` share no modules by
+//! design (doc/adr/0017-*.md); its protocol is unrelated to nanocached's
+//! cache protocol, so nothing is shared. Run it via `ncd discovery start`,
+//! or directly as `nanocached-discovery`.
 //!
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
@@ -23,16 +23,28 @@
 //!                             and so has no belief to report. When `r` is
 //!                             nonzero and disagrees with this replica's
 //!                             own `--replication-factor`, the mismatch is
-//!                             logged loudly (not rejected — see ADR-0010,
-//!                             replicas never reconcile configuration with
-//!                             each other). Response: `A\n`.
+//!                             logged loudly and recorded (not rejected —
+//!                             see ADR-0010, replicas never reconcile
+//!                             membership with each other); unlike
+//!                             membership, replication factor is static
+//!                             config, so a recorded mismatch makes this
+//!                             replica refuse `L` until it clears — see
+//!                             below. Response: `A\n`.
 //!
 //!   L\n                       List currently `Joined` nodes. Response:
 //!                             `N <count>\n` followed by `count` lines,
 //!                             each `<name-length> <addr-length>\n
 //!                             <name><addr>` — `name` (ADR-0009) is what
 //!                             hash-ring computations use; `addr` is only
-//!                             for opening a connection.
+//!                             for opening a connection. Refused with
+//!                             `B\n` (connection then closed) if any
+//!                             currently-`Joined` node's last heartbeat
+//!                             reported a replication factor different
+//!                             from this replica's own (issue #30) — this
+//!                             replica's `config.replication`, which this
+//!                             response embeds, is then a value known to
+//!                             disagree with what some node in the
+//!                             cluster learned elsewhere.
 //!
 //!   J <name-length> <addr-length>\n<name><addr>   Ask to join (ADR-0008),
 //!                             declaring the node's own name (ADR-0009)
@@ -253,6 +265,17 @@ struct NodeInfo {
     /// should move to `Joined`; the connection task holding this node's
     /// `J` connection open waits on it instead of polling.
     promoted: Arc<Notify>,
+    /// The replication factor this node last reported believing, via
+    /// `H`'s `r` field (issue #30) — `None` until its first heartbeat
+    /// that reports one (a node that hasn't sent an ADR-0011 handoff `M`
+    /// yet has no belief to report). Unlike membership, replication
+    /// factor is static operator config: the `L` handler refuses to
+    /// serve `config.replication` while any currently-`Joined` node's
+    /// value here disagrees with it. Overwritten on every heartbeat, so
+    /// a past mismatch is cleared the moment the node reports a matching
+    /// value again; removed along with the rest of a departed node's
+    /// entry.
+    reported_replication: Option<usize>,
 }
 
 impl NodeInfo {
@@ -262,6 +285,7 @@ impl NodeInfo {
             state,
             last_heartbeat: Instant::now(),
             promoted: Arc::new(Notify::new()),
+            reported_replication: None,
         }
     }
 }
@@ -1339,8 +1363,7 @@ async fn start_join(
             .filter(|(_, info)| info.state == NodeState::Joined)
             .map(|(joined_name, info)| (joined_name.clone(), info.address.clone()))
             .collect();
-        let message_len =
-            build_migrate_message(name, &address, &joined_now, replication).len();
+        let message_len = build_migrate_message(name, &address, &joined_now, replication).len();
         if message_len > NODE_MAX_REQUEST_SIZE {
             return Err(JoinRejection::MigrateMessageTooLarge { message_len });
         }
@@ -1978,6 +2001,11 @@ async fn handle_connection(
                     match guard.get_mut(&name) {
                         Some(info) if info.state == NodeState::Joined => {
                             info.last_heartbeat = Instant::now();
+                            // Stored unconditionally (`Some` or `None`)
+                            // every heartbeat, not just on a mismatch —
+                            // see `NodeInfo::reported_replication` and the
+                            // `L` handler, which reads this back.
+                            info.reported_replication = replication;
                             true
                         }
                         _ => false,
@@ -1996,10 +2024,19 @@ async fn handle_connection(
                 // this replica's configured value — every discovery
                 // replica takes its own `--replication-factor` flag and
                 // nothing else validates they agree (ADR-0010 deliberately
-                // keeps replicas from talking to each other). Loud,
-                // repeated logging is the whole mechanism: the mismatch
-                // isn't rejected, since a stale replica can't tell which
-                // side is actually wrong.
+                // keeps replicas from talking to each other). Membership
+                // itself is soft state that's expected to converge as
+                // nodes join, leave, and heartbeat, so ADR-0010's "never
+                // reconcile, just log" applies there — but replication
+                // factor is static operator config, not membership, and a
+                // persistent disagreement means this replica's own
+                // `--replication-factor` (which `L` embeds) is a value at
+                // least one node in the cluster has already learned is
+                // wrong. Recorded above (`reported_replication`) so the
+                // `L` handler can refuse to serve that value instead of
+                // handing it out anyway; still logged loudly here too,
+                // since even a since-resolved disagreement is worth the
+                // operator's attention.
                 if let Some(reported) = replication
                     && reported != config.replication
                 {
@@ -2023,6 +2060,36 @@ async fn handle_connection(
                     // connection-limit rejection: "can't serve you right
                     // now, retry", which the SDK maps to trying its next
                     // discovery seed.
+                    stream.write_all(b"B\n").await?;
+                    return Ok(());
+                }
+
+                // Issue #30: refuse to serve `config.replication` (the R
+                // this response embeds) if any currently-`Joined` node's
+                // last heartbeat reported a different one — see
+                // `NodeInfo::reported_replication` and the heartbeat
+                // handler's comment above for why replication factor gets
+                // this treatment and membership doesn't. Same `B\n`-then-
+                // close shape as the startup-grace refusal just above:
+                // "can't serve you right now, retry" is exactly as
+                // appropriate here, since a client bootstrapping now would
+                // otherwise compute a replica set some node in the
+                // cluster already disagrees with.
+                let mismatched_replication = lock(&registry).values().any(|info| {
+                    info.state == NodeState::Joined
+                        && info
+                            .reported_replication
+                            .is_some_and(|r| r != config.replication)
+                });
+                if mismatched_replication {
+                    eprintln!(
+                        "WARN refusing L: a Joined node's last heartbeat reported a \
+                         replication factor different from this replica's own \
+                         --replication-factor {} — discovery replicas have drifted out of \
+                         alignment; the operator must align --replication-factor across \
+                         every replica (see doc/adr/0010-*.md)",
+                        config.replication
+                    );
                     stream.write_all(b"B\n").await?;
                     return Ok(());
                 }
@@ -2523,10 +2590,13 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_heartbeat_reporting_a_mismatched_replication_factor_is_still_acked() {
-        // Issue #30: a mismatch is logged, not rejected — this replica has
-        // no way to tell which side is actually misconfigured (ADR-0010
-        // keeps replicas from reconciling with each other), so the node
-        // must stay `Joined` and keep heartbeating normally.
+        // Issue #30: a mismatch is logged and recorded, not rejected —
+        // this replica has no way to tell which side is actually
+        // misconfigured (ADR-0010 keeps replicas from reconciling
+        // membership with each other), so the node must stay `Joined`
+        // and keep heartbeating normally. (Recording the mismatch does
+        // make this replica start refusing `L` — see
+        // `a_mismatched_heartbeat_replication_factor_makes_l_refuse`.)
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
@@ -2560,11 +2630,11 @@ mod tests {
         // This replica is configured with R=2 (above); the node here
         // reports R=1 on its heartbeat — a disagreement.
         client
-            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-aL\n")
+            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-a")
             .await
             .unwrap();
 
-        let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let expected = b"R\nA\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -2575,6 +2645,137 @@ mod tests {
         }
 
         assert_eq!(received, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_mismatched_heartbeat_replication_factor_makes_l_refuse() {
+        // Issue #30: replication factor is static operator config, not
+        // membership — a persistent disagreement means this replica's own
+        // `--replication-factor` (which `L` embeds) is a value the node
+        // itself has learned elsewhere is wrong, so `L` must refuse
+        // rather than hand it out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_registry = Arc::clone(&registry);
+        let server_current_join = Arc::clone(&current_join);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_connection(
+                MaybeTls::Plain(stream),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                server_registry,
+                server_current_join,
+                ConnectionConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    list_ready_at: Instant::now(),
+                    replication: 2,
+                    auth_secret: None,
+                    tls_acceptor: None,
+                    tls_connector: None,
+                },
+                shutdown_rx,
+                Arc::new(std::sync::Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        // This replica is configured with R=2 (above); the node here
+        // reports R=1 on its heartbeat, then asks for `L`.
+        client
+            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-aL\n")
+            .await
+            .unwrap();
+
+        let expected = b"R\nA\nB\n";
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 64];
+
+        while received.len() < expected.len() {
+            let bytes_read = client.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response arrived");
+            received.extend_from_slice(&chunk[..bytes_read]);
+        }
+
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_later_matching_heartbeat_clears_the_mismatch_and_l_serves_again() {
+        // Issue #30: the recorded mismatch is overwritten on every
+        // heartbeat, so a node that later reports the matching value
+        // clears it naturally — `L` must go back to serving normally
+        // rather than staying refused forever. Two separate connections
+        // (an `L` refusal closes the connection it arrived on, same as
+        // the startup-grace refusal — see
+        // `list_answers_busy_during_the_startup_grace_while_announce_still_works`),
+        // sharing one registry.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = || ConnectionConfig {
+            idle_timeout: Duration::from_secs(5),
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+        };
+
+        // First connection: joins node-a, then a mismatched (R=1)
+        // heartbeat, then an `L` that must be refused and close.
+        let (mut first, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        first
+            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-aL\n")
+            .await
+            .unwrap();
+
+        let expected_first = b"R\nA\nB\n";
+        let mut received_first = Vec::new();
+        let mut chunk = [0u8; 64];
+        while received_first.len() < expected_first.len() {
+            let bytes_read = first.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response arrived");
+            received_first.extend_from_slice(&chunk[..bytes_read]);
+        }
+        assert_eq!(received_first, expected_first);
+
+        // Second connection: a matching (R=2) heartbeat for the same
+        // node-a, then an `L` that must serve normally again.
+        let (mut second, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        second.write_all(b"H 6 2\nnode-aL\n").await.unwrap();
+
+        let expected_second = b"A\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let mut received_second = Vec::new();
+        while received_second.len() < expected_second.len() {
+            let bytes_read = second.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response arrived");
+            received_second.extend_from_slice(&chunk[..bytes_read]);
+        }
+        assert_eq!(received_second, expected_second);
     }
 
     #[test]

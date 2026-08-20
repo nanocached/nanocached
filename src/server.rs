@@ -754,15 +754,28 @@ async fn handle_connection(
                 // `MigrationRejected` on the same ack, instead of telling
                 // the sender `MigrationAccepted` and then silently doing
                 // nothing.
-                let Some(migration_guard) = MigrationGuard::new(
+                let migration_guard = match MigrationGuard::new(
                     Arc::clone(&node_context.active_migration),
                     joining_name.clone(),
                     joining_addr.clone(),
                     Arc::clone(&after_ring),
                     replication,
-                ) else {
-                    write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
-                    continue;
+                ) {
+                    MigrationOutcome::New(guard) => guard,
+                    // A discovery retry of `M` for the handoff already
+                    // running here (its ack was lost in transit) — re-ack
+                    // with the same count the original `M` computed
+                    // instead of starting a second migration. See
+                    // `MigrationGuard::new`'s doc comment.
+                    MigrationOutcome::DuplicateAcked(entries) => {
+                        write_response(&mut stream, &Response::MigrationAccepted(entries).encode())
+                            .await?;
+                        continue;
+                    }
+                    MigrationOutcome::Conflict => {
+                        write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
+                        continue;
+                    }
                 };
 
                 // doc/adr/0017-*.md: sizes discovery's migration timeout.
@@ -786,6 +799,12 @@ async fn handle_connection(
                         replication,
                     )
                 });
+
+                // Stamped before acking, not after, so a retry of this
+                // same `M` arriving right after the ack goes out (but
+                // before this stamp landed) still finds `acked_entries`
+                // set — see `MigrationGuard::new`.
+                migration_guard.ack(entries_to_send);
 
                 write_response(
                     &mut stream,
@@ -1377,6 +1396,14 @@ struct ActiveMigration {
     /// different handoffs move different amounts of data. Meaningless
     /// (left at `Duration::ZERO`) until `completed_at` is `Some`.
     forwarding_grace: Duration,
+    /// Stamped by `MigrationGuard::ack` once the `M` handler has computed
+    /// the entry count it acks (`entries_to_send_count`) — that snapshot
+    /// happens after this slot is reserved, so it can't be filled in at
+    /// construction. `None` for the brief window before that stamp lands.
+    /// Lets `MigrationGuard::new` answer a duplicate `M` for this same
+    /// `joining_name` (a discovery retry after a lost ack) with the same
+    /// `A <entries>` ack again — see `MigrationOutcome::DuplicateAcked`.
+    acked_entries: Option<usize>,
     abort_requested: Arc<AtomicBool>,
 }
 
@@ -1398,19 +1425,65 @@ struct MigrationGuard {
     completed: bool,
 }
 
+/// What `MigrationGuard::new` found when it tried to reserve `slot` for
+/// an incoming `M` — see its doc comment for the reasoning behind each
+/// case.
+enum MigrationOutcome {
+    /// A fresh slot was reserved; the caller should ack with the entry
+    /// count it computes, then stamp it via `MigrationGuard::ack`.
+    New(MigrationGuard),
+    /// This `M` names the same `joining_name` as the handoff already
+    /// occupying the slot, and that handoff has already stamped what it
+    /// acked — a discovery retry after a lost ack. The caller should
+    /// resend `MigrationAccepted` with this same count rather than start
+    /// a second migration.
+    DuplicateAcked(usize),
+    /// The slot is occupied by a handoff for a different `joining_name`,
+    /// or by the same `joining_name` whose `acked_entries` hasn't been
+    /// stamped yet. The caller should reject with `MigrationRejected`.
+    Conflict,
+}
+
+#[cfg(test)]
+impl MigrationOutcome {
+    /// Test-only convenience: most tests only care about the successful
+    /// path, so this saves a `match` at every one of those call sites.
+    fn unwrap_new(self) -> MigrationGuard {
+        match self {
+            MigrationOutcome::New(guard) => guard,
+            MigrationOutcome::DuplicateAcked(entries) => {
+                panic!("expected a new migration guard, got a duplicate ack for {entries} entries")
+            }
+            MigrationOutcome::Conflict => panic!("expected a new migration guard, got a conflict"),
+        }
+    }
+}
+
 impl MigrationGuard {
-    /// `None` if `slot` is already occupied by another *active* migration
-    /// (issue #3): unconditionally overwriting it would clobber that
-    /// migration's `completed_at`/`forwarding_grace`/`abort_requested` out
-    /// from under its own still-running `run_migration` task (or its
-    /// post-completion forwarding window), corrupting `migration_target_for`
-    /// and `X`/`C` matching for whichever migration loses the slot. A
-    /// second `M` for the same `joining_name` — a discovery retry after a
-    /// lost ack (`send_migrate_with_retry`) — is the expected way to hit
-    /// this; an `M` for a *different* `joining_name` while one is already
-    /// active shouldn't happen given discovery's single-join-at-a-time
-    /// invariant, but is handled the same defensive way regardless of
-    /// cause.
+    /// Reserves `slot` for a new handoff, or reports why it couldn't
+    /// (issue #3): unconditionally overwriting an occupied slot would
+    /// clobber the active migration's
+    /// `completed_at`/`forwarding_grace`/`abort_requested` out from under
+    /// its own still-running `run_migration` task (or its post-completion
+    /// forwarding window), corrupting `migration_target_for` and `X`/`C`
+    /// matching for whichever migration loses the slot.
+    ///
+    /// A second `M` for the same `joining_name` — a discovery retry after
+    /// a lost ack (`send_migrate_with_retry`) — is the expected way to
+    /// hit an occupied slot, and is handled idempotently: once the
+    /// original `M`'s handler has stamped `acked_entries` (see
+    /// `MigrationGuard::ack`), the retry gets back
+    /// `MigrationOutcome::DuplicateAcked` carrying the same entry count
+    /// the first ack reported, so the caller can resend the same `A
+    /// <entries>` ack instead of starting a second migration or
+    /// rejecting a retry that's really just a replay. In the brief
+    /// window before that stamp lands, and for an `M` naming a
+    /// genuinely different `joining_name` while one is already active
+    /// (shouldn't happen given discovery's single-join-at-a-time
+    /// invariant, but handled the same defensive way regardless of
+    /// cause), this returns `MigrationOutcome::Conflict` so the caller
+    /// rejects with `R\n` — for the same-name case, the next retry will
+    /// find `acked_entries` stamped.
     ///
     /// Reuses `migration_target_for`'s lazy-expiry check first: a slot
     /// left by a prior handoff that finished *and* whose forwarding grace
@@ -1418,13 +1491,17 @@ impl MigrationGuard {
     /// completed slot that no client `GET`/`SET` has touched since (the
     /// only other place that lazily clears it) would wrongly block the
     /// very next join.
+    // Returns `MigrationOutcome`, not `Self`, on purpose: reserving the
+    // slot can produce an idempotent re-ack or a rejection instead of a
+    // guard — see `MigrationOutcome`.
+    #[allow(clippy::new_ret_no_self)]
     fn new(
         slot: Arc<Mutex<Option<ActiveMigration>>>,
         joining_name: String,
         joining_addr: String,
         after_ring: Arc<HashRing>,
         replication: usize,
-    ) -> Option<Self> {
+    ) -> MigrationOutcome {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let expired = guard.as_ref().is_some_and(|active| {
@@ -1437,6 +1514,16 @@ impl MigrationGuard {
         }
 
         if let Some(existing) = guard.as_ref() {
+            if existing.joining_name == joining_name {
+                // Same-name retry: re-ack idempotently once the original
+                // `M` has computed what to ack, otherwise ask the caller
+                // to reject — the next retry will find it stamped.
+                return match existing.acked_entries {
+                    Some(acked_entries) => MigrationOutcome::DuplicateAcked(acked_entries),
+                    None => MigrationOutcome::Conflict,
+                };
+            }
+
             let conflicting_joining_name = existing.joining_name.clone();
             // Dropped before logging (unlike the lock this replaced,
             // which held it across the `eprintln!`) since `slot` is also
@@ -1447,7 +1534,7 @@ impl MigrationGuard {
                 "WARN ignoring M for {joining_name}: a migration to \
                  {conflicting_joining_name} is already active"
             );
-            return None;
+            return MigrationOutcome::Conflict;
         }
 
         let abort_requested = Arc::new(AtomicBool::new(false));
@@ -1459,15 +1546,32 @@ impl MigrationGuard {
             replication,
             completed_at: None,
             forwarding_grace: Duration::ZERO,
+            acked_entries: None,
             abort_requested: Arc::clone(&abort_requested),
         });
         drop(guard);
 
-        Some(Self {
+        MigrationOutcome::New(Self {
             slot,
             abort_requested,
             completed: false,
         })
+    }
+
+    /// Stamps the entry count this handoff acks (`entries_to_send_count`,
+    /// computed by the caller after this guard exists — the snapshot it
+    /// needs isn't available yet at `new`'s call site) into the slot, so
+    /// a same-`joining_name` retry of `M` can be answered with the same
+    /// ack again — see `MigrationGuard::new`'s doc comment.
+    fn ack(&self, entries: usize) {
+        if let Some(active) = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
+            active.acked_entries = Some(entries);
+        }
     }
 
     /// Consumes the guard after a successful transfer: instead of
@@ -2365,14 +2469,7 @@ mod tests {
         };
 
         let forward_task = tokio::spawn(async move {
-            set_on_joining_node(
-                &node_context,
-                &joining_addr,
-                b"name",
-                b"Alice",
-                None,
-            )
-            .await
+            set_on_joining_node(&node_context, &joining_addr, b"name", b"Alice", None).await
         });
 
         tokio::task::yield_now().await;
@@ -2848,7 +2945,7 @@ mod tests {
             Arc::clone(&after_ring),
             2,
         )
-        .unwrap();
+        .unwrap_new();
 
         let entries = list_entries(&request_tx).await;
 
@@ -3011,6 +3108,7 @@ mod tests {
             replication: 2,
             completed_at: Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1)),
             forwarding_grace: forwarding_grace(0),
+            acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
         });
 
@@ -3038,6 +3136,7 @@ mod tests {
             replication: 2,
             completed_at: Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1)),
             forwarding_grace: forwarding_grace(0),
+            acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
         })));
 
@@ -3045,7 +3144,7 @@ mod tests {
             "ready-node".to_string(),
             "joiner-1".to_string(),
         ]));
-        let guard = MigrationGuard::new(
+        let outcome = MigrationGuard::new(
             Arc::clone(&slot),
             "joiner-1".to_string(),
             "127.0.0.1:10".to_string(),
@@ -3053,7 +3152,10 @@ mod tests {
             2,
         );
 
-        assert!(guard.is_some(), "an expired slot must not block a new join");
+        assert!(
+            matches!(outcome, MigrationOutcome::New(_)),
+            "an expired slot must not block a new join"
+        );
         assert_eq!(
             slot.lock().unwrap().as_ref().unwrap().joining_name,
             "joiner-1"
@@ -3072,6 +3174,7 @@ mod tests {
             replication: 2,
             completed_at: None,
             forwarding_grace: Duration::ZERO,
+            acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
         })));
 
@@ -3079,7 +3182,7 @@ mod tests {
             "ready-node".to_string(),
             "joiner-1".to_string(),
         ]));
-        let guard = MigrationGuard::new(
+        let outcome = MigrationGuard::new(
             Arc::clone(&slot),
             "joiner-1".to_string(),
             "127.0.0.1:10".to_string(),
@@ -3088,7 +3191,7 @@ mod tests {
         );
 
         assert!(
-            guard.is_none(),
+            matches!(outcome, MigrationOutcome::Conflict),
             "a still-active migration must not be clobbered"
         );
         assert_eq!(
@@ -3222,6 +3325,222 @@ mod tests {
         // deadlocks until `handle_connection`'s own idle timeout breaks
         // it, wasting `IDLE_TIMEOUT` (30s) on every run for nothing (the
         // same class of ordering bug `run`'s shutdown path had).
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        migration_relay.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_re_acks_a_duplicate_m_for_the_same_joining_node() {
+        // Regression: a discovery retry of `M` after a lost ack
+        // (`send_migrate_with_retry`) used to hit the same `R\n` rejection
+        // as a genuinely conflicting migration, burning the retry's fixed
+        // attempt budget against the still-running original handoff and
+        // stalling the join until discovery's own migration timeout. It
+        // must instead be re-acked with the same entry count, and only one
+        // migration must ever run.
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake joining node: accepts exactly one connection. If the
+        // duplicate `M` wrongly started a second migration, a second SET
+        // would arrive here and the assertion on `joining_received` below
+        // would see it duplicated.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_received: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let joining_received_task = Arc::clone(&joining_received);
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            joining_received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"S\n").await.unwrap();
+        });
+
+        // A fake discovery server: accepts one connection, expects one C
+        // (not two — only one migration should ever run), acks it.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+            buffer[..bytes_read].to_vec()
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    discovery_addr,
+                    active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+                migration_tx,
+            },
+            shutdown_rx.clone(),
+        ));
+
+        let joining_name = "joiner-107";
+        let mut migrate_message =
+            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+
+        client.write_all(&migrate_message).await.unwrap();
+        let mut ack = [0u8; 4];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A 1\n");
+
+        // The discovery retry: identical `M`, sent only after the first
+        // ack was read, so the original `M`'s handler has already stamped
+        // `acked_entries` by the time this one is processed.
+        client.write_all(&migrate_message).await.unwrap();
+        let mut second_ack = [0u8; 4];
+        client.read_exact(&mut second_ack).await.unwrap();
+        assert_eq!(
+            &second_ack, b"A 1\n",
+            "a duplicate M for the same joining node must be re-acked with the same count"
+        );
+
+        let complete = discovery_task.await.unwrap();
+        assert_eq!(
+            complete,
+            complete_message("ready-node", "joiner-107"),
+            "exactly one migration must run and report completion"
+        );
+
+        joining_task.await.unwrap();
+        let expected_set = set_message(b"name", b"Alice", None);
+        assert_eq!(
+            *joining_received.lock().unwrap(),
+            expected_set,
+            "the joining node must receive the transfer exactly once"
+        );
+
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        migration_relay.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_rejects_a_different_joining_node_while_one_is_active() {
+        // A duplicate `M` sharing the active migration's `joining_name` is
+        // re-acked (see `migrate_command_re_acks_a_duplicate_m_for_the_same_joining_node`);
+        // an `M` for a genuinely different `joining_name` while one is
+        // already active must still be rejected with `R\n`.
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        // No keys in the cache: the active migration has nothing to
+        // transfer, so it needs no joining-node connection at all — only
+        // a discovery connection to report `C` on. Its slot stays
+        // occupied by "joiner-a" for `forwarding_grace(0)` (60s base)
+        // after completion, long past this test's lifetime.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    discovery_addr,
+                    active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+                migration_tx,
+            },
+            shutdown_rx.clone(),
+        ));
+
+        let first_joining_addr = "127.0.0.1:1";
+        let mut first_migrate_message =
+            format!("M {} {} 0 1\n", "joiner-a".len(), first_joining_addr.len()).into_bytes();
+        first_migrate_message.extend_from_slice(b"joiner-a");
+        first_migrate_message.extend_from_slice(first_joining_addr.as_bytes());
+
+        client.write_all(&first_migrate_message).await.unwrap();
+        let mut first_ack = [0u8; 4];
+        client.read_exact(&mut first_ack).await.unwrap();
+        assert_eq!(&first_ack, b"A 0\n");
+
+        let second_joining_addr = "127.0.0.1:2";
+        let mut second_migrate_message =
+            format!("M {} {} 0 1\n", "joiner-b".len(), second_joining_addr.len()).into_bytes();
+        second_migrate_message.extend_from_slice(b"joiner-b");
+        second_migrate_message.extend_from_slice(second_joining_addr.as_bytes());
+
+        client.write_all(&second_migrate_message).await.unwrap();
+        let mut second_ack = [0u8; 2];
+        client.read_exact(&mut second_ack).await.unwrap();
+        assert_eq!(
+            &second_ack, b"R\n",
+            "an M for a different joining node must still be rejected while one is active"
+        );
+
+        discovery_task.await.unwrap();
         client.shutdown().await.unwrap();
         let _ = connection_task.await;
         migration_relay.await.unwrap();

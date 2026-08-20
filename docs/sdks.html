@@ -158,7 +158,15 @@ existed, err := client.Delete("greeting")</code></pre>
   and one retry; recovery is bounded by discovery's liveness timeout.</li>
   <li><b>Reconnect</b> — nodes close idle connections after 60 s; SDKs
   keep their connections warm automatically (an internal 30 s
-  keep-alive), and redial transparently if one does die.</li>
+  keep-alive), and redial transparently if one does die. The keep-alive
+  is a real <code>get</code> of a reserved 21-byte key (a leading NUL
+  byte followed by <code>nanocached-keepalive</code>) — treat that key
+  as reserved by the SDKs.</li>
+  <li><b>Observability</b> — failures the SDKs deliberately swallow
+  (replica-leg writes, read-repair writes, node-list refreshes) are
+  counted in monotonic per-client counters, exposed via a
+  <code>stats()</code>-style accessor in every SDK, so silently
+  degrading replication or a stuck refresh is detectable.</li>
   <li><b>Concurrency</b> — every client is safe for concurrent use;
   requests are pipelined per connection (concurrent callers each pay
   only their own network latency, not everyone else's ahead of them —

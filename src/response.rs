@@ -20,8 +20,15 @@ pub enum Response {
     MigrationAccepted(usize),
     /// An `M` arrived while this node's single migration slot was already
     /// occupied by another active (not merely stale-and-unswept) handoff
-    /// — see `MigrationGuard::new`. Deliberately doesn't parse as
-    /// `MigrationAccepted`'s `A <entries>\n` ack, so `send_migrate`
+    /// for a *different* `joining_name` — see `MigrationGuard::new`. A
+    /// retry of `M` for the SAME `joining_name` (the expected way to hit
+    /// an occupied slot — a discovery retry after a lost ack, see
+    /// `send_migrate_with_retry`) is instead answered idempotently with a
+    /// repeated `MigrationAccepted` carrying the same entry count, once
+    /// the original `M` has computed it; only the brief window before
+    /// that count is available still answers a same-name retry with this
+    /// rejection. Deliberately doesn't parse as `MigrationAccepted`'s `A
+    /// <entries>\n` ack, so `send_migrate`
     /// (`src/bin/nanocached-discovery.rs`) treats it as a failed send and
     /// retries via the existing `send_migrate_with_retry` path instead of
     /// being told the handoff started when it never did.

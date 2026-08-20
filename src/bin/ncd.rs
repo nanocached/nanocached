@@ -6,8 +6,8 @@
 //!
 //! This binary has no dependency on the node or discovery implementations;
 //! it only looks up and runs the sibling binary installed next to itself.
-//! `bench` is a development tool, not a product component, so it is
-//! deliberately not reachable through `ncd`.
+//! Its dispatch surface is deliberately just these two components — any
+//! other installed binary is reachable only by invoking it directly.
 //!
 //! On Unix, the sibling binary replaces `ncd`'s own process image (via
 //! `exec`) rather than running as a child. A plain spawn-and-wait leaves an

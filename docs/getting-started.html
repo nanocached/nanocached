@@ -119,9 +119,15 @@ on Kubernetes, a headless Service-per-replica or a StatefulSet's stable
 per-pod DNS names.</p>
 <p>Every replica must be started with the same
 <code>--replication-factor</code> — nothing enforces this at startup, since
-replicas never talk to each other, but a node reports the replication
-factor it has learned on every heartbeat, and a replica logs a loud
-<code>WARN</code> if that disagrees with its own configured value.</p>
+replicas never talk to each other. A node reports the replication
+factor it has learned on every heartbeat; while any joined node's
+reported value disagrees with a replica's own configured value, that
+replica logs a loud <code>WARN</code> and refuses node-list requests
+with <code>B</code> (the same "retry elsewhere" answer as its startup
+grace) rather than serving a replica count known to disagree with what
+part of the cluster learned elsewhere. Clients simply skip to the next
+seed, so a partially rolled-out misconfiguration degrades loudly
+instead of silently splitting routing.</p>
 
 <h2>Authentication</h2>
 <p>Set <code>NANOCACHED_AUTH_SECRET</code> to require clients to

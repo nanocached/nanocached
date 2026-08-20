@@ -2,11 +2,11 @@
 //! ADR 0011, which replaced ADR 0002's virtual-node ring: FNV-1a's weak
 //! high-bit avalanche clustered each node's ring points into narrow bands,
 //! skewing shares by up to ~2×; HRW measures within 2% of fair and yields
-//! replica sets for free). A byte-for-byte port of the same algorithm
-//! `src/bin/bench.rs` and the TypeScript SDK use — not shared with them via
-//! a common library (this project's binaries don't share code that way, see
-//! ADR 0006), just the same computation independently implemented, the way
-//! any two independent nanocached clients must agree on it.
+//! replica sets for free). A byte-for-byte port of the same algorithm all
+//! six SDKs use — not shared with them via a common library (this project's
+//! binaries don't share code that way, see ADR 0006), just the same
+//! computation independently implemented, the way any two independent
+//! nanocached clients must agree on it.
 //!
 //! For each (node, key) pair, `score = fmix64(fnv1a(name) ^ fnv1a(key))`;
 //! a key's owners are the `replicas` highest-scoring nodes in descending
@@ -83,7 +83,7 @@ impl HashRing {
     /// The key's primary — `owners(key, 1)[0]`. Panics on an empty ring,
     /// which no caller constructs. Production code works in top-R terms
     /// (`owners`/`is_owner`); this stays for tests and for parity with
-    /// bench's and the SDK's primary-routing.
+    /// the SDKs' primary-routing.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn route(&self, key: &[u8]) -> &str {
         self.owners(key, 1)[0]

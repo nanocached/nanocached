@@ -1,6 +1,5 @@
-//! Retained ADR-0008 verification/demonstration harness — not a load
-//! testing tool (see `src/bin/bench.rs` for that, which this binary is
-//! deliberately kept separate from per the user's request). Spawns real
+//! Retained ADR-0008 verification/demonstration harness — a correctness
+//! check, not a load-testing tool. Spawns real
 //! `nanocached-discovery`/`nanocached-node` processes as subprocesses and
 //! drives them exactly like a real client would (raw TCP, the same wire
 //! protocol any SDK speaks), to empirically check staged-join behavior
@@ -21,8 +20,8 @@
 //! default `--replication-factor 2`, a node rejects `G`/`S` for any key
 //! outside its own top-R with `W` (see `wrong_node` in `src/server.rs`).
 //! So this harness carries its own byte-for-byte port of the HRW ring
-//! (`Ring`, below — the same algorithm `src/hash_ring.rs`, `bench.rs`, and
-//! the SDKs each implement independently) and routes every seed write,
+//! (`Ring`, below — the same algorithm `src/hash_ring.rs` and the SDKs
+//! each implement independently) and routes every seed write,
 //! workload op, and post-join check to a key's actual owners instead of
 //! to a fixed node.
 //!
@@ -31,8 +30,9 @@
 //! to run one, or omit it to run all three in sequence.
 //!
 //! This binary has no dependency on the node/discovery implementations
-//! (see `src/bin/bench.rs` for the same independence rule and rationale,
-//! per ADR-0006): it only spawns the sibling binaries as subprocesses and
+//! (the binaries share no modules by design — see doc/adr/0017-*.md and
+//! `nanocached-discovery.rs`'s module docs): it only spawns the sibling
+//! binaries as subprocesses and
 //! speaks the wire protocol to them, with its own minimal copy of just
 //! the pieces it needs (`A`/`G`/`S` and discovery's `L`). No TLS/auth
 //! support yet — this is for local verification (see ADR-0008's Context);
@@ -355,7 +355,7 @@ fn fmix64(mut hash: u64) -> u64 {
 }
 
 /// A byte-for-byte port of `src/hash_ring.rs`'s HRW ring, independently
-/// implemented the way any other ADR-0011 participant (node, SDK, bench)
+/// implemented the way any other ADR-0011 participant (node, SDK)
 /// must — see this file's module docs. Only what this harness needs:
 /// computing a key's top-R owners, in score order, from a roster snapshot.
 struct Ring<'a> {
