@@ -19,7 +19,7 @@ let value: Option<String> = client.get("greeting").await?;
 let bytes: Option<Vec<u8>> = client.get_bytes("greeting").await?; // raw bytes, no UTF-8 check
 let existed: bool = client.delete("greeting").await?;
 
-client.close();
+client.close().await;
 ```
 
 Keys and values are anything `AsRef<[u8]>`. `get` decodes the stored
@@ -84,9 +84,9 @@ client's own writes — it carries no wire format, and different clients
 may use different settings freely. At most 32 replica writes across the
 whole client run in the background at once; past that cap, further
 replica legs run synchronously exactly as with the option off (a
-graceful degrade, not a queue or a drop). `close()` gives any
-still-in-flight background replica writes a chance to finish before
-tearing down their connections.
+graceful degrade, not a queue or a drop). `close()` is async and
+returns only after any still-in-flight background replica writes have
+finished and the connections are torn down.
 
 ## Read repair
 
@@ -103,8 +103,7 @@ let options = Options::new()
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL —
-the wire protocol's `G` response never returns one to preserve — and,
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
 unlike fire-and-forget replica writes, is uncapped and not drained on
 `close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
@@ -118,7 +117,7 @@ healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
 operations are idempotent). There is nothing to configure.
 
-Every dial (connect, redial, refresh) is bounded by a 10-second
+Every dial (connect, redial, refresh) is bounded by a 5-second
 connect deadline covering the TCP connect and handshake, so a node
 whose address has become a blackhole (a dead cloud instance) fails
 over instead of hanging.
@@ -198,6 +197,10 @@ rather than bloated.
 - It shares no code with the server (the repository's independence
   rule); the hash pipeline is pinned to cross-language test vectors that
   the server, TypeScript, Python, and Java implementations also assert.
+- Every failure is a variant of the one `Error` enum. Caller mistakes
+  are `Error::InvalidArgument` — this SDK's `Result`-based idiom for
+  what the other SDKs raise as host-language builtins (issue #47);
+  authentication failure surfaces as `Error::Protocol`.
 
 ## License
 

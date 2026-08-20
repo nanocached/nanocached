@@ -19,6 +19,15 @@ final class Compression {
     private static final byte MARKER_RAW = 0x00;
     private static final byte MARKER_DEFLATE = 0x01;
 
+    // Bounds a DEFLATE value's expanded output. The wire cap
+    // (MAX_VALUE_LENGTH) bounds only the compressed bytes received;
+    // without this, a small, highly-repetitive value written by a
+    // compromised node could expand to gigabytes and exhaust client
+    // memory on a plain get (a decompression bomb). Far above any
+    // realistic cache value. Same 64 MiB cap as the other five SDKs
+    // (issue #41).
+    private static final int MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024;
+
     private Compression() {}
 
     /**
@@ -83,7 +92,20 @@ final class Compression {
                 int total = 0;
                 while (!inflater.finished()) {
                     if (total == buffer.length) {
-                        buffer = Arrays.copyOf(buffer, buffer.length * 2);
+                        // Grow toward the cap, never past it: a buffer
+                        // already at MAX_DECOMPRESSED_LENGTH + 1 that
+                        // still isn't finished means more output would
+                        // follow — a bomb — so stop before allocating for
+                        // it. The +1 lets an output of exactly the cap
+                        // still decompress, mirroring the Go/Rust/Python
+                        // implementations.
+                        if (total > MAX_DECOMPRESSED_LENGTH) {
+                            throw new NanocachedException.DecompressionFailed(
+                                    "nanocached: decompressed value exceeds the maximum size — "
+                                            + "possible decompression bomb");
+                        }
+                        buffer = Arrays.copyOf(buffer,
+                                (int) Math.min(2L * buffer.length, MAX_DECOMPRESSED_LENGTH + 1L));
                     }
                     int produced = inflater.inflate(buffer, total, buffer.length - total);
                     if (produced == 0 && inflater.needsInput()) {
@@ -95,6 +117,11 @@ final class Compression {
                                         + "(doc/adr/0013-*.md)? (truncated DEFLATE stream)");
                     }
                     total += produced;
+                }
+                if (total > MAX_DECOMPRESSED_LENGTH) {
+                    throw new NanocachedException.DecompressionFailed(
+                            "nanocached: decompressed value exceeds the maximum size — "
+                                    + "possible decompression bomb");
                 }
                 return Arrays.copyOf(buffer, total);
             } catch (DataFormatException error) {

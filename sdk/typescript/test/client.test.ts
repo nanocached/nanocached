@@ -1,9 +1,19 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
+import {
+  AlreadyClosedError,
+  AuthenticationError,
+  ConnectionLostError,
+  DecompressionError,
+  DiscoveryBusyError,
+  NanocachedClient,
+  NanocachedError,
+  WrongNodeError,
+} from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING } from "../src/client.js";
+import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -153,16 +163,20 @@ describe("NanocachedClient against a single node", () => {
   it("reports a missing secret differently from a wrong one", async () => {
     const node = await startMockNode({ requiredSecret: "s3cret" });
     try {
+      // Both shapes are matchable as AuthenticationError (issue #47
+      // item 5), not just by message.
       await assert.rejects(
         NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] }),
-        /requires authentication/,
+        (error: unknown) =>
+          error instanceof AuthenticationError && /requires authentication/.test(error.message),
       );
       await assert.rejects(
         NanocachedClient.connect({
           addresses: [{ host: "127.0.0.1", port: node.port }],
           authSecret: "wrong",
         }),
-        /authentication failed/,
+        (error: unknown) =>
+          error instanceof AuthenticationError && /authentication failed/.test(error.message),
       );
     } finally {
       await node.close();
@@ -870,6 +884,152 @@ describe("NanocachedClient keep-alive", () => {
   });
 });
 
+describe("NanocachedError base class (issue #44)", () => {
+  it("parents every SDK error class onto one catchable family", () => {
+    // Callers can catch "an expected nanocached failure" with a single
+    // `instanceof NanocachedError`, like the other five SDKs' base
+    // type/enum/sentinels allow.
+    assert.ok(new AlreadyClosedError() instanceof NanocachedError);
+    assert.ok(new WrongNodeError() instanceof NanocachedError);
+    assert.ok(new ConnectionLostError("x") instanceof NanocachedError);
+    assert.ok(new DecompressionError("x") instanceof NanocachedError);
+    assert.ok(new DiscoveryBusyError() instanceof NanocachedError);
+    // Still Errors too — existing instanceof checks keep passing.
+    assert.ok(new WrongNodeError() instanceof Error);
+  });
+
+  it("classifies an auth failure as a NanocachedError", async () => {
+    // Auth failure used to be a plain Error — outside any catchable
+    // family.
+    const node = await startMockNode({ requiredSecret: "s3cret" });
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: node.port }],
+          authSecret: "wrong",
+        }),
+        (error: unknown) =>
+          error instanceof NanocachedError && /authentication failed/.test((error as Error).message),
+      );
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("unsolicited busy response (issue #45)", () => {
+  it("poisons the connection the moment the frame arrives", async () => {
+    // Regression: an unsolicited `B` (connection-limit busy) only
+    // recorded lastError and kept parsing — the connection died only
+    // when the server's follow-up FIN landed, and until then the client
+    // could keep writing requests into it. It must be poisoned
+    // immediately, like the other five SDKs.
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      // Unsolicited busy with nothing pending — and deliberately NO
+      // server-side close afterwards: the client must not need the FIN.
+      socket.write("B\n");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+
+      await waitFor(() => connection.isClosed(), "the busy frame to poison the connection");
+      assert.ok(socket.destroyed, "the client must destroy the socket itself");
+      await assert.rejects(connection.get("k"), /connection limit reached/);
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
+describe("NanocachedClient request timeout (issue #42)", () => {
+  // REQUEST_TIMEOUT_TUNING exists only so these tests can shorten it.
+  const defaultTimeoutMs = REQUEST_TIMEOUT_TUNING.timeoutMs;
+  afterEach(() => {
+    REQUEST_TIMEOUT_TUNING.timeoutMs = defaultTimeoutMs;
+  });
+
+  it("fails a request to a half-open server within the timeout instead of hanging", async () => {
+    // Regression: a server that completes the A handshake but then never
+    // answers a G/S/D used to hang get/set/delete forever — there was no
+    // in-flight request timeout at all.
+    const node = await startMockNode();
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 150;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+      });
+      try {
+        await client.set("k", "v");
+        node.goSilentAfterHandshake();
+
+        const started = Date.now();
+        // The client's retry layer redials once after the first timeout;
+        // the redialed connection times out too, so this settles after
+        // roughly two windows — still bounded.
+        await assert.rejects(
+          client.get("k"),
+          (error: unknown) =>
+            error instanceof Error && /request timed out/.test(error.message),
+        );
+        assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("steady new requests do not postpone half-open detection", async () => {
+    // The deadline is progress-based: new sends must not extend it while
+    // an older request is still waiting (mirrors the Go SDK's regression
+    // test of the same name).
+    const node = await startMockNode();
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 200;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+      });
+      try {
+        await client.set("k", "v");
+        node.goSilentAfterHandshake();
+
+        // New requests keep arriving well inside every deadline window
+        // (once the connection is poisoned they just fail fast).
+        const ticker = setInterval(() => {
+          client.get("more").catch(() => {});
+        }, 50);
+        try {
+          const started = Date.now();
+          await assert.rejects(
+            client.get("k"),
+            (error: unknown) =>
+              error instanceof Error && /request timed out/.test(error.message),
+          );
+          assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
+        } finally {
+          clearInterval(ticker);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
 describe("NanocachedClient replication (ADR-0011, R=2)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
@@ -1150,9 +1310,10 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
       replica.mock.delaySets(80);
 
       await client.set("k", "v");
-      client.close(); // should not abandon the still-in-flight replica write
-
-      await waitFor(() => replica.mock.store.has("k"), "Close() to drain the background replica write");
+      // The drain contract (ADR-0014 as amended by issue #47 item 3):
+      // close() resolves only after the in-flight replica write finished.
+      await client.close();
+      assert.ok(replica.mock.store.has("k"), "close() resolved before the background replica write finished");
     } finally {
       await cluster.close();
     }
@@ -1307,7 +1468,10 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     }
   });
 
-  it("counts a swallowed read-repair failure when a replica is unreachable (ADR-0015)", async () => {
+  it("swallows a failed owner probe without counting it (issue #43)", async () => {
+    // readRepairFailures counts failed repair *write-backs* only,
+    // matching the other five SDKs — a failed owner probe during the
+    // repair scan is swallowed silently.
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({
       addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
@@ -1320,11 +1484,37 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       await replica.mock.close();
       await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
 
-      assert.equal(client.stats().readRepairFailures, 0);
       // The primary reports a clean miss, then read repair probes the
-      // (dead) replica and swallows the resulting connection failure.
+      // (dead) replica and swallows the resulting connection failure —
+      // without counting it.
       assert.equal(await client.get(key), null);
-      assert.equal(client.stats().readRepairFailures, 1);
+      assert.equal(client.stats().readRepairFailures, 0);
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("counts a failed repair write-back (ADR-0015, issue #43)", async () => {
+    // The write-back leg is what the counter measures — the replica's
+    // value is still returned to the caller, but the background repair
+    // write to the primary fails and is counted.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readRepair: true,
+    });
+    try {
+      const key = "read-repair-write-back";
+      const { primary, replica } = cluster.ownerOf(key);
+      replica.mock.store.set(key, Buffer.from("from-replica"));
+      // GETs against the primary keep missing normally; only the
+      // repair's background S is answered with W and swallowed.
+      primary.mock.answerWrongNodeOnSetOnce();
+
+      assert.equal(client.stats().readRepairFailures, 0);
+      assert.equal(await client.get(key), "from-replica");
+      await waitFor(() => client.stats().readRepairFailures >= 1, "the failed repair write-back to be counted");
     } finally {
       client.close();
       await cluster.close().catch(() => {});

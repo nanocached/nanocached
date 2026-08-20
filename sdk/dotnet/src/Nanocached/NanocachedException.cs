@@ -27,6 +27,17 @@ public sealed class WrongNodeException : NanocachedException
 }
 
 /// <summary>
+/// The server rejected the <c>A</c> handshake's secret — either no
+/// <c>AuthSecret</c> was configured for a server that requires one, or
+/// the configured secret is wrong. Never transient: retrying with the
+/// same configuration cannot succeed.
+/// </summary>
+public sealed class AuthenticationFailedException : NanocachedException
+{
+    public AuthenticationFailedException(string message) : base(message) { }
+}
+
+/// <summary>
 /// A discovery server answered <c>L</c> with <c>B</c> — it is inside its
 /// startup grace (ADR-0010), re-learning membership after a restart. Try
 /// another address, or retry shortly.

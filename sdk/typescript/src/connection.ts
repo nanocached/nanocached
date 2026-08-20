@@ -1,5 +1,6 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
+import { NanocachedError } from "./errors.js";
 import {
   encodeDelete,
   encodeGet,
@@ -21,6 +22,16 @@ function toBytes(value: string | Uint8Array): Buffer {
   return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
 }
 
+/** Bounds how long the connection may go without progress while requests
+ * are outstanding (issue #42) — each response must arrive within this
+ * window of the previous one (or of its own send, when the queue was
+ * empty): without it, a half-open server that accepts the TCP connection
+ * but never writes back — or stops mid-stream — would hang get/set/delete
+ * forever. Generous versus the server's own 10s outbound timeouts, and
+ * the same 30s the Go and Rust SDKs use. Exported as a mutable object
+ * only so tests can shorten it, mirroring KEEPALIVE_TUNING. */
+export const REQUEST_TIMEOUT_TUNING = { timeoutMs: 30_000 };
+
 
 /** Thrown by get/set/delete when the node answers `W` (ADR-0008): per its
  * own current view of cluster membership, this node no longer (or not yet)
@@ -30,7 +41,7 @@ function toBytes(value: string | Uint8Array): Buffer {
  * `NanocachedClient.get`/`set`/`delete` normally need to handle themselves
  * unless they're bypassing that retry (e.g. by calling a single `Connection`
  * directly). */
-export class WrongNodeError extends Error {
+export class WrongNodeError extends NanocachedError {
   constructor() {
     super("nanocached: this node no longer owns the requested key");
     this.name = "WrongNodeError";
@@ -41,7 +52,7 @@ export class WrongNodeError extends Error {
  * from under a request. In cluster mode the client treats this like `W` —
  * refresh the node list and retry once — since the usual cause is a node
  * death that discovery has since noticed. */
-export class ConnectionLostError extends Error {
+export class ConnectionLostError extends NanocachedError {
   constructor(message: string) {
     super(message);
     this.name = "ConnectionLostError";
@@ -80,6 +91,11 @@ export class Connection {
   private closed = false;
   private lastError: Error | null = null;
   private lastUsed = Date.now();
+  /** The progress-based request deadline (issue #42): armed when the
+   * pending queue goes from empty to non-empty, re-armed by `onData` each
+   * time a response is dispatched with more still outstanding, cleared
+   * once nothing is. Never fires on an idle connection. */
+  private requestTimer: NodeJS.Timeout | null = null;
 
   constructor(socket: Socket | TLSSocket, tagged = false) {
     this.socket = socket;
@@ -166,11 +182,17 @@ export class Connection {
       const frame = build(tag);
       const waiter: Waiter = { resolve, reject, tag };
       this.pending.push(waiter);
+      // Armed only on the empty→non-empty transition: arming on *every*
+      // request would let a continuous stream of new requests push the
+      // deadline forever ahead of a server that has stopped answering —
+      // exactly the half-open hang the timeout exists to catch.
+      if (this.pending.length === 1) this.armRequestTimer();
 
       this.socket.write(frame, (error) => {
         if (error) {
           const index = this.pending.indexOf(waiter);
           if (index !== -1) this.pending.splice(index, 1);
+          if (this.pending.length === 0) this.clearRequestTimer();
           reject(error);
         }
       });
@@ -207,7 +229,7 @@ export class Connection {
         // malicious server can't wedge this open by trickling bytes that
         // never assemble into a parseable frame (issue #12 follow-up).
         if (buffer.length > MAX_RESPONSE_FRAME_LENGTH) {
-          this.lastError = new Error("nanocached: response frame exceeds maximum size (connection desynced)");
+          this.lastError = new NanocachedError("nanocached: response frame exceeds maximum size (connection desynced)");
           this.socket.destroy();
           return;
         }
@@ -224,14 +246,27 @@ export class Connection {
 
       // An unsolicited "busy" response means the server hit its connection
       // limit right after accept and is about to close the connection; it
-      // isn't an answer to anything we sent.
+      // isn't an answer to anything we sent. Poison immediately (issue
+      // #45), like the other five SDKs and the tag-mismatch path below —
+      // waiting for the server's follow-up FIN would let the client keep
+      // writing requests into a connection the server has already
+      // declared it is abandoning.
       if (parsed.response.kind === "busy" && this.pending.length === 0) {
-        this.lastError = new Error("nanocached: server rejected the connection (connection limit reached)");
-        continue;
+        this.closed = true;
+        this.lastError = new NanocachedError("nanocached: server rejected the connection (connection limit reached)");
+        this.socket.destroy();
+        return;
       }
 
       const waiter = this.pending.shift();
       if (waiter === undefined) continue;
+
+      // Progress-based deadline (see send()): a dispatched response is
+      // progress, so the next-oldest request gets a fresh window; with
+      // nothing left waiting, clear it so an otherwise-idle connection is
+      // never closed by it.
+      if (this.pending.length === 0) this.clearRequestTimer();
+      else this.armRequestTimer();
 
       // ADR-0019: on a tagged connection, verify the echoed tag against
       // the request this response is about to answer — *before* it can
@@ -255,12 +290,36 @@ export class Connection {
     }
   }
 
+  private armRequestTimer(): void {
+    this.clearRequestTimer();
+    this.requestTimer = setTimeout(() => {
+      // Poison, exactly like a read error: mark closed synchronously and
+      // destroy the socket — the 'close' event then rejects every pending
+      // waiter (the stalled request and everything pipelined behind it)
+      // with this error, and the client's retry layer redials.
+      this.lastError = new ConnectionLostError(
+        `nanocached: no response from server within ${REQUEST_TIMEOUT_TUNING.timeoutMs}ms (request timed out)`,
+      );
+      this.closed = true;
+      this.requestTimer = null;
+      this.socket.destroy();
+    }, REQUEST_TIMEOUT_TUNING.timeoutMs);
+  }
+
+  private clearRequestTimer(): void {
+    if (this.requestTimer !== null) {
+      clearTimeout(this.requestTimer);
+      this.requestTimer = null;
+    }
+  }
+
   private onError(error: Error): void {
     this.lastError = error;
   }
 
   private onClose(): void {
     this.closed = true;
+    this.clearRequestTimer();
     const error = this.lastError ?? new ConnectionLostError("nanocached: connection closed");
     const waiters = this.pending.splice(0);
     for (const waiter of waiters) waiter.reject(error);

@@ -29,6 +29,17 @@ import java.util.function.Function;
  * matches the order their frames actually hit the wire.
  */
 final class Connection {
+    /** Bounds how long the connection may go without progress while
+     * requests are outstanding (issue #42) — each response must arrive
+     * within this window of the previous one (or of its own send, when
+     * the queue was empty): without it, a half-open server that accepts
+     * the TCP connection but never writes back — or stops mid-stream —
+     * would hang get/set/delete forever in {@code future.join()}.
+     * Generous versus the server's own 10s outbound timeouts, and the
+     * same 30s the Go and Rust SDKs use. Non-final only so tests can
+     * shorten it, mirroring {@code keepAliveIntervalMillis}. */
+    static volatile long requestTimeoutMillis = 30_000;
+
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
@@ -41,6 +52,21 @@ final class Connection {
     private final Deque<Pending> pending = new ArrayDeque<>();
     private volatile boolean closed = false;
     private volatile long lastUsedNanos = System.nanoTime();
+
+    /** The progress-based request deadline (issue #42), guarded by
+     * {@link #deadlineLock} — its own lock, not this connection's
+     * monitor, because the watchdog must be able to fire even while a
+     * caller is blocked in {@code out.write} holding the monitor (a
+     * half-open peer can stall the write side too, and a monitor-based
+     * watchdog could never reacquire it to act). Lock order is always
+     * monitor → deadlineLock; the watchdog takes deadlineLock alone and
+     * releases it before poisoning. 0 means unarmed. */
+    private final Object deadlineLock = new Object();
+    private long requestDeadlineNanos = 0;
+    /** Set by the watchdog just before it closes the socket, so the
+     * poison() that actually wins — often the reader's, reacting to the
+     * close with a generic IOException — still reports the timeout. */
+    private volatile NanocachedException timedOutError;
 
     /** {@code onClose} fires exactly once, the first time this connection
      * closes for any reason — used by {@link NanocachedClient} to keep its
@@ -55,6 +81,67 @@ final class Connection {
         Thread reader = new Thread(this::readLoop, "nanocached-connection-reader");
         reader.setDaemon(true);
         reader.start();
+        Thread watchdog = new Thread(this::watchdogLoop, "nanocached-request-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
+    }
+
+    /** Called with the monitor held (see {@link #deadlineLock}'s lock
+     * order). Arms — or, on progress, re-arms — the request deadline. */
+    private void armDeadline() {
+        synchronized (deadlineLock) {
+            requestDeadlineNanos = System.nanoTime() + requestTimeoutMillis * 1_000_000L;
+            deadlineLock.notifyAll();
+        }
+    }
+
+    /** Called from readLoop's dispatch (monitor held) and from poison()
+     * (monitor released) — safe either way; see {@link #armDeadline}. */
+    private void clearDeadline() {
+        synchronized (deadlineLock) {
+            requestDeadlineNanos = 0;
+            deadlineLock.notifyAll();
+        }
+    }
+
+    /** Sleeps until the armed deadline expires (poisoning the connection,
+     * which unblocks the reader — and any blocked writer — with a socket
+     * error) or the connection closes for another reason. Parked in
+     * {@code wait()} whenever no deadline is armed, so an idle connection
+     * is never closed by this. */
+    private void watchdogLoop() {
+        synchronized (deadlineLock) {
+            while (!closed) {
+                try {
+                    if (requestDeadlineNanos == 0) {
+                        deadlineLock.wait();
+                    } else {
+                        long remainingMillis = (requestDeadlineNanos - System.nanoTime()) / 1_000_000;
+                        if (remainingMillis <= 0) break;
+                        deadlineLock.wait(remainingMillis + 1);
+                    }
+                } catch (InterruptedException interrupted) {
+                    return;
+                }
+            }
+            if (closed) return;
+        }
+        // The deadline expired with requests still pending. Record the
+        // timeout error first (so whichever thread's poison() wins the
+        // race reports the timeout, not a bare "Socket closed"), then
+        // close the socket *before* trying to poison: poison() takes the
+        // monitor, and a writer wedged in out.write holds it — only the
+        // close itself can unblock that writer (and the blocked reader).
+        timedOutError = new NanocachedException.ConnectionFailed(
+                "nanocached: no response from server within " + requestTimeoutMillis
+                        + "ms (request timed out)",
+                null);
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Closing an already-broken socket is fine.
+        }
+        poison(timedOutError);
     }
 
     boolean isClosed() {
@@ -135,6 +222,11 @@ final class Connection {
      * effect.
      */
     private void poison(NanocachedException error) {
+        // A watchdog-recorded timeout is the root cause — the generic
+        // IOException another thread saw is just the closed socket's echo
+        // of it (see watchdogLoop).
+        NanocachedException timeout = timedOutError;
+        if (timeout != null) error = timeout;
         List<Pending> drained;
         synchronized (this) {
             if (closed) return;
@@ -142,6 +234,7 @@ final class Connection {
             drained = new ArrayList<>(pending);
             pending.clear();
         }
+        clearDeadline();
         try {
             socket.close();
         } catch (IOException ignored) {
@@ -197,6 +290,12 @@ final class Connection {
             Integer tag = tagged ? claimTag() : null;
             byte[] frame = build.apply(tag);
             pending.addLast(new Pending(future, tag == null ? -1 : tag));
+            // Armed only on the empty→non-empty transition: arming on
+            // *every* request would let a continuous stream of new
+            // requests push the deadline forever ahead of a server that
+            // has stopped answering — exactly the half-open hang the
+            // timeout exists to catch (issue #42).
+            if (pending.size() == 1) armDeadline();
             try {
                 out.write(frame);
                 out.flush();
@@ -258,6 +357,17 @@ final class Connection {
             synchronized (this) {
                 wasEmpty = pending.isEmpty();
                 waiter = wasEmpty ? null : pending.pollFirst();
+                // Progress-based deadline (see request()): a dispatched
+                // response is progress, so the next-oldest request gets a
+                // fresh window; with nothing left waiting, clear it so an
+                // otherwise-idle connection is never closed by it. Under
+                // the monitor so this can't race a concurrent request()
+                // arming the deadline for a request this section didn't
+                // see.
+                if (waiter != null) {
+                    if (pending.isEmpty()) clearDeadline();
+                    else armDeadline();
+                }
             }
 
             // An unsolicited "busy" response means the server hit its

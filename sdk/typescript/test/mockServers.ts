@@ -17,6 +17,11 @@ export interface MockNode extends MockServerBase {
   store: Map<string, Buffer>;
   /** Queue a one-off `W` reply for the next G/S/D request. */
   answerWrongNodeOnce(): void;
+  /** Queue a one-off `W` reply for the next S specifically (not G/D) —
+   * for tests that need a node to keep answering GET normally while a
+   * later SET against it (e.g. a read-repair write-back) fails. Mirrors
+   * the .NET mock's hook of the same name. */
+  answerWrongNodeOnSetOnce(): void;
   /** Queue a one-off reply for the next G request on a tagged connection
    * that echoes the WRONG tag (the request's tag + 1) — the desync a
    * pre-ADR-0019 stream misalignment would produce. */
@@ -54,6 +59,13 @@ export interface MockNode extends MockServerBase {
   /** Makes every future `S` reply wait `ms` first — for tests proving a
    * caller isn't blocked on a slow replica leg (doc/adr/0014-*.md). */
   delaySets(ms: number): void;
+  /** Makes this node a half-open server from this point on: it still
+   * accepts and completes the `A` handshake, and still reads every
+   * request frame off the wire (so the TCP stream stays well-formed),
+   * but never writes a reply — regression coverage for the request
+   * timeout (issue #42), mirroring the Go suite's hook of the same
+   * name. */
+  goSilentAfterHandshake(): void;
 }
 
 export interface MockDiscovery extends MockServerBase {
@@ -130,6 +142,7 @@ export async function startMockNode(
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
   let wrongNodeReplies = 0;
+  let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
   let swallowedGets = 0;
   let malformedValueReplies = 0;
@@ -140,6 +153,7 @@ export async function startMockNode(
   let gets = 0;
   let setDelayMs = 0;
   let lastSetTtl = 0;
+  let silent = false;
 
   const server = createServer((socket) => {
     connections++;
@@ -189,6 +203,8 @@ export async function startMockNode(
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + keyLength);
             gets++;
+
+            if (silent) break;
 
             if (swallowedGets > 0) {
               swallowedGets--;
@@ -263,6 +279,14 @@ export async function startMockNode(
             const ttlFieldCount = parts.length - (tagged ? 4 : 3);
             lastSetTtl = ttlFieldCount > 0 ? Number(parts[3]) : 0;
 
+            if (silent) break;
+
+            if (wrongNodeOnSetReplies > 0) {
+              wrongNodeOnSetReplies--;
+              socket.write(`W${tag}\n`);
+              break;
+            }
+
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
               socket.write(`W${tag}\n`);
@@ -283,6 +307,8 @@ export async function startMockNode(
             if (buffer.length < bodyStart + keyLength) return;
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + keyLength);
+
+            if (silent) break;
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
@@ -312,6 +338,9 @@ export async function startMockNode(
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
     },
+    answerWrongNodeOnSetOnce: () => {
+      wrongNodeOnSetReplies++;
+    },
     answerWrongTagOnce: () => {
       wrongTagReplies++;
     },
@@ -336,6 +365,9 @@ export async function startMockNode(
     },
     delaySets: (ms) => {
       setDelayMs = ms;
+    },
+    goSilentAfterHandshake: () => {
+      silent = true;
     },
     close,
   };

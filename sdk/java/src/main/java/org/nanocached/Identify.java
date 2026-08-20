@@ -78,19 +78,27 @@ final class Identify {
             } catch (IOException error) {
                 // Only the extended attempt is worth retrying untagged —
                 // a failure while already running untagged is a real
-                // failure.
-                throw requestTags ? new LegacyServerSignal(error) : error;
+                // failure. A read timeout is not a legacy-server signal
+                // either: the server kept the connection open, it just
+                // didn't answer (issue #40) — retrying it untagged would
+                // only hang another CONNECT_TIMEOUT_MS.
+                boolean legacyShaped = requestTags && !(error instanceof java.io.InterruptedIOException);
+                throw legacyShaped ? new LegacyServerSignal(error) : error;
             }
 
             if (!identity.accepted()) {
                 if (authSecret == null) {
-                    throw new NanocachedException("nanocached: " + host + ":" + port
+                    throw new NanocachedException.AuthenticationFailed("nanocached: " + host + ":" + port
                             + " requires authentication, but no authSecret was given");
                 }
-                throw new NanocachedException("nanocached: authentication failed");
+                throw new NanocachedException.AuthenticationFailed("nanocached: authentication failed");
             }
 
             if (identity.kind() == 'n') {
+                // Identify succeeded — hand the socket to Connection with
+                // the exchange deadline cleared, mirroring Go's
+                // SetDeadline(time.Time{}) on success (issue #40).
+                socket.setSoTimeout(0);
                 return new NodeTarget(socket, identity.tagged());
             }
 
@@ -153,12 +161,17 @@ final class Identify {
         // own connect(host, port) has no timeout, so an unresponsive
         // (packet-dropping) address would hang connect()/refresh forever
         // instead of failing over. Layer SSL over a pre-connected,
-        // timeout-bounded plain socket instead, and bound the handshake
-        // with a read timeout.
+        // timeout-bounded plain socket instead. The read timeout stays
+        // armed through the TLS handshake AND the whole identify exchange
+        // (issue #40): a peer that accepts the connection but never
+        // answers must surface as a connect failure, not hang the caller
+        // in readExactly forever. identifyOnce clears it only when
+        // handing a node socket to Connection.
         Socket plain = new Socket();
         try {
             plain.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
             plain.setTcpNoDelay(true);
+            plain.setSoTimeout(CONNECT_TIMEOUT_MS);
             if (tls == null) {
                 return plain;
             }
@@ -166,7 +179,6 @@ final class Identify {
                     (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
             socket.setSoTimeout(CONNECT_TIMEOUT_MS);
             socket.startHandshake();
-            socket.setSoTimeout(0);
             return socket;
         } catch (IOException error) {
             plain.close();

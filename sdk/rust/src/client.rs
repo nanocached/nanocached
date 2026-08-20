@@ -539,7 +539,13 @@ impl NanocachedClient {
 
     /// Idempotent — but a second call warns (stderr), since it's usually
     /// a sign the caller lost track of this instance's lifecycle.
-    pub fn close(&self) {
+    ///
+    /// Returns only after every in-flight background replica write has
+    /// finished and the connections are torn down (doc/adr/0014-*.md as
+    /// amended by issue #47 item 3 — the drain contract every SDK now
+    /// shares); async since then, which is what lets it actually await
+    /// that drain instead of handing teardown to a detached task.
+    pub async fn close(&self) {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             eprintln!("nanocached: close() called again on an already-closed client");
             return;
@@ -548,48 +554,25 @@ impl NanocachedClient {
             keepalive.abort();
         }
 
-        // doc/adr/0014-*.md: give background replica writes a chance to
-        // finish before their connections are torn out from under them.
         // Every in-flight background write holds one permit and releases
-        // it on completion, so acquiring all of them blocks until every
+        // it on completion, so acquiring all of them waits until every
         // one has finished — bounded by background_replica_cap, so this
         // is a short wait in practice. Skipped entirely when nothing is
-        // in flight (the common case), which also keeps close() on its
-        // existing fast, non-blocking path then.
+        // in flight (the common case).
         if self.inner.background_replica_permits.available_permits()
             < self.inner.background_replica_cap
         {
-            let inner = Arc::clone(&self.inner);
-            tokio::spawn(async move {
-                let _ = Arc::clone(&inner.background_replica_permits)
-                    .acquire_many_owned(inner.background_replica_cap as u32)
-                    .await;
-                let state = inner.state.lock().await;
-                close_all_connections(&state.target);
-            });
-            return;
+            let _ = Arc::clone(&self.inner.background_replica_permits)
+                .acquire_many_owned(self.inner.background_replica_cap as u32)
+                .await;
         }
 
         // Close every connection now rather than waiting for the last
         // `NanocachedClient` clone (and so `Inner`) to drop, both to
         // release the sockets promptly and to keep open_targets accurate
-        // (see Connection::close). `state` is a tokio::sync::Mutex, so a
-        // request that's mid-flight (holding it only long enough to clone
-        // an `Arc<Connection>` out — see `slot_connection`) could very
-        // briefly contend it; rather than block this synchronous method,
-        // fall back to closing them once it's free, same as the native
-        // socket "close" event the TypeScript SDK relies on landing on a
-        // later tick.
-        match self.inner.state.try_lock() {
-            Ok(state) => close_all_connections(&state.target),
-            Err(_) => {
-                let inner = Arc::clone(&self.inner);
-                tokio::spawn(async move {
-                    let state = inner.state.lock().await;
-                    close_all_connections(&state.target);
-                });
-            }
-        }
+        // (see Connection::close).
+        let state = self.inner.state.lock().await;
+        close_all_connections(&state.target);
     }
 
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {

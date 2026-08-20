@@ -12,7 +12,7 @@ import asyncio
 import ssl as ssl_module
 from dataclasses import dataclass
 
-from ._errors import DiscoveryBusyError, NanocachedError
+from ._errors import AuthenticationError, DiscoveryBusyError, NanocachedError
 
 # Sent as the `A` secret when the caller didn't configure one: a server
 # with no secret accepts any non-empty secret, and one that requires a
@@ -175,10 +175,10 @@ async def _connect_and_identify(
 
         if ack[0:1] == b"E":
             if auth_secret is None:
-                raise NanocachedError(
+                raise AuthenticationError(
                     f"nanocached: {host}:{port} requires authentication, but no auth_secret was given"
                 )
-            raise NanocachedError("nanocached: authentication failed")
+            raise AuthenticationError("nanocached: authentication failed")
 
         if ack[1:2] == b"n":
             return NodeTarget(reader=reader, writer=writer, tagged=tagged)

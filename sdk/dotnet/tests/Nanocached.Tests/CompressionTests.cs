@@ -92,6 +92,29 @@ public class CompressionTests
     }
 
     [Fact]
+    public void AnOverCapDecompressedValueThrowsInsteadOfExhaustingMemory()
+    {
+        // Regression (issue #41): a small compressed value expanding past
+        // 64 MiB used to allocate without bound (a decompression bomb);
+        // it must fail as a decompression error like the other SDKs.
+        byte[] bomb = new byte[64 * 1024 * 1024 + 1];
+        byte[] stored = Compression.CompressValue(bomb, 0);
+        Assert.Equal(0x01, stored[0]);
+        Assert.True(stored.Length < 1024 * 1024); // small on the wire
+        var error = Assert.Throws<DecompressionException>(() => Compression.DecompressValue(stored));
+        Assert.Contains("decompression bomb", error.Message);
+    }
+
+    [Fact]
+    public void AValueOfExactlyTheDecompressionCapStillDecompresses()
+    {
+        byte[] atCap = new byte[64 * 1024 * 1024];
+        byte[] stored = Compression.CompressValue(atCap, 0);
+        Assert.Equal(0x01, stored[0]);
+        Assert.Equal(atCap, Compression.DecompressValue(stored));
+    }
+
+    [Fact]
     public void CorruptDeflateMarkedValueThrows()
     {
         Assert.Throws<DecompressionException>(

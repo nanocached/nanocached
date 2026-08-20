@@ -145,9 +145,9 @@ internal static class Identify
             if (ack[0] == (byte)'E')
             {
                 throw authSecret is null
-                    ? new NanocachedException(
+                    ? new AuthenticationFailedException(
                         $"nanocached: {host}:{port} requires authentication, but no AuthSecret was given")
-                    : new NanocachedException("nanocached: authentication failed");
+                    : new AuthenticationFailedException("nanocached: authentication failed");
             }
 
             if (ack[1] == (byte)'n')

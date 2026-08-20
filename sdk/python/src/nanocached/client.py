@@ -355,9 +355,11 @@ class NanocachedClient:
         value repairs the true primary in the background, with TTL
         _READ_REPAIR_TTL (the original TTL can't be recovered from a
         GET, and TTL 0 would permanently resurrect already-expired
-        data). Every failure along the way is swallowed and counted in
-        stats().read_repair_failures; nothing here may turn an
-        already-accepted miss into an error — except a genuine
+        data). Every failure along the way is swallowed; only a failed
+        repair *write-back* is counted in stats().read_repair_failures —
+        a failed owner probe is silent, matching the counter's write-back
+        semantics in the other five SDKs (issue #43). Nothing here may
+        turn an already-accepted miss into an error — except a genuine
         programming error (anything outside _SWALLOWABLE_ERRORS), which
         still propagates."""
         names = self._owner_names(key)
@@ -366,7 +368,6 @@ class NanocachedClient:
                 connection = await self._member_connection(name)
                 value = await connection.get(key)
             except _SWALLOWABLE_ERRORS:
-                self._read_repair_failures += 1
                 continue
             if value is None:
                 continue
@@ -421,10 +422,16 @@ class NanocachedClient:
             lambda: self._write(key_bytes, lambda connection: connection.delete(key_bytes))
         )
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """Idempotent; later get/set/delete raise AlreadyClosedError. A
         second close() is usually a sign the caller lost track of this
-        instance's lifecycle, so — unlike the first — it warns."""
+        instance's lifecycle, so — unlike the first — it warns.
+
+        Returns only after every in-flight background replica write has
+        finished and the connections are torn down (doc/adr/0014-*.md as
+        amended by issue #47 item 3 — the drain contract every SDK now
+        shares); a coroutine since then, the same shape aiohttp's
+        ``ClientSession.close`` has."""
         if self._closed:
             _warn("nanocached: close() called again on an already-closed client")
             return
@@ -432,19 +439,10 @@ class NanocachedClient:
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
 
-        # doc/adr/0014-*.md: give background replica writes a chance to
-        # finish before their connections are torn out from under them —
-        # close() stays synchronous, so the teardown itself is deferred
-        # via a scheduled coroutine rather than awaited here.
         if self._background_replica_writes:
-            pending = list(self._background_replica_writes)
-
-            async def _drain_then_teardown() -> None:
-                await asyncio.gather(*pending, return_exceptions=True)
-                self._teardown()
-
-            asyncio.ensure_future(_drain_then_teardown())
-            return
+            await asyncio.gather(
+                *list(self._background_replica_writes), return_exceptions=True
+            )
 
         self._teardown()
 
@@ -452,7 +450,7 @@ class NanocachedClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        self.close()
+        await self.close()
 
     def _teardown(self) -> None:
         if self._single is not None:

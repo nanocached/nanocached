@@ -91,6 +91,29 @@ class CompressionTest {
     }
 
     @Test
+    void anOverCapDecompressedValueThrowsInsteadOfExhaustingMemory() {
+        // Regression (issue #41): a small compressed value expanding past
+        // 64 MiB used to allocate without bound (a decompression bomb);
+        // it must fail as a decompression error like the other SDKs.
+        byte[] bomb = new byte[64 * 1024 * 1024 + 1];
+        byte[] stored = Compression.compressValue(bomb, 0);
+        assertEquals(0x01, stored[0]);
+        assertTrue(stored.length < 1024 * 1024); // small on the wire
+        NanocachedException.DecompressionFailed error =
+                assertThrows(NanocachedException.DecompressionFailed.class,
+                        () -> Compression.decompressValue(stored));
+        assertTrue(error.getMessage().contains("decompression bomb"));
+    }
+
+    @Test
+    void aValueOfExactlyTheDecompressionCapStillDecompresses() {
+        byte[] atCap = new byte[64 * 1024 * 1024];
+        byte[] stored = Compression.compressValue(atCap, 0);
+        assertEquals(0x01, stored[0]);
+        assertArrayEquals(atCap, Compression.decompressValue(stored));
+    }
+
+    @Test
     void corruptDeflateMarkedValueThrows() {
         assertThrows(NanocachedException.DecompressionFailed.class,
                 () -> Compression.decompressValue(new byte[] {0x01, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}));

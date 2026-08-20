@@ -4,7 +4,10 @@ Date: 2026-08-19
 
 ## Status
 
-Accepted
+Accepted. Amended 2026-08-20 to match the implementations (issues #46
+and #43): the repair write carries a 60-second TTL rather than "no
+TTL", and the `readRepairFailures` stats counter is defined to count
+failed repair write-backs only.
 
 ## Context
 
@@ -45,10 +48,13 @@ Two things this can't get right, from the wire protocol itself:
 
 - **TTL.** `G`'s response (`docs/protocol.html`) is `V <length>\n<value>`
   or `N\n` — it never carries remaining TTL. A repair write therefore
-  cannot preserve the original expiry; it writes with no TTL. A repaired
-  key outlives what its TTL would have been, until the next real write,
-  delete, or (if the *replica* copy itself expires first) it simply stops
-  being found to repair from at all. This is a real, permanent
+  cannot preserve the original expiry. *(As implemented, in all six
+  SDKs: the repair writes with a fixed **60-second TTL**, not "no TTL"
+  as this ADR originally said. TTL 0 — no expiry — would permanently
+  immortalize a key that was legitimately expiring; 60s bounds the
+  overshoot instead, and a key that outlives its repair TTL simply gets
+  re-repaired on a later miss. This is the shared cross-SDK policy.)*
+  Either way the original expiry is unrecoverable — a real, permanent
   limitation of the current wire protocol, not an implementation gap.
 - **Which owner actually missed.** By the time `get`/`get_bytes` sees a
   clean miss, the normal read path (unrelated to this feature) has
@@ -81,10 +87,18 @@ clean miss (no error, key not found) *and* `read_repair` is on:
    the caller (the read is now a hit), and — detached, not awaited, no
    in-flight tracking, no `close()` draining (Context) — that same value
    is written back to `names[0]` (the true primary, regardless of which
-   owner in the walk actually had it) with no TTL. Errors from this
-   write are swallowed the same way every other best-effort write in
-   this codebase is ([[0011]]'s replica writes, [[0014]]'s background
-   replica writes).
+   owner in the walk actually had it) with a 60-second TTL (see the TTL
+   note in Context). Errors from this write are swallowed the same way
+   every other best-effort write in this codebase is ([[0011]]'s replica
+   writes, [[0014]]'s background replica writes).
+
+Observability (issue #43): each SDK's `stats()` exposes a
+`readRepairFailures` counter, and it counts **failed repair write-backs
+only** — a swallowed failure in step 2's background write. Failed owner
+probes during step 1's walk are swallowed silently and are *not*
+counted; they are the normal texture of walking a cluster with a dead
+member, not a failed repair. This definition is uniform across all six
+SDKs.
 3. If no owner has it, the result is what it already was: a clean miss.
 
 This operates purely on wire bytes, below [[0013]]'s compression layer —
@@ -110,12 +124,13 @@ Easier:
 
 Harder / risks to mitigate:
 
-- **A repaired key loses its TTL** (Context) — a real, permanent
-  consequence of the wire protocol not exposing remaining TTL on `G`,
-  not something a future SDK change can fix without a protocol change.
-  Callers relying on TTL-bounded staleness for keys that might hit this
-  path should treat that guarantee as best-effort, not absolute, once
-  `read_repair` is enabled.
+- **A repaired key loses its original TTL** (Context) — a real,
+  permanent consequence of the wire protocol not exposing remaining TTL
+  on `G`, not something a future SDK change can fix without a protocol
+  change. The repaired copy lives for the fixed 60-second repair TTL
+  instead, so callers relying on TTL-bounded staleness for keys that
+  might hit this path should treat that guarantee as best-effort (off
+  by up to 60s), not absolute, once `read_repair` is enabled.
 - A clean miss with `read_repair` on costs up to R sequential round
   trips instead of one, worst case (every owner unreachable or missing).
   Still bounded and small (R is typically 2-3), but not free — this is

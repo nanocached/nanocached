@@ -901,7 +901,7 @@ func (c *Client) refreshNodeList() {
 
 // fetchNodeList walks every configured address (ADR-0010); ok=false
 // means keep the last-known list.
-func (c *Client) fetchNodeList() ([]DiscoveredNode, int, bool) {
+func (c *Client) fetchNodeList() ([]discoveredNode, int, bool) {
 	for _, addr := range c.addresses {
 		result, err := connectAndIdentify(addr.String(), c.authSecret, c.tlsConfig)
 		if err != nil {

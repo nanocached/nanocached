@@ -16,6 +16,14 @@ internal static class Compression
     private const byte MarkerRaw = 0x00;
     private const byte MarkerDeflate = 0x01;
 
+    // Bounds a DEFLATE value's expanded output. The wire cap
+    // (MaxValueLength) bounds only the compressed bytes received; without
+    // this, a small, highly-repetitive value written by a compromised
+    // node could expand to gigabytes and exhaust client memory on a plain
+    // GetAsync (a decompression bomb). Far above any realistic cache
+    // value. Same 64 MiB cap as the other five SDKs (issue #41).
+    private const int MaxDecompressedLength = 64 * 1024 * 1024;
+
     /// <summary>Below <paramref name="threshold"/>, or when compressing
     /// doesn't actually shrink the value (incompressible data), the
     /// marker byte alone is added and the value is stored unchanged.
@@ -65,7 +73,23 @@ internal static class Compression
                 using var input = new MemoryStream(value, 1, value.Length - 1);
                 using var deflate = new DeflateStream(input, CompressionMode.Decompress);
                 using var output = new MemoryStream();
-                deflate.CopyTo(output);
+                // Copy in counted chunks instead of CopyTo so the total
+                // is checked as it grows — an over-cap value stops here
+                // rather than expanding fully into memory.
+                byte[] chunk = new byte[64 * 1024];
+                long total = 0;
+                int read;
+                while ((read = deflate.Read(chunk, 0, chunk.Length)) > 0)
+                {
+                    total += read;
+                    if (total > MaxDecompressedLength)
+                    {
+                        throw new DecompressionException(
+                            "nanocached: decompressed value exceeds the maximum size — "
+                            + "possible decompression bomb");
+                    }
+                    output.Write(chunk, 0, read);
+                }
                 return output.ToArray();
             }
             catch (InvalidDataException error)

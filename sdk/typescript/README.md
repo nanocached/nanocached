@@ -34,7 +34,7 @@ const bytes = await client.getBytes("greeting"); // Buffer | null, raw bytes
 
 const existed = await client.delete("greeting"); // boolean
 
-client.close();
+await client.close();
 ```
 
 Keys and values may be `string` (encoded as UTF-8) or `Uint8Array`.
@@ -169,8 +169,7 @@ const client = await NanocachedClient.connect({
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL —
-the wire protocol's `G` response never returns one to preserve — and,
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
 unlike fire-and-forget replica writes, is uncapped and not drained on
 `close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
@@ -224,9 +223,23 @@ operations are idempotent). There is nothing to configure.
 - `client.set(key, value, ttlSeconds = 0)` — `ttlSeconds` must be a
   non-negative integer; 0 (the default) means no expiry
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
-- `client.close()` — closes all connections; later calls reject with
-  `AlreadyClosedError`; a second `close()` warns but stays idempotent
+- `client.close()` — resolves (`Promise<void>`) after any in-flight
+  background replica writes finish and all connections are closed; later
+  calls reject with `AlreadyClosedError`; a second `close()` warns but
+  stays idempotent. Awaiting it is optional — un-awaited, teardown still
+  happens once the drain settles
 - `client.nodeUrls` — addresses currently connected to (introspection)
+
+Every error the SDK itself raises — `AlreadyClosedError`,
+`WrongNodeError`, `ConnectionLostError`, `DecompressionError`,
+`DiscoveryBusyError`, and protocol/auth failures — extends the exported
+`NanocachedError` base class, so `error instanceof NanocachedError`
+distinguishes an expected nanocached failure from everything else. Node
+system errors from the socket itself (`ECONNREFUSED`, `ECONNRESET`, …)
+surface as-is, outside the family — and so do caller mistakes caught
+by argument validation (e.g. an invalid `ttlSeconds` throws a builtin
+`RangeError`): those indicate a bug in the calling code, not a
+nanocached failure, a convention shared across the SDKs (issue #47).
 
 ## License
 

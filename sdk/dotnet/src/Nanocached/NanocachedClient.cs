@@ -625,14 +625,15 @@ public sealed class NanocachedClient : IDisposable
             {
                 throw;
             }
-            catch (AlreadyClosedException)
-            {
-                // A Close() racing this read should fail fast, not walk
-                // the remaining owners (issue #12).
-                throw;
-            }
             catch (Exception error) when (error is NanocachedException)
             {
+                // A Close() racing this read is included here (issue #47
+                // item 4, superseding issue #12's fail-fast): keep
+                // walking the remaining owners like Rust/Python/TS do.
+                // Every later owner throws AlreadyClosedException too, so
+                // the caller still surfaces it via lastError — the walk
+                // just no longer takes a different path than the other
+                // SDKs in the same race.
                 lastError = error;
             }
         }

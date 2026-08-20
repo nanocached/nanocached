@@ -18,11 +18,12 @@ import (
 // and one that requires a real secret correctly rejects this placeholder.
 var noSecretPlaceholder = []byte{0}
 
-// DiscoveredNode pairs a node's hash-ring identity (a random per-process
+// discoveredNode pairs a node's hash-ring identity (a random per-process
 // UUID) with its network address — two different things since
 // doc/adr/0009-*.md: Name is what routing hashes; Address is only for
-// opening a connection.
-type DiscoveredNode struct {
+// opening a connection. Unexported (issue #47): no public API ever
+// returns or accepts it, so exporting it was dead public surface.
+type discoveredNode struct {
 	Name    string
 	Address string
 }
@@ -30,7 +31,7 @@ type DiscoveredNode struct {
 type identified struct {
 	// Exactly one of conn / cluster is set.
 	conn        net.Conn
-	nodes       []DiscoveredNode
+	nodes       []discoveredNode
 	replication int
 	// tagged (doc/adr/0019-*.md): the node accepted the extended `A ... T`,
 	// so this connection's G/S/D traffic must carry tags and its
@@ -45,19 +46,25 @@ type identified struct {
 // (doc/adr/0007-*.md). A node's conn is handed back live; a discovery
 // connection is used once for L and closed, returning the name/address
 // list and the cluster's replication factor R (doc/adr/0009, 0010, 0011).
-// handshakeDeadline bounds the identify exchange after the dial: a
-// server that accepts the TCP connection but never answers (a blackholed
-// address behaves the same way) must not hang the caller. A variable
+// connectDeadline bounds one whole connect attempt — dial, TLS
+// handshake, and the identify exchange share a single 5s budget, the
+// same shape as the other five SDKs (issue #47 item 1: the previous
+// 10s-dial + 5s-handshake staging made Go's worst-case failover ~3x
+// the others'). A server that accepts the TCP connection but never
+// answers (a blackholed address behaves the same way) must not hang
+// the caller. The ADR-0019 legacy fallback's redial gets a fresh
+// budget, matching the per-attempt deadlines elsewhere. A variable
 // only so tests can shorten it.
-var handshakeDeadline = 5 * time.Second
+var connectDeadline = 5 * time.Second
 
 func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config) (*identified, error) {
-	conn, err := open(address, tlsConfig)
+	deadline := time.Now().Add(connectDeadline)
+	conn, err := open(address, tlsConfig, deadline)
 	if err != nil {
 		return nil, connectionLost("could not connect to "+address, err)
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
+	_ = conn.SetDeadline(deadline)
 	result, err := identify(conn, address, authSecret, true)
 	if err != nil {
 		_ = conn.Close()
@@ -69,11 +76,12 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 		// replying — redial once with the plain form and run the
 		// connection untagged (the pre-0019 behavior, desync window
 		// included).
-		conn, err = open(address, tlsConfig)
+		deadline = time.Now().Add(connectDeadline)
+		conn, err = open(address, tlsConfig, deadline)
 		if err != nil {
 			return nil, connectionLost("could not connect to "+address, err)
 		}
-		_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
+		_ = conn.SetDeadline(deadline)
 		result, err = identify(conn, address, authSecret, false)
 		if err != nil {
 			_ = conn.Close()
@@ -100,8 +108,12 @@ func isLegacyServerSignal(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
-func open(address string, tlsConfig *tls.Config) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: 10 * time.Second}
+// open dials (and, with TLS, handshakes) within the attempt's shared
+// absolute deadline — see connectDeadline. tls.DialWithDialer applies
+// the dialer's deadline to the TLS handshake too, so the whole attempt
+// stays inside one budget.
+func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, error) {
+	dialer := net.Dialer{Deadline: deadline}
 	if tlsConfig == nil {
 		conn, err := dialer.Dial("tcp", address)
 		if err != nil {
@@ -185,10 +197,10 @@ func identify(conn net.Conn, address string, authSecret []byte, requestTags bool
 
 	if ack[0] == 'E' {
 		if authSecret == nil {
-			return nil, fmt.Errorf(
-				"nanocached: %s requires authentication, but no AuthSecret was given", address)
+			return nil, errors.Join(ErrAuthenticationFailed, fmt.Errorf(
+				"nanocached: %s requires authentication, but no AuthSecret was given", address))
 		}
-		return nil, fmt.Errorf("nanocached: authentication failed")
+		return nil, ErrAuthenticationFailed
 	}
 
 	if ack[1] == 'n' {
@@ -238,7 +250,7 @@ const (
 	maxNodeListResponseBytes = 16 * 1024 * 1024
 )
 
-func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
+func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 	header, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, 0, connectionLost("node-list read failed", err)
@@ -267,7 +279,7 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 		return nil, 0, fmt.Errorf("nanocached: invalid replication factor in discovery response")
 	}
 
-	nodes := make([]DiscoveredNode, 0, count)
+	nodes := make([]discoveredNode, 0, count)
 	total := 0
 	for i := 0; i < count; i++ {
 		entry, err := reader.ReadString('\n')
@@ -300,7 +312,7 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 		if body[len(body)-1] != '\n' {
 			return nil, 0, fmt.Errorf("nanocached: malformed node entry in discovery response")
 		}
-		nodes = append(nodes, DiscoveredNode{
+		nodes = append(nodes, discoveredNode{
 			Name:    string(body[:nameLength]),
 			Address: string(body[nameLength : nameLength+addrLength]),
 		})

@@ -31,6 +31,18 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
+     * The server rejected the {@code A} handshake's secret — either no
+     * {@code authSecret} was configured for a server that requires one,
+     * or the configured secret is wrong. Never transient: retrying with
+     * the same configuration cannot succeed.
+     */
+    public static final class AuthenticationFailed extends NanocachedException {
+        public AuthenticationFailed(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * A discovery server answered {@code L} with {@code B} — it is inside
      * its startup grace (ADR-0010), re-learning membership after a
      * restart. Try another address, or retry shortly.

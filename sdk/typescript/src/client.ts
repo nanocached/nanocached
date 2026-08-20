@@ -5,8 +5,10 @@ import { Connection, ConnectionLostError, isConnectionError, WrongNodeError } fr
 import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
+import { NanocachedError } from "./errors.js";
 
 export { ConnectionLostError, WrongNodeError } from "./connection.js";
+export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
 
 // A value decoded by get() must be exactly what set() would have encoded —
@@ -17,7 +19,7 @@ const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 /** Thrown by get/set/delete when called after close(). Not thrown by
  * close() itself, which is idempotent (see NanocachedClient.close). */
-export class AlreadyClosedError extends Error {
+export class AlreadyClosedError extends NanocachedError {
   constructor() {
     super("nanocached: this client is closed");
     this.name = "AlreadyClosedError";
@@ -28,8 +30,8 @@ export class AlreadyClosedError extends Error {
 // of an actual bug in this SDK's own code (or in a caller's arguments,
 // e.g. an invalid ttlSeconds surfacing from encodeSet deep inside a
 // replica leg) — never something nanocached deliberately throws on
-// purpose, which is always a plain Error or one of this SDK's own
-// subclasses (WrongNodeError, ConnectionLostError, DiscoveryBusyError,
+// purpose, which is always NanocachedError or one of its subclasses
+// (WrongNodeError, ConnectionLostError, DiscoveryBusyError,
 // AlreadyClosedError). isSwallowable below uses this as the discriminator
 // instead of an allowlist of "expected" error classes, since the set of
 // plain Errors a flaky discovery/node can legitimately produce during a
@@ -154,13 +156,13 @@ export const KEEPALIVE_TUNING = { intervalMs: 30_000 };
 function splitHostPort(address: string): { host: string; port: number } {
   const separator = address.lastIndexOf(":");
   if (separator === -1) {
-    throw new Error(`nanocached: invalid node address from discovery server: ${address}`);
+    throw new NanocachedError(`nanocached: invalid node address from discovery server: ${address}`);
   }
 
   const host = address.slice(0, separator);
   const port = Number(address.slice(separator + 1));
   if (!Number.isInteger(port)) {
-    throw new Error(`nanocached: invalid node address from discovery server: ${address}`);
+    throw new NanocachedError(`nanocached: invalid node address from discovery server: ${address}`);
   }
 
   return { host, port };
@@ -286,7 +288,7 @@ export class NanocachedClient {
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
     const addresses = options.addresses ?? [];
     if (addresses.length === 0) {
-      throw new Error("nanocached: connect() needs a non-empty addresses list");
+      throw new NanocachedError("nanocached: connect() needs a non-empty addresses list");
     }
 
     // ca is meaningful only paired with tls: true; a set ca with tls not
@@ -354,7 +356,7 @@ export class NanocachedClient {
       }
 
       if (identified.nodes.length === 0) {
-        lastError = new Error(`nanocached: no live nodes registered with the discovery server at ${key}`);
+        lastError = new NanocachedError(`nanocached: no live nodes registered with the discovery server at ${key}`);
         continue;
       }
 
@@ -367,7 +369,7 @@ export class NanocachedClient {
           const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls, ca });
 
           if (nodeIdentified.kind !== "node") {
-            throw new Error(`nanocached: discovery server returned a non-node address: ${node.address}`);
+            throw new NanocachedError(`nanocached: discovery server returned a non-node address: ${node.address}`);
           }
 
           sockets.set(node.name, { socket: nodeIdentified.socket, tagged: nodeIdentified.tagged });
@@ -407,7 +409,7 @@ export class NanocachedClient {
       );
     }
 
-    throw lastError ?? new Error("nanocached: could not connect to any address");
+    throw lastError ?? new NanocachedError("nanocached: could not connect to any address");
   }
 
   /** Whether close() has already been called on this instance. */
@@ -415,7 +417,13 @@ export class NanocachedClient {
     return this.closed;
   }
 
-  close(): void {
+  /** Resolves only after every in-flight background replica write has
+   * finished and the connections are torn down (doc/adr/0014-*.md as
+   * amended by issue #47 item 3 — the drain contract every SDK now
+   * shares). Callers that don't await keep the old fire-and-forget
+   * behavior: `closed` flips synchronously, and teardown still happens
+   * once the drain settles. */
+  async close(): Promise<void> {
     // Still idempotent (not an error, matching how socket.destroy() itself
     // behaves on an already-destroyed socket) — but a second close() is
     // usually a sign the caller lost track of this instance's lifecycle,
@@ -431,13 +439,8 @@ export class NanocachedClient {
       this.keepAliveTimer = null;
     }
 
-    // doc/adr/0014-*.md: give background replica writes a chance to
-    // finish before their connections are torn out from under them —
-    // close() stays synchronous (it already can't block on this
-    // runtime), so the teardown itself is just deferred, not awaited.
     if (this.backgroundReplicaWrites.size > 0) {
-      void Promise.allSettled([...this.backgroundReplicaWrites]).then(() => this.teardownConnections());
-      return;
+      await Promise.allSettled([...this.backgroundReplicaWrites]);
     }
     this.teardownConnections();
   }
@@ -505,9 +508,11 @@ export class NanocachedClient {
    * primary) in the background, with TTL READ_REPAIR_TTL_SECONDS (the
    * original TTL can't be recovered from a GET, and TTL 0 would
    * permanently resurrect already-expired data). Every failure along the
-   * way (connection lost, WrongNode, another miss) is swallowed and
-   * counted in stats().readRepairFailures; nothing here may turn an
-   * already-accepted miss into an error — except an actual programming
+   * way (connection lost, WrongNode, another miss) is swallowed; only a
+   * failed repair *write-back* is counted in stats().readRepairFailures —
+   * a failed owner probe is silent, matching the counter's write-back
+   * semantics in the other five SDKs (issue #43). Nothing here may turn
+   * an already-accepted miss into an error — except an actual programming
    * bug (isSwallowable), which still propagates. */
   private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
     const names = this.ownerNames(key);
@@ -518,7 +523,6 @@ export class NanocachedClient {
         value = await connection.get(key);
       } catch (error) {
         if (!isSwallowable(error)) throw error;
-        this.readRepairFailures++;
         continue;
       }
       if (value === null) continue;
@@ -871,7 +875,7 @@ export class NanocachedClient {
    * await one dial, see `reconnects`). */
   private async singleConnection(): Promise<Connection> {
     if (this.target.kind !== "single") {
-      throw new Error("nanocached: internal error — singleConnection on a cluster target");
+      throw new NanocachedError("nanocached: internal error — singleConnection on a cluster target");
     }
     if (!this.target.connection.isClosed()) return this.target.connection;
 
@@ -888,7 +892,7 @@ export class NanocachedClient {
    * read and every write leg funnels through here, per owner. */
   private async memberConnection(name: string): Promise<Connection> {
     if (this.target.kind !== "cluster") {
-      throw new Error("nanocached: internal error — memberConnection on a single target");
+      throw new NanocachedError("nanocached: internal error — memberConnection on a single target");
     }
 
     const member = this.target.members.get(name);
@@ -908,7 +912,7 @@ export class NanocachedClient {
     const current = this.target.kind === "cluster" ? this.target.members.get(name) : null;
     if (!current) {
       connection.close();
-      throw new Error(`nanocached: ${name} left the cluster while reconnecting`);
+      throw new NanocachedError(`nanocached: ${name} left the cluster while reconnecting`);
     }
     if (current.connection.isClosed()) {
       current.connection = connection;
@@ -935,7 +939,7 @@ export class NanocachedClient {
     const identified = await connectAndIdentify({ ...splitHostPort(address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
 
     if (identified.kind !== "node") {
-      throw new Error(`nanocached: ${address} no longer identifies as a cache node`);
+      throw new NanocachedError(`nanocached: ${address} no longer identifies as a cache node`);
     }
     if (this.closed) {
       identified.socket.destroy();

@@ -26,6 +26,13 @@ class WrongNodeError(NanocachedError):
         super().__init__("nanocached: this node does not hold the requested key")
 
 
+class AuthenticationError(NanocachedError):
+    """The server rejected the ``A`` handshake's secret — either no
+    ``auth_secret`` was configured for a server that requires one, or the
+    configured secret is wrong. Never transient: retrying with the same
+    configuration cannot succeed."""
+
+
 class DiscoveryBusyError(NanocachedError):
     """A discovery server answered ``L`` with ``B`` — it is inside its
     startup grace (ADR-0010), re-learning membership after a restart. Try

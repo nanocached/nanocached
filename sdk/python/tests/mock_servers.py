@@ -27,6 +27,7 @@ class MockNode:
         self.connection_count = 0
         self.get_count = 0
         self._wrong_node_replies = 0
+        self._wrong_node_on_set_replies = 0
         self._wrong_tag_replies = 0
         self._swallowed_gets = 0
         self._malformed_value_replies = 0
@@ -35,6 +36,7 @@ class MockNode:
         self._stored_to_get_replies = 0
         self._get_delay = 0.0
         self._set_delay = 0.0
+        self._silent = False
         self.last_set_ttl = 0
         self._server: asyncio.Server | None = None
         self._sockets: set[asyncio.StreamWriter] = set()
@@ -46,6 +48,13 @@ class MockNode:
 
     def answer_wrong_node_once(self) -> None:
         self._wrong_node_replies += 1
+
+    def answer_wrong_node_on_set_once(self) -> None:
+        """Reply ``W`` to the next S specifically (not G/D) — for tests
+        that need a node to keep answering GET normally while a later
+        SET against it (e.g. a read-repair write-back) fails. Mirrors
+        the .NET mock's hook of the same name."""
+        self._wrong_node_on_set_replies += 1
 
     def answer_wrong_tag_once(self) -> None:
         """Queue a one-off reply for the next G request on a tagged
@@ -83,6 +92,15 @@ class MockNode:
         """Hold every future S's response — for tests proving a caller
         isn't blocked on a slow replica leg (doc/adr/0014-*.md)."""
         self._set_delay = seconds
+
+    def go_silent_after_handshake(self) -> None:
+        """Makes this node a half-open server from this point on: it
+        still accepts and completes the ``A`` handshake, and still reads
+        every request frame off the wire (so the TCP stream stays
+        well-formed), but never writes a reply — regression coverage for
+        the request timeout (issue #42), mirroring the Go suite's hook
+        of the same name."""
+        self._silent = True
 
     async def start(self) -> "MockNode":
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
@@ -137,6 +155,8 @@ class MockNode:
                 elif parts[0] == b"G":
                     key = await reader.readexactly(int(parts[1]))
                     self.get_count += 1
+                    if self._silent:
+                        continue
                     if self._get_delay > 0:
                         delay, self._get_delay = self._get_delay, 0.0
                         await asyncio.sleep(delay)
@@ -190,9 +210,14 @@ class MockNode:
                     # after it as the last field.
                     base_field_count = 4 if tagged else 3
                     self.last_set_ttl = int(parts[3]) if len(parts) > base_field_count else 0
+                    if self._silent:
+                        continue
                     if self._set_delay > 0:
                         await asyncio.sleep(self._set_delay)
-                    if self._wrong_node_replies > 0:
+                    if self._wrong_node_on_set_replies > 0:
+                        self._wrong_node_on_set_replies -= 1
+                        writer.write(b"W" + tag_suffix + b"\n")
+                    elif self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")
                     else:
@@ -202,6 +227,8 @@ class MockNode:
 
                 elif parts[0] == b"D":
                     key = await reader.readexactly(int(parts[1]))
+                    if self._silent:
+                        continue
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")

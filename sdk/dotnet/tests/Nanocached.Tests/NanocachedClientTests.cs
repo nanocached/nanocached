@@ -144,11 +144,13 @@ public class NanocachedClientTests
             Assert.Equal("v", await client.GetAsync("k"));
         }
 
-        NanocachedException missing = await Assert.ThrowsAsync<NanocachedException>(
+        // Both shapes are matchable as AuthenticationFailedException
+        // (issue #47 item 5), not just by message.
+        AuthenticationFailedException missing = await Assert.ThrowsAsync<AuthenticationFailedException>(
             () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port)));
         Assert.Contains("requires authentication", missing.Message);
 
-        NanocachedException wrong = await Assert.ThrowsAsync<NanocachedException>(
+        AuthenticationFailedException wrong = await Assert.ThrowsAsync<AuthenticationFailedException>(
             () => NanocachedClient.ConnectAsync(
                 new NanocachedClient.Options { Addresses = { ("127.0.0.1", node.Port) }, AuthSecret = "wrong" }));
         Assert.Contains("authentication failed", wrong.Message);
@@ -392,6 +394,85 @@ public class NanocachedClientTests
         finally
         {
             NanocachedClient.KeepAliveInterval = defaultInterval;
+        }
+    }
+
+    [Fact]
+    public async Task ARequestToAHalfOpenServerFailsWithinTheTimeoutInsteadOfHanging()
+    {
+        // Regression (issue #42): a server that completes the A handshake
+        // but then never answers a G/S/D used to hang Get/Set/Delete
+        // forever — there was no in-flight request timeout at all. The
+        // internal field exists only so tests can shorten it.
+        TimeSpan defaultTimeout = Connection.RequestTimeout;
+        Connection.RequestTimeout = TimeSpan.FromMilliseconds(150);
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+            await client.SetAsync("k", "v");
+            node.GoSilentAfterHandshake();
+
+            var started = System.Diagnostics.Stopwatch.StartNew();
+            // The client's retry layer redials once after the first
+            // timeout; the redialed connection times out too, so this
+            // settles after roughly two windows — still bounded.
+            var error = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
+            Assert.Contains("request timed out", error.Message);
+            Assert.True(started.ElapsedMilliseconds < 2_000,
+                $"GetAsync took {started.ElapsedMilliseconds}ms, want well under 2s");
+        }
+        finally
+        {
+            Connection.RequestTimeout = defaultTimeout;
+        }
+    }
+
+    [Fact]
+    public async Task SteadyNewRequestsDoNotPostponeHalfOpenDetection()
+    {
+        // The deadline is progress-based: new sends must not extend it
+        // while an older request is still waiting (mirrors the Go SDK's
+        // regression test of the same name).
+        TimeSpan defaultTimeout = Connection.RequestTimeout;
+        Connection.RequestTimeout = TimeSpan.FromMilliseconds(200);
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+            await client.SetAsync("k", "v");
+            node.GoSilentAfterHandshake();
+
+            // New requests keep arriving well inside every deadline
+            // window (once the connection is poisoned they just fail
+            // fast).
+            using var stop = new CancellationTokenSource();
+            Task ticker = Task.Run(async () =>
+            {
+                while (!stop.IsCancellationRequested)
+                {
+                    await Task.Delay(50, stop.Token).ContinueWith(_ => { });
+                    try { await client.GetAsync("more"); }
+                    catch (Exception) { /* expected once poisoned */ }
+                }
+            });
+            try
+            {
+                var started = System.Diagnostics.Stopwatch.StartNew();
+                var error = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
+                Assert.Contains("request timed out", error.Message);
+                Assert.True(started.ElapsedMilliseconds < 2_000,
+                    $"GetAsync took {started.ElapsedMilliseconds}ms, want well under 2s");
+            }
+            finally
+            {
+                stop.Cancel();
+                await ticker;
+            }
+        }
+        finally
+        {
+            Connection.RequestTimeout = defaultTimeout;
         }
     }
 

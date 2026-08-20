@@ -39,6 +39,7 @@ public sealed class MockNode : IDisposable
     private int _storedToGetReplies;
     private int _wrongNodeOnSetReplies;
     private volatile int _setDelayMillis;
+    private volatile bool _silent;
     private long _lastSetTtl;
 
     public MockNode(string? requiredSecret = null, bool supportTags = false, bool closeOnExtendedAuth = false)
@@ -83,6 +84,14 @@ public sealed class MockNode : IDisposable
     /// first — for tests proving a caller isn't blocked on a slow replica
     /// leg (doc/adr/0014-*.md).</summary>
     public void DelaySets(int millis) => _setDelayMillis = millis;
+
+    /// <summary>Makes this node a half-open server from this point on: it
+    /// still accepts and completes the A handshake, and still reads every
+    /// request frame off the wire (so the TCP stream stays well-formed),
+    /// but never writes a reply — regression coverage for the request
+    /// timeout (issue #42), mirroring the Go suite's hook of the same
+    /// name.</summary>
+    public void GoSilentAfterHandshake() => _silent = true;
 
     /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
     public void DropConnections()
@@ -155,6 +164,10 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         Interlocked.Increment(ref _getCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
                         if (TakeOne(ref _swallowedGets))
                         {
                             break;
@@ -199,6 +212,10 @@ public sealed class MockNode : IDisposable
                         // sits after it as the last field.
                         int ttlFieldCount = parts.Length - (tagged ? 4 : 3);
                         _lastSetTtl = ttlFieldCount > 0 ? long.Parse(parts[3]) : 0;
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
                         if (_setDelayMillis > 0)
                         {
                             await Task.Delay(_setDelayMillis);
@@ -217,6 +234,10 @@ public sealed class MockNode : IDisposable
                     case "D":
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
                         if (TakeWrongNode())
                         {
                             await Wire.WriteAsync(stream, $"W{tag}\n");

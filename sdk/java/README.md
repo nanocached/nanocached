@@ -103,8 +103,7 @@ NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL —
-the wire protocol's `G` response never returns one to preserve — and,
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
 unlike fire-and-forget replica writes, is uncapped and not drained on
 `close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
@@ -170,6 +169,15 @@ already-closed client`) since it usually means the caller lost track of
 this client's lifecycle. Likewise, calling `connect()` again for the
 same single address while a previous connection to it is still open
 warns to stderr — `was close() forgotten?`.
+
+## Errors
+
+Every exception this SDK throws extends `NanocachedException` —
+including `AuthenticationFailed` for a rejected secret — so one catch
+clause covers "an expected nanocached failure". Caller mistakes (an
+invalid TTL, an empty address list) throw `IllegalArgumentException`
+instead: they indicate a bug in the calling code, not a nanocached
+failure, a convention shared across the SDKs (issue #47).
 
 ## Build
 

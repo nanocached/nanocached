@@ -36,6 +36,21 @@ internal sealed class Connection
     // or malicious frame, never just a legitimately large value.
     private const int MaxValueLength = 2 * 1024 * 1024;
 
+    /// <summary>Bounds how long the connection may go without progress
+    /// while requests are outstanding (issue #42) — each response must
+    /// arrive within this window of the previous one (or of its own send,
+    /// when the queue was empty): without it, a half-open server that
+    /// accepts the TCP connection but never writes back — or stops
+    /// mid-stream — would hang Get/Set/Delete forever. No
+    /// <see cref="CancellationToken"/> ever reaches the <see cref="Stream"/>
+    /// calls (see <see cref="RequestAsync"/>'s doc comment), so the
+    /// watchdog instead disposes the stream, which unblocks the read loop
+    /// with an IO error the existing poison path already handles.
+    /// Generous versus the server's own 10s outbound timeouts, and the
+    /// same 30s the Go and Rust SDKs use. Mutable only so tests can
+    /// shorten it, mirroring <c>KeepAliveInterval</c>.</summary>
+    internal static TimeSpan RequestTimeout = TimeSpan.FromSeconds(30);
+
     private readonly Stream _stream;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     /// <summary>ADR-0019: negotiated during identify — when true, every
@@ -59,6 +74,30 @@ internal sealed class Connection
     // from `synchronized`.
     private int _closedFlag;
 
+    // The reason CloseWithReason was closing for, published before the
+    // stream is disposed. The read loop wakes from that dispose with a
+    // bare ObjectDisposedException and races CloseWithReason's own drain
+    // for the oldest pending entry — whoever wins, the caller must see
+    // the *reason* (e.g. the issue-#42 request timeout), not the disposed
+    // stream's noise.
+    private volatile Exception? _closeReason;
+
+    // The progress-based request deadline (issue #42): armed when the
+    // outstanding count goes 0→1, re-armed by the read loop each time a
+    // response is dispatched with more still outstanding, cleared once
+    // nothing is. _deadlineTicks (Environment.TickCount64-based) is the
+    // authority a possibly-stale timer callback re-checks against — a
+    // Timer.Change can't recall a callback already in flight. 0 = unarmed.
+    private readonly Timer _watchdog;
+    private long _deadlineTicks;
+    private int _outstanding;
+    // Serializes arm/clear decisions against each other: without it, the
+    // read loop's "count hit 0, clear" could land *after* a concurrent
+    // writer's "count hit 1, arm" and disarm the deadline with a request
+    // still outstanding. Each decision re-reads _outstanding under this
+    // gate, so the last one to run always matches the current count.
+    private readonly object _deadlineGate = new();
+
     /// <summary><paramref name="tagged"/> (ADR-0019): whether identify
     /// negotiated tagged mode for this connection. <paramref name="onClosed"/>,
     /// when given, fires exactly once — the first time this connection
@@ -71,7 +110,60 @@ internal sealed class Connection
         _stream = stream;
         _tagged = tagged;
         _onClosed = onClosed;
+        _watchdog = new Timer(OnRequestTimeout, null, Timeout.Infinite, Timeout.Infinite);
         _ = ReadLoopAsync();
+    }
+
+    private void ArmDeadline()
+    {
+        lock (_deadlineGate)
+        {
+            if (Volatile.Read(ref _outstanding) == 0) return; // cleared concurrently
+            TimeSpan timeout = RequestTimeout;
+            Volatile.Write(ref _deadlineTicks, Environment.TickCount64 + (long)timeout.TotalMilliseconds);
+            try
+            {
+                _watchdog.Change(timeout, Timeout.InfiniteTimeSpan);
+            }
+            catch (ObjectDisposedException)
+            {
+                // CloseWithReason disposed the timer concurrently — the
+                // connection is already poisoned, nothing left to bound.
+            }
+        }
+    }
+
+    private void ClearDeadline()
+    {
+        lock (_deadlineGate)
+        {
+            if (Volatile.Read(ref _outstanding) != 0) return; // re-armed concurrently
+            Volatile.Write(ref _deadlineTicks, 0);
+            try
+            {
+                _watchdog.Change(Timeout.Infinite, Timeout.Infinite);
+            }
+            catch (ObjectDisposedException)
+            {
+                // Same benign race as in ArmDeadline.
+            }
+        }
+    }
+
+    private void OnRequestTimeout(object? _)
+    {
+        // A stale callback — the deadline was cleared or pushed forward
+        // after this fired — does nothing; the re-armed timer covers the
+        // new deadline.
+        long deadline = Volatile.Read(ref _deadlineTicks);
+        if (deadline == 0 || Environment.TickCount64 < deadline) return;
+        // Poison with the timeout as the drain reason: CloseWithReason
+        // disposes the stream, which is what actually unblocks the read
+        // loop (and any in-flight write) with an IO error, and rejects the
+        // stalled request plus everything pipelined behind it.
+        CloseWithReason(new ConnectionLostException(
+            $"nanocached: no response from server within {(long)RequestTimeout.TotalMilliseconds}ms "
+            + "(request timed out)"));
     }
 
     internal bool IsClosed => Volatile.Read(ref _closedFlag) != 0;
@@ -93,6 +185,9 @@ internal sealed class Connection
     private void CloseWithReason(Exception reason)
     {
         if (Interlocked.Exchange(ref _closedFlag, 1) != 0) return;
+        _closeReason = reason;
+        Volatile.Write(ref _deadlineTicks, 0);
+        _watchdog.Dispose();
         _stream.Dispose();
         _onClosed?.Invoke();
         while (_pending.TryDequeue(out var pending))
@@ -189,7 +284,9 @@ internal sealed class Connection
     /// runs to completion regardless of what the caller does
     /// afterward — and completing an abandoned
     /// <see cref="TaskCompletionSource{TResult}"/> that nothing is
-    /// awaiting anymore is harmless.</summary>
+    /// awaiting anymore is harmless. The await below is still bounded:
+    /// <see cref="RequestTimeout"/>'s watchdog poisons the connection
+    /// when a response stops making progress (issue #42).</summary>
     /// <param name="buildFrame">Builds the wire frame from this request's
     /// claimed tag (<c>null</c> on an untagged connection). Called inside
     /// the write-gate critical section, after the tag is claimed but
@@ -221,6 +318,15 @@ internal sealed class Connection
             uint? tag = _tagged ? ClaimTag() : null;
             byte[] frame = buildFrame(tag);
             _pending.Enqueue((tcs, tag));
+            // Armed only on the 0→1 transition: arming on *every* request
+            // would let a continuous stream of new requests push the
+            // deadline forever ahead of a server that has stopped
+            // answering — exactly the half-open hang the timeout exists
+            // to catch (issue #42).
+            if (Interlocked.Increment(ref _outstanding) == 1)
+            {
+                ArmDeadline();
+            }
             await _stream.WriteAsync(frame).ConfigureAwait(false);
             await _stream.FlushAsync().ConfigureAwait(false);
         }
@@ -271,17 +377,32 @@ internal sealed class Connection
                 // oldest pending request specifically, not the
                 // connection in general; Close() drains everyone else
                 // with a generic "connection closed" instead, since
-                // their responses were never received at all.
+                // their responses were never received at all. When the
+                // read failed because CloseWithReason disposed the stream
+                // under us, its recorded reason is the root cause and the
+                // disposed-stream error is just its echo (issue #42's CI
+                // race: this dequeue can beat CloseWithReason's drain to
+                // the stalled request).
                 if (_pending.TryDequeue(out var failed))
                 {
-                    failed.Tcs.TrySetException(error);
+                    failed.Tcs.TrySetException(_closeReason ?? error);
                 }
                 Close();
                 return;
             }
 
             bool wasEmpty = _pending.IsEmpty;
-            _pending.TryDequeue(out var pending);
+            bool dispatched = _pending.TryDequeue(out var pending);
+
+            // Progress-based deadline (see RequestAsync): a dispatched
+            // response is progress, so the next-oldest request gets a
+            // fresh window; with nothing left waiting, clear it so an
+            // otherwise-idle connection is never closed by it.
+            if (dispatched)
+            {
+                if (Interlocked.Decrement(ref _outstanding) == 0) ClearDeadline();
+                else ArmDeadline();
+            }
 
             // An unsolicited "busy" response means the server hit its
             // connection limit right after accept and is about to close
