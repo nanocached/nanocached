@@ -31,7 +31,13 @@ class NanocachedClientTest {
 
     private static void waitFor(java.util.function.BooleanSupplier condition, String what)
             throws InterruptedException {
-        long deadline = System.nanoTime() + 5_000_000_000L;
+        // Generous relative to how fast the awaited work is locally: these
+        // conditions settle in well under a second, but a loaded CI runner
+        // can stall a background leg (e.g. the read-repair writer) for
+        // several seconds, so the deadline only has to be comfortably below
+        // the 30s per-test @Timeout, not tight. Returns the instant the
+        // condition holds, so a longer deadline never slows the happy path.
+        long deadline = System.nanoTime() + 20_000_000_000L;
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) throw new AssertionError("timed out waiting for " + what);
             Thread.sleep(5);
