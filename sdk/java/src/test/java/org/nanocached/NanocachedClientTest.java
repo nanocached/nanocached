@@ -479,6 +479,45 @@ class NanocachedClientTest {
     }
 
     @Test
+    void failsOverPastASilentAddressInsteadOfHangingForever() throws Exception {
+        // Regression (issue #40): the identify exchange had no read
+        // timeout, so an address that accepts the TCP connection but
+        // never answers `A` hung connect() forever instead of failing
+        // over. It must now time out (bounded by CONNECT_TIMEOUT_MS) —
+        // and a timeout must NOT be mistaken for a pre-ADR-0019 server,
+        // which would trigger a second, equally doomed untagged dial.
+        try (MockNode node = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(
+                        List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1);
+                java.net.ServerSocket silent = new java.net.ServerSocket(0)) {
+            List<java.net.Socket> acceptedSockets =
+                    java.util.Collections.synchronizedList(new ArrayList<>());
+            Thread acceptor = new Thread(() -> {
+                try {
+                    while (true) acceptedSockets.add(silent.accept());
+                } catch (java.io.IOException ignored) {
+                    // Server socket closed.
+                }
+            }, "test-silent-accept");
+            acceptor.setDaemon(true);
+            acceptor.start();
+
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", silent.getLocalPort()),
+                            new Address("127.0.0.1", discovery.port()))))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
+            assertEquals(1, acceptedSockets.size(),
+                    "a silent peer's read timeout must not trigger the legacy-server redial");
+            synchronized (acceptedSockets) {
+                for (java.net.Socket socket : acceptedSockets) socket.close();
+            }
+        }
+    }
+
+    @Test
     void skipsAWarmingUpAddress() throws Exception {
         try (MockNode node = new MockNode();
                 MockDiscovery warming = new MockDiscovery(
@@ -933,7 +972,8 @@ class NanocachedClientTest {
 
                 // A "new" node that accepts the TCP connection but never
                 // answers identify: the refresh's dial to it blocks until
-                // the socket is closed below.
+                // the socket is closed below (or the issue-#40 identify
+                // read timeout fires, whichever comes first).
                 try (java.net.ServerSocket silent = new java.net.ServerSocket(0)) {
                     // The dial may connect more than once (the ADR-0019
                     // legacy fallback redials after the first connection
