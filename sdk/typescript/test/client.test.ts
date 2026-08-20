@@ -1,7 +1,15 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
+import {
+  AlreadyClosedError,
+  ConnectionLostError,
+  DecompressionError,
+  DiscoveryBusyError,
+  NanocachedClient,
+  NanocachedError,
+  WrongNodeError,
+} from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING } from "../src/client.js";
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
@@ -865,6 +873,39 @@ describe("NanocachedClient keep-alive", () => {
       } finally {
         client.close();
       }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedError base class (issue #44)", () => {
+  it("parents every SDK error class onto one catchable family", () => {
+    // Callers can catch "an expected nanocached failure" with a single
+    // `instanceof NanocachedError`, like the other five SDKs' base
+    // type/enum/sentinels allow.
+    assert.ok(new AlreadyClosedError() instanceof NanocachedError);
+    assert.ok(new WrongNodeError() instanceof NanocachedError);
+    assert.ok(new ConnectionLostError("x") instanceof NanocachedError);
+    assert.ok(new DecompressionError("x") instanceof NanocachedError);
+    assert.ok(new DiscoveryBusyError() instanceof NanocachedError);
+    // Still Errors too — existing instanceof checks keep passing.
+    assert.ok(new WrongNodeError() instanceof Error);
+  });
+
+  it("classifies an auth failure as a NanocachedError", async () => {
+    // Auth failure used to be a plain Error — outside any catchable
+    // family.
+    const node = await startMockNode({ requiredSecret: "s3cret" });
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: node.port }],
+          authSecret: "wrong",
+        }),
+        (error: unknown) =>
+          error instanceof NanocachedError && /authentication failed/.test((error as Error).message),
+      );
     } finally {
       await node.close();
     }

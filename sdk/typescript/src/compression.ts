@@ -1,4 +1,5 @@
 import { deflateRawSync, inflateRawSync } from "node:zlib";
+import { NanocachedError } from "./errors.js";
 
 // doc/adr/0013-*.md: the one-byte marker every value carries once
 // `compress` is enabled on this client — 0x00 for "stored as-is" (below
@@ -20,7 +21,7 @@ const MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024;
  * sharing this key (see doc/adr/0013-*.md's compatibility caveat: every
  * client touching a given keyspace must agree on `compress`), not a
  * transient failure. */
-export class DecompressionError extends Error {
+export class DecompressionError extends NanocachedError {
   constructor(message: string) {
     super(message);
     this.name = "DecompressionError";

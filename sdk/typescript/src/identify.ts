@@ -1,6 +1,7 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { ConnectionLostError } from "./connection.js";
+import { NanocachedError } from "./errors.js";
 import { CONNECT_DEADLINE_MS, connectSocket } from "./socket.js";
 
 export interface IdentifyOptions {
@@ -114,7 +115,7 @@ function readFrame<T>(
 
       if (maxBufferLength !== undefined && buffer.length > maxBufferLength) {
         cleanup();
-        reject(new Error("nanocached: discovery response exceeds maximum size (connection desynced)"));
+        reject(new NanocachedError("nanocached: discovery response exceeds maximum size (connection desynced)"));
       }
     };
     const onError = (error: Error) => {
@@ -123,7 +124,7 @@ function readFrame<T>(
     };
     const onClose = () => {
       cleanup();
-      reject(new Error("nanocached: connection closed before the expected response arrived"));
+      reject(new NanocachedError("nanocached: connection closed before the expected response arrived"));
     };
 
     socket.on("data", onData);
@@ -154,7 +155,7 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
 
   const accepted = status === 0x4f /* 'O' */;
   if (!accepted && status !== 0x45 /* 'E' */) {
-    throw new Error("nanocached: unexpected response to A");
+    throw new NanocachedError("nanocached: unexpected response to A");
   }
 
   let tagged: boolean;
@@ -163,23 +164,23 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   } else if (buf[2] === 0x54 /* 'T' */) {
     if (buf.length < 4) return null;
     if (buf[3] !== 0x0a) {
-      throw new Error("nanocached: unexpected response to A");
+      throw new NanocachedError("nanocached: unexpected response to A");
     }
     tagged = true;
   } else {
-    throw new Error("nanocached: unexpected response to A");
+    throw new NanocachedError("nanocached: unexpected response to A");
   }
 
   if (type === 0x6e /* 'n' */) return { accepted, kind: "node", tagged };
   if (type === 0x64 /* 'd' */) return { accepted, kind: "cluster", tagged };
-  throw new Error("nanocached: unexpected response to A");
+  throw new NanocachedError("nanocached: unexpected response to A");
 }
 
 /** Thrown when a discovery server answers `L` with `B` — it is inside its
  * startup grace (ADR-0010), re-learning cluster membership after a
  * restart, and refuses to serve a possibly-partial node list. The caller
  * should try another address, or retry shortly. */
-export class DiscoveryBusyError extends Error {
+export class DiscoveryBusyError extends NanocachedError {
   constructor() {
     super("nanocached: the discovery server is warming up after a restart");
     this.name = "DiscoveryBusyError";
@@ -207,7 +208,7 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
     // malicious server withholding the LF forever must not be able to
     // buffer this unboundedly (issue #12 follow-up).
     if (buf.length > MAX_NODE_LIST_HEADER_LENGTH) {
-      throw new Error("nanocached: invalid node-list header in discovery response (missing header terminator)");
+      throw new NanocachedError("nanocached: invalid node-list header in discovery response (missing header terminator)");
     }
     return null;
   }
@@ -217,23 +218,23 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
   }
 
   if (buf[0] !== 0x4e /* 'N' */) {
-    throw new Error(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
+    throw new NanocachedError(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
   }
 
   // `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
   const header = buf.subarray(2, headerEnd).toString("ascii").split(" ");
   if (header.length !== 2) {
-    throw new Error("nanocached: invalid node-list header in discovery response");
+    throw new NanocachedError("nanocached: invalid node-list header in discovery response");
   }
 
   const count = Number(header[0]);
   if (!Number.isInteger(count) || count < 0 || count > MAX_NODE_COUNT) {
-    throw new Error("nanocached: invalid node count in discovery response");
+    throw new NanocachedError("nanocached: invalid node count in discovery response");
   }
 
   const replication = Number(header[1]);
   if (!Number.isInteger(replication) || replication < 1) {
-    throw new Error("nanocached: invalid replication factor in discovery response");
+    throw new NanocachedError("nanocached: invalid replication factor in discovery response");
   }
 
   const nodes: DiscoveredNode[] = [];
@@ -243,14 +244,14 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
     const entryHeaderEnd = buf.indexOf(0x0a, offset);
     if (entryHeaderEnd === -1) {
       if (buf.length - offset > MAX_NODE_ENTRY_HEADER_LENGTH) {
-        throw new Error("nanocached: invalid node entry header in discovery response (missing header terminator)");
+        throw new NanocachedError("nanocached: invalid node entry header in discovery response (missing header terminator)");
       }
       return null;
     }
 
     const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
     if (lengths.length !== 2) {
-      throw new Error("nanocached: invalid node entry header in discovery response");
+      throw new NanocachedError("nanocached: invalid node entry header in discovery response");
     }
 
     const nameLength = Number(lengths[0]);
@@ -263,7 +264,7 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
       addrLength < 0 ||
       addrLength > MAX_NODE_FIELD_LENGTH
     ) {
-      throw new Error("nanocached: invalid node entry lengths in discovery response");
+      throw new NanocachedError("nanocached: invalid node entry lengths in discovery response");
     }
 
     const nameStart = entryHeaderEnd + 1;
@@ -273,7 +274,7 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
 
     if (buf.length < entryEnd) return null;
     if (buf[addrEnd] !== 0x0a) {
-      throw new Error("nanocached: malformed node entry in discovery response");
+      throw new NanocachedError("nanocached: malformed node entry in discovery response");
     }
 
     nodes.push({
@@ -341,11 +342,11 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Pro
   if (!identity.accepted) {
     socket.destroy();
     if (options.authSecret === undefined) {
-      throw new Error(
+      throw new NanocachedError(
         `nanocached: ${options.host}:${options.port} requires authentication, but no authSecret was provided`,
       );
     }
-    throw new Error("nanocached: authentication failed");
+    throw new NanocachedError("nanocached: authentication failed");
   }
 
   if (identity.kind === "node") {

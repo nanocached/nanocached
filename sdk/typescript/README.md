@@ -228,6 +228,14 @@ operations are idempotent). There is nothing to configure.
   `AlreadyClosedError`; a second `close()` warns but stays idempotent
 - `client.nodeUrls` — addresses currently connected to (introspection)
 
+Every error the SDK itself raises — `AlreadyClosedError`,
+`WrongNodeError`, `ConnectionLostError`, `DecompressionError`,
+`DiscoveryBusyError`, and protocol/auth failures — extends the exported
+`NanocachedError` base class, so `error instanceof NanocachedError`
+distinguishes an expected nanocached failure from everything else. Node
+system errors from the socket itself (`ECONNREFUSED`, `ECONNRESET`, …)
+surface as-is, outside the family.
+
 ## License
 
 MIT

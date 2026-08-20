@@ -6,6 +6,8 @@
  * only ever carries `G`/`S`/`D` requests and their responses.
  */
 
+import { NanocachedError } from "./errors.js";
+
 function toAscii(text: string): Buffer {
   return Buffer.from(text, "ascii");
 }
@@ -92,7 +94,7 @@ const LF = 0x0a;
 function parseTag(field: string): number {
   const tag = Number(field);
   if (!Number.isInteger(tag) || tag < 0 || tag > MAX_TAG) {
-    throw new Error("nanocached: invalid response tag");
+    throw new NanocachedError("nanocached: invalid response tag");
   }
   return tag;
 }
@@ -120,12 +122,12 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
       const headerEnd = buf.indexOf(LF);
       if (headerEnd === -1) {
         if (buf.length > MAX_TAGGED_FIXED_FRAME_LENGTH) {
-          throw new Error("nanocached: invalid tagged response (missing terminator)");
+          throw new NanocachedError("nanocached: invalid tagged response (missing terminator)");
         }
         return null;
       }
       if (buf[1] !== 0x20 /* ' ' */) {
-        throw new Error("nanocached: response is missing its tag (connection desynced)");
+        throw new NanocachedError("nanocached: response is missing its tag (connection desynced)");
       }
 
       const tag = parseTag(buf.subarray(2, headerEnd).toString("ascii"));
@@ -141,7 +143,7 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         // Keep waiting only while the header could still turn out legal;
         // beyond MAX_VALUE_HEADER_LENGTH with no LF, it never will.
         if (buf.length > MAX_VALUE_HEADER_LENGTH + (tagged ? 1 + String(MAX_TAG).length : 0)) {
-          throw new Error("nanocached: invalid value length in response (missing header terminator)");
+          throw new NanocachedError("nanocached: invalid value length in response (missing header terminator)");
         }
         return null;
       }
@@ -149,14 +151,14 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
       // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019).
       const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
       if (fields.length !== (tagged ? 2 : 1)) {
-        throw new Error("nanocached: invalid value header in response");
+        throw new NanocachedError("nanocached: invalid value header in response");
       }
 
       const length = Number(fields[0]);
       // Lengths beyond the server's own 1 MiB request cap are protocol
       // garbage — reject before buffering toward them (issue #12).
       if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
-        throw new Error("nanocached: invalid value length in response");
+        throw new NanocachedError("nanocached: invalid value length in response");
       }
 
       const tag = tagged ? parseTag(fields[1]) : undefined;
@@ -172,6 +174,6 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
     }
 
     default:
-      throw new Error(`nanocached: unexpected response from server: ${String.fromCharCode(buf[0])}`);
+      throw new NanocachedError(`nanocached: unexpected response from server: ${String.fromCharCode(buf[0])}`);
   }
 }

@@ -1,5 +1,6 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
+import { NanocachedError } from "./errors.js";
 import {
   encodeDelete,
   encodeGet,
@@ -40,7 +41,7 @@ export const REQUEST_TIMEOUT_TUNING = { timeoutMs: 30_000 };
  * `NanocachedClient.get`/`set`/`delete` normally need to handle themselves
  * unless they're bypassing that retry (e.g. by calling a single `Connection`
  * directly). */
-export class WrongNodeError extends Error {
+export class WrongNodeError extends NanocachedError {
   constructor() {
     super("nanocached: this node no longer owns the requested key");
     this.name = "WrongNodeError";
@@ -51,7 +52,7 @@ export class WrongNodeError extends Error {
  * from under a request. In cluster mode the client treats this like `W` —
  * refresh the node list and retry once — since the usual cause is a node
  * death that discovery has since noticed. */
-export class ConnectionLostError extends Error {
+export class ConnectionLostError extends NanocachedError {
   constructor(message: string) {
     super(message);
     this.name = "ConnectionLostError";
@@ -228,7 +229,7 @@ export class Connection {
         // malicious server can't wedge this open by trickling bytes that
         // never assemble into a parseable frame (issue #12 follow-up).
         if (buffer.length > MAX_RESPONSE_FRAME_LENGTH) {
-          this.lastError = new Error("nanocached: response frame exceeds maximum size (connection desynced)");
+          this.lastError = new NanocachedError("nanocached: response frame exceeds maximum size (connection desynced)");
           this.socket.destroy();
           return;
         }
@@ -247,7 +248,7 @@ export class Connection {
       // limit right after accept and is about to close the connection; it
       // isn't an answer to anything we sent.
       if (parsed.response.kind === "busy" && this.pending.length === 0) {
-        this.lastError = new Error("nanocached: server rejected the connection (connection limit reached)");
+        this.lastError = new NanocachedError("nanocached: server rejected the connection (connection limit reached)");
         continue;
       }
 
