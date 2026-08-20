@@ -389,7 +389,7 @@ async fn round_trips_set_get_delete() {
     assert!(!client.delete("greeting").await.unwrap());
     assert_eq!(client.replication().await, 1);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -409,7 +409,7 @@ async fn wire_format_is_untouched_when_compress_is_off() {
     );
     assert_eq!(client.get("k").await.unwrap(), Some(value));
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -442,7 +442,7 @@ async fn compresses_at_or_above_the_threshold_and_decompresses_back() {
         Some(value.into_bytes())
     );
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -464,7 +464,7 @@ async fn below_threshold_value_is_prefixed_but_not_compressed() {
     );
     assert_eq!(client.get("k").await.unwrap(), Some("short".to_string()));
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -495,7 +495,7 @@ async fn incompressible_data_passes_through_unbloated() {
     );
     assert_eq!(client.get_bytes("k").await.unwrap(), Some(value));
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -515,7 +515,7 @@ async fn reading_a_legacy_value_with_compress_enabled_errors_clearly() {
         .set("k", vec![0x01u8, 0xFF, 0xFF, 0xFF, 0xFF], 0)
         .await
         .unwrap();
-    writer.close();
+    writer.close().await;
 
     let reader = NanocachedClient::connect(options(node.port).compress(true))
         .await
@@ -525,7 +525,7 @@ async fn reading_a_legacy_value_with_compress_enabled_errors_clearly() {
         Err(Error::Decompression(_))
     ));
 
-    reader.close();
+    reader.close().await;
     node.stop();
 }
 
@@ -539,7 +539,7 @@ async fn get_bytes_round_trips_non_utf8_values() {
     assert_eq!(client.get_bytes("binary").await.unwrap(), Some(value));
     assert_eq!(client.get_bytes("missing").await.unwrap(), None);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -560,7 +560,7 @@ async fn get_rejects_a_non_utf8_value_with_strict_decoding() {
         Some(vec![0xff, 0xfe])
     );
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -586,7 +586,7 @@ async fn ttl_zero_means_no_expiry_and_omits_the_ttl_field_on_the_wire() {
     );
     assert!(header.ends_with(" 60"), "{header:?}");
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -624,7 +624,7 @@ async fn pipelines_concurrent_requests_on_one_connection() {
         assert_eq!(task.await.unwrap().unwrap(), Some(format!("value-{i}")));
     }
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -641,7 +641,7 @@ async fn authenticates() {
         .unwrap();
     client.set("k", "v", 0).await.unwrap();
     assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
-    client.close();
+    client.close().await;
 
     let missing = NanocachedClient::connect(options(node.port)).await;
     assert!(missing
@@ -665,7 +665,7 @@ async fn wrong_node_propagates_in_single_mode() {
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
     node.state.wrong_node_replies.fetch_add(1, Ordering::SeqCst);
     assert!(matches!(client.get("k").await, Err(Error::WrongNode)));
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -673,8 +673,8 @@ async fn wrong_node_propagates_in_single_mode() {
 async fn rejects_use_after_close() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
-    client.close();
-    client.close(); // idempotent (also warns on stderr — see
+    client.close().await;
+    client.close().await; // idempotent (also warns on stderr — see
                     // close_called_twice_warns_once_on_stderr, which
                     // captures that separately since this harness
                     // doesn't otherwise observe it).
@@ -719,7 +719,7 @@ async fn a_malformed_value_length_poisons_the_connection_and_retries_transparent
     assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -743,7 +743,7 @@ async fn a_mismatched_response_kind_poisons_the_connection() {
     assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -772,7 +772,7 @@ async fn an_abandoned_request_future_does_not_poison_the_connection() {
     assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -795,7 +795,7 @@ async fn transparently_reconnects_after_a_server_fin() {
     // connection surfaces as ConnectionLost after the node is gone.
     let result = client.get("k").await;
     assert!(matches!(result, Err(Error::ConnectionLost(_))));
-    client.close();
+    client.close().await;
 }
 
 #[tokio::test]
@@ -820,7 +820,7 @@ async fn keep_alive_pings_an_idle_connection() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -858,7 +858,7 @@ async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_retu
         started.elapsed()
     );
 
-    client.close(); // must return promptly, not hang on the dead connection
+    client.close().await; // must return promptly, not hang on the dead connection
     node.stop();
 }
 
@@ -880,7 +880,7 @@ async fn fails_over_to_the_second_address() {
     .unwrap();
     client.set("k", "v", 0).await.unwrap();
     assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
-    client.close();
+    client.close().await;
     discovery.stop();
     node.stop();
 }
@@ -991,7 +991,7 @@ async fn routes_and_reads_its_own_writes() {
     assert_eq!(sizes.iter().sum::<usize>(), 50);
     assert!(sizes.iter().all(|size| *size > 0), "{sizes:?}");
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1024,7 +1024,7 @@ async fn wrong_node_triggers_refresh_and_one_retry() {
         Err(Error::WrongNode)
     ));
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1052,7 +1052,7 @@ async fn fans_writes_out_to_every_owner() {
         }
     }
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1081,7 +1081,7 @@ async fn reads_fail_over_when_the_primary_dies() {
         Some("still here".to_string())
     );
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1113,7 +1113,7 @@ async fn a_dead_replica_does_not_fail_writes() {
         .unwrap()
         .contains_key(&b"written-anyway".to_vec()));
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1151,7 +1151,7 @@ async fn writes_route_around_a_dead_primary_once_discovery_drops_it() {
     client.set(key, "v", 0).await.unwrap();
     assert_eq!(client.get(key).await.unwrap(), Some("v".to_string()));
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1185,8 +1185,8 @@ async fn close_called_twice_warns_once_on_stderr() {
     if std::env::var_os(CHILD_ENV).is_some() {
         let node = MockNode::start().await;
         let client = NanocachedClient::connect(options(node.port)).await.unwrap();
-        client.close();
-        client.close(); // the second call must warn, exactly once
+        client.close().await;
+        client.close().await; // the second call must warn, exactly once
         node.stop();
         return;
     }
@@ -1207,8 +1207,8 @@ async fn connect_after_forgetting_close_warns_on_stderr() {
         // `first` is deliberately never closed before reconnecting to the
         // same single address.
         let second = NanocachedClient::connect(options(node.port)).await.unwrap();
-        second.close();
-        first.close();
+        second.close().await;
+        first.close().await;
         node.stop();
         return;
     }
@@ -1238,7 +1238,7 @@ async fn fans_deletes_out_to_every_owner() {
             .contains_key(&b"gone-everywhere".to_vec()));
     }
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1280,7 +1280,7 @@ async fn by_default_a_write_still_waits_for_the_replica_leg() {
         "set() should have waited for the replica"
     );
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1323,7 +1323,7 @@ async fn fire_and_forget_replicas_returns_as_soon_as_the_primary_acks() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1372,7 +1372,7 @@ async fn fire_and_forget_replicas_falls_back_to_synchronous_past_the_cap() {
         "expected at least one call to return fast (below the cap): {elapsed:?}"
     );
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1393,23 +1393,20 @@ async fn close_drains_in_flight_background_replica_writes() {
         .unwrap();
 
     client.set("k", "v", 0).await.unwrap();
-    client.close(); // should not abandon the still-in-flight replica write
+    // The drain contract (ADR-0014 as amended by issue #47 item 3):
+    // close() returns only after the in-flight replica write finished.
+    client.close().await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let replica = node_by_name(&nodes, &owners[1]);
-    while !replica
-        .state
-        .store
-        .lock()
-        .unwrap()
-        .contains_key(&b"k".to_vec())
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "close() returned before the background replica write finished"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    assert!(
+        replica
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .contains_key(&b"k".to_vec()),
+        "close() returned before the background replica write finished"
+    );
 
     discovery.stop();
     for (_, node) in nodes {
@@ -1442,7 +1439,7 @@ async fn by_default_a_clean_miss_on_the_primary_is_not_repaired() {
         .unwrap()
         .contains_key(b"k".as_slice()));
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1490,7 +1487,7 @@ async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
         "repair TTL should be READ_REPAIR_TTL (60s), not immortal (ttl_seconds 0)"
     );
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1506,7 +1503,7 @@ async fn stays_a_clean_miss_when_no_owner_has_the_value() {
 
     assert_eq!(client.get_bytes("nowhere").await.unwrap(), None);
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1538,7 +1535,7 @@ async fn a_dead_replica_counts_a_replica_write_failure_in_stats() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1580,7 +1577,7 @@ async fn a_failed_repair_write_counts_a_read_repair_failure_in_stats() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    client.close();
+    client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
@@ -1610,7 +1607,7 @@ async fn refresh_against_an_unreachable_discovery_seed_counts_a_refresh_failure_
         "refresh_failures was never counted"
     );
 
-    client.close();
+    client.close().await;
     for (_, node) in nodes {
         node.stop();
     }
@@ -1658,7 +1655,7 @@ async fn tags_round_trip_pipelined_requests_on_a_tagged_connection() {
     assert!(client.delete("key-0").await.unwrap());
     assert!(!client.delete("key-0").await.unwrap());
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -1698,7 +1695,7 @@ async fn tags_catch_an_off_by_one_desync_before_any_caller_sees_wrong_data() {
     assert_eq!(second.unwrap(), Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -1722,7 +1719,7 @@ async fn a_response_echoing_the_wrong_tag_poisons_the_connection() {
     assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
-    client.close();
+    client.close().await;
     node.stop();
 }
 
@@ -1744,6 +1741,6 @@ async fn falls_back_to_the_untagged_protocol_against_a_pre_0019_server() {
     // plain fallback that stuck.
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
-    client.close();
+    client.close().await;
     node.stop();
 }

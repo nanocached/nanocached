@@ -417,7 +417,13 @@ export class NanocachedClient {
     return this.closed;
   }
 
-  close(): void {
+  /** Resolves only after every in-flight background replica write has
+   * finished and the connections are torn down (doc/adr/0014-*.md as
+   * amended by issue #47 item 3 — the drain contract every SDK now
+   * shares). Callers that don't await keep the old fire-and-forget
+   * behavior: `closed` flips synchronously, and teardown still happens
+   * once the drain settles. */
+  async close(): Promise<void> {
     // Still idempotent (not an error, matching how socket.destroy() itself
     // behaves on an already-destroyed socket) — but a second close() is
     // usually a sign the caller lost track of this instance's lifecycle,
@@ -433,13 +439,8 @@ export class NanocachedClient {
       this.keepAliveTimer = null;
     }
 
-    // doc/adr/0014-*.md: give background replica writes a chance to
-    // finish before their connections are torn out from under them —
-    // close() stays synchronous (it already can't block on this
-    // runtime), so the teardown itself is just deferred, not awaited.
     if (this.backgroundReplicaWrites.size > 0) {
-      void Promise.allSettled([...this.backgroundReplicaWrites]).then(() => this.teardownConnections());
-      return;
+      await Promise.allSettled([...this.backgroundReplicaWrites]);
     }
     this.teardownConnections();
   }

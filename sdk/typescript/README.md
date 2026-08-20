@@ -224,8 +224,11 @@ operations are idempotent). There is nothing to configure.
 - `client.set(key, value, ttlSeconds = 0)` — `ttlSeconds` must be a
   non-negative integer; 0 (the default) means no expiry
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
-- `client.close()` — closes all connections; later calls reject with
-  `AlreadyClosedError`; a second `close()` warns but stays idempotent
+- `client.close()` — resolves (`Promise<void>`) after any in-flight
+  background replica writes finish and all connections are closed; later
+  calls reject with `AlreadyClosedError`; a second `close()` warns but
+  stays idempotent. Awaiting it is optional — un-awaited, teardown still
+  happens once the drain settles
 - `client.nodeUrls` — addresses currently connected to (introspection)
 
 Every error the SDK itself raises — `AlreadyClosedError`,

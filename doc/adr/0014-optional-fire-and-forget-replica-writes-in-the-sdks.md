@@ -4,7 +4,14 @@ Date: 2026-08-19
 
 ## Status
 
-Accepted
+Accepted. Amended 2026-08-20 (issue #47 item 3): the close-draining
+split described below is superseded — `close()` now **drains** in every
+SDK, returning (or resolving) only after every in-flight background
+replica write has finished and the connections are torn down. Rust's
+`close()` became `async`, Python's a coroutine (the aiohttp
+`ClientSession.close` shape), and TypeScript's returns `Promise<void>`
+(un-awaited callers keep the old behavior: teardown still happens once
+the drain settles). The original text is kept below for the record.
 
 ## Context
 
@@ -130,6 +137,12 @@ Harder / risks to mitigate:
   not an oversight. The externally observable guarantee is the same in
   both groups: a background replica write that had already started is
   given the chance to finish before its connection is torn down.
+  *Superseded by the 2026-08-20 amendment (Status): the defer camp's
+  close() went async so it can genuinely await the drain — the contract
+  is now uniform: close() completes only after in-flight background
+  replica writes finish. The remaining caveat is on the caller: a
+  process that exits without awaiting/waiting for close() can still lose
+  in-flight legs, in any SDK.*
 - Every SDK's shared test matrix gains cases for: default-off behavior
   unchanged, a write returning before a slow replica leg completes when
   enabled, the 32-slot degrade-to-synchronous path, and close() not

@@ -19,7 +19,7 @@ let value: Option<String> = client.get("greeting").await?;
 let bytes: Option<Vec<u8>> = client.get_bytes("greeting").await?; // raw bytes, no UTF-8 check
 let existed: bool = client.delete("greeting").await?;
 
-client.close();
+client.close().await;
 ```
 
 Keys and values are anything `AsRef<[u8]>`. `get` decodes the stored
@@ -84,9 +84,9 @@ client's own writes — it carries no wire format, and different clients
 may use different settings freely. At most 32 replica writes across the
 whole client run in the background at once; past that cap, further
 replica legs run synchronously exactly as with the option off (a
-graceful degrade, not a queue or a drop). `close()` gives any
-still-in-flight background replica writes a chance to finish before
-tearing down their connections.
+graceful degrade, not a queue or a drop). `close()` is async and
+returns only after any still-in-flight background replica writes have
+finished and the connections are torn down.
 
 ## Read repair
 

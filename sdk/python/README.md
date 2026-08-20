@@ -30,7 +30,7 @@ async def main():
     print(value)                           # hello
     existed = await client.delete("greeting")  # bool
 
-    client.close()
+    await client.close()
 
 asyncio.run(main())
 ```
@@ -182,8 +182,10 @@ media, random bytes) is passed through unchanged rather than bloated.
   only their own network latency, not everyone else's ahead of them.
 - This SDK speaks the current wire protocol (rendezvous hashing,
   replication-aware `L`/`W`); it requires an up-to-date server.
-- `close()` is idempotent, but calling it again on an already-closed
-  client prints a warning to stderr — usually a sign the client's
+- `close()` is a coroutine (like aiohttp's `ClientSession.close`): it
+  returns only after any in-flight background replica writes finish and
+  every connection is torn down. It is idempotent, but calling it again
+  on an already-closed client prints a warning to stderr — usually a sign the client's
   lifecycle was mismanaged. Likewise, calling `connect()` again for the
   same single address while a previous connection to it is still open
   prints a warning ("was close() forgotten?"); this check is skipped for

@@ -1310,9 +1310,10 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
       replica.mock.delaySets(80);
 
       await client.set("k", "v");
-      client.close(); // should not abandon the still-in-flight replica write
-
-      await waitFor(() => replica.mock.store.has("k"), "Close() to drain the background replica write");
+      // The drain contract (ADR-0014 as amended by issue #47 item 3):
+      // close() resolves only after the in-flight replica write finished.
+      await client.close();
+      assert.ok(replica.mock.store.has("k"), "close() resolved before the background replica write finished");
     } finally {
       await cluster.close();
     }

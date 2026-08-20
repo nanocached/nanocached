@@ -52,7 +52,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await client.get("greeting"))
             self.assertFalse(await client.delete("greeting"))
         finally:
-            client.close()
+            await client.close()
 
     async def test_get_returns_a_decoded_string(self):
         client = await self.connect()
@@ -62,7 +62,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(value, str)
             self.assertEqual(value, "hello")
         finally:
-            client.close()
+            await client.close()
 
     async def test_get_raises_on_invalid_utf8(self):
         client = await self.connect()
@@ -73,7 +73,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             # get_bytes must still hand back the raw, undecoded value.
             self.assertEqual(await client.get_bytes(b"bad-utf8"), b"\xff\xfe")
         finally:
-            client.close()
+            await client.close()
 
     async def test_get_bytes_round_trips_byte_values(self):
         client = await self.connect()
@@ -82,7 +82,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.get_bytes(b"\x01\x02"), b"\x00\xff")
             self.assertIsNone(await client.get_bytes("missing"))
         finally:
-            client.close()
+            await client.close()
 
     async def test_handles_binary_and_empty_values(self):
         client = await self.connect()
@@ -92,7 +92,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             await client.set("empty", "")
             self.assertEqual(await client.get("empty"), "")
         finally:
-            client.close()
+            await client.close()
 
     async def test_ttl_zero_means_no_expiry(self):
         client = await self.connect()
@@ -102,7 +102,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             await client.set("k", "v", ttl_seconds=0)
             self.assertEqual(await client.get("k"), "v")
         finally:
-            client.close()
+            await client.close()
 
     async def test_pipelines_concurrent_requests_on_one_connection(self):
         # Same shape as the TypeScript SDK's own pipelining test: N
@@ -117,7 +117,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             for i, value in enumerate(values):
                 self.assertEqual(value, f"value-{i}")
         finally:
-            client.close()
+            await client.close()
 
     async def test_ttl_validation_is_synchronous(self):
         client = await self.connect()
@@ -129,7 +129,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             # The rejected set must not have poisoned the connection.
             self.assertEqual(await client.get("k"), "v")
         finally:
-            client.close()
+            await client.close()
 
     async def test_authentication(self):
         secure = await MockNode(required_secret=b"s3cret").start()
@@ -141,7 +141,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
             finally:
-                client.close()
+                await client.close()
 
             # Both shapes are matchable as AuthenticationError (issue #47
             # item 5), not just by message.
@@ -166,12 +166,12 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(WrongNodeError):
                 await client.get("k")
         finally:
-            client.close()
+            await client.close()
 
     async def test_rejects_use_after_close(self):
         client = await self.connect()
-        client.close()
-        client.close()  # idempotent
+        await client.close()
+        await client.close()  # idempotent
         self.assertTrue(client.closed)
         with self.assertRaises(AlreadyClosedError):
             await client.get("k")
@@ -181,7 +181,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertEqual(client.replication, 1)
         finally:
-            client.close()
+            await client.close()
 
 
 class CompressionTests(unittest.IsolatedAsyncioTestCase):
@@ -204,7 +204,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.node.store[b"k"], value.encode("utf-8"))
             self.assertEqual(await client.get("k"), value)
         finally:
-            client.close()
+            await client.close()
 
     async def test_compresses_at_or_above_the_threshold_and_decompresses_back(self):
         client = await self.connect(compress=True, compression_threshold=64)
@@ -219,7 +219,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.get("k"), value)
             self.assertEqual(await client.get_bytes("k"), value.encode("utf-8"))
         finally:
-            client.close()
+            await client.close()
 
     async def test_below_threshold_value_is_prefixed_but_not_compressed(self):
         client = await self.connect(compress=True, compression_threshold=256)
@@ -228,7 +228,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.node.store[b"k"], bytes([0x00]) + b"short")
             self.assertEqual(await client.get("k"), "short")
         finally:
-            client.close()
+            await client.close()
 
     async def test_incompressible_data_passes_through_unbloated(self):
         client = await self.connect(compress=True, compression_threshold=16)
@@ -238,7 +238,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.node.store[b"k"], bytes([0x00]) + value)
             self.assertEqual(await client.get_bytes("k"), value)
         finally:
-            client.close()
+            await client.close()
 
     async def test_reading_a_legacy_value_with_compress_enabled_raises_clearly(self):
         writer = await self.connect()
@@ -249,14 +249,14 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
             # other clients still touch without it.
             await writer.set("k", bytes([0x01, 2, 3, 4]))
         finally:
-            writer.close()
+            await writer.close()
 
         reader = await self.connect(compress=True)
         try:
             with self.assertRaises(DecompressionError):
                 await reader.get_bytes("k")
         finally:
-            reader.close()
+            await reader.close()
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
@@ -274,7 +274,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await client.get("k"), "v")
                 self.assertEqual(node.connection_count, 2)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -293,7 +293,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(value == "v" for value in values))
                 self.assertEqual(node.connection_count, 2, "redial was not shared")
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -315,7 +315,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await client.get("k"), "v")
                 self.assertEqual(node.connection_count, 2)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -350,7 +350,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                     "the connection to be closed",
                 )
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -371,7 +371,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await client.get("k"), "v")
                 self.assertEqual(node.connection_count, 2)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -397,7 +397,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await client.get("k"), "v")
                 self.assertEqual(node.connection_count, 1)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -434,7 +434,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         try:
             client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
             before = node.connection_count
-            client.close()
+            await client.close()
             await client._refresh_node_list()
             self.assertEqual(node.connection_count, before)
         finally:
@@ -532,7 +532,7 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
                 await wait_for(lambda: node.get_count >= 2, "keep-alive pings")
                 self.assertEqual(node.connection_count, 1)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -542,7 +542,7 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
             self._client_module._KEEPALIVE_INTERVAL = 0.02
             client = await NanocachedClient.connect([("127.0.0.1", node.port)])
             await wait_for(lambda: node.get_count >= 1, "a keep-alive ping")
-            client.close()
+            await client.close()
             pings = node.get_count
             await asyncio.sleep(0.1)
             self.assertEqual(node.get_count, pings)
@@ -583,7 +583,7 @@ class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     await client.get("k")
                 self.assertLess(asyncio.get_running_loop().time() - started, 2.0)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -619,7 +619,7 @@ class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     with contextlib.suppress(asyncio.CancelledError):
                         await ticker
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -641,7 +641,7 @@ class AddressesTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             await node.close()
@@ -659,7 +659,7 @@ class AddressesTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
             finally:
-                client.close()
+                await client.close()
         finally:
             await warming.close()
             await healthy.close()
@@ -685,10 +685,10 @@ class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
         node = await MockNode().start()
         try:
             client = await NanocachedClient.connect([("127.0.0.1", node.port)])
-            client.close()  # the real close — must not warn
+            await client.close()  # the real close — must not warn
             captured = io.StringIO()
             with contextlib.redirect_stderr(captured):
-                client.close()  # the forgotten second close — warns once
+                await client.close()  # the forgotten second close — warns once
             self.assertTrue(client.closed)
             warnings = captured.getvalue().count(
                 "close() called again on an already-closed client"
@@ -711,9 +711,9 @@ class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
                         captured.getvalue(),
                     )
                 finally:
-                    second.close()
+                    await second.close()
             finally:
-                first.close()
+                await first.close()
         finally:
             await node.close()
 
@@ -735,9 +735,9 @@ class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
                 try:
                     self.assertNotIn("forgotten", captured.getvalue())
                 finally:
-                    second.close()
+                    await second.close()
             finally:
-                first.close()
+                await first.close()
         finally:
             await node.close()
 
@@ -798,7 +798,7 @@ class ClusterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sum(stores), len(keys))
                 self.assertTrue(all(count > 0 for count in stores), stores)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for _, node in nodes:
@@ -816,7 +816,7 @@ class ClusterTests(unittest.IsolatedAsyncioTestCase):
                     owner = dict(nodes)[ring.route(key.encode())]
                     self.assertIn(key.encode(), owner.store, key)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for _, node in nodes:
@@ -838,7 +838,7 @@ class ClusterTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(WrongNodeError):
                     await client.get(key)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for _, node in nodes:
@@ -871,7 +871,7 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
                     for name, node in nodes.items():
                         self.assertIn(key.encode(), node.store, f"{key} missing from {name}")
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -891,7 +891,7 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(await client.get(key), "still here")
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -914,7 +914,7 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(key.encode(), nodes[primary].store)
             self.assertEqual(await client.get(key), "v")
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -942,7 +942,7 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
             await client.set(key, "v")
             self.assertEqual(await client.get(key), "v")
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -963,7 +963,7 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
                 for node in nodes.values():
                     self.assertNotIn(key.encode(), node.store)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1016,7 +1016,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                 elapsed = asyncio.get_running_loop().time() - start
                 self.assertGreaterEqual(elapsed, 0.08 - self.TIMING_TOLERANCE_S)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1042,7 +1042,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                     "the background write to land on the replica",
                 )
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1070,7 +1070,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(e >= 0.15 - self.TIMING_TOLERANCE_S for e in elapsed), elapsed)
                 self.assertTrue(any(e < 0.15 for e in elapsed), elapsed)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1086,11 +1086,14 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             nodes[replica].delay_sets(0.08)
 
             await client.set("k", "v")
-            client.close()  # should not abandon the still-in-flight replica write
-
-            await wait_for(
-                lambda: b"k" in nodes[replica].store,
-                "close() to drain the background replica write",
+            # The drain contract (ADR-0014 as amended by issue #47 item
+            # 3): close() returns only after the in-flight replica write
+            # finished.
+            await client.close()
+            self.assertIn(
+                b"k",
+                nodes[replica].store,
+                "close() returned before the background replica write finished",
             )
         finally:
             await discovery.close()
@@ -1124,7 +1127,7 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(await client.get_bytes("k"))
                 self.assertNotIn(b"k", nodes[primary].store)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1148,7 +1151,7 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
                 # _READ_REPAIR_TTL in client.py.
                 self.assertEqual(nodes[primary].last_set_ttl, 60)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1163,7 +1166,7 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertIsNone(await client.get_bytes("nowhere"))
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -1196,7 +1199,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                     ClientStats(replica_write_failures=0, read_repair_failures=0, refresh_failures=0),
                 )
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -1217,7 +1220,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(key.encode(), nodes[primary].store)
             self.assertEqual(client.stats().replica_write_failures, 1)
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -1248,7 +1251,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await client.get_bytes(key))
             self.assertEqual(client.stats().read_repair_failures, 0)
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -1279,7 +1282,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 "the failed repair write-back to be counted",
             )
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -1303,7 +1306,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 await client._refresh_node_list()
                 self.assertEqual(client.stats().refresh_failures, 1)
             finally:
-                client.close()
+                await client.close()
         finally:
             await discovery.close()
             await node.close()
@@ -1336,7 +1339,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 "a programming error must not be counted as a swallow",
             )
         finally:
-            client.close()
+            await client.close()
             await discovery.close()
             for node in nodes.values():
                 try:
@@ -1363,7 +1366,7 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await client.delete("key-0"))
                 self.assertFalse(await client.delete("key-0"))
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -1393,7 +1396,7 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await client.get("k"), "v")
                 self.assertEqual(node.connection_count, 2)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -1406,7 +1409,7 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(ConnectionError, "desynced"):
                     await client.get("k")
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
@@ -1424,7 +1427,7 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 # then the plain fallback that stuck.
                 self.assertEqual(node.connection_count, 2)
             finally:
-                client.close()
+                await client.close()
         finally:
             await node.close()
 
