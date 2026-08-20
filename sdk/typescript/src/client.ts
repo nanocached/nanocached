@@ -85,6 +85,15 @@ export interface NanocachedClientOptions {
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
+// TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
+// the protocol's TTL unit throughout (see encodeSet in protocol.ts). The
+// original TTL isn't recoverable from a GET response, and repairing with
+// TTL 0 (no expiry) would permanently resurrect data that was legitimately
+// expiring; 60s bounds the overshoot instead — an immortal key just gets
+// re-repaired on a later miss. Cross-SDK policy decision, applied
+// identically across all SDKs.
+const READ_REPAIR_TTL_SECONDS = 60;
+
 /** Bounds how many replica writes a single client may have running in
  * the background at once when `fireAndForgetReplicas` is enabled
  * (doc/adr/0014-*.md) — once the cap is reached, further replica legs
@@ -433,8 +442,10 @@ export class NanocachedClient {
    * value the normal read path already reported missing. The first
    * owner that has it wins: its value is returned, and — detached, not
    * awaited, no tracking — that same value repairs `names[0]` (the true
-   * primary) in the background, with no TTL. Every failure along the way
-   * (connection lost, WrongNode, another miss) is swallowed; nothing
+   * primary) in the background, with TTL READ_REPAIR_TTL_SECONDS (the
+   * original TTL can't be recovered from a GET, and TTL 0 would
+   * permanently resurrect already-expired data). Every failure along the
+   * way (connection lost, WrongNode, another miss) is swallowed; nothing
    * here may turn an already-accepted miss into an error. */
   private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
     const names = this.ownerNames(key);
@@ -452,7 +463,7 @@ export class NanocachedClient {
       const repairValue = value;
       if (primaryName !== undefined) {
         void this.memberConnection(primaryName)
-          .then((connection) => connection.set(key, repairValue, 0))
+          .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS))
           .catch(() => {
             // Swallowed by design — see the doc comment.
           });

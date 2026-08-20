@@ -104,6 +104,22 @@ final class Identify {
         }
     }
 
+    // Bounds a discovery `N <count> <r>` response before allocation,
+    // mirroring MAX_VALUE_LENGTH on the `V` path: a malicious or MITM'd
+    // discovery server must not be able to make the client pre-allocate
+    // arbitrary memory from an unverified length prefix (`N 2000000000 3`
+    // would otherwise ask for a multi-GB list). 65536 mirrors the cap the
+    // Go and Rust SDKs already enforce.
+    private static final int MAX_NODE_COUNT = 1 << 16;
+
+    // A within-cap node count can still carry an absurd per-entry
+    // name/address length, so this bounds the whole response's on-wire
+    // size too: comfortably fits a full MAX_NODE_COUNT-node registry of
+    // ordinary lengths while still bounding a malicious discovery
+    // server's memory pressure on this client. The same constant is
+    // being added to all six SDKs.
+    private static final long MAX_NODE_LIST_RESPONSE_BYTES = 16L * 1024 * 1024;
+
     private static ClusterTarget readNodeList(InputStream in) throws IOException {
         String header = readLine(in);
         if (header.startsWith("B")) {
@@ -119,20 +135,54 @@ final class Identify {
         if (fields.length != 2) {
             throw new NanocachedException("nanocached: invalid node-list header in discovery response");
         }
-        int count = Integer.parseInt(fields[0]);
-        int replication = Integer.parseInt(fields[1]);
+        int count;
+        int replication;
+        try {
+            count = Integer.parseInt(fields[0]);
+            replication = Integer.parseInt(fields[1]);
+        } catch (NumberFormatException malformed) {
+            // Every SDK exception must extend NanocachedException — never
+            // let a raw parse failure escape (issue tracked alongside the
+            // NanocachedClient port-parse fix).
+            throw new NanocachedException("nanocached: invalid node-list header in discovery response");
+        }
+        if (count < 0 || count > MAX_NODE_COUNT) {
+            throw new NanocachedException("nanocached: invalid node count in discovery response");
+        }
         if (replication < 1) {
             throw new NanocachedException("nanocached: invalid replication factor in discovery response");
         }
 
+        // count is now bounded by MAX_NODE_COUNT above, so sizing the
+        // list's capacity from it is safe — never trust an unvalidated
+        // wire value for a pre-allocation, validated or not.
         List<DiscoveredNode> nodes = new ArrayList<>(count);
+        long totalBytes = 0;
         for (int i = 0; i < count; i++) {
             String[] lengths = readLine(in).split(" ");
             if (lengths.length != 2) {
                 throw new NanocachedException("nanocached: invalid node entry header in discovery response");
             }
-            int nameLength = Integer.parseInt(lengths[0]);
-            int addrLength = Integer.parseInt(lengths[1]);
+            int nameLength;
+            int addrLength;
+            try {
+                nameLength = Integer.parseInt(lengths[0]);
+                addrLength = Integer.parseInt(lengths[1]);
+            } catch (NumberFormatException malformed) {
+                throw new NanocachedException("nanocached: invalid node entry header in discovery response");
+            }
+            if (nameLength < 0 || addrLength < 0) {
+                throw new NanocachedException("nanocached: invalid node entry header in discovery response");
+            }
+
+            // Checked before allocating: a single absurd entry (or many
+            // ordinary ones) must not be able to exhaust memory even
+            // though count itself is within MAX_NODE_COUNT.
+            totalBytes += (long) nameLength + addrLength + 1;
+            if (totalBytes > MAX_NODE_LIST_RESPONSE_BYTES) {
+                throw new NanocachedException(
+                        "nanocached: discovery node-list response exceeds " + MAX_NODE_LIST_RESPONSE_BYTES + " bytes");
+            }
 
             byte[] body = readExactly(in, nameLength + addrLength + 1); // +1: trailing '\n'
             if (body[body.length - 1] != '\n') {

@@ -87,6 +87,15 @@ public sealed class NanocachedClient : IDisposable
     // The server rejects empty keys, so the keep-alive G needs one byte.
     private static readonly byte[] KeepaliveKey = { 0 };
 
+    // TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
+    // the protocol's TTL unit throughout (see SetAsync's ttlSeconds). The
+    // original TTL isn't recoverable from a GET response, and repairing
+    // with TTL 0 (no expiry) would permanently resurrect data that was
+    // legitimately expiring; 60s bounds the overshoot instead — an
+    // immortal key just gets re-repaired on a later miss. Cross-SDK
+    // policy decision, applied identically across all SDKs.
+    private const long ReadRepairTtlSeconds = 60;
+
     private sealed class Member
     {
         internal Member(string address, Connection connection)
@@ -349,9 +358,11 @@ public sealed class NanocachedClient : IDisposable
     /// already reported missing. The first owner that has it wins: its
     /// value is returned, and — detached, not awaited, no tracking —
     /// that same value repairs the true primary in the background, with
-    /// no TTL. Every failure along the way (connection lost, WrongNode,
-    /// another miss) is swallowed; nothing here may turn an
-    /// already-accepted miss into an error.</summary>
+    /// TTL <see cref="ReadRepairTtlSeconds"/> (the original TTL can't be
+    /// recovered from a GET, and TTL 0 would permanently resurrect
+    /// already-expired data). Every failure along the way (connection
+    /// lost, WrongNode, another miss) is swallowed; nothing here may turn
+    /// an already-accepted miss into an error.</summary>
     private async Task<byte[]?> TryReadRepairAsync(byte[] key)
     {
         IReadOnlyList<string> names = OwnerNames(key);
@@ -379,7 +390,7 @@ public sealed class NanocachedClient : IDisposable
                     {
                         await ApplyReconnectingAsync<object?>(primary, async connection =>
                         {
-                            await connection.SetAsync(key, repairValue, 0).ConfigureAwait(false);
+                            await connection.SetAsync(key, repairValue, ReadRepairTtlSeconds).ConfigureAwait(false);
                             return null;
                         }).ConfigureAwait(false);
                     }

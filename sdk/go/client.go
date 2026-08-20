@@ -110,6 +110,15 @@ var maxInFlightBackgroundReplicaWrites = 32
 // client. A variable only so tests can shorten it.
 var keepAliveInterval = 30 * time.Second
 
+// readRepairTTL is the TTL a read-repair write applies to the primary
+// (doc/adr/0015-*.md). G's response carries no TTL, so the key's
+// original expiry is unrecoverable; repairing with TTL 0 would make an
+// expiring key immortal, permanently resurrecting data the primary had
+// correctly let expire. 60s bounds the overshoot instead — a key
+// repaired past its true expiry simply gets re-repaired (or genuinely
+// found missing) on a later miss.
+const readRepairTTL = 60
+
 type member struct {
 	address    string
 	connection *connection
@@ -392,12 +401,12 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 // tryReadRepair probes every owner of key, in rank order, for a value the
 // normal read path already reported missing. The first owner that has it
 // wins: its value is returned, and a best-effort, fully detached write
-// repairs the primary in the background (doc/adr/0015-*.md) — no TTL
-// (G's response carries none to preserve), no bounding, no close()
-// draining, since losing this write costs nothing beyond staying in the
-// window this feature narrows for one more read. Every failure along the
-// way (connection lost, WrongNode, another miss) is swallowed; nothing
-// here may turn an already-accepted miss into an error.
+// repairs the primary in the background (doc/adr/0015-*.md) with
+// readRepairTTL — no bounding, no close() draining, since losing this
+// write costs nothing beyond staying in the window this feature narrows
+// for one more read. Every failure along the way (connection lost,
+// WrongNode, another miss) is swallowed; nothing here may turn an
+// already-accepted miss into an error.
 func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 	names := c.ownerNames(key)
 	for _, name := range names {
@@ -409,7 +418,7 @@ func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 			primary := names[0]
 			go func() {
 				_ = c.applyReconnecting(primary, func(conn *connection) error {
-					return conn.set(key, v, -1)
+					return conn.set(key, v, readRepairTTL)
 				})
 			}()
 		}

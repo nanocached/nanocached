@@ -88,7 +88,11 @@ func (r *HashRing) Owners(key []byte, replicas int) []string {
 	return owners
 }
 
-// Route returns the key's primary — Owners(key, 1)[0].
+// Route returns the key's primary — Owners(key, 1)[0]. Panics on an
+// empty ring.
 func (r *HashRing) Route(key []byte) string {
+	if len(r.nodes) == 0 {
+		panic("nanocached: HashRing.Route called on an empty ring")
+	}
 	return r.Owners(key, 1)[0]
 }

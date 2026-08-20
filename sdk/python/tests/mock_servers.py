@@ -16,9 +16,12 @@ class MockNode:
         self.get_count = 0
         self._wrong_node_replies = 0
         self._malformed_value_replies = 0
+        self._unterminated_value_replies = 0
+        self.unterminated_value_bytes_sent = 0
         self._stored_to_get_replies = 0
         self._get_delay = 0.0
         self._set_delay = 0.0
+        self.last_set_ttl = 0
         self._server: asyncio.Server | None = None
         self._sockets: set[asyncio.StreamWriter] = set()
         self.port = 0
@@ -32,6 +35,13 @@ class MockNode:
 
     def answer_malformed_value_once(self) -> None:
         self._malformed_value_replies += 1
+
+    def answer_unterminated_value_once(self) -> None:
+        """Reply `V` to the next G, then stream chunks of non-newline
+        bytes (until the socket is closed, or a large safety cap is hit)
+        instead of ever completing the header — simulating a malicious or
+        corrupted server withholding the terminating LF forever."""
+        self._unterminated_value_replies += 1
 
     def answer_stored_to_get_once(self) -> None:
         """Reply `S` to the next G — a well-formed frame of the wrong kind,
@@ -103,6 +113,18 @@ class MockNode:
                         writer.write(b"V x\n")
                         await writer.drain()
                         continue
+                    if self._unterminated_value_replies > 0:
+                        self._unterminated_value_replies -= 1
+                        writer.write(b"V")
+                        try:
+                            while self.unterminated_value_bytes_sent <= 512 * 1024:
+                                filler = b"9" * 1024
+                                writer.write(filler)
+                                await writer.drain()
+                                self.unterminated_value_bytes_sent += len(filler)
+                        except (ConnectionError, OSError):
+                            pass
+                        return
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W\n")
@@ -116,6 +138,10 @@ class MockNode:
                 elif parts[0] == b"S":
                     key = await reader.readexactly(int(parts[1]))
                     value = await reader.readexactly(int(parts[2]))
+                    # parts[3], when present, is the TTL (omitted on the
+                    # wire means "no expiry", i.e. 0 — see _encode_set's
+                    # doc comment in _connection.py).
+                    self.last_set_ttl = int(parts[3]) if len(parts) > 3 else 0
                     if self._set_delay > 0:
                         await asyncio.sleep(self._set_delay)
                     if self._wrong_node_replies > 0:
@@ -151,8 +177,17 @@ class MockDiscovery:
         self.nodes = nodes
         self.replication = replication
         self.warming_up = False
+        self._unterminated_list_replies = 0
+        self.unterminated_list_bytes_sent = 0
         self._server: asyncio.Server | None = None
         self.port = 0
+
+    def answer_unterminated_list_once(self) -> None:
+        """Reply `N` to the next L, then stream chunks of non-newline
+        bytes (until the socket is closed, or a large safety cap is hit)
+        instead of ever completing the header — mirrors MockNode's
+        answer_unterminated_value_once on the cache-node path."""
+        self._unterminated_list_replies += 1
 
     async def start(self) -> "MockDiscovery":
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
@@ -181,6 +216,18 @@ class MockDiscovery:
                     if self.warming_up:
                         writer.write(b"B\n")
                         await writer.drain()
+                        return
+                    if self._unterminated_list_replies > 0:
+                        self._unterminated_list_replies -= 1
+                        writer.write(b"N")
+                        try:
+                            while self.unterminated_list_bytes_sent <= 512 * 1024:
+                                filler = b"9" * 1024
+                                writer.write(filler)
+                                await writer.drain()
+                                self.unterminated_list_bytes_sent += len(filler)
+                        except (ConnectionError, OSError):
+                            pass
                         return
                     frame = b"N %d %d\n" % (len(self.nodes), self.replication)
                     for name, address in self.nodes:

@@ -19,6 +19,16 @@ export interface MockNode extends MockServerBase {
   answerWrongNodeOnce(): void;
   /** Queue a one-off garbage `V` header for the next G request. */
   answerMalformedValueOnce(): void;
+  /** Queue a one-off `V` reply for the next G request whose header is
+   * never terminated by an LF — streams chunks of non-newline bytes
+   * (until the socket is destroyed, or a large safety cap is hit)
+   * instead, simulating a malicious/corrupted server withholding the
+   * terminator forever. */
+  answerUnterminatedValueOnce(): void;
+  /** Total bytes written so far by the unterminated-value stream queued
+   * with answerUnterminatedValueOnce — lets a test assert the client
+   * detected and closed the connection without waiting for much data. */
+  unterminatedValueBytesSent(): number;
   /** Queue a one-off `S` reply for the next G request — a well-formed
    * frame of the wrong kind, as a desynced (off-by-one) stream would
    * produce. */
@@ -27,6 +37,9 @@ export interface MockNode extends MockServerBase {
   connectionCount(): number;
   /** How many `G` requests this server has ever received. */
   getCount(): number;
+  /** The TTL (whole seconds; 0 if omitted on the wire) from the most
+   * recent `S` request this server received. */
+  lastSetTtl(): number;
   /** Server-side close of every currently open connection (a FIN, like
    * nanocached-node's own idle timeout), leaving the server listening. */
   dropConnections(): void;
@@ -40,6 +53,14 @@ export interface MockDiscovery extends MockServerBase {
   /** While true, `L` answers `B\n` and closes — the ADR-0010 startup
    * grace of a freshly restarted discovery server. */
   setWarmingUp(warming: boolean): void;
+  /** Queue a one-off `N` reply for the next `L` request whose header is
+   * never terminated by an LF — streams chunks of non-newline bytes
+   * (until the socket is destroyed, or a large safety cap is hit)
+   * instead, simulating a malicious/corrupted discovery server. */
+  answerUnterminatedListOnce(): void;
+  /** Total bytes written so far by the unterminated-list stream queued
+   * with answerUnterminatedListOnce. */
+  unterminatedListBytesSent(): number;
 }
 
 /** A port with nothing listening on it — bound once to reserve a real
@@ -91,10 +112,13 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
   const store = new Map<string, Buffer>();
   let wrongNodeReplies = 0;
   let malformedValueReplies = 0;
+  let unterminatedValueReplies = 0;
+  let unterminatedBytesSent = 0;
   let storedToGetReplies = 0;
   let connections = 0;
   let gets = 0;
   let setDelayMs = 0;
+  let lastSetTtl = 0;
 
   const server = createServer((socket) => {
     connections++;
@@ -139,6 +163,27 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
               break;
             }
 
+            if (unterminatedValueReplies > 0) {
+              unterminatedValueReplies--;
+              socket.write("V");
+              // Stream non-newline bytes so the header never terminates,
+              // simulating a malicious/corrupted server withholding the
+              // LF forever. A well-behaved client must detect and close
+              // the connection long before this safety cap (a few
+              // hundred KB) is reached; the interval also stops itself
+              // once the socket is gone.
+              const interval = setInterval(() => {
+                if (socket.destroyed || unterminatedBytesSent > 512 * 1024) {
+                  clearInterval(interval);
+                  return;
+                }
+                const filler = Buffer.alloc(1024, 0x39 /* '9' */);
+                unterminatedBytesSent += filler.length;
+                socket.write(filler);
+              }, 1);
+              break;
+            }
+
             if (storedToGetReplies > 0) {
               storedToGetReplies--;
               socket.write("S\n");
@@ -167,6 +212,9 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             const value = Buffer.from(buffer.subarray(bodyStart + keyLength, bodyStart + keyLength + valueLength));
             buffer = buffer.subarray(bodyStart + keyLength + valueLength);
+            // parts[3], when present, is the TTL (omitted on the wire
+            // means "no expiry", i.e. 0 — see encodeSet's doc comment).
+            lastSetTtl = parts.length > 3 ? Number(parts[3]) : 0;
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
@@ -220,11 +268,16 @@ export async function startMockNode(options: { requiredSecret?: string } = {}): 
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
     },
+    answerUnterminatedValueOnce: () => {
+      unterminatedValueReplies++;
+    },
+    unterminatedValueBytesSent: () => unterminatedBytesSent,
     answerStoredToGetOnce: () => {
       storedToGetReplies++;
     },
     connectionCount: () => connections,
     getCount: () => gets,
+    lastSetTtl: () => lastSetTtl,
     dropConnections: () => {
       for (const socket of sockets) socket.end();
     },
@@ -241,6 +294,8 @@ export async function startMockDiscovery(
 ): Promise<MockDiscovery> {
   let nodes = initialNodes;
   let warmingUp = false;
+  let unterminatedListReplies = 0;
+  let unterminatedListBytesSent = 0;
   // Default 1 (no replication) so single-placement assertions in tests
   // stay exact; replication tests opt in explicitly. The real server
   // defaults to 2.
@@ -274,6 +329,24 @@ export async function startMockDiscovery(
             if (warmingUp) {
               socket.write("B\n");
               socket.end();
+              return;
+            }
+
+            if (unterminatedListReplies > 0) {
+              unterminatedListReplies--;
+              socket.write("N");
+              // Stream non-newline bytes so the header never terminates —
+              // see MockNode's answerUnterminatedValueOnce for the same
+              // idea on the cache-node path.
+              const interval = setInterval(() => {
+                if (socket.destroyed || unterminatedListBytesSent > 512 * 1024) {
+                  clearInterval(interval);
+                  return;
+                }
+                const filler = Buffer.alloc(1024, 0x39 /* '9' */);
+                unterminatedListBytesSent += filler.length;
+                socket.write(filler);
+              }, 1);
               return;
             }
 
@@ -311,6 +384,10 @@ export async function startMockDiscovery(
     setWarmingUp: (warming) => {
       warmingUp = warming;
     },
+    answerUnterminatedListOnce: () => {
+      unterminatedListReplies++;
+    },
+    unterminatedListBytesSent: () => unterminatedListBytesSent,
     close,
   };
 }

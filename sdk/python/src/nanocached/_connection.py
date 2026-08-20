@@ -180,6 +180,17 @@ class Connection:
             except (asyncio.IncompleteReadError, OSError) as error:
                 self._poison(ConnectionError(f"nanocached: connection failed: {error}"))
                 return
+            except asyncio.LimitOverrunError as error:
+                # readuntil() found no `\n` within the stream's internal
+                # buffer limit (64 KiB) — the connection is desynced
+                # mid-frame, same as an out-of-range value length below.
+                # LimitOverrunError is a ValueError subclass, not an
+                # OSError, so it must be caught explicitly here or the
+                # read task dies silently: _poison() never runs, the
+                # writer never closes, and every pending/future request
+                # hangs forever (issue #8).
+                self._poison(ConnectionError(f"nanocached: connection failed: {error}"))
+                return
 
             was_empty = not self._pending
 

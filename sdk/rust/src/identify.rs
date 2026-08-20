@@ -27,6 +27,13 @@ const NO_SECRET_PLACEHOLDER: &[u8] = &[0];
 const MAX_NODE_COUNT: usize = 1 << 16;
 const MAX_NODE_FIELD_LENGTH: usize = 64 * 1024;
 
+/// Per-field caps alone still leave the aggregate response size
+/// unbounded in practice (`MAX_NODE_COUNT * 2 * MAX_NODE_FIELD_LENGTH` is
+/// ~8.5GB) — this caps the total, bounding a malicious discovery
+/// server's memory pressure on the client while comfortably fitting a
+/// full 65536-node registry of ordinary name/address lengths.
+const MAX_NODE_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 /// A node's hash-ring identity (a random per-process UUID) and its
 /// network address — two different things since doc/adr/0009-*.md.
 #[derive(Debug, Clone)]
@@ -299,8 +306,10 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
     }
 
     let mut nodes = Vec::with_capacity(count.min(1024));
+    let mut total = 0usize;
     for _ in 0..count {
         let entry = read_line_checked(stream).await?;
+        total += entry.len();
         let mut lengths = entry.split(' ');
         let (name_length, addr_length) = match (lengths.next(), lengths.next(), lengths.next()) {
             (Some(name), Some(addr), None) => (
@@ -313,7 +322,15 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
             return Err(bad_header(()));
         }
 
-        let mut body = vec![0u8; name_length + addr_length + 1]; // +1: trailing '\n'
+        let body_length = name_length + addr_length + 1; // +1: trailing '\n'
+        total += body_length;
+        if total > MAX_NODE_LIST_RESPONSE_BYTES {
+            return Err(Error::Protocol(format!(
+                "nanocached: discovery node-list response exceeds {MAX_NODE_LIST_RESPONSE_BYTES} bytes"
+            )));
+        }
+
+        let mut body = vec![0u8; body_length];
         stream.read_exact(&mut body).await?;
         if body.last() != Some(&b'\n') {
             return Err(Error::Protocol(

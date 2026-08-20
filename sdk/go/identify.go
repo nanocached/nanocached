@@ -150,9 +150,15 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 // before allocation, mirroring maxValueLength on the `V` path: a
 // malicious or MITM'd discovery server must not be able to make the
 // client pre-allocate arbitrary memory from an unverified length prefix.
+// Per-field caps alone still leave the aggregate unbounded in practice
+// (maxNodeCount * 2 * maxNodeFieldLength is ~8.5GB) — maxNodeListResponseBytes
+// caps the total, bounding a malicious discovery server's memory
+// pressure on the client while comfortably fitting a full 65536-node
+// registry of ordinary name/address lengths.
 const (
-	maxNodeCount       = 1 << 16
-	maxNodeFieldLength = 64 * 1024
+	maxNodeCount             = 1 << 16
+	maxNodeFieldLength       = 64 * 1024
+	maxNodeListResponseBytes = 16 * 1024 * 1024
 )
 
 func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
@@ -185,11 +191,13 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 	}
 
 	nodes := make([]DiscoveredNode, 0, count)
+	total := 0
 	for i := 0; i < count; i++ {
 		entry, err := reader.ReadString('\n')
 		if err != nil {
 			return nil, 0, connectionLost("node-list read failed", err)
 		}
+		total += len(entry)
 		lengths := strings.Split(strings.TrimSuffix(entry, "\n"), " ")
 		if len(lengths) != 2 {
 			return nil, 0, fmt.Errorf("nanocached: invalid node entry header in discovery response")
@@ -201,7 +209,14 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 			return nil, 0, fmt.Errorf("nanocached: invalid node entry lengths in discovery response")
 		}
 
-		body := make([]byte, nameLength+addrLength+1) // +1: trailing '\n'
+		bodyLength := nameLength + addrLength + 1 // +1: trailing '\n'
+		total += bodyLength
+		if total > maxNodeListResponseBytes {
+			return nil, 0, fmt.Errorf(
+				"nanocached: discovery node-list response exceeds %d bytes", maxNodeListResponseBytes)
+		}
+
+		body := make([]byte, bodyLength)
 		if _, err := readFull(reader, body); err != nil {
 			return nil, 0, connectionLost("node-list read failed", err)
 		}

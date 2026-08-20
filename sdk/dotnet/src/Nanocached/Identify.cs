@@ -110,10 +110,12 @@ internal static class Identify
         string host, int port, SslClientAuthenticationOptions? tls, CancellationToken cancel)
     {
         var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        NetworkStream? network = null;
+        SslStream? ssl = null;
         try
         {
             await socket.ConnectAsync(host, port, cancel).ConfigureAwait(false);
-            var network = new NetworkStream(socket, ownsSocket: true);
+            network = new NetworkStream(socket, ownsSocket: true);
             if (tls is null)
             {
                 return network;
@@ -125,13 +127,24 @@ internal static class Identify
                 options = Clone(options);
                 options.TargetHost = host;
             }
-            var ssl = new SslStream(network);
+            ssl = new SslStream(network);
             await ssl.AuthenticateAsClientAsync(options, cancel).ConfigureAwait(false);
             return ssl;
         }
         catch
         {
-            socket.Dispose();
+            // Dispose only the outermost wrapper that actually got built —
+            // SslStream.Dispose() cascades into its NetworkStream (it
+            // doesn't own leaveInnerStreamOpen), which cascades into the
+            // socket (ownsSocket: true), so this never double-disposes.
+            // Without this, a failed handshake left the SslStream and
+            // NetworkStream around forever: only socket.Dispose() ran, so
+            // repeated failed handshakes accumulated undisposed streams.
+            // Mirrors Java's Identify.open, whose autoClose SSLSocket ties
+            // the same cleanup to closing the underlying plain socket.
+            if (ssl is not null) ssl.Dispose();
+            else if (network is not null) network.Dispose();
+            else socket.Dispose();
             throw;
         }
     }
@@ -145,6 +158,22 @@ internal static class Identify
             CertificateRevocationCheckMode = options.CertificateRevocationCheckMode,
             EnabledSslProtocols = options.EnabledSslProtocols,
         };
+
+    // Bounds a discovery `N <count> <r>` response before allocation,
+    // mirroring MaxValueLength on the `V` path: a malicious or MITM'd
+    // discovery server must not be able to make the client pre-allocate
+    // arbitrary memory from an unverified length prefix (`N 2000000000 3`
+    // would otherwise ask for a multi-GB list). 65536 mirrors the cap the
+    // Go and Rust SDKs already enforce.
+    private const int MaxNodeCount = 1 << 16;
+
+    // A within-cap node count can still carry an absurd per-entry
+    // name/address length, so this bounds the whole response's on-wire
+    // size too: comfortably fits a full MaxNodeCount-node registry of
+    // ordinary lengths while still bounding a malicious discovery
+    // server's memory pressure on this client. The same constant is
+    // being added to all six SDKs.
+    private const long MaxNodeListResponseBytes = 16 * 1024 * 1024;
 
     private static async Task<ClusterTarget> ReadNodeListAsync(Stream stream, CancellationToken cancel)
     {
@@ -168,20 +197,40 @@ internal static class Identify
         {
             throw new NanocachedException("nanocached: invalid node-list header in discovery response");
         }
+        if (count < 0 || count > MaxNodeCount)
+        {
+            throw new NanocachedException("nanocached: invalid node count in discovery response");
+        }
         if (replication < 1)
         {
             throw new NanocachedException("nanocached: invalid replication factor in discovery response");
         }
 
+        // count is now bounded by MaxNodeCount above, so sizing the list's
+        // capacity from it is safe — never trust an unvalidated wire value
+        // for a pre-allocation, validated or not.
         var nodes = new List<DiscoveredNode>(count);
+        long totalBytes = 0;
         for (int i = 0; i < count; i++)
         {
             string[] lengths = (await ReadLineAsync(stream, cancel).ConfigureAwait(false)).Split(' ');
             if (lengths.Length != 2
                 || !int.TryParse(lengths[0], out int nameLength)
-                || !int.TryParse(lengths[1], out int addrLength))
+                || !int.TryParse(lengths[1], out int addrLength)
+                || nameLength < 0
+                || addrLength < 0)
             {
                 throw new NanocachedException("nanocached: invalid node entry header in discovery response");
+            }
+
+            // Checked before allocating: a single absurd entry (or many
+            // ordinary ones) must not be able to exhaust memory even
+            // though count itself is within MaxNodeCount.
+            totalBytes += (long)nameLength + addrLength + 1;
+            if (totalBytes > MaxNodeListResponseBytes)
+            {
+                throw new NanocachedException(
+                    $"nanocached: discovery node-list response exceeds {MaxNodeListResponseBytes} bytes");
             }
 
             var body = new byte[nameLength + addrLength + 1]; // +1: trailing '\n'

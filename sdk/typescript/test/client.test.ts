@@ -614,6 +614,73 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("an `N` header with no newline fails promptly instead of buffering forever", async () => {
+    // Regression for the unbounded-buffer-growth issue (issue #12
+    // follow-up) on the discovery path: a malicious/corrupted discovery
+    // server can send `N` and then withhold the header's terminating LF
+    // forever. connectAndIdentify must detect this and fail long before
+    // it has buffered anywhere near the server's willingness to stream.
+    const discovery = await startMockDiscovery([]);
+    try {
+      discovery.answerUnterminatedListOnce();
+      const { connectAndIdentify } = await import("../src/identify.js");
+      await assert.rejects(
+        connectAndIdentify({ host: "127.0.0.1", port: discovery.port }),
+        /invalid node-list header|missing header terminator/,
+      );
+      assert.ok(
+        discovery.unterminatedListBytesSent() < 64 * 1024,
+        `client kept the connection open through ${discovery.unterminatedListBytesSent()} bytes without a newline`,
+      );
+    } finally {
+      await discovery.close();
+    }
+  });
+
+  it("an oversized node-list response fails instead of buffering unbounded memory", async () => {
+    // Regression: bounds a malicious discovery server's memory pressure
+    // with an aggregate cap on the whole `N ...` response (16 MiB),
+    // independent of the per-field caps — this same constant is being
+    // added to all six SDKs.
+    const { createServer } = await import("node:net");
+    const server = createServer((socket) => {
+      socket.on("error", () => {});
+      socket.on("data", (chunk: Buffer) => {
+        const text = chunk.toString("ascii");
+        if (text.startsWith("A ")) {
+          socket.write("Od\n");
+          return;
+        }
+        if (text.startsWith("L")) {
+          // A well-formed, oversized `N` response: many entries each near
+          // the per-field cap, adding up to comfortably past the 16 MiB
+          // aggregate cap. Declared count is a lie relative to what's
+          // actually sent — the client must bail out from the size alone,
+          // well before needing all of it.
+          const fieldLength = 64 * 1024; // MAX_NODE_FIELD_LENGTH
+          const entryCount = 300; // ~300 * ~128 KiB > 16 MiB
+          socket.write(`N ${entryCount} 1\n`);
+          const name = Buffer.alloc(fieldLength, 0x61 /* 'a' */);
+          const addr = Buffer.alloc(fieldLength, 0x62 /* 'b' */);
+          const entry = Buffer.concat([Buffer.from(`${fieldLength} ${fieldLength}\n`), name, addr, Buffer.from("\n")]);
+          for (let i = 0; i < entryCount; i++) {
+            if (socket.destroyed) break;
+            socket.write(entry);
+          }
+        }
+      });
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port));
+    });
+    try {
+      const { connectAndIdentify } = await import("../src/identify.js");
+      await assert.rejects(connectAndIdentify({ host: "127.0.0.1", port }), /exceeds maximum size/);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("a malformed value length poisons the connection and the next request redials", async () => {
     // Regression for issue #8: a garbage `V <len>` header desyncs the
     // stream; the connection must be poisoned (never reused mid-frame)
@@ -628,6 +695,38 @@ describe("NanocachedClient reconnect-on-use", () => {
 
         // The poisoned connection is replaced lazily; no stray bytes leak
         // into this response.
+        assert.equal(await client.get("k"), "v");
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a `V` header with no newline poisons the connection promptly instead of buffering forever", async () => {
+    // Regression for the unbounded-buffer-growth issue (issue #12
+    // follow-up): a malicious/corrupted server can send `V` and then
+    // withhold the header's terminating LF forever. The client must
+    // detect this and poison the connection long before it has buffered
+    // anywhere near the server's willingness to keep streaming.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        node.answerUnterminatedValueOnce();
+        await assert.rejects(client.get("k"), /invalid value length|missing header terminator/);
+
+        // Detected quickly: nowhere near the mock's 512 KiB safety cap.
+        assert.ok(
+          node.unterminatedValueBytesSent() < 64 * 1024,
+          `client kept the connection open through ${node.unterminatedValueBytesSent()} bytes without a newline`,
+        );
+
+        // The poisoned connection is replaced lazily; the next request
+        // transparently redials.
+        await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
       } finally {
@@ -1118,6 +1217,10 @@ describe("NanocachedClient read repair (doc/adr/0015-*.md)", () => {
 
       assert.equal(await client.get("k"), "from-replica");
       await waitFor(() => primary.mock.store.has("k"), "the primary to be repaired");
+      // The original TTL can't be recovered from a GET; a repair must
+      // not use TTL 0 (no expiry), which would permanently resurrect
+      // already-expired data — see READ_REPAIR_TTL_SECONDS in client.ts.
+      assert.equal(primary.mock.lastSetTtl(), 60);
     } finally {
       client.close();
       await cluster.close();

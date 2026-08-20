@@ -56,13 +56,24 @@ const NO_SECRET_PLACEHOLDER = Buffer.from([0]);
 const MAX_NODE_COUNT = 1 << 16;
 const MAX_NODE_FIELD_LENGTH = 64 * 1024;
 
+// Aggregate cap on a whole `N ...` node-list response, independent of the
+// per-field caps above: bounds a malicious discovery server's memory
+// pressure while still fitting a full 65536-node registry. This same
+// constant is being added to all six SDKs.
+const MAX_NODE_LIST_RESPONSE_LENGTH = 16 * 1024 * 1024;
+
 /** Reads from `socket` until `tryParse` returns non-null, resolving with
  * that value. One-shot: meant for a single request/response, not a
- * long-lived connection matching multiple in-flight requests. */
+ * long-lived connection matching multiple in-flight requests. `maxBufferLength`,
+ * when given, poisons the read if the accumulated buffer grows past it
+ * without ever yielding a parseable frame — a backstop against a
+ * malicious/misbehaving server that never sends a valid terminator
+ * (issue #12 follow-up). */
 function readFrame<T>(
   socket: Socket | TLSSocket,
   tryParse: (buf: Buffer) => T | null,
   deadlineMs: number,
+  maxBufferLength?: number,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -95,6 +106,12 @@ function readFrame<T>(
       if (parsed !== null) {
         cleanup();
         resolve(parsed);
+        return;
+      }
+
+      if (maxBufferLength !== undefined && buffer.length > maxBufferLength) {
+        cleanup();
+        reject(new Error("nanocached: discovery response exceeds maximum size (connection desynced)"));
       }
     };
     const onError = (error: Error) => {
@@ -157,9 +174,26 @@ export class DiscoveryBusyError extends Error {
  * name and address are simply concatenated, split by their declared
  * lengths, not by a delimiter. Returns `null` while more bytes are still
  * needed. */
+// Longest legal `N <count> <r>\n` header: marker + space + digits of
+// MAX_NODE_COUNT + space + a generous digit allowance for the
+// replication factor (uncapped on the wire) + LF.
+const MAX_NODE_LIST_HEADER_LENGTH = 2 + String(MAX_NODE_COUNT).length + 1 + 20 + 1;
+
+// Longest legal `<name-length> <addr-length>\n` entry header: two
+// MAX_NODE_FIELD_LENGTH-digit fields, a space, and the LF.
+const MAX_NODE_ENTRY_HEADER_LENGTH = 2 * String(MAX_NODE_FIELD_LENGTH).length + 1 + 1;
+
 function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: number } | null {
   const headerEnd = buf.indexOf(0x0a);
-  if (headerEnd === -1) return null;
+  if (headerEnd === -1) {
+    // Keep waiting only while the header could still turn out legal; a
+    // malicious server withholding the LF forever must not be able to
+    // buffer this unboundedly (issue #12 follow-up).
+    if (buf.length > MAX_NODE_LIST_HEADER_LENGTH) {
+      throw new Error("nanocached: invalid node-list header in discovery response (missing header terminator)");
+    }
+    return null;
+  }
 
   if (buf[0] === 0x42 /* 'B' */) {
     throw new DiscoveryBusyError();
@@ -190,7 +224,12 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
 
   for (let i = 0; i < count; i++) {
     const entryHeaderEnd = buf.indexOf(0x0a, offset);
-    if (entryHeaderEnd === -1) return null;
+    if (entryHeaderEnd === -1) {
+      if (buf.length - offset > MAX_NODE_ENTRY_HEADER_LENGTH) {
+        throw new Error("nanocached: invalid node entry header in discovery response (missing header terminator)");
+      }
+      return null;
+    }
 
     const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
     if (lengths.length !== 2) {
@@ -273,7 +312,12 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
 
   try {
     socket.write(Buffer.from("L\n"));
-    const { nodes, replication } = await readFrame(socket, tryParseNodeList, deadlineMs);
+    const { nodes, replication } = await readFrame(
+      socket,
+      tryParseNodeList,
+      deadlineMs,
+      MAX_NODE_LIST_RESPONSE_LENGTH,
+    );
     return { kind: "cluster", nodes, replication };
   } finally {
     socket.destroy();

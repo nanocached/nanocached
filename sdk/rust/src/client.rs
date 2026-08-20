@@ -34,6 +34,14 @@ const NODE_LIST_STALE_AFTER: Duration = Duration::from_secs(30);
 // The keep-alive ping: the server rejects empty keys, so it needs at
 // least one byte; a single NUL stays out of any real key space.
 const KEEPALIVE_KEY: &[u8] = &[0];
+/// The TTL a read-repair write applies to the primary (doc/adr/0015-*.md).
+/// `get`'s response carries no TTL, so the key's original expiry is
+/// unrecoverable; repairing with `ttl_seconds` 0 (no expiry) would make
+/// an expiring key immortal, permanently resurrecting data the primary
+/// had correctly let expire. 60s bounds the overshoot instead — a key
+/// repaired past its true expiry simply gets re-repaired (or genuinely
+/// found missing) on a later miss.
+const READ_REPAIR_TTL: u64 = 60;
 /// Internal keep-alive interval in milliseconds — see the comment at its
 /// use in `connect`. Public-but-hidden purely as a test hook.
 #[doc(hidden)]
@@ -568,7 +576,7 @@ impl NanocachedClient {
     /// a value the normal read path already reported missing. The first
     /// owner that has it wins: its value is returned, and — detached, not
     /// awaited, no tracking — that same value repairs the true primary in
-    /// the background, with no TTL. Every failure along the way
+    /// the background with `READ_REPAIR_TTL`. Every failure along the way
     /// (connection lost, WrongNode, another miss) is swallowed; nothing
     /// here may turn an already-accepted miss into an error.
     async fn try_read_repair(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -592,7 +600,7 @@ impl NanocachedClient {
                     let op = move |connection: Arc<Connection>| {
                         let key = Arc::clone(&owned_key);
                         let value = Arc::clone(&owned_value);
-                        async move { connection.set(&key, &value, 0).await }
+                        async move { connection.set(&key, &value, READ_REPAIR_TTL).await }
                     };
                     let _ = client.apply_reconnecting(Some(&primary), &op).await;
                 });
@@ -612,6 +620,7 @@ impl NanocachedClient {
         ttl_seconds: u64,
     ) -> Result<()> {
         let key = key.as_ref();
+        self.before_operation().await?;
         let owned_compressed;
         let value: &[u8] = if self.inner.compress {
             owned_compressed = crate::compression::compress_value(
@@ -622,7 +631,6 @@ impl NanocachedClient {
         } else {
             value.as_ref()
         };
-        self.before_operation().await?;
         self.with_cluster_retry(|| {
             self.write(
                 key,

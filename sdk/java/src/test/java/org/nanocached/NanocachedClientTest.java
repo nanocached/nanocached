@@ -378,6 +378,80 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void closeFiresOnCloseExactlyOnceUnderConcurrency() throws Exception {
+        // Java's Connection.poison() already gates on `synchronized (this)
+        // { if (closed) return; closed = true; ... }`, so this documents
+        // the existing correct-by-construction guarantee (the .NET port
+        // had the analogous bug: a non-atomic check-then-set let
+        // concurrent Close() calls both pass and double-fire onClose,
+        // corrupting the open-target counter).
+        try (java.net.Socket socket = new java.net.Socket()) {
+            try (MockNode node = new MockNode()) {
+                socket.connect(new java.net.InetSocketAddress("127.0.0.1", node.port()));
+                java.util.concurrent.atomic.AtomicInteger closedCount = new java.util.concurrent.atomic.AtomicInteger();
+                Connection connection = new Connection(socket, closedCount::incrementAndGet);
+
+                ExecutorService pool = Executors.newFixedThreadPool(8);
+                try {
+                    List<Future<?>> futures = new ArrayList<>();
+                    for (int i = 0; i < 50; i++) {
+                        futures.add(pool.submit(connection::close));
+                    }
+                    for (Future<?> future : futures) future.get();
+                } finally {
+                    pool.shutdown();
+                }
+
+                assertEquals(1, closedCount.get());
+            }
+        }
+    }
+
+    @Test
+    void newTrackedConnectionUntracksAndClosesSocketWhenConstructorFails() throws Exception {
+        // Regression: Connection's constructor calls
+        // socket.getInputStream()/getOutputStream(), which throws
+        // IOException on an already-closed/never-connected socket.
+        // newTrackedConnection() used to call trackOpenTarget() before
+        // that constructor call, with nothing undoing it (or closing the
+        // socket) on failure — leaking both the open-target counter and
+        // the socket on every occurrence. Exercised directly via
+        // reflection since forcing the constructor to fail from the
+        // normal connect path isn't otherwise reachable deterministically.
+        try (MockNode node = new MockNode()) {
+            NanocachedClient client = connect("127.0.0.1", node.port());
+            try {
+                java.lang.reflect.Field targetKeyField = NanocachedClient.class.getDeclaredField("targetKey");
+                targetKeyField.setAccessible(true);
+                String targetKey = (String) targetKeyField.get(client);
+
+                java.lang.reflect.Field openTargetsField = NanocachedClient.class.getDeclaredField("OPEN_TARGETS");
+                openTargetsField.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                java.util.concurrent.ConcurrentHashMap<String, Integer> openTargets =
+                        (java.util.concurrent.ConcurrentHashMap<String, Integer>) openTargetsField.get(null);
+                int before = openTargets.getOrDefault(targetKey, 0);
+
+                // Never connected: getInputStream()/getOutputStream() (and
+                // thus Connection's constructor) throw IOException on it.
+                java.net.Socket neverConnected = new java.net.Socket();
+
+                java.lang.reflect.Method newTrackedConnection =
+                        NanocachedClient.class.getDeclaredMethod("newTrackedConnection", java.net.Socket.class);
+                newTrackedConnection.setAccessible(true);
+                assertThrows(java.lang.reflect.InvocationTargetException.class,
+                        () -> newTrackedConnection.invoke(client, neverConnected));
+
+                assertEquals(before, openTargets.getOrDefault(targetKey, 0),
+                        "the open-target counter must not leak when the Connection constructor fails");
+                assertTrue(neverConnected.isClosed(), "the socket must be closed when the Connection constructor fails");
+            } finally {
+                client.close();
+            }
+        }
+    }
+
     // ── addresses ─────────────────────────────────────────────────
 
     @Test
@@ -432,6 +506,66 @@ class NanocachedClientTest {
                             .addresses(List.of(
                                     new Address("127.0.0.1", first.port()),
                                     new Address("127.0.0.1", second.port())))));
+        }
+    }
+
+    // ── discovery response limits ────────────────────────────────
+
+    @Test
+    void rejectsANodeCountBeyondTheMaximum() throws Exception {
+        // Regression: `N 2000000001 3` used to drive
+        // `new ArrayList<>(count)` straight from the wire — a
+        // multi-gigabyte allocation from an untrusted server. The header
+        // alone must be rejected before any entry is read.
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.rawListResponse = "N 2000000001 3\n";
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertTrue(error.getMessage().contains("node count"), error.getMessage());
+        }
+    }
+
+    @Test
+    void rejectsANodeListResponseBeyondTheAggregateCap() throws Exception {
+        // Regression: a within-cap node count can still declare an
+        // absurd per-entry name/address length. A single entry near the
+        // 16 MiB aggregate cap must be rejected before its body is even
+        // read — otherwise a malicious server could make the client
+        // allocate gigabytes without ever sending that many bytes.
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            int hugeNameLength = 20 * 1024 * 1024; // > 16 MiB alone
+            discovery.rawListResponse = "N 1 1\n" + hugeNameLength + " 0\n";
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertTrue(error.getMessage().contains("exceeds"), error.getMessage());
+        }
+    }
+
+    @Test
+    void rejectsAMalformedNodeCountHeaderInsteadOfLeakingANumberFormatException() throws Exception {
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.rawListResponse = "N x 1\n";
+            assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
+        }
+    }
+
+    @Test
+    void rejectsAMalformedNodeEntryLengthHeaderInsteadOfLeakingANumberFormatException() throws Exception {
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.rawListResponse = "N 1 1\nx y\n";
+            assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
+        }
+    }
+
+    @Test
+    void rejectsAMalformedNodeAddressPortInsteadOfLeakingANumberFormatException() throws Exception {
+        // Regression: NanocachedClient.openNodeConnection used to call
+        // Integer.parseInt directly on a discovered node's port.
+        try (MockDiscovery discovery = new MockDiscovery(
+                List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:notaport")), 1)) {
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertTrue(error.getMessage().contains("invalid node address"), error.getMessage());
         }
     }
 
@@ -725,6 +859,11 @@ class NanocachedClientTest {
                 String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
                 waitFor(() -> cluster.nodes().get(owners.get(0)).store.containsKey(stored),
                         "the primary to be repaired");
+                // The original TTL can't be recovered from a GET; a
+                // repair must not use TTL 0 (no expiry), which would
+                // permanently resurrect already-expired data — see
+                // READ_REPAIR_TTL_SECONDS.
+                assertEquals(60, cluster.nodes().get(owners.get(0)).lastSetTtl);
             }
         }
     }

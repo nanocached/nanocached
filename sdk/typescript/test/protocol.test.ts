@@ -103,6 +103,25 @@ describe("tryParseResponse", () => {
     assert.throws(() => tryParseResponse(Buffer.from("V -1\n")), /invalid value length/);
   });
 
+  it("keeps waiting for a `V` header's newline while it could still be legal", () => {
+    // The longest legal header is "V " + digits of MAX_VALUE_LENGTH (7
+    // digits) + "\n" = 10 bytes; one byte short of that, still unterminated,
+    // must still mean "need more data", not "garbage".
+    assert.equal(tryParseResponse(Buffer.from(`V ${"9".repeat(6)}`)), null);
+  });
+
+  it("throws instead of buffering forever when a `V` header's newline never arrives", () => {
+    // Regression for the unbounded-buffer-growth issue (issue #12
+    // follow-up): a malicious/corrupted server could otherwise withhold
+    // the LF forever, growing the caller's buffer without limit. Once
+    // the header has grown past what any legal header could be, this
+    // must throw immediately rather than return null.
+    assert.throws(
+      () => tryParseResponse(Buffer.concat([Buffer.from("V "), Buffer.alloc(4096, 0x39 /* '9' */)])),
+      /invalid value length|missing header terminator/,
+    );
+  });
+
   it("throws on an unknown marker", () => {
     assert.throws(() => tryParseResponse(Buffer.from("Z\n")), /unexpected response/);
   });

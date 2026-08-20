@@ -152,6 +152,14 @@ public final class NanocachedClient implements AutoCloseable {
     private static final Duration NODE_LIST_STALE_AFTER = Duration.ofSeconds(30);
     // The server rejects empty keys, so the keep-alive G needs one byte.
     private static final byte[] KEEPALIVE_KEY = {0};
+    // TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
+    // the protocol's TTL unit throughout (see set()'s ttlSeconds). The
+    // original TTL isn't recoverable from a GET response, and repairing
+    // with TTL 0 (no expiry) would permanently resurrect data that was
+    // legitimately expiring; 60s bounds the overshoot instead — an
+    // immortal key just gets re-repaired on a later miss. Cross-SDK
+    // policy decision, applied identically across all SDKs.
+    private static final long READ_REPAIR_TTL_SECONDS = 60;
     static volatile long keepAliveIntervalMillis = 30_000;
     // doc/adr/0014-*.md: bounds how many replica writes a single client
     // may have running in the background at once when
@@ -198,7 +206,20 @@ public final class NanocachedClient implements AutoCloseable {
     private String targetKey;
 
     private volatile boolean closed = false;
-    private Connection single;              // single-node mode
+    // volatile so a reader sees a redial's new Connection right away.
+    // redialLocks (per-slot monitors) give mutual exclusion for the
+    // redial itself, but a monitor only guarantees visibility to threads
+    // that acquire that *same* lock — and single/Member.connection are
+    // read under different locks in different places (stateLock for the
+    // keep-alive sweep, no lock at all on singleConnection()'s/
+    // memberConnection()'s fast path), so a plain field could let a
+    // thread keep seeing a stale, already-closed connection after
+    // another thread redialed. volatile fixes the cross-thread
+    // visibility on top of the locking that already exists — correct
+    // double-checked locking. .NET's Connection sidesteps this by
+    // routing every access through _stateLock instead of splitting it
+    // across a lock and an unlocked fast path.
+    private volatile Connection single;              // single-node mode
     private String singleAddress;
     private final Map<String, Member> members = new LinkedHashMap<>(); // cluster mode
     private HashRing ring;
@@ -210,7 +231,9 @@ public final class NanocachedClient implements AutoCloseable {
 
     private static final class Member {
         String address;
-        Connection connection;
+        // volatile for the same cross-thread visibility reason as
+        // `single` above — see that field's comment.
+        volatile Connection connection;
 
         Member(String address, Connection connection) {
             this.address = address;
@@ -422,7 +445,9 @@ public final class NanocachedClient implements AutoCloseable {
      * order, for a value the normal read path already reported missing.
      * The first owner that has it wins: its value is returned, and —
      * detached, not awaited, no tracking — that same value repairs the
-     * true primary in the background, with no TTL. Every failure along
+     * true primary in the background, with TTL READ_REPAIR_TTL_SECONDS
+     * (the original TTL can't be recovered from a GET, and TTL 0 would
+     * permanently resurrect already-expired data). Every failure along
      * the way (connection lost, WrongNode, another miss) is swallowed;
      * nothing here may turn an already-accepted miss into an error. */
     private byte[] tryReadRepair(byte[] key) {
@@ -442,7 +467,7 @@ public final class NanocachedClient implements AutoCloseable {
                 replicaWriters.execute(() -> {
                     try {
                         applyReconnecting(() -> memberConnection(primary), connection -> {
-                            connection.set(key, repairValue, null);
+                            connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS);
                             return null;
                         });
                     } catch (RuntimeException ignored) {
@@ -715,13 +740,26 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    /** {@code null} on anything {@link Integer#parseInt} would reject —
+     * every SDK exception must extend {@link NanocachedException}, so a
+     * raw {@link NumberFormatException} must never escape a discovery
+     * response's port field. Mirrors .NET's {@code int.TryParse} handling
+     * at the same spot (Identify.SplitHostPort). */
+    private static Integer parsePort(String text) {
+        try {
+            return Integer.parseInt(text);
+        } catch (NumberFormatException malformed) {
+            return null;
+        }
+    }
+
     private Connection openNodeConnection(String address) throws IOException {
         int separator = address.lastIndexOf(':');
-        if (separator == -1) {
+        Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
+        if (separator == -1 || port == null) {
             throw new NanocachedException("nanocached: invalid node address from discovery server: " + address);
         }
         String host = address.substring(0, separator);
-        int port = Integer.parseInt(address.substring(separator + 1));
 
         Identify.Result identified = Identify.connectAndIdentify(host, port, authSecret, tls);
         if (!(identified instanceof Identify.NodeTarget node)) {
@@ -746,10 +784,30 @@ public final class NanocachedClient implements AutoCloseable {
      * client's open-sockets count under {@link #targetKey} and arranging
      * for it to be decremented the moment that connection closes for any
      * reason — self-poisoning on a protocol error, a refresh dropping the
-     * node, a lazy redial discarding it, or {@link #close()}. */
+     * node, a lazy redial discarding it, or {@link #close()}.
+     *
+     * <p>{@link Connection}'s constructor calls {@code socket
+     * .getInputStream()}/{@code getOutputStream()}, which can throw
+     * {@link IOException} (e.g. the socket died between accept and here).
+     * If that happens after {@link #trackOpenTarget} already ran, both the
+     * open-target counter and the socket itself would otherwise leak —
+     * nothing else ever closes a socket whose {@code Connection} never got
+     * built. On that failure, undo the tracking and close the socket
+     * (suppressing a close error — the constructor's is the interesting
+     * one) before rethrowing. */
     private Connection newTrackedConnection(Socket socket) throws IOException {
         trackOpenTarget(targetKey);
-        return new Connection(socket, () -> untrackOpenTarget(targetKey));
+        try {
+            return new Connection(socket, () -> untrackOpenTarget(targetKey));
+        } catch (IOException | RuntimeException error) {
+            untrackOpenTarget(targetKey);
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // The original failure is the interesting one.
+            }
+            throw error;
+        }
     }
 
     // ── ノードリスト更新 ──────────────────────────────────────────

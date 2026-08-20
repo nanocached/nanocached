@@ -15,6 +15,8 @@ mod open_targets;
 pub use client::KEEPALIVE_INTERVAL_MS;
 pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 pub use client::{NanocachedClient, Options};
+#[doc(hidden)]
+pub use connection::REQUEST_TIMEOUT_MS;
 pub use error::{Error, Result};
 pub use hash_ring::HashRing;
 pub use identify::DiscoveredNode;

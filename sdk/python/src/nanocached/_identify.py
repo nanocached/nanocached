@@ -33,6 +33,12 @@ CONNECT_DEADLINE = 5.0
 _MAX_NODE_COUNT = 1 << 16
 _MAX_NODE_FIELD_LENGTH = 64 * 1024
 
+# Aggregate cap on a whole `N ...` node-list response, independent of the
+# per-field caps above: bounds a malicious discovery server's memory
+# pressure while still fitting a full 65536-node registry. This same
+# constant is being added to all six SDKs.
+_MAX_NODE_LIST_RESPONSE_LENGTH = 16 * 1024 * 1024
+
 
 @dataclass(frozen=True)
 class DiscoveredNode:
@@ -117,7 +123,19 @@ async def _connect_and_identify(
 
 
 async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
-    header = await reader.readuntil(b"\n")
+    try:
+        header = await reader.readuntil(b"\n")
+    except asyncio.LimitOverrunError as error:
+        # No `\n` within the stream's internal buffer limit (64 KiB) — the
+        # connection is desynced mid-frame. LimitOverrunError is a
+        # ValueError subclass, neither NanocachedError nor OSError, so
+        # left unwrapped it would break client.py's `except
+        # (NanocachedError, OSError)` contracts ("try next address
+        # silently", "refresh swallows failures") and escape raw to
+        # callers instead (mirrors the TimeoutError wrapping above).
+        raise NanocachedError(
+            "nanocached: invalid node-list header in discovery response (missing header terminator)"
+        ) from error
 
     if header.startswith(b"B"):
         raise DiscoveryBusyError()
@@ -137,8 +155,15 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         raise NanocachedError("nanocached: invalid node count in discovery response")
 
     nodes: list[DiscoveredNode] = []
+    total_bytes = len(header)
     for _ in range(count):
-        entry_header = await reader.readuntil(b"\n")
+        try:
+            entry_header = await reader.readuntil(b"\n")
+        except asyncio.LimitOverrunError as error:
+            raise NanocachedError(
+                "nanocached: invalid node entry header in discovery response (missing header terminator)"
+            ) from error
+        total_bytes += len(entry_header)
         lengths = entry_header[:-1].split(b" ")
         if len(lengths) != 2:
             raise NanocachedError("nanocached: invalid node entry header in discovery response")
@@ -150,6 +175,10 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
             or addr_length > _MAX_NODE_FIELD_LENGTH
         ):
             raise NanocachedError("nanocached: invalid node entry lengths in discovery response")
+
+        total_bytes += name_length + addr_length + 1
+        if total_bytes > _MAX_NODE_LIST_RESPONSE_LENGTH:
+            raise NanocachedError("nanocached: discovery response exceeds maximum size")
 
         body = await reader.readexactly(name_length + addr_length + 1)  # +1: trailing '\n'
         if body[-1:] != b"\n":

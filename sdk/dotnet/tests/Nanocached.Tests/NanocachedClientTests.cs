@@ -295,6 +295,72 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task RepeatedTlsHandshakeFailuresEachFailPromptlyWithoutLeaking()
+    {
+        // Regression: OpenAsync's catch block used to call only
+        // socket.Dispose() on a failed TLS handshake, leaving the
+        // SslStream/NetworkStream wrapping it undisposed — so repeated
+        // failed handshakes accumulated undisposed streams. There's no
+        // clean outside observation of stream disposal, so this proves
+        // the fix's externally visible contract instead: many failed
+        // handshakes against the same never-TLS-speaking listener each
+        // fail promptly and independently, with no hang or crash from
+        // accumulating undisposed streams.
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        _ = AcceptAndCloseForeverAsync(listener);
+
+        try
+        {
+            for (int i = 0; i < 20; i++)
+            {
+                await Assert.ThrowsAnyAsync<Exception>(() => NanocachedClient.ConnectAsync(new NanocachedClient.Options
+                {
+                    Addresses = { ("127.0.0.1", port) },
+                    Tls = true,
+                }));
+            }
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    private static async Task AcceptAndCloseForeverAsync(System.Net.Sockets.TcpListener listener)
+    {
+        while (true)
+        {
+            System.Net.Sockets.TcpClient client;
+            try
+            {
+                client = await listener.AcceptTcpClientAsync();
+            }
+            catch
+            {
+                return;
+            }
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    // Not a valid TLS record — the client's handshake fails.
+                    await client.GetStream().WriteAsync(new byte[] { 0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28 });
+                }
+                catch
+                {
+                    // The client may have already given up.
+                }
+                finally
+                {
+                    client.Close();
+                }
+            });
+        }
+    }
+
+    [Fact]
     public async Task TransparentlyReconnectsAfterAServerFin()
     {
         using var node = new MockNode();
@@ -326,6 +392,26 @@ public class NanocachedClientTests
         {
             NanocachedClient.KeepAliveInterval = defaultInterval;
         }
+    }
+
+    [Fact]
+    public async Task CloseFiresOnClosedExactlyOnceUnderConcurrency()
+    {
+        // Regression: the old "if (_closed) return; _closed = true;"
+        // check-then-set let concurrent Close() calls both pass the
+        // check, double-firing onClosed and corrupting the open-target
+        // counter it decrements. Interlocked.Exchange makes the gate
+        // atomic instead.
+        using var node = new MockNode();
+        using var raw = new System.Net.Sockets.TcpClient();
+        await raw.ConnectAsync("127.0.0.1", node.Port);
+
+        int closedCount = 0;
+        var connection = new Connection(raw.GetStream(), () => Interlocked.Increment(ref closedCount));
+
+        await Task.WhenAll(Enumerable.Range(0, 50).Select(_ => Task.Run(connection.Close)));
+
+        Assert.Equal(1, closedCount);
     }
 
     // ── addresses ─────────────────────────────────────────────────
@@ -375,6 +461,70 @@ public class NanocachedClientTests
         await Assert.ThrowsAsync<DiscoveryBusyException>(
             () => NanocachedClient.ConnectAsync(
                 ManyAddresses(("127.0.0.1", first.Port), ("127.0.0.1", second.Port))));
+    }
+
+    // ── discovery response limits ────────────────────────────────
+
+    [Fact]
+    public async Task RejectsANodeCountBeyondTheMaximum()
+    {
+        // Regression: `N 2000000001 3` used to drive
+        // `new List<DiscoveredNode>(count)` straight from the wire — a
+        // multi-gigabyte allocation from an untrusted server. The header
+        // alone must be rejected before any entry is read.
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.RawListResponse = "N 2000000001 3\n";
+
+        NanocachedException error = await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port)));
+        Assert.Contains("node count", error.Message);
+    }
+
+    [Fact]
+    public async Task RejectsANodeListResponseBeyondTheAggregateCap()
+    {
+        // Regression: a within-cap node count can still declare an
+        // absurd per-entry name/address length. A single entry near the
+        // 16 MiB aggregate cap must be rejected before its body is even
+        // read — otherwise a malicious server could make the client
+        // allocate gigabytes without ever sending that many bytes.
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        const int hugeNameLength = 20 * 1024 * 1024; // > 16 MiB alone
+        discovery.RawListResponse = $"N 1 1\n{hugeNameLength} 0\n";
+
+        NanocachedException error = await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port)));
+        Assert.Contains("exceeds", error.Message);
+    }
+
+    [Fact]
+    public async Task RejectsAMalformedNodeCountHeader()
+    {
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.RawListResponse = "N x 1\n";
+
+        await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port)));
+    }
+
+    [Fact]
+    public async Task RejectsAMalformedNodeEntryLengthHeader()
+    {
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.RawListResponse = "N 1 1\nx y\n";
+
+        await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port)));
+    }
+
+    [Fact]
+    public async Task RejectsAMalformedNodeAddressPort()
+    {
+        using var discovery = new MockDiscovery(new[] { (Names[0], "127.0.0.1:notaport") });
+
+        NanocachedException error = await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port)));
+        Assert.Contains("invalid node address", error.Message);
     }
 
     // ── クラスタと複製 ────────────────────────────────────────────
@@ -663,6 +813,10 @@ public class NanocachedClientTests
         await WaitForAsync(
             () => cluster.Nodes[owners[0]].Store.ContainsKey(stored),
             "the primary to be repaired");
+        // The original TTL can't be recovered from a GET; a repair must
+        // not use TTL 0 (no expiry), which would permanently resurrect
+        // already-expired data — see ReadRepairTtlSeconds.
+        Assert.Equal(60, cluster.Nodes[owners[0]].LastSetTtl);
     }
 
     [Fact]

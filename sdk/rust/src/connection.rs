@@ -23,6 +23,22 @@ use crate::identify::Stream;
 /// The server never stores values above its 1 MiB request limit.
 const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
 
+/// Bounds a request's full round trip (write + wait for its matched
+/// response), in milliseconds: without it, a half-open server that
+/// accepts the TCP connection but never writes back — or stops
+/// mid-stream — would hang `get`/`set`/`delete` forever awaiting a
+/// response that never comes, wedging every other pending caller behind
+/// it (and, transitively, `close()`'s in-flight background-write
+/// drain). Generous versus the server's own 10s outbound timeouts.
+/// Public-but-hidden purely as a test hook, mirroring
+/// `client::KEEPALIVE_INTERVAL_MS` — but read fresh on every request
+/// rather than once at connect, so a test that lowers it should restore
+/// it immediately after the one call it means to affect, and should
+/// pick a value comfortably above every other test's own simulated
+/// server delays to avoid tripping over a concurrently running one.
+#[doc(hidden)]
+pub static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
+
 /// A raw response marker byte plus its value bytes (`V` only) — what the
 /// read task parses off the wire, before `get`/`set`/`delete` convert it
 /// into a [`ResponseKind`] or a `WrongNode`/protocol error.
@@ -212,6 +228,28 @@ impl Connection {
         }
     }
 
+    /// Wraps `request_uncapped` in `REQUEST_TIMEOUT_MS`: if the whole
+    /// round trip hasn't completed by then, the server is presumed dead
+    /// (a half-open server that accepts but never answers looks
+    /// identical to one that's still slow) and this connection is
+    /// poisoned so the abandoned request's queue slot — otherwise stuck
+    /// forever with no receiver ever coming back for it, since nothing
+    /// will ever answer — gets cleared and the socket released, instead
+    /// of merely leaving it for a read that will never arrive to
+    /// eventually skip over.
+    async fn request(&self, frame: &[u8]) -> Result<ResponseKind> {
+        let timeout = Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::SeqCst));
+        match tokio::time::timeout(timeout, self.request_uncapped(frame)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.close();
+                Err(Error::ConnectionLost(format!(
+                    "nanocached: request timed out after {timeout:?} waiting for a response"
+                )))
+            }
+        }
+    }
+
     /// Enqueues a pending slot and writes `frame` under one lock (see the
     /// module doc comment), then waits on its own oneshot receiver — not
     /// the socket. If this future is dropped while awaiting that
@@ -220,8 +258,10 @@ impl Connection {
     /// listening and move on, exactly like the TypeScript SDK's
     /// Connection, whose plain Promises can't be cancelled out from
     /// under `pending` at all — every request behind it in the queue is
-    /// unaffected.
-    async fn request(&self, frame: &[u8]) -> Result<ResponseKind> {
+    /// unaffected. (`request`'s timeout wrapper additionally poisons the
+    /// connection outright when it fires, since in that case nothing is
+    /// ever going to answer.)
+    async fn request_uncapped(&self, frame: &[u8]) -> Result<ResponseKind> {
         if self.is_closed() {
             return Err(Error::ConnectionLost(
                 "nanocached: connection is closed".to_string(),

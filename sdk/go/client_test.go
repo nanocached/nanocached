@@ -74,12 +74,20 @@ type mockNode struct {
 	lastSetTTL      atomic.Value // string: the TTL field of the last S, or "none"
 	setDelay        atomic.Int64 // nanoseconds; sleep this long before every S reply
 	conns           sync.Map     // net.Conn -> struct{}
+	silent          atomic.Bool  // once true, every G/S/D is read but never answered
 }
 
 // delaySets makes every future S reply from this node wait d first — for
 // tests proving a caller isn't blocked on a slow replica leg
 // (doc/adr/0014-*.md).
 func (m *mockNode) delaySets(d time.Duration) { m.setDelay.Store(int64(d)) }
+
+// goSilentAfterHandshake makes this node a half-open server from this
+// point on: it still accepts and completes the A handshake, and still
+// reads every request frame off the wire (so the TCP stream stays
+// well-formed), but never writes a reply — regression coverage for a
+// request-level I/O timeout (issue tracked alongside doc/adr/0016-*.md).
+func (m *mockNode) goSilentAfterHandshake() { m.silent.Store(true) }
 
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
 	t.Helper()
@@ -158,6 +166,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 		case "G":
 			key := string(mustRead(reader, atoiOrPanic(parts[1])))
+			if m.silent.Load() {
+				continue
+			}
 			m.getCount.Add(1)
 			if m.takeOne(&m.malformedLeft) {
 				if _, err := conn.Write([]byte("V x\n")); err != nil {
@@ -188,6 +199,9 @@ func (m *mockNode) serve(conn net.Conn) {
 		case "S":
 			key := string(mustRead(reader, atoiOrPanic(parts[1])))
 			value := mustRead(reader, atoiOrPanic(parts[2]))
+			if m.silent.Load() {
+				continue
+			}
 			if len(parts) == 4 {
 				m.lastSetTTL.Store(parts[3])
 			} else {
@@ -207,6 +221,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 		case "D":
 			key := string(mustRead(reader, atoiOrPanic(parts[1])))
+			if m.silent.Load() {
+				continue
+			}
 			reply := "N\n"
 			if m.takeWrongNode() {
 				reply = "W\n"
@@ -879,6 +896,43 @@ func TestKeepAlivePingsAnIdleConnection(t *testing.T) {
 	}
 }
 
+func TestARequestToAHalfOpenServerFailsWithinTheTimeoutAndCloseReturns(t *testing.T) {
+	// Regression: a server that completes the A handshake but then never
+	// answers a G/S/D (accepts the TCP connection and goes silent — a
+	// blackholed peer behaves the same way once the deadline is cleared
+	// after the handshake) must not hang Get/Set/Delete, or transitively
+	// Close(), forever.
+	original := requestTimeout
+	requestTimeout = 100 * time.Millisecond
+	defer func() { requestTimeout = original }()
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.goSilentAfterHandshake()
+
+	started := time.Now()
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get against a half-open connection = %v, want ErrConnectionLost", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Get took %v, want well under 2s", elapsed)
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		client.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not return")
+	}
+}
+
 // ── addresses ─────────────────────────────────────────────────────
 
 func TestRejectsAMissingTarget(t *testing.T) {
@@ -914,6 +968,36 @@ func TestRaisesBusyWhenEveryAddressIsWarming(t *testing.T) {
 
 	if _, err := Connect(Config{Addresses: []Address{addr(first.address()), addr(second.address())}}); !errors.Is(err, ErrDiscoveryBusy) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestDiscoveryNodeListExceedingTheAggregateCapIsRejected(t *testing.T) {
+	// Regression: maxNodeCount and maxNodeFieldLength bound each field of
+	// an N response, but not its aggregate size — a discovery server
+	// claiming many maxNodeFieldLength-sized entries could otherwise make
+	// the client accumulate tens of megabytes (~8.5GB at the theoretical
+	// extreme: maxNodeCount * 2 * maxNodeFieldLength) from a single L
+	// response. This test's entries hit the (legal) per-field max, just
+	// enough of them to cross maxNodeListResponseBytes — well short of
+	// maxNodeCount — so the aggregate cap specifically is what trips.
+	const fieldLen = maxNodeFieldLength
+	entryBytes := 2*fieldLen + 1 // name + address + trailing '\n'
+	count := maxNodeListResponseBytes/entryBytes + 2
+
+	name := strings.Repeat("n", fieldLen)
+	address := strings.Repeat("a", fieldLen)
+	nodes := make([]DiscoveredNode, count)
+	for i := range nodes {
+		nodes[i] = DiscoveredNode{Name: name, Address: address}
+	}
+
+	discovery := startMockDiscovery(t, nodes, 1)
+	_, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err == nil {
+		t.Fatal("expected an error for a node-list response exceeding the aggregate cap")
+	}
+	if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want an aggregate-cap error", err)
 	}
 }
 
@@ -1282,6 +1366,9 @@ func TestReadRepairFindsAValueOnAReplicaAndRepairsThePrimary(t *testing.T) {
 
 	if !waitUntil(t, 2*time.Second, func() bool { return nodes[owners[0]].hasKey(key) }) {
 		t.Fatal("the primary was never repaired")
+	}
+	if got := nodes[owners[0]].lastSetTTL.Load(); got != "60" {
+		t.Fatalf("repair TTL = %v, want %d (readRepairTTL, not immortal)", got, readRepairTTL)
 	}
 }
 

@@ -11,6 +11,7 @@ from nanocached import (
     DiscoveryBusyError,
     HashRing,
     NanocachedClient,
+    NanocachedError,
     WrongNodeError,
 )
 
@@ -314,6 +315,41 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_an_unterminated_value_header_poisons_the_connection_promptly(self):
+        # Regression for issue #8 follow-up: readuntil()'s
+        # LimitOverrunError (a ValueError subclass — neither
+        # ConnectionError nor NanocachedError/OSError) previously escaped
+        # _read_loop's except clauses uncaught, killing the read task
+        # silently: _poison() never ran, the writer never closed, and
+        # every pending/future request hung forever. A malicious or
+        # corrupted server sending `V` and withholding the header's `\n`
+        # must instead fail promptly and close the connection.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                node.answer_unterminated_value_once()
+                # Before the fix, this hung forever (LimitOverrunError
+                # killed the read task silently, and no timeout in this
+                # SDK ever intervenes) — the outer wait_for turns that
+                # into a prompt, unambiguous test failure instead of a
+                # stuck test run. The 512 KiB mock write loop finishing
+                # before the reader task gets scheduled is a harmless
+                # artifact of both ends sharing one event loop in this
+                # test; readuntil()'s own 64 KiB limit is what actually
+                # bounds a real, separate-process client.
+                with self.assertRaises(ConnectionError):
+                    await asyncio.wait_for(client.get("k"), timeout=5.0)
+
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the connection to be closed",
+                )
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
     async def test_a_mismatched_response_kind_poisons_the_connection(self):
         # A well-formed response of the wrong kind (`S` answering a G)
         # means the request/response streams are off by one; reusing the
@@ -400,6 +436,74 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await discovery.close()
             await node.close()
+
+
+class IdentifyMalformedResponseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_an_unterminated_node_list_header_fails_promptly(self):
+        # Regression: mirrors the `V`-path LimitOverrunError fix on the
+        # discovery path. readuntil() can raise LimitOverrunError here
+        # too (neither NanocachedError nor OSError); left unwrapped it
+        # would break client.py's `except (NanocachedError, OSError)`
+        # contracts ("try next address silently", "refresh swallows
+        # failures") and escape raw to callers instead.
+        from nanocached import _identify
+
+        discovery = await MockDiscovery([]).start()
+        try:
+            discovery.answer_unterminated_list_once()
+            # Left unwrapped, this would either escape as a raw
+            # LimitOverrunError or (once CONNECT_DEADLINE elapses) as a
+            # plain ConnectionError — neither satisfies NanocachedError,
+            # so this assertion also catches a regression back to the
+            # unwrapped exception, not just a hang.
+            with self.assertRaises(NanocachedError):
+                await asyncio.wait_for(
+                    _identify.connect_and_identify("127.0.0.1", discovery.port, None, None),
+                    timeout=5.0,
+                )
+        finally:
+            await discovery.close()
+
+    async def test_an_oversized_node_list_response_fails_instead_of_buffering_unbounded_memory(self):
+        # Regression: bounds a malicious discovery server's memory
+        # pressure with an aggregate cap on the whole `N ...` response
+        # (16 MiB), independent of the per-field caps — this same
+        # constant is being added to all six SDKs.
+        from nanocached import _identify
+
+        field_length = 64 * 1024  # _MAX_NODE_FIELD_LENGTH
+        entry_count = 300  # ~300 * ~128 KiB > 16 MiB
+
+        async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                await reader.readuntil(b"\n")  # the `A ...` frame
+                writer.write(b"Od\n")
+                await writer.drain()
+                await reader.readuntil(b"\n")  # the `L\n` frame
+                writer.write(b"N %d 1\n" % entry_count)
+                name = b"a" * field_length
+                addr = b"b" * field_length
+                entry = b"%d %d\n%b%b\n" % (field_length, field_length, name, addr)
+                for _ in range(entry_count):
+                    writer.write(entry)
+                    await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                writer.close()
+
+        server = await asyncio.start_server(serve, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            with self.assertRaises(NanocachedError) as ctx:
+                await asyncio.wait_for(
+                    _identify.connect_and_identify("127.0.0.1", port, None, None),
+                    timeout=10.0,
+                )
+            self.assertIn("exceeds maximum size", str(ctx.exception))
+        finally:
+            server.close()
+            await server.wait_closed()
 
 
 class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
@@ -960,6 +1064,11 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(await client.get_bytes("k"), b"from-replica")
                 await wait_for(lambda: b"k" in nodes[primary].store, "the primary to be repaired")
+                # The original TTL can't be recovered from a GET; a
+                # repair must not use TTL 0 (no expiry), which would
+                # permanently resurrect already-expired data — see
+                # _READ_REPAIR_TTL in client.py.
+                self.assertEqual(nodes[primary].last_set_ttl, 60)
             finally:
                 client.close()
         finally:

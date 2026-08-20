@@ -1,6 +1,13 @@
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { encodeDelete, encodeGet, encodeSet, tryParseResponse, type ParsedResponse } from "./protocol.js";
+import {
+  encodeDelete,
+  encodeGet,
+  encodeSet,
+  MAX_RESPONSE_FRAME_LENGTH,
+  tryParseResponse,
+  type ParsedResponse,
+} from "./protocol.js";
 
 interface Waiter {
   resolve: (response: ParsedResponse) => void;
@@ -55,7 +62,12 @@ export function isConnectionError(error: unknown): boolean {
  */
 export class Connection {
   private readonly socket: Socket | TLSSocket;
-  private buffer: Buffer = Buffer.alloc(0);
+  // Chunks are accumulated in an array and only concatenated when a parse
+  // is attempted, instead of concatenating on every onData call — avoids
+  // an O(n^2) cost re-copying the whole buffer for each fragment of a
+  // large value.
+  private chunks: Buffer[] = [];
+  private chunksLength = 0;
   private readonly pending: Waiter[] = [];
   private closed = false;
   private lastError: Error | null = null;
@@ -149,21 +161,43 @@ export class Connection {
   }
 
   private onData(chunk: Buffer): void {
-    this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
+    this.chunks.push(chunk);
+    this.chunksLength += chunk.length;
 
     for (;;) {
+      const buffer = this.chunks.length === 1 ? this.chunks[0] : Buffer.concat(this.chunks, this.chunksLength);
+
       let parsed;
       try {
-        parsed = tryParseResponse(this.buffer);
+        parsed = tryParseResponse(buffer);
       } catch (error) {
         this.lastError = error as Error;
         this.socket.destroy();
         return;
       }
 
-      if (parsed === null) return;
+      if (parsed === null) {
+        // A frame this large without ever completing means the server
+        // will never send a valid terminator — tryParseResponse already
+        // bounds the `V` header search on its own, but this is a backstop
+        // covering the value body (and any other response kind), so a
+        // malicious server can't wedge this open by trickling bytes that
+        // never assemble into a parseable frame (issue #12 follow-up).
+        if (buffer.length > MAX_RESPONSE_FRAME_LENGTH) {
+          this.lastError = new Error("nanocached: response frame exceeds maximum size (connection desynced)");
+          this.socket.destroy();
+          return;
+        }
+        // Collapse back to a single stored chunk so later onData calls
+        // don't re-concat bytes already merged here.
+        this.chunks = [buffer];
+        this.chunksLength = buffer.length;
+        return;
+      }
 
-      this.buffer = this.buffer.subarray(parsed.consumed);
+      const remainder = buffer.subarray(parsed.consumed);
+      this.chunks = remainder.length > 0 ? [remainder] : [];
+      this.chunksLength = remainder.length;
 
       // An unsolicited "busy" response means the server hit its connection
       // limit right after accept and is about to close the connection; it

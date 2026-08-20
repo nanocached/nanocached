@@ -31,6 +31,9 @@ final class MockServers {
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
+        /** The TTL (whole seconds; 0 if omitted on the wire) from the
+         * most recent S request this server received. */
+        volatile long lastSetTtl = 0;
         private final byte[] requiredSecret;
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
@@ -157,6 +160,9 @@ final class MockServers {
                         case "S" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             byte[] value = in.readNBytes(Integer.parseInt(parts[2]));
+                            // parts[3], when present, is the TTL (omitted
+                            // on the wire means "no expiry", i.e. 0).
+                            lastSetTtl = parts.length > 3 ? Long.parseLong(parts[3]) : 0;
                             if (setDelayMillis > 0) {
                                 try {
                                     Thread.sleep(setDelayMillis);
@@ -213,6 +219,13 @@ final class MockServers {
         volatile boolean warmingUp = false;
         final int replication;
         private final ServerSocket server;
+        /** When set, an L request gets this exact text instead of the
+         * normally generated frame — for tests that need to claim things
+         * about the node list a real registry couldn't (an over-the-cap
+         * count, a malformed header, an entry whose declared length
+         * would blow the aggregate response cap) without actually
+         * holding that much node data in memory. */
+        volatile String rawListResponse;
 
         MockDiscovery(List<DiscoveredNode> nodes, int replication) throws IOException {
             this.nodes = nodes;
@@ -258,6 +271,12 @@ final class MockServers {
                     } else if (parts[0].equals("L")) {
                         if (warmingUp) {
                             out.write("B\n".getBytes(StandardCharsets.US_ASCII));
+                            out.flush();
+                            return;
+                        }
+                        String raw = rawListResponse;
+                        if (raw != null) {
+                            out.write(raw.getBytes(StandardCharsets.UTF_8));
                             out.flush();
                             return;
                         }

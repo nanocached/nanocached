@@ -20,8 +20,9 @@ namespace Nanocached;
 /// </summary>
 internal sealed class Connection
 {
-    // The server never stores values above its 1 MiB request limit, so a
-    // claimed length beyond this is a corrupt or malicious frame.
+    // The server's own request cap is 1 MiB; this constant doubles that
+    // as headroom, so a claimed length beyond it is definitely a corrupt
+    // or malicious frame, never just a legitimately large value.
     private const int MaxValueLength = 2 * 1024 * 1024;
 
     private readonly Stream _stream;
@@ -29,7 +30,15 @@ internal sealed class Connection
     private readonly ConcurrentQueue<TaskCompletionSource<(byte Marker, byte[]? Value)>> _pending = new();
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
     private readonly Action? _onClosed;
-    private volatile bool _closed;
+    // 0 = open, 1 = closed. An int (not a bool) so Close() can gate on it
+    // with Interlocked.Exchange: the previous plain "if (_closed) return;
+    // _closed = true;" was a non-atomic check-then-set, so two concurrent
+    // Close() calls could both pass the check and both run the body,
+    // double-firing _onClosed and corrupting the open-target counter it
+    // decrements. Exchange makes "am I the first caller to close this"
+    // a single atomic step — exactly the guarantee Java's poison() gets
+    // from `synchronized`.
+    private int _closedFlag;
 
     /// <summary><paramref name="onClosed"/>, when given, fires exactly
     /// once — the first time this connection actually closes — no matter
@@ -44,18 +53,18 @@ internal sealed class Connection
         _ = ReadLoopAsync();
     }
 
-    internal bool IsClosed => _closed;
+    internal bool IsClosed => Volatile.Read(ref _closedFlag) != 0;
 
     internal TimeSpan Idle => _sinceLastUse.Elapsed;
 
-    /// <summary>Idempotent. Rejects every request still pending with a
+    /// <summary>Idempotent — safe to call concurrently from more than one
+    /// caller. Rejects every request still pending with a
     /// connection-closed error — the read loop's own exit path (a failed
     /// read) also routes through here, so this is the single place
     /// draining ever happens.</summary>
     internal void Close()
     {
-        if (_closed) return;
-        _closed = true;
+        if (Interlocked.Exchange(ref _closedFlag, 1) != 0) return;
         _stream.Dispose();
         _onClosed?.Invoke();
         while (_pending.TryDequeue(out var tcs))
@@ -143,7 +152,7 @@ internal sealed class Connection
     /// awaiting anymore is harmless.</summary>
     private async Task<(byte Marker, byte[]? Value)> RequestAsync(byte[] frame)
     {
-        if (_closed)
+        if (IsClosed)
         {
             throw new ConnectionLostException("nanocached: connection is closed");
         }
@@ -154,7 +163,7 @@ internal sealed class Connection
         await _writeGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            if (_closed)
+            if (IsClosed)
             {
                 throw new ConnectionLostException("nanocached: connection is closed");
             }

@@ -34,6 +34,10 @@ struct NodeState {
     /// The raw `S ...` header most recently received, so tests can assert
     /// whether the ttl field was present on the wire.
     last_set_header: Mutex<Option<String>>,
+    /// Once true, every G/S/D is read off the wire (so the stream stays
+    /// well-formed) but never answered — a half-open server, for the
+    /// request-timeout regression test.
+    silent: std::sync::atomic::AtomicBool,
 }
 
 struct MockNode {
@@ -111,6 +115,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             }
             "G" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
                 state.gets.fetch_add(1, Ordering::SeqCst);
                 let delay = state.get_delay_ms.swap(0, Ordering::SeqCst);
                 if delay > 0 {
@@ -147,6 +154,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             "S" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
                 let value = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let delay = state.set_delay_ms.load(Ordering::SeqCst);
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
@@ -164,6 +174,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             }
             "D" => {
                 let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let reply: &[u8] = if take_wrong_node(&state) {
                     b"W\n"
                 } else if state.store.lock().unwrap().remove(&key).is_some() {
@@ -751,6 +764,44 @@ async fn keep_alive_pings_an_idle_connection() {
     node.stop();
 }
 
+#[tokio::test]
+async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_returns() {
+    // Regression: a server that completes the A handshake but then never
+    // answers a G/S/D (accepts the TCP connection and goes silent — a
+    // blackholed peer behaves the same way) must not hang get/set/delete
+    // forever, and close() must still return promptly rather than being
+    // left waiting on a connection that will never hear back.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    node.state.silent.store(true, Ordering::SeqCst);
+
+    // REQUEST_TIMEOUT_MS is read fresh on every request (unlike
+    // KEEPALIVE_INTERVAL_MS, which is only read at connect), so lowering
+    // and restoring it tightly around the one call below keeps this from
+    // affecting concurrently running tests' requests — 800ms is chosen
+    // comfortably above the largest simulated server delay used anywhere
+    // else in this suite (200ms), so even a request from another test
+    // that lands inside this window still comfortably beats it.
+    let default_timeout = nanocached::REQUEST_TIMEOUT_MS.load(Ordering::SeqCst);
+    nanocached::REQUEST_TIMEOUT_MS.store(800, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let result = client.get("k").await;
+    nanocached::REQUEST_TIMEOUT_MS.store(default_timeout, Ordering::SeqCst);
+
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "get against a half-open connection = {result:?}, want ConnectionLost"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "get took {:?}, want well under 5s",
+        started.elapsed()
+    );
+
+    client.close(); // must return promptly, not hang on the dead connection
+    node.stop();
+}
+
 // ── addresses ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -788,6 +839,45 @@ async fn raises_busy_when_every_address_is_warming() {
     assert!(matches!(result, Err(Error::DiscoveryBusy)));
     first.stop();
     second.stop();
+}
+
+#[tokio::test]
+async fn discovery_node_list_exceeding_the_aggregate_cap_is_rejected() {
+    // Regression: MAX_NODE_COUNT and MAX_NODE_FIELD_LENGTH bound each
+    // field of an N response, but not its aggregate size — a discovery
+    // server claiming many max-field-length entries could otherwise make
+    // the client accumulate tens of megabytes (~8.5GB at the theoretical
+    // extreme: MAX_NODE_COUNT * 2 * MAX_NODE_FIELD_LENGTH) from a single
+    // L response. The literals below mirror identify.rs's private
+    // MAX_NODE_FIELD_LENGTH / MAX_NODE_LIST_RESPONSE_BYTES (not exported
+    // to this integration-test crate). This test's entries hit the
+    // (legal) per-field max, just enough of them to cross the aggregate
+    // cap — well short of MAX_NODE_COUNT — so the aggregate cap
+    // specifically is what trips.
+    const FIELD_LEN: usize = 64 * 1024;
+    const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    let entry_bytes = 2 * FIELD_LEN + 1; // name + address + trailing '\n'
+    let count = MAX_RESPONSE_BYTES / entry_bytes + 2;
+
+    let name = "n".repeat(FIELD_LEN);
+    let address = "a".repeat(FIELD_LEN);
+    let nodes = vec![(name, address); count];
+
+    let discovery = MockDiscovery::start(nodes, 1).await;
+    let result =
+        NanocachedClient::connect(Options::new().addresses([("127.0.0.1", discovery.port)])).await;
+
+    match result {
+        Err(Error::Protocol(message)) => {
+            assert!(
+                message.contains("exceeds"),
+                "err = {message}, want an aggregate-cap error"
+            );
+        }
+        Ok(_) => panic!("connect() succeeded, want a Protocol error"),
+        Err(other) => panic!("connect() = {other}, want a Protocol error"),
+    }
+    discovery.stop();
 }
 
 // ── クラスタと複製 ────────────────────────────────────────────────
@@ -1334,6 +1424,11 @@ async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    assert_eq!(
+        primary.state.last_set_header.lock().unwrap().as_deref(),
+        Some("S 1 12 60"),
+        "repair TTL should be READ_REPAIR_TTL (60s), not immortal (ttl_seconds 0)"
+    );
 
     client.close();
     discovery.stop();

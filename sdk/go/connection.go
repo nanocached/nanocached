@@ -25,6 +25,16 @@ import (
 // larger is a corrupt or malicious frame.
 const maxValueLength = 2 * 1024 * 1024
 
+// requestTimeout bounds each outstanding request's full round trip
+// (write + wait for its matched response): without it, a half-open
+// server that accepts the TCP connection but never writes back — or
+// stops mid-stream — would hang Get/Set/Delete forever in readLoop's
+// blocking Read, wedging every other pending caller behind it (and,
+// transitively, Close(), which waits on background replica writes).
+// Generous versus the server's own 10s outbound timeouts. A variable
+// only so tests can shorten it.
+var requestTimeout = 30 * time.Second
+
 type roundTripResult struct {
 	marker byte
 	value  []byte
@@ -206,6 +216,11 @@ func (c *connection) request(frame []byte) (byte, []byte, error) {
 	}
 	c.lastUsed = time.Now()
 	c.pending = append(c.pending, resultCh)
+	// requestTimeout bounds this request while it's outstanding; reset
+	// on every new request so the deadline always reflects the newest
+	// thing waiting on an answer. readLoop clears it once nothing is
+	// outstanding, so an idle connection is never closed by this alone.
+	_ = c.conn.SetDeadline(time.Now().Add(requestTimeout))
 	_, writeErr := c.conn.Write(frame)
 	c.mu.Unlock()
 
@@ -241,6 +256,7 @@ func (c *connection) readLoop() {
 			ch = c.pending[0]
 			c.pending = c.pending[1:]
 		}
+		noneOutstanding := len(c.pending) == 0
 		c.mu.Unlock()
 
 		// An unsolicited "busy" response means the server hit its
@@ -254,6 +270,13 @@ func (c *connection) readLoop() {
 		if ch == nil {
 			c.poison(fmt.Errorf("nanocached: unsolicited response %q from server (connection desynced)", marker))
 			return
+		}
+		if noneOutstanding {
+			// Nothing left waiting on an answer: clear requestTimeout's
+			// deadline so an otherwise-idle connection is never closed
+			// by it (keep-alive pings excepted — they set their own
+			// deadline via request() like any other call).
+			_ = c.conn.SetDeadline(time.Time{})
 		}
 		ch <- roundTripResult{marker: marker, value: value}
 	}

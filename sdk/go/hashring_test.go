@@ -74,6 +74,15 @@ func TestAddingANodeNeverReordersExistingNodes(t *testing.T) {
 	}
 }
 
+func TestRoutePanicsOnAnEmptyRing(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("Route on an empty ring did not panic")
+		}
+	}()
+	NewHashRing(nil).Route([]byte("k"))
+}
+
 func TestSpreadsKeysEvenly(t *testing.T) {
 	nodes := []string{"node-a", "node-b", "node-c"}
 	ring := NewHashRing(nodes)

@@ -41,6 +41,15 @@ _DEFAULT_COMPRESSION_THRESHOLD = 256
 # get/set/delete refreshes it first (checked lazily on use).
 _NODE_LIST_STALE_AFTER = 30.0
 
+# TTL (whole seconds — the protocol's TTL unit throughout, see
+# _encode_set in _connection.py) a read-repair write uses
+# (doc/adr/0015-*.md). The original TTL isn't recoverable from a GET
+# response, and repairing with TTL 0 (no expiry) would permanently
+# resurrect data that was legitimately expiring; 60s bounds the overshoot
+# instead — an immortal key just gets re-repaired on a later miss.
+# Cross-SDK policy decision, applied identically across all SDKs.
+_READ_REPAIR_TTL = 60
+
 # The keep-alive ping: the server rejects empty keys, so it needs at least
 # one byte; a single NUL stays out of any real key space.
 _KEEPALIVE_KEY = b"\x00"
@@ -277,9 +286,11 @@ class NanocachedClient:
         order, for a value the normal read path already reported
         missing. The first owner that has it wins: its value is
         returned, and — detached, not awaited, no tracking — that same
-        value repairs the true primary in the background, with no TTL.
-        Every failure along the way is swallowed; nothing here may turn
-        an already-accepted miss into an error."""
+        value repairs the true primary in the background, with TTL
+        _READ_REPAIR_TTL (the original TTL can't be recovered from a
+        GET, and TTL 0 would permanently resurrect already-expired
+        data). Every failure along the way is swallowed; nothing here
+        may turn an already-accepted miss into an error."""
         names = self._owner_names(key)
         for name in names:
             try:
@@ -296,7 +307,7 @@ class NanocachedClient:
                 async def repair(primary: str = primary, value: bytes = value) -> None:
                     try:
                         connection = await self._member_connection(primary)
-                        await connection.set(key, value, 0)
+                        await connection.set(key, value, _READ_REPAIR_TTL)
                     except Exception:
                         pass  # Swallowed by design — see the docstring.
 

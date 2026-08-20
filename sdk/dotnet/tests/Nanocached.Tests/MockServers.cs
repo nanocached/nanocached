@@ -16,6 +16,10 @@ public sealed class MockNode : IDisposable
     public int ConnectionCount => _connectionCount;
     public int GetCount => _getCount;
 
+    /// <summary>The TTL (whole seconds; 0 if omitted on the wire) from
+    /// the most recent S request this server received.</summary>
+    public long LastSetTtl => _lastSetTtl;
+
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
@@ -25,6 +29,7 @@ public sealed class MockNode : IDisposable
     private int _malformedValueReplies;
     private int _storedToGetReplies;
     private volatile int _setDelayMillis;
+    private long _lastSetTtl;
 
     public MockNode(string? requiredSecret = null)
     {
@@ -137,6 +142,9 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         byte[] value = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        // parts[3], when present, is the TTL (omitted on
+                        // the wire means "no expiry", i.e. 0).
+                        _lastSetTtl = parts.Length > 3 ? long.Parse(parts[3]) : 0;
                         if (_setDelayMillis > 0)
                         {
                             await Task.Delay(_setDelayMillis);
@@ -242,6 +250,14 @@ public sealed class MockDiscovery : IDisposable
 
     public void SetNodes(IReadOnlyList<(string Name, string Address)> nodes) => _nodes = nodes;
 
+    /// <summary>When set, an L request gets this exact text instead of
+    /// the normally generated frame — for tests that need to claim
+    /// things about the node list a real registry couldn't (an
+    /// over-the-cap count, a malformed header, an entry whose declared
+    /// length would blow the aggregate response cap) without actually
+    /// having to hold that much node data in memory.</summary>
+    public string? RawListResponse { get; set; }
+
     public void Dispose() => _listener.Stop();
 
     private async Task AcceptLoopAsync()
@@ -278,6 +294,11 @@ public sealed class MockDiscovery : IDisposable
                     if (WarmingUp)
                     {
                         await Wire.WriteAsync(stream, "B\n");
+                        return;
+                    }
+                    if (RawListResponse is not null)
+                    {
+                        await Wire.WriteAsync(stream, RawListResponse);
                         return;
                     }
                     IReadOnlyList<(string Name, string Address)> snapshot = _nodes;

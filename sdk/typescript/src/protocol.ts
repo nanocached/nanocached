@@ -47,6 +47,20 @@ export interface ParsedResponse {
 // claimed length beyond this is a corrupt or malicious frame.
 const MAX_VALUE_LENGTH = 2 * 1024 * 1024;
 
+// The longest a legal `V <len>\n` header can ever be: marker + space +
+// the decimal digits of MAX_VALUE_LENGTH + LF. A buffer that has grown
+// past this without an LF can never complete into a legal header, so the
+// header search below must not keep waiting for one — a malicious server
+// could otherwise withhold the LF forever while the caller buffers
+// unboundedly (issue #12 follow-up).
+const MAX_VALUE_HEADER_LENGTH = 2 + String(MAX_VALUE_LENGTH).length + 1;
+
+// The longest a complete `V` frame can ever be: its header plus the
+// value body. Exported so Connection can bound total per-frame
+// accumulation as a backstop covering every response kind, not just the
+// header search above.
+export const MAX_RESPONSE_FRAME_LENGTH = MAX_VALUE_HEADER_LENGTH + MAX_VALUE_LENGTH;
+
 const MARKER_STORED = 0x53; // 'S'
 const MARKER_DELETED = 0x44; // 'D'
 const MARKER_NOT_FOUND = 0x4e; // 'N'
@@ -75,7 +89,14 @@ export function tryParseResponse(buf: Buffer): { response: ParsedResponse; consu
 
     case MARKER_VALUE: {
       const headerEnd = buf.indexOf(LF);
-      if (headerEnd === -1) return null;
+      if (headerEnd === -1) {
+        // Keep waiting only while the header could still turn out legal;
+        // beyond MAX_VALUE_HEADER_LENGTH with no LF, it never will.
+        if (buf.length > MAX_VALUE_HEADER_LENGTH) {
+          throw new Error("nanocached: invalid value length in response (missing header terminator)");
+        }
+        return null;
+      }
 
       const length = Number(buf.subarray(2, headerEnd).toString("ascii"));
       // Lengths beyond the server's own 1 MiB request cap are protocol
