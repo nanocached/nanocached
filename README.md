@@ -479,7 +479,10 @@ loud `WARN` if that disagrees with its own configured value.
 - Maximum cache memory usage: 256 MiB by default, configurable with
   `--max-memory <bytes>` (approximate: sum of stored key and value bytes
   plus a small per-entry accounting overhead), least-recently-used
-  entries evicted first
+  entries evicted first; `--max-memory` rejects anything below 1 MiB
+  (1,048,576 bytes) — a budget that low can never actually be satisfied
+  (the cache always keeps at least one entry), so it would just evict
+  everything else on every write instead of caching anything
 - Idle connection timeout: 60 seconds
 
 ### nanocached-discovery

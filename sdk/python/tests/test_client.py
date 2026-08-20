@@ -131,6 +131,57 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_empty_key_is_rejected_before_touching_the_connection(self):
+        # An empty key would serialize to a frame the server rejects with
+        # no reply (ParseError::EmptyKey, src/command.rs), closing the
+        # shared, pipelined connection and taking every other in-flight
+        # request on it down with it — same consequence as an invalid
+        # ttl_seconds, so it must be rejected the same way: synchronously,
+        # before anything is written.
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.get("")
+            with self.assertRaises(ValueError):
+                await client.set("", "v")
+            with self.assertRaises(ValueError):
+                await client.delete("")
+
+            # None of the rejections above wrote anything to the shared
+            # connection — a concurrent valid call on it must still
+            # succeed normally, and no reconnect should have happened.
+            await client.set("k", "v")
+            results = await asyncio.gather(
+                client.get("k"),
+                client.set("", "poison-attempt"),
+                client.get("k"),
+                return_exceptions=True,
+            )
+            self.assertEqual(results[0], "v")
+            self.assertIsInstance(results[1], ValueError)
+            self.assertEqual(results[2], "v")
+            self.assertEqual(self.node.connection_count, 1, "an empty-key rejection triggered a reconnect")
+        finally:
+            await client.close()
+
+    async def test_oversized_key_and_value_are_rejected_before_touching_the_connection(self):
+        from nanocached.client import _MAX_REQUEST_BYTES
+
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.get(b"k" * (_MAX_REQUEST_BYTES + 1))
+            with self.assertRaises(ValueError):
+                await client.set("k", b"v" * (_MAX_REQUEST_BYTES + 1))
+            with self.assertRaises(ValueError):
+                await client.delete(b"k" * (_MAX_REQUEST_BYTES + 1))
+
+            # Still usable afterward — none of the above touched the wire.
+            await client.set("k", "v")
+            self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
     async def test_authentication(self):
         secure = await MockNode(required_secret=b"s3cret").start()
         try:
@@ -332,6 +383,124 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(calls, 1, "the cancelled awaiter caused a redundant second dial")
             finally:
                 await client.close()
+        finally:
+            await node.close()
+
+    async def test_reconnect_cooldown_skips_a_known_dead_address(self):
+        node = await MockNode().start()
+        port = node.port
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", port)], reconnect_cooldown=0.2
+        )
+        try:
+            await client.set("k", "v")
+            await node.close()
+            await wait_for(
+                lambda: client._single is not None and client._single.closed,
+                "the client to see the FIN",
+            )
+
+            # Nothing listens on `port` anymore, so this redial fails fast
+            # and starts the cooldown window for that address.
+            with self.assertRaises(ConnectionError):
+                await client.get("k")
+
+            # A listener now sits on the same port and answers immediately
+            # with bytes the identify handshake rejects outright —
+            # deliberately not the IncompleteReadError/ConnectionResetError/
+            # BrokenPipeError shape that triggers connect_and_identify's
+            # legacy-server fallback redial (_identify.py), so each dial
+            # against it fails after exactly one connection, letting
+            # `connections` below tell "cooldown skipped the dial" apart
+            # from "cooldown let it through" unambiguously.
+            connections = 0
+
+            async def handle(reader, writer):
+                nonlocal connections
+                connections += 1
+                writer.write(b"XXX")
+                try:
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    pass
+                writer.close()
+
+            garbage = await asyncio.start_server(handle, "127.0.0.1", port)
+            try:
+                # Still within the cooldown window: rejects with the
+                # cached failure near-instantly, without dialing the
+                # listener at all.
+                start = asyncio.get_running_loop().time()
+                with self.assertRaises(ConnectionError):
+                    await client.get("k")
+                elapsed = asyncio.get_running_loop().time() - start
+                self.assertLess(elapsed, 0.1, f"expected a cooldown-fast rejection, took {elapsed}s")
+                self.assertEqual(connections, 0, "the cooldown did not prevent a redial")
+
+                # Once the cooldown window has passed, the address is
+                # dialed again, this time reaching the listener.
+                await asyncio.sleep(0.25)
+                with self.assertRaisesRegex(NanocachedError, "unexpected response to A"):
+                    await client.get("k")
+                self.assertEqual(
+                    connections, 1, "the address was never redialed after the cooldown elapsed"
+                )
+            finally:
+                garbage.close()
+                await garbage.wait_closed()
+        finally:
+            await client.close()
+
+    async def test_close_drains_an_in_flight_redial(self):
+        # A redial kept alive via asyncio.shield after its original caller
+        # was cancelled/timed out (see
+        # test_a_cancelled_awaiter_does_not_cause_a_redundant_second_dial)
+        # used to keep running unobserved past close(): the connection it
+        # eventually adopted could leak past close() (breaking the
+        # README's "close() returns after all connections are finished"),
+        # and a later failure in it had nothing left to retrieve its
+        # exception, surfacing as an "exception was never retrieved"
+        # warning. close() must drain it the same way it already drains
+        # background replica writes.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            await client.set("k", "v")
+            node.drop_connections()
+            await wait_for(
+                lambda: client._single is not None and client._single.closed,
+                "the client to see the FIN",
+            )
+
+            real_open = client._open_node_connection
+            calls = 0
+
+            async def slow_open(address):
+                nonlocal calls
+                calls += 1
+                await asyncio.sleep(0.08)
+                return await real_open(address)
+
+            client._open_node_connection = slow_open
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(client.get("k"), timeout=0.01)
+
+            # The redial is still running in the background, shielded
+            # from the caller above, which already gave up on it.
+            self.assertTrue(client._redials, "expected a redial still in flight")
+
+            start = asyncio.get_running_loop().time()
+            await client.close()
+            elapsed = asyncio.get_running_loop().time() - start
+            self.assertGreaterEqual(
+                elapsed, 0.06, "close() returned before the in-flight redial finished"
+            )
+            self.assertFalse(client._redials, "close() left a redial task untracked")
+            self.assertEqual(calls, 1)
+            # The connection the drained redial adopted must itself have
+            # been torn down by close(), not leaked.
+            self.assertTrue(client._single is not None and client._single.closed)
         finally:
             await node.close()
 

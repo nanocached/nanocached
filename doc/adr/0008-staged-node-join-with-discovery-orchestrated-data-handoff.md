@@ -9,6 +9,8 @@ items below; several mechanics are follow-up work, not yet designed.
 
 Builds on [2. Client-side consistent hashing with a lightweight self-hosted discovery server](0002-client-side-consistent-hashing-with-a-lightweight-self-hosted-discovery-server.md)
 
+`bench` (`src/bin/bench.rs`) was removed from the repository in #29 (a load-test client living in `src/bin/` read as product surface; see commit 97c83fe) — every mention of it below is historical context from when this decision was made, not a reference to current code.
+
 ## Context
 
 [[0002]]'s consequences already named the expected cost of a scaling event:

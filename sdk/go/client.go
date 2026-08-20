@@ -98,11 +98,89 @@ type Config struct {
 	// (doc/adr/0015-*.md). Off by default. Costs extra reads only on the
 	// misses it actually applies to.
 	ReadRepair bool
+	// ReconnectCooldown is how long, after a reconnect dial to an address
+	// fails, that address is treated as still down — a request routed to
+	// it during this window fails immediately with the original dial
+	// error instead of paying another full 5-second connect deadline
+	// redialing an address that just proved unreachable. Zero means
+	// DefaultReconnectCooldown (1s). Keep it well under nodeListStaleAfter
+	// (30s) so a node that genuinely recovers isn't shut out for long. A
+	// negative value disables the cooldown entirely — every request that
+	// finds a dead connection pays its own full dial attempt.
+	ReconnectCooldown time.Duration
+}
+
+// String implements fmt.Stringer, redacting AuthSecret so a Config never
+// leaks its shared secret through logging, error messages, or %v/%s
+// formatting (issue #47 audit item G3) — a Config is otherwise a
+// tempting thing to log wholesale for debugging.
+func (c Config) String() string {
+	secret := "unset"
+	if c.AuthSecret != "" {
+		secret = "REDACTED"
+	}
+	return fmt.Sprintf(
+		"Config{Addresses:%v AuthSecret:%s TLS:%v CA:%q Compress:%v CompressionThreshold:%d "+
+			"FireAndForgetReplicas:%v ReadRepair:%v ReconnectCooldown:%v}",
+		c.Addresses, secret, c.TLS, c.CA, c.Compress, c.CompressionThreshold,
+		c.FireAndForgetReplicas, c.ReadRepair, c.ReconnectCooldown)
+}
+
+// GoString implements fmt.GoStringer so %#v also redacts AuthSecret —
+// without this, %#v bypasses String() entirely and would print the
+// secret in plain text.
+func (c Config) GoString() string {
+	return c.String()
 }
 
 // DefaultCompressionThreshold is the CompressionThreshold used when
 // Config.CompressionThreshold is left at zero.
 const DefaultCompressionThreshold = 256
+
+// DefaultReconnectCooldown is the ReconnectCooldown used when
+// Config.ReconnectCooldown is left at zero.
+const DefaultReconnectCooldown = time.Second
+
+// maxRequestBytes bounds key+value size before any network I/O. The
+// server's own request cap (src/server.rs's MAX_REQUEST_SIZE) is 1 MiB
+// for the *entire* frame — header line plus key plus value; a request
+// over that limit is rejected by simply closing the connection without a
+// response, which poisons whatever else is pipelined behind it on that
+// same connection. This reserves 256 bytes of headroom for the header
+// itself (marker byte, decimal lengths, an optional TTL, ADR-0019's tag
+// field, spaces, the trailing newline — always comfortably under this
+// even for the largest fields), so a key+value that clears maxRequestBytes
+// is guaranteed to fit under the server's own cap (issue #47 audit item
+// G1).
+const maxRequestBytes = 1024*1024 - 256
+
+// validateKey rejects an empty key before any network I/O: the server has
+// no way to answer a zero-length key request except by closing the
+// connection outright, silently poisoning every other request already
+// pipelined on that connection. Matches the style of the ttlSeconds < 0
+// check in SetBytes.
+func validateKey(key string) error {
+	if len(key) == 0 {
+		return fmt.Errorf("nanocached: key must not be empty")
+	}
+	return nil
+}
+
+// validateKeyAndValue is validateKey plus a maxRequestBytes bound on
+// len(key)+valueLen — anything past it can never fit the server's own
+// request cap, so failing fast here is strictly better than sending a
+// frame the server can only reject by silently closing the connection.
+func validateKeyAndValue(key string, valueLen int) error {
+	if err := validateKey(key); err != nil {
+		return err
+	}
+	if len(key)+valueLen > maxRequestBytes {
+		return fmt.Errorf(
+			"nanocached: key (%d bytes) + value (%d bytes) exceeds the %d-byte request limit",
+			len(key), valueLen, maxRequestBytes)
+	}
+	return nil
+}
 
 // maxInFlightBackgroundReplicaWrites bounds how many replica writes a
 // single client may have running in the background at once when
@@ -128,6 +206,15 @@ const readRepairTTL = 60
 type member struct {
 	address    string
 	connection *connection
+}
+
+// redialCooldown records a failed dial's outcome for one address (see
+// Client.reconnectCooldown): the deadline the address stays "down" until,
+// and the error to hand back verbatim to every caller that hits the
+// cooldown window.
+type redialCooldown struct {
+	until time.Time
+	err   error
 }
 
 // Stats holds counters for failures this SDK deliberately swallows
@@ -156,6 +243,17 @@ type Client struct {
 	refreshMu   sync.Mutex
 	redialMu    sync.Mutex
 	redialGates map[string]*sync.Mutex
+
+	// reconnectCooldown and redialCooldowns implement the per-address
+	// reconnect cooldown (see Config.ReconnectCooldown): the address of
+	// the most recently failed dial, and how long it stays "down" before
+	// another dial to it is attempted. Keyed by address, not slot — a
+	// cluster refresh can reassign a slot (node name) to a different
+	// address, but the address itself is what's actually unreachable.
+	// <= 0 disables the cooldown.
+	reconnectCooldown time.Duration
+	redialCooldownMu  sync.Mutex
+	redialCooldowns   map[string]redialCooldown
 
 	stats clientStats
 
@@ -254,8 +352,15 @@ func Connect(config Config) (*Client, error) {
 		compressionThreshold = DefaultCompressionThreshold
 	}
 
+	reconnectCooldown := config.ReconnectCooldown
+	if reconnectCooldown == 0 {
+		reconnectCooldown = DefaultReconnectCooldown
+	}
+
 	client := &Client{
 		redialGates:           map[string]*sync.Mutex{},
+		reconnectCooldown:     reconnectCooldown,
+		redialCooldowns:       map[string]redialCooldown{},
 		addresses:             append([]Address(nil), config.Addresses...),
 		tlsConfig:             tlsConfig,
 		members:               map[string]*member{},
@@ -416,6 +521,9 @@ func (c *Client) Get(key string) (value string, ok bool, err error) {
 // remaining owners before being accepted as final, repairing the gap in
 // the background if one still holds the value (doc/adr/0015-*.md).
 func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
+	if err := validateKey(key); err != nil {
+		return nil, false, err
+	}
 	if err := c.beforeOperation(); err != nil {
 		return nil, false, err
 	}
@@ -517,6 +625,9 @@ func (c *Client) Set(key, value string, ttlSeconds int64) error {
 // Transparently compresses values at or above Config.CompressionThreshold
 // when Config.Compress is enabled (doc/adr/0013-*.md).
 func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
+	if err := validateKeyAndValue(key, len(value)); err != nil {
+		return err
+	}
 	if ttlSeconds < 0 {
 		return fmt.Errorf("nanocached: ttlSeconds must not be negative, got %d", ttlSeconds)
 	}
@@ -541,6 +652,9 @@ func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 
 // Delete removes the key, reporting whether it existed before this call.
 func (c *Client) Delete(key string) (existed bool, err error) {
+	if err := validateKey(key); err != nil {
+		return false, err
+	}
 	if err := c.beforeOperation(); err != nil {
 		return false, err
 	}
@@ -795,10 +909,31 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 		return current, nil
 	}
 
+	// Per-address reconnect cooldown (see Client.redialCooldowns' own doc
+	// comment): an address whose dial just failed stays "down" for
+	// reconnectCooldown, so a burst of requests routed to it — or one
+	// request every keep-alive tick — fails immediately with the same
+	// error the dial itself produced, instead of each paying another full
+	// connectDeadline in turn.
+	c.redialCooldownMu.Lock()
+	cooldown, onCooldown := c.redialCooldowns[address]
+	c.redialCooldownMu.Unlock()
+	if onCooldown && time.Now().Before(cooldown.until) {
+		return nil, cooldown.err
+	}
+
 	fresh, err := c.openNodeConnection(address)
 	if err != nil {
+		if c.reconnectCooldown > 0 {
+			c.redialCooldownMu.Lock()
+			c.redialCooldowns[address] = redialCooldown{until: time.Now().Add(c.reconnectCooldown), err: err}
+			c.redialCooldownMu.Unlock()
+		}
 		return nil, err
 	}
+	c.redialCooldownMu.Lock()
+	delete(c.redialCooldowns, address)
+	c.redialCooldownMu.Unlock()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

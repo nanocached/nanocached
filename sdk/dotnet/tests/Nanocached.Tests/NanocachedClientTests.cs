@@ -1,5 +1,8 @@
+using System.Net;
 using System.Reflection;
+using System.Security.Authentication;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using Xunit;
 
@@ -111,6 +114,56 @@ public class NanocachedClientTests
         Assert.Equal("v", await client.GetAsync("k"));
     }
 
+    // Audit finding D2: an empty key, or a key+value pair large enough to
+    // risk the server's MAX_REQUEST_SIZE (src/server.rs, 1 MiB), must be
+    // rejected synchronously (into the returned Task, before any bytes
+    // reach the connection) — exactly like the ttlSeconds check above.
+    [Fact]
+    public async Task RejectsEmptyKeysOnGetSetDelete()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] emptyKey = Array.Empty<byte>();
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetAsync(emptyKey));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetBytesAsync(emptyKey));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.SetAsync(emptyKey, Bytes("v")));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.DeleteAsync(emptyKey));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetAsync(""));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.SetAsync("", "v"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.DeleteAsync(""));
+
+        // Rejected client-side, before any request frame — no second
+        // connection beyond the initial ConnectAsync() above.
+        Assert.Equal(1, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task RejectsOversizeKeyOrKeyPlusValueBeforeTouchingTheConnection()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        // Warm the connection up first so ConnectionCount below only
+        // reflects that, not the rejections.
+        await client.SetAsync("warm", "up");
+        int connectionsBeforeRejections = node.ConnectionCount;
+
+        byte[] oversizeKey = new byte[1024 * 1024];
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.GetAsync(oversizeKey));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.DeleteAsync(oversizeKey));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.SetAsync(oversizeKey, Bytes("v")));
+
+        // A modest key with a value large enough to push key+value over
+        // the limit must be rejected too.
+        byte[] smallKey = Bytes("k");
+        byte[] oversizeValue = new byte[1024 * 1024];
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.SetAsync(smallKey, oversizeValue));
+
+        Assert.Equal(connectionsBeforeRejections, node.ConnectionCount);
+        Assert.Equal("up", await client.GetAsync("warm"));
+    }
+
     [Fact]
     public async Task PipelinesConcurrentRequestsOnOneConnection()
     {
@@ -174,6 +227,26 @@ public class NanocachedClientTests
         client.Close(); // idempotent
         Assert.True(client.IsClosed);
         await Assert.ThrowsAsync<AlreadyClosedException>(() => client.GetAsync("k"));
+    }
+
+    // Audit finding D4: Close() cancelled `_lifetime` but never disposed
+    // it, leaking the CancellationTokenSource. Reflection is the only way
+    // to reach the private field; disposal is observed indirectly by the
+    // ObjectDisposedException a disposed CancellationTokenSource's own
+    // members throw.
+    [Fact]
+    public async Task CloseDisposesTheLifetimeCancellationTokenSource()
+    {
+        using var node = new MockNode();
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        FieldInfo lifetimeField = typeof(NanocachedClient)
+            .GetField("_lifetime", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var lifetime = (CancellationTokenSource)lifetimeField.GetValue(client)!;
+
+        client.Close();
+
+        Assert.Throws<ObjectDisposedException>(() => lifetime.Token);
     }
 
     [Fact]
@@ -374,6 +447,111 @@ public class NanocachedClientTests
         await Task.Delay(50); // let the FIN land
         Assert.Equal("v", await client.GetAsync("k"));
         Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task AServerFinWhileARequestIsInFlightSurfacesAsConnectionLost()
+    {
+        // The FIN lands *after* the request was written but before its
+        // reply: the read loop hits end-of-stream with a waiter pending.
+        // That waiter must get a ConnectionLostException (the README's
+        // "every failure extends NanocachedException" contract, and what
+        // the retry layer redials on) — not the raw EndOfStreamException.
+        var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        await client.SetAsync("k", "v");
+        node.GoSilentAfterHandshake();
+
+        Task<string?> inFlight = client.GetAsync("k");
+        await Task.Delay(50); // the G frame is on the wire, unanswered
+        node.Dispose(); // FIN on the pending connection; nothing left to redial
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => inFlight);
+    }
+
+    [Fact]
+    public async Task ReconnectCooldownSkipsARedialToAKnownDeadAddress()
+    {
+        var node = new MockNode();
+        int port = node.Port;
+        var options = SingleAddress("127.0.0.1", port);
+        options.ReconnectCooldown = TimeSpan.FromMilliseconds(200);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+
+        await client.SetAsync("k", "v");
+        node.Dispose();
+        await Task.Delay(50); // let the FIN land, as TransparentlyReconnectsAfterAServerFin does
+
+        // Nothing listens on `port` anymore, so this redial fails fast
+        // with a connection-refused error and starts the cooldown window
+        // for that address.
+        var firstError = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
+
+        // A listener now sits on the same port and answers immediately
+        // with bytes the identify handshake rejects outright —
+        // deliberately not a bare close/reset (the shape that triggers
+        // ConnectAndIdentifyAsync's legacy-server fallback redial,
+        // Identify.cs), so each dial against it fails after exactly one
+        // connection, letting `connections` below tell "cooldown skipped
+        // the dial" apart from "cooldown let it through" unambiguously.
+        int connections = 0;
+        var garbage = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
+        garbage.Start();
+        _ = AcceptAndAnswerGarbageAsync(garbage, () => Interlocked.Increment(ref connections));
+
+        try
+        {
+            // Still within the cooldown window: rejects with the cached
+            // failure — the very same exception instance — near-instantly,
+            // without dialing the listener at all.
+            DateTime started = DateTime.UtcNow;
+            var secondError = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
+            TimeSpan elapsed = DateTime.UtcNow - started;
+            Assert.True(elapsed < TimeSpan.FromMilliseconds(100),
+                $"expected a cooldown-fast rejection, took {elapsed.TotalMilliseconds}ms");
+            Assert.Equal(0, connections);
+            Assert.Same(firstError, secondError);
+
+            // Once the cooldown window has passed, the address is dialed
+            // again, this time reaching the listener.
+            await Task.Delay(250);
+            NanocachedException thirdError = await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
+            Assert.Contains("unexpected response to A", thirdError.Message);
+            Assert.Equal(1, connections);
+        }
+        finally
+        {
+            garbage.Stop();
+        }
+    }
+
+    private static async Task AcceptAndAnswerGarbageAsync(System.Net.Sockets.TcpListener listener, Action onAccepted)
+    {
+        while (true)
+        {
+            System.Net.Sockets.TcpClient accepted;
+            try
+            {
+                accepted = await listener.AcceptTcpClientAsync();
+            }
+            catch
+            {
+                return;
+            }
+            onAccepted();
+            try
+            {
+                await accepted.GetStream().WriteAsync(Bytes("XXX"));
+            }
+            catch
+            {
+                // The client may have already given up.
+            }
+            finally
+            {
+                accepted.Dispose();
+            }
+        }
     }
 
     [Fact]
@@ -1058,6 +1236,61 @@ public class NanocachedClientTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => client.SetAsync("k", "v"));
     }
 
+    // Audit finding D3: when the failing replica leg instead runs in the
+    // background (FireAndForgetReplicas), the same InvalidOperationException
+    // now escapes ReplicaWriteAsync's own try/catch (it isn't one of the
+    // connection-layer types that swallows) inside a fire-and-forget
+    // Task.Run — there is no caller awaiting it to observe the fault.
+    // Before the fix, the ContinueWith only released the semaphore, so
+    // this fault was never read: exactly an *unobserved* Task exception,
+    // which the .NET runtime reports via
+    // TaskScheduler.UnobservedTaskException once the faulted Task is
+    // finalized. This proves the fix actually reads `completed.Exception`
+    // (nothing is ever raised as unobserved) and still counts the failure
+    // via Stats(), the one diagnostic channel this SDK has for it.
+    [Fact]
+    public async Task AnEscapedExceptionOnAFireAndForgetReplicaLegIsObservedNotLeaked()
+    {
+        var unobserved = new List<Exception>();
+        void OnUnobserved(object? _, UnobservedTaskExceptionEventArgs args)
+        {
+            unobserved.Add(args.Exception);
+            args.SetObserved();
+        }
+        TaskScheduler.UnobservedTaskException += OnUnobserved;
+        try
+        {
+            using Cluster cluster = StartCluster(replication: 2);
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+                FireAndForgetReplicas = true,
+            });
+
+            string replica = OwnersOf("k")[1];
+            ReplaceMemberConnection(client, replica, new Connection(new ThrowingStream()));
+
+            Assert.Equal(0, client.Stats().ReplicaWriteFailures);
+            // The primary write still succeeds; the replica leg's bug is
+            // backgrounded, so this must not throw.
+            await client.SetAsync("k", "v");
+            await WaitForAsync(
+                () => client.Stats().ReplicaWriteFailures > 0, "the escaped replica exception to be counted");
+
+            // Force finalization: an exception left genuinely unobserved
+            // (the pre-fix behavior) only gets reported by the runtime
+            // once the faulted Task is collected.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= OnUnobserved;
+        }
+        Assert.Empty(unobserved);
+    }
+
     // ── 値の圧縮 (doc/adr/0013-*.md) ──────────────────────────────
 
     private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>
@@ -1227,5 +1460,70 @@ public class NanocachedClientTests
         // Two dials: the extended attempt the server slammed shut, then
         // the plain fallback that stuck.
         Assert.Equal(2, node.ConnectionCount);
+    }
+
+    // ── TLS hostname verification (audit finding D1) ─────────────────
+    //
+    // Certificates are generated per-test with the BCL's own
+    // CertificateRequest API (see MockServers.Tls) rather than a
+    // bundled/pre-generated PEM: that keeps the certificate's
+    // notBefore/notAfter always valid without a maintenance burden, and
+    // needs no TLS/crypto test dependency this SDK doesn't otherwise
+    // have.
+
+    [Fact]
+    public async Task TlsRejectsACertificateForADifferentHostname()
+    {
+        // A cert that is otherwise perfectly valid (self-signed, but
+        // trusted directly via Ca) except its SAN names a host the client
+        // never dialed. Before the D1 fix this was accepted outright — the
+        // custom RemoteCertificateValidationCallback re-validated the
+        // chain of trust but never looked at sslPolicyErrors, so it never
+        // noticed SslStream had already flagged a name mismatch.
+        using X509Certificate2 cert = Tls.GenerateSelfSigned("wrong-host", sanDnsName: "wrong.example.test");
+        string pemPath = Tls.WritePemCertificate(cert);
+        try
+        {
+            using MockNode node = MockNode.WithTls(cert);
+
+            await Assert.ThrowsAsync<AuthenticationException>(() =>
+                NanocachedClient.ConnectAsync(new NanocachedClient.Options
+                {
+                    Addresses = { ("127.0.0.1", node.Port) },
+                    Tls = true,
+                    Ca = pemPath,
+                }));
+        }
+        finally
+        {
+            File.Delete(pemPath);
+        }
+    }
+
+    [Fact]
+    public async Task TlsAcceptsACertificateForTheMatchingHostname()
+    {
+        // The client dials "127.0.0.1"; .NET's hostname verification
+        // checks a numeric host against the cert's iPAddress SAN entries
+        // (RFC 2818), so the cert must carry one.
+        using X509Certificate2 cert = Tls.GenerateSelfSigned("127.0.0.1", sanIpAddress: IPAddress.Loopback);
+        string pemPath = Tls.WritePemCertificate(cert);
+        try
+        {
+            using MockNode node = MockNode.WithTls(cert);
+
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", node.Port) },
+                Tls = true,
+                Ca = pemPath,
+            });
+            await client.SetAsync("k", "v");
+            Assert.Equal("v", await client.GetAsync("k"));
+        }
+        finally
+        {
+            File.Delete(pemPath);
+        }
     }
 }

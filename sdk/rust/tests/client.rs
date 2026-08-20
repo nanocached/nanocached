@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nanocached::{Error, HashRing, NanocachedClient, Options};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -774,6 +774,144 @@ async fn an_abandoned_request_future_does_not_poison_the_connection() {
 
     client.close().await;
     node.stop();
+}
+
+// ── 引数検証 (issue #47 audit item R1) ───────────────────────────────
+
+#[tokio::test]
+async fn rejects_an_empty_key_before_touching_the_network() {
+    // The server has no way to answer an empty-key request except by
+    // closing the connection outright — poisoning every other request
+    // already pipelined behind it on that connection (see
+    // src/command.rs's rejects_empty_key_for_get et al.). Catching this
+    // client-side, as Error::InvalidArgument, must happen before any
+    // bytes hit the wire — verified below by checking no extra connection
+    // was ever dialed.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert!(matches!(
+        client.get_bytes("").await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.set("", "v", 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.delete("").await,
+        Err(Error::InvalidArgument(_))
+    ));
+    // Only connect()'s own dial ever reached the node.
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn rejects_a_key_and_value_that_would_exceed_the_servers_request_cap() {
+    // MAX_REQUEST_BYTES leaves headroom under the server's own 1 MiB
+    // MAX_REQUEST_SIZE (src/server.rs) — a set() whose key+value would
+    // exceed it can never succeed against the server, so it's rejected
+    // synchronously instead of being sent only to have the server close
+    // the connection without a response.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let oversized_value = vec![0u8; 1024 * 1024];
+    let result = client.set("k", oversized_value, 0).await;
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "expected InvalidArgument, got {result:?}"
+    );
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn accepts_a_key_and_value_right_at_the_request_cap_boundary() {
+    // Only *exceeding* MAX_REQUEST_BYTES (1024*1024 - 256, mirrored here)
+    // is rejected — a key+value that exactly fits must still round-trip
+    // normally.
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let key = "k";
+    let value = vec![b'x'; MAX_REQUEST_BYTES - key.len()];
+    client.set(key, value.clone(), 0).await.unwrap();
+    assert_eq!(client.get_bytes(key).await.unwrap(), Some(value));
+
+    client.close().await;
+    node.stop();
+}
+
+// ── ヘッダー行の長さ上限 (issue #47 audit item R2) ────────────────────
+
+#[tokio::test]
+async fn a_response_header_without_a_terminator_is_rejected_instead_of_growing_unbounded() {
+    // Regression: read_line (the `V <len>` header, and shared by
+    // identify.rs's discovery node-list headers) used to grow its buffer
+    // without bound waiting for a `\n` that might never come — a
+    // malicious or misbehaving peer could use this to exhaust client
+    // memory. It now caps the line at MAX_HEADER_LINE_LENGTH and fails
+    // fast with a Protocol error, wrapped in an outer test timeout so a
+    // regression fails loudly instead of hanging the suite.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut stream = BufReader::new(socket);
+        let Ok(auth) = read_line(&mut stream).await else {
+            return;
+        };
+        let parts: Vec<&str> = auth.split(' ').collect();
+        let Ok(secret_len) = parts[1].parse::<usize>() else {
+            return;
+        };
+        let _ = read_exact(&mut stream, secret_len).await;
+        if stream.get_mut().write_all(b"On\n").await.is_err() {
+            return;
+        }
+        let Ok(get) = read_line(&mut stream).await else {
+            return;
+        };
+        let parts: Vec<&str> = get.split(' ').collect();
+        let Ok(key_len) = parts[1].parse::<usize>() else {
+            return;
+        };
+        let _ = read_exact(&mut stream, key_len).await;
+        // A `V` header that never terminates: flood well past the client's
+        // cap without ever sending '\n', then go silent (still holding the
+        // socket open) — the client must give up on its own instead of
+        // waiting for either more bytes or an EOF.
+        let mut frame = b"V".to_vec();
+        frame.extend(std::iter::repeat(b'9').take(8192));
+        let _ = stream.get_mut().write_all(&frame).await;
+        std::future::pending::<()>().await;
+    });
+
+    let client = NanocachedClient::connect(options(port)).await.unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(5), client.get("k"))
+        .await
+        .expect("get() must fail fast on a runaway header instead of hanging");
+    assert!(
+        matches!(result, Err(Error::Protocol(_))),
+        "expected a protocol error, got {result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "get took {:?}, want the cap to be hit almost immediately",
+        started.elapsed()
+    );
+
+    client.close().await;
 }
 
 #[tokio::test]
@@ -1721,6 +1859,157 @@ async fn a_response_echoing_the_wrong_tag_poisons_the_connection() {
 
     client.close().await;
     node.stop();
+}
+
+// ── アドレスごとの再接続クールダウン ────────────────────────────────
+
+#[tokio::test]
+async fn reconnect_cooldown_skips_a_known_dead_address() {
+    let node = MockNode::start().await;
+    let port = node.port;
+    let client =
+        NanocachedClient::connect(options(port).reconnect_cooldown(Duration::from_millis(200)))
+            .await
+            .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Nothing listens on `port` anymore, so this redial fails fast
+    // (connection refused) and starts the cooldown window for that
+    // address.
+    let first = client.get("k").await;
+    assert!(matches!(first, Err(Error::ConnectionLost(_))), "{first:?}");
+
+    // A listener now sits on the same port and answers immediately with
+    // bytes the identify handshake rejects outright — deliberately not
+    // the reset/EOF/broken-pipe-before-any-reply shape that triggers
+    // connect_and_identify's legacy-server fallback redial (identify.rs),
+    // so each dial against it fails after exactly one connection, letting
+    // `connections` below tell "cooldown skipped the dial" apart from
+    // "cooldown let it through" unambiguously.
+    let listener = {
+        let mut attempt = 0;
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(error) if attempt < 50 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = error;
+                }
+                Err(error) => panic!("could not rebind 127.0.0.1:{port}: {error}"),
+            }
+        }
+    };
+    let connections = Arc::new(AtomicUsize::new(0));
+    let garbage_connections = Arc::clone(&connections);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            garbage_connections.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.write_all(b"XXX").await;
+        }
+    });
+
+    // Still within the cooldown window: rejects with the cached failure
+    // near-instantly, without dialing the listener at all.
+    let started = Instant::now();
+    let second = client.get("k").await;
+    assert!(
+        matches!(second, Err(Error::ConnectionLost(_))),
+        "{second:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "expected a cooldown-fast rejection, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "the cooldown did not prevent a redial"
+    );
+
+    // Once the cooldown window has passed, the address is dialed again,
+    // this time reaching the listener.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let third = client.get("k").await;
+    match third {
+        Err(Error::Protocol(message)) => {
+            assert!(message.contains("unexpected response to A"), "{message}");
+        }
+        other => panic!("expected a Protocol error, got {other:?}"),
+    }
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "the address was never redialed after the cooldown elapsed"
+    );
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_zero_reconnect_cooldown_redials_immediately() {
+    let node = MockNode::start().await;
+    let port = node.port;
+    let client = NanocachedClient::connect(options(port).reconnect_cooldown(Duration::ZERO))
+        .await
+        .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let first = client.get("k").await;
+    assert!(matches!(first, Err(Error::ConnectionLost(_))), "{first:?}");
+
+    let listener = {
+        let mut attempt = 0;
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(error) if attempt < 50 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = error;
+                }
+                Err(error) => panic!("could not rebind 127.0.0.1:{port}: {error}"),
+            }
+        }
+    };
+    let connections = Arc::new(AtomicUsize::new(0));
+    let garbage_connections = Arc::clone(&connections);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            garbage_connections.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.write_all(b"XXX").await;
+        }
+    });
+
+    // With the cooldown disabled (Duration::ZERO), this redials
+    // immediately instead of reusing the cached failure.
+    let second = client.get("k").await;
+    match second {
+        Err(Error::Protocol(message)) => {
+            assert!(message.contains("unexpected response to A"), "{message}");
+        }
+        other => panic!("expected a Protocol error, got {other:?}"),
+    }
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "a disabled cooldown should redial immediately"
+    );
+
+    client.close().await;
 }
 
 #[tokio::test]

@@ -522,6 +522,117 @@ func TestRejectsANegativeTtl(t *testing.T) {
 	}
 }
 
+// ── 引数検証 (issue #47 audit item G1) ────────────────────────────────
+
+func TestRejectsAnEmptyKeyAndOversizedRequestWithoutTouchingTheNetwork(t *testing.T) {
+	// The server has no way to answer an empty-key request except by
+	// closing the connection outright — poisoning every other request
+	// already pipelined behind it on that connection. Catching this (and
+	// a key+value that could never fit the server's own request cap)
+	// client-side must happen before any bytes hit the wire — verified
+	// below by checking no extra connection was ever dialed beyond
+	// Connect's own.
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, _, err := client.GetBytes(""); err == nil {
+		t.Fatal("empty key accepted by GetBytes")
+	}
+	if err := client.SetBytes("", []byte("v"), 0); err == nil {
+		t.Fatal("empty key accepted by SetBytes")
+	}
+	if _, err := client.Delete(""); err == nil {
+		t.Fatal("empty key accepted by Delete")
+	}
+
+	oversized := make([]byte, 1024*1024)
+	if err := client.SetBytes("k", oversized, 0); err == nil {
+		t.Fatal("oversized key+value accepted by SetBytes")
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (validation must reject before any network I/O)", got)
+	}
+}
+
+func TestAnInvalidRequestDoesNotPoisonConcurrentValidRequestsOnTheSameConnection(t *testing.T) {
+	// Key/size validation runs before any network I/O, so an invalid call
+	// (empty key) never touches the wire at all — and so can never desync
+	// or poison a connection that other, valid, concurrent requests are
+	// pipelined on (doc/adr/0016-*.md).
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("key-%d", i)
+			value := fmt.Sprintf("value-%d", i)
+			if err := client.Set(key, value, 0); err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := client.GetBytes(""); err == nil {
+				t.Error("empty key accepted")
+			}
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		value, ok, err := client.Get(fmt.Sprintf("key-%d", i))
+		if err != nil || !ok {
+			t.Fatalf("Get key-%d: value=%q ok=%v err=%v", i, value, ok, err)
+		}
+		if want := fmt.Sprintf("value-%d", i); value != want {
+			t.Fatalf("key-%d = %q, want %q", i, value, want)
+		}
+	}
+}
+
+// ── Config.String/GoString (issue #47 audit item G3) ─────────────────
+
+func TestConfigStringAndGoStringRedactAuthSecret(t *testing.T) {
+	cfg := Config{
+		Addresses:  []Address{addr("127.0.0.1:8357")},
+		AuthSecret: "s3cret",
+		TLS:        true,
+	}
+	for _, rendered := range []string{
+		fmt.Sprintf("%v", cfg),
+		fmt.Sprintf("%s", cfg),
+		fmt.Sprintf("%#v", cfg),
+	} {
+		if strings.Contains(rendered, "s3cret") {
+			t.Fatalf("Config format leaked AuthSecret: %s", rendered)
+		}
+		if !strings.Contains(rendered, "REDACTED") {
+			t.Fatalf("Config format did not redact a set AuthSecret: %s", rendered)
+		}
+	}
+
+	cfg.AuthSecret = ""
+	if got := cfg.String(); strings.Contains(got, "REDACTED") {
+		t.Fatalf("Config.String() redacted an unset AuthSecret: %s", got)
+	}
+}
+
 func TestTtlZeroMeansNoExpiryAndAPositiveTtlIsSentAsIs(t *testing.T) {
 	node := startMockNode(t, nil)
 	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
@@ -1150,6 +1261,148 @@ func TestTransparentlyReconnectsAfterAServerFin(t *testing.T) {
 	}
 	if node.connectionCount.Load() != 2 {
 		t.Fatalf("connections = %d", node.connectionCount.Load())
+	}
+}
+
+func TestReconnectCooldownSkipsAKnownDeadAddress(t *testing.T) {
+	node := startMockNode(t, nil)
+	hostPort := node.address()
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(hostPort)},
+		ReconnectCooldown: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.close()
+	time.Sleep(50 * time.Millisecond) // let the FIN land and the listener release the port
+
+	// Nothing listens on hostPort anymore, so this redial fails fast
+	// (connection refused) and starts the cooldown window for that
+	// address.
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get after node close = %v, want ErrConnectionLost", err)
+	}
+
+	// A listener now sits on the same address and answers immediately
+	// with bytes the identify handshake rejects outright — deliberately
+	// not the closed/EOF/reset-before-any-reply shape that signals a
+	// legacy server (identify.go's isLegacyServerSignal), so each dial
+	// against it fails after exactly one connection, letting connections
+	// below tell "cooldown skipped the dial" apart from "cooldown let it
+	// through" unambiguously.
+	var garbage net.Listener
+	for attempt := 0; ; attempt++ {
+		l, listenErr := net.Listen("tcp", hostPort)
+		if listenErr == nil {
+			garbage = l
+			break
+		}
+		if attempt >= 50 {
+			t.Fatalf("could not rebind %s: %v", hostPort, listenErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer garbage.Close()
+
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, acceptErr := garbage.Accept()
+			if acceptErr != nil {
+				return
+			}
+			connections.Add(1)
+			_, _ = conn.Write([]byte("XXX"))
+		}
+	}()
+
+	// Still within the cooldown window: rejects with the cached failure
+	// near-instantly, without dialing the listener at all.
+	started := time.Now()
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get within the cooldown window = %v, want ErrConnectionLost", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("expected a cooldown-fast rejection, took %v", elapsed)
+	}
+	if got := connections.Load(); got != 0 {
+		t.Fatalf("the cooldown did not prevent a redial: connections = %d", got)
+	}
+
+	// Once the cooldown window has passed, the address is dialed again,
+	// this time reaching the listener.
+	time.Sleep(250 * time.Millisecond)
+	_, _, err = client.Get("k")
+	if err == nil || !strings.Contains(err.Error(), "unexpected response to A") {
+		t.Fatalf("Get after the cooldown elapsed = %v, want an unexpected-response-to-A error", err)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("the address was never redialed after the cooldown elapsed: connections = %d", got)
+	}
+}
+
+func TestNegativeReconnectCooldownDisablesTheCooldown(t *testing.T) {
+	node := startMockNode(t, nil)
+	hostPort := node.address()
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(hostPort)},
+		ReconnectCooldown: -1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.close()
+	time.Sleep(50 * time.Millisecond) // let the FIN land and the listener release the port
+
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get after node close = %v, want ErrConnectionLost", err)
+	}
+
+	var garbage net.Listener
+	for attempt := 0; ; attempt++ {
+		l, listenErr := net.Listen("tcp", hostPort)
+		if listenErr == nil {
+			garbage = l
+			break
+		}
+		if attempt >= 50 {
+			t.Fatalf("could not rebind %s: %v", hostPort, listenErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer garbage.Close()
+
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, acceptErr := garbage.Accept()
+			if acceptErr != nil {
+				return
+			}
+			connections.Add(1)
+			_, _ = conn.Write([]byte("XXX"))
+		}
+	}()
+
+	// With the cooldown disabled (negative ReconnectCooldown), this
+	// redials immediately instead of reusing the cached failure.
+	_, _, err = client.Get("k")
+	if err == nil || !strings.Contains(err.Error(), "unexpected response to A") {
+		t.Fatalf("Get with the cooldown disabled = %v, want an unexpected-response-to-A error", err)
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("a disabled cooldown should redial immediately: connections = %d", got)
 	}
 }
 

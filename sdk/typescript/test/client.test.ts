@@ -109,6 +109,36 @@ describe("NanocachedClient against a single node", () => {
     }
   });
 
+  it("rejects an empty key before writing, without poisoning the shared connection", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await assert.rejects(client.get(""), RangeError);
+        await assert.rejects(client.set("", "v"), RangeError);
+        await assert.rejects(client.delete(""), RangeError);
+
+        // None of the rejected calls above wrote anything to the shared,
+        // pipelined connection — a concurrent valid call on it must still
+        // succeed normally, and no reconnect should have happened.
+        await client.set("k", "v");
+        const results = await Promise.all([
+          client.get("k"),
+          client.set("", "poison-attempt").catch((error) => error),
+          client.get("k"),
+        ]);
+        assert.equal(results[0], "v");
+        assert.ok(results[1] instanceof RangeError);
+        assert.equal(results[2], "v");
+        assert.equal(node.connectionCount(), 1, "an empty-key rejection triggered a reconnect");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("ttlSeconds 0 (the default) means no expiry", async () => {
     const node = await startMockNode();
     try {
@@ -777,6 +807,71 @@ describe("NanocachedClient reconnect-on-use", () => {
       await node.close();
       await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
       await assert.rejects(client.get("k"), /ECONNREFUSED/);
+    } finally {
+      client.close();
+    }
+  });
+
+  it("cools down a failed reconnect address instead of redialing it on every call", async () => {
+    const node = await startMockNode();
+    const port = node.port;
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port }],
+      reconnectCooldownMs: 200,
+    });
+    try {
+      await client.set("k", "v");
+      await node.close();
+      await waitFor(() => singleConnectionClosed(client), "the client to see the FIN");
+
+      // Nothing listens on `port` anymore, so this redial fails fast with
+      // ECONNREFUSED and starts the cooldown window for that address.
+      await assert.rejects(client.get("k"), /ECONNREFUSED/);
+
+      // A listener now sits on the same port and answers immediately with
+      // bytes the identify handshake rejects outright — deliberately not
+      // the ECONNRESET/close-before-reply shape that triggers connectAndIdentify's
+      // legacy-server fallback redial (identify.ts), so each dial against
+      // it fails after exactly one connection, letting `connections` below
+      // tell "cooldown skipped the dial" apart from "cooldown let it
+      // through" unambiguously.
+      const { createServer } = await import("node:net");
+      let connections = 0;
+      const garbageSockets = new Set<import("node:net").Socket>();
+      const garbage = createServer((socket) => {
+        connections++;
+        garbageSockets.add(socket);
+        socket.on("error", () => {});
+        socket.on("close", () => garbageSockets.delete(socket));
+        socket.write("XXX");
+      });
+      await new Promise<void>((resolve, reject) => {
+        garbage.once("error", reject);
+        garbage.listen(port, "127.0.0.1", () => resolve());
+      });
+      try {
+        // Still within the cooldown window: rejects with the cached
+        // failure near-instantly, without dialing the listener at all.
+        const start = Date.now();
+        await assert.rejects(client.get("k"), /ECONNREFUSED/);
+        const elapsed = Date.now() - start;
+        assert.ok(elapsed < 100, `expected a cooldown-fast rejection, took ${elapsed}ms`);
+        assert.equal(connections, 0, "the cooldown did not prevent a redial");
+
+        // Once the cooldown window has passed, the address is dialed
+        // again, this time reaching the listener.
+        await delay(250);
+        await assert.rejects(client.get("k"), /unexpected response to A/);
+        assert.equal(connections, 1, "the address was never redialed after the cooldown elapsed");
+      } finally {
+        // The client's own socket.destroy() (identify.ts) closes its end
+        // on a parse error, but doesn't guarantee the server side has
+        // finished tearing down by the time this runs — close every
+        // accepted socket explicitly so garbage.close()'s callback isn't
+        // left waiting on one that's merely mid-teardown.
+        for (const socket of garbageSockets) socket.destroy();
+        await new Promise<void>((resolve) => garbage.close(() => resolve()));
+      }
     } finally {
       client.close();
     }

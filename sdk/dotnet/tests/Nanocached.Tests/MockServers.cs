@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 
 namespace Nanocached.Tests;
@@ -41,16 +44,32 @@ public sealed class MockNode : IDisposable
     private volatile int _setDelayMillis;
     private volatile bool _silent;
     private long _lastSetTtl;
+    /// <summary>J1/D1: when set, every accepted connection is wrapped in
+    /// an <see cref="SslStream"/> presenting this certificate before the
+    /// A/G/S/D protocol loop runs — everything past the handshake is
+    /// identical to a plain MockNode, since <see cref="ServeAsync"/> only
+    /// ever talks to a generic <see cref="Stream"/>.</summary>
+    private readonly X509Certificate2? _serverCertificate;
 
-    public MockNode(string? requiredSecret = null, bool supportTags = false, bool closeOnExtendedAuth = false)
+    public MockNode(
+        string? requiredSecret = null,
+        bool supportTags = false,
+        bool closeOnExtendedAuth = false,
+        X509Certificate2? serverCertificate = null)
     {
         _requiredSecret = requiredSecret is null ? null : Encoding.UTF8.GetBytes(requiredSecret);
         _supportTags = supportTags;
         _closeOnExtendedAuth = closeOnExtendedAuth;
+        _serverCertificate = serverCertificate;
         _listener = new TcpListener(IPAddress.Loopback, 0);
         _listener.Start();
         _ = AcceptLoopAsync();
     }
+
+    /// <summary>D1: a node that speaks TLS, presenting <paramref
+    /// name="serverCertificate"/>.</summary>
+    public static MockNode WithTls(X509Certificate2 serverCertificate) =>
+        new(serverCertificate: serverCertificate);
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
@@ -129,7 +148,14 @@ public sealed class MockNode : IDisposable
     {
         try
         {
-            NetworkStream stream = client.GetStream();
+            Stream stream = client.GetStream();
+            if (_serverCertificate is not null)
+            {
+                var ssl = new SslStream(stream, leaveInnerStreamOpen: false);
+                await ssl.AuthenticateAsServerAsync(_serverCertificate, clientCertificateRequired: false,
+                    checkCertificateRevocation: false);
+                stream = ssl;
+            }
             // ADR-0019: set when this connection's `A ... T` was
             // acknowledged — its requests then carry a trailing tag the
             // replies must echo.
@@ -398,6 +424,60 @@ public sealed class MockDiscovery : IDisposable
         {
             client.Close();
         }
+    }
+}
+
+/// <summary>
+/// D1 test support: throwaway self-signed TLS certificates, generated
+/// entirely with the BCL's own <see cref="CertificateRequest"/> API — no
+/// external TLS/crypto test dependency this SDK doesn't otherwise need,
+/// and no dependency on an external `openssl`/`keytool`-style binary
+/// being on PATH. Each certificate is self-signed and used as its own
+/// trust anchor, mirroring how a real deployment's private CA is passed
+/// to <c>Options.Ca</c>.
+/// </summary>
+internal static class Tls
+{
+    /// <summary>Builds a self-signed certificate for <paramref
+    /// name="commonName"/> whose Subject Alternative Name is exactly
+    /// <paramref name="sanDnsName"/> (if set) and/or <paramref
+    /// name="sanIpAddress"/> (if set) — these are exactly what .NET's
+    /// hostname verification (issue D1) checks the connected-to host
+    /// against.</summary>
+    internal static X509Certificate2 GenerateSelfSigned(
+        string commonName, string? sanDnsName = null, IPAddress? sanIpAddress = null)
+    {
+        using RSA rsa = RSA.Create(2048);
+        var request = new CertificateRequest(
+            $"CN={commonName}", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+        var sanBuilder = new SubjectAlternativeNameBuilder();
+        if (sanDnsName is not null) sanBuilder.AddDnsName(sanDnsName);
+        if (sanIpAddress is not null) sanBuilder.AddIpAddress(sanIpAddress);
+        request.CertificateExtensions.Add(sanBuilder.Build());
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
+
+        X509Certificate2 cert = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(3650));
+
+        // Round-tripped through a PFX export/import: a certificate fresh
+        // off CreateSelfSigned carries an *ephemeral* private key that
+        // SslStream's server-side AuthenticateAsServerAsync can't
+        // reliably use on every platform — re-importing gives it a normal
+        // (if still in-memory/exportable) key.
+        return X509CertificateLoader.LoadPkcs12(
+            cert.Export(X509ContentType.Pfx), password: null,
+            X509KeyStorageFlags.Exportable);
+    }
+
+    /// <summary>Writes just the public certificate (no private key) as a
+    /// PEM file — the same shape <c>Options.Ca</c> expects from a real
+    /// private CA's root certificate.</summary>
+    internal static string WritePemCertificate(X509Certificate2 certificate)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"nanocached-test-ca-{Guid.NewGuid():N}.pem");
+        File.WriteAllText(path, certificate.ExportCertificatePem());
+        return path;
     }
 }
 

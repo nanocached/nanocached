@@ -125,7 +125,18 @@ export interface NanocachedClientOptions {
    * (doc/adr/0015-*.md). Off by default. Costs extra reads only on the
    * misses this actually applies to. */
   readRepair?: boolean;
+  /** How long, after a reconnect dial to an address fails, that address is
+   * treated as still down — a request routed to it during this window
+   * fails immediately with the original dial error instead of paying
+   * another full `CONNECT_DEADLINE_MS` (5s, socket.ts) redialing an
+   * address that just proved unreachable. Default `DEFAULT_RECONNECT_COOLDOWN_MS`
+   * (1s). Keep well under `NODE_LIST_STALE_AFTER_MS` so a node that
+   * genuinely recovers isn't shut out for long. */
+  reconnectCooldownMs?: number;
 }
+
+// See `NanocachedClientOptions.reconnectCooldownMs`.
+const DEFAULT_RECONNECT_COOLDOWN_MS = 1_000;
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
@@ -250,6 +261,13 @@ export class NanocachedClient {
    * the same dead connection share one reconnect instead of dialing N
    * times. See routedConnection. */
   private readonly reconnects = new Map<string, Promise<Connection>>();
+  /** Per-address reconnect cooldown (see `NanocachedClientOptions.reconnectCooldownMs`):
+   * the address of the most recently failed dial, and how long it stays
+   * "down" before another dial to it is attempted. Keyed by address, not
+   * slot — `memberConnection`'s slot (node name) can be reassigned to a
+   * different address by a refresh, but the address itself is what's
+   * actually unreachable. */
+  private readonly reconnectCooldowns = new Map<string, { until: number; error: Error }>();
   private keepAliveTimer: NodeJS.Timeout | null = null;
 
   // Backing counters for stats()/ClientStats — see its doc comment.
@@ -285,6 +303,8 @@ export class NanocachedClient {
     private readonly compressionThreshold: number,
     private readonly fireAndForgetReplicas: boolean,
     private readonly readRepair: boolean,
+    /** See `NanocachedClientOptions.reconnectCooldownMs`. */
+    private readonly reconnectCooldownMs: number,
   ) {
     this.nodeUrls = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
@@ -308,6 +328,7 @@ export class NanocachedClient {
     const ca = options.tls === true && options.ca !== undefined ? readFileSync(options.ca) : undefined;
     const compress = options.compress === true;
     const compressionThreshold = options.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD;
+    const reconnectCooldownMs = options.reconnectCooldownMs ?? DEFAULT_RECONNECT_COOLDOWN_MS;
 
     // Walk the addresses in order until one yields a working target. An
     // address is skipped when it's unreachable, answers `B` (ADR-0010
@@ -362,6 +383,7 @@ export class NanocachedClient {
           compressionThreshold,
           options.fireAndForgetReplicas === true,
           options.readRepair === true,
+          reconnectCooldownMs,
         );
       }
 
@@ -416,6 +438,7 @@ export class NanocachedClient {
         compressionThreshold,
         options.fireAndForgetReplicas === true,
         options.readRepair === true,
+        reconnectCooldownMs,
       );
     }
 
@@ -974,7 +997,27 @@ export class NanocachedClient {
     const inFlight = this.reconnects.get(slot);
     if (inFlight) return inFlight;
 
-    const attempt = this.openNodeConnection(address);
+    // Per-address reconnect cooldown (see reconnectCooldowns' own doc
+    // comment): an address whose dial just failed stays "down" for
+    // reconnectCooldownMs, so a burst of requests routed to it — or one
+    // request every keep-alive tick — fails immediately with the same
+    // error the dial itself produced, instead of each paying another full
+    // CONNECT_DEADLINE_MS in turn.
+    const cooldown = this.reconnectCooldowns.get(address);
+    if (cooldown && Date.now() < cooldown.until) {
+      throw cooldown.error;
+    }
+
+    const attempt = this.openNodeConnection(address).then(
+      (connection) => {
+        this.reconnectCooldowns.delete(address);
+        return connection;
+      },
+      (error: Error) => {
+        this.reconnectCooldowns.set(address, { until: Date.now() + this.reconnectCooldownMs, error });
+        throw error;
+      },
+    );
     this.reconnects.set(slot, attempt);
     try {
       return await attempt;

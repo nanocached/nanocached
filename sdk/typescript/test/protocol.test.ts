@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { encodeDelete, encodeGet, encodeSet, tryParseResponse } from "../src/protocol.js";
+import { encodeDelete, encodeGet, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
 
 describe("encodeGet", () => {
   it("frames the key with its byte length", () => {
@@ -10,6 +10,19 @@ describe("encodeGet", () => {
   it("uses the byte length, not the character count", () => {
     const key = Buffer.from("日本", "utf8"); // 6 bytes, 2 characters
     assert.deepEqual(encodeGet(key), Buffer.concat([Buffer.from("G 6\n"), key]));
+  });
+
+  it("rejects an empty key synchronously", () => {
+    assert.throws(() => encodeGet(Buffer.alloc(0)), RangeError);
+  });
+
+  it("rejects a key beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeGet(Buffer.alloc(MAX_REQUEST_BYTES + 1)), RangeError);
+  });
+
+  it("accepts a key of exactly MAX_REQUEST_BYTES", () => {
+    const key = Buffer.alloc(MAX_REQUEST_BYTES, "k");
+    assert.doesNotThrow(() => encodeGet(key));
   });
 });
 
@@ -31,11 +44,36 @@ describe("encodeSet", () => {
       assert.throws(() => encodeSet(Buffer.from("k"), Buffer.from("v"), ttl), RangeError);
     }
   });
+
+  it("rejects an empty key synchronously", () => {
+    assert.throws(() => encodeSet(Buffer.alloc(0), Buffer.from("v")), RangeError);
+  });
+
+  it("rejects a key+value combination beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(
+      () => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("x")),
+      RangeError,
+    );
+  });
+
+  it("accepts a key+value combination of exactly MAX_REQUEST_BYTES", () => {
+    const key = Buffer.alloc(MAX_REQUEST_BYTES - 1, "k");
+    const value = Buffer.from("v");
+    assert.doesNotThrow(() => encodeSet(key, value));
+  });
 });
 
 describe("encodeDelete", () => {
   it("frames the key with its byte length", () => {
     assert.deepEqual(encodeDelete(Buffer.from("key")), Buffer.from("D 3\nkey"));
+  });
+
+  it("rejects an empty key synchronously", () => {
+    assert.throws(() => encodeDelete(Buffer.alloc(0)), RangeError);
+  });
+
+  it("rejects a key beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeDelete(Buffer.alloc(MAX_REQUEST_BYTES + 1)), RangeError);
   });
 });
 

@@ -1,18 +1,24 @@
 package org.nanocached;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyStore;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
 
 /**
  * In-process stand-ins for nanocached-node and nanocached-discovery,
@@ -60,31 +66,43 @@ final class MockServers {
         private final List<Thread> threads = new CopyOnWriteArrayList<>();
 
         MockNode() throws IOException {
-            this(null, false, false);
+            this(null, false, false, null);
         }
 
         MockNode(byte[] requiredSecret) throws IOException {
-            this(requiredSecret, false, false);
+            this(requiredSecret, false, false, null);
         }
 
         /** ADR-0019: a node that negotiates tags — accepts `A ... T`
          * with `OnT\n` and echoes tags on that connection's replies. */
         static MockNode withTagSupport() throws IOException {
-            return new MockNode(null, true, false);
+            return new MockNode(null, true, false, null);
         }
 
         /** ADR-0019: a pre-0019 node — the extended `A ... T` is a parse
          * error, so it closes the connection without replying, forcing
          * the caller's transparent untagged fallback. */
         static MockNode legacyServer() throws IOException {
-            return new MockNode(null, false, true);
+            return new MockNode(null, false, true, null);
         }
 
-        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth) throws IOException {
+        /** J1: a node that speaks TLS, presenting whatever certificate
+         * {@code serverTls} was built with (see {@link Tls#generate}).
+         * Everything past the handshake (A/G/S/D) is identical to a plain
+         * MockNode — an {@link javax.net.ssl.SSLSocket} is a {@link
+         * Socket}, so {@link #serve} needs no TLS-specific code at all. */
+        static MockNode withTls(SSLContext serverTls) throws IOException {
+            return new MockNode(null, false, false, serverTls);
+        }
+
+        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
+                SSLContext serverTls) throws IOException {
             this.requiredSecret = requiredSecret;
             this.supportTags = supportTags;
             this.closeOnExtendedAuth = closeOnExtendedAuth;
-            this.server = new ServerSocket(0);
+            this.server = serverTls == null
+                    ? new ServerSocket(0)
+                    : serverTls.getServerSocketFactory().createServerSocket(0);
             Thread acceptor = new Thread(this::acceptLoop, "mock-node-accept");
             acceptor.setDaemon(true);
             acceptor.start();
@@ -428,6 +446,79 @@ final class MockServers {
                 }
             } catch (IOException | RuntimeException done) {
                 // Connection closed — normal end of a mock session.
+            }
+        }
+    }
+
+    /**
+     * J1 test support: throwaway self-signed TLS certificates, generated
+     * with the JDK's own {@code keytool} binary (shipped with every JDK
+     * install — this adds no Maven/Gradle test dependency) rather than a
+     * TLS/crypto library this SDK doesn't otherwise need. Each certificate
+     * is self-signed and used as its own trust anchor, mirroring how a
+     * real deployment's private CA is passed to {@code Options.ca(Path)}.
+     */
+    static final class Tls {
+        private static final char[] PASSWORD = "changeit".toCharArray();
+        private Tls() {}
+
+        record Generated(SSLContext serverContext, Path pemCert) {}
+
+        /** {@code subjectAltName} is a keytool {@code -ext SAN=...} value,
+         * e.g. {@code "ip:127.0.0.1"} or {@code "dns:wrong.example.test"} —
+         * this is exactly the value the JDK's HTTPS endpoint-identification
+         * algorithm (issue J1) checks the connected-to host against. */
+        static Generated generate(Path dir, String commonName, String subjectAltName) throws Exception {
+            Path keystore = dir.resolve("node.p12");
+            Path pem = dir.resolve("node.pem");
+
+            runKeytool(dir,
+                    "-genkeypair",
+                    "-alias", "node",
+                    "-keyalg", "RSA",
+                    "-keysize", "2048",
+                    "-validity", "3650",
+                    "-storetype", "PKCS12",
+                    "-keystore", keystore.toString(),
+                    "-storepass", new String(PASSWORD),
+                    "-keypass", new String(PASSWORD),
+                    "-dname", "CN=" + commonName,
+                    "-ext", "SAN=" + subjectAltName);
+            runKeytool(dir,
+                    "-exportcert",
+                    "-alias", "node",
+                    "-keystore", keystore.toString(),
+                    "-storepass", new String(PASSWORD),
+                    "-rfc",
+                    "-file", pem.toString());
+
+            KeyStore serverKeystore = KeyStore.getInstance("PKCS12");
+            try (InputStream in = Files.newInputStream(keystore)) {
+                serverKeystore.load(in, PASSWORD);
+            }
+            KeyManagerFactory keyManagerFactory =
+                    KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+            keyManagerFactory.init(serverKeystore, PASSWORD);
+            SSLContext serverContext = SSLContext.getInstance("TLS");
+            serverContext.init(keyManagerFactory.getKeyManagers(), null, null);
+            return new Generated(serverContext, pem);
+        }
+
+        private static void runKeytool(Path workingDir, String... args) throws IOException, InterruptedException {
+            List<String> command = new java.util.ArrayList<>();
+            command.add(System.getProperty("java.home") + File.separator + "bin" + File.separator + "keytool");
+            command.addAll(List.of(args));
+            Process process = new ProcessBuilder(command)
+                    .directory(workingDir.toFile())
+                    .redirectErrorStream(true)
+                    .start();
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                throw new IOException("keytool timed out: " + command);
+            }
+            if (process.exitValue() != 0) {
+                throw new IOException("keytool failed (exit " + process.exitValue() + "): " + output);
             }
         }
     }

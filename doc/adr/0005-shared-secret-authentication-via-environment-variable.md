@@ -6,6 +6,8 @@ Date: 2026-08-15
 
 Accepted
 
+`bench` (`src/bin/bench.rs`) was removed from the repository in #29 (a load-test client living in `src/bin/` read as product surface; see commit 97c83fe) — every mention of it below is historical context from when this decision was made, not a reference to current code.
+
 ## Context
 
 `nanocached-node` and `nanocached-discovery` had no authentication: any

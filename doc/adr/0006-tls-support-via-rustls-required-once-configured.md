@@ -8,6 +8,8 @@ Accepted
 
 Builds on [5. Shared-secret authentication via environment variable](0005-shared-secret-authentication-via-environment-variable.md)
 
+`bench` (`src/bin/bench.rs`) was removed from the repository in #29 (a load-test client living in `src/bin/` read as product surface; see commit 97c83fe) — every mention of it below is historical context from when this decision was made, not a reference to current code.
+
 ## Context
 
 [[0005]] added shared-secret authentication but explicitly framed it as a

@@ -115,7 +115,19 @@ its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
-operations are idempotent). There is nothing to configure.
+operations are idempotent).
+
+An address whose redial just failed is treated as still down for
+`reconnectCooldown` (default `Duration.ofMillis(1000)`): requests routed
+to it during that window fail immediately with the original dial error
+instead of each paying another full 5-second connect timeout. Keep it
+short — a node that genuinely recovers is shut out for at most this long.
+
+```java
+NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+        .addresses(List.of(new Address("cache.internal", 8357)))
+        .reconnectCooldown(java.time.Duration.ofMillis(1000))); // default
+```
 
 ## Authentication and TLS
 

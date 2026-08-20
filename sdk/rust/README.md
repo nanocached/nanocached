@@ -122,6 +122,22 @@ connect deadline covering the TCP connect and handshake, so a node
 whose address has become a blackhole (a dead cloud instance) fails
 over instead of hanging.
 
+An address whose redial just failed is treated as still down for
+`Options::reconnect_cooldown` (default 1 second): requests routed to it
+during that window fail immediately with the original dial error instead
+of each paying another full 5-second connect timeout.
+
+```rust
+let options = Options::new()
+    .addresses([("127.0.0.1", 8357)])
+    .reconnect_cooldown(std::time::Duration::from_millis(500));
+```
+
+Keep it well under the 30-second node-list refresh interval so a node
+that genuinely recovers isn't shut out for long; pass
+`Duration::ZERO` to disable it entirely (every request that finds a dead
+connection pays its own full dial attempt).
+
 ## Authentication and TLS
 
 ```rust
@@ -134,8 +150,8 @@ let options = Options::new()
 TLS is behind the `tls` feature, enabled by default:
 
 ```toml
-nanocached = "0.1"                                     # tls included
-nanocached = { version = "0.1", default-features = false } # plaintext only, smaller build
+nanocached = "0.2"                                     # tls included
+nanocached = { version = "0.2", default-features = false } # plaintext only, smaller build
 ```
 
 `tls` is a plain bool; `ca` names a PEM file of trusted root

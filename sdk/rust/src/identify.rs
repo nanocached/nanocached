@@ -105,16 +105,37 @@ pub(crate) type TlsConfig = std::convert::Infallible;
 /// every dial this client makes. `ca` is meaningful only when `tls` is
 /// true — a `ca` set with `tls(false)` is silently ignored, matching
 /// every other nanocached SDK.
+///
+/// `build_tls_config`'s file read (`std::fs::File::open`) and PEM parsing
+/// are blocking calls; since `connect()` (this function's only caller) is
+/// itself async, running them inline would block whatever tokio worker
+/// thread happens to poll it — a real stall under a multi-thread runtime
+/// with a slow or network-mounted CA file. `spawn_blocking` moves that
+/// work onto tokio's blocking thread pool instead (issue #47 audit item
+/// R3); the join error case only fires if that task panics, which
+/// `build_tls_config` never does on its own.
 #[cfg(feature = "tls")]
-pub(crate) fn resolve_tls(tls: bool, ca: Option<&std::path::Path>) -> Result<Option<TlsConfig>> {
+pub(crate) async fn resolve_tls(
+    tls: bool,
+    ca: Option<&std::path::Path>,
+) -> Result<Option<TlsConfig>> {
     if !tls {
         return Ok(None);
     }
-    build_tls_config(ca).map(Some)
+    let ca = ca.map(std::path::Path::to_path_buf);
+    let config = tokio::task::spawn_blocking(move || build_tls_config(ca.as_deref()))
+        .await
+        .map_err(|error| {
+            Error::Protocol(format!("nanocached: TLS setup task panicked: {error}"))
+        })??;
+    Ok(Some(config))
 }
 
 #[cfg(not(feature = "tls"))]
-pub(crate) fn resolve_tls(tls: bool, _ca: Option<&std::path::Path>) -> Result<Option<TlsConfig>> {
+pub(crate) async fn resolve_tls(
+    tls: bool,
+    _ca: Option<&std::path::Path>,
+) -> Result<Option<TlsConfig>> {
     if tls {
         return Err(Error::InvalidArgument(
             "nanocached: tls(true) requires the `tls` feature".to_string(),
@@ -569,41 +590,47 @@ ValXM/4meyTDFmbKUiHWzNkElZZ8lEhjxHccD4X23w==\n\
             path
         }
 
-        #[test]
-        fn tls_false_silently_ignores_ca() {
+        // resolve_tls now runs its blocking file I/O on spawn_blocking
+        // (issue #47 audit item R3), which needs a tokio runtime even for
+        // the tls(false) short-circuit path — hence #[tokio::test] rather
+        // than #[test] throughout this module. Error types/messages are
+        // unchanged, so the assertions below are otherwise identical to
+        // before that change.
+        #[tokio::test]
+        async fn tls_false_silently_ignores_ca() {
             // Even a nonexistent CA file must not error when tls is off.
-            let result = resolve_tls(false, Some(Path::new("/no/such/ca.pem")));
+            let result = resolve_tls(false, Some(Path::new("/no/such/ca.pem"))).await;
             assert!(matches!(result, Ok(None)));
         }
 
-        #[test]
-        fn tls_true_without_ca_resolves_to_the_default_trust_store() {
-            assert!(resolve_tls(true, None).unwrap().is_some());
+        #[tokio::test]
+        async fn tls_true_without_ca_resolves_to_the_default_trust_store() {
+            assert!(resolve_tls(true, None).await.unwrap().is_some());
         }
 
-        #[test]
-        fn tls_true_with_a_valid_ca_file_replaces_the_default_store() {
+        #[tokio::test]
+        async fn tls_true_with_a_valid_ca_file_replaces_the_default_store() {
             let dir = std::env::temp_dir();
             let path = write_pem(&dir, "nanocached-test-valid-ca.pem", VALID_CA_PEM);
-            let result = resolve_tls(true, Some(&path));
+            let result = resolve_tls(true, Some(&path)).await;
             std::fs::remove_file(&path).ok();
             assert!(result.unwrap().is_some());
         }
 
-        #[test]
-        fn tls_true_with_an_unreadable_ca_file_is_a_connect_time_error() {
-            let result = resolve_tls(true, Some(Path::new("/no/such/ca.pem")));
+        #[tokio::test]
+        async fn tls_true_with_an_unreadable_ca_file_is_a_connect_time_error() {
+            let result = resolve_tls(true, Some(Path::new("/no/such/ca.pem"))).await;
             assert!(
                 matches!(result, Err(Error::InvalidArgument(_))),
                 "expected InvalidArgument, got {result:?}"
             );
         }
 
-        #[test]
-        fn tls_true_with_a_ca_file_containing_no_certificates_is_a_connect_time_error() {
+        #[tokio::test]
+        async fn tls_true_with_a_ca_file_containing_no_certificates_is_a_connect_time_error() {
             let dir = std::env::temp_dir();
             let path = write_pem(&dir, "nanocached-test-empty-ca.pem", "not a certificate\n");
-            let result = resolve_tls(true, Some(&path));
+            let result = resolve_tls(true, Some(&path)).await;
             std::fs::remove_file(&path).ok();
             assert!(
                 matches!(result, Err(Error::InvalidArgument(_))),
@@ -613,9 +640,9 @@ ValXM/4meyTDFmbKUiHWzNkElZZ8lEhjxHccD4X23w==\n\
     }
 
     #[cfg(not(feature = "tls"))]
-    #[test]
-    fn tls_true_without_the_feature_is_a_connect_time_error() {
-        let result = resolve_tls(true, None);
+    #[tokio::test]
+    async fn tls_true_without_the_feature_is_a_connect_time_error() {
+        let result = resolve_tls(true, None).await;
         assert!(
             matches!(result, Err(Error::InvalidArgument(_))),
             "expected InvalidArgument, got {result:?}"
@@ -623,8 +650,8 @@ ValXM/4meyTDFmbKUiHWzNkElZZ8lEhjxHccD4X23w==\n\
     }
 
     #[cfg(not(feature = "tls"))]
-    #[test]
-    fn tls_false_is_fine_without_the_feature() {
-        assert!(matches!(resolve_tls(false, None), Ok(None)));
+    #[tokio::test]
+    async fn tls_false_is_fine_without_the_feature() {
+        assert!(matches!(resolve_tls(false, None).await, Ok(None)));
     }
 }

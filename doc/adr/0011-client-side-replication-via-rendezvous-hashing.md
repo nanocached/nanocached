@@ -11,6 +11,8 @@ Builds on [2. Client-side consistent hashing with a lightweight self-hosted disc
 [9. Decouple node identity from network address](0009-decouple-node-identity-from-network-address.md),
 and [10. Discovery HA via soft-state replicas and member announce](0010-discovery-ha-via-soft-state-replicas-and-member-announce.md)
 
+`bench` (`src/bin/bench.rs`) was removed from the repository in #29 (a load-test client living in `src/bin/` read as product surface; see commit 97c83fe) — every mention of it below is historical context from when this decision was made, not a reference to current code.
+
 ## Context
 
 Losing a cache node today loses every key it held: each key lives on

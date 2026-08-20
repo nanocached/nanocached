@@ -25,6 +25,16 @@ use crate::identify::Stream;
 /// malicious frame, never just a legitimately large value.
 const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
 
+/// Caps a response header line (`read_line`, shared with identify.rs's
+/// discovery node-list headers) before it can grow without bound: every
+/// real header line (`V <len> <tag>`, `S <tag>`, a discovery `N <count>
+/// <r>`/entry line, ...) is a few dozen bytes at most, so a peer that
+/// never sends the terminating `\n` is corrupt or hostile, not just slow
+/// — 4 KiB is generous headroom while still bounding its memory pressure
+/// on the client (issue #47 audit item R2, mirrors `MAX_VALUE_LENGTH`'s
+/// rationale for the `V` body).
+const MAX_HEADER_LINE_LENGTH: usize = 4 * 1024;
+
 /// Bounds a request's full round trip (write + wait for its matched
 /// response), in milliseconds: without it, a half-open server that
 /// accepts the TCP connection but never writes back — or stops
@@ -647,5 +657,10 @@ pub(crate) async fn read_line<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -
                 .map_err(|_| Error::Protocol("nanocached: non-UTF-8 response header".to_string()));
         }
         line.push(byte);
+        if line.len() > MAX_HEADER_LINE_LENGTH {
+            return Err(Error::Protocol(format!(
+                "nanocached: response header line exceeds {MAX_HEADER_LINE_LENGTH} bytes without a terminator"
+            )));
+        }
     }
 }

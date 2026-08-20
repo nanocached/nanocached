@@ -11,6 +11,17 @@ use std::time::Duration;
 
 const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
+/// Floor on `--max-memory`. `Cache::insert` (src/cache.rs) never evicts
+/// the entry it just inserted — its eviction loop stops once only that
+/// one entry is left, even if the entry alone still exceeds the budget —
+/// so a budget at or below `cache::ENTRY_OVERHEAD_BYTES` (its own
+/// per-entry bookkeeping estimate, before counting a single byte of key
+/// or value) can never actually be satisfied: every write would evict
+/// every other entry, degrading the cache into a single-entry, thrash-
+/// on-every-write store forever. Set well above that floor, not just
+/// past it, so the minimum leaves room for an actually useful number of
+/// entries rather than merely avoiding the degenerate case.
+const MIN_MAX_MEMORY_BYTES: usize = 1024 * 1024;
 
 /// Reads the shared auth secret from the environment rather than a CLI
 /// flag, since CLI arguments are visible to anyone who can list processes
@@ -51,6 +62,7 @@ impl Default for Args {
 /// exit code 0) from an actual parsing error (printed to stderr with exit
 /// code 1) — both previously took the same `Err` path, so `--help` looked
 /// like a failure to shell scripts and CLI conventions alike.
+#[derive(Debug)]
 enum ArgsError {
     Help(String),
     Invalid(String),
@@ -63,8 +75,16 @@ impl From<String> for ArgsError {
 }
 
 fn parse_args() -> Result<Args, ArgsError> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// Does the actual parsing, taking the raw flags/values as an iterator
+/// rather than reading `std::env::args()` directly — so tests can drive
+/// it with an in-memory list instead of the real process argv (which is
+/// both global, mutable, and process-wide, none of which unit tests
+/// should touch).
+fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsError> {
     let mut args = Args::default();
-    let mut raw = std::env::args().skip(1);
 
     while let Some(flag) = raw.next() {
         let mut value = || raw.next().ok_or_else(|| format!("{flag} requires a value"));
@@ -83,9 +103,21 @@ fn parse_args() -> Result<Args, ArgsError> {
             "--tls-ca" => args.tls_ca = Some(value()?),
             "--max-memory" => {
                 let raw_max_memory = value()?;
-                args.max_memory = raw_max_memory
+                let max_memory: usize = raw_max_memory
                     .parse()
                     .map_err(|_| format!("invalid value for --max-memory: {raw_max_memory}"))?;
+
+                if max_memory < MIN_MAX_MEMORY_BYTES {
+                    return Err(format!(
+                        "--max-memory must be at least {MIN_MAX_MEMORY_BYTES} bytes \
+                         ({} MiB); {raw_max_memory} is too small for the cache to ever \
+                         hold more than a single entry (see MIN_MAX_MEMORY_BYTES)",
+                        MIN_MAX_MEMORY_BYTES / (1024 * 1024)
+                    )
+                    .into());
+                }
+
+                args.max_memory = max_memory;
             }
             "-h" | "--help" => return Err(ArgsError::Help(usage())),
             other => {
@@ -129,9 +161,12 @@ Usage: nanocached-node [options]
   --max-memory <bytes>        cache memory budget in bytes, approximately
                                the sum of stored key+value bytes plus a
                                small per-entry accounting overhead
-                               (default {} — 256 MiB); least-recently-used
-                               entries are evicted first once over budget",
+                               (default {} — 256 MiB, minimum {} — {} MiB);
+                               least-recently-used entries are evicted
+                               first once over budget",
         server::MAX_CACHE_MEMORY_BYTES,
+        MIN_MAX_MEMORY_BYTES,
+        MIN_MAX_MEMORY_BYTES / (1024 * 1024),
     )
 }
 
@@ -215,4 +250,76 @@ async fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds the argument iterator `parse_args_from` expects out of
+    /// plain string literals, matching how they'd actually arrive from
+    /// `std::env::args()`.
+    fn args(flags: &[&str]) -> impl Iterator<Item = String> {
+        flags
+            .iter()
+            .map(|flag| flag.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn max_memory_defaults_to_the_documented_256_mebibytes_when_omitted() {
+        let parsed = parse_args_from(args(&[])).unwrap();
+        assert_eq!(parsed.max_memory, server::MAX_CACHE_MEMORY_BYTES);
+    }
+
+    #[test]
+    fn max_memory_at_the_minimum_is_accepted() {
+        let parsed =
+            parse_args_from(args(&["--max-memory", &MIN_MAX_MEMORY_BYTES.to_string()])).unwrap();
+        assert_eq!(parsed.max_memory, MIN_MAX_MEMORY_BYTES);
+    }
+
+    #[test]
+    fn max_memory_one_byte_below_the_minimum_is_rejected() {
+        // Regression: `Cache::insert` (src/cache.rs) never evicts the
+        // entry it just inserted, so a budget too small to hold even one
+        // entry comfortably can never actually be satisfied — the cache
+        // degrades into evicting everything else on every single write.
+        // `--max-memory` must reject that instead of silently accepting
+        // an effectively broken cache.
+        let result = parse_args_from(args(&[
+            "--max-memory",
+            &(MIN_MAX_MEMORY_BYTES - 1).to_string(),
+        ]));
+
+        let Err(ArgsError::Invalid(message)) = result else {
+            panic!("expected an Invalid rejection");
+        };
+        assert!(
+            message.contains("--max-memory"),
+            "expected the error to name the offending flag, got: {message}"
+        );
+    }
+
+    #[test]
+    fn max_memory_zero_is_rejected() {
+        let result = parse_args_from(args(&["--max-memory", "0"]));
+        assert!(matches!(result, Err(ArgsError::Invalid(_))));
+    }
+
+    #[test]
+    fn max_memory_well_above_the_minimum_is_accepted() {
+        let parsed = parse_args_from(args(&["--max-memory", "268435456"])).unwrap();
+        assert_eq!(parsed.max_memory, 268_435_456);
+    }
+
+    #[test]
+    fn an_invalid_max_memory_value_is_still_reported_as_a_parse_error_not_a_range_error() {
+        let result = parse_args_from(args(&["--max-memory", "not-a-number"]));
+        let Err(ArgsError::Invalid(message)) = result else {
+            panic!("expected an Invalid rejection");
+        };
+        assert!(message.contains("invalid value for --max-memory"));
+    }
 }
