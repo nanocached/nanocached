@@ -4,7 +4,13 @@ Date: 2026-08-19
 
 ## Status
 
-Accepted
+Accepted — implemented in all five SDKs. Clarified 2026-08-20 (issue
+#46): the Context below describes the pre-decision state; today **all
+six** SDKs pipeline identically — TypeScript's `connection.ts` `send()`
+claims a tag, pushes a waiter onto the FIFO and writes the frame
+immediately, and the other five match it per the Decision — so no SDK
+serializes requests per connection anymore. Amended by [[0019]] (echoed
+response tags close the desync window noted in Consequences).
 
 ## Context
 

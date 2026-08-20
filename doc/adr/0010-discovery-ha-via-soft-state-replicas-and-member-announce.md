@@ -4,7 +4,12 @@ Date: 2026-08-17
 
 ## Status
 
-Proposed — being implemented and verified on `feat/discovery-ha`.
+Accepted — implemented. Amended 2026-08-20 to match the implementation
+(issue #46): the client-side option is named `addresses` (not `seeds`)
+and exists in all six SDKs; the startup grace is pinned to the liveness
+timeout rather than carrying its own `--startup-grace` flag; and the
+bootstrap-vs-refresh asymmetry for an address that answers as a cache
+node is now written down.
 
 Builds on [2. Client-side consistent hashing with a lightweight self-hosted discovery server](0002-client-side-consistent-hashing-with-a-lightweight-self-hosted-discovery-server.md),
 [8. Staged node join with discovery-orchestrated data handoff](0008-staged-node-join-with-discovery-orchestrated-data-handoff.md),
@@ -84,15 +89,34 @@ one piece of state that genuinely needs a single writer keeps exactly one.
 **Every node must list the discovery addresses in the same order**; this is
 an operational requirement, not something the system verifies.
 
-The TypeScript SDK's `connect()` gains a `seeds` option (a list of
+Every SDK's `connect()` takes an `addresses` option (a list of
 discovery addresses tried in order, for both bootstrap and node-list
 refresh), so losing any one discovery replica costs clients nothing.
+*(As implemented: the option is named `addresses` — per each language's
+casing — in all six SDKs, and the identifier `seeds` this ADR
+originally proposed appears nowhere in the source.)*
+
+One asymmetry, uniform across all six SDKs, is deliberate: when a
+configured address answers `A` as a **cache node** rather than a
+discovery server, bootstrap **stops** there — the client pins itself to
+that single node (single-node mode, with a warning when more addresses
+were configured), since a lone node cannot provide cluster routing but
+is a perfectly good deliberate dev/single-node target. During a
+node-list **refresh** the same answer is **skipped** and the walk
+continues: an established cluster client must never silently collapse
+to single-node mode because one address in its list turned out to be a
+node.
 
 ### 3. A startup grace period for `L`
 
-`nanocached-discovery --startup-grace <secs>` (default: the liveness
-timeout, 15s; `0` disables): until the grace elapses after process start,
-`L` is answered with the existing busy byte `B\n` instead of a node list.
+Until the grace elapses after process start, `L` is answered with the
+existing busy byte `B\n` instead of a node list. *(As implemented: the
+grace is pinned to `--liveness-timeout` and is not separately
+configurable — the proposed `--startup-grace` flag was dropped. The
+grace exists so every live member has had time to re-announce before
+`L` is served, and that time is the liveness window by definition; a
+separate knob would only invite setting it shorter than the value that
+makes it correct.)*
 Within one heartbeat interval of a restart every live member has
 re-announced, so once the grace passes the registry is complete; answering
 `B` in the meantime keeps a bootstrapping client from ever building a ring
@@ -121,6 +145,7 @@ run during it.
   replicas orchestrate joins concurrently, which [[0008]] does not
   support. Documented, not enforced.
 - A brand-new discovery (first boot, empty cluster) also serves its grace
-  period, delaying the very first `L` by up to `--startup-grace` — it
+  period, delaying the very first `L` by up to the liveness timeout — it
   cannot distinguish first boot from an amnesiac restart. Operators who
-  care can pass `--startup-grace 0`.
+  care can shorten `--liveness-timeout`, which shortens the grace with
+  it (they are the same window by definition; see Decision 3).

@@ -113,7 +113,12 @@ Wire-visible format, applied only in the raw-bytes `set`/`get` path
   unchanged. `0x01` → raw-DEFLATE-decompress the rest and return that.
   Any other marker byte is a decompression error (see Consequences),
   raised as this SDK's normal error type with a message pointing at a
-  `compress` mismatch as the likely cause.
+  `compress` mismatch as the likely cause. Decompressed output is capped
+  at **64 MiB** in every SDK (added 2026-08-20, issue #41): the wire cap
+  bounds only the *compressed* bytes received, so without this a tiny
+  hostile or corrupt value could expand to an arbitrarily large
+  allocation — a decompression bomb. Exceeding the cap is a
+  decompression error like any other.
 - With `compress` off (the default), `get`/`set` are entirely unchanged —
   no marker byte, no CPU cost, byte-for-byte what every existing
   deployment already does.
