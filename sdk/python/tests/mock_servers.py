@@ -27,6 +27,7 @@ class MockNode:
         self.connection_count = 0
         self.get_count = 0
         self._wrong_node_replies = 0
+        self._wrong_node_on_set_replies = 0
         self._wrong_tag_replies = 0
         self._swallowed_gets = 0
         self._malformed_value_replies = 0
@@ -47,6 +48,13 @@ class MockNode:
 
     def answer_wrong_node_once(self) -> None:
         self._wrong_node_replies += 1
+
+    def answer_wrong_node_on_set_once(self) -> None:
+        """Reply ``W`` to the next S specifically (not G/D) — for tests
+        that need a node to keep answering GET normally while a later
+        SET against it (e.g. a read-repair write-back) fails. Mirrors
+        the .NET mock's hook of the same name."""
+        self._wrong_node_on_set_replies += 1
 
     def answer_wrong_tag_once(self) -> None:
         """Queue a one-off reply for the next G request on a tagged
@@ -206,7 +214,10 @@ class MockNode:
                         continue
                     if self._set_delay > 0:
                         await asyncio.sleep(self._set_delay)
-                    if self._wrong_node_replies > 0:
+                    if self._wrong_node_on_set_replies > 0:
+                        self._wrong_node_on_set_replies -= 1
+                        writer.write(b"W" + tag_suffix + b"\n")
+                    elif self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")
                     else:

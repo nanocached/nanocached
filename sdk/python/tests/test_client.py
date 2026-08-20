@@ -1222,7 +1222,10 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 except Exception:
                     pass
 
-    async def test_counts_a_swallowed_read_repair_failure_when_a_replica_is_unreachable(self):
+    async def test_a_failed_owner_probe_is_swallowed_but_not_counted(self):
+        # Issue #43: read_repair_failures counts failed repair
+        # *write-backs* only, matching the other five SDKs — a failed
+        # owner probe during the repair scan is swallowed silently.
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect(
             [("127.0.0.1", discovery.port)], read_repair=True
@@ -1236,12 +1239,42 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 "the client to see the FIN",
             )
 
-            self.assertEqual(client.stats().read_repair_failures, 0)
             # The primary reports a clean miss, then read repair probes
             # the (dead) replica and swallows the resulting connection
-            # failure.
+            # failure — without counting it.
             self.assertIsNone(await client.get_bytes(key))
-            self.assertEqual(client.stats().read_repair_failures, 1)
+            self.assertEqual(client.stats().read_repair_failures, 0)
+        finally:
+            client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+    async def test_a_failed_repair_write_back_increments_read_repair_failures(self):
+        # Issue #43: the write-back leg is what the counter measures —
+        # the replica's value is still returned to the caller, but the
+        # background repair write to the primary fails and is counted.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], read_repair=True
+        )
+        try:
+            key = "read-repair-write-back"
+            primary, replica = self.owners_of(key)
+            nodes[replica].store[key.encode()] = b"from-replica"
+            # GETs against the primary keep missing normally; only the
+            # repair's background S is answered with W and swallowed.
+            nodes[primary].answer_wrong_node_on_set_once()
+
+            self.assertEqual(client.stats().read_repair_failures, 0)
+            self.assertEqual(await client.get_bytes(key), b"from-replica")
+            await wait_for(
+                lambda: client.stats().read_repair_failures >= 1,
+                "the failed repair write-back to be counted",
+            )
         finally:
             client.close()
             await discovery.close()

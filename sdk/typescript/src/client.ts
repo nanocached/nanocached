@@ -505,9 +505,11 @@ export class NanocachedClient {
    * primary) in the background, with TTL READ_REPAIR_TTL_SECONDS (the
    * original TTL can't be recovered from a GET, and TTL 0 would
    * permanently resurrect already-expired data). Every failure along the
-   * way (connection lost, WrongNode, another miss) is swallowed and
-   * counted in stats().readRepairFailures; nothing here may turn an
-   * already-accepted miss into an error — except an actual programming
+   * way (connection lost, WrongNode, another miss) is swallowed; only a
+   * failed repair *write-back* is counted in stats().readRepairFailures —
+   * a failed owner probe is silent, matching the counter's write-back
+   * semantics in the other five SDKs (issue #43). Nothing here may turn
+   * an already-accepted miss into an error — except an actual programming
    * bug (isSwallowable), which still propagates. */
   private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
     const names = this.ownerNames(key);
@@ -518,7 +520,6 @@ export class NanocachedClient {
         value = await connection.get(key);
       } catch (error) {
         if (!isSwallowable(error)) throw error;
-        this.readRepairFailures++;
         continue;
       }
       if (value === null) continue;

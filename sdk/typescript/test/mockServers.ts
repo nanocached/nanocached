@@ -17,6 +17,11 @@ export interface MockNode extends MockServerBase {
   store: Map<string, Buffer>;
   /** Queue a one-off `W` reply for the next G/S/D request. */
   answerWrongNodeOnce(): void;
+  /** Queue a one-off `W` reply for the next S specifically (not G/D) —
+   * for tests that need a node to keep answering GET normally while a
+   * later SET against it (e.g. a read-repair write-back) fails. Mirrors
+   * the .NET mock's hook of the same name. */
+  answerWrongNodeOnSetOnce(): void;
   /** Queue a one-off reply for the next G request on a tagged connection
    * that echoes the WRONG tag (the request's tag + 1) — the desync a
    * pre-ADR-0019 stream misalignment would produce. */
@@ -137,6 +142,7 @@ export async function startMockNode(
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
   let wrongNodeReplies = 0;
+  let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
   let swallowedGets = 0;
   let malformedValueReplies = 0;
@@ -275,6 +281,12 @@ export async function startMockNode(
 
             if (silent) break;
 
+            if (wrongNodeOnSetReplies > 0) {
+              wrongNodeOnSetReplies--;
+              socket.write(`W${tag}\n`);
+              break;
+            }
+
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
               socket.write(`W${tag}\n`);
@@ -325,6 +337,9 @@ export async function startMockNode(
     store,
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
+    },
+    answerWrongNodeOnSetOnce: () => {
+      wrongNodeOnSetReplies++;
     },
     answerWrongTagOnce: () => {
       wrongTagReplies++;

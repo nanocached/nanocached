@@ -1386,7 +1386,10 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     }
   });
 
-  it("counts a swallowed read-repair failure when a replica is unreachable (ADR-0015)", async () => {
+  it("swallows a failed owner probe without counting it (issue #43)", async () => {
+    // readRepairFailures counts failed repair *write-backs* only,
+    // matching the other five SDKs — a failed owner probe during the
+    // repair scan is swallowed silently.
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({
       addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
@@ -1399,11 +1402,37 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       await replica.mock.close();
       await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
 
-      assert.equal(client.stats().readRepairFailures, 0);
       // The primary reports a clean miss, then read repair probes the
-      // (dead) replica and swallows the resulting connection failure.
+      // (dead) replica and swallows the resulting connection failure —
+      // without counting it.
       assert.equal(await client.get(key), null);
-      assert.equal(client.stats().readRepairFailures, 1);
+      assert.equal(client.stats().readRepairFailures, 0);
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("counts a failed repair write-back (ADR-0015, issue #43)", async () => {
+    // The write-back leg is what the counter measures — the replica's
+    // value is still returned to the caller, but the background repair
+    // write to the primary fails and is counted.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readRepair: true,
+    });
+    try {
+      const key = "read-repair-write-back";
+      const { primary, replica } = cluster.ownerOf(key);
+      replica.mock.store.set(key, Buffer.from("from-replica"));
+      // GETs against the primary keep missing normally; only the
+      // repair's background S is answered with W and swallowed.
+      primary.mock.answerWrongNodeOnSetOnce();
+
+      assert.equal(client.stats().readRepairFailures, 0);
+      assert.equal(await client.get(key), "from-replica");
+      await waitFor(() => client.stats().readRepairFailures >= 1, "the failed repair write-back to be counted");
     } finally {
       client.close();
       await cluster.close().catch(() => {});

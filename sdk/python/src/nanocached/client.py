@@ -355,9 +355,11 @@ class NanocachedClient:
         value repairs the true primary in the background, with TTL
         _READ_REPAIR_TTL (the original TTL can't be recovered from a
         GET, and TTL 0 would permanently resurrect already-expired
-        data). Every failure along the way is swallowed and counted in
-        stats().read_repair_failures; nothing here may turn an
-        already-accepted miss into an error — except a genuine
+        data). Every failure along the way is swallowed; only a failed
+        repair *write-back* is counted in stats().read_repair_failures —
+        a failed owner probe is silent, matching the counter's write-back
+        semantics in the other five SDKs (issue #43). Nothing here may
+        turn an already-accepted miss into an error — except a genuine
         programming error (anything outside _SWALLOWABLE_ERRORS), which
         still propagates."""
         names = self._owner_names(key)
@@ -366,7 +368,6 @@ class NanocachedClient:
                 connection = await self._member_connection(name)
                 value = await connection.get(key)
             except _SWALLOWABLE_ERRORS:
-                self._read_repair_failures += 1
                 continue
             if value is None:
                 continue
