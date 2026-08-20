@@ -1,5 +1,5 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
-use crate::command::{Command, ParseError, parse};
+use crate::command::{Command, ParseError, parse, parse_tagged};
 use crate::hash_ring::HashRing;
 use crate::response::Response;
 use bytes::{Bytes, BytesMut};
@@ -685,6 +685,15 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
 
+/// ADR-0019: a `G`/`S`/`D` response on a tagged-mode connection echoes
+/// the request's tag; untagged connections keep the original encoding.
+fn encode_response(response: &Response, tag: Option<u32>) -> Vec<u8> {
+    match tag {
+        Some(tag) => response.encode_with_tag(tag),
+        None => response.encode(),
+    }
+}
+
 async fn handle_connection(
     mut stream: ServerStream,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -703,8 +712,18 @@ async fn handle_connection(
     // specifically, rather than on every byte read.
     let mut deadline = Instant::now() + config.idle_timeout;
 
+    // ADR-0019: set once an `A ... T` is accepted. From then on every
+    // request must carry a trailing tag (`parse_tagged`) and every
+    // `G`/`S`/`D` response echoes it, so the client's read loop can
+    // verify request/response alignment before dispatching.
+    let mut tagged = false;
+
     loop {
-        let parsed = parse(&mut received);
+        let parsed = if tagged {
+            parse_tagged(&mut received)
+        } else {
+            parse(&mut received).map(|command| (command, None))
+        };
 
         // Only a fully parsed command extends the deadline — an
         // `Incomplete` result (more bytes needed) leaves it untouched, so
@@ -716,19 +735,31 @@ async fn handle_connection(
         }
 
         match parsed {
-            Ok(Command::Auth { secret }) => {
+            Ok((Command::Auth { secret, tagging }, _)) => {
                 let accepted = match &config.auth_secret {
                     Some(expected) => constant_time_eq(&secret, expected),
                     None => true,
                 };
 
+                // The identity reply echoes the tag capability only to a
+                // client that asked for it (ADR-0019) — a plain `A` keeps
+                // the exact three-byte reply older SDKs hard-read.
+                let identity = |response: &Response| {
+                    if tagging {
+                        response.encode_identity_tagged()
+                    } else {
+                        response.encode()
+                    }
+                };
+
                 if accepted {
                     authenticated = true;
-                    write_response(&mut stream, &Response::AuthOk.encode()).await?;
+                    tagged = tagging;
+                    write_response(&mut stream, &identity(&Response::AuthOk)).await?;
                     continue;
                 }
 
-                write_response(&mut stream, &Response::Unauthorized.encode()).await?;
+                write_response(&mut stream, &identity(&Response::Unauthorized)).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "invalid auth secret",
@@ -741,12 +772,15 @@ async fn handle_connection(
                     "command sent before authenticating",
                 ));
             }
-            Ok(Command::Migrate {
-                joining_name,
-                joining_addr,
-                joined,
-                replication,
-            }) => {
+            Ok((
+                Command::Migrate {
+                    joining_name,
+                    joining_addr,
+                    joined,
+                    replication,
+                },
+                _,
+            )) => {
                 let Some(node_context) = config.node_context.clone() else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -847,7 +881,7 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(Command::CancelMigration { joining_name }) => {
+            Ok((Command::CancelMigration { joining_name }, _)) => {
                 let Some(node_context) = config.node_context.clone() else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -880,24 +914,26 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(Command::Get { key }) => {
+            Ok((Command::Get { key }, tag)) => {
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
                 {
-                    write_response(&mut stream, &Response::WrongNode.encode()).await?;
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
                     continue;
                 }
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
-                write_response(&mut stream, &response.encode()).await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 continue;
             }
-            Ok(Command::Set { key, value, ttl }) => {
+            Ok((Command::Set { key, value, ttl }, tag)) => {
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
                 {
-                    write_response(&mut stream, &Response::WrongNode.encode()).await?;
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
                     continue;
                 }
 
@@ -910,7 +946,7 @@ async fn handle_connection(
                     },
                 )
                 .await?;
-                write_response(&mut stream, &response.encode()).await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 // ADR-0008: this key may be one an in-progress handoff is
                 // moving to a joining node — see `migration_target_for`.
@@ -927,17 +963,18 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(Command::Delete { key }) => {
+            Ok((Command::Delete { key }, tag)) => {
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
                 {
-                    write_response(&mut stream, &Response::WrongNode.encode()).await?;
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
                     continue;
                 }
 
                 let response =
                     execute_command(&request_tx, Command::Delete { key: key.clone() }).await?;
-                write_response(&mut stream, &response.encode()).await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 if let Some(node_context) = &config.node_context
                     && let Some(joining_addr) = migration_target_for(node_context, &key)
@@ -952,7 +989,7 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(command) => {
+            Ok((command, _)) => {
                 // `ListEntries`/`MarkMigrated`/`UnmarkMigrated`/`Sweep`/
                 // `PeekEntry`: internal-only, constructed directly by
                 // server-side tasks, never by `parse()` — this arm exists
@@ -2788,6 +2825,108 @@ mod tests {
 
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_echoes_tags_after_a_tagged_auth() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        // ADR-0019: `A ... T` flips the connection into tagged mode; every
+        // later request carries a trailing tag and every response echoes
+        // it — including the four-field tagged SET-with-TTL form.
+        client
+            .write_all(b"A 1 T\nxS 4 5 7\nnameAliceG 4 8\nnameS 4 5 60 9\nnameAliceG 5 10\notherD 4 11\nname")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"OnT\nS 7\nV 5 8\nAliceS 9\nN 10\nD 11\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_rejects_an_untagged_request_on_a_tagged_connection() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        // A `G` without the trailing tag is a parse error on a tagged
+        // connection — dispatching it positionally is exactly the
+        // ambiguity tagged mode exists to remove.
+        client.write_all(b"A 1 T\nxG 4\nname").await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut ack = [0_u8; 4];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"OnT\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_answers_a_tagged_auth_rejection_in_kind() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"correct-secret")),
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"A 5 T\nwrong").await.unwrap();
+
+        let mut ack = [0_u8; 4];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"EnT\n");
+
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test(flavor = "current_thread")]

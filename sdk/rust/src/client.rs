@@ -348,7 +348,7 @@ impl NanocachedClient {
                 .await
             {
                 Err(error) => last_error = Some(error),
-                Ok(Identified::Node(stream)) => {
+                Ok(Identified::Node { stream, tagged }) => {
                     if options.addresses.len() > 1 {
                         let remaining = options.addresses.len() - 1;
                         eprintln!(
@@ -360,7 +360,7 @@ impl NanocachedClient {
                     }
                     target = Some(Target::Single {
                         address: key.clone(),
-                        connection: Arc::new(Connection::new(stream, key.clone())),
+                        connection: Arc::new(Connection::new(stream, key.clone(), tagged)),
                     });
                     tracking_key = key;
                     break;
@@ -387,7 +387,7 @@ impl NanocachedClient {
                             )
                             .await?;
                             match identified {
-                                Identified::Node(stream) => Ok(stream),
+                                Identified::Node { stream, tagged } => Ok((stream, tagged)),
                                 Identified::Cluster { .. } => Err(Error::Protocol(format!(
                                     "nanocached: discovery server returned a non-node address: {}",
                                     node.address
@@ -397,12 +397,16 @@ impl NanocachedClient {
                         .await;
 
                         match outcome {
-                            Ok(stream) => {
+                            Ok((stream, tagged)) => {
                                 members.insert(
                                     node.name.clone(),
                                     Member {
                                         address: node.address.clone(),
-                                        connection: Arc::new(Connection::new(stream, key.clone())),
+                                        connection: Arc::new(Connection::new(
+                                            stream,
+                                            key.clone(),
+                                            tagged,
+                                        )),
                                     },
                                 );
                             }
@@ -952,9 +956,11 @@ impl NanocachedClient {
             }
         }
 
+        let (stream, tagged) = self.open_node_stream(&address).await?;
         let connection = Arc::new(Connection::new(
-            self.open_node_stream(&address).await?,
+            stream,
             self.inner.tracking_key.clone(),
+            tagged,
         ));
 
         let mut state = self.inner.state.lock().await;
@@ -993,7 +999,7 @@ impl NanocachedClient {
         Ok(connection)
     }
 
-    async fn open_node_stream(&self, address: &str) -> Result<crate::identify::Stream> {
+    async fn open_node_stream(&self, address: &str) -> Result<(crate::identify::Stream, bool)> {
         let (host, port) = split_host_port(address)?;
         let identified = connect_and_identify(
             &host,
@@ -1004,11 +1010,11 @@ impl NanocachedClient {
         )
         .await?;
         match identified {
-            Identified::Node(stream) => {
+            Identified::Node { stream, tagged } => {
                 if self.is_closed() {
                     return Err(Error::AlreadyClosed);
                 }
-                Ok(stream)
+                Ok((stream, tagged))
             }
             Identified::Cluster { .. } => Err(Error::Protocol(format!(
                 "nanocached: {address} no longer identifies as a cache node"

@@ -9,12 +9,26 @@ import asyncio
 
 
 class MockNode:
-    def __init__(self, required_secret: bytes | None = None) -> None:
+    def __init__(
+        self,
+        required_secret: bytes | None = None,
+        support_tags: bool = False,
+        close_on_extended_auth: bool = False,
+    ) -> None:
         self.store: dict[bytes, bytes] = {}
         self.required_secret = required_secret
+        # ADR-0019: acknowledge `A ... T` with `OnT\n` and echo tags on
+        # that connection's replies. Off by default so the bulk of the
+        # suite keeps exercising the legacy untagged path.
+        self.support_tags = support_tags
+        # Behave like a pre-ADR-0019 server: an extended `A ... T` is a
+        # parse error — close the connection without replying.
+        self.close_on_extended_auth = close_on_extended_auth
         self.connection_count = 0
         self.get_count = 0
         self._wrong_node_replies = 0
+        self._wrong_tag_replies = 0
+        self._swallowed_gets = 0
         self._malformed_value_replies = 0
         self._unterminated_value_replies = 0
         self.unterminated_value_bytes_sent = 0
@@ -32,6 +46,18 @@ class MockNode:
 
     def answer_wrong_node_once(self) -> None:
         self._wrong_node_replies += 1
+
+    def answer_wrong_tag_once(self) -> None:
+        """Queue a one-off reply for the next G request on a tagged
+        connection that echoes the WRONG tag (the request's tag + 1) —
+        the desync a pre-ADR-0019 stream misalignment would produce."""
+        self._wrong_tag_replies += 1
+
+    def swallow_get_once(self) -> None:
+        """Swallow the next G request entirely (no reply) — the
+        off-by-one stream desync where every later response answers the
+        previous request."""
+        self._swallowed_gets += 1
 
     def answer_malformed_value_once(self) -> None:
         self._malformed_value_replies += 1
@@ -77,6 +103,9 @@ class MockNode:
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.connection_count += 1
         self._sockets.add(writer)
+        # ADR-0019: set when this connection's `A ... T` was acknowledged
+        # — its requests then carry a trailing tag the replies must echo.
+        tagged = False
         try:
             while True:
                 try:
@@ -84,15 +113,23 @@ class MockNode:
                 except (asyncio.IncompleteReadError, ConnectionError):
                     return
                 parts = header[:-1].split(b" ")
+                # On a tagged connection every request's last header field
+                # is its tag, echoed back as each reply's own last field.
+                tag_suffix = b" " + parts[-1] if tagged else b""
 
                 if parts[0] == b"A":
+                    if len(parts) > 2 and self.close_on_extended_auth:
+                        writer.close()
+                        return
+
                     secret = await reader.readexactly(int(parts[1]))
                     accepted = (
                         len(secret) > 0
                         if self.required_secret is None
                         else secret == self.required_secret
                     )
-                    writer.write(b"On\n" if accepted else b"En\n")
+                    tagged = accepted and self.support_tags and len(parts) > 2 and parts[2] == b"T"
+                    writer.write(b"OnT\n" if tagged else (b"On\n" if accepted else b"En\n"))
                     await writer.drain()
                     if not accepted:
                         return
@@ -103,9 +140,17 @@ class MockNode:
                     if self._get_delay > 0:
                         delay, self._get_delay = self._get_delay, 0.0
                         await asyncio.sleep(delay)
+                    if self._swallowed_gets > 0:
+                        self._swallowed_gets -= 1
+                        continue
+                    if self._wrong_tag_replies > 0 and tagged:
+                        self._wrong_tag_replies -= 1
+                        writer.write(b"N %d\n" % (int(parts[-1]) + 1))
+                        await writer.drain()
+                        continue
                     if self._stored_to_get_replies > 0:
                         self._stored_to_get_replies -= 1
-                        writer.write(b"S\n")
+                        writer.write(b"S" + tag_suffix + b"\n")
                         await writer.drain()
                         continue
                     if self._malformed_value_replies > 0:
@@ -127,38 +172,42 @@ class MockNode:
                         return
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
-                        writer.write(b"W\n")
+                        writer.write(b"W" + tag_suffix + b"\n")
                     elif key in self.store:
                         value = self.store[key]
-                        writer.write(b"V %d\n%b" % (len(value), value))
+                        writer.write(b"V %d%b\n%b" % (len(value), tag_suffix, value))
                     else:
-                        writer.write(b"N\n")
+                        writer.write(b"N" + tag_suffix + b"\n")
                     await writer.drain()
 
                 elif parts[0] == b"S":
                     key = await reader.readexactly(int(parts[1]))
                     value = await reader.readexactly(int(parts[2]))
-                    # parts[3], when present, is the TTL (omitted on the
-                    # wire means "no expiry", i.e. 0 — see _encode_set's
-                    # doc comment in _connection.py).
-                    self.last_set_ttl = int(parts[3]) if len(parts) > 3 else 0
+                    # parts[3], when present (and not the tag itself), is
+                    # the TTL (omitted on the wire means "no expiry", i.e.
+                    # 0 — see _encode_set's doc comment in
+                    # _connection.py). On a tagged connection the tag sits
+                    # after it as the last field.
+                    base_field_count = 4 if tagged else 3
+                    self.last_set_ttl = int(parts[3]) if len(parts) > base_field_count else 0
                     if self._set_delay > 0:
                         await asyncio.sleep(self._set_delay)
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
-                        writer.write(b"W\n")
+                        writer.write(b"W" + tag_suffix + b"\n")
                     else:
                         self.store[key] = value
-                        writer.write(b"S\n")
+                        writer.write(b"S" + tag_suffix + b"\n")
                     await writer.drain()
 
                 elif parts[0] == b"D":
                     key = await reader.readexactly(int(parts[1]))
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
-                        writer.write(b"W\n")
+                        writer.write(b"W" + tag_suffix + b"\n")
                     else:
-                        writer.write(b"D\n" if self.store.pop(key, None) is not None else b"N\n")
+                        deleted = self.store.pop(key, None) is not None
+                        writer.write((b"D" if deleted else b"N") + tag_suffix + b"\n")
                     await writer.drain()
 
                 else:
@@ -210,7 +259,11 @@ class MockDiscovery:
 
                 if parts[0] == b"A":
                     await reader.readexactly(int(parts[1]))
-                    writer.write(b"Od\n")
+                    # ADR-0019: echo the tag capability — clients send the
+                    # extended A before knowing which kind of server
+                    # answered. Discovery's `L` exchange never uses tags
+                    # itself, so nothing else here depends on this.
+                    writer.write(b"OdT\n" if len(parts) > 2 and parts[2] == b"T" else b"Od\n")
                     await writer.drain()
                 elif parts[0] == b"L":
                     if self.warming_up:

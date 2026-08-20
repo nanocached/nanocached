@@ -132,7 +132,10 @@ Harder / risks to mitigate:
   mismatch tests only exercise the single-request-in-flight case, where
   this never shows up — a latent gap in coverage this ADR doesn't
   attempt to close, consistent with matching TypeScript's behavior
-  exactly rather than exceeding it.
+  exactly rather than exceeding it. *Since closed by [[0019]]: echoed
+  response tags let the read loop verify alignment before dispatch on
+  negotiated connections; only connections to pre-0019 servers retain
+  this window.*
 - The write side is still a single critical section per connection in
   every port (Context) — pipelining removes the *read* wait from the
   critical path, not the write. A connection whose writes themselves

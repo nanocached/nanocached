@@ -43,16 +43,35 @@ pub static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 
 /// A raw response marker byte plus its value bytes (`V` only) — what the
 /// read task parses off the wire, before `get`/`set`/`delete` convert it
-/// into a [`ResponseKind`] or a `WrongNode`/protocol error.
+/// into a [`ResponseKind`] or a `WrongNode`/protocol error. The echoed
+/// tag (ADR-0019), when present, is verified against the pending slot's
+/// expected tag by the read loop itself and never reaches this type — see
+/// `WireResponse`.
 type RawResponse = (u8, Option<Vec<u8>>);
 type RawResponseSender = oneshot::Sender<Result<RawResponse>>;
+
+/// A pending request's queue slot: the sender its response ultimately
+/// resolves, plus — on a tagged connection (ADR-0019) — the tag it was
+/// sent with, which the read loop checks the response's echoed tag
+/// against before handing the response off. `tag` is always `None` on an
+/// untagged connection, and simply unused.
+struct PendingSlot {
+    tag: Option<u32>,
+    tx: RawResponseSender,
+}
 
 struct WriteState {
     /// `None` once poisoned (or for the pre-poisoned placeholder,
     /// `dead()`, which never opened a socket) — further requests fail
     /// as connection-lost rather than reusing a torn-down half.
     write_half: Option<WriteHalf<Stream>>,
-    pending: VecDeque<RawResponseSender>,
+    pending: VecDeque<PendingSlot>,
+    /// ADR-0019: this connection's tag counter, a u32 wrapping at its
+    /// width — claimed under this same lock, in the same critical section
+    /// that enqueues the pending slot and writes the frame, so tag order
+    /// can never skew from queue/wire order (ADR-0016's invariant).
+    /// Unused (stays 0) on an untagged connection.
+    next_tag: u32,
 }
 
 struct Shared {
@@ -66,6 +85,11 @@ struct Shared {
     /// `open_targets`) — `None` for the pre-poisoned `dead()` placeholder,
     /// which never opened a socket and so was never counted.
     tracking_key: Option<String>,
+    /// ADR-0019: negotiated during identify (see `identify::Identified`) —
+    /// when true, every request carries a tag the server echoes, and the
+    /// read loop verifies the echo against the oldest pending slot before
+    /// resolving it.
+    tagged: bool,
 }
 
 impl Shared {
@@ -127,7 +151,7 @@ impl Connection {
     /// of whichever configured address answered `connect()`) — every
     /// socket the client ever opens, regardless of which node it dials,
     /// is counted against that one key (see `open_targets`).
-    pub(crate) fn new(stream: Stream, tracking_key: String) -> Self {
+    pub(crate) fn new(stream: Stream, tracking_key: String, tagged: bool) -> Self {
         crate::open_targets::increment(&tracking_key);
         let (read_half, write_half) = split(stream);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -136,11 +160,13 @@ impl Connection {
             write_state: Mutex::new(WriteState {
                 write_half: Some(write_half),
                 pending: VecDeque::new(),
+                next_tag: 0,
             }),
             closed: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             tracking_key: Some(tracking_key),
+            tagged,
         });
 
         let read_shared = Arc::clone(&shared);
@@ -167,11 +193,13 @@ impl Connection {
                 write_state: Mutex::new(WriteState {
                     write_half: None,
                     pending: VecDeque::new(),
+                    next_tag: 0,
                 }),
                 closed: AtomicBool::new(true),
                 last_used_ms: AtomicU64::new(0),
                 epoch: Instant::now(),
                 tracking_key: None,
+                tagged: false,
             }),
             shutdown: shutdown_tx,
         }
@@ -194,9 +222,22 @@ impl Connection {
     }
 
     pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut frame = format!("G {}\n", key.len()).into_bytes();
-        frame.extend_from_slice(key);
-        match self.request(&frame).await? {
+        match self
+            .request(|tag| {
+                // ADR-0019: a tagged connection's request header carries
+                // the claimed tag as its last field; `tag` is `None` on an
+                // untagged connection, in which case the frame is exactly
+                // the pre-0019 bytes.
+                let mut frame = match tag {
+                    Some(tag) => format!("G {} {tag}\n", key.len()),
+                    None => format!("G {}\n", key.len()),
+                }
+                .into_bytes();
+                frame.extend_from_slice(key);
+                frame
+            })
+            .await?
+        {
             ResponseKind::Value(value) => Ok(Some(value)),
             ResponseKind::NotFound => Ok(None),
             other => Err(self.mismatch(&other)),
@@ -206,24 +247,41 @@ impl Connection {
     /// `ttl_seconds == 0` means no expiry — mapped to the wire exactly as
     /// the absent-TTL frame always was.
     pub(crate) async fn set(&self, key: &[u8], value: &[u8], ttl_seconds: u64) -> Result<()> {
-        let header = if ttl_seconds == 0 {
-            format!("S {} {}\n", key.len(), value.len())
-        } else {
-            format!("S {} {} {}\n", key.len(), value.len(), ttl_seconds)
-        };
-        let mut frame = header.into_bytes();
-        frame.extend_from_slice(key);
-        frame.extend_from_slice(value);
-        match self.request(&frame).await? {
+        match self
+            .request(|tag| {
+                // ADR-0019: the tag, when present, is always the last
+                // header field — after the TTL when there is one.
+                let header = match (ttl_seconds, tag) {
+                    (0, None) => format!("S {} {}\n", key.len(), value.len()),
+                    (0, Some(tag)) => format!("S {} {} {tag}\n", key.len(), value.len()),
+                    (ttl, None) => format!("S {} {} {ttl}\n", key.len(), value.len()),
+                    (ttl, Some(tag)) => format!("S {} {} {ttl} {tag}\n", key.len(), value.len()),
+                };
+                let mut frame = header.into_bytes();
+                frame.extend_from_slice(key);
+                frame.extend_from_slice(value);
+                frame
+            })
+            .await?
+        {
             ResponseKind::Stored => Ok(()),
             other => Err(self.mismatch(&other)),
         }
     }
 
     pub(crate) async fn delete(&self, key: &[u8]) -> Result<bool> {
-        let mut frame = format!("D {}\n", key.len()).into_bytes();
-        frame.extend_from_slice(key);
-        match self.request(&frame).await? {
+        match self
+            .request(|tag| {
+                let mut frame = match tag {
+                    Some(tag) => format!("D {} {tag}\n", key.len()),
+                    None => format!("D {}\n", key.len()),
+                }
+                .into_bytes();
+                frame.extend_from_slice(key);
+                frame
+            })
+            .await?
+        {
             ResponseKind::Deleted => Ok(true),
             ResponseKind::NotFound => Ok(false),
             other => Err(self.mismatch(&other)),
@@ -239,9 +297,12 @@ impl Connection {
     /// will ever answer — gets cleared and the socket released, instead
     /// of merely leaving it for a read that will never arrive to
     /// eventually skip over.
-    async fn request(&self, frame: &[u8]) -> Result<ResponseKind> {
+    async fn request<F>(&self, build: F) -> Result<ResponseKind>
+    where
+        F: FnOnce(Option<u32>) -> Vec<u8>,
+    {
         let timeout = Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::SeqCst));
-        match tokio::time::timeout(timeout, self.request_uncapped(frame)).await {
+        match tokio::time::timeout(timeout, self.request_uncapped(build)).await {
             Ok(result) => result,
             Err(_) => {
                 self.close();
@@ -263,7 +324,10 @@ impl Connection {
     /// unaffected. (`request`'s timeout wrapper additionally poisons the
     /// connection outright when it fires, since in that case nothing is
     /// ever going to answer.)
-    async fn request_uncapped(&self, frame: &[u8]) -> Result<ResponseKind> {
+    async fn request_uncapped<F>(&self, build: F) -> Result<ResponseKind>
+    where
+        F: FnOnce(Option<u32>) -> Vec<u8>,
+    {
         if self.is_closed() {
             return Err(Error::ConnectionLost(
                 "nanocached: connection is closed".to_string(),
@@ -282,7 +346,22 @@ impl Connection {
                 self.shared.epoch.elapsed().as_millis() as u64,
                 Ordering::SeqCst,
             );
-            state.pending.push_back(tx);
+
+            // ADR-0019: claim this connection's next tag (if tagged) and
+            // build the frame in the same critical section that enqueues
+            // the pending slot and writes it, so tag order can never skew
+            // from queue/wire order (ADR-0016's invariant). `None` on an
+            // untagged connection produces exactly the pre-0019 frame.
+            let tag = if self.shared.tagged {
+                let tag = state.next_tag;
+                state.next_tag = state.next_tag.wrapping_add(1);
+                Some(tag)
+            } else {
+                None
+            };
+            let frame = build(tag);
+
+            state.pending.push_back(PendingSlot { tag, tx });
             let write_half = state.write_half.as_mut().expect("checked above");
 
             let mut guard = WriteGuard {
@@ -290,7 +369,7 @@ impl Connection {
                 shutdown: &self.shutdown,
                 completed: false,
             };
-            let write_result = write_half.write_all(frame).await;
+            let write_result = write_half.write_all(&frame).await;
             guard.completed = true;
 
             if let Err(error) = write_result {
@@ -352,10 +431,10 @@ async fn read_loop(
                 drain_pending(&shared, None).await;
                 return;
             }
-            result = read_one_response(&mut read_half) => result,
+            result = read_one_response(&mut read_half, shared.tagged) => result,
         };
 
-        let (marker, value) = match response {
+        let (marker, value, tag) = match response {
             Ok(response) => response,
             Err(error) => {
                 // error belongs to whichever request has been waiting
@@ -369,15 +448,15 @@ async fn read_loop(
             }
         };
 
-        let (was_empty, tx) = {
+        let (was_empty, slot) = {
             let mut state = shared.write_state.lock().await;
             let was_empty = state.pending.is_empty();
-            let tx = if was_empty {
+            let slot = if was_empty {
                 None
             } else {
                 state.pending.pop_front()
             };
-            (was_empty, tx)
+            (was_empty, slot)
         };
 
         // An unsolicited "busy" response means the server hit its
@@ -389,16 +468,39 @@ async fn read_loop(
             drain_pending(&shared, None).await;
             return;
         }
-        let Some(tx) = tx else {
+        let Some(slot) = slot else {
             // Unsolicited and not the known busy case — desync.
             shared.mark_closed(&shutdown_tx);
             drain_pending(&shared, None).await;
             return;
         };
+
+        // ADR-0019: on a tagged connection, verify the echoed tag against
+        // the request this response is about to answer — *before* it can
+        // reach any caller. A mismatch means the streams are misaligned;
+        // unlike the caller-side kind check (`mismatch()`), catching it
+        // here stops the misdelivery instead of merely noticing it later.
+        if shared.tagged && tag != slot.tag {
+            let message = format!(
+                "nanocached: response tag {tag:?} does not answer request tag {:?} (connection desynced)",
+                slot.tag
+            );
+            shared.mark_closed(&shutdown_tx);
+            // The popped slot is no longer in `pending`, so drain_pending
+            // won't reach it — reject it here. Every request still queued
+            // behind it never got any response at all, but is just as
+            // misaligned, so it gets the same "desynced" error rather
+            // than the generic "connection closed" drain_pending would
+            // otherwise give it.
+            let _ = slot.tx.send(Err(Error::ConnectionLost(message.clone())));
+            drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
+            return;
+        }
+
         // An Err here just means the caller abandoned this request after
         // its write completed (see `Connection::request`) — nothing to
         // do, the queue position was already correctly consumed above.
-        let _ = tx.send(Ok((marker, value)));
+        let _ = slot.tx.send(Ok((marker, value)));
     }
 }
 
@@ -414,28 +516,51 @@ async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
     state.write_half = None;
     let mut pending = state.pending.drain(..);
     if let Some(error) = first_error {
-        if let Some(tx) = pending.next() {
-            let _ = tx.send(Err(error));
+        if let Some(slot) = pending.next() {
+            let _ = slot.tx.send(Err(error));
         }
     }
-    for tx in pending {
-        let _ = tx.send(Err(Error::ConnectionLost(
+    for slot in pending {
+        let _ = slot.tx.send(Err(Error::ConnectionLost(
             "nanocached: connection closed".to_string(),
         )));
     }
 }
 
-async fn read_one_response(read_half: &mut ReadHalf<Stream>) -> Result<RawResponse> {
+/// A marker byte, its value bytes (`V` only), and — on a tagged
+/// connection (ADR-0019) — the tag it echoed, straight off the wire
+/// before the read loop has verified that tag against anything. Only
+/// `read_one_response`/`read_loop` ever see this third field; once
+/// verified it's stripped down to a plain [`RawResponse`] before being
+/// handed to a waiting caller.
+type WireResponse = (u8, Option<Vec<u8>>, Option<u32>);
+
+async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Result<WireResponse> {
     let marker = read_half.read_u8().await?;
     match marker {
         b'V' => {
             let header = read_line(read_half).await?;
+            let header = header.trim();
+            // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019) —
+            // the tag rides as a second field on the same header line.
+            let (length_field, tag) = if tagged {
+                let mut fields = header.splitn(2, ' ');
+                match (fields.next(), fields.next()) {
+                    (Some(length), Some(tag)) => (length, Some(parse_tag(tag)?)),
+                    _ => {
+                        return Err(Error::Protocol(
+                            "nanocached: invalid value header in response".to_string(),
+                        ))
+                    }
+                }
+            } else {
+                (header, None)
+            };
             // The server never stores values above its 1 MiB request
             // limit, so a claimed length beyond MAX_VALUE_LENGTH is a
             // corrupt or malicious frame (issue #12); reject before
             // allocating.
-            let length: usize = header
-                .trim()
+            let length: usize = length_field
                 .parse()
                 .ok()
                 .filter(|length| *length <= MAX_VALUE_LENGTH)
@@ -444,17 +569,37 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>) -> Result<RawRespon
                 })?;
             let mut value = vec![0u8; length];
             read_half.read_exact(&mut value).await?;
-            Ok((marker, Some(value)))
+            Ok((marker, Some(value), tag))
         }
-        b'S' | b'D' | b'N' | b'W' | b'B' => {
+        b'B' => {
+            // `B` (busy) is always untagged — unsolicited, sent before
+            // auth (and so before tagging) even completes (ADR-0019).
             read_half.read_u8().await?; // the trailing '\n'
-            Ok((marker, None))
+            Ok((marker, None, None))
+        }
+        b'S' | b'D' | b'N' | b'W' => {
+            if tagged {
+                // `S <tag>\n` / `D <tag>\n` / `N <tag>\n` / `W <tag>\n`.
+                let line = read_line(read_half).await?;
+                Ok((marker, None, Some(parse_tag(line.trim())?)))
+            } else {
+                read_half.read_u8().await?; // the trailing '\n'
+                Ok((marker, None, None))
+            }
         }
         other => Err(Error::Protocol(format!(
             "nanocached: unexpected response from server: {}",
             other as char
         ))),
     }
+}
+
+/// Parses a response's echoed tag (ADR-0019): a `u32` in decimal,
+/// matching the wire width the client itself claims tags from.
+fn parse_tag(field: &str) -> Result<u32> {
+    field
+        .parse()
+        .map_err(|_| Error::Protocol("nanocached: invalid response tag".to_string()))
 }
 
 /// Converts `request`'s raw `(marker, value)` into the higher-level kind

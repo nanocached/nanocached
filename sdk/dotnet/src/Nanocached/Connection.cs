@@ -17,6 +17,17 @@ namespace Nanocached;
 /// never contends with writers. Enqueuing the pending slot and writing the
 /// frame happen under one semaphore, so concurrent callers' queue order
 /// always matches the order their frames actually hit the wire.
+///
+/// <para>doc/adr/0019-*.md: when <see cref="_tagged"/> (negotiated during
+/// identify), every request carries a per-connection tag as its header's
+/// last field, and the server echoes it in the response. The tag is
+/// claimed inside the same enqueue+write critical section as the pending
+/// slot itself, so tag order can never skew from queue/wire order, and the
+/// read loop verifies the echoed tag against the oldest pending slot's
+/// expected tag <em>before</em> that slot is handed its response — closing
+/// the desync window an off-by-one stream corruption (e.g. a swallowed
+/// response) would otherwise leave open (the caller-side kind check in
+/// <see cref="Mismatch"/> only ever notices that after the fact).</para>
 /// </summary>
 internal sealed class Connection
 {
@@ -27,7 +38,15 @@ internal sealed class Connection
 
     private readonly Stream _stream;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
-    private readonly ConcurrentQueue<TaskCompletionSource<(byte Marker, byte[]? Value)>> _pending = new();
+    /// <summary>ADR-0019: negotiated during identify — when true, every
+    /// request carries a tag the server echoes, and the read loop verifies
+    /// the echo against the oldest pending slot before resolving it.</summary>
+    private readonly bool _tagged;
+    // A u32 wrapping counter (ADR-0019), claimed only inside the
+    // _writeGate critical section — never touched concurrently, so no
+    // Interlocked ceremony is needed here the way _closedFlag needs one.
+    private uint _nextTag;
+    private readonly ConcurrentQueue<(TaskCompletionSource<(byte Marker, byte[]? Value)> Tcs, uint? Tag)> _pending = new();
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
     private readonly Action? _onClosed;
     // 0 = open, 1 = closed. An int (not a bool) so Close() can gate on it
@@ -40,15 +59,17 @@ internal sealed class Connection
     // from `synchronized`.
     private int _closedFlag;
 
-    /// <summary><paramref name="onClosed"/>, when given, fires exactly
-    /// once — the first time this connection actually closes — no matter
-    /// how many call sites call <see cref="Close"/> on it. Lets the client
-    /// hook every place it closes or discards a connection (issue #12's
-    /// forgotten-close tracking) without each call site worrying about
-    /// double-counting.</summary>
-    internal Connection(Stream stream, Action? onClosed = null)
+    /// <summary><paramref name="tagged"/> (ADR-0019): whether identify
+    /// negotiated tagged mode for this connection. <paramref name="onClosed"/>,
+    /// when given, fires exactly once — the first time this connection
+    /// actually closes — no matter how many call sites call
+    /// <see cref="Close"/> on it. Lets the client hook every place it
+    /// closes or discards a connection (issue #12's forgotten-close
+    /// tracking) without each call site worrying about double-counting.</summary>
+    internal Connection(Stream stream, bool tagged = false, Action? onClosed = null)
     {
         _stream = stream;
+        _tagged = tagged;
         _onClosed = onClosed;
         _ = ReadLoopAsync();
     }
@@ -62,21 +83,28 @@ internal sealed class Connection
     /// connection-closed error — the read loop's own exit path (a failed
     /// read) also routes through here, so this is the single place
     /// draining ever happens.</summary>
-    internal void Close()
+    internal void Close() => CloseWithReason(new ConnectionLostException("nanocached: connection closed"));
+
+    /// <summary>Same idempotency as <see cref="Close"/>, but drains every
+    /// still-pending request with <paramref name="reason"/> instead of the
+    /// generic closed error — used by the ADR-0019 tag check below so that
+    /// every request behind a desynced one is rejected with a message that
+    /// actually says so, not a generic "connection closed".</summary>
+    private void CloseWithReason(Exception reason)
     {
         if (Interlocked.Exchange(ref _closedFlag, 1) != 0) return;
         _stream.Dispose();
         _onClosed?.Invoke();
-        while (_pending.TryDequeue(out var tcs))
+        while (_pending.TryDequeue(out var pending))
         {
-            tcs.TrySetException(new ConnectionLostException("nanocached: connection closed"));
+            pending.Tcs.TrySetException(reason);
         }
     }
 
     internal async Task<byte[]?> GetAsync(byte[] key)
     {
-        var frame = Frame($"G {key.Length}\n", key, null);
-        var (marker, value) = await RequestAsync(frame).ConfigureAwait(false);
+        var (marker, value) = await RequestAsync(tag => Frame($"G {key.Length}{TagField(tag)}\n", key, null))
+            .ConfigureAwait(false);
         return marker switch
         {
             (byte)'V' => value,
@@ -90,17 +118,21 @@ internal sealed class Connection
     /// on the wire exactly as the old absent-TTL header was.</summary>
     internal async Task SetAsync(byte[] key, byte[] value, long ttlSeconds)
     {
-        string header = ttlSeconds == 0
-            ? $"S {key.Length} {value.Length}\n"
-            : $"S {key.Length} {value.Length} {ttlSeconds}\n";
-        var (marker, _) = await RequestAsync(Frame(header, key, value)).ConfigureAwait(false);
+        var (marker, _) = await RequestAsync(tag =>
+        {
+            string header = ttlSeconds == 0
+                ? $"S {key.Length} {value.Length}{TagField(tag)}\n"
+                : $"S {key.Length} {value.Length} {ttlSeconds}{TagField(tag)}\n";
+            return Frame(header, key, value);
+        }).ConfigureAwait(false);
         if (marker == (byte)'W') throw new WrongNodeException();
         if (marker != (byte)'S') throw Mismatch(marker);
     }
 
     internal async Task<bool> DeleteAsync(byte[] key)
     {
-        var (marker, _) = await RequestAsync(Frame($"D {key.Length}\n", key, null)).ConfigureAwait(false);
+        var (marker, _) = await RequestAsync(tag => Frame($"D {key.Length}{TagField(tag)}\n", key, null))
+            .ConfigureAwait(false);
         return marker switch
         {
             (byte)'D' => true,
@@ -120,6 +152,11 @@ internal sealed class Connection
         return frame;
     }
 
+    /// <summary>ADR-0019: on a tagged connection every request header's
+    /// last field is the client's tag; an untagged connection's wire bytes
+    /// are unchanged from before this field existed.</summary>
+    private static string TagField(uint? tag) => tag is null ? "" : $" {tag}";
+
     /// <summary>
     /// A well-formed response of the wrong kind (a <c>S</c> answering a G)
     /// means the request/response streams are misaligned — every later
@@ -130,6 +167,9 @@ internal sealed class Connection
     /// misaligned data by the time this runs — an inherent limitation of
     /// matching-by-order pipelining shared with the TypeScript SDK's
     /// Connection (doc/adr/0016-*.md), not something this SDK introduces.
+    /// This is the second line of defense: on a tagged connection, the
+    /// read loop's own tag check (ADR-0019) normally catches a desync like
+    /// this before any response is ever handed to a caller.
     /// </summary>
     private ConnectionLostException Mismatch(byte marker)
     {
@@ -138,9 +178,9 @@ internal sealed class Connection
             $"nanocached: response '{(char)marker}' does not match the request (connection desynced)");
     }
 
-    /// <summary>Enqueues a pending slot and writes <paramref name="frame"/>
-    /// under one semaphore — see the class doc comment — then awaits its
-    /// own <see cref="TaskCompletionSource{TResult}"/>, not the stream.
+    /// <summary>Enqueues a pending slot and writes the built frame under
+    /// one semaphore — see the class doc comment — then awaits its own
+    /// <see cref="TaskCompletionSource{TResult}"/>, not the stream.
     /// Nothing here needs to guard against the caller abandoning this
     /// await (e.g. racing it with a timeout): unlike some other SDKs'
     /// ports of this design, this method never receives a
@@ -150,7 +190,13 @@ internal sealed class Connection
     /// afterward — and completing an abandoned
     /// <see cref="TaskCompletionSource{TResult}"/> that nothing is
     /// awaiting anymore is harmless.</summary>
-    private async Task<(byte Marker, byte[]? Value)> RequestAsync(byte[] frame)
+    /// <param name="buildFrame">Builds the wire frame from this request's
+    /// claimed tag (<c>null</c> on an untagged connection). Called inside
+    /// the write-gate critical section, after the tag is claimed but
+    /// before anything is enqueued — an encoder that rejects its input
+    /// must fail with nothing queued, or the next response would resolve
+    /// an orphaned waiter and desync the stream (ADR-0019).</param>
+    private async Task<(byte Marker, byte[]? Value)> RequestAsync(Func<uint?, byte[]> buildFrame)
     {
         if (IsClosed)
         {
@@ -168,7 +214,13 @@ internal sealed class Connection
                 throw new ConnectionLostException("nanocached: connection is closed");
             }
             _sinceLastUse.Restart();
-            _pending.Enqueue(tcs);
+            // ADR-0019: the tag is claimed in the same critical section
+            // that enqueues the waiter and writes the frame (ADR-0016's
+            // enqueue+write atomicity), so tag order can never skew from
+            // queue/wire order.
+            uint? tag = _tagged ? ClaimTag() : null;
+            byte[] frame = buildFrame(tag);
+            _pending.Enqueue((tcs, tag));
             await _stream.WriteAsync(frame).ConfigureAwait(false);
             await _stream.FlushAsync().ConfigureAwait(false);
         }
@@ -187,6 +239,16 @@ internal sealed class Connection
         return await tcs.Task.ConfigureAwait(false);
     }
 
+    /// <summary>Only ever called from inside the <c>_writeGate</c>
+    /// critical section, so no interlocking is needed despite concurrent
+    /// callers of <see cref="RequestAsync"/>.</summary>
+    private uint ClaimTag()
+    {
+        uint tag = _nextTag;
+        unchecked { _nextTag++; } // wraps at u32, matching the wire's width
+        return tag;
+    }
+
     /// <summary>This connection's only reader, for its whole lifetime —
     /// nothing else may read from <see cref="_stream"/>. Consumes
     /// responses off the wire and dispatches each to the oldest pending
@@ -195,7 +257,7 @@ internal sealed class Connection
     {
         while (true)
         {
-            (byte Marker, byte[]? Value) response;
+            (byte Marker, byte[]? Value, uint? Tag) response;
             try
             {
                 response = await ReadResponseAsync().ConfigureAwait(false);
@@ -212,63 +274,118 @@ internal sealed class Connection
                 // their responses were never received at all.
                 if (_pending.TryDequeue(out var failed))
                 {
-                    failed.TrySetException(error);
+                    failed.Tcs.TrySetException(error);
                 }
                 Close();
                 return;
             }
 
             bool wasEmpty = _pending.IsEmpty;
-            _pending.TryDequeue(out var tcs);
+            _pending.TryDequeue(out var pending);
 
             // An unsolicited "busy" response means the server hit its
             // connection limit right after accept and is about to close
             // the connection; it isn't an answer to anything we sent
-            // (mirrors the TypeScript SDK's Connection.onData).
+            // (mirrors the TypeScript SDK's Connection.onData). Busy is
+            // always untagged (ADR-0019) — it is never a reply to a
+            // specific request.
             if (response.Marker == (byte)'B' && wasEmpty)
             {
                 Close();
                 return;
             }
-            if (tcs is null)
+
+            if (pending.Tcs is null)
             {
                 // Unsolicited and not the known busy case — desync.
                 Close();
                 return;
             }
-            tcs.TrySetResult(response);
+
+            // ADR-0019: on a tagged connection, verify the echoed tag
+            // against the request this response is about to answer —
+            // *before* it can reach any caller. A mismatch means the
+            // streams are misaligned; unlike the caller-side kind check
+            // (Mismatch()), catching it here stops the misdelivery
+            // instead of merely noticing it later.
+            if (_tagged && response.Tag != pending.Tag)
+            {
+                var error = new ConnectionLostException(
+                    $"nanocached: response tag {response.Tag} does not answer request tag {pending.Tag} "
+                    + "(connection desynced)");
+                // pending has already been dequeued, so CloseWithReason's
+                // own drain won't reach it — poison the rest of the
+                // queue with the same desynced reason, then reject this
+                // one directly.
+                CloseWithReason(error);
+                pending.Tcs.TrySetException(error);
+                return;
+            }
+
+            pending.Tcs.TrySetResult((response.Marker, response.Value));
         }
     }
 
-    private async Task<(byte Marker, byte[]? Value)> ReadResponseAsync()
+    private async Task<(byte Marker, byte[]? Value, uint? Tag)> ReadResponseAsync()
     {
         byte marker = await ReadByteAsync().ConfigureAwait(false);
         switch (marker)
         {
             case (byte)'V':
             {
+                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019).
+                string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
+                if (fields.Length != (_tagged ? 2 : 1))
+                {
+                    throw new ConnectionLostException("nanocached: invalid value header in response");
+                }
+
                 // A non-numeric, negative, or absurd length (the server
                 // caps requests at 1 MiB) is protocol garbage: the
                 // connection is desynced mid-frame and must be poisoned,
                 // and the error must be connection-classified so the
                 // redial/retry layer handles it (issue #8).
-                if (!int.TryParse(await ReadLineAsync().ConfigureAwait(false), out int length)
-                    || length < 0
-                    || length > MaxValueLength)
+                if (!int.TryParse(fields[0], out int length) || length < 0 || length > MaxValueLength)
                 {
                     throw new ConnectionLostException("nanocached: invalid value length in response");
                 }
+                uint? tag = _tagged ? ParseTag(fields[1]) : null;
+
                 var value = new byte[length];
                 await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
-                return (marker, value);
+                return (marker, value, tag);
             }
             case (byte)'S':
             case (byte)'D':
             case (byte)'N':
             case (byte)'W':
+            {
+                if (!_tagged)
+                {
+                    await ReadByteAsync().ConfigureAwait(false); // the trailing '\n'
+                    return (marker, null, null);
+                }
+
+                // Tagged: `<marker> <tag>\n` — a byte other than the
+                // space separator here means the server answered with the
+                // untagged 2-byte form on a connection it agreed to tag,
+                // i.e. the response is missing its tag entirely: the
+                // streams are desynced exactly as much as an echoed wrong
+                // tag would mean.
+                byte next = await ReadByteAsync().ConfigureAwait(false);
+                if (next != (byte)' ')
+                {
+                    throw new ConnectionLostException(
+                        "nanocached: response is missing its tag (connection desynced)");
+                }
+                uint tag = ParseTag(await ReadLineAsync().ConfigureAwait(false));
+                return (marker, null, tag);
+            }
             case (byte)'B':
+                // Busy is unsolicited and always bare (ADR-0019) — never
+                // tagged, even on a tagged connection.
                 await ReadByteAsync().ConfigureAwait(false); // the trailing '\n'
-                return (marker, null);
+                return (marker, null, null);
             default:
                 // A garbage marker means the stream is desynced; poison
                 // and classify as connection-level (issue #8) so the
@@ -276,6 +393,15 @@ internal sealed class Connection
                 throw new ConnectionLostException(
                     $"nanocached: unexpected response from server: {(char)marker}");
         }
+    }
+
+    private static uint ParseTag(string field)
+    {
+        if (!uint.TryParse(field, out uint tag))
+        {
+            throw new ConnectionLostException("nanocached: invalid response tag");
+        }
+        return tag;
     }
 
     private async Task<byte> ReadByteAsync()

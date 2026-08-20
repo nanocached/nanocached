@@ -12,6 +12,9 @@ import {
 interface Waiter {
   resolve: (response: ParsedResponse) => void;
   reject: (error: Error) => void;
+  /** ADR-0019: the tag this request was sent with, which its response
+   * must echo — `undefined` on untagged connections. */
+  tag?: number;
 }
 
 function toBytes(value: string | Uint8Array): Buffer {
@@ -62,6 +65,11 @@ export function isConnectionError(error: unknown): boolean {
  */
 export class Connection {
   private readonly socket: Socket | TLSSocket;
+  /** ADR-0019: negotiated during identify — when true, every request
+   * carries a tag the server echoes, and `onData` verifies the echo
+   * against the oldest waiter before resolving it. */
+  private readonly tagged: boolean;
+  private nextTag = 0;
   // Chunks are accumulated in an array and only concatenated when a parse
   // is attempted, instead of concatenating on every onData call — avoids
   // an O(n^2) cost re-copying the whole buffer for each fragment of a
@@ -73,15 +81,16 @@ export class Connection {
   private lastError: Error | null = null;
   private lastUsed = Date.now();
 
-  constructor(socket: Socket | TLSSocket) {
+  constructor(socket: Socket | TLSSocket, tagged = false) {
     this.socket = socket;
+    this.tagged = tagged;
     this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
     this.socket.on("error", (error: Error) => this.onError(error));
     this.socket.on("close", () => this.onClose());
   }
 
   async get(key: string | Uint8Array): Promise<Buffer | null> {
-    const response = await this.send(encodeGet(toBytes(key)));
+    const response = await this.send((tag) => encodeGet(toBytes(key), tag));
     if (response.kind === "value") return response.value ?? Buffer.alloc(0);
     if (response.kind === "notFound") return null;
     if (response.kind === "wrongNode") throw new WrongNodeError();
@@ -89,14 +98,14 @@ export class Connection {
   }
 
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
-    const response = await this.send(encodeSet(toBytes(key), toBytes(value), ttlSeconds));
+    const response = await this.send((tag) => encodeSet(toBytes(key), toBytes(value), ttlSeconds, tag));
     if (response.kind === "wrongNode") throw new WrongNodeError();
     if (response.kind !== "stored") throw this.mismatch(response);
   }
 
   /** Returns whether the key existed before this call. */
   async delete(key: string | Uint8Array): Promise<boolean> {
-    const response = await this.send(encodeDelete(toBytes(key)));
+    const response = await this.send((tag) => encodeDelete(toBytes(key), tag));
     if (response.kind === "deleted") return true;
     if (response.kind === "notFound") return false;
     if (response.kind === "wrongNode") throw new WrongNodeError();
@@ -140,14 +149,22 @@ export class Connection {
     return Date.now() - this.lastUsed;
   }
 
-  private send(frame: Buffer): Promise<ParsedResponse> {
+  private send(build: (tag: number | undefined) => Buffer): Promise<ParsedResponse> {
     if (this.closed) {
       return Promise.reject(this.lastError ?? new ConnectionLostError("nanocached: connection is closed"));
     }
     this.lastUsed = Date.now();
 
     return new Promise((resolve, reject) => {
-      const waiter: Waiter = { resolve, reject };
+      // The tag is claimed in the same synchronous span that enqueues the
+      // waiter and writes the frame (ADR-0016's enqueue+write atomicity),
+      // so tag order can never skew from queue/wire order (ADR-0019).
+      const tag = this.tagged ? this.claimTag() : undefined;
+      // Build before enqueueing: an encoder that rejects its input (e.g.
+      // encodeSet's TTL check) must fail with nothing queued, or the next
+      // response would resolve an orphaned waiter and desync the stream.
+      const frame = build(tag);
+      const waiter: Waiter = { resolve, reject, tag };
       this.pending.push(waiter);
 
       this.socket.write(frame, (error) => {
@@ -160,6 +177,12 @@ export class Connection {
     });
   }
 
+  private claimTag(): number {
+    const tag = this.nextTag;
+    this.nextTag = (this.nextTag + 1) >>> 0; // wrap at u32, matching the wire's width
+    return tag;
+  }
+
   private onData(chunk: Buffer): void {
     this.chunks.push(chunk);
     this.chunksLength += chunk.length;
@@ -169,7 +192,7 @@ export class Connection {
 
       let parsed;
       try {
-        parsed = tryParseResponse(buffer);
+        parsed = tryParseResponse(buffer, this.tagged);
       } catch (error) {
         this.lastError = error as Error;
         this.socket.destroy();
@@ -208,7 +231,27 @@ export class Connection {
       }
 
       const waiter = this.pending.shift();
-      waiter?.resolve(parsed.response);
+      if (waiter === undefined) continue;
+
+      // ADR-0019: on a tagged connection, verify the echoed tag against
+      // the request this response is about to answer — *before* it can
+      // reach any caller. A mismatch means the streams are misaligned;
+      // unlike the caller-side kind check (`mismatch()`), catching it
+      // here stops the misdelivery instead of merely noticing it later.
+      if (this.tagged && parsed.response.tag !== waiter.tag) {
+        const error = new ConnectionLostError(
+          `nanocached: response tag ${parsed.response.tag} does not answer request tag ${waiter.tag} (connection desynced)`,
+        );
+        this.closed = true;
+        this.lastError = error;
+        this.socket.destroy();
+        // The shifted waiter is no longer in `pending`, so onClose won't
+        // reach it — reject it here; the rest drain on the close event.
+        waiter.reject(error);
+        return;
+      }
+
+      waiter.resolve(parsed.response);
     }
   }
 

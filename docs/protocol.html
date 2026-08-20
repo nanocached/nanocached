@@ -51,7 +51,10 @@ until a matching <code>A</code> has been sent.</p>
 <code>On</code>/<code>Od</code> (node/discovery) instead of a bare
 <code>O</code> — that one extra byte is how a client discovers what kind
 of server it reached and adapts, with no configuration. Plain
-<code>A</code> as documented here always works.</div>
+<code>A</code> as documented here always works. SDKs additionally append
+a <code>T</code> field (<code>A &lt;secret-length&gt; T\n</code>) to
+request <a href="#tags">response tags</a>; a server that supports them
+echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>
 
 <h2 id="g">G — get</h2>
 <pre><code>G &lt;key-length&gt;\n&lt;key&gt;</code></pre>
@@ -70,6 +73,28 @@ expires <code>&lt;ttl-seconds&gt;</code> after the write.</p>
 <pre><code>D &lt;key-length&gt;\n&lt;key&gt;</code></pre>
 <p>Responds <code>D\n</code> if the key existed, <code>N\n</code>
 otherwise.</p>
+
+<h2 id="tags">Response tags (tagged mode)</h2>
+<p>Pipelined clients match responses to requests by order alone — the
+frames above carry nothing to verify against. A connection whose
+<code>A</code> carried the <code>T</code> flag and was answered
+<code>OnT</code> runs in <em>tagged mode</em>: every
+<code>G</code>/<code>S</code>/<code>D</code> header must end with a
+client-chosen tag (a u32 in decimal), and the response echoes it as its
+own last field, so a client can verify the pairing before trusting the
+answer.</p>
+<pre><code>G &lt;key-length&gt; &lt;tag&gt;\n&lt;key&gt;
+S &lt;key-length&gt; &lt;value-length&gt; &lt;tag&gt;\n&lt;key&gt;&lt;value&gt;
+S &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt; &lt;tag&gt;\n&lt;key&gt;&lt;value&gt;
+D &lt;key-length&gt; &lt;tag&gt;\n&lt;key&gt;</code></pre>
+<p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
+<code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
+<code>N &lt;tag&gt;\n</code>, and <code>W &lt;tag&gt;\n</code>;
+<code>B\n</code> stays bare (it is unsolicited, sent before
+authentication). Tagged mode is per connection and entirely opt-in — a
+plain <code>A</code> keeps every frame exactly as documented above. See
+<a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0019-echoed-response-tags-close-the-pipeline-desync-window.md">ADR-0019</a>
+for the design.</p>
 
 <h2 id="status">Other statuses you may see</h2>
 <div class="table-wrap">

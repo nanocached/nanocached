@@ -408,7 +408,7 @@ public class NanocachedClientTests
         await raw.ConnectAsync("127.0.0.1", node.Port);
 
         int closedCount = 0;
-        var connection = new Connection(raw.GetStream(), () => Interlocked.Increment(ref closedCount));
+        var connection = new Connection(raw.GetStream(), onClosed: () => Interlocked.Increment(ref closedCount));
 
         await Task.WhenAll(Enumerable.Range(0, 50).Select(_ => Task.Run(connection.Close)));
 
@@ -1062,5 +1062,89 @@ public class NanocachedClientTests
 
         using NanocachedClient reader = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
         await Assert.ThrowsAsync<DecompressionException>(() => reader.GetBytesAsync("k"));
+    }
+
+    // ── response tags (doc/adr/0019-*.md) ───────────────────────────
+
+    [Fact]
+    public async Task PipelinesConcurrentRequestsOnATaggedConnection()
+    {
+        // Same shape as PipelinesConcurrentRequestsOnOneConnection, but
+        // against a tag-supporting node — proves tagged requests/responses
+        // round-trip correctly under concurrency, not just the untagged
+        // wire format.
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        const int n = 20;
+        await Task.WhenAll(Enumerable.Range(0, n).Select(i => client.SetAsync($"key-{i}", $"value-{i}")));
+
+        string?[] values = await Task.WhenAll(Enumerable.Range(0, n).Select(i => client.GetAsync($"key-{i}")));
+        for (int i = 0; i < n; i++)
+        {
+            Assert.Equal($"value-{i}", values[i]);
+        }
+
+        Assert.True(await client.DeleteAsync("key-0"));
+        Assert.False(await client.DeleteAsync("key-0"));
+    }
+
+    [Fact]
+    public async Task AWrongTagResponsePoisonsTheConnectionAndRetriesTransparently()
+    {
+        // A response echoing a tag other than the oldest pending request's
+        // own tag means the streams are misaligned. The read loop must
+        // catch this before handing the response to any caller, poison
+        // the connection, and — like every other connection-classified
+        // failure (see AMismatchedResponseKindPoisonsTheConnection) — the
+        // built-in redial-and-retry-once heals it.
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        node.AnswerWrongTagOnce();
+        Assert.Null(await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task ASwallowedResponseDesyncIsCaughtBeforeAnyCallerSeesWrongData()
+    {
+        // The exact misdelivery ADR-0016 left open: the server (as a
+        // stand-in for any off-by-one stream corruption) never answers the
+        // first GET, so the second GET's response arrives at the first
+        // GET's pending slot. Without the ADR-0019 tag check, the first
+        // caller would receive the second's value as a plausible,
+        // exception-free wrong answer — the classic desync. The tag check
+        // must catch this before either caller sees anything wrong, and
+        // this SDK's built-in redial-and-retry-once then transparently
+        // heals both calls with their own correct results.
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+
+        node.SwallowGetOnce();
+        Task<string?> first = client.GetAsync("a");
+        Task<string?> second = client.GetAsync("k");
+
+        Assert.Null(await first);
+        Assert.Equal("v", await second);
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task FallsBackToTheUntaggedProtocolAgainstAPre0019Server()
+    {
+        // An old server treats `A ... T` as a parse error and closes
+        // without replying; the client must redial once with the plain
+        // form and run untagged — transparently, with the same results.
+        using var node = new MockNode(closeOnExtendedAuth: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+        // Two dials: the extended attempt the server slammed shut, then
+        // the plain fallback that stuck.
+        Assert.Equal(2, node.ConnectionCount);
     }
 }

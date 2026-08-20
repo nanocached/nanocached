@@ -41,6 +41,21 @@ struct NodeState {
     /// well-formed) but never answered — a half-open server, for the
     /// request-timeout regression test.
     silent: std::sync::atomic::AtomicBool,
+    /// ADR-0019: acknowledge an extended `A ... T` with `OnT\n` and echo
+    /// tags on that connection's G/S/D replies. Off by default so the
+    /// bulk of the suite keeps exercising the legacy untagged path
+    /// (mirrors the TypeScript SDK mock's `supportTags`).
+    support_tags: bool,
+    /// ADR-0019: behave like a pre-0019 server — an extended `A ... T` is
+    /// a parse error, so close the connection without replying.
+    close_on_extended_auth: bool,
+    /// Swallow the next `G` entirely (no reply) — the off-by-one stream
+    /// desync where every later response answers the previous request.
+    swallow_get_replies: AtomicUsize,
+    /// Answer the next `G` on a tagged connection with the wrong echoed
+    /// tag (the request's tag + 1) — the desync a pre-ADR-0019 stream
+    /// misalignment would produce.
+    wrong_tag_replies: AtomicUsize,
 }
 
 struct MockNode {
@@ -99,19 +114,43 @@ impl MockNode {
 
 async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
     let mut stream = BufReader::new(socket);
+    // ADR-0019: set once this connection's extended `A ... T` was
+    // acknowledged (`support_tags` and the caller asked for `T`) — its
+    // G/S/D traffic then carries a trailing tag every reply must echo.
+    let mut tagged = false;
     loop {
         let Ok(header) = read_line(&mut stream).await else {
             return;
         };
         let parts: Vec<&str> = header.split(' ').collect();
+        // On a tagged connection every request's last header field is its
+        // tag, echoed back as each reply's own last field.
+        let tag_suffix = if tagged {
+            format!(" {}", parts[parts.len() - 1])
+        } else {
+            String::new()
+        };
         match parts[0] {
             "A" => {
+                if parts.len() > 2 && state.close_on_extended_auth {
+                    return;
+                }
+
                 let secret = read_exact(&mut stream, parts[1].parse().unwrap()).await;
                 let accepted = match &state.required_secret {
                     None => !secret.is_empty(),
                     Some(required) => secret == *required,
                 };
-                let reply: &[u8] = if accepted { b"On\n" } else { b"En\n" };
+                tagged = accepted && state.support_tags && parts.get(2) == Some(&"T");
+                let reply: &[u8] = if accepted {
+                    if tagged {
+                        b"OnT\n"
+                    } else {
+                        b"On\n"
+                    }
+                } else {
+                    b"En\n"
+                };
                 if stream.get_mut().write_all(reply).await.is_err() || !accepted {
                     return;
                 }
@@ -126,8 +165,26 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
+                if take_one(&state.swallow_get_replies) {
+                    // The off-by-one stream desync: this request's reply
+                    // simply never comes, so the next response arrives at
+                    // this request's pending slot instead.
+                    continue;
+                }
+                if tagged && take_one(&state.wrong_tag_replies) {
+                    // ADR-0019: echo the wrong tag (request tag + 1) — the
+                    // desync a pre-ADR-0019 stream misalignment would
+                    // otherwise produce silently.
+                    let requested_tag: u64 = parts[2].parse().unwrap();
+                    let reply = format!("N {}\n", requested_tag + 1);
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if take_one(&state.stored_to_get_replies) {
-                    if stream.get_mut().write_all(b"S\n").await.is_err() {
+                    let reply = format!("S{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                         return;
                     }
                     continue;
@@ -139,15 +196,15 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     continue;
                 }
                 let reply = if take_wrong_node(&state) {
-                    b"W\n".to_vec()
+                    format!("W{tag_suffix}\n").into_bytes()
                 } else {
                     match state.store.lock().unwrap().get(&key) {
                         Some(value) => {
-                            let mut frame = format!("V {}\n", value.len()).into_bytes();
+                            let mut frame = format!("V {}{tag_suffix}\n", value.len()).into_bytes();
                             frame.extend_from_slice(value);
                             frame
                         }
-                        None => b"N\n".to_vec(),
+                        None => format!("N{tag_suffix}\n").into_bytes(),
                     }
                 };
                 if stream.get_mut().write_all(&reply).await.is_err() {
@@ -165,14 +222,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
                 *state.last_set_header.lock().unwrap() = Some(header.clone());
-                let reply: &[u8] =
-                    if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
-                        b"W\n"
-                    } else {
-                        state.store.lock().unwrap().insert(key, value);
-                        b"S\n"
-                    };
-                if stream.get_mut().write_all(reply).await.is_err() {
+                let reply = if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
+                    format!("W{tag_suffix}\n")
+                } else {
+                    state.store.lock().unwrap().insert(key, value);
+                    format!("S{tag_suffix}\n")
+                };
+                if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                     return;
                 }
             }
@@ -181,14 +237,14 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
-                let reply: &[u8] = if take_wrong_node(&state) {
-                    b"W\n"
+                let reply = if take_wrong_node(&state) {
+                    format!("W{tag_suffix}\n")
                 } else if state.store.lock().unwrap().remove(&key).is_some() {
-                    b"D\n"
+                    format!("D{tag_suffix}\n")
                 } else {
-                    b"N\n"
+                    format!("N{tag_suffix}\n")
                 };
-                if stream.get_mut().write_all(reply).await.is_err() {
+                if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                     return;
                 }
             }
@@ -1558,4 +1614,136 @@ async fn refresh_against_an_unreachable_discovery_seed_counts_a_refresh_failure_
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+// ── ADR-0019: response tags (doc/adr/0019-*.md) ─────────────────────
+
+#[tokio::test]
+async fn tags_round_trip_pipelined_requests_on_a_tagged_connection() {
+    // Same shape as pipelines_concurrent_requests_on_one_connection, but
+    // against a server that negotiated ADR-0019 tags on this connection
+    // — proves tagged responses are matched to the right caller in send
+    // order exactly like the untagged path.
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let mut sets = Vec::new();
+    for i in 0..20u64 {
+        let client = client.clone();
+        sets.push(tokio::spawn(async move {
+            client
+                .set(format!("key-{i}"), format!("value-{i}"), i)
+                .await
+        }));
+    }
+    for task in sets {
+        task.await.unwrap().unwrap();
+    }
+
+    let mut gets = Vec::new();
+    for i in 0..20 {
+        let client = client.clone();
+        gets.push(tokio::spawn(
+            async move { client.get(format!("key-{i}")).await },
+        ));
+    }
+    for (i, task) in gets.into_iter().enumerate() {
+        assert_eq!(task.await.unwrap().unwrap(), Some(format!("value-{i}")));
+    }
+
+    assert!(client.delete("key-0").await.unwrap());
+    assert!(!client.delete("key-0").await.unwrap());
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn tags_catch_an_off_by_one_desync_before_any_caller_sees_wrong_data() {
+    // The exact misdelivery ADR-0016 left open: the server (standing in
+    // for any off-by-one stream corruption) never answers the first GET,
+    // so the second GET's response arrives at the first GET's pending
+    // slot. Without tags the first caller could receive the second's
+    // value as a plausible, exception-free wrong answer; the tag check
+    // must poison the connection before either caller sees anything, and
+    // the client's single transparent redial-and-retry (unlike the
+    // TypeScript SDK, this SDK retries a ConnectionLost even in
+    // single-node mode — see `apply_reconnecting`) then answers both
+    // correctly from a fresh connection.
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+
+    node.state
+        .swallow_get_replies
+        .fetch_add(1, Ordering::SeqCst);
+    let (first, second) = tokio::join!(client.get("a"), client.get("k"));
+
+    // The one misdelivery this test exists to catch — "a" surfacing
+    // "k"'s value — must never happen, whatever else the retry heals.
+    assert_eq!(
+        first.unwrap(),
+        None,
+        "the swallowed GET must not surface \"k\"'s value"
+    );
+    assert_eq!(second.unwrap(), Some("v".to_string()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_response_echoing_the_wrong_tag_poisons_the_connection() {
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    node.state.wrong_tag_replies.fetch_add(1, Ordering::SeqCst);
+
+    // The tag check poisons the connection; the client's single
+    // transparent redial-and-retry heals it — but never by reusing the
+    // desynced stream (ADR-0019), matching
+    // a_mismatched_response_kind_poisons_the_connection's shape above.
+    let value = client.get("k").await.unwrap();
+    assert_eq!(value, Some("v".to_string()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close();
+    node.stop();
+}
+
+#[tokio::test]
+async fn falls_back_to_the_untagged_protocol_against_a_pre_0019_server() {
+    // An old server treats `A ... T` as a parse error and closes without
+    // replying; the client must redial once with the plain form and run
+    // untagged — transparently, with the same results.
+    let node = MockNode::start_with(NodeState {
+        close_on_extended_auth: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    // Two dials: the extended attempt the server slammed shut, then the
+    // plain fallback that stuck.
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close();
+    node.stop();
 }

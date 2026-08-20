@@ -232,10 +232,10 @@ func openTargetCount(key string) int {
 // targetKey until it closes (whichever of the several close() call
 // sites — Close(), refresh reconciliation, dead-connection replacement —
 // eventually fires).
-func (c *Client) trackedConnection(netConn net.Conn) *connection {
+func (c *Client) trackedConnection(netConn net.Conn, tagged bool) *connection {
 	key := c.targetKey
 	trackOpenTarget(key)
-	return newConnection(netConn, func() { untrackOpenTarget(key) })
+	return newConnection(netConn, func() { untrackOpenTarget(key) }, tagged)
 }
 
 // Connect dials the first working address and returns a ready client.
@@ -305,7 +305,7 @@ func Connect(config Config) (*Client, error) {
 						"at discovery servers for cluster routing and failover.\n",
 					key, len(client.addresses)-1)
 			}
-			client.single = client.trackedConnection(result.conn)
+			client.single = client.trackedConnection(result.conn, result.tagged)
 			client.singleAddress = key
 			client.startKeepalive(keepAliveInterval)
 			return client, nil
@@ -817,7 +817,7 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 		_ = result.conn.Close()
 		return nil, ErrClosed
 	}
-	return c.trackedConnection(result.conn), nil
+	return c.trackedConnection(result.conn, result.tagged), nil
 }
 
 // ── ノードリスト更新 ──────────────────────────────────────────────

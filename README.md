@@ -242,6 +242,11 @@ secret is sent. If it does, every other command on that connection is
 rejected with `E\n` (and the connection closed) until a matching `A` has
 been sent — `A` itself is always accepted before authentication.
 
+SDKs additionally append a `T` field (`A <secret-length> T\n<secret>`) to
+request response tags; a server that supports them echoes the capability
+in its reply (`OnT\n`/`OdT\n`) and the connection runs in tagged mode —
+see "Response tags" below.
+
 ### G (get)
 
 ```text
@@ -297,6 +302,29 @@ or:
 ```text
 N\n
 ```
+
+### Response tags (tagged mode)
+
+Pipelined clients match responses to requests by order alone — the frames
+above carry nothing to verify against. A connection whose `A` carried the
+`T` flag and was answered `OnT\n` runs in tagged mode: every `G`/`S`/`D`
+header must end with a client-chosen tag (a u32 in decimal), and the
+response echoes it as its own last field, so a client can verify the
+pairing before trusting the answer
+([ADR-0019](doc/adr/0019-echoed-response-tags-close-the-pipeline-desync-window.md)).
+
+```text
+G <key-length> <tag>\n<key>
+S <key-length> <value-length> <tag>\n<key><value>
+S <key-length> <value-length> <ttl-seconds> <tag>\n<key><value>
+D <key-length> <tag>\n<key>
+```
+
+Responses become `V <value-length> <tag>\n<value>`, `S <tag>\n`,
+`D <tag>\n`, `N <tag>\n`, and `W <tag>\n`; `B\n` stays bare (it is
+unsolicited, sent before authentication). Tagged mode is per connection
+and entirely opt-in — a plain `A` keeps every frame exactly as documented
+above.
 
 When the connection limit has been reached, the server responds with:
 

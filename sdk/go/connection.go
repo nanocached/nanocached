@@ -42,11 +42,24 @@ type roundTripResult struct {
 	err    error
 }
 
+// pendingRequest is one still-outstanding request: the channel its result
+// is delivered on, paired with the tag (doc/adr/0019-*.md) its response
+// must echo. tag is meaningless when the connection is untagged.
+type pendingRequest struct {
+	ch  chan roundTripResult
+	tag uint32
+}
+
 type connection struct {
-	mu       sync.Mutex
-	conn     net.Conn // nil only for the pre-poisoned placeholder
-	reader   *bufio.Reader
-	pending  []chan roundTripResult
+	mu     sync.Mutex
+	conn   net.Conn // nil only for the pre-poisoned placeholder
+	reader *bufio.Reader
+	// tagged (doc/adr/0019-*.md): negotiated during identify — when true,
+	// every request carries a tag the server echoes, and readLoop verifies
+	// the echo against the oldest pending request before dispatching it.
+	tagged   bool
+	nextTag  uint32
+	pending  []pendingRequest
 	closed   bool
 	lastErr  error
 	lastUsed time.Time
@@ -60,15 +73,27 @@ type connection struct {
 // onClose is taken here, not assigned afterward, so it's fully set
 // before the read loop goroutine — started before newConnection even
 // returns — can possibly read it in poison().
-func newConnection(conn net.Conn, onClose func()) *connection {
+func newConnection(conn net.Conn, onClose func(), tagged bool) *connection {
 	c := &connection{
 		conn:     conn,
 		reader:   bufio.NewReader(conn),
+		tagged:   tagged,
 		lastUsed: time.Now(),
 		onClose:  onClose,
 	}
 	go c.readLoop()
 	return c
+}
+
+// tagField renders a request's doc/adr/0019-*.md tag as its trailing
+// header field on a tagged connection, or nothing on an untagged one —
+// matching protocol.ts's tagField exactly. Untagged mode is byte-for-byte
+// identical to the pre-0019 wire format.
+func tagField(tagged bool, tag uint32) string {
+	if !tagged {
+		return ""
+	}
+	return fmt.Sprintf(" %d", tag)
 }
 
 // deadConnection is a pre-poisoned placeholder for a newly discovered
@@ -95,8 +120,9 @@ func (c *connection) idle() time.Duration {
 }
 
 func (c *connection) get(key []byte) ([]byte, bool, error) {
-	frame := append([]byte(fmt.Sprintf("G %d\n", len(key))), key...)
-	marker, value, err := c.request(frame)
+	marker, value, err := c.request(func(tag uint32) []byte {
+		return append([]byte(fmt.Sprintf("G %d%s\n", len(key), tagField(c.tagged, tag))), key...)
+	})
 	if err != nil {
 		return nil, false, err
 	}
@@ -113,14 +139,15 @@ func (c *connection) get(key []byte) ([]byte, bool, error) {
 }
 
 func (c *connection) set(key, value []byte, ttlSeconds int64) error {
-	var header string
-	if ttlSeconds < 0 {
-		header = fmt.Sprintf("S %d %d\n", len(key), len(value))
-	} else {
-		header = fmt.Sprintf("S %d %d %d\n", len(key), len(value), ttlSeconds)
-	}
-	frame := append(append([]byte(header), key...), value...)
-	marker, _, err := c.request(frame)
+	marker, _, err := c.request(func(tag uint32) []byte {
+		var header string
+		if ttlSeconds < 0 {
+			header = fmt.Sprintf("S %d %d%s\n", len(key), len(value), tagField(c.tagged, tag))
+		} else {
+			header = fmt.Sprintf("S %d %d %d%s\n", len(key), len(value), ttlSeconds, tagField(c.tagged, tag))
+		}
+		return append(append([]byte(header), key...), value...)
+	})
 	if err != nil {
 		return err
 	}
@@ -135,8 +162,9 @@ func (c *connection) set(key, value []byte, ttlSeconds int64) error {
 }
 
 func (c *connection) delete(key []byte) (bool, error) {
-	frame := append([]byte(fmt.Sprintf("D %d\n", len(key))), key...)
-	marker, _, err := c.request(frame)
+	marker, _, err := c.request(func(tag uint32) []byte {
+		return append([]byte(fmt.Sprintf("D %d%s\n", len(key), tagField(c.tagged, tag))), key...)
+	})
 	if err != nil {
 		return false, err
 	}
@@ -190,20 +218,24 @@ func (c *connection) poison(err error) {
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
-	for _, ch := range pending {
-		ch <- roundTripResult{err: err}
+	for _, req := range pending {
+		req.ch <- roundTripResult{err: err}
 	}
 	if onClose != nil {
 		onClose()
 	}
 }
 
-// request sends frame and waits for its matched response. Pushing onto
-// the pending queue and writing the frame happen under the same lock, so
-// concurrent callers' queue order always matches the order their frames
-// actually hit the wire — required for the read loop's FIFO dispatch to
-// stay correct.
-func (c *connection) request(frame []byte) (byte, []byte, error) {
+// request builds a frame via build and waits for its matched response.
+// build receives this request's doc/adr/0019-*.md tag (claimed here,
+// meaningless when the connection is untagged) so it can render the
+// frame's trailing tag field. Claiming the tag, pushing onto the pending
+// queue, and writing the frame all happen under the same lock, so
+// concurrent callers' tag order and queue order always match the order
+// their frames actually hit the wire — required for the read loop's FIFO
+// dispatch, and the tag echo it verifies before dispatching, to stay
+// correct.
+func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, error) {
 	resultCh := make(chan roundTripResult, 1)
 
 	c.mu.Lock()
@@ -216,7 +248,10 @@ func (c *connection) request(frame []byte) (byte, []byte, error) {
 		return 0, nil, err
 	}
 	c.lastUsed = time.Now()
-	c.pending = append(c.pending, resultCh)
+	tag := c.nextTag
+	c.nextTag++ // wraps at the uint32's own width, matching the wire
+	frame := build(tag)
+	c.pending = append(c.pending, pendingRequest{ch: resultCh, tag: tag})
 	// requestTimeout bounds this request while it's outstanding; reset
 	// on every new request so the deadline always reflects the newest
 	// thing waiting on an answer. readLoop clears it once nothing is
@@ -244,7 +279,7 @@ func (c *connection) request(frame []byte) (byte, []byte, error) {
 // may read from conn.
 func (c *connection) readLoop() {
 	for {
-		marker, value, err := c.readOneResponse()
+		marker, value, tag, err := c.readOneResponse()
 		if err != nil {
 			c.poison(connectionLost("connection failed", err))
 			return
@@ -252,9 +287,10 @@ func (c *connection) readLoop() {
 
 		c.mu.Lock()
 		wasEmpty := len(c.pending) == 0
-		var ch chan roundTripResult
-		if !wasEmpty {
-			ch = c.pending[0]
+		var req pendingRequest
+		haveReq := !wasEmpty
+		if haveReq {
+			req = c.pending[0]
 			c.pending = c.pending[1:]
 		}
 		noneOutstanding := len(c.pending) == 0
@@ -268,10 +304,28 @@ func (c *connection) readLoop() {
 			c.poison(fmt.Errorf("nanocached: server rejected the connection (connection limit reached)"))
 			return
 		}
-		if ch == nil {
+		if !haveReq {
 			c.poison(fmt.Errorf("nanocached: unsolicited response %q from server (connection desynced)", marker))
 			return
 		}
+
+		// doc/adr/0019-*.md: on a tagged connection, verify the echoed tag
+		// against the request this response is about to answer — *before*
+		// it can reach any caller. A mismatch means the streams are
+		// misaligned; unlike the caller-side kind check (mismatch()),
+		// catching it here stops the misdelivery instead of merely
+		// noticing it later. Busy is always untagged, so it's exempt.
+		if c.tagged && marker != 'B' && tag != req.tag {
+			err := connectionLost(
+				fmt.Sprintf("response tag %d does not answer request tag %d (connection desynced)", tag, req.tag), nil)
+			// req has already been shifted out of c.pending, so poison()'s
+			// own rejection sweep won't reach it — reject it here; the
+			// rest drain when poison() runs.
+			c.poison(err)
+			req.ch <- roundTripResult{err: err}
+			return
+		}
+
 		if noneOutstanding {
 			// Nothing left waiting on an answer: clear requestTimeout's
 			// deadline so an otherwise-idle connection is never closed
@@ -279,41 +333,97 @@ func (c *connection) readLoop() {
 			// deadline via request() like any other call).
 			_ = c.conn.SetDeadline(time.Time{})
 		}
-		ch <- roundTripResult{marker: marker, value: value}
+		req.ch <- roundTripResult{marker: marker, value: value}
 	}
 }
 
-func (c *connection) readOneResponse() (byte, []byte, error) {
-	marker, err := c.reader.ReadByte()
+// readOneResponse reads one response frame off the wire. tag is only
+// meaningful (and only present on the wire at all — doc/adr/0019-*.md) for
+// non-busy responses on a tagged connection; callers gate on c.tagged the
+// same way readOneResponse itself does.
+func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, err error) {
+	marker, err = c.reader.ReadByte()
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, 0, err
 	}
 	switch marker {
 	case 'V':
 		header, err := c.reader.ReadString('\n')
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, 0, err
 		}
-		// The wire is `V <len>\n`; after the marker byte the header still
-		// carries the leading space. Lengths beyond the server's own 1 MiB
-		// request cap are protocol garbage — reject before allocating.
-		length, err := strconv.Atoi(strings.TrimSpace(header))
+		// Untagged wire: `V <len>\n`. Tagged: `V <len> <seq>\n`
+		// (doc/adr/0019-*.md). After the marker byte the header still
+		// carries the leading space.
+		fields := strings.Fields(header)
+		wantFields := 1
+		if c.tagged {
+			wantFields = 2
+		}
+		if len(fields) != wantFields {
+			return 0, nil, 0, fmt.Errorf("invalid value header in response")
+		}
+		// Lengths beyond the server's own 1 MiB request cap are protocol
+		// garbage — reject before allocating.
+		length, err := strconv.Atoi(fields[0])
 		if err != nil || length < 0 || length > maxValueLength {
-			return 0, nil, fmt.Errorf("invalid value length in response")
+			return 0, nil, 0, fmt.Errorf("invalid value length in response")
+		}
+		var responseTag uint32
+		if c.tagged {
+			responseTag, err = parseTag(fields[1])
+			if err != nil {
+				return 0, nil, 0, err
+			}
 		}
 		value := make([]byte, length)
 		if _, err := readFull(c.reader, value); err != nil {
-			return 0, nil, err
+			return 0, nil, 0, err
 		}
-		return marker, value, nil
-	case 'S', 'D', 'N', 'W', 'B':
+		return marker, value, responseTag, nil
+	case 'B':
+		// Busy is always untagged (doc/adr/0019-*.md) — it's an
+		// unsolicited response sent whether or not this connection
+		// negotiated tags.
 		if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
-			return 0, nil, err
+			return 0, nil, 0, err
 		}
-		return marker, nil, nil
+		return marker, nil, 0, nil
+	case 'S', 'D', 'N', 'W':
+		if !c.tagged {
+			if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
+				return 0, nil, 0, err
+			}
+			return marker, nil, 0, nil
+		}
+		// Tagged wire: `S <seq>\n` etc. (doc/adr/0019-*.md).
+		header, err := c.reader.ReadString('\n')
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		header = strings.TrimSuffix(header, "\n")
+		field, ok := strings.CutPrefix(header, " ")
+		if !ok {
+			return 0, nil, 0, fmt.Errorf("response is missing its tag (connection desynced)")
+		}
+		responseTag, err := parseTag(field)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		return marker, nil, responseTag, nil
 	default:
-		return 0, nil, fmt.Errorf("unexpected response from server: %c", marker)
+		return 0, nil, 0, fmt.Errorf("unexpected response from server: %c", marker)
 	}
+}
+
+// parseTag parses a response's doc/adr/0019-*.md echoed tag — a u32
+// written in decimal — matching protocol.ts's parseTag.
+func parseTag(field string) (uint32, error) {
+	tag, err := strconv.ParseUint(field, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid response tag")
+	}
+	return uint32(tag), nil
 }
 
 func readFull(reader *bufio.Reader, buf []byte) (int, error) {

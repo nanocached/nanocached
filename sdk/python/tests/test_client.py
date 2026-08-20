@@ -1235,5 +1235,89 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
 
+class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
+    # doc/adr/0019-*.md: echoed response tags close the pipeline desync
+    # window ADR-0016 left open. Mirrors the TypeScript SDK's own
+    # "NanocachedClient response tags" suite.
+
+    async def test_negotiates_tags_and_round_trips_pipelined_requests(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await asyncio.gather(*(client.set(f"key-{i}", f"value-{i}") for i in range(20)))
+                values = await asyncio.gather(*(client.get(f"key-{i}") for i in range(20)))
+                for i, value in enumerate(values):
+                    self.assertEqual(value, f"value-{i}")
+
+                self.assertTrue(await client.delete("key-0"))
+                self.assertFalse(await client.delete("key-0"))
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_a_desynced_stream_is_caught_by_the_tag_check_before_any_caller_sees_wrong_data(self):
+        # The exact misdelivery ADR-0016 left open: the server (as a
+        # stand-in for any off-by-one stream corruption) never answers
+        # the first GET, so the second GET's response arrives at the
+        # first GET's pending slot. Without tags the first caller would
+        # receive the second's value as a plausible, exception-free wrong
+        # answer; the tag check must poison the connection before either
+        # caller sees anything.
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+
+                node.swallow_get_once()
+                first = asyncio.ensure_future(client.get("a"))
+                second = asyncio.ensure_future(client.get("k"))
+                with self.assertRaisesRegex(ConnectionError, "desynced"):
+                    await first
+                with self.assertRaisesRegex(ConnectionError, "desynced"):
+                    await second
+
+                # The poisoned connection redials transparently on next use.
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_a_response_echoing_the_wrong_tag_poisons_the_connection(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                node.answer_wrong_tag_once()
+                with self.assertRaisesRegex(ConnectionError, "desynced"):
+                    await client.get("k")
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_falls_back_to_the_untagged_protocol_against_a_pre_0019_server(self):
+        # An old server treats `A ... T` as a parse error and closes
+        # without replying; the client must redial once with the plain
+        # form and run untagged — transparently, with the same results.
+        node = await MockNode(close_on_extended_auth=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                # Two dials: the extended attempt the server slammed shut,
+                # then the plain fallback that stuck.
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+
 if __name__ == "__main__":
     unittest.main()

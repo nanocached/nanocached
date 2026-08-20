@@ -25,21 +25,31 @@ from ._errors import NanocachedError, WrongNodeError
 # malicious frame, never just a legitimately large value.
 _MAX_VALUE_LENGTH = 2 * 1024 * 1024
 
+# A tag is a u32 in decimal (ADR-0019).
+_MAX_TAG = 0xFFFFFFFF
 
-def _encode_get(key: bytes) -> bytes:
-    return b"G %d\n%b" % (len(key), key)
+
+# ADR-0019: on a tagged-mode connection every request header carries the
+# client's tag as its last field, and the server echoes it in the
+# response — `tag is None` is the untagged (pre-0019) form.
+def _tag_field(tag: int | None) -> bytes:
+    return b"" if tag is None else b" %d" % tag
 
 
-def _encode_set(key: bytes, value: bytes, ttl_seconds: int) -> bytes:
+def _encode_get(key: bytes, tag: int | None = None) -> bytes:
+    return b"G %d%b\n%b" % (len(key), _tag_field(tag), key)
+
+
+def _encode_set(key: bytes, value: bytes, ttl_seconds: int, tag: int | None = None) -> bytes:
     # 0 means no expiry — omitted from the wire exactly as the old
     # None/absent TTL was.
     if ttl_seconds == 0:
-        return b"S %d %d\n%b%b" % (len(key), len(value), key, value)
-    return b"S %d %d %d\n%b%b" % (len(key), len(value), ttl_seconds, key, value)
+        return b"S %d %d%b\n%b%b" % (len(key), len(value), _tag_field(tag), key, value)
+    return b"S %d %d %d%b\n%b%b" % (len(key), len(value), ttl_seconds, _tag_field(tag), key, value)
 
 
-def _encode_delete(key: bytes) -> bytes:
-    return b"D %d\n%b" % (len(key), key)
+def _encode_delete(key: bytes, tag: int | None = None) -> bytes:
+    return b"D %d%b\n%b" % (len(key), _tag_field(tag), key)
 
 
 class Connection:
@@ -48,14 +58,23 @@ class Connection:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         on_close: Callable[[], None] | None = None,
+        tagged: bool = False,
     ) -> None:
         self._reader = reader
         self._writer = writer
+        # ADR-0019: negotiated during identify — when true, every request
+        # carries a tag the server echoes, and _read_loop verifies the
+        # echo against the oldest pending slot before resolving it.
+        self._tagged = tagged
+        self._next_tag = 0
         # Serializes "enqueue the pending slot, then write the frame" —
         # not the whole round trip — across concurrent callers, so queue
         # order always matches wire order for the dedicated reader below.
         self._write_lock = asyncio.Lock()
-        self._pending: deque[asyncio.Future[tuple[bytes, bytes | None]]] = deque()
+        # Each slot pairs the future with the tag its request was sent
+        # under (None on an untagged connection) — the expected echo
+        # _read_loop checks the response against before handing it out.
+        self._pending: deque[tuple[int | None, asyncio.Future[tuple[bytes, bytes | None]]]] = deque()
         self._closed = False
         self._last_used = time.monotonic()
         self._on_close = on_close
@@ -74,7 +93,7 @@ class Connection:
         self._poison(ConnectionError("nanocached: connection closed"))
 
     async def get(self, key: bytes) -> bytes | None:
-        marker, value = await self._request(_encode_get(key))
+        marker, value = await self._request(lambda tag: _encode_get(key, tag))
         if marker == b"V":
             return value
         if marker == b"N":
@@ -84,14 +103,14 @@ class Connection:
         raise self._mismatch(marker)
 
     async def set(self, key: bytes, value: bytes, ttl_seconds: int) -> None:
-        marker, _ = await self._request(_encode_set(key, value, ttl_seconds))
+        marker, _ = await self._request(lambda tag: _encode_set(key, value, ttl_seconds, tag))
         if marker == b"W":
             raise WrongNodeError()
         if marker != b"S":
             raise self._mismatch(marker)
 
     async def delete(self, key: bytes) -> bool:
-        marker, _ = await self._request(_encode_delete(key))
+        marker, _ = await self._request(lambda tag: _encode_delete(key, tag))
         if marker == b"D":
             return True
         if marker == b"N":
@@ -135,13 +154,18 @@ class Connection:
         pending = list(self._pending)
         self._pending.clear()
         self._writer.close()
-        for future in pending:
+        for _tag, future in pending:
             if not future.cancelled():
                 future.set_exception(error)
         if self._on_close is not None:
             self._on_close()
 
-    async def _request(self, frame: bytes) -> tuple[bytes, bytes | None]:
+    def _claim_tag(self) -> int:
+        tag = self._next_tag
+        self._next_tag = (self._next_tag + 1) & _MAX_TAG  # wrap at u32, matching the wire's width
+        return tag
+
+    async def _request(self, build: Callable[[int | None], bytes]) -> tuple[bytes, bytes | None]:
         if self.closed:
             raise ConnectionError("nanocached: connection is closed")
 
@@ -150,7 +174,16 @@ class Connection:
             if self.closed:
                 raise ConnectionError("nanocached: connection is closed")
             self._last_used = time.monotonic()
-            self._pending.append(future)
+            # ADR-0019: the tag is claimed in the same locked span that
+            # enqueues the pending slot and writes the frame, so tag
+            # order can never skew from queue/wire order (ADR-0016's
+            # enqueue+write atomicity). build() runs before the pending
+            # slot is appended — a builder that raises must fail with
+            # nothing queued, or the next response would resolve an
+            # orphaned slot and desync the stream.
+            tag = self._claim_tag() if self._tagged else None
+            frame = build(tag)
+            self._pending.append((tag, future))
             try:
                 self._writer.write(frame)
                 await self._writer.drain()
@@ -184,7 +217,7 @@ class Connection:
     async def _read_loop(self) -> None:
         while True:
             try:
-                marker, value = await self._read_one_response()
+                marker, value, tag = await self._read_one_response()
             except (ConnectionError, NanocachedError) as error:
                 self._poison(error)
                 return
@@ -220,18 +253,42 @@ class Connection:
                 )
                 return
 
-            future = self._pending.popleft()
+            expected_tag, future = self._pending.popleft()
+
+            # ADR-0019: on a tagged connection, verify the echoed tag
+            # against the request this response is about to answer —
+            # *before* it can reach any caller. A mismatch means the
+            # streams are misaligned; unlike the caller-side kind check
+            # (_mismatch), catching it here stops the misdelivery instead
+            # of merely noticing it later.
+            if self._tagged and tag != expected_tag:
+                error = ConnectionError(
+                    f"nanocached: response tag {tag} does not answer request tag {expected_tag} "
+                    f"(connection desynced)"
+                )
+                self._poison(error)
+                # The popped future is no longer in _pending, so _poison()
+                # didn't reject it — do that here; the rest drain via
+                # _poison()'s own rejection of what's left.
+                if not future.cancelled():
+                    future.set_exception(error)
+                return
+
             if not future.cancelled():
                 future.set_result((marker, value))
 
-    async def _read_one_response(self) -> tuple[bytes, bytes | None]:
+    async def _read_one_response(self) -> tuple[bytes, bytes | None, int | None]:
         marker = await self._reader.readexactly(1)
 
         if marker == b"V":
-            # `V <length>\n<value>`
+            # Untagged: `V <length>\n<value>`. Tagged: `V <length> <tag>\n<value>`
+            # (ADR-0019).
             header = await self._reader.readuntil(b"\n")
+            fields = header[1:-1].split(b" ")
+            if len(fields) != (2 if self._tagged else 1):
+                raise ConnectionError("nanocached: invalid value header in response")
             try:
-                length = int(header[1:-1])
+                length = int(fields[0])
             except ValueError:
                 length = -1
             # A non-numeric, negative, or absurd length (the server caps
@@ -241,11 +298,34 @@ class Connection:
             # (issue #8).
             if length < 0 or length > _MAX_VALUE_LENGTH:
                 raise ConnectionError("nanocached: invalid value length in response")
+            tag = self._parse_tag(fields[1]) if self._tagged else None
             value = await self._reader.readexactly(length)
-            return marker, value
+            return marker, value, tag
 
-        if marker in (b"S", b"D", b"N", b"W", b"B"):
+        if marker in (b"S", b"D", b"N", b"W"):
+            if self._tagged:
+                # `<marker> <tag>\n` (ADR-0019).
+                header = await self._reader.readuntil(b"\n")
+                if len(header) < 2 or header[0:1] != b" ":
+                    raise ConnectionError("nanocached: response is missing its tag (connection desynced)")
+                return marker, None, self._parse_tag(header[1:-1])
             await self._reader.readexactly(1)  # the trailing '\n'
-            return marker, None
+            return marker, None, None
+
+        if marker == b"B":
+            # `B\n` (busy) is always untagged — an unsolicited response
+            # sent before auth, so it never carries a request's tag.
+            await self._reader.readexactly(1)  # the trailing '\n'
+            return marker, None, None
 
         raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
+
+    @staticmethod
+    def _parse_tag(field: bytes) -> int:
+        try:
+            tag = int(field)
+        except ValueError:
+            tag = -1
+        if tag < 0 or tag > _MAX_TAG:
+            raise ConnectionError("nanocached: invalid response tag")
+        return tag

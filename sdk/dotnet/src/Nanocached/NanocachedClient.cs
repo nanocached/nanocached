@@ -288,7 +288,7 @@ public sealed class NanocachedClient : IDisposable
                                 + "for cluster routing and failover.");
                         }
                         client._targetKey = key;
-                        client._single = client.NewConnection(node.Stream);
+                        client._single = client.NewConnection(node.Stream, node.Tagged);
                         client._singleAddress = key;
                         client.StartKeepAlive();
                         return client;
@@ -322,11 +322,11 @@ public sealed class NanocachedClient : IDisposable
     /// that happens (client.Close(), a refresh reconciling a departed
     /// node, a dead-connection replacement, or discarding a redial that
     /// raced a concurrent Close()).</summary>
-    private Connection NewConnection(Stream stream)
+    private Connection NewConnection(Stream stream, bool tagged)
     {
         string key = _targetKey!;
         IncrementOpenTarget(key);
-        return new Connection(stream, () => DecrementOpenTarget(key));
+        return new Connection(stream, tagged, () => DecrementOpenTarget(key));
     }
 
     private async Task OpenClusterAsync(Identify.ClusterTarget cluster)
@@ -788,7 +788,7 @@ public sealed class NanocachedClient : IDisposable
             node.Stream.Dispose();
             throw new AlreadyClosedException();
         }
-        return NewConnection(node.Stream);
+        return NewConnection(node.Stream, node.Tagged);
     }
 
     // ── ノードリスト更新 ──────────────────────────────────────────

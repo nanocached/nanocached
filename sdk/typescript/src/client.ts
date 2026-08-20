@@ -339,7 +339,7 @@ export class NanocachedClient {
 
         trackOpenTarget(key, [identified.socket]);
         return new NanocachedClient(
-          { kind: "single", connection: new Connection(identified.socket) },
+          { kind: "single", connection: new Connection(identified.socket, identified.tagged) },
           key,
           [key],
           addresses,
@@ -359,7 +359,7 @@ export class NanocachedClient {
       }
 
       // Keyed by name (doc/adr/0009-*.md), not address — see `Target`.
-      const sockets = new Map<string, Socket | TLSSocket>();
+      const sockets = new Map<string, { socket: Socket | TLSSocket; tagged: boolean }>();
 
       try {
         for (const node of identified.nodes) {
@@ -370,20 +370,21 @@ export class NanocachedClient {
             throw new Error(`nanocached: discovery server returned a non-node address: ${node.address}`);
           }
 
-          sockets.set(node.name, nodeIdentified.socket);
+          sockets.set(node.name, { socket: nodeIdentified.socket, tagged: nodeIdentified.tagged });
         }
       } catch (error) {
         // A node (not the discovery address) is the problem here; another
         // address would hand back the same node list, so don't try one.
-        for (const socket of sockets.values()) socket.destroy();
+        for (const { socket } of sockets.values()) socket.destroy();
         throw error;
       }
 
-      trackOpenTarget(key, [...sockets.values()]);
+      trackOpenTarget(key, [...sockets.values()].map(({ socket }) => socket));
 
       const members = new Map<string, ClusterMember>();
       for (const node of identified.nodes) {
-        members.set(node.name, { address: node.address, connection: new Connection(sockets.get(node.name)!) });
+        const { socket, tagged } = sockets.get(node.name)!;
+        members.set(node.name, { address: node.address, connection: new Connection(socket, tagged) });
       }
 
       return new NanocachedClient(
@@ -801,7 +802,7 @@ export class NanocachedClient {
         }
 
         trackOpenTarget(this.url, [nodeIdentified.socket]);
-        members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket) });
+        members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged) });
       } catch (error) {
         // Connecting to this new node failed — skip it silently and retry
         // on the next refresh (see the doc comment above), counted in
@@ -942,7 +943,7 @@ export class NanocachedClient {
     }
 
     trackOpenTarget(this.url, [identified.socket]);
-    return new Connection(identified.socket);
+    return new Connection(identified.socket, identified.tagged);
   }
 
   /** See KEEPALIVE_TUNING. Each tick pings only

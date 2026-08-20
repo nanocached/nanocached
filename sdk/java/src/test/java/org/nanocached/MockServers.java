@@ -28,6 +28,15 @@ final class MockServers {
         final AtomicInteger connectionCount = new AtomicInteger();
         final AtomicInteger getCount = new AtomicInteger();
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
+        /** ADR-0019: queued one-off replies that echo the WRONG tag (the
+         * request's tag + 1) — the desync a pre-ADR-0019 stream
+         * misalignment would produce. Only takes effect on a tagged
+         * connection. */
+        private final AtomicInteger wrongTagReplies = new AtomicInteger();
+        /** ADR-0019: swallows the next G entirely (no reply) — the
+         * off-by-one stream desync where every later response answers
+         * the previous request. */
+        private final AtomicInteger swallowedGets = new AtomicInteger();
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
@@ -36,16 +45,44 @@ final class MockServers {
          * most recent S request this server received. */
         volatile long lastSetTtl = 0;
         private final byte[] requiredSecret;
+        /** ADR-0019: acknowledge an extended `A ... T` with `OnT\n` and
+         * echo tags on that connection's G/S/D replies. Off by default so
+         * the bulk of the suite keeps exercising the legacy untagged
+         * path. */
+        private final boolean supportTags;
+        /** ADR-0019: behave like a pre-0019 server — an extended
+         * `A ... T` is a parse error, so close the connection without
+         * replying. */
+        private final boolean closeOnExtendedAuth;
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
         private final List<Thread> threads = new CopyOnWriteArrayList<>();
 
         MockNode() throws IOException {
-            this(null);
+            this(null, false, false);
         }
 
         MockNode(byte[] requiredSecret) throws IOException {
+            this(requiredSecret, false, false);
+        }
+
+        /** ADR-0019: a node that negotiates tags — accepts `A ... T`
+         * with `OnT\n` and echoes tags on that connection's replies. */
+        static MockNode withTagSupport() throws IOException {
+            return new MockNode(null, true, false);
+        }
+
+        /** ADR-0019: a pre-0019 node — the extended `A ... T` is a parse
+         * error, so it closes the connection without replying, forcing
+         * the caller's transparent untagged fallback. */
+        static MockNode legacyServer() throws IOException {
+            return new MockNode(null, false, true);
+        }
+
+        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth) throws IOException {
             this.requiredSecret = requiredSecret;
+            this.supportTags = supportTags;
+            this.closeOnExtendedAuth = closeOnExtendedAuth;
             this.server = new ServerSocket(0);
             Thread acceptor = new Thread(this::acceptLoop, "mock-node-accept");
             acceptor.setDaemon(true);
@@ -63,6 +100,19 @@ final class MockServers {
 
         void answerWrongNodeOnce() {
             wrongNodeReplies.incrementAndGet();
+        }
+
+        /** Queue a one-off reply for the next G request on a tagged
+         * connection that echoes the WRONG tag (ADR-0019). */
+        void answerWrongTagOnce() {
+            wrongTagReplies.incrementAndGet();
+        }
+
+        /** Swallow the next G request entirely (no reply) — the
+         * off-by-one stream desync where every later response answers
+         * the previous request (ADR-0019). */
+        void swallowGetOnce() {
+            swallowedGets.incrementAndGet();
         }
 
         /** Queue a one-off garbage `V` header for the next G request. */
@@ -129,39 +179,67 @@ final class MockServers {
             try (socket) {
                 InputStream in = socket.getInputStream();
                 OutputStream out = socket.getOutputStream();
+                // ADR-0019: set when this connection's `A ... T` was
+                // acknowledged — its requests then carry a trailing tag
+                // the replies must echo.
+                boolean tagged = false;
                 while (true) {
                     String[] parts = readLine(in).split(" ");
+                    // On a tagged connection every request's last header
+                    // field is its tag, echoed back as each reply's own
+                    // last field.
+                    String tagSuffix = tagged ? " " + parts[parts.length - 1] : "";
+
                     switch (parts[0]) {
                         case "A" -> {
+                            if (parts.length > 2 && closeOnExtendedAuth) {
+                                return; // pre-0019 behavior: close without replying
+                            }
                             byte[] secret = in.readNBytes(Integer.parseInt(parts[1]));
                             boolean accepted = requiredSecret == null
                                     ? secret.length > 0
                                     : java.util.Arrays.equals(secret, requiredSecret);
-                            out.write((accepted ? "On\n" : "En\n").getBytes(StandardCharsets.US_ASCII));
+                            tagged = accepted && supportTags && parts.length > 2 && parts[2].equals("T");
+                            out.write((accepted ? (tagged ? "OnT\n" : "On\n") : "En\n")
+                                    .getBytes(StandardCharsets.US_ASCII));
                             out.flush();
                             if (!accepted) return;
                         }
                         case "G" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             getCount.incrementAndGet();
+
+                            if (swallowedGets.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                                break; // no reply — simulates an off-by-one stream desync
+                            }
+                            if (tagged && takeWrongTag()) {
+                                // Echo the WRONG tag (the request's tag +
+                                // 1) — the desync a pre-ADR-0019 stream
+                                // misalignment would produce.
+                                long wrongTag = Long.parseLong(parts[2]) + 1;
+                                out.write(("N " + wrongTag + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (malformedValueReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                                 out.write("V x\n".getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (storedToGetReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
-                                out.write("S\n".getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write("W\n".getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 byte[] value = store.get(key);
                                 if (value == null) {
-                                    out.write("N\n".getBytes(StandardCharsets.US_ASCII));
+                                    out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 } else {
-                                    out.write(("V " + value.length + "\n").getBytes(StandardCharsets.US_ASCII));
+                                    out.write(("V " + value.length + tagSuffix + "\n")
+                                            .getBytes(StandardCharsets.US_ASCII));
                                     out.write(value);
                                 }
                             }
@@ -170,9 +248,12 @@ final class MockServers {
                         case "S" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             byte[] value = in.readNBytes(Integer.parseInt(parts[2]));
-                            // parts[3], when present, is the TTL (omitted
-                            // on the wire means "no expiry", i.e. 0).
-                            lastSetTtl = parts.length > 3 ? Long.parseLong(parts[3]) : 0;
+                            // The TTL, when present, is the field after
+                            // the two lengths (omitted on the wire means
+                            // "no expiry", i.e. 0); on a tagged connection
+                            // the tag sits after it as the last field.
+                            int ttlFieldCount = parts.length - (tagged ? 4 : 3);
+                            lastSetTtl = ttlFieldCount > 0 ? Long.parseLong(parts[3]) : 0;
                             if (failSets) {
                                 // Reset the connection instead of acking:
                                 // the frame is fully consumed above, so the
@@ -189,19 +270,19 @@ final class MockServers {
                                 }
                             }
                             if (takeWrongNode()) {
-                                out.write("W\n".getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 store.put(key, value);
-                                out.write("S\n".getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
                         case "D" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             if (takeWrongNode()) {
-                                out.write("W\n".getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write((store.remove(key) != null ? "D\n" : "N\n")
+                                out.write((store.remove(key) != null ? "D" + tagSuffix + "\n" : "N" + tagSuffix + "\n")
                                         .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
@@ -223,6 +304,14 @@ final class MockServers {
                 int pending = wrongNodeReplies.get();
                 if (pending == 0) return false;
                 if (wrongNodeReplies.compareAndSet(pending, pending - 1)) return true;
+            }
+        }
+
+        private boolean takeWrongTag() {
+            while (true) {
+                int pending = wrongTagReplies.get();
+                if (pending == 0) return false;
+                if (wrongTagReplies.compareAndSet(pending, pending - 1)) return true;
             }
         }
 
@@ -283,7 +372,13 @@ final class MockServers {
                     String[] parts = readLine(in).split(" ");
                     if (parts[0].equals("A")) {
                         in.readNBytes(Integer.parseInt(parts[1]));
-                        out.write("Od\n".getBytes(StandardCharsets.US_ASCII));
+                        // ADR-0019: echo the tag capability — clients send
+                        // the extended A before knowing which kind of
+                        // server answered. Discovery itself never tags
+                        // requests (L is a one-shot), but the ack must
+                        // still parse.
+                        boolean requestedTags = parts.length > 2 && parts[2].equals("T");
+                        out.write((requestedTags ? "OdT\n" : "Od\n").getBytes(StandardCharsets.US_ASCII));
                         out.flush();
                     } else if (parts[0].equals("L")) {
                         if (warmingUp) {

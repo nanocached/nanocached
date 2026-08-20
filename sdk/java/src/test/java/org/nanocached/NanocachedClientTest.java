@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -390,7 +391,7 @@ class NanocachedClientTest {
             try (MockNode node = new MockNode()) {
                 socket.connect(new java.net.InetSocketAddress("127.0.0.1", node.port()));
                 java.util.concurrent.atomic.AtomicInteger closedCount = new java.util.concurrent.atomic.AtomicInteger();
-                Connection connection = new Connection(socket, closedCount::incrementAndGet);
+                Connection connection = new Connection(socket, false, closedCount::incrementAndGet);
 
                 ExecutorService pool = Executors.newFixedThreadPool(8);
                 try {
@@ -437,11 +438,11 @@ class NanocachedClientTest {
                 // thus Connection's constructor) throw IOException on it.
                 java.net.Socket neverConnected = new java.net.Socket();
 
-                java.lang.reflect.Method newTrackedConnection =
-                        NanocachedClient.class.getDeclaredMethod("newTrackedConnection", java.net.Socket.class);
+                java.lang.reflect.Method newTrackedConnection = NanocachedClient.class.getDeclaredMethod(
+                        "newTrackedConnection", java.net.Socket.class, boolean.class);
                 newTrackedConnection.setAccessible(true);
                 assertThrows(java.lang.reflect.InvocationTargetException.class,
-                        () -> newTrackedConnection.invoke(client, neverConnected));
+                        () -> newTrackedConnection.invoke(client, neverConnected, false));
 
                 assertEquals(before, openTargets.getOrDefault(targetKey, 0),
                         "the open-target counter must not leak when the Connection constructor fails");
@@ -992,6 +993,130 @@ class NanocachedClientTest {
                 }
                 assertTrue(sawClassCastException,
                         "expected the injected ClassCastException to propagate, got: " + thrown.getCause());
+            }
+        }
+    }
+
+    // ── 応答タグ (doc/adr/0019-*.md) ──────────────────────────────
+
+    @Test
+    void negotiatesTagsAndRoundTripsPipelinedRequests() throws Exception {
+        // Same shape as pipelinesConcurrentRequestsOnOneConnection, but
+        // against a tag-negotiating server: N concurrent set/get on one
+        // tagged connection, each independently verified to round-trip
+        // its own value.
+        try (MockNode node = MockNode.withTagSupport()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int n = 20;
+                ExecutorService pool = Executors.newFixedThreadPool(n);
+                try {
+                    List<Future<?>> sets = new ArrayList<>();
+                    for (int i = 0; i < n; i++) {
+                        int index = i;
+                        sets.add(pool.submit(() -> client.set("key-" + index, "value-" + index, index)));
+                    }
+                    for (Future<?> future : sets) future.get();
+
+                    List<Future<Optional<String>>> gets = new ArrayList<>();
+                    for (int i = 0; i < n; i++) {
+                        int index = i;
+                        gets.add(pool.submit(() -> client.get("key-" + index)));
+                    }
+                    for (int i = 0; i < n; i++) {
+                        assertEquals(Optional.of("value-" + i), gets.get(i).get());
+                    }
+                } finally {
+                    pool.shutdown();
+                }
+
+                assertTrue(client.delete("key-0"));
+                assertFalse(client.delete("key-0"));
+            }
+        }
+    }
+
+    @Test
+    void aDesyncedStreamIsCaughtByTheTagCheckBeforeAnyCallerSeesWrongData() throws Exception {
+        // The exact misdelivery doc/adr/0016-*.md left open: the server
+        // (as a stand-in for any off-by-one stream corruption) never
+        // answers the first GET, so the second GET's response arrives at
+        // the first GET's pending slot. Without tags the first caller
+        // would receive the second's value as a plausible, exception-free
+        // wrong answer; the tag check must poison the connection before
+        // either caller sees anything. Exercised directly against
+        // Connection (bypassing NanocachedClient's own redial-and-retry,
+        // which would otherwise mask the desync behind a transparently
+        // healed retry) so the raw per-call outcome is observable.
+        try (MockNode node = MockNode.withTagSupport()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            assertTrue(target.tagged());
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                connection.set("k".getBytes(StandardCharsets.UTF_8), "v".getBytes(StandardCharsets.UTF_8), null);
+
+                node.swallowGetOnce();
+                ExecutorService pool = Executors.newFixedThreadPool(2);
+                try {
+                    Future<byte[]> first = pool.submit(() -> connection.get("a".getBytes(StandardCharsets.UTF_8)));
+                    waitFor(() -> node.getCount.get() >= 1, "the swallowed GET to reach the server");
+                    Future<byte[]> second = pool.submit(() -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+
+                    ExecutionException firstError = assertThrows(ExecutionException.class, first::get);
+                    assertTrue(firstError.getCause().getMessage().contains("desynced"), firstError.getCause().getMessage());
+                    ExecutionException secondError = assertThrows(ExecutionException.class, second::get);
+                    assertTrue(secondError.getCause().getMessage().contains("desynced"), secondError.getCause().getMessage());
+                } finally {
+                    pool.shutdown();
+                }
+
+                assertTrue(connection.isClosed());
+            } finally {
+                connection.close();
+            }
+
+            // The poisoned connection redials transparently through
+            // NanocachedClient on next use.
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
+            assertEquals(2, node.connectionCount.get());
+        }
+    }
+
+    @Test
+    void aResponseEchoingTheWrongTagPoisonsTheConnection() throws Exception {
+        // Exercised directly against Connection — see the desync test
+        // above for why NanocachedClient's own transparent retry would
+        // otherwise mask this.
+        try (MockNode node = MockNode.withTagSupport()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                node.answerWrongTagOnce();
+                NanocachedException error = assertThrows(NanocachedException.class,
+                        () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+                assertTrue(error.getMessage().contains("desynced"), error.getMessage());
+                assertTrue(connection.isClosed());
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    @Test
+    void fallsBackToTheUntaggedProtocolAgainstAPre0019Server() throws Exception {
+        // An old server treats `A ... T` as a parse error and closes
+        // without replying; the client must redial once with the plain
+        // form and run untagged — transparently, with the same results.
+        try (MockNode node = MockNode.legacyServer()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+                // Two dials: the extended attempt the server slammed
+                // shut, then the plain fallback that stuck.
+                assertEquals(2, node.connectionCount.get());
             }
         }
     }

@@ -1508,3 +1508,90 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
     }
   });
 });
+
+describe("NanocachedClient response tags (doc/adr/0019-*.md)", () => {
+  it("negotiates tags and round-trips pipelined requests", async () => {
+    const node = await startMockNode({ supportTags: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await Promise.all(Array.from({ length: 20 }, (_, i) => client.set(`key-${i}`, `value-${i}`, i)));
+        const values = await Promise.all(Array.from({ length: 20 }, (_, i) => client.get(`key-${i}`)));
+        values.forEach((value, i) => assert.equal(value, `value-${i}`));
+
+        assert.equal(await client.delete("key-0"), true);
+        assert.equal(await client.delete("key-0"), false);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a desynced stream is caught by the tag check before any caller sees wrong data", async () => {
+    // The exact misdelivery ADR-0016 left open: the server (as a stand-in
+    // for any off-by-one stream corruption) never answers the first GET,
+    // so the second GET's response arrives at the first GET's pending
+    // slot. Without tags the first caller would receive the second's
+    // value as a plausible, exception-free wrong answer; the tag check
+    // must poison the connection before either caller sees anything.
+    const node = await startMockNode({ supportTags: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+
+        node.swallowGetOnce();
+        const first = client.get("a");
+        const second = client.get("k");
+        await assert.rejects(first, /desynced/);
+        await assert.rejects(second, /desynced/);
+
+        // The poisoned connection redials transparently on next use.
+        assert.equal(await client.get("k"), "v");
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a response echoing the wrong tag poisons the connection", async () => {
+    const node = await startMockNode({ supportTags: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        node.answerWrongTagOnce();
+        await assert.rejects(client.get("k"), /desynced/);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("falls back to the untagged protocol against a pre-0019 server", async () => {
+    // An old server treats `A ... T` as a parse error and closes without
+    // replying; the client must redial once with the plain form and run
+    // untagged — transparently, with the same results.
+    const node = await startMockNode({ closeOnExtendedAuth: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+        // Two dials: the extended attempt the server slammed shut, then
+        // the plain fallback that stuck.
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});

@@ -7,6 +7,9 @@ use std::time::Duration;
 pub enum Command {
     Auth {
         secret: Bytes,
+        /// ADR-0019: the client sent `A <len> T\n` — it wants response
+        /// tags echoed on this connection's `G`/`S`/`D` replies.
+        tagging: bool,
     },
     Get {
         key: Bytes,
@@ -152,6 +155,21 @@ pub enum ParseError {
 /// returned command's key/value share that removed chunk's allocation
 /// (no copy). On `Incomplete`, `input` is left untouched.
 pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
+    parse_with_mode(input, false).map(|(command, _)| command)
+}
+
+/// ADR-0019: `parse` for a connection whose `A ... T` negotiation
+/// succeeded. `G`/`S`/`D` headers must carry the client's tag as their
+/// last field, returned alongside for the response to echo; commands
+/// that never carry one (`A`, `M`, `X`) return `None`.
+pub fn parse_tagged(input: &mut BytesMut) -> Result<(Command, Option<u32>), ParseError> {
+    parse_with_mode(input, true)
+}
+
+fn parse_with_mode(
+    input: &mut BytesMut,
+    tagged: bool,
+) -> Result<(Command, Option<u32>), ParseError> {
     let header_end = find_lf(&input[..]).ok_or(ParseError::Incomplete)?;
     let header = &input[..header_end];
 
@@ -161,6 +179,15 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
     match command {
         b"A" => {
             let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            // ADR-0019: an optional literal `T` requests tagged mode.
+            // Accepted regardless of the connection's current mode, since
+            // this is the field that *establishes* the mode.
+            let tagging = match parts.next() {
+                None => false,
+                Some(b"T") => true,
+                Some(_) => return Err(ParseError::InvalidCommand),
+            };
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -184,11 +211,12 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let frame = input.split_to(secret_end).freeze();
             let secret = frame.slice(secret_start..secret_end);
 
-            Ok(Command::Auth { secret })
+            Ok((Command::Auth { secret, tagging }, None))
         }
 
         b"G" | b"D" => {
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -214,17 +242,33 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let frame = input.split_to(key_end).freeze();
             let key = frame.slice(key_start..key_end);
 
-            Ok(if is_get {
-                Command::Get { key }
-            } else {
-                Command::Delete { key }
-            })
+            Ok((
+                if is_get {
+                    Command::Get { key }
+                } else {
+                    Command::Delete { key }
+                },
+                tag,
+            ))
         }
 
         b"S" => {
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
-            let ttl = parts.next();
+            // In tagged mode the tag is the *last* field, so with both
+            // optional fields the header is `S <k> <v> [ttl] <tag>`:
+            // one trailing field is the tag alone, two are TTL then tag.
+            // The connection's negotiated mode is what disambiguates a
+            // three-field header — never a guess frame by frame.
+            let (ttl, tag) = if tagged {
+                let first = parts.next().ok_or(ParseError::InvalidLength)?;
+                match parts.next() {
+                    Some(second) => (Some(first), Some(parse_tag(second)?)),
+                    None => (None, Some(parse_tag(first)?)),
+                }
+            } else {
+                (parts.next(), None)
+            };
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -265,7 +309,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let key = frame.slice(key_start..key_end);
             let value = frame.slice(key_end..value_end);
 
-            Ok(Command::Set { key, value, ttl })
+            Ok((Command::Set { key, value, ttl }, tag))
         }
 
         b"X" => {
@@ -293,7 +337,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
             let frame = input.split_to(joining_name_end);
             let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
 
-            Ok(Command::CancelMigration { joining_name })
+            Ok((Command::CancelMigration { joining_name }, None))
         }
 
         b"M" => {
@@ -325,6 +369,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
                 joined_count,
                 replication,
             )
+            .map(|command| (command, None))
         }
 
         _ => Err(ParseError::InvalidCommand),
@@ -435,6 +480,25 @@ fn decode_field(frame: &[u8], start: usize, length: usize) -> Result<String, Par
     String::from_utf8(frame[start..start + length].to_vec()).map_err(|_| ParseError::InvalidUtf8)
 }
 
+/// ADR-0019: in tagged mode the next header field is the required
+/// request tag; in untagged mode there is nothing to consume.
+fn parse_trailing_tag<'a>(
+    parts: &mut impl Iterator<Item = &'a [u8]>,
+    tagged: bool,
+) -> Result<Option<u32>, ParseError> {
+    if !tagged {
+        return Ok(None);
+    }
+
+    parse_tag(parts.next().ok_or(ParseError::InvalidLength)?).map(Some)
+}
+
+/// ADR-0019: a tag is a u32 in the same decimal encoding as every
+/// length field.
+fn parse_tag(input: &[u8]) -> Result<u32, ParseError> {
+    u32::try_from(parse_length(input)?).map_err(|_| ParseError::InvalidLength)
+}
+
 fn find_lf(input: &[u8]) -> Option<usize> {
     input.iter().position(|byte| *byte == b'\n')
 }
@@ -472,9 +536,31 @@ mod tests {
             parse(&mut input),
             Ok(Command::Auth {
                 secret: Bytes::from_static(b"secret"),
+                tagging: false,
             })
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_auth_command_with_tagging_flag() {
+        let mut input = buf(b"A 6 T\nsecret");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Auth {
+                secret: Bytes::from_static(b"secret"),
+                tagging: true,
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn rejects_an_auth_flag_other_than_t() {
+        let mut input = buf(b"A 6 X\nsecret");
+
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
     }
 
     #[test]
@@ -691,6 +777,7 @@ mod tests {
 
         let command = Command::Auth {
             secret: Bytes::from_static(b"secret"),
+            tagging: false,
         };
 
         let _ = command.execute(&mut cache);
@@ -877,6 +964,97 @@ mod tests {
         let mut input = buf(b"M 6 14 999999999999 2\nnode-b127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+    }
+
+    #[test]
+    fn parse_tagged_requires_and_returns_the_tag_on_get_and_delete() {
+        let mut input = buf(b"G 4 7\nnameD 4 4294967295\nname");
+
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Get {
+                    key: Bytes::from_static(b"name"),
+                },
+                Some(7),
+            ))
+        );
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Delete {
+                    key: Bytes::from_static(b"name"),
+                },
+                Some(u32::MAX),
+            ))
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_tagged_rejects_a_get_without_a_tag() {
+        let mut input = buf(b"G 4\nname");
+
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_tagged_reads_a_three_field_set_header_as_untimed() {
+        let mut input = buf(b"S 4 5 9\nnameAlice");
+
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Set {
+                    key: Bytes::from_static(b"name"),
+                    value: Bytes::from_static(b"Alice"),
+                    ttl: None,
+                },
+                Some(9),
+            ))
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_tagged_reads_a_four_field_set_header_as_ttl_then_tag() {
+        let mut input = buf(b"S 4 5 10 9\nnameAlice");
+
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Set {
+                    key: Bytes::from_static(b"name"),
+                    value: Bytes::from_static(b"Alice"),
+                    ttl: Some(Duration::from_secs(10)),
+                },
+                Some(9),
+            ))
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_tagged_rejects_a_tag_beyond_u32() {
+        let mut input = buf(b"G 4 4294967296\nname");
+
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_tagged_returns_no_tag_for_auth() {
+        let mut input = buf(b"A 6 T\nsecret");
+
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Auth {
+                    secret: Bytes::from_static(b"secret"),
+                    tagging: true,
+                },
+                None,
+            ))
+        );
     }
 
     #[test]
