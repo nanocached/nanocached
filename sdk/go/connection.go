@@ -3,6 +3,7 @@ package nanocached
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -25,6 +26,17 @@ import (
 // headroom, so a claimed length beyond it is definitely a corrupt or
 // malicious frame, never just a legitimately large value.
 const maxValueLength = 2 * 1024 * 1024
+
+// maxHeaderLineLength caps a response header line (readLine, shared with
+// identify.go's discovery node-list headers) before it can grow without
+// bound: every real header line (`V <len> <tag>`, `S <tag>`, a discovery
+// `N <count> <r>`/entry line, ...) is a few dozen bytes at most, so a
+// peer that never sends the terminating '\n' is corrupt or hostile, not
+// just slow — 4 KiB is generous headroom while still bounding its memory
+// pressure on the client (issue #47 audit; mirrors Rust's
+// MAX_HEADER_LINE_LENGTH in connection.rs:36 and maxValueLength's
+// rationale for the `V` body above).
+const maxHeaderLineLength = 4 * 1024
 
 // requestTimeout bounds how long the connection may go without progress
 // while requests are outstanding — each response must arrive within
@@ -379,7 +391,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 	}
 	switch marker {
 	case 'V':
-		header, err := c.reader.ReadString('\n')
+		header, err := readLine(c.reader)
 		if err != nil {
 			return 0, nil, 0, err
 		}
@@ -428,7 +440,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			return marker, nil, 0, nil
 		}
 		// Tagged wire: `S <seq>\n` etc. (doc/adr/0019-*.md).
-		header, err := c.reader.ReadString('\n')
+		header, err := readLine(c.reader)
 		if err != nil {
 			return 0, nil, 0, err
 		}
@@ -457,14 +469,40 @@ func parseTag(field string) (uint32, error) {
 	return uint32(tag), nil
 }
 
-func readFull(reader *bufio.Reader, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := reader.Read(buf[total:])
-		total += n
+// readLine reads one '\n'-terminated line from reader, like
+// bufio.Reader.ReadString('\n') — the returned string includes the
+// trailing '\n' on success, and holds whatever was read so far when err
+// is non-nil, matching ReadString's own contract — but bounded: a peer
+// that never sends '\n' would otherwise make ReadString's internal
+// buffer grow without limit. Mirrors Rust's read_line in connection.rs
+// (issue #47 audit); see maxHeaderLineLength above.
+func readLine(reader *bufio.Reader) (string, error) {
+	var line []byte
+	for {
+		b, err := reader.ReadByte()
 		if err != nil {
-			return total, err
+			return string(line), err
+		}
+		line = append(line, b)
+		if b == '\n' {
+			return string(line), nil
+		}
+		if len(line) > maxHeaderLineLength {
+			return string(line), fmt.Errorf(
+				"nanocached: response header line exceeds %d bytes without a terminator", maxHeaderLineLength)
 		}
 	}
-	return total, nil
+}
+
+// readFull reads exactly len(buf) bytes from reader, wrapping
+// io.ReadFull so a final read that delivers the last bytes and an EOF
+// (or ErrUnexpectedEOF) together still counts as success — io.ReadFull's
+// io.ReadAtLeast forces err to nil once enough bytes have been read,
+// regardless of what the underlying Read also returned alongside them.
+// The hand-rolled loop this replaced didn't have that: it returned
+// whatever error the final Read produced even when that Read had
+// delivered every remaining byte (issue #47 audit), which wrongly failed
+// a peer that writes the last bytes and closes in the same flush.
+func readFull(reader *bufio.Reader, buf []byte) (int, error) {
+	return io.ReadFull(reader, buf)
 }

@@ -291,6 +291,29 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_an_oversized_value_is_rejected_before_compression_even_if_it_would_compress_under_the_cap(self):
+        # Regression (issue #47 audit item 3): the request-size cap must be
+        # checked against the *original* value, matching Rust's and Go's
+        # Set — not the compressed frame, which a highly repetitive value
+        # can shrink well under _MAX_REQUEST_BYTES even though the
+        # uncompressed value the caller asked to store never could have
+        # fit the server's own request cap.
+        from nanocached.client import _MAX_REQUEST_BYTES
+
+        client = await self.connect(compress=True, compression_threshold=16)
+        try:
+            oversized = b"a" * (_MAX_REQUEST_BYTES + 1000)  # DEFLATE-friendly
+            with self.assertRaises(ValueError):
+                await client.set("k", oversized)
+            # Rejected before any I/O — the key was never written.
+            self.assertNotIn(b"k", self.node.store)
+
+            # Still usable afterward — none of the above touched the wire.
+            await client.set("k", "v")
+            self.assertEqual(await client.get("k"), "v")
+        finally:
+            await client.close()
+
     async def test_reading_a_legacy_value_with_compress_enabled_raises_clearly(self):
         writer = await self.connect()
         try:
@@ -1283,6 +1306,35 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_write_starting_after_close_falls_back_to_synchronous_instead_of_registering(self):
+        # Regression (issue #47 audit item 4): the fire_and_forget_replicas
+        # admission check in _write() must recheck self._closed immediately
+        # before registering a background task. Without it, a write that
+        # reaches this point after a concurrent close() has already set
+        # self._closed (but is still draining, or has already finished
+        # draining and moved on to teardown) could add an entry close()
+        # will never await — leaking it past teardown instead of falling
+        # back to the synchronous path close() doesn't need to wait for.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+            )
+            client._closed = True  # simulate close() having already started
+            try:
+                await client._write(b"k", lambda connection: connection.set(b"k", b"v", 0))
+            finally:
+                client._closed = False  # let the real close() below run cleanly
+
+            self.assertEqual(client._background_replica_writes, set())
+            _, replica = self.owners_of("k")
+            self.assertIn(b"k", nodes[replica].store, "the replica leg did not run synchronously")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_close_drains_in_flight_background_replica_writes(self):
         nodes, discovery = await self.start_cluster()
         try:
@@ -1400,6 +1452,118 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
                 nodes[primary].store,
                 "close() returned before the read-repair write-back finished",
             )
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_repair_starting_after_close_is_skipped_instead_of_registering(self):
+        # Regression (issue #47 audit item 4), the _try_read_repair()
+        # counterpart of FireAndForgetReplicaWritesTests's equivalent test:
+        # a read-repair write-back has no synchronous fallback (it's
+        # opportunistic), so once self._closed is set — rechecked
+        # immediately before registering the background task — the repair
+        # for this miss must simply be skipped rather than adding an entry
+        # a concurrent close() would never await.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            primary, replica = self.owners_of("k")
+            nodes[replica].store[b"k"] = b"from-replica"
+
+            client._closed = True  # simulate close() having already started
+            try:
+                value = await client._try_read_repair(b"k")
+            finally:
+                client._closed = False  # let the real close() below run cleanly
+
+            self.assertEqual(value, b"from-replica")  # the probe itself still ran
+            self.assertEqual(client._background_replica_writes, set())
+            self.assertNotIn(b"k", nodes[primary].store, "the repair write-back should have been skipped")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
+class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
+    # doc/adr/0014-*.md as amended by doc/adr/0015-*.md (issue #47 audit
+    # item 5): fire_and_forget_replicas writes and read-repair write-backs
+    # draw from ONE shared admission pool of at most
+    # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES, not one independent cap per
+    # category.
+
+    def setUp(self):
+        from nanocached import client as client_module
+
+        self._client_module = client_module
+        self._default_cap = client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+
+    def tearDown(self):
+        self._client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = self._default_cap
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_a_full_fire_and_forget_pool_also_blocks_a_read_repair_write_back(self):
+        self._client_module._MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 1
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)],
+                fire_and_forget_replicas=True,
+                read_repair=True,
+            )
+            try:
+                _, replica1 = self.owners_of("k1")
+                primary2, replica2 = self.owners_of("k2")
+                nodes[replica1].delay_sets(0.15)
+                nodes[replica2].store[b"k2"] = b"from-replica"
+
+                # Occupies the single shared slot with a fire_and_forget
+                # replica write that won't finish for 0.15s.
+                await client.set("k1", "v")
+                self.assertEqual(len(client._background_replica_writes), 1)
+
+                # A concurrent read-repair write-back finds a value fine
+                # (the owner probe doesn't need a slot), but must not get a
+                # slot of its own to write it back — if the two categories
+                # had independent caps, this would still succeed.
+                self.assertEqual(await client.get_bytes("k2"), b"from-replica")
+                self.assertNotIn(
+                    b"k2",
+                    nodes[primary2].store,
+                    "read-repair write-back ran despite the shared pool being full",
+                )
+                self.assertEqual(len(client._background_replica_writes), 1)
+
+                # Once the slot frees up, the same miss is opportunistically
+                # repairable again on a later read.
+                _, replica1 = self.owners_of("k1")
+                await wait_for(
+                    lambda: b"k1" in nodes[replica1].store,
+                    "the fire-and-forget replica write to finish and free its slot",
+                )
+                self.assertEqual(await client.get_bytes("k2"), b"from-replica")
+                await wait_for(
+                    lambda: b"k2" in nodes[primary2].store,
+                    "the read-repair write-back to land once the shared pool had room",
+                )
+            finally:
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():

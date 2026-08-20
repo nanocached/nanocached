@@ -9,6 +9,15 @@ and #43): the repair write carries a 60-second TTL rather than "no
 TTL", and the `readRepairFailures` stats counter is defined to count
 failed repair write-backs only.
 
+Amended 2026-08-21 (issue #47 audit) to match the implementations
+again: the "detached, not awaited, no in-flight tracking, no `close()`
+draining" design described in Decision and Consequences below is
+superseded — in every SDK (TypeScript, .NET, Rust, Go, and now Python),
+a read-repair write-back shares the same bounded background-slot pool
+[[0014]]'s fire-and-forget replica writes use (one combined cap of 32,
+not 32 per category) and is drained by `close()` the same way, instead
+of running fully untracked as originally decided.
+
 ## Context
 
 [[0011]] deliberately ships without read repair: `get`/`get_bytes` asks

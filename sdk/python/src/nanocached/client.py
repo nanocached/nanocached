@@ -109,11 +109,17 @@ _KEEPALIVE_KEY = b"\x00nanocached-keepalive"
 # so tests can shorten it.
 _KEEPALIVE_INTERVAL = 30.0
 
-# doc/adr/0014-*.md: bounds how many replica writes a single client may
-# have running in the background at once when fire_and_forget_replicas is
-# enabled — once the cap is reached, further replica legs fall back to
-# running synchronously, the same as with the option off. Mutable only so
-# tests can shrink it, mirroring _KEEPALIVE_INTERVAL.
+# doc/adr/0014-*.md, amended by doc/adr/0015-*.md (issue #47 audit item
+# 5): bounds how many replica writes a single client may have running in
+# the background at once, combined across fire_and_forget_replicas writes
+# (_write()) *and* read-repair write-backs (_try_read_repair()) — one
+# shared pool, not one cap per category — mirroring Go's
+# backgroundReplicaSem and Rust's background_replica_permits. Once the
+# cap is reached, further fire_and_forget_replicas legs fall back to
+# running synchronously, the same as with the option off; a read-repair
+# write-back past the cap is simply skipped, since it has no synchronous
+# fallback. Mutable only so tests can shrink it, mirroring
+# _KEEPALIVE_INTERVAL.
 _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
 
 # The longest a request header can ever legally be: marker + space + up to
@@ -122,7 +128,11 @@ _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
 # _encode_delete in _connection.py). Rounded well up so _MAX_REQUEST_BYTES
 # below can be computed without pushing key+value right up against the
 # server's own limit and letting the header alone tip a request over it.
-_MAX_REQUEST_HEADER_BYTES = 64
+# 256, matching Rust's MAX_REQUEST_BYTES (client.rs) and Go's
+# maxRequestBytes (client.go) headroom — standardised across the SDKs
+# (issue #47 audit) so the same key+value fits or fails identically
+# regardless of which client sends it.
+_MAX_REQUEST_HEADER_BYTES = 256
 
 # Mirrors nanocached-node's own MAX_REQUEST_SIZE (src/server.rs, 1 MiB) —
 # the cap on a whole request frame (header + key + value) — minus headroom
@@ -235,14 +245,19 @@ class NanocachedClient:
         self._compress: bool = False
         self._compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD
         self._fire_and_forget_replicas: bool = False
+        # Shared by both fire_and_forget_replicas writes (_write()) and
+        # read-repair write-backs (_try_read_repair()): both are gated on
+        # len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_
+        # REPLICA_WRITES before a task is ever created, so the two
+        # categories draw from ONE combined pool of at most
+        # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES in flight — mirroring
+        # Go's backgroundReplicaSem and Rust's background_replica_permits,
+        # which are likewise a single semaphore shared across both paths
+        # (issue #47 audit item 5). A previous, separate
+        # asyncio.Semaphore(32) just for read-repair let the two
+        # categories admit up to twice the intended cap combined.
         self._background_replica_writes: set[asyncio.Task[None]] = set()
         self._read_repair: bool = False
-        # Bounds concurrent read-repair write-backs the same way
-        # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES bounds fire-and-forget
-        # replica writes — see _try_read_repair().
-        self._read_repair_write_semaphore = asyncio.Semaphore(
-            _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
-        )
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -422,17 +437,23 @@ class NanocachedClient:
         value — that same value repairs the true primary in the
         background, with TTL _READ_REPAIR_TTL (the original TTL can't be
         recovered from a GET, and TTL 0 would permanently resurrect
-        already-expired data). The write-back is bounded and tracked the
-        same way fire_and_forget_replicas writes are (a shared semaphore
-        capped at _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES, registered in
-        _background_replica_writes), so close() drains it too instead of
-        leaving it dangling. Every failure along the way is swallowed; only a failed
-        repair *write-back* is counted in stats().read_repair_failures —
-        a failed owner probe is silent, matching the counter's write-back
-        semantics in the other five SDKs (issue #43). Nothing here may
-        turn an already-accepted miss into an error — except a genuine
-        programming error (anything outside _SWALLOWABLE_ERRORS), which
-        still propagates."""
+        already-expired data). The write-back shares its admission check
+        and its tracking set (_background_replica_writes) with
+        fire_and_forget_replicas writes in _write() — one combined pool of
+        at most _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES in flight, exactly
+        as Go's backgroundReplicaSem and Rust's background_replica_permits
+        are shared across both paths (issue #47 audit item 5) — so
+        close() drains it too instead of leaving it dangling. Past the cap,
+        or once close() has started (self._closed), the repair for this
+        miss is simply skipped: it's opportunistic (a later miss repairs
+        the key instead), and unlike a replica write there's no
+        synchronous fallback available here. Every failure along the way
+        is swallowed; only a failed repair *write-back* is counted in
+        stats().read_repair_failures — a failed owner probe is silent,
+        matching the counter's write-back semantics in the other five SDKs
+        (issue #43). Nothing here may turn an already-accepted miss into
+        an error — except a genuine programming error (anything outside
+        _SWALLOWABLE_ERRORS), which still propagates."""
         names = self._owner_names(key)
         for name in names:
             try:
@@ -447,17 +468,26 @@ class NanocachedClient:
                 primary = names[0]
 
                 async def repair(primary: str = primary, value: bytes = value) -> None:
-                    async with self._read_repair_write_semaphore:
-                        try:
-                            connection = await self._member_connection(primary)
-                            await connection.set(key, value, _READ_REPAIR_TTL)
-                        except _SWALLOWABLE_ERRORS:
-                            # Swallowed by design — see the docstring.
-                            self._read_repair_failures += 1
+                    try:
+                        connection = await self._member_connection(primary)
+                        await connection.set(key, value, _READ_REPAIR_TTL)
+                    except _SWALLOWABLE_ERRORS:
+                        # Swallowed by design — see the docstring.
+                        self._read_repair_failures += 1
 
-                task = asyncio.ensure_future(repair())
-                self._background_replica_writes.add(task)
-                task.add_done_callback(self._background_replica_writes.discard)
+                # Recheck self._closed here, immediately before
+                # registering the task: close() sets it before draining
+                # _background_replica_writes, so a get_bytes() call still
+                # in flight when close() runs must not add a new entry
+                # that drain has already (or is about to have) taken its
+                # snapshot of — see close()'s own comment.
+                if (
+                    not self._closed
+                    and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+                ):
+                    task = asyncio.ensure_future(repair())
+                    self._background_replica_writes.add(task)
+                    task.add_done_callback(self._background_replica_writes.discard)
             return value
         return None
 
@@ -479,9 +509,17 @@ class NanocachedClient:
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
             raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
+        # Validate the *original* value's size before compressing, matching
+        # Rust's and Go's Set — an oversized value must be rejected outright,
+        # not silently forwarded just because DEFLATE happens to shrink it
+        # under the cap (issue #47 audit; Rust/Go's own bound is on the
+        # pre-compression value for the same reason). Re-checked after
+        # compression too, purely as a defense-in-depth backstop should
+        # compress_value ever grow a value instead of shrinking it.
+        _check_key_and_value(key_bytes, value_bytes)
         if self._compress:
             value_bytes = compress_value(value_bytes, self._compression_threshold)
-        _check_key_and_value(key_bytes, value_bytes)
+            _check_key_and_value(key_bytes, value_bytes)
         await self._before_operation()
         await self._with_wrong_node_retry(
             lambda: self._write(
@@ -533,7 +571,15 @@ class NanocachedClient:
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-        if self._background_replica_writes:
+        # Looped, not a single gather: every registration site rechecks
+        # self._closed immediately before adding to this set (issue #47
+        # audit item 4), so nothing should slip in after it's set above —
+        # but draining in a loop, like Go's Close() re-checking its
+        # WaitGroup, means anything that did would still be awaited here
+        # instead of leaking past close() and surfacing later as an
+        # "exception was never retrieved" warning with nothing left to
+        # report it to.
+        while self._background_replica_writes:
             await asyncio.gather(
                 *list(self._background_replica_writes), return_exceptions=True
             )
@@ -632,12 +678,19 @@ class NanocachedClient:
         replica_tasks = []
         for name in replicas:
             # doc/adr/0014-*.md: with fire_and_forget_replicas, up to
-            # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES legs run in the
-            # background instead of being waited for below — past that
-            # cap, further legs fall back to the synchronous path exactly
-            # as with the option off.
+            # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES legs — shared with
+            # read-repair write-backs, see _background_replica_writes'
+            # own comment in __init__ (issue #47 audit item 5) — run in
+            # the background instead of being waited for below. Past that
+            # cap, or once close() has started (self._closed, rechecked
+            # here immediately before registering the task — close() sets
+            # it before draining, so a write() still in flight when close()
+            # runs must not add an entry that drain has already, or is
+            # about to have, taken its snapshot of), further legs fall
+            # back to the synchronous path exactly as with the option off.
             if (
                 self._fire_and_forget_replicas
+                and not self._closed
                 and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
             ):
                 task = asyncio.ensure_future(replica_write(name))

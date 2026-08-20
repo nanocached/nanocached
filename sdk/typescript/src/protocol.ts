@@ -24,7 +24,10 @@ function tagField(tag: number | undefined): string {
 // 10-digit TTL + up to 10-digit tag + LF. Rounded well up so MAX_REQUEST_BYTES
 // below can be computed without pushing key+value right up against the
 // server's own limit and letting the header alone tip a request over it.
-const MAX_REQUEST_HEADER_LENGTH = 64;
+// 256 bytes, standardized across every SDK (Go/Rust's original value;
+// Java's and .NET's headroom constants match — issue: cross-SDK audit
+// finding, headroom constants had drifted to 64/1024 in different SDKs).
+const MAX_REQUEST_HEADER_LENGTH = 256;
 
 // Mirrors nanocached-node's own `MAX_REQUEST_SIZE` (src/server.rs, 1 MiB) —
 // the cap on a whole request frame (header + key + value) — minus headroom
@@ -158,7 +161,16 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         buf[0] === MARKER_STORED ? "stored" : buf[0] === MARKER_DELETED ? "deleted" : buf[0] === MARKER_NOT_FOUND ? "notFound" : "wrongNode";
 
       if (!tagged) {
-        return buf.length < 2 ? null : { response: { kind }, consumed: 2 };
+        if (buf.length < 2) return null;
+        // The untagged form is always exactly `<marker>\n` — a second
+        // byte other than LF means the server tagged a response on an
+        // untagged connection (or some other desync), and every later
+        // response would be misaligned too (issue: audit finding,
+        // unverified trailing byte on the untagged fast path).
+        if (buf[1] !== LF) {
+          throw new NanocachedError("nanocached: unexpected byte after response marker (connection desynced)");
+        }
+        return { response: { kind }, consumed: 2 };
       }
 
       const headerEnd = buf.indexOf(LF);

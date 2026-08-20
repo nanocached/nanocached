@@ -26,6 +26,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -203,14 +204,15 @@ public final class NanocachedClient implements AutoCloseable {
     // *whole* frame, header included. Validating key/value length against
     // that exact number would still let a caller build a frame that trips
     // it once the "G "/"S "/"D "/lengths/ttl/tag header text and framing
-    // are added, so this constant carries 1 KiB of headroom for that
-    // header — comfortably more than any header this SDK ever writes
-    // (issue: audit finding J2). Catching an oversize request here, before
-    // it ever reaches Connection, avoids the confusing alternative of the
-    // server silently closing the connection with no response (a bare
-    // key+value length rejection is never sent back — see
-    // request_is_too_large in server.rs).
-    private static final int MAX_REQUEST_BYTES = 1024 * 1024 - 1024;
+    // are added, so this constant carries headroom for that header —
+    // comfortably more than any header this SDK ever writes (issue: audit
+    // finding J2). 256 bytes, standardized across every SDK (Go/Rust's
+    // original value; TypeScript's and .NET's headroom constants match).
+    // Catching an oversize request here, before it ever reaches Connection,
+    // avoids the confusing alternative of the server silently closing the
+    // connection with no response (a bare key+value length rejection is
+    // never sent back — see request_is_too_large in server.rs).
+    private static final int MAX_REQUEST_BYTES = 1024 * 1024 - 256;
 
     public static Options builder() {
         return new Options();
@@ -248,6 +250,16 @@ public final class NanocachedClient implements AutoCloseable {
     // the option off. Mutable only so tests can shrink it, mirroring
     // keepAliveIntervalMillis.
     static volatile int maxInFlightBackgroundReplicaWrites = 32;
+    // Headroom above maxInFlightBackgroundReplicaWrites for replicaWriters'
+    // fixed thread count (see openCluster): background legs are capped by
+    // backgroundReplicaWritePermits, but synchronous-fallback legs (option
+    // off, or the cap already reached) are not permit-gated and can pile up
+    // from many concurrent write() calls — this headroom lets a burst of
+    // them run with real parallelism instead of only ever queueing, without
+    // reintroducing newCachedThreadPool's unbounded thread growth. Chosen,
+    // not derived: no formula makes this precise, just generous enough in
+    // practice.
+    private static final int REPLICA_WRITER_POOL_HEADROOM = 16;
 
     // Tracks, per connect() target (not per instance — mirrors
     // sdk/typescript/src/client.ts's openTargets), how many open sockets
@@ -505,11 +517,19 @@ public final class NanocachedClient implements AutoCloseable {
         replication = cluster.replication();
         backgroundReplicaWritePermitCount = maxInFlightBackgroundReplicaWrites;
         backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
-        replicaWriters = Executors.newCachedThreadPool(runnable -> {
-            Thread thread = new Thread(runnable, "nanocached-replica-writer");
-            thread.setDaemon(true);
-            return thread;
-        });
+        // Bounded (not newCachedThreadPool, which grows one thread per
+        // submitted task with no cap) — see REPLICA_WRITER_POOL_HEADROOM.
+        // The queue backing a fixed-size pool is unbounded, so a burst
+        // beyond the fixed thread count simply queues rather than being
+        // rejected or blocking the submitter; only the thread count itself
+        // is bounded (issue: audit finding, unbounded replica-writer
+        // threads).
+        replicaWriters = Executors.newFixedThreadPool(
+                backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM, runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-replica-writer");
+                    thread.setDaemon(true);
+                    return thread;
+                });
     }
 
     // ── 公開 API ──────────────────────────────────────────────────
@@ -582,7 +602,13 @@ public final class NanocachedClient implements AutoCloseable {
      * the way (connection lost, WrongNode, another miss) is swallowed;
      * nothing here may turn an already-accepted miss into an error. A
      * failure repairing the primary specifically is counted via
-     * {@link #stats()}'s readRepairFailures. */
+     * {@link #stats()}'s readRepairFailures. The write-back is bounded by
+     * — and drained on {@link #close()} through — the same
+     * {@link #backgroundReplicaWritePermits} pool as a fireAndForgetReplicas
+     * replica leg (doc/adr/0014-*.md): past the cap, the repair for this
+     * miss is simply skipped, since read repair is opportunistic and a
+     * later miss on the same key repairs it (issue: audit finding,
+     * unbounded/undrained read-repair write-backs). */
     private byte[] tryReadRepair(byte[] key) {
         List<String> names = ownerNames(key);
         for (String name : names) {
@@ -594,10 +620,10 @@ public final class NanocachedClient implements AutoCloseable {
             }
             if (value == null) continue;
 
-            if (!names.isEmpty()) {
+            if (!names.isEmpty() && backgroundReplicaWritePermits.tryAcquire()) {
                 String primary = names.get(0);
                 byte[] repairValue = value;
-                replicaWriters.execute(() -> {
+                Runnable repair = () -> {
                     try {
                         applyReconnecting(() -> memberConnection(primary), connection -> {
                             connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS);
@@ -612,7 +638,19 @@ public final class NanocachedClient implements AutoCloseable {
                         // being treated identically to a dead primary.
                         readRepairFailures.incrementAndGet();
                     }
-                });
+                };
+                try {
+                    CompletableFuture.runAsync(repair, replicaWriters)
+                            .whenComplete((ignoredResult, ignoredError) ->
+                                    backgroundReplicaWritePermits.release());
+                } catch (RejectedExecutionException rejected) {
+                    // close() shut replicaWriters down concurrently — see
+                    // the matching handling in write(). The repair is
+                    // opportunistic, so simply release the permit and skip
+                    // it rather than run it inline; a later miss repairs
+                    // the primary anyway.
+                    backgroundReplicaWritePermits.release();
+                }
             }
             return value;
         }
@@ -715,7 +753,10 @@ public final class NanocachedClient implements AutoCloseable {
             return;
         }
         closed = true;
-        if (keepAlive != null) keepAlive.shutdownNow();
+        if (keepAlive != null) {
+            keepAlive.shutdownNow();
+            awaitTerminationQuietly(keepAlive);
+        }
         // doc/adr/0014-*.md: give background replica writes a chance to
         // finish before their connections are torn out from under them.
         // Acquiring every permit — rather than snapshotting the future
@@ -730,8 +771,31 @@ public final class NanocachedClient implements AutoCloseable {
         if (backgroundReplicaWritePermits != null) {
             backgroundReplicaWritePermits.acquireUninterruptibly(backgroundReplicaWritePermitCount);
         }
-        if (replicaWriters != null) replicaWriters.shutdown();
+        if (replicaWriters != null) {
+            replicaWriters.shutdown();
+            awaitTerminationQuietly(replicaWriters);
+        }
         teardown();
+    }
+
+    // Bounds close()'s wait for an already-shutdown executor's worker
+    // threads to actually finish exiting — without this, close() could
+    // return (and teardown() tear the connections out from under any
+    // still-running task) before every task genuinely stopped running,
+    // even though every permit/future it cared about was already
+    // accounted for above (issue: audit finding, close() not awaiting
+    // termination). A few seconds is generous: by the time shutdown()/
+    // shutdownNow() runs here, every task either already completed (the
+    // permit-drain above) or was already interrupted (keepAlive), so this
+    // is just waiting out thread teardown itself, not real work.
+    private static final long EXECUTOR_TERMINATION_TIMEOUT_SECONDS = 5;
+
+    private static void awaitTerminationQuietly(ExecutorService executor) {
+        try {
+            executor.awaitTermination(EXECUTOR_TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void teardown() {
@@ -802,13 +866,20 @@ public final class NanocachedClient implements AutoCloseable {
 
         // Owners in rank order; fall through only on connection-level
         // failure — a replica hedges against a dead holder, not a miss.
+        // Narrowed to NanocachedException, matching write()'s replicaWrite
+        // catch (~line 836): WrongNode is already peeled off by the catch
+        // above, so this only ever sees ConnectionFailed/AlreadyClosed/etc,
+        // and a genuine programming bug (e.g. a NullPointerException)
+        // propagates instead of being treated identically to a dead owner
+        // and silently retried against the next one (issue: audit finding,
+        // overbroad RuntimeException catch).
         RuntimeException lastError = null;
         for (String name : ownerNames(key)) {
             try {
                 return applyReconnecting(() -> memberConnection(name), op);
             } catch (NanocachedException.WrongNode error) {
                 throw error;
-            } catch (RuntimeException error) {
+            } catch (NanocachedException error) {
                 lastError = error;
             }
         }
@@ -853,13 +924,24 @@ public final class NanocachedClient implements AutoCloseable {
             // cap, further legs fall back to the synchronous path exactly
             // as with the option off.
             if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
-                CompletableFuture.runAsync(replicaWrite, replicaWriters)
-                        .whenComplete((ignoredResult, ignoredError) ->
-                                backgroundReplicaWritePermits.release());
+                try {
+                    CompletableFuture.runAsync(replicaWrite, replicaWriters)
+                            .whenComplete((ignoredResult, ignoredError) ->
+                                    backgroundReplicaWritePermits.release());
+                } catch (RejectedExecutionException rejected) {
+                    // close() shut replicaWriters down concurrently: the
+                    // permit was already acquired, but the task was never
+                    // submitted, so whenComplete would never run to release
+                    // it — release it here instead of leaking it, and run
+                    // the leg inline rather than losing it (issue: audit
+                    // finding, background-write permit leak on close race).
+                    backgroundReplicaWritePermits.release();
+                    replicaWrite.run();
+                }
                 continue;
             }
 
-            replicaWrites.add(CompletableFuture.runAsync(replicaWrite, replicaWriters));
+            replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
 
         try {
@@ -868,6 +950,23 @@ public final class NanocachedClient implements AutoCloseable {
             for (CompletableFuture<Void> pending : replicaWrites) {
                 pending.join();
             }
+        }
+    }
+
+    /** Submits {@code replicaWrite} to {@link #replicaWriters}, falling
+     * back to running it inline on this thread if the pool was
+     * concurrently shut down by {@link #close()} — the synchronous-fallback
+     * counterpart of the fire-and-forget path's own
+     * {@code RejectedExecutionException} handling in {@link #write}, so a
+     * write racing close() never throws a raw
+     * {@link RejectedExecutionException} out to the caller (issue: audit
+     * finding, background-write permit leak on close race). */
+    private CompletableFuture<Void> submitReplicaWrite(Runnable replicaWrite) {
+        try {
+            return CompletableFuture.runAsync(replicaWrite, replicaWriters);
+        } catch (RejectedExecutionException rejected) {
+            replicaWrite.run();
+            return CompletableFuture.completedFuture(null);
         }
     }
 
@@ -1060,6 +1159,12 @@ public final class NanocachedClient implements AutoCloseable {
                     // Node names are per-process UUIDs; a departed node's
                     // redial gate would otherwise leak forever (issue #12).
                     redialLocks.remove(entry.getKey());
+                    // Same leak, for the same reason, on the per-address
+                    // cooldown map: a departed node's address is never
+                    // reused, so its cooldown entry (if any) would
+                    // otherwise linger forever (issue: audit finding,
+                    // unpruned reconnectCooldowns).
+                    reconnectCooldowns.remove(entry.getValue().address);
                     return true;
                 }
                 return false;

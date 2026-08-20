@@ -101,6 +101,15 @@ describe("tryParseResponse", () => {
     assert.equal(tryParseResponse(Buffer.from("S")), null);
   });
 
+  it("throws when an untagged S/D/N/W response's second byte isn't a newline", () => {
+    // Issue: audit finding — the untagged form is always exactly
+    // `<marker>\n`; a second byte other than LF means the streams are
+    // desynced (this used to be accepted silently, with consumed: 2).
+    for (const wire of ["SX", "DX", "NX", "WX"]) {
+      assert.throws(() => tryParseResponse(Buffer.from(wire)), /connection desynced/);
+    }
+  });
+
   it("parses a value response", () => {
     const parsed = tryParseResponse(Buffer.from("V 5\nhello"));
     assert.equal(parsed?.consumed, 9);

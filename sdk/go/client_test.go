@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -1502,6 +1503,118 @@ func TestSteadyNewRequestsDoNotPostponeHalfOpenDetection(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("Get took %v, want well under 2s", elapsed)
+	}
+}
+
+// TestAnUnterminatedResponseHeaderFailsInsteadOfGrowingWithoutBound is a
+// regression for the unbounded bufio.Reader.ReadString('\n') this SDK
+// used to read every response header: a peer that never sends the '\n'
+// terminator made the client's read buffer grow without bound (issue
+// #47 audit; mirrors Rust's MAX_HEADER_LINE_LENGTH regression coverage
+// in rust/tests/client.rs). readLine's maxHeaderLineLength cap must
+// fail the request instead.
+func TestAnUnterminatedResponseHeaderFailsInsteadOfGrowingWithoutBound(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	// Loops accepting connections (mirrors mockNode.acceptLoop): every
+	// connection gets the same treatment, so the client's built-in
+	// redial-and-retry-once on ErrConnectionLost (see
+	// TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently)
+	// hits an oversized header again on the retry instead of a dead
+	// listener backlog entry, keeping this test fast regardless of that
+	// retry.
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+
+				// The `A` handshake.
+				header, err := reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				parts := strings.Fields(header)
+				_ = mustRead(reader, atoiOrPanic(parts[1])) // the secret
+				if _, err := conn.Write([]byte("On\n")); err != nil {
+					return
+				}
+
+				// The `G` request.
+				header, err = reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				parts = strings.Fields(header)
+				_ = mustRead(reader, atoiOrPanic(parts[1])) // the key
+
+				// A `V` header that streams 5 KiB and never terminates
+				// with '\n'.
+				_, _ = conn.Write(append([]byte("V"), bytes.Repeat([]byte("9"), 5*1024)...))
+			}(conn)
+		}
+	}()
+
+	client, err := Connect(Config{Addresses: []Address{addr(listener.Addr().String())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	started := time.Now()
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get against a peer streaming an unterminated header = %v, want ErrConnectionLost", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Get took %v, want well under 2s (bounded by maxHeaderLineLength, not requestTimeout)", elapsed)
+	}
+}
+
+// fakeFinalChunkWithEOF is an io.Reader that delivers its entire
+// remaining payload and io.EOF in the same Read call — the shape a real
+// net.Conn can produce when a peer writes its last bytes and closes in
+// the same flush.
+type fakeFinalChunkWithEOF struct {
+	data []byte
+}
+
+func (f *fakeFinalChunkWithEOF) Read(p []byte) (int, error) {
+	n := copy(p, f.data)
+	f.data = f.data[n:]
+	return n, io.EOF
+}
+
+// TestReadFullSucceedsWhenTheFinalReadDeliversAllBytesAndEOFTogether is a
+// regression for the hand-rolled readFull this SDK used to have: it
+// returned whatever error the final underlying Read produced even when
+// that Read had delivered every remaining byte (issue #47 audit),
+// wrongly failing a peer that writes its last bytes and closes in the
+// same flush. readFull now wraps io.ReadFull, whose io.ReadAtLeast
+// forces the error to nil once enough bytes have been read regardless
+// of what accompanied them.
+func TestReadFullSucceedsWhenTheFinalReadDeliversAllBytesAndEOFTogether(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 32)
+	source := &fakeFinalChunkWithEOF{data: append([]byte(nil), payload...)}
+	// A bufio.Reader whose internal buffer (bufio's own 16-byte floor)
+	// is no larger than the destination slice below forces Read to
+	// bypass its own buffering and call source.Read directly with the
+	// full-sized p — the only way to observe a single Read that both
+	// completes the request and reports an error together.
+	reader := bufio.NewReaderSize(source, 16)
+	buf := make([]byte, len(payload))
+	n, err := readFull(reader, buf)
+	if err != nil {
+		t.Fatalf("readFull = _, %v, want nil", err)
+	}
+	if n != len(payload) || !bytes.Equal(buf, payload) {
+		t.Fatalf("readFull = %q, %d, want %q, %d", buf, n, payload, len(payload))
 	}
 }
 

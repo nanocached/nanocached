@@ -334,6 +334,15 @@ final class Connection {
     // or malicious frame, never just a legitimately large value.
     private static final int MAX_VALUE_LENGTH = 2 * 1024 * 1024;
 
+    // Header/tag lines (the marker line ahead of a V's body, or the whole
+    // line for S/D/N/W) are always a handful of bytes in the real
+    // protocol. Without a cap, a malicious or buggy node that streams
+    // bytes with no '\n' would grow readLine()'s buffer without bound,
+    // gated only by requestTimeoutMillis rather than failing fast — mirrors
+    // .NET's Connection.MaxHeaderLineLength and Rust's 4 KiB (issue: audit
+    // finding, unbounded readLine).
+    private static final int MAX_HEADER_LINE_LENGTH = 4096;
+
     /** This connection's only reader, for its whole lifetime — nothing
      * else may read from {@code in}. Consumes responses off the wire and
      * dispatches each to the oldest pending request (FIFO —
@@ -438,12 +447,12 @@ final class Connection {
             // Busy is always bare (ADR-0019): it's an unsolicited
             // pre-auth response, never an answer to a tagged request.
             case 'B' -> {
-                readByte(); // the trailing '\n'
+                expectLf(); // the trailing '\n'
                 return new Response(marker, null, -1);
             }
             case 'S', 'D', 'N', 'W' -> {
                 if (!tagged) {
-                    readByte(); // the trailing '\n'
+                    expectLf(); // the trailing '\n'
                     return new Response(marker, null, -1);
                 }
                 return new Response(marker, null, parseTag(readLine()));
@@ -473,10 +482,32 @@ final class Connection {
         return value;
     }
 
-    /** Reads up to (and consuming) the next '\n', returning what preceded it. */
+    /** Consumes one byte and verifies it is '\n' — used for the untagged
+     * fixed-shape responses (`S`/`D`/`N`/`W`/`B`), which are exactly two
+     * bytes on the wire. A byte other than '\n' here means the streams
+     * are desynced (e.g. a server that unexpectedly tagged a response on
+     * an untagged connection) and every later response would be
+     * misaligned too, so this must poison the connection rather than
+     * silently ignore the extra byte. */
+    private void expectLf() throws IOException {
+        int value = readByte();
+        if (value != '\n') {
+            throw new NanocachedException.ConnectionFailed(
+                    "nanocached: unexpected byte after response marker (connection desynced)", null);
+        }
+    }
+
+    /** Reads up to (and consuming) the next '\n', returning what preceded
+     * it. Bounded by {@link #MAX_HEADER_LINE_LENGTH}: a malicious or
+     * buggy node streaming bytes with no '\n' must fail fast instead of
+     * growing this buffer without bound. */
     private String readLine() throws IOException {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         for (int b = readByte(); b != '\n'; b = readByte()) {
+            if (line.size() >= MAX_HEADER_LINE_LENGTH) {
+                throw new NanocachedException.ConnectionFailed(
+                        "nanocached: response header line too long", null);
+            }
             line.write(b);
         }
         return line.toString(StandardCharsets.US_ASCII).trim();

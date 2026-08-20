@@ -541,11 +541,16 @@ internal sealed class Connection
         return tag;
     }
 
+    // Reused across every call instead of allocating a fresh byte[1] each
+    // time (audit finding): safe because ReadLoopAsync is this connection's
+    // only reader, for its whole lifetime (see the class doc comment) — no
+    // other call can be mid-ReadByteAsync concurrently.
+    private readonly byte[] _readByteBuffer = new byte[1];
+
     private async Task<byte> ReadByteAsync()
     {
-        var single = new byte[1];
-        await _stream.ReadExactlyAsync(single).ConfigureAwait(false);
-        return single[0];
+        await _stream.ReadExactlyAsync(_readByteBuffer).ConfigureAwait(false);
+        return _readByteBuffer[0];
     }
 
     /// <summary>Reads up to (and consuming) the next '\n'.</summary>

@@ -174,7 +174,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, interval, timeout};
+use tokio::time::{Instant, interval, timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const READ_CHUNK_SIZE: usize = 256;
@@ -304,8 +304,32 @@ fn waiting_timeout_for(queue_position: usize) -> Duration {
         .saturating_add(WAITING_TIMEOUT_MARGIN)
 }
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds how long a connection may hold one of `MAX_CONNECTIONS` open
+/// without ever successfully parsing a single complete command (issue:
+/// slowloris via `MAX_CONNECTIONS` exhaustion). `IDLE_TIMEOUT` alone
+/// doesn't bound this: a connection that trickles in one byte just under
+/// `IDLE_TIMEOUT` apart resets the per-read timeout forever without ever
+/// finishing a frame. This is a fixed deadline measured from when the
+/// connection started (not reset per read, unlike `IDLE_TIMEOUT`), so no
+/// amount of slow byte-at-a-time trickling extends it — see
+/// `handle_connection`'s `unidentified_deadline`. Set equal to
+/// `IDLE_TIMEOUT`: a well-behaved peer sends its first command in one
+/// write, well under either bound, so this only ever fires for a
+/// connection already behaving like an attack. Once any command is
+/// successfully parsed, this bound stops applying — `IDLE_TIMEOUT` alone
+/// governs from then on, exactly as before this fix.
+const UNIDENTIFIED_CONNECTION_TIMEOUT: Duration = IDLE_TIMEOUT;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backoff applied after an `accept()` failure that looks like file-
+/// descriptor exhaustion (EMFILE/ENFILE, see `is_fd_exhaustion_error`) —
+/// issue: `listener.accept()`'s error used to be propagated with `?`,
+/// killing the whole process on what is, for this and every other
+/// recoverable accept() error (ECONNABORTED, ENOBUFS, ...), a transient
+/// condition. Retrying immediately under fd exhaustion would just spin
+/// the accept loop hot instead of giving descriptors a chance to free up;
+/// short enough not to meaningfully delay recovery once they do.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// Bounds every outbound dial and ack read this process makes toward a
 /// node (`M`/`X`, issue #6): without it, one node that accepts TCP but
 /// never answers freezes the single sweep task — and with it all
@@ -319,6 +343,20 @@ const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// side (same fixed-attempt-count, fresh-connection-each-time shape).
 const MIGRATE_SEND_ATTEMPTS: u32 = 3;
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
+/// Upper bound on a `name`/`joining_name` field's length, enforced at
+/// parse time (`parse_two_string_fields`/`parse_three_string_fields`).
+/// Both `nanocached-node` and `verify-staged-join` only ever generate a
+/// v4 UUID (`Uuid::new_v4().to_string()`, 36 bytes — see `src/server.rs`,
+/// ADR-0009) for a name, so 128 is far more headroom than any legitimate
+/// value ever needs, while still bounding how much of `MAX_REQUEST_SIZE`
+/// — and, more to the point, how much of every registry entry
+/// (`NodeInfo`, keyed by name) and every `L`/`M` response listing it —
+/// one field can consume.
+const MAX_NAME_LENGTH: usize = 128;
+/// Upper bound on a `token` field's length, same rationale and same
+/// headroom over the 36-byte v4 UUID `nanocached-node` actually generates
+/// (`NodeInfo::token`, issue #34) as `MAX_NAME_LENGTH`.
+const MAX_TOKEN_LENGTH: usize = 128;
 
 /// A registered node's place in the ADR-0008 join lifecycle: `Waiting`
 /// (registered, asked to join, but another join is already in progress)
@@ -422,19 +460,32 @@ impl NodeInfo {
 type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
 
 /// Tracks the single in-progress join (ADR-0008: only one node moves
-/// through `Waiting` -> `Joining` at a time). `completed` accumulates the
-/// names (ADR-0009) of ready nodes that have reported finishing their
-/// handoff via `C`; once it covers all of `expected`, the joining node is
-/// promoted. `started_at` backs the timeout that catches a ready node
-/// that's alive but never reports in (see `abandon_current_join`,
-/// `migration_timeout_for`), sized from `max_entries` — the largest
-/// entry count any ready node has reported acknowledging its `M` so far
-/// (doc/adr/0017-*.md), updated as each of `try_begin_next_join`'s
-/// parallel sends resolves. Starts at 0 (the bound is just
-/// `MIGRATION_TIMEOUT_BASE` until the first ack arrives).
+/// through `Waiting` -> `Joining` at a time). `expected` snapshots, at
+/// join start, every ready node this join is waiting on and the token
+/// (issue #34) it presented at that moment — name -> token, not a plain
+/// `HashSet<String>`. This is a security fix, not a convenience: names
+/// are public via `L`, and an unknown name is trust-on-first-use for
+/// `J`/`P` (ADR-0018), so if `handle_complete` instead checked a
+/// reporter's token against whatever the *live* registry entry holds, an
+/// attacker could wait for a ready node to be evicted (see
+/// `sweep_expired`'s own mid-join-eviction handling below, and the
+/// liveness/waiting-timeout paths generally), re-register its now-free
+/// name under a token of the attacker's choosing, and send a `C` crediting
+/// a handoff that member never performed — forging join completion.
+/// Checking against this snapshot instead means only the token that was
+/// actually registered when the join began can ever complete it.
+/// `completed` accumulates the names (ADR-0009) of ready nodes that have
+/// reported finishing their handoff via `C`; once it covers all of
+/// `expected`, the joining node is promoted. `started_at` backs the
+/// timeout that catches a ready node that's alive but never reports in
+/// (see `abandon_current_join`, `migration_timeout_for`), sized from
+/// `max_entries` — the largest entry count any ready node has reported
+/// acknowledging its `M` so far (doc/adr/0017-*.md), updated as each of
+/// `try_begin_next_join`'s parallel sends resolves. Starts at 0 (the
+/// bound is just `MIGRATION_TIMEOUT_BASE` until the first ack arrives).
 struct PendingJoin {
     joining_name: String,
-    expected: HashSet<String>,
+    expected: HashMap<String, String>,
     completed: HashSet<String>,
     started_at: Instant,
     max_entries: usize,
@@ -705,6 +756,55 @@ fn announce_insert_allowed(limiter: &AnnounceLimiter, peer_ip: std::net::IpAddr)
 
     guard.insert(peer_ip, now);
     true
+}
+
+/// Applies an announce (`P`) for `name`/`addr`/`token` against an
+/// already-registered entry, or reports `None` if `name` isn't currently
+/// registered — the caller decides separately how to admit it as new. A
+/// read-modify-write against this one entry, so the caller must hold
+/// `registry`'s lock across the call (see the `Announce` handler's own
+/// comment for why this is split out: admitting a genuinely new name also
+/// needs `announce_insert_allowed`'s rate-limit decision, which must run
+/// with the registry lock *not* held).
+fn apply_announce_to_existing(
+    guard: &mut FxHashMap<String, NodeInfo>,
+    name: &str,
+    addr: &str,
+    token: &str,
+    peer_ip: std::net::IpAddr,
+) -> Option<Result<(), &'static str>> {
+    match guard.get_mut(name) {
+        // Issue #34: an announce for a registered name is only the node
+        // itself re-declaring if it can present the token its
+        // registration established — checked before the mid-join check
+        // below, and before the caller lets this connection claim `name`,
+        // so a stranger's announce can neither re-point the node's
+        // address nor, by getting itself rejected, have its teardown run
+        // `on_node_connection_ended` against the real node's entry (which
+        // would let anyone abort an in-progress join by announcing its
+        // name).
+        Some(info) if !constant_time_eq(info.token.as_bytes(), token.as_bytes()) => {
+            eprintln!(
+                "WARN rejected announce for {name} from {peer_ip}: wrong token — either \
+                 an impersonation attempt (issue #34) or a node reusing another's name"
+            );
+            Some(Err(
+                "announce with a token that does not match the registered one",
+            ))
+        }
+        // A name mid-join announcing would corrupt the ADR-0008 join
+        // bookkeeping, and no correct node does it (announces only
+        // happen after promotion).
+        Some(info) if info.state != NodeState::Joined => {
+            Some(Err("announce for a node that is mid-join"))
+        }
+        Some(info) => {
+            info.address = addr.to_string();
+            info.last_heartbeat = Instant::now();
+            Some(Ok(()))
+        }
+        None => None,
+    }
 }
 
 struct Args {
@@ -1043,7 +1143,9 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 /// Parses two consecutive length-prefixed fields (`H`/`J`/`P`'s name then
 /// token — issue #34), checking both are fully buffered before consuming
 /// any of `input`, so `parse`'s "untouched on `Incomplete`" contract
-/// holds even though this reads across two fields in one call.
+/// holds even though this reads across two fields in one call. Bounds
+/// each field to `MAX_NAME_LENGTH`/`MAX_TOKEN_LENGTH` — see those
+/// constants' own doc comments for why.
 fn parse_two_string_fields(
     input: &mut BytesMut,
     header_end: usize,
@@ -1052,6 +1154,9 @@ fn parse_two_string_fields(
 ) -> Result<(String, String), ParseError> {
     if first_length == 0 || second_length == 0 {
         return Err(ParseError::EmptyField);
+    }
+    if first_length > MAX_NAME_LENGTH || second_length > MAX_TOKEN_LENGTH {
+        return Err(ParseError::InvalidLength);
     }
 
     let first_start = header_end + 1;
@@ -1077,7 +1182,8 @@ fn parse_two_string_fields(
 
 /// Parses three consecutive length-prefixed fields (`C`'s name, joining
 /// name, then token — issue #34), with the same "untouched on
-/// `Incomplete`" contract as `parse_two_string_fields`.
+/// `Incomplete`" contract as `parse_two_string_fields`. Bounds each field
+/// to `MAX_NAME_LENGTH`/`MAX_TOKEN_LENGTH`, same as that function.
 fn parse_three_string_fields(
     input: &mut BytesMut,
     header_end: usize,
@@ -1087,6 +1193,12 @@ fn parse_three_string_fields(
 ) -> Result<(String, String, String), ParseError> {
     if first_length == 0 || second_length == 0 || third_length == 0 {
         return Err(ParseError::EmptyField);
+    }
+    if first_length > MAX_NAME_LENGTH
+        || second_length > MAX_NAME_LENGTH
+        || third_length > MAX_TOKEN_LENGTH
+    {
+        return Err(ParseError::InvalidLength);
     }
 
     let first_start = header_end + 1;
@@ -1222,7 +1334,12 @@ async fn try_begin_next_join(
             return;
         }
 
-        let expected: HashSet<String> = joined.iter().map(|(name, _)| name.clone()).collect();
+        // Issue #34 forged-completion fix (see `PendingJoin::expected`'s
+        // own doc comment): snapshot each ready node's token as it stood
+        // at join start. `ready_tokens` was already captured in this same
+        // lock scope, keyed by the same names as `joined`, so this is
+        // just reusing it rather than a second registry pass.
+        let expected = ready_tokens.clone();
 
         *join_guard = Some(PendingJoin {
             joining_name: name.clone(),
@@ -1749,24 +1866,6 @@ async fn handle_complete(
     for_joining_name: &str,
     token: &str,
 ) {
-    // Issue #34: only the reporting node itself may credit its own
-    // handoff as done — a forged `C` would promote the joining node
-    // before it actually holds the reporter's share of the keyspace. A
-    // reporter with no registry entry can't be verified at all (it was
-    // swept mid-join; its report is moot — `abandon_current_join`'s
-    // machinery owns that case), so it is refused the same way.
-    let token_ok = lock(registry)
-        .get(reporting_name)
-        .is_some_and(|info| constant_time_eq(info.token.as_bytes(), token.as_bytes()));
-    if !token_ok {
-        eprintln!(
-            "WARN ignored handoff-complete report from {reporting_name} for \
-             {for_joining_name}: reporter is not registered or presented the wrong \
-             token (issue #34)"
-        );
-        return;
-    }
-
     let joining_name = {
         let mut join_guard = lock_current_join(current_join);
 
@@ -1781,7 +1880,33 @@ async fn handle_complete(
             return;
         }
 
-        if !pending.expected.contains(reporting_name) {
+        // Issue #34 forged-completion fix: verify `token` against the
+        // token `PendingJoin::expected` snapshotted for this name at join
+        // start, NOT whatever the *live* registry entry for
+        // `reporting_name` currently holds. Checking the live entry would
+        // let an attacker wait for `sweep_expired` (or a connection drop)
+        // to evict the real ready node, re-register its now-free name
+        // under a token of the attacker's own choosing (names are public
+        // via `L`; an unknown name is trust-on-first-use, ADR-0018), and
+        // then send a `C` crediting a handoff that member never
+        // performed. A reporter not in `expected` at all — never a ready
+        // member of this join, or already evicted from it by the
+        // mid-join-eviction handling in `sweep_expired` below — is
+        // rejected the same way `contains_key` already would have.
+        let Some(expected_token) = pending.expected.get(reporting_name) else {
+            eprintln!(
+                "WARN ignored handoff-complete report from {reporting_name} for \
+                 {for_joining_name}: not a ready member of this join (issue #34)"
+            );
+            return;
+        };
+        if !constant_time_eq(expected_token.as_bytes(), token.as_bytes()) {
+            eprintln!(
+                "WARN ignored handoff-complete report from {reporting_name} for \
+                 {for_joining_name}: presented token does not match the one recorded \
+                 when this join started — either a forged report or a stale one from a \
+                 node that re-registered under this name since (issue #34)"
+            );
             return;
         }
 
@@ -1932,7 +2057,7 @@ async fn abandon_current_join(
         let guard = lock(registry);
         pending
             .expected
-            .iter()
+            .keys()
             .filter_map(|name| {
                 guard
                     .get(name)
@@ -2067,6 +2192,29 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
+/// Whether `error` (from a failed `listener.accept()`) looks like the
+/// process (EMFILE) or the whole system (ENFILE) being out of file
+/// descriptors — the two accept() failures where retrying immediately
+/// would spin the accept loop hot instead of recovering (see
+/// `ACCEPT_ERROR_BACKOFF`). EMFILE/ENFILE share the same numeric errno on
+/// every Unix this project targets (Linux, macOS/BSD), so this hardcodes
+/// them rather than pulling in a `libc` dependency for two integers. Any
+/// other accept() error (ECONNABORTED, ENOBUFS, ...) is still logged and
+/// retried immediately by the caller — just without the backoff, since
+/// those aren't a resource-pressure condition an immediate retry would
+/// make worse.
+#[cfg(unix)]
+fn is_fd_exhaustion_error(error: &io::Error) -> bool {
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+    matches!(error.raw_os_error(), Some(EMFILE) | Some(ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion_error(_error: &io::Error) -> bool {
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     address: &str,
@@ -2137,7 +2285,24 @@ async fn run(
             }
 
             result = listener.accept() => {
-                let (stream, address) = result?;
+                // Issue: this used to be `result?`, tearing down the
+                // whole discovery process on any accept() failure — most
+                // of which (ECONNABORTED: the peer reset before the
+                // handshake completed; EMFILE/ENFILE/ENOBUFS: transient
+                // resource pressure) are recoverable and say nothing
+                // about this listener's own health. Log and keep serving
+                // instead; only a backoff (fd exhaustion specifically)
+                // changes the loop's pace, never its continuation.
+                let (stream, address) = match result {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        eprintln!("WARN accept failed: {error}");
+                        if is_fd_exhaustion_error(&error) {
+                            tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                        }
+                        continue;
+                    }
+                };
 
                 dispatch_connection(
                     stream,
@@ -2327,12 +2492,48 @@ async fn sweep_expired(
                     }
                     keep
                 });
-                for name in heartbeat_evicted {
+                for name in &heartbeat_evicted {
                     eprintln!(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
                         liveness_timeout.as_secs()
                     );
                 }
+
+                // Issue #34 forged-completion fix, other half (see
+                // `PendingJoin::expected`'s doc comment): a `Joined` node
+                // evicted here for missing heartbeats may be one of the
+                // current join's own ready members, still expected but not
+                // yet `completed`. Left alone, the join would either hang
+                // until `migration_timeout_for` eventually reaps it, or —
+                // worse — sit there long enough for an attacker to
+                // re-register the now-free name (names are public via `L`;
+                // an unknown name is trust-on-first-use, ADR-0018) and
+                // forge a `C` for a handoff that member never performed.
+                // `handle_complete`'s token-snapshot check already closes
+                // that specific forgery, but abandoning immediately is
+                // still strictly better than waiting on the timeout for a
+                // member that is provably gone. A no-op if none of the
+                // evicted names are part of the current join.
+                let ready_member_evicted_mid_join = lock_current_join(&current_join)
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        heartbeat_evicted.iter().any(|name| {
+                            pending.expected.contains_key(name)
+                                && !pending.completed.contains(name)
+                        })
+                    });
+                if ready_member_evicted_mid_join {
+                    abandon_current_join(
+                        &registry,
+                        &current_join,
+                        &auth_secret,
+                        &tls_connector,
+                        replication,
+                        "ready member evicted mid-join",
+                    )
+                    .await;
+                }
+
                 for (name, promoted) in waiting_evicted {
                     eprintln!(
                         "WARN node evicted: {name} (never promoted; waiting-to-join timeout \
@@ -2380,9 +2581,23 @@ async fn handle_connection(
     // No secret configured means auth isn't required, so every connection
     // starts already authenticated.
     let mut authenticated = config.auth_secret.is_none();
+    // Issue (slowloris via MAX_CONNECTIONS exhaustion): whether this
+    // connection has ever successfully parsed a single complete command.
+    // `IDLE_TIMEOUT` alone resets on every partial read, so a connection
+    // that trickles in one byte at a time — never completing a frame —
+    // can otherwise hold a `MAX_CONNECTIONS` slot open indefinitely.
+    // `unidentified_deadline` below bounds that; once `identified` flips
+    // true it no longer applies, and `IDLE_TIMEOUT` governs exactly as
+    // before this fix.
+    let mut identified = false;
+    let unidentified_deadline = Instant::now() + UNIDENTIFIED_CONNECTION_TIMEOUT;
 
     loop {
-        match parse(&mut received) {
+        let parsed = parse(&mut received);
+        if parsed.is_ok() {
+            identified = true;
+        }
+        match parsed {
             Ok(DiscoveryCommand::Auth { secret, tagging }) => {
                 let accepted = match &config.auth_secret {
                     Some(expected) => constant_time_eq(&secret, expected),
@@ -2631,77 +2846,81 @@ async fn handle_connection(
             Ok(DiscoveryCommand::Announce { name, port, token }) => {
                 let addr = format!("{peer_ip}:{port}");
 
-                let rejection = {
-                    let mut guard = lock(&registry);
-                    let at_capacity = guard.len() >= MAX_REGISTRY_SIZE;
-                    // Issue: `P` holds no connection open the way `J`
-                    // does, so nothing else bounds how fast one source can
-                    // grow the registry toward `MAX_REGISTRY_SIZE` via
-                    // connect -> `A` -> `P` -> disconnect, repeated under a
-                    // fresh name each time. Only computed (and only ever
-                    // records this source in the limiter) for a genuinely
-                    // new name — a refresh of an existing entry never
-                    // touches the limiter, so a legitimate node's own
-                    // reconnect/re-announce cadence is unaffected no
-                    // matter how frequent. Short-circuits on `at_capacity`
-                    // so a registry that's already full doesn't also spend
-                    // a limiter slot on a source it's about to reject
-                    // anyway. See `announce_insert_allowed`.
-                    let rate_limited = !at_capacity
-                        && !guard.contains_key(&name)
-                        && !announce_insert_allowed(&config.announce_limiter, peer_ip);
-                    match guard.get_mut(&name) {
-                        // Issue #34: an announce for a registered name is
-                        // only the node itself re-declaring if it can
-                        // present the token its registration established
-                        // — checked before the mid-join check below, and
-                        // before this connection claims `name` (further
-                        // below), so a stranger's announce can neither
-                        // re-point the node's address nor, by getting
-                        // itself rejected, have its teardown run
-                        // `on_node_connection_ended` against the real
-                        // node's entry (which would let anyone abort an
-                        // in-progress join by announcing its name).
-                        Some(info)
-                            if !constant_time_eq(info.token.as_bytes(), token.as_bytes()) =>
-                        {
-                            eprintln!(
-                                "WARN rejected announce for {name} from {peer_ip}: wrong \
-                                 token — either an impersonation attempt (issue #34) or a \
-                                 node reusing another's name"
-                            );
-                            Some("announce with a token that does not match the registered one")
-                        }
-                        // A name mid-join announcing would corrupt the
-                        // ADR-0008 join bookkeeping, and no correct node
-                        // does it (announces only happen after promotion).
-                        Some(info) if info.state != NodeState::Joined => {
-                            Some("announce for a node that is mid-join")
-                        }
-                        Some(info) => {
-                            info.address = addr;
-                            info.last_heartbeat = Instant::now();
-                            None
-                        }
-                        None if at_capacity => Some("registry is full"),
-                        None if rate_limited => {
-                            eprintln!(
-                                "WARN rejected announce for {name} from {peer_ip}: too many \
-                                 new registrations from this source within \
-                                 {}s (see ANNOUNCE_INSERT_COOLDOWN)",
-                                ANNOUNCE_INSERT_COOLDOWN.as_secs()
-                            );
-                            Some("too many new announces from this source; retry shortly")
-                        }
-                        None => {
-                            println!("INFO node announced: {name} at {addr} (re-registered)");
-                            guard.insert(
-                                name.clone(),
-                                NodeInfo::new(addr, NodeState::Joined, token),
-                            );
-                            None
-                        }
+                // Issue: `announce_insert_allowed` (only reached for a
+                // genuinely new name, below) is a *different* mutex
+                // (`AnnounceLimiter`) than the registry's, and when its
+                // own map is full it does a bounded-but-non-trivial
+                // linear eviction scan (`MAX_ANNOUNCE_LIMITER_ENTRIES`).
+                // Running that scan while still holding the registry
+                // lock would block every other connection's registry
+                // access (heartbeats, `L`, other joins) for no reason,
+                // since the limiter's own state needs no protection from
+                // the registry lock. So: an existing-name outcome (token
+                // check / mid-join rejection / refresh) is a read-modify-
+                // write on that one entry and stays atomic under a single
+                // lock acquisition; only a genuinely new name drops the
+                // lock to consult the limiter, then re-acquires to
+                // insert — re-validated against fresh state, since
+                // another connection could have changed either while the
+                // lock was released.
+                let rejection = 'decide: {
+                    let existing = {
+                        let mut guard = lock(&registry);
+                        apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip)
+                    };
+                    match existing {
+                        Some(Ok(())) => break 'decide None,
+                        Some(Err(reason)) => break 'decide Some(reason),
+                        None => {}
                     }
+
+                    // Short-circuits on `at_capacity` so a registry
+                    // that's already full doesn't also spend a limiter
+                    // slot on a source it's about to reject anyway.
+                    if lock(&registry).len() >= MAX_REGISTRY_SIZE {
+                        break 'decide Some("registry is full");
+                    }
+
+                    // Issue: `P` holds no connection open the way `J`
+                    // does, so nothing else bounds how fast one source
+                    // can grow the registry toward `MAX_REGISTRY_SIZE`
+                    // via connect -> `A` -> `P` -> disconnect, repeated
+                    // under a fresh name each time. Only reached for a
+                    // genuinely new name (checked above) — a refresh of
+                    // an existing entry never touches the limiter, so a
+                    // legitimate node's own reconnect/re-announce cadence
+                    // is unaffected no matter how frequent. Deliberately
+                    // called with the registry lock NOT held (see this
+                    // arm's own comment above).
+                    if !announce_insert_allowed(&config.announce_limiter, peer_ip) {
+                        eprintln!(
+                            "WARN rejected announce for {name} from {peer_ip}: too many new \
+                             registrations from this source within {}s (see \
+                             ANNOUNCE_INSERT_COOLDOWN)",
+                            ANNOUNCE_INSERT_COOLDOWN.as_secs()
+                        );
+                        break 'decide Some(
+                            "too many new announces from this source; retry \
+                                            shortly",
+                        );
+                    }
+
+                    // Re-validate: another connection may have registered
+                    // this exact name, or filled the registry, while the
+                    // lock above was released for the limiter call.
+                    let mut guard = lock(&registry);
+                    if let Some(outcome) =
+                        apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip)
+                    {
+                        break 'decide outcome.err();
+                    }
+                    if guard.len() >= MAX_REGISTRY_SIZE {
+                        break 'decide Some("registry is full");
+                    }
+
+                    println!("INFO node announced: {name} at {addr} (re-registered)");
+                    guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined, token));
+                    None
                 };
 
                 if let Some(reason) = rejection {
@@ -2761,12 +2980,32 @@ async fn handle_connection(
 
         received.reserve(READ_CHUNK_SIZE);
 
+        // Issue (slowloris): bound this read by whichever of the ordinary
+        // per-read idle timeout and the connection's total unidentified
+        // lifetime is tighter. `unidentified_deadline` is a fixed point in
+        // time (unlike `IDLE_TIMEOUT`, which resets every read), so no
+        // amount of trickling small reads in just under it extends the
+        // bound — see `identified`'s doc comment above.
+        let read_deadline = if identified {
+            Instant::now() + config.idle_timeout
+        } else {
+            unidentified_deadline.min(Instant::now() + config.idle_timeout)
+        };
+
         let bytes_read = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
 
-            result = timeout(config.idle_timeout, stream.read_buf(&mut received)) => {
+            result = timeout_at(read_deadline, stream.read_buf(&mut received)) => {
                 result.map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout")
+                    if !identified && Instant::now() >= unidentified_deadline {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "connection did not complete a single command within the \
+                             unidentified-connection timeout",
+                        )
+                    } else {
+                        io::Error::new(io::ErrorKind::TimedOut, "connection idle timeout")
+                    }
                 })??
             }
         };
@@ -2918,6 +3157,54 @@ mod tests {
     fn parse_rejects_a_heartbeat_with_an_empty_token() {
         let mut input = BytesMut::from(&b"H 9 2 0\nsome-name"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn parse_rejects_a_heartbeat_whose_name_exceeds_max_name_length() {
+        // Both a node's name and token are v4 UUIDs (36 bytes) in
+        // practice (ADR-0009, issue #34) — MAX_NAME_LENGTH/
+        // MAX_TOKEN_LENGTH bound the field at parse time regardless, so
+        // an oversized declared length can't bloat a registry entry or
+        // every `L`/`M` response that lists it.
+        let long_name = "n".repeat(MAX_NAME_LENGTH + 1);
+        let header = format!("H {} 0 5\n", long_name.len());
+        let mut input = BytesMut::from(format!("{header}{long_name}tok-a").as_bytes());
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_rejects_a_heartbeat_whose_token_exceeds_max_token_length() {
+        let long_token = "t".repeat(MAX_TOKEN_LENGTH + 1);
+        let header = format!("H 9 0 {}\n", long_token.len());
+        let mut input = BytesMut::from(format!("{header}some-name{long_token}").as_bytes());
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_accepts_a_heartbeat_with_fields_at_exactly_the_length_bounds() {
+        // Off-by-one check for the bounds above: exactly at the limit
+        // must still parse.
+        let name = "n".repeat(MAX_NAME_LENGTH);
+        let token = "t".repeat(MAX_TOKEN_LENGTH);
+        let header = format!("H {} 0 {}\n", name.len(), token.len());
+        let mut input = BytesMut::from(format!("{header}{name}{token}").as_bytes());
+        assert_eq!(
+            parse(&mut input),
+            Ok(DiscoveryCommand::Heartbeat {
+                name,
+                replication: None,
+                token,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rejects_a_complete_whose_joining_name_exceeds_max_name_length() {
+        let long_joining_name = "j".repeat(MAX_NAME_LENGTH + 1);
+        let header = format!("C 9 {} 5\n", long_joining_name.len());
+        let mut input =
+            BytesMut::from(format!("{header}some-name{long_joining_name}tok-a").as_bytes());
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
@@ -3830,7 +4117,7 @@ mod tests {
         // registration and make it stop counting against the cap.
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "unrelated-joiner".to_string(),
-            expected: HashSet::new(),
+            expected: HashMap::new(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
@@ -4177,7 +4464,9 @@ mod tests {
         );
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-x".to_string(),
-            expected: ["node-a".to_string()].into_iter().collect(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
@@ -4319,6 +4608,160 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&promoted, b"R\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forged_complete_after_a_ready_members_eviction_and_reregistration_is_rejected() {
+        // Issue #34 forged-completion fix (see `PendingJoin::expected`'s
+        // doc comment): node names are public via `L`, and `P` for an
+        // unknown name is trust-on-first-use (ADR-0018) — so once a ready
+        // member's registry entry is gone for any reason, an attacker can
+        // re-register its name under a token of their own choosing. Before
+        // this fix, `handle_complete` checked a `C`'s token against
+        // whatever the *live* registry entry for that name currently held,
+        // so this would forge a credited handoff the real node-a never
+        // performed. The registry entry is removed directly here (not via
+        // `sweep_expired`) so this test isolates the token-snapshot check
+        // itself, independent of the sibling fix that abandons a join when
+        // `sweep_expired` evicts one of its own ready members.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_node_a, mut node_b, registry, current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx.clone()).await;
+
+        // node-a's entry disappears (crash, out-of-band eviction, ...)
+        // while the join is still pending on it.
+        assert!(lock(&registry).remove("node-a").is_some());
+
+        // An attacker re-registers the now-free name with a token of its
+        // own choosing — trust-on-first-use accepts it, exactly as it
+        // would for a legitimate standby learning the name for the first
+        // time (ADR-0018).
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+        };
+        let (mut attacker, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config,
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        attacker
+            .write_all(b"P 6 9001 10\nnode-aevil-token")
+            .await
+            .unwrap();
+        let mut announce_ack = [0u8; 2];
+        attacker.read_exact(&mut announce_ack).await.unwrap();
+        assert_eq!(&announce_ack, b"R\n");
+        assert_eq!(
+            lock(&registry).get("node-a").map(|info| info.token.clone()),
+            Some("evil-token".to_string()),
+            "the attacker's re-registration must have won the name under its own token"
+        );
+
+        // The forged completion report, presenting the attacker's own
+        // (now genuinely "registered") token — this is exactly the
+        // report a check against the *live* registry entry would accept.
+        attacker
+            .write_all(b"C 6 6 10\nnode-anode-bevil-token")
+            .await
+            .unwrap();
+        let mut complete_ack = [0u8; 2];
+        attacker.read_exact(&mut complete_ack).await.unwrap();
+        assert_eq!(&complete_ack, b"A\n");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_ne!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joined),
+            "a forged C from a re-registered name was credited to a handoff it never \
+             performed"
+        );
+        // node-b's connection must still be parked, not promoted.
+        let mut byte = [0u8; 1];
+        let woken = tokio::time::timeout(Duration::from_millis(50), node_b.read(&mut byte)).await;
+        assert!(
+            woken.is_err(),
+            "node-b must not have been promoted by the forged report"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sweep_expired_abandons_the_join_when_an_expected_ready_member_is_evicted() {
+        // Issue #34 forged-completion fix, other half (see
+        // `PendingJoin::expected`'s doc comment and the sibling test
+        // above): `sweep_expired`'s ordinary liveness-eviction path must
+        // not leave a join dangling on a ready member it just removed —
+        // otherwise the join either hangs until `migration_timeout_for`,
+        // or leaves a window for the forged-report attack the sibling
+        // test exercises directly.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            Duration::from_secs(1),
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        // node-a's own liveness eviction (well under the migration
+        // timeout) must have abandoned the join immediately, not left it
+        // to `migration_timeout_for` to eventually reap.
+        assert!(
+            lock_current_join(&current_join).is_none(),
+            "the join must be abandoned once one of its expected ready members is evicted"
+        );
+        assert!(!lock(&registry).contains_key("node-a"));
+        assert!(
+            !lock(&registry).contains_key("node-b"),
+            "abandon_current_join must also strand the joining node's own entry"
+        );
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4608,6 +5051,61 @@ mod tests {
             roster.contains(&ready_addr),
             "roster should list node-a's address: {roster:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn handle_connection_is_closed_after_the_unidentified_connection_timeout() {
+        // Issue (slowloris via MAX_CONNECTIONS exhaustion): a connection
+        // that never completes a single valid command must not be able
+        // to hold its MAX_CONNECTIONS slot open for anywhere near
+        // `idle_timeout` — `idle_timeout` is set well above
+        // UNIDENTIFIED_CONNECTION_TIMEOUT here so this test isolates the
+        // new, tighter bound specifically, not the ordinary idle timeout
+        // it already had.
+        let (client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: UNIDENTIFIED_CONNECTION_TIMEOUT * 3,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        // Never sends anything — never completes a command, so
+        // `identified` never flips true.
+        tokio::task::yield_now().await;
+        tokio::time::advance(UNIDENTIFIED_CONNECTION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), connection_task)
+            .await
+            .expect(
+                "the connection must be closed once the unidentified-connection timeout \
+                 elapses, not held open for the full (much larger) idle_timeout",
+            )
+            .unwrap();
+
+        assert!(
+            result.is_err(),
+            "a connection that never completes a command must be closed"
+        );
+        // Kept alive for the whole test so the socket isn't dropped/reset
+        // before the server side observes the timeout on its own.
+        drop(client);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5154,6 +5652,12 @@ mod tests {
         tls.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
 
+        // Without this, the connection sits open and the server task only
+        // finishes after IDLE_TIMEOUT (60s) — see the equivalent fix on
+        // the node's own `dispatch_connection_serves_commands_over_tls`,
+        // `src/server.rs`.
+        tls.shutdown().await.unwrap();
+
         server_task.await.unwrap();
     }
 
@@ -5377,7 +5881,9 @@ mod tests {
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-c".to_string(),
-            expected: ["node-a".to_string()].into_iter().collect(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
@@ -5442,7 +5948,9 @@ mod tests {
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-b".to_string(),
-            expected: ["node-a".to_string()].into_iter().collect(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
@@ -5486,7 +5994,9 @@ mod tests {
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-b".to_string(),
-            expected: ["node-a".to_string()].into_iter().collect(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
@@ -5540,7 +6050,9 @@ mod tests {
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-b".to_string(),
-            expected: ["node-a".to_string()].into_iter().collect(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 100_000,
@@ -5553,7 +6065,12 @@ mod tests {
             None,
             None,
             2,
-            Duration::from_secs(60),
+            // Well above the advance below, so node-a's own liveness
+            // eviction (and the mid-join-eviction abandon it would now
+            // trigger, issue #34) doesn't confound what this test is
+            // actually about: the size-derived *migration* timeout, not
+            // the liveness one.
+            Duration::from_secs(600),
             shutdown_rx,
         ));
 

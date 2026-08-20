@@ -1,7 +1,7 @@
 {
   "name": "nanocached",
   "version": "0.2.0",
-  "description": "TypeScript SDK for nanocached — a tiny distributed cache with client-side consistent hashing",
+  "description": "TypeScript SDK for nanocached, a tiny distributed cache with client-side replication",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,7 +16,7 @@
     "nanocached",
     "cache",
     "distributed-cache",
-    "consistent-hashing",
+    "rendezvous-hashing",
     "client",
     "sdk"
   ],

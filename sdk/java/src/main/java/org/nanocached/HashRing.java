@@ -2,7 +2,9 @@ package org.nanocached;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.PriorityQueue;
 
 /**
  * Rendezvous (highest-random-weight) hashing over a fixed node list (see
@@ -57,29 +59,52 @@ public final class HashRing {
     /**
      * The key's owners: the {@code replicas} highest-scoring nodes,
      * primary first. Returns fewer when the cluster is smaller.
+     *
+     * <p>Top-{@code replicas} selection via a bounded max-heap of the
+     * {@code replicas} best candidates seen so far (O(n log replicas))
+     * instead of sorting every node (O(n log n)) — replicas is typically a
+     * small constant (2-5) while a cluster can have many nodes, so this
+     * avoids paying for a full ranking this call only ever uses the front
+     * of. Produces the identical ordering a full sort would (same
+     * comparator, {@link #order}), just without sorting the nodes this
+     * call discards.
      */
     public List<String> owners(byte[] key, int replicas) {
         long keyHash = fnv1a(key);
+        int limit = Math.min(replicas, nodes.size());
+        if (limit <= 0) return List.of();
 
-        record Scored(long score, String node) {}
-        List<Scored> scored = new ArrayList<>(nodes.size());
+        // The heap holds the `limit` best candidates seen so far, ordered
+        // by `order` REVERSED — so its root (PriorityQueue.peek(), the
+        // "least" element under whatever comparator it's given) is always
+        // the WORST of those kept, the one to evict when a better
+        // candidate shows up.
+        PriorityQueue<Scored> heap = new PriorityQueue<>(limit, ORDER.reversed());
         for (int i = 0; i < nodes.size(); i++) {
-            scored.add(new Scored(fmix64(nodeHashes[i] ^ keyHash), nodes.get(i)));
+            Scored candidate = new Scored(fmix64(nodeHashes[i] ^ keyHash), nodes.get(i));
+            if (heap.size() < limit) {
+                heap.add(candidate);
+            } else if (ORDER.compare(candidate, heap.peek()) < 0) {
+                heap.poll();
+                heap.add(candidate);
+            }
         }
 
-        // Descending by UNSIGNED score; ties toward the lexicographically
-        // smaller name — a total order every implementation agrees on.
-        scored.sort((a, b) -> {
-            int byScore = Long.compareUnsigned(b.score(), a.score());
-            return byScore != 0 ? byScore : a.node().compareTo(b.node());
-        });
-
-        List<String> result = new ArrayList<>(Math.min(replicas, scored.size()));
-        for (int i = 0; i < Math.min(replicas, scored.size()); i++) {
-            result.add(scored.get(i).node());
-        }
+        List<Scored> best = new ArrayList<>(heap);
+        best.sort(ORDER);
+        List<String> result = new ArrayList<>(best.size());
+        for (Scored s : best) result.add(s.node());
         return result;
     }
+
+    private record Scored(long score, String node) {}
+
+    // Descending by UNSIGNED score; ties toward the lexicographically
+    // smaller name — a total order every implementation agrees on.
+    private static final Comparator<Scored> ORDER = (a, b) -> {
+        int byScore = Long.compareUnsigned(b.score(), a.score());
+        return byScore != 0 ? byScore : a.node().compareTo(b.node());
+    };
 
     /** The key's primary — {@code owners(key, 1).get(0)}. */
     public String route(byte[] key) {

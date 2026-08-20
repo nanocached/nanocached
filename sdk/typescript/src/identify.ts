@@ -17,8 +17,8 @@ export interface IdentifyOptions {
   connectDeadlineMs?: number;
 }
 
-/** A node's consistent-hashing identity (a random per-process UUID) and
- * its network address (`host:port`) — two different things since
+/** A node's hash-ring identity (a random per-process UUID) and its
+ * network address (`host:port`) — two different things since
  * doc/adr/0009-*.md. `name` is what a hash ring must be built from, so
  * every party (this client, another client, or a node computing a
  * handoff) agrees on cluster membership; `address` is only for opening a

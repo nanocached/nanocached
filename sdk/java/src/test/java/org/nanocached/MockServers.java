@@ -45,6 +45,15 @@ final class MockServers {
         private final AtomicInteger swallowedGets = new AtomicInteger();
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
+        /** Queues a one-off G reply whose `V` header never terminates with
+         * '\n' — regression coverage for the unbounded readLine() growth
+         * fix (issue: audit finding, MAX_HEADER_LINE_LENGTH). */
+        private final AtomicInteger runawayHeaderReplies = new AtomicInteger();
+        /** Queues a one-off untagged fixed-shape (`N`) reply whose second
+         * byte is something other than '\n' — regression coverage for the
+         * unverified-trailing-byte fix (issue: audit finding, "connection
+         * desynced" on a bad trailer). */
+        private final AtomicInteger badTrailerReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
         private volatile boolean failSets = false;
         private volatile boolean silent = false;
@@ -143,6 +152,20 @@ final class MockServers {
          * wrong kind, as a desynced (off-by-one) stream would produce. */
         void answerStoredToGetOnce() {
             storedToGetReplies.incrementAndGet();
+        }
+
+        /** Queue a one-off G reply that streams a `V` marker followed by
+         * bytes with no '\n' ever — a malicious/buggy node's header that
+         * would otherwise grow the client's line buffer without bound. */
+        void answerRunawayHeaderOnce() {
+            runawayHeaderReplies.incrementAndGet();
+        }
+
+        /** Queue a one-off G miss (`N`) reply whose second byte is not
+         * '\n' — the untagged fixed-shape response is always exactly two
+         * bytes on the wire, so anything else here is a desync. */
+        void answerBadTrailerOnce() {
+            badTrailerReplies.incrementAndGet();
         }
 
         /** Holds every future S reply for {@code millis} first — for tests
@@ -263,12 +286,33 @@ final class MockServers {
                                 out.flush();
                                 break;
                             }
+                            if (runawayHeaderReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                                // 'V' followed by 5 KiB with no '\n' — never
+                                // a legal header, so the client must fail
+                                // fast (MAX_HEADER_LINE_LENGTH) instead of
+                                // growing its line buffer forever.
+                                byte[] junk = new byte[5 * 1024];
+                                java.util.Arrays.fill(junk, (byte) 'x');
+                                out.write('V');
+                                out.write(junk);
+                                out.flush();
+                                break;
+                            }
                             if (takeWrongNode()) {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 byte[] value = store.get(key);
                                 if (value == null) {
-                                    out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                    if (badTrailerReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                                        // Two bytes, as the untagged form
+                                        // always is, but the second isn't
+                                        // '\n' — a desync the client must
+                                        // catch rather than silently accept.
+                                        out.write(("N" + tagSuffix).getBytes(StandardCharsets.US_ASCII));
+                                        out.write('X');
+                                    } else {
+                                        out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                    }
                                 } else {
                                     out.write(("V " + value.length + tagSuffix + "\n")
                                             .getBytes(StandardCharsets.US_ASCII));
