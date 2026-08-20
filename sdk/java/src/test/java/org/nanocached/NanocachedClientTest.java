@@ -31,13 +31,7 @@ class NanocachedClientTest {
 
     private static void waitFor(java.util.function.BooleanSupplier condition, String what)
             throws InterruptedException {
-        // Generous relative to how fast the awaited work is locally: these
-        // conditions settle in well under a second, but a loaded CI runner
-        // can stall a background leg (e.g. the read-repair writer) for
-        // several seconds, so the deadline only has to be comfortably below
-        // the 30s per-test @Timeout, not tight. Returns the instant the
-        // condition holds, so a longer deadline never slows the happy path.
-        long deadline = System.nanoTime() + 20_000_000_000L;
+        long deadline = System.nanoTime() + 5_000_000_000L;
         while (!condition.getAsBoolean()) {
             if (System.nanoTime() > deadline) throw new AssertionError("timed out waiting for " + what);
             Thread.sleep(5);
@@ -934,20 +928,21 @@ class NanocachedClientTest {
             cluster.nodes().get(owners.get(1)).store.put(
                     MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
                     "from-replica".getBytes(StandardCharsets.UTF_8));
-            // Delays the primary's reply to the repair write (not the
-            // initial miss, which is a G) long enough that closing the
-            // primary right after getBytes() returns reliably lands before
-            // that write is acknowledged.
-            primary.delaySets(300);
+            // The primary stays up and misses the initial G (its store is
+            // empty), so read-repair triggers and aims its write back at
+            // the primary — but every S there is dropped (connection reset)
+            // rather than acked, so the repair deterministically fails and
+            // is counted. Deterministic in place of the previous
+            // delaySets()+close() race, which was timing-flaky on loaded
+            // CI runners.
+            primary.failSets();
 
             try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
                 assertArrayEquals("from-replica".getBytes(StandardCharsets.UTF_8),
                         client.getBytes("k").orElseThrow());
 
-                primary.close();
-
                 waitFor(() -> client.stats().readRepairFailures() >= 1,
-                        "the repair write to the now-dead primary to fail and be counted");
+                        "the repair write to the primary to fail and be counted");
             }
         }
     }

@@ -31,6 +31,7 @@ final class MockServers {
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
+        private volatile boolean failSets = false;
         /** The TTL (whole seconds; 0 if omitted on the wire) from the
          * most recent S request this server received. */
         volatile long lastSetTtl = 0;
@@ -80,6 +81,15 @@ final class MockServers {
          * (doc/adr/0014-*.md). */
         void delaySets(long millis) {
             setDelayMillis = millis;
+        }
+
+        /** Drops the connection (server-side reset) on every S instead of
+         * acking it, so a write here fails with a connection error — for
+         * tests that need a repair/replica write to deterministically
+         * fail without racing a close(). Reads (G) are unaffected, so a
+         * node can still miss the initial lookup that triggers the repair. */
+        void failSets() {
+            failSets = true;
         }
 
         /** Server-side FIN on every open connection, like the idle timeout. */
@@ -163,6 +173,13 @@ final class MockServers {
                             // parts[3], when present, is the TTL (omitted
                             // on the wire means "no expiry", i.e. 0).
                             lastSetTtl = parts.length > 3 ? Long.parseLong(parts[3]) : 0;
+                            if (failSets) {
+                                // Reset the connection instead of acking:
+                                // the frame is fully consumed above, so the
+                                // client sees a clean connection error on
+                                // the write, not a desync.
+                                return;
+                            }
                             if (setDelayMillis > 0) {
                                 try {
                                     Thread.sleep(setDelayMillis);
