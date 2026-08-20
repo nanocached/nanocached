@@ -66,11 +66,20 @@ const MAX_VALUE_LENGTH = 2 * 1024 * 1024;
 // unboundedly (issue #12 follow-up).
 const MAX_VALUE_HEADER_LENGTH = 2 + String(MAX_VALUE_LENGTH).length + 1;
 
+// A tag is a u32 in decimal (ADR-0019) — the longest a tagged
+// fixed-response frame (`S <tag>\n`) can ever be. Bounds the header
+// search the same way MAX_VALUE_HEADER_LENGTH does for `V`.
+const MAX_TAG = 0xffffffff;
+const MAX_TAGGED_FIXED_FRAME_LENGTH = 2 + String(MAX_TAG).length + 1;
+
 // The longest a complete `V` frame can ever be: its header plus the
-// value body. Exported so Connection can bound total per-frame
-// accumulation as a backstop covering every response kind, not just the
-// header search above.
-export const MAX_RESPONSE_FRAME_LENGTH = MAX_VALUE_HEADER_LENGTH + MAX_VALUE_LENGTH;
+// value body — including the echoed tag a tagged-mode header carries
+// (`V <len> <tag>\n`, ADR-0019), so a legal near-max frame arriving in
+// chunks is never mistaken for a desynced one. Exported so Connection
+// can bound total per-frame accumulation as a backstop covering every
+// response kind, not just the header search above.
+export const MAX_RESPONSE_FRAME_LENGTH =
+  MAX_VALUE_HEADER_LENGTH + 1 + String(MAX_TAG).length + MAX_VALUE_LENGTH;
 
 const MARKER_STORED = 0x53; // 'S'
 const MARKER_DELETED = 0x44; // 'D'
@@ -79,12 +88,6 @@ const MARKER_BUSY = 0x42; // 'B'
 const MARKER_VALUE = 0x56; // 'V'
 const MARKER_WRONG_NODE = 0x57; // 'W'
 const LF = 0x0a;
-
-// A tag is a u32 in decimal (ADR-0019) — the longest a tagged
-// fixed-response frame (`S <tag>\n`) can ever be. Bounds the header
-// search the same way MAX_VALUE_HEADER_LENGTH does for `V`.
-const MAX_TAG = 0xffffffff;
-const MAX_TAGGED_FIXED_FRAME_LENGTH = 2 + String(MAX_TAG).length + 1;
 
 function parseTag(field: string): number {
   const tag = Number(field);

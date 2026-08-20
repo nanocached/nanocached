@@ -329,8 +329,13 @@ internal static class Identify
 
     internal static (string Host, int Port) SplitHostPort(string address)
     {
+        // The range check matters: an out-of-range port would otherwise
+        // surface later as a raw ArgumentOutOfRangeException from the
+        // socket layer instead of a NanocachedException.
         int separator = address.LastIndexOf(':');
-        if (separator == -1 || !int.TryParse(address[(separator + 1)..], out int port))
+        if (separator == -1
+            || !int.TryParse(address[(separator + 1)..], out int port)
+            || port is < 0 or > 65535)
         {
             throw new NanocachedException(
                 $"nanocached: invalid node address from discovery server: {address}");
