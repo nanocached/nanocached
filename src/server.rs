@@ -646,7 +646,9 @@ fn dispatch_connection(
 
         let _connection_permit = permit;
 
-        if let Err(error) = handle_connection(stream, request_tx, config, shutdown_rx).await {
+        if let Err(error) =
+            handle_connection(stream, address, request_tx, config, shutdown_rx).await
+        {
             eprintln!("WARN connection error from {address}: {error}");
         }
     });
@@ -696,6 +698,7 @@ fn encode_response(response: &Response, tag: Option<u32>) -> Vec<u8> {
 
 async fn handle_connection(
     mut stream: ServerStream,
+    address: SocketAddr,
     request_tx: mpsc::Sender<CacheRequest>,
     config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -774,6 +777,7 @@ async fn handle_connection(
             }
             Ok((
                 Command::Migrate {
+                    token,
                     joining_name,
                     joining_addr,
                     joined,
@@ -787,6 +791,26 @@ async fn handle_connection(
                         "received M but this node isn't configured with a discovery server",
                     ));
                 };
+
+                // The shared secret proves only "cluster member" (ADR-0005),
+                // not "the discovery server" — so without this every client
+                // holding it could send `M` and make this node stream its
+                // cache to an attacker-chosen address. Discovery echoes this
+                // node's own membership token (issue #34) on `M`; only a
+                // discovery server this node registered with knows it (no
+                // client does, and it's never sent back out — ADR-0018), so
+                // a mismatch means the sender isn't discovery. Reject loudly.
+                if !constant_time_eq(token.as_bytes(), node_context.token.as_bytes()) {
+                    eprintln!(
+                        "WARN rejected M from {address}: membership token mismatch \
+                         (sender is not this node's discovery server)"
+                    );
+                    write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "M carried the wrong membership token",
+                    ));
+                }
 
                 let (before_ring, after_ring) =
                     migration_rings(&node_context, &joining_name, &joined);
@@ -881,13 +905,33 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok((Command::CancelMigration { joining_name }, _)) => {
+            Ok((
+                Command::CancelMigration {
+                    token,
+                    joining_name,
+                },
+                _,
+            )) => {
                 let Some(node_context) = config.node_context.clone() else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "received X but this node isn't configured with a discovery server",
                     ));
                 };
+
+                // Same authorization as `M` (see there): without the token
+                // check any client holding the shared secret could abort a
+                // legitimate in-flight handoff just by sending `X`.
+                if !constant_time_eq(token.as_bytes(), node_context.token.as_bytes()) {
+                    eprintln!(
+                        "WARN rejected X from {address}: membership token mismatch \
+                         (sender is not this node's discovery server)"
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "X carried the wrong membership token",
+                    ));
+                }
 
                 // A safe no-op if there's no active migration, or it's for
                 // a different `joining_name` (already finished, or this
@@ -2323,6 +2367,12 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
+    /// A stand-in peer address for `handle_connection` in tests — only the
+    /// `M`/`X` token-mismatch WARN logs read it, never the control flow.
+    fn test_client_addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn run_cache_stores_and_retrieves_a_value() {
         let (request_tx, request_rx) = mpsc::channel(1);
@@ -2365,6 +2415,7 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2405,6 +2456,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2446,6 +2498,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2481,6 +2534,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2677,6 +2731,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2702,6 +2757,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2749,6 +2805,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2778,6 +2835,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2808,6 +2866,7 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2845,6 +2904,7 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2884,6 +2944,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2917,6 +2978,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -2947,6 +3009,7 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -3453,6 +3516,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -3478,8 +3542,15 @@ mod tests {
         // Chosen so HRW ranks it above "ready-node" for both test keys
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
-        let mut migrate_message =
-            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -3511,6 +3582,106 @@ mod tests {
         // deadlocks until `handle_connection`'s own idle timeout breaks
         // it, wasting `IDLE_TIMEOUT` (30s) on every run for nothing (the
         // same class of ordering bug `run`'s shutdown path had).
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        migration_relay.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_with_the_wrong_token_is_rejected_and_transfers_nothing() {
+        // Security regression (issue #34, node side): the shared secret only
+        // proves "cluster member", so an `M` from any client holding it must
+        // NOT be honored unless it echoes this node's own membership token —
+        // otherwise a client could make the node stream its cache to an
+        // attacker-chosen address. A wrong token must be rejected outright,
+        // no migration started, no `SET` forwarded anywhere.
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // An address the node would stream keys to if it (wrongly) honored
+        // the `M`. Nothing must ever connect here.
+        let attacker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_addr = attacker_listener.local_addr().unwrap().to_string();
+        let attacker_connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attacker_flag = Arc::clone(&attacker_connected);
+        let attacker_task = tokio::spawn(async move {
+            if attacker_listener.accept().await.is_ok() {
+                attacker_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
+                    discovery_addr: "127.0.0.1:1".to_string(),
+                    active_migration: Arc::new(Mutex::new(None)),
+                    known_ring: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+                migration_tx,
+            },
+            shutdown_rx.clone(),
+        ));
+
+        let joining_name = "joiner-107";
+        let wrong_token = "tk-not-mine";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            attacker_addr.len(),
+            wrong_token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(wrong_token.as_bytes());
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(attacker_addr.as_bytes());
+        client.write_all(&migrate_message).await.unwrap();
+
+        // The node rejects with `R\n` (MigrationRejected) and closes the
+        // connection — the read returns EOF right after the rejection.
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"R\n");
+
+        // Give any (wrongly) spawned migration a chance to dial out.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !attacker_connected.load(Ordering::SeqCst),
+            "a rejected M must never stream keys to the attacker address"
+        );
+
+        attacker_task.abort();
         client.shutdown().await.unwrap();
         let _ = connection_task.await;
         migration_relay.await.unwrap();
@@ -3584,6 +3755,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -3605,8 +3777,15 @@ mod tests {
         ));
 
         let joining_name = "joiner-107";
-        let mut migrate_message =
-            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -3683,6 +3862,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -3704,8 +3884,15 @@ mod tests {
         ));
 
         let first_joining_addr = "127.0.0.1:1";
-        let mut first_migrate_message =
-            format!("M {} {} 0 1\n", "joiner-a".len(), first_joining_addr.len()).into_bytes();
+        let token = "tk-ready-node";
+        let mut first_migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            "joiner-a".len(),
+            first_joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        first_migrate_message.extend_from_slice(token.as_bytes());
         first_migrate_message.extend_from_slice(b"joiner-a");
         first_migrate_message.extend_from_slice(first_joining_addr.as_bytes());
 
@@ -3715,8 +3902,14 @@ mod tests {
         assert_eq!(&first_ack, b"A 0\n");
 
         let second_joining_addr = "127.0.0.1:2";
-        let mut second_migrate_message =
-            format!("M {} {} 0 1\n", "joiner-b".len(), second_joining_addr.len()).into_bytes();
+        let mut second_migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            "joiner-b".len(),
+            second_joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        second_migrate_message.extend_from_slice(token.as_bytes());
         second_migrate_message.extend_from_slice(b"joiner-b");
         second_migrate_message.extend_from_slice(second_joining_addr.as_bytes());
 
@@ -3790,6 +3983,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -3813,8 +4007,15 @@ mod tests {
         // Chosen so HRW ranks it above "ready-node" for both test keys
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
-        let mut migrate_message =
-            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -3830,7 +4031,8 @@ mod tests {
         // discovery would really use, is equivalent from the node's side).
         set_received_rx.await.unwrap();
 
-        let mut cancel_message = format!("X {}\n", joining_name.len()).into_bytes();
+        let mut cancel_message = format!("X {} {}\n", joining_name.len(), token.len()).into_bytes();
+        cancel_message.extend_from_slice(token.as_bytes());
         cancel_message.extend_from_slice(joining_name.as_bytes());
         client.write_all(&cancel_message).await.unwrap();
 
@@ -3964,6 +4166,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -3987,8 +4190,15 @@ mod tests {
         // Chosen so HRW ranks it above "ready-node" for both test keys
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
-        let mut migrate_message =
-            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 
@@ -4078,6 +4288,7 @@ mod tests {
 
         let connection_task = tokio::spawn(handle_connection(
             ServerStream::Plain(server),
+            test_client_addr(),
             request_tx.clone(),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
@@ -4101,8 +4312,15 @@ mod tests {
         // Chosen so HRW ranks it above "ready-node" for both test keys
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
-        let mut migrate_message =
-            format!("M {} {} 0 1\n", joining_name.len(), joining_addr.len()).into_bytes();
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
 

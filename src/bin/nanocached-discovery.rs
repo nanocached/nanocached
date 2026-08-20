@@ -37,11 +37,14 @@
 //!                             below. Response: `A\n`.
 //!
 //!   L\n                       List currently `Joined` nodes. Response:
-//!                             `N <count>\n` followed by `count` lines,
-//!                             each `<name-length> <addr-length>\n
-//!                             <name><addr>` — `name` (ADR-0009) is what
-//!                             hash-ring computations use; `addr` is only
-//!                             for opening a connection. Refused with
+//!                             `N <count> <replication>\n` (the replication
+//!                             factor is this replica's own, issue #30)
+//!                             followed by `count` entries, each
+//!                             `<name-length> <addr-length>\n<name><addr>\n`
+//!                             — note the trailing newline after every
+//!                             entry. `name` (ADR-0009) is what hash-ring
+//!                             computations use; `addr` is only for opening
+//!                             a connection. Refused with
 //!                             `B\n` (connection then closed) if any
 //!                             currently-`Joined` node's last heartbeat
 //!                             reported a replication factor different
@@ -151,6 +154,7 @@ use bytes::{Bytes, BytesMut};
 use rustc_hash::FxHashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io;
 use std::io::BufReader;
@@ -1024,14 +1028,14 @@ async fn try_begin_next_join(
     // (a std::sync::MutexGuard, not Send) is unambiguously out of scope
     // before the awaits below — required for this (and everything that
     // calls it) to remain a Send future, which `tokio::spawn` needs.
-    let (name, joining_addr, joined) = {
+    let (name, joining_addr, joined, ready_tokens) = {
         let mut join_guard = lock_current_join(current_join);
 
         if join_guard.is_some() {
             return;
         }
 
-        let (name, joining_addr, joined) = {
+        let (name, joining_addr, joined, ready_tokens) = {
             let mut reg = lock(registry);
 
             let next_waiting = reg
@@ -1049,6 +1053,16 @@ async fn try_begin_next_join(
                 .map(|(name, info)| (name.clone(), info.address.clone()))
                 .collect();
 
+            // Each ready node's own token, so `M` can be sent with the
+            // token that node will verify (issue #34) — the roster above
+            // stays name+address only, since the wire `M` never carries
+            // anyone else's token.
+            let ready_tokens: HashMap<String, String> = reg
+                .iter()
+                .filter(|(_, info)| info.state == NodeState::Joined)
+                .map(|(name, info)| (name.clone(), info.token.clone()))
+                .collect();
+
             // Flip the state within the same lock acquisition used to find
             // and snapshot it, so a concurrent disconnect (which removes
             // the registry entry under this same lock, see
@@ -1061,7 +1075,7 @@ async fn try_begin_next_join(
                 None => return,
             }
 
-            (name, joining_addr, joined)
+            (name, joining_addr, joined, ready_tokens)
         };
 
         if joined.is_empty() {
@@ -1080,7 +1094,7 @@ async fn try_begin_next_join(
             max_entries: 0,
         });
 
-        (name, joining_addr, joined)
+        (name, joining_addr, joined, ready_tokens)
     };
 
     println!(
@@ -1096,9 +1110,13 @@ async fn try_begin_next_join(
         let joining_name = name.clone();
         let joining_addr = joining_addr.clone();
         let joined_roster = joined.clone();
+        // Every `Joined` node in `joined` was captured with its token in the
+        // same lock scope, so this lookup is always present.
+        let ready_token = ready_tokens.get(&ready_name).cloned().unwrap_or_default();
 
         sends.spawn(async move {
             let result = send_migrate_with_retry(
+                &ready_token,
                 &ready_name,
                 &ready_addr,
                 &auth_secret,
@@ -1157,6 +1175,7 @@ async fn try_begin_next_join(
 /// concern (see `send_migrate`'s own docs).
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate_with_retry(
+    token: &str,
     ready_name: &str,
     address: &str,
     auth_secret: &Option<Bytes>,
@@ -1171,6 +1190,7 @@ async fn send_migrate_with_retry(
 
     for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
         match send_migrate(
+            token,
             address,
             auth_secret,
             tls_connector,
@@ -1205,19 +1225,26 @@ async fn send_migrate_with_retry(
 /// the actual wire format, rather than a hand-maintained estimate that
 /// could silently drift out of sync with it.
 fn build_migrate_message(
+    token: &str,
     joining_name: &str,
     joining_addr: &str,
     joined: &[(String, String)],
     replication: usize,
 ) -> Vec<u8> {
+    // `token` is the *recipient* ready node's own membership token, echoed
+    // so the node can prove this `M` came from a discovery server it
+    // registered with (issue #34) — see `Command::Migrate::token` on the
+    // node side. Body layout: `<token><joining_name><joining_addr><entries>`.
     let mut message = format!(
-        "M {} {} {} {}\n",
+        "M {} {} {} {} {}\n",
         joining_name.len(),
         joining_addr.len(),
         joined.len(),
-        replication
+        replication,
+        token.len()
     )
     .into_bytes();
+    message.extend_from_slice(token.as_bytes());
     message.extend_from_slice(joining_name.as_bytes());
     message.extend_from_slice(joining_addr.as_bytes());
 
@@ -1240,6 +1267,7 @@ fn build_migrate_message(
 /// migration timeout (doc/adr/0017-*.md) — not otherwise used here.
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate(
+    token: &str,
     address: &str,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
@@ -1254,7 +1282,7 @@ async fn send_migrate(
     if let Some(secret) = auth_secret {
         let mut auth = format!("A {}\n", secret.len()).into_bytes();
         auth.extend_from_slice(secret);
-        stream.write_all(&auth).await?;
+        write_all_timed(&mut stream, &auth, io_timeout).await?;
 
         let mut ack = [0u8; 3];
         read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
@@ -1267,9 +1295,9 @@ async fn send_migrate(
         }
     }
 
-    let message = build_migrate_message(joining_name, joining_addr, joined, replication);
+    let message = build_migrate_message(token, joining_name, joining_addr, joined, replication);
 
-    stream.write_all(&message).await?;
+    write_all_timed(&mut stream, &message, io_timeout).await?;
 
     let line = read_line_timed(&mut stream, io_timeout).await?;
     let entries = line
@@ -1289,6 +1317,25 @@ async fn read_exact_timed(
     timeout(io_timeout, stream.read_exact(buf))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ack read timed out"))??;
+    Ok(())
+}
+
+/// `write_all` bounded by `io_timeout`. Without this bound a ready node
+/// that accepts the connection but stops draining its receive buffer (a
+/// crashed-but-open, blackholed, or malicious peer) would make this write
+/// block forever — and because `abandon_current_join`/`try_begin_next_join`
+/// await these sends, that would freeze `sweep_expired`, the sole task doing
+/// liveness eviction and migration-timeout reaping. Mirrors the read-side
+/// bound so the whole `M`/`X` exchange is time-bounded, exactly like
+/// `server.rs`'s `OUTBOUND_IO_TIMEOUT` machinery.
+async fn write_all_timed(
+    stream: &mut ClientStream,
+    buf: &[u8],
+    io_timeout: Duration,
+) -> io::Result<()> {
+    timeout(io_timeout, stream.write_all(buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))??;
     Ok(())
 }
 
@@ -1331,6 +1378,7 @@ async fn read_line_timed(stream: &mut ClientStream, io_timeout: Duration) -> io:
 /// handoff (safe no-op on its end) or will find out its `C` report goes
 /// nowhere once `current_join` has already moved on.
 async fn send_cancel(
+    token: &str,
     address: &str,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
@@ -1342,7 +1390,7 @@ async fn send_cancel(
     if let Some(secret) = auth_secret {
         let mut auth = format!("A {}\n", secret.len()).into_bytes();
         auth.extend_from_slice(secret);
-        stream.write_all(&auth).await?;
+        write_all_timed(&mut stream, &auth, io_timeout).await?;
 
         let mut ack = [0u8; 3];
         read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
@@ -1355,10 +1403,13 @@ async fn send_cancel(
         }
     }
 
-    let mut message = format!("X {}\n", joining_name.len()).into_bytes();
+    // `<token><joining_name>` — the recipient node's own token first, so it
+    // can prove this `X` came from discovery (see `send_migrate`/issue #34).
+    let mut message = format!("X {} {}\n", joining_name.len(), token.len()).into_bytes();
+    message.extend_from_slice(token.as_bytes());
     message.extend_from_slice(joining_name.as_bytes());
 
-    stream.write_all(&message).await?;
+    write_all_timed(&mut stream, &message, io_timeout).await?;
 
     let mut ack = [0u8; 2];
     read_exact_timed(&mut stream, &mut ack, io_timeout).await?;
@@ -1474,7 +1525,11 @@ async fn start_join(
             .filter(|(_, info)| info.state == NodeState::Joined)
             .map(|(joined_name, info)| (joined_name.clone(), info.address.clone()))
             .collect();
-        let message_len = build_migrate_message(name, &address, &joined_now, replication).len();
+        // The `M` recipients' tokens are all per-process UUIDs of the same
+        // length as this joining node's own `token`, so it stands in here
+        // for an accurate size estimate without looking each recipient up.
+        let message_len =
+            build_migrate_message(&token, name, &address, &joined_now, replication).len();
         if message_len > NODE_MAX_REQUEST_SIZE {
             return Err(JoinRejection::MigrateMessageTooLarge { message_len });
         }
@@ -1693,7 +1748,7 @@ async fn abandon_current_join(
         info.promoted.notify_one();
     }
 
-    let ready_addrs: Vec<(String, String)> = {
+    let ready_addrs: Vec<(String, String, String)> = {
         let guard = lock(registry);
         pending
             .expected
@@ -1701,20 +1756,21 @@ async fn abandon_current_join(
             .filter_map(|name| {
                 guard
                     .get(name)
-                    .map(|info| (name.clone(), info.address.clone()))
+                    .map(|info| (name.clone(), info.address.clone(), info.token.clone()))
             })
             .collect()
     };
 
     let mut sends = JoinSet::new();
 
-    for (ready_name, ready_addr) in ready_addrs {
+    for (ready_name, ready_addr, ready_token) in ready_addrs {
         let auth_secret = auth_secret.clone();
         let tls_connector = tls_connector.clone();
         let joining_name = pending.joining_name.clone();
 
         sends.spawn(async move {
             let result = send_cancel(
+                &ready_token,
                 &ready_addr,
                 &auth_secret,
                 &tls_connector,
@@ -2228,12 +2284,27 @@ async fn handle_connection(
                 // appropriate here, since a client bootstrapping now would
                 // otherwise compute a replica set some node in the
                 // cluster already disagrees with.
-                let mismatched_replication = lock(&registry).values().any(|info| {
-                    info.state == NodeState::Joined
-                        && info
-                            .reported_replication
-                            .is_some_and(|r| r != config.replication)
-                });
+                // The mismatch guard and the served roster are read under
+                // one lock acquisition so they're a consistent snapshot: a
+                // concurrent heartbeat/leave can't slip between "no node
+                // disagrees on replication" and the roster we then serve,
+                // which would otherwise let a `B\n`-worthy state be served
+                // as a valid `N` list (or vice versa) for one request.
+                let (mismatched_replication, nodes) = {
+                    let guard = lock(&registry);
+                    let mismatched = guard.values().any(|info| {
+                        info.state == NodeState::Joined
+                            && info
+                                .reported_replication
+                                .is_some_and(|r| r != config.replication)
+                    });
+                    let nodes: Vec<(String, String)> = guard
+                        .iter()
+                        .filter(|(_, info)| info.state == NodeState::Joined)
+                        .map(|(name, info)| (name.clone(), info.address.clone()))
+                        .collect();
+                    (mismatched, nodes)
+                };
                 if mismatched_replication {
                     eprintln!(
                         "WARN refusing L: a Joined node's last heartbeat reported a \
@@ -2246,12 +2317,6 @@ async fn handle_connection(
                     stream.write_all(b"B\n").await?;
                     return Ok(());
                 }
-
-                let nodes: Vec<(String, String)> = lock(&registry)
-                    .iter()
-                    .filter(|(_, info)| info.state == NodeState::Joined)
-                    .map(|(name, info)| (name.clone(), info.address.clone()))
-                    .collect();
                 let mut response = format!("N {} {}\n", nodes.len(), config.replication);
                 for (name, addr) in &nodes {
                     response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
@@ -3863,8 +3928,15 @@ mod tests {
         });
 
         let started = Instant::now();
-        let result =
-            send_cancel(&address, &None, &None, "node-b", Duration::from_millis(100)).await;
+        let result = send_cancel(
+            "ready-token",
+            &address,
+            &None,
+            &None,
+            "node-b",
+            Duration::from_millis(100),
+        )
+        .await;
         silent.abort();
 
         let error = result.expect_err("expected the silent node to time the ack read out");
@@ -4064,18 +4136,23 @@ mod tests {
         let joining_addr_length: usize = header.next().unwrap().parse().unwrap();
         let joined_count: usize = header.next().unwrap().parse().unwrap();
         let replication: usize = header.next().unwrap().parse().unwrap();
+        let token_length: usize = header.next().unwrap().parse().unwrap();
         assert_eq!(header.next(), None);
         assert_eq!(joined_count, 1);
         assert_eq!(replication, 2);
 
+        // Body: `<token><joining_name><joining_addr><roster>` — the token is
+        // node-a's own membership token, echoed so it can authenticate the M.
         let body = &message[header_end + 1..];
-        assert_eq!(&body[..joining_name_length], "node-b");
+        assert_eq!(&body[..token_length], "tk-node-a");
+        let after_token = &body[token_length..];
+        assert_eq!(&after_token[..joining_name_length], "node-b");
         assert_eq!(
-            &body[joining_name_length..joining_name_length + joining_addr_length],
+            &after_token[joining_name_length..joining_name_length + joining_addr_length],
             "127.0.0.1:9002"
         );
 
-        let roster = &body[joining_name_length + joining_addr_length..];
+        let roster = &after_token[joining_name_length + joining_addr_length..];
         assert!(
             roster.contains("node-a"),
             "roster should list node-a: {roster:?}"
@@ -4505,6 +4582,7 @@ mod tests {
         // A plaintext-only `send_migrate` call would never complete a TLS
         // handshake with this fake node and this would hang/error instead.
         send_migrate(
+            "ready-token",
             &address,
             &None,
             &Some(connector),
@@ -4519,7 +4597,8 @@ mod tests {
 
         node_task.await.unwrap();
 
-        let mut expected = b"M 12 11 0 2\n".to_vec();
+        let mut expected = b"M 12 11 0 2 11\n".to_vec();
+        expected.extend_from_slice(b"ready-token");
         expected.extend_from_slice(b"joining-node");
         expected.extend_from_slice(b"127.0.0.1:9");
         assert_eq!(*received.lock().unwrap(), expected);
@@ -4544,6 +4623,7 @@ mod tests {
         });
 
         let result = send_migrate_with_retry(
+            "ready-token",
             "ready-node",
             &address,
             &None,
@@ -4581,6 +4661,7 @@ mod tests {
         });
 
         let result = send_migrate_with_retry(
+            "ready-token",
             "ready-node",
             &address,
             &None,
@@ -4627,6 +4708,7 @@ mod tests {
         });
 
         send_cancel(
+            "ready-token",
             &address,
             &None,
             &Some(connector),
@@ -4638,7 +4720,8 @@ mod tests {
 
         node_task.await.unwrap();
 
-        let mut expected = b"X 12\n".to_vec();
+        let mut expected = b"X 12 11\n".to_vec();
+        expected.extend_from_slice(b"ready-token");
         expected.extend_from_slice(b"joining-node");
         assert_eq!(*received.lock().unwrap(), expected);
     }
@@ -4746,7 +4829,8 @@ mod tests {
         assert!(lock_current_join(&current_join).is_none());
         assert!(!lock(&registry).contains_key("node-b"));
 
-        let mut expected_cancel = b"X 6\n".to_vec();
+        let mut expected_cancel = b"X 6 9\n".to_vec();
+        expected_cancel.extend_from_slice(b"tk-node-a");
         expected_cancel.extend_from_slice(b"node-b");
         assert_eq!(*received.lock().unwrap(), expected_cancel);
     }

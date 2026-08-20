@@ -61,7 +61,18 @@ pub enum Command {
     /// "before" roster, to which `joining_name` is the "after" addition.
     /// `replication` is discovery's replication factor R (ADR-0011) — the
     /// single source nodes learn R from.
+    ///
+    /// `token` is *this receiving node's own* membership token (issue #34),
+    /// echoed back by discovery to prove the `M` really came from a
+    /// discovery server this node registered with — the only party that
+    /// knows it. This closes the gap where any holder of the shared secret
+    /// (every client) could otherwise send `M` directly and make the node
+    /// stream its cache to an attacker-chosen address. It does not violate
+    /// ADR-0018's "tokens are never sent back out" invariant: the token in
+    /// an `M` is the *recipient's* own token (which it already holds and no
+    /// client knows), never some other node's.
     Migrate {
+        token: String,
         joining_name: String,
         joining_addr: String,
         joined: Vec<(String, String)>,
@@ -73,7 +84,12 @@ pub enum Command {
     /// identifies which handoff to abandon (a node only ever has one
     /// active at a time, but a cancel for an already-finished or
     /// never-started one must be a safe no-op — see `run_migration`).
+    ///
+    /// `token` is this receiving node's own membership token, echoed by
+    /// discovery for the same reason as `Migrate::token` — otherwise any
+    /// client holding the shared secret could abort a legitimate handoff.
     CancelMigration {
+        token: String,
         joining_name: String,
     },
 }
@@ -314,18 +330,26 @@ fn parse_with_mode(
 
         b"X" => {
             let joining_name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
             }
 
             let joining_name_length = parse_length(joining_name_length)?;
+            let token_length = parse_length(token_length)?;
 
-            if joining_name_length == 0 {
+            if joining_name_length == 0 || token_length == 0 {
                 return Err(ParseError::EmptyField);
             }
 
-            let joining_name_start = header_end + 1;
+            // Body layout: `<token><joining_name>` — the token comes first
+            // so the connection handler can verify it before acting on the
+            // cancel (see `Command::CancelMigration::token`).
+            let token_start = header_end + 1;
+            let joining_name_start = token_start
+                .checked_add(token_length)
+                .ok_or(ParseError::InvalidLength)?;
             let joining_name_end = joining_name_start
                 .checked_add(joining_name_length)
                 .ok_or(ParseError::InvalidLength)?;
@@ -335,9 +359,16 @@ fn parse_with_mode(
             }
 
             let frame = input.split_to(joining_name_end);
+            let token = decode_field(&frame, token_start, token_length)?;
             let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
 
-            Ok((Command::CancelMigration { joining_name }, None))
+            Ok((
+                Command::CancelMigration {
+                    token,
+                    joining_name,
+                },
+                None,
+            ))
         }
 
         b"M" => {
@@ -345,6 +376,7 @@ fn parse_with_mode(
             let joining_addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joined_count = parts.next().ok_or(ParseError::InvalidLength)?;
             let replication = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -354,6 +386,7 @@ fn parse_with_mode(
             let joining_addr_length = parse_length(joining_addr_length)?;
             let joined_count = parse_length(joined_count)?;
             let replication = parse_length(replication)?;
+            let token_length = parse_length(token_length)?;
 
             // R=0 could never be meant (nothing would own any key) and
             // would make every ownership check vacuously reject.
@@ -364,6 +397,7 @@ fn parse_with_mode(
             parse_migrate(
                 input,
                 header_end,
+                token_length,
                 joining_name_length,
                 joining_addr_length,
                 joined_count,
@@ -388,16 +422,22 @@ fn parse_with_mode(
 fn parse_migrate(
     input: &mut BytesMut,
     header_end: usize,
+    token_length: usize,
     joining_name_length: usize,
     joining_addr_length: usize,
     joined_count: usize,
     replication: usize,
 ) -> Result<Command, ParseError> {
-    if joining_name_length == 0 || joining_addr_length == 0 {
+    if token_length == 0 || joining_name_length == 0 || joining_addr_length == 0 {
         return Err(ParseError::EmptyField);
     }
 
-    let joining_name_start = header_end + 1;
+    // Body layout: `<token><joining_name><joining_addr><entries>` — the
+    // token leads so the connection handler can verify it before acting.
+    let token_start = header_end + 1;
+    let joining_name_start = token_start
+        .checked_add(token_length)
+        .ok_or(ParseError::InvalidLength)?;
     let joining_addr_start = joining_name_start
         .checked_add(joining_name_length)
         .ok_or(ParseError::InvalidLength)?;
@@ -458,6 +498,7 @@ fn parse_migrate(
     // decode each field from the now-owned `frame`.
     let frame = input.split_to(cursor);
 
+    let token = decode_field(&frame, token_start, token_length)?;
     let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
     let joining_addr = decode_field(&frame, joining_addr_start, joining_addr_length)?;
 
@@ -469,6 +510,7 @@ fn parse_migrate(
     }
 
     Ok(Command::Migrate {
+        token,
         joining_name,
         joining_addr,
         joined,
@@ -903,11 +945,12 @@ mod tests {
 
     #[test]
     fn parses_a_migrate_command_with_no_joined_nodes() {
-        let mut input = buf(b"M 6 14 0 2\nnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 0 2 5\ntok-bnode-b127.0.0.1:8357");
 
         assert_eq!(
             parse(&mut input),
             Ok(Command::Migrate {
+                token: "tok-b".to_string(),
                 joining_name: "node-b".to_string(),
                 joining_addr: "127.0.0.1:8357".to_string(),
                 joined: Vec::new(),
@@ -920,12 +963,13 @@ mod tests {
     #[test]
     fn parses_a_migrate_command_with_joined_nodes_and_consumes_only_that_frame() {
         let mut input = buf(
-            b"M 6 14 2 2\nnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
+            b"M 6 14 2 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
         );
 
         assert_eq!(
             parse(&mut input),
             Ok(Command::Migrate {
+                token: "tok-b".to_string(),
                 joining_name: "node-b".to_string(),
                 joining_addr: "127.0.0.1:8357".to_string(),
                 joined: vec![
@@ -940,7 +984,7 @@ mod tests {
 
     #[test]
     fn parse_leaves_a_migrate_command_untouched_when_a_joined_entry_is_incomplete() {
-        let original = b"M 6 14 1 2\nnode-b127.0.0.1:83576 14\nnode-a127.0.0".to_vec();
+        let original = b"M 6 14 1 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0".to_vec();
         let mut input = BytesMut::from(&original[..]);
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
@@ -949,7 +993,14 @@ mod tests {
 
     #[test]
     fn rejects_an_empty_joining_name_in_migrate() {
-        let mut input = buf(b"M 0 14 0 2\n127.0.0.1:8357");
+        let mut input = buf(b"M 0 14 0 2 5\ntok-b127.0.0.1:8357");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn rejects_an_empty_token_in_migrate() {
+        let mut input = buf(b"M 6 14 0 2 0\nnode-b127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
@@ -961,7 +1012,7 @@ mod tests {
         // would request terabytes and abort the process). With the joining
         // node's own fields present but no entries buffered, this must simply
         // report `Incomplete` — cheaply, without touching that huge number.
-        let mut input = buf(b"M 6 14 999999999999 2\nnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 999999999999 2 5\ntok-bnode-b127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
@@ -1059,11 +1110,12 @@ mod tests {
 
     #[test]
     fn parses_a_cancel_migration_command() {
-        let mut input = buf(b"X 6\nnode-b");
+        let mut input = buf(b"X 6 5\ntok-bnode-b");
 
         assert_eq!(
             parse(&mut input),
             Ok(Command::CancelMigration {
+                token: "tok-b".to_string(),
                 joining_name: "node-b".to_string(),
             })
         );
@@ -1072,7 +1124,7 @@ mod tests {
 
     #[test]
     fn parse_leaves_a_cancel_migration_command_untouched_when_the_name_is_incomplete() {
-        let original = b"X 6\nnod".to_vec();
+        let original = b"X 6 5\ntok-bnod".to_vec();
         let mut input = buf(&original);
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
@@ -1081,7 +1133,14 @@ mod tests {
 
     #[test]
     fn rejects_an_empty_joining_name_in_cancel_migration() {
-        let mut input = buf(b"X 0\n");
+        let mut input = buf(b"X 0 5\ntok-b");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn rejects_an_empty_token_in_cancel_migration() {
+        let mut input = buf(b"X 6 0\nnode-b");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }

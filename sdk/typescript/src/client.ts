@@ -161,7 +161,17 @@ function splitHostPort(address: string): { host: string; port: number } {
 
   const host = address.slice(0, separator);
   const port = Number(address.slice(separator + 1));
-  if (!Number.isInteger(port)) {
+  // Must be a valid TCP port (0-65535, matching the Python SDK's
+  // split_host_port) — a bogus value like "999999" or "-1" would
+  // otherwise reach net.connect/tls.connect and throw a synchronous
+  // RangeError there instead, which — being a programming-error
+  // constructor, see PROGRAMMING_ERROR_CONSTRUCTORS/isSwallowable — is
+  // not swallowable and would escape refreshNodeList() into the
+  // caller's get/set/delete, breaking "refresh never throws to the
+  // caller". Throwing NanocachedError here instead keeps this a
+  // by-design swallow, exactly like every other malformed-address case
+  // above.
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
     throw new NanocachedError(`nanocached: invalid node address from discovery server: ${address}`);
   }
 
@@ -504,16 +514,23 @@ export class NanocachedClient {
   /** doc/adr/0015-*.md: probes every owner of `key`, in rank order, for a
    * value the normal read path already reported missing. The first
    * owner that has it wins: its value is returned, and — detached, not
-   * awaited, no tracking — that same value repairs `names[0]` (the true
-   * primary) in the background, with TTL READ_REPAIR_TTL_SECONDS (the
-   * original TTL can't be recovered from a GET, and TTL 0 would
-   * permanently resurrect already-expired data). Every failure along the
-   * way (connection lost, WrongNode, another miss) is swallowed; only a
-   * failed repair *write-back* is counted in stats().readRepairFailures —
-   * a failed owner probe is silent, matching the counter's write-back
-   * semantics in the other five SDKs (issue #43). Nothing here may turn
-   * an already-accepted miss into an error — except an actual programming
-   * bug (isSwallowable), which still propagates. */
+   * awaited by this method's own caller — that same value repairs
+   * `names[0]` (the true primary) in the background, with TTL
+   * READ_REPAIR_TTL_SECONDS (the original TTL can't be recovered from a
+   * GET, and TTL 0 would permanently resurrect already-expired data).
+   * That write-back is bounded and tracked the same way a
+   * fireAndForgetReplicas replica write is (FIRE_AND_FORGET_TUNING.maxInFlight,
+   * backgroundReplicaWrites — doc/adr/0014-*.md), so close() drains it too
+   * and an unlucky run of misses can't spawn unbounded background writes;
+   * past the cap, the repair for that miss is simply skipped — read
+   * repair is opportunistic, so a later miss on the same key repairs it.
+   * Every failure along the way (connection lost, WrongNode, another
+   * miss) is swallowed; only a failed repair *write-back* is counted in
+   * stats().readRepairFailures — a failed owner probe is silent, matching
+   * the counter's write-back semantics in the other five SDKs (issue
+   * #43). Nothing here may turn an already-accepted miss into an error —
+   * except an actual programming bug (isSwallowable), which still
+   * propagates. */
   private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
     const names = this.ownerNames(key);
     for (const name of names) {
@@ -529,7 +546,14 @@ export class NanocachedClient {
 
       const primaryName = names[0];
       const repairValue = value;
-      if (primaryName !== undefined) {
+      // Bounded and tracked the same way a fireAndForgetReplicas replica
+      // write is (doc/adr/0014-*.md) — reusing backgroundReplicaWrites and
+      // FIRE_AND_FORGET_TUNING.maxInFlight — so close() drains this
+      // write-back too instead of abandoning it, and this can't grow
+      // unbounded the way an untracked spawn-per-miss would. Past the
+      // cap, skip the repair for this miss; it's opportunistic, so a
+      // later miss on the same key repairs it.
+      if (primaryName !== undefined && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const repaired = this.memberConnection(primaryName)
           .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS))
           .catch((error) => {
@@ -543,8 +567,11 @@ export class NanocachedClient {
         // catch anyway, synchronously — otherwise Node would flag the
         // rethrow above as an unhandled rejection (it isn't counted in
         // readRepairFailures either way, so it stays distinguishable from
-        // a routine swallow to anything inspecting stats()).
-        repaired.catch(() => {});
+        // a routine swallow to anything inspecting stats()) — before
+        // tracking it in backgroundReplicaWrites, mirroring writeToOwners.
+        const settled = repaired.catch(() => {});
+        this.backgroundReplicaWrites.add(repaired);
+        settled.finally(() => this.backgroundReplicaWrites.delete(repaired));
       }
       return value;
     }
@@ -621,12 +648,14 @@ export class NanocachedClient {
   }
 
   /** Cluster write (ADR-0011): fan the operation out to every owner in
-   * parallel. The primary's outcome is the operation's outcome; replica
-   * failures are swallowed — a dead replica must not fail writes, it just
-   * leaves the key under-replicated until the next node-list refresh
-   * drops the dead node out of the ranking. (A replica may also answer
-   * `W` when its own membership view disagrees; equally ignorable — the
-   * refresh converges everyone.) */
+   * parallel. The primary's outcome is the operation's outcome — a
+   * successful primary write is always what's returned, even if a
+   * replica leg goes on to hit a genuine bug — replica failures are
+   * swallowed — a dead replica must not fail writes, it just leaves the
+   * key under-replicated until the next node-list refresh drops the dead
+   * node out of the ranking. (A replica may also answer `W` when its own
+   * membership view disagrees; equally ignorable — the refresh converges
+   * everyone.) */
   private async writeToOwners<T>(
     key: string | Uint8Array,
     op: (connection: Connection) => Promise<T>,
@@ -677,19 +706,38 @@ export class NanocachedClient {
       const write = replicaWrite(name);
       // Same reasoning as above: attach a no-op catch synchronously so a
       // genuine programming bug surfacing here doesn't trip Node's
-      // unhandled-rejection detector before the `finally` below gets a
-      // chance to await this exact promise and propagate the real error
-      // to the caller of set()/delete().
+      // unhandled-rejection detector before the `Promise.allSettled`
+      // below gets a chance to await this exact promise and propagate the
+      // real error to the caller of set()/delete() — unless the primary
+      // already succeeded, in which case that success wins instead (see
+      // below).
       write.catch(() => {});
       return write;
     });
 
+    let primary: { ok: true; value: T } | { ok: false; error: unknown };
     try {
       const connection = await this.memberConnection(primaryName);
-      return await op(connection);
-    } finally {
-      await Promise.all(synchronousReplicaWrites);
+      primary = { ok: true, value: await op(connection) };
+    } catch (error) {
+      primary = { ok: false, error };
     }
+
+    // Always drain the replica legs — for close()'s tracking, and so a
+    // genuine replica-leg bug (isSwallowable) doesn't linger as an
+    // unhandled rejection — but never let one override an
+    // already-successful primary write: the write happened, so
+    // set()/delete() throwing despite that would misreport a completed
+    // write as failed (this used to be a plain `finally { await
+    // Promise.all(...) }`, whose rejection silently replaced a
+    // successful `return` from the try). A genuine replica bug is only
+    // ever surfaced when the primary itself failed, same as before.
+    const replicaResults = await Promise.allSettled(synchronousReplicaWrites);
+
+    if (primary.ok) return primary.value;
+
+    const replicaBug = replicaResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    throw replicaBug ? replicaBug.reason : primary.error;
   }
 
   /** Runs `operation`; if a routed-to node answers `W` (ADR-0008: it

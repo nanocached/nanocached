@@ -184,6 +184,12 @@ class NanocachedClient:
         self._fire_and_forget_replicas: bool = False
         self._background_replica_writes: set[asyncio.Task[None]] = set()
         self._read_repair: bool = False
+        # Bounds concurrent read-repair write-backs the same way
+        # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES bounds fire-and-forget
+        # replica writes — see _try_read_repair().
+        self._read_repair_write_semaphore = asyncio.Semaphore(
+            _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+        )
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -351,11 +357,15 @@ class NanocachedClient:
         """doc/adr/0015-*.md: probes every owner of ``key``, in rank
         order, for a value the normal read path already reported
         missing. The first owner that has it wins: its value is
-        returned, and — detached, not awaited, no tracking — that same
-        value repairs the true primary in the background, with TTL
-        _READ_REPAIR_TTL (the original TTL can't be recovered from a
-        GET, and TTL 0 would permanently resurrect already-expired
-        data). Every failure along the way is swallowed; only a failed
+        returned, and — detached from the caller, which already has its
+        value — that same value repairs the true primary in the
+        background, with TTL _READ_REPAIR_TTL (the original TTL can't be
+        recovered from a GET, and TTL 0 would permanently resurrect
+        already-expired data). The write-back is bounded and tracked the
+        same way fire_and_forget_replicas writes are (a shared semaphore
+        capped at _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES, registered in
+        _background_replica_writes), so close() drains it too instead of
+        leaving it dangling. Every failure along the way is swallowed; only a failed
         repair *write-back* is counted in stats().read_repair_failures —
         a failed owner probe is silent, matching the counter's write-back
         semantics in the other five SDKs (issue #43). Nothing here may
@@ -376,14 +386,17 @@ class NanocachedClient:
                 primary = names[0]
 
                 async def repair(primary: str = primary, value: bytes = value) -> None:
-                    try:
-                        connection = await self._member_connection(primary)
-                        await connection.set(key, value, _READ_REPAIR_TTL)
-                    except _SWALLOWABLE_ERRORS:
-                        # Swallowed by design — see the docstring.
-                        self._read_repair_failures += 1
+                    async with self._read_repair_write_semaphore:
+                        try:
+                            connection = await self._member_connection(primary)
+                            await connection.set(key, value, _READ_REPAIR_TTL)
+                        except _SWALLOWABLE_ERRORS:
+                            # Swallowed by design — see the docstring.
+                            self._read_repair_failures += 1
 
-                asyncio.ensure_future(repair())
+                task = asyncio.ensure_future(repair())
+                self._background_replica_writes.add(task)
+                task.add_done_callback(self._background_replica_writes.discard)
             return value
         return None
 
@@ -531,7 +544,8 @@ class NanocachedClient:
                 # stats().replica_write_failures, whether this leg ran
                 # synchronously or as a fire_and_forget_replicas
                 # background write — both paths share this function. A
-                # genuine programming error still propagates.
+                # genuine programming error still escapes this except
+                # clause (see _write()'s finally for what happens to it).
                 self._replica_write_failures += 1
 
         replica_tasks = []
@@ -552,17 +566,25 @@ class NanocachedClient:
             replica_tasks.append(asyncio.ensure_future(replica_write(name)))
 
         try:
-            return await op(await self._member_connection(primary))
+            result = await op(await self._member_connection(primary))
         finally:
             if replica_tasks:
-                # No return_exceptions=True here: replica_write() already
-                # fully handles every expected failure internally (caught
-                # by _SWALLOWABLE_ERRORS, counted in
-                # stats().replica_write_failures, never re-raised), so the
-                # only thing that can still escape a task here is a
-                # genuine programming error — which this await must
-                # propagate to the caller of set()/delete(), not discard.
-                await asyncio.gather(*replica_tasks)
+                # replica_write() already fully handles every expected
+                # failure internally (caught by _SWALLOWABLE_ERRORS,
+                # counted in stats().replica_write_failures, never
+                # re-raised), so the only thing that can still escape a
+                # task here is a genuine programming error. It must not
+                # be silently dropped — but raising it from this finally
+                # would replace whatever the try above just produced,
+                # discarding a successful primary result (or masking the
+                # primary's own exception) even though the write already
+                # completed. return_exceptions=True keeps that from
+                # happening; the bug is still surfaced, just via a
+                # warning rather than by clobbering the primary outcome.
+                for outcome in await asyncio.gather(*replica_tasks, return_exceptions=True):
+                    if isinstance(outcome, BaseException):
+                        _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+        return result
 
     # ── 遅延再接続(issue #1)────────────────────────────────────────
 
@@ -589,18 +611,22 @@ class NanocachedClient:
         adoption in the awaiting caller, a cancelled caller (e.g.
         asyncio.wait_for around a client call) would abandon the
         shield-protected task's connection unreferenced — a leaked
-        socket."""
+        socket. For the same reason, the in-flight entry is cleared by
+        the dial task's own done-callback rather than by whichever
+        awaiter happens to unwind first: if the originating awaiter is
+        cancelled while asyncio.shield keeps the dial running, the entry
+        must stay put until that dial actually finishes, or a later
+        caller would start a redundant second dial to the same address."""
         in_flight = self._redials.get(slot)
         if in_flight is not None:
             return await asyncio.shield(in_flight)
 
         task = asyncio.ensure_future(self._open_and_adopt(slot, address))
         self._redials[slot] = task
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if self._redials.get(slot) is task:
-                del self._redials[slot]
+        task.add_done_callback(
+            lambda t: self._redials.pop(slot, None) if self._redials.get(slot) is t else None
+        )
+        return await asyncio.shield(task)
 
     async def _open_and_adopt(self, slot: str, address: str) -> Connection:
         connection = await self._open_node_connection(address)
