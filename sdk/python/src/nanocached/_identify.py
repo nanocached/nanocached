@@ -77,9 +77,14 @@ class _LegacyServerSignal(Exception):
 
 def split_host_port(address: str) -> tuple[str, int]:
     host, separator, port = address.rpartition(":")
-    if not separator or not port.isdigit():
+    # isascii() matters: str.isdigit() also accepts characters like "²"
+    # that int() rejects with a raw ValueError.
+    if not separator or not port.isascii() or not port.isdigit():
         raise NanocachedError(f"nanocached: invalid node address from discovery server: {address}")
-    return host, int(port)
+    port_number = int(port)
+    if port_number > 65535:
+        raise NanocachedError(f"nanocached: invalid node address from discovery server: {address}")
+    return host, port_number
 
 
 async def connect_and_identify(
@@ -160,6 +165,12 @@ async def _connect_and_identify(
             # a legacy server's silent door-slam.
             if request_tags:
                 raise _LegacyServerSignal() from error
+            if isinstance(error, asyncio.IncompleteReadError):
+                # An EOFError, not an OSError — wrap it so it stays inside
+                # client.py's _SWALLOWABLE_ERRORS contract.
+                raise NanocachedError(
+                    "nanocached: connection closed during the auth handshake"
+                ) from error
             raise
 
         if ack[0:1] == b"E":
@@ -197,6 +208,12 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         raise NanocachedError(
             "nanocached: invalid node-list header in discovery response (missing header terminator)"
         ) from error
+    except asyncio.IncompleteReadError as error:
+        # EOF before the terminator — an EOFError, not an OSError, so the
+        # same escape hatch applies.
+        raise NanocachedError(
+            "nanocached: truncated node-list header in discovery response"
+        ) from error
 
     if header.startswith(b"B"):
         raise DiscoveryBusyError()
@@ -209,7 +226,14 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
     fields = header[2:-1].split(b" ")
     if len(fields) != 2:
         raise NanocachedError("nanocached: invalid node-list header in discovery response")
-    count, replication = int(fields[0]), int(fields[1])
+    try:
+        count, replication = int(fields[0]), int(fields[1])
+    except ValueError as error:
+        # Non-numeric fields must surface as NanocachedError, not a raw
+        # ValueError — client.py's _SWALLOWABLE_ERRORS contract ("try next
+        # address silently", "refresh swallows failures") only covers
+        # NanocachedError/ConnectionError/OSError.
+        raise NanocachedError("nanocached: invalid node-list header in discovery response") from error
     if replication < 1:
         raise NanocachedError("nanocached: invalid replication factor in discovery response")
     if count < 0 or count > _MAX_NODE_COUNT:
@@ -224,11 +248,20 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
             raise NanocachedError(
                 "nanocached: invalid node entry header in discovery response (missing header terminator)"
             ) from error
+        except asyncio.IncompleteReadError as error:
+            raise NanocachedError(
+                "nanocached: truncated node entry header in discovery response"
+            ) from error
         total_bytes += len(entry_header)
         lengths = entry_header[:-1].split(b" ")
         if len(lengths) != 2:
             raise NanocachedError("nanocached: invalid node entry header in discovery response")
-        name_length, addr_length = int(lengths[0]), int(lengths[1])
+        try:
+            name_length, addr_length = int(lengths[0]), int(lengths[1])
+        except ValueError as error:
+            raise NanocachedError(
+                "nanocached: invalid node entry header in discovery response"
+            ) from error
         if (
             name_length < 0
             or addr_length < 0
@@ -241,14 +274,27 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         if total_bytes > _MAX_NODE_LIST_RESPONSE_LENGTH:
             raise NanocachedError("nanocached: discovery response exceeds maximum size")
 
-        body = await reader.readexactly(name_length + addr_length + 1)  # +1: trailing '\n'
+        try:
+            body = await reader.readexactly(name_length + addr_length + 1)  # +1: trailing '\n'
+        except asyncio.IncompleteReadError as error:
+            # EOF mid-entry (discovery restarted, connection dropped).
+            # IncompleteReadError is an EOFError, not an OSError, so left
+            # unwrapped it would escape _SWALLOWABLE_ERRORS.
+            raise NanocachedError(
+                "nanocached: truncated node entry in discovery response"
+            ) from error
         if body[-1:] != b"\n":
             raise NanocachedError("nanocached: malformed node entry in discovery response")
-        nodes.append(
-            DiscoveredNode(
-                name=body[:name_length].decode("utf-8"),
-                address=body[name_length:-1].decode("utf-8"),
+        try:
+            nodes.append(
+                DiscoveredNode(
+                    name=body[:name_length].decode("utf-8"),
+                    address=body[name_length:-1].decode("utf-8"),
+                )
             )
-        )
+        except UnicodeDecodeError as error:
+            raise NanocachedError(
+                "nanocached: malformed node entry in discovery response"
+            ) from error
 
     return ClusterTarget(nodes=nodes, replication=replication)
