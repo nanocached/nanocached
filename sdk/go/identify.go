@@ -18,11 +18,12 @@ import (
 // and one that requires a real secret correctly rejects this placeholder.
 var noSecretPlaceholder = []byte{0}
 
-// DiscoveredNode pairs a node's hash-ring identity (a random per-process
+// discoveredNode pairs a node's hash-ring identity (a random per-process
 // UUID) with its network address — two different things since
 // doc/adr/0009-*.md: Name is what routing hashes; Address is only for
-// opening a connection.
-type DiscoveredNode struct {
+// opening a connection. Unexported (issue #47): no public API ever
+// returns or accepts it, so exporting it was dead public surface.
+type discoveredNode struct {
 	Name    string
 	Address string
 }
@@ -30,7 +31,7 @@ type DiscoveredNode struct {
 type identified struct {
 	// Exactly one of conn / cluster is set.
 	conn        net.Conn
-	nodes       []DiscoveredNode
+	nodes       []discoveredNode
 	replication int
 	// tagged (doc/adr/0019-*.md): the node accepted the extended `A ... T`,
 	// so this connection's G/S/D traffic must carry tags and its
@@ -238,7 +239,7 @@ const (
 	maxNodeListResponseBytes = 16 * 1024 * 1024
 )
 
-func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
+func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 	header, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, 0, connectionLost("node-list read failed", err)
@@ -267,7 +268,7 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 		return nil, 0, fmt.Errorf("nanocached: invalid replication factor in discovery response")
 	}
 
-	nodes := make([]DiscoveredNode, 0, count)
+	nodes := make([]discoveredNode, 0, count)
 	total := 0
 	for i := 0; i < count; i++ {
 		entry, err := reader.ReadString('\n')
@@ -300,7 +301,7 @@ func readNodeList(reader *bufio.Reader) ([]DiscoveredNode, int, error) {
 		if body[len(body)-1] != '\n' {
 			return nil, 0, fmt.Errorf("nanocached: malformed node entry in discovery response")
 		}
-		nodes = append(nodes, DiscoveredNode{
+		nodes = append(nodes, discoveredNode{
 			Name:    string(body[:nameLength]),
 			Address: string(body[nameLength : nameLength+addrLength]),
 		})

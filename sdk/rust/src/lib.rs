@@ -13,6 +13,7 @@ mod open_targets;
 
 #[doc(hidden)]
 pub use client::KEEPALIVE_INTERVAL_MS;
+#[doc(hidden)]
 pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 pub use client::{NanocachedClient, Options, Stats};
 #[doc(hidden)]

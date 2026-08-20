@@ -330,11 +330,11 @@ type mockDiscovery struct {
 	listener    net.Listener
 	replication int
 	mu          sync.Mutex
-	nodes       []DiscoveredNode
+	nodes       []discoveredNode
 	warmingUp   bool
 }
 
-func startMockDiscovery(t *testing.T, nodes []DiscoveredNode, replication int) *mockDiscovery {
+func startMockDiscovery(t *testing.T, nodes []discoveredNode, replication int) *mockDiscovery {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -348,7 +348,7 @@ func startMockDiscovery(t *testing.T, nodes []DiscoveredNode, replication int) *
 
 func (m *mockDiscovery) address() string { return m.listener.Addr().String() }
 
-func (m *mockDiscovery) setNodes(nodes []DiscoveredNode) {
+func (m *mockDiscovery) setNodes(nodes []discoveredNode) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nodes = nodes
@@ -395,7 +395,7 @@ func (m *mockDiscovery) serve(conn net.Conn) {
 			}
 		case "L":
 			m.mu.Lock()
-			warming, nodes := m.warmingUp, append([]DiscoveredNode(nil), m.nodes...)
+			warming, nodes := m.warmingUp, append([]discoveredNode(nil), m.nodes...)
 			m.mu.Unlock()
 			if warming {
 				_, _ = conn.Write([]byte("B\n"))
@@ -1262,7 +1262,7 @@ func TestRejectsAMissingTarget(t *testing.T) {
 func TestFailsOverToTheSecondAddress(t *testing.T) {
 	node := startMockNode(t, nil)
 	discovery := startMockDiscovery(t,
-		[]DiscoveredNode{{Name: testNames[0], Address: node.address()}}, 1)
+		[]discoveredNode{{Name: testNames[0], Address: node.address()}}, 1)
 
 	client, err := Connect(Config{Addresses: []Address{addr(unusedPort(t)), addr(discovery.address())}})
 	if err != nil {
@@ -1304,9 +1304,9 @@ func TestDiscoveryNodeListExceedingTheAggregateCapIsRejected(t *testing.T) {
 
 	name := strings.Repeat("n", fieldLen)
 	address := strings.Repeat("a", fieldLen)
-	nodes := make([]DiscoveredNode, count)
+	nodes := make([]discoveredNode, count)
 	for i := range nodes {
-		nodes[i] = DiscoveredNode{Name: name, Address: address}
+		nodes[i] = discoveredNode{Name: name, Address: address}
 	}
 
 	discovery := startMockDiscovery(t, nodes, 1)
@@ -1327,9 +1327,9 @@ func startCluster(t *testing.T, replication int) (map[string]*mockNode, *mockDis
 		testNames[0]: startMockNode(t, nil),
 		testNames[1]: startMockNode(t, nil),
 	}
-	listed := make([]DiscoveredNode, 0, len(nodes))
+	listed := make([]discoveredNode, 0, len(nodes))
 	for _, name := range testNames {
-		listed = append(listed, DiscoveredNode{Name: name, Address: nodes[name].address()})
+		listed = append(listed, discoveredNode{Name: name, Address: nodes[name].address()})
 	}
 	return nodes, startMockDiscovery(t, listed, replication)
 }
@@ -1475,7 +1475,7 @@ func TestWritesRouteAroundADeadPrimaryOnceDiscoveryDropsIt(t *testing.T) {
 	// attempt fails on the dead primary, forcing a refresh that re-ranks
 	// onto the survivor, and the retry succeeds.
 	nodes[owners[0]].close()
-	discovery.setNodes([]DiscoveredNode{{Name: owners[1], Address: nodes[owners[1]].address()}})
+	discovery.setNodes([]discoveredNode{{Name: owners[1], Address: nodes[owners[1]].address()}})
 	time.Sleep(50 * time.Millisecond)
 
 	if err := client.Set(key, "v", 0); err != nil {
