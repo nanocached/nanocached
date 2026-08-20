@@ -628,28 +628,46 @@ impl NanocachedClient {
             };
 
             if let Some(primary) = owners.first() {
-                let client = self.clone();
-                let primary = primary.clone();
-                let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
-                let owned_value: Arc<[u8]> = Arc::from(value.clone());
-                tokio::spawn(async move {
-                    let op = move |connection: Arc<Connection>| {
-                        let key = Arc::clone(&owned_key);
-                        let value = Arc::clone(&owned_value);
-                        async move { connection.set(&key, &value, READ_REPAIR_TTL).await }
-                    };
-                    if client
-                        .apply_reconnecting(Some(&primary), &op)
-                        .await
-                        .is_err()
-                    {
-                        client
-                            .inner
-                            .stats
-                            .read_repair_failures
-                            .fetch_add(1, Ordering::Relaxed);
+                // Bounded and tracked exactly like a fire-and-forget replica
+                // write (see `write`): the background repair holds one
+                // `background_replica_permits` permit until it finishes, so
+                // `close()`'s drain waits for it and no more than
+                // `background_replica_cap` run at once. Past the cap the
+                // repair for this miss is simply skipped — it's opportunistic
+                // (ADR-0015), so a later miss repairs the key instead, and it
+                // must never add latency or unbounded task growth to the read
+                // path it rides on. The `closed` re-check after acquiring the
+                // permit closes the same teardown race the replica path guards
+                // against (issue #47 item 3).
+                if let Ok(permit) =
+                    Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
+                {
+                    if !self.inner.closed.load(Ordering::SeqCst) {
+                        let client = self.clone();
+                        let primary = primary.clone();
+                        let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
+                        let owned_value: Arc<[u8]> = Arc::from(value.clone());
+                        tokio::spawn(async move {
+                            let _permit = permit; // held until this task finishes
+                            let op = move |connection: Arc<Connection>| {
+                                let key = Arc::clone(&owned_key);
+                                let value = Arc::clone(&owned_value);
+                                async move { connection.set(&key, &value, READ_REPAIR_TTL).await }
+                            };
+                            if client
+                                .apply_reconnecting(Some(&primary), &op)
+                                .await
+                                .is_err()
+                            {
+                                client
+                                    .inner
+                                    .stats
+                                    .read_repair_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
                     }
-                });
+                }
             }
             return Some(value);
         }
@@ -813,39 +831,56 @@ impl NanocachedClient {
                     if let Ok(permit) =
                         Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
                     {
-                        let client = self.clone();
-                        let name = name.clone();
-                        let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
-                        let owned_body = body.to_owned();
-                        tokio::spawn(async move {
-                            let _permit = permit; // held until this task finishes
-                            let failed = match owned_body {
-                                OwnedWriteBody::Set { value, ttl_seconds } => {
-                                    let value: Arc<[u8]> = Arc::from(value);
-                                    let op = move |connection: Arc<Connection>| {
-                                        let key = Arc::clone(&owned_key);
-                                        let value = Arc::clone(&value);
-                                        async move { connection.set(&key, &value, ttl_seconds).await }
-                                    };
-                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
+                        // Re-check `closed` *after* taking the permit, the
+                        // same ordering Go's SDK gets from re-checking under
+                        // the lock `Close()` holds: `close()` sets `closed`
+                        // before draining permits, so if we still see it
+                        // clear here, `close()`'s drain is guaranteed to wait
+                        // for this permit; if it's already set, `close()` may
+                        // have passed its drain, so we must not spawn a
+                        // detached task it won't await — fall back to the
+                        // synchronous path (issue #47 item 3). SeqCst on both
+                        // sides makes the permit acquisition and this load
+                        // totally ordered against `close()`'s swap+drain.
+                        if self.inner.closed.load(Ordering::SeqCst) {
+                            drop(permit);
+                        } else {
+                            let client = self.clone();
+                            let name = name.clone();
+                            let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
+                            let owned_body = body.to_owned();
+                            tokio::spawn(async move {
+                                let _permit = permit; // held until this task finishes
+                                let failed = match owned_body {
+                                    OwnedWriteBody::Set { value, ttl_seconds } => {
+                                        let value: Arc<[u8]> = Arc::from(value);
+                                        let op = move |connection: Arc<Connection>| {
+                                            let key = Arc::clone(&owned_key);
+                                            let value = Arc::clone(&value);
+                                            async move {
+                                                connection.set(&key, &value, ttl_seconds).await
+                                            }
+                                        };
+                                        client.apply_reconnecting(Some(&name), &op).await.is_err()
+                                    }
+                                    OwnedWriteBody::Delete => {
+                                        let op = move |connection: Arc<Connection>| {
+                                            let key = Arc::clone(&owned_key);
+                                            async move { connection.delete(&key).await }
+                                        };
+                                        client.apply_reconnecting(Some(&name), &op).await.is_err()
+                                    }
+                                };
+                                if failed {
+                                    client
+                                        .inner
+                                        .stats
+                                        .replica_write_failures
+                                        .fetch_add(1, Ordering::Relaxed);
                                 }
-                                OwnedWriteBody::Delete => {
-                                    let op = move |connection: Arc<Connection>| {
-                                        let key = Arc::clone(&owned_key);
-                                        async move { connection.delete(&key).await }
-                                    };
-                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
-                                }
-                            };
-                            if failed {
-                                client
-                                    .inner
-                                    .stats
-                                    .replica_write_failures
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        });
-                        continue;
+                            });
+                            continue;
+                        }
                     }
                 }
                 if self.apply_reconnecting(Some(name), &op).await.is_err() {

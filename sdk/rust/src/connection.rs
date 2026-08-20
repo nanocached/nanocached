@@ -32,6 +32,22 @@ const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
 /// response that never comes, wedging every other pending caller behind
 /// it (and, transitively, `close()`'s in-flight background-write
 /// drain). Generous versus the server's own 10s outbound timeouts.
+///
+/// Cross-SDK note: this is a *per-request* wall-clock bound (measured
+/// from when each request is issued), which is deliberately stricter than
+/// the Go SDK's *connection-level, progress-based* deadline (re-armed
+/// whenever any response arrives). Under very deep pipelining against a
+/// slow-but-healthy server the two differ — a request that waits out this
+/// whole window for its turn is timed out here even while the server is
+/// still answering others. That's intentional: this wrapper's job is to
+/// guarantee an abandoned queue slot (one nothing will *ever* answer) is
+/// cleared and the socket released, which requires a bound tied to the
+/// individual request, not to whole-connection liveness. Kept as an
+/// accepted difference rather than reworked, since making it
+/// progress-based would mean threading connection-wide liveness state
+/// through this SDK's cancellation-safe per-request wait — a change to
+/// the most concurrency-sensitive path here for a benefit that only
+/// shows up at pipelining depths past this timeout.
 /// Public-but-hidden purely as a test hook, mirroring
 /// `client::KEEPALIVE_INTERVAL_MS` — but read fresh on every request
 /// rather than once at connect, so a test that lowers it should restore

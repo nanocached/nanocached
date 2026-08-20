@@ -36,6 +36,13 @@ internal sealed class Connection
     // or malicious frame, never just a legitimately large value.
     private const int MaxValueLength = 2 * 1024 * 1024;
 
+    // Header/tag lines (the marker line ahead of a V's body, or the whole
+    // line for S/D/N/W) are always a handful of bytes in the real
+    // protocol. Without a cap, a malicious or buggy node that streams
+    // bytes with no '\n' would grow ReadLineAsync's StringBuilder without
+    // bound, gated only by RequestTimeout rather than failing fast.
+    private const int MaxHeaderLineLength = 1024;
+
     /// <summary>Bounds how long the connection may go without progress
     /// while requests are outstanding (issue #42) — each response must
     /// arrive within this window of the previous one (or of its own send,
@@ -540,6 +547,10 @@ internal sealed class Connection
         {
             byte b = await ReadByteAsync().ConfigureAwait(false);
             if (b == (byte)'\n') return line.ToString().Trim();
+            if (line.Length >= MaxHeaderLineLength)
+            {
+                throw new ConnectionLostException("nanocached: response header line too long");
+            }
             line.Append((char)b);
         }
     }

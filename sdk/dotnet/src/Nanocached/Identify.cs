@@ -217,14 +217,26 @@ internal static class Identify
         }
     }
 
+    // Copies every settable field the caller could have populated, not
+    // just the handful this SDK happens to exercise today — otherwise an
+    // Options value that sets, say, ClientCertificateContext or
+    // CipherSuitesPolicy would silently lose it here, since this clone
+    // only exists to patch in TargetHost per-connect.
     private static SslClientAuthenticationOptions Clone(SslClientAuthenticationOptions options) =>
         new()
         {
             TargetHost = options.TargetHost,
             ClientCertificates = options.ClientCertificates,
+            ClientCertificateContext = options.ClientCertificateContext,
             RemoteCertificateValidationCallback = options.RemoteCertificateValidationCallback,
+            LocalCertificateSelectionCallback = options.LocalCertificateSelectionCallback,
             CertificateRevocationCheckMode = options.CertificateRevocationCheckMode,
             EnabledSslProtocols = options.EnabledSslProtocols,
+            ApplicationProtocols = options.ApplicationProtocols,
+            AllowRenegotiation = options.AllowRenegotiation,
+            CipherSuitesPolicy = options.CipherSuitesPolicy,
+            EncryptionPolicy = options.EncryptionPolicy,
+            CertificateChainPolicy = options.CertificateChainPolicy,
         };
 
     // Bounds a discovery `N <count> <r>` response before allocation,
@@ -242,6 +254,14 @@ internal static class Identify
     // server's memory pressure on this client. The same constant is
     // being added to all six SDKs.
     private const long MaxNodeListResponseBytes = 16 * 1024 * 1024;
+
+    // The `N <count> <r>` header and each per-node `<nameLen> <addrLen>`
+    // line are always a handful of bytes in the real protocol — this
+    // bounds ReadLineAsync itself, before MaxNodeCount/
+    // MaxNodeListResponseBytes ever get a chance to run: without it, a
+    // malicious or MITM'd discovery server that streams bytes with no
+    // '\n' would grow the line buffer without bound.
+    private const int MaxHeaderLineLength = 1024;
 
     private static async Task<ClusterTarget> ReadNodeListAsync(Stream stream, CancellationToken cancel)
     {
@@ -323,6 +343,10 @@ internal static class Identify
         {
             await stream.ReadExactlyAsync(single, cancel).ConfigureAwait(false);
             if (single[0] == (byte)'\n') return line.ToString();
+            if (line.Length >= MaxHeaderLineLength)
+            {
+                throw new NanocachedException("nanocached: header line too long in discovery response");
+            }
             line.Append((char)single[0]);
         }
     }

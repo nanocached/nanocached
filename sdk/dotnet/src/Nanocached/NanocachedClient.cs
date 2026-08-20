@@ -162,6 +162,12 @@ public sealed class NanocachedClient : IDisposable
     // so Close() can acquire exactly all of them even if a test mutates
     // the static MaxInFlightBackgroundReplicaWrites afterwards.
     private readonly int _backgroundReplicaPermitCount;
+    // Same mechanism as _backgroundReplicaPermits, but for the background
+    // primary-repair write TryReadRepairAsync fires (doc/adr/0015-*.md):
+    // bounds how many may run at once and lets Close() drain them too,
+    // instead of the unbounded, untracked Task.Run this used to be.
+    private readonly SemaphoreSlim _backgroundReadRepairPermits;
+    private readonly int _backgroundReadRepairPermitCount;
     private readonly CancellationTokenSource _lifetime = new();
 
     // Observability for failures this client swallows by design — see
@@ -201,6 +207,8 @@ public sealed class NanocachedClient : IDisposable
         _fireAndForgetReplicas = options.FireAndForgetReplicas;
         _backgroundReplicaPermitCount = MaxInFlightBackgroundReplicaWrites;
         _backgroundReplicaPermits = new SemaphoreSlim(_backgroundReplicaPermitCount, _backgroundReplicaPermitCount);
+        _backgroundReadRepairPermitCount = MaxInFlightBackgroundReadRepairs;
+        _backgroundReadRepairPermits = new SemaphoreSlim(_backgroundReadRepairPermitCount, _backgroundReadRepairPermitCount);
         _readRepair = options.ReadRepair;
     }
 
@@ -408,7 +416,9 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>doc/adr/0015-*.md: probes every owner of <paramref
     /// name="key"/>, in rank order, for a value the normal read path
     /// already reported missing. The first owner that has it wins: its
-    /// value is returned, and — detached, not awaited, no tracking —
+    /// value is returned, and — detached, not awaited, but bounded and
+    /// tracked via <see cref="_backgroundReadRepairPermits"/> the same way
+    /// <see cref="_backgroundReplicaPermits"/> bounds replica writes —
     /// that same value repairs the true primary in the background, with
     /// TTL <see cref="ReadRepairTtlSeconds"/> (the original TTL can't be
     /// recovered from a GET, and TTL 0 would permanently resurrect
@@ -434,11 +444,11 @@ public sealed class NanocachedClient : IDisposable
             }
             if (value is null) continue;
 
-            if (names.Count > 0)
+            if (names.Count > 0 && _backgroundReadRepairPermits.Wait(0))
             {
                 string primary = names[0];
                 byte[] repairValue = value;
-                _ = Task.Run(async () =>
+                Task background = Task.Run(async () =>
                 {
                     try
                     {
@@ -462,6 +472,15 @@ public sealed class NanocachedClient : IDisposable
                         Interlocked.Increment(ref _readRepairFailures);
                     }
                 });
+                // Bounded and tracked (doc/adr/0014-*.md's mechanism,
+                // reused here): past MaxInFlightBackgroundReadRepairs
+                // in-flight repairs, Wait(0) above just fails and this
+                // particular repair is skipped rather than queued — a
+                // missed repair is harmless, so there is no synchronous
+                // fallback to await here the way replica writes have.
+                _ = background.ContinueWith(
+                    completed => _backgroundReadRepairPermits.Release(),
+                    TaskScheduler.Default);
             }
             return value;
         }
@@ -532,6 +551,12 @@ public sealed class NanocachedClient : IDisposable
         for (int i = 0; i < _backgroundReplicaPermitCount; i++)
         {
             _backgroundReplicaPermits.Wait();
+        }
+        // Same drain, for the background read-repair writes fired by
+        // TryReadRepairAsync.
+        for (int i = 0; i < _backgroundReadRepairPermitCount; i++)
+        {
+            _backgroundReadRepairPermits.Wait();
         }
         Teardown();
     }
@@ -942,6 +967,16 @@ public sealed class NanocachedClient : IDisposable
     // mirroring KeepAliveInterval. Read once per constructor call, so
     // tests must set it before ConnectAsync().
     internal static int MaxInFlightBackgroundReplicaWrites = 32;
+
+    // Same idea as MaxInFlightBackgroundReplicaWrites, but bounds
+    // TryReadRepairAsync's background primary-repair write instead: once
+    // the cap is reached, further repair attempts are skipped rather than
+    // queued, since a missed repair is harmless (the key is simply
+    // repaired on some later miss) and this path must never add latency
+    // to the read it rides along with. Internal and mutable only so tests
+    // can shrink it. Read once per constructor call, so tests must set it
+    // before ConnectAsync().
+    internal static int MaxInFlightBackgroundReadRepairs = 32;
 
     private void StartKeepAlive()
     {

@@ -439,14 +439,18 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 
 // tryReadRepair probes every owner of key, in rank order, for a value the
 // normal read path already reported missing. The first owner that has it
-// wins: its value is returned, and a best-effort, fully detached write
-// repairs the primary in the background (doc/adr/0015-*.md) with
-// readRepairTTL — no bounding, no close() draining, since losing this
-// write costs nothing beyond staying in the window this feature narrows
-// for one more read. Every failure along the way (connection lost,
-// WrongNode, another miss) is swallowed; nothing here may turn an
-// already-accepted miss into an error. A failed repair write is counted
-// in Stats().ReadRepairFailures.
+// wins: its value is returned, and a best-effort write repairs the primary
+// in the background (doc/adr/0015-*.md) with readRepairTTL. The background
+// write is bounded and drained exactly like a fire-and-forget replica
+// write: it takes a backgroundReplicaSem slot and is tracked on
+// backgroundReplicaWG so Close() waits for it, and no more than
+// maxInFlightBackgroundReplicaWrites run at once. Past the cap the repair
+// for this miss is simply skipped — it's opportunistic, so a later miss
+// repairs the key instead, and it must never add latency or unbounded
+// goroutine growth to the read it rides on. Every failure along the way
+// (connection lost, WrongNode, another miss) is swallowed; nothing here may
+// turn an already-accepted miss into an error. A failed repair write is
+// counted in Stats().ReadRepairFailures.
 func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 	names := c.ownerNames(key)
 	for _, name := range names {
@@ -456,13 +460,37 @@ func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 		}
 		if len(names) > 0 {
 			primary := names[0]
-			go func() {
+			repair := func() {
 				if err := c.applyReconnecting(primary, func(conn *connection) error {
 					return conn.set(key, v, readRepairTTL)
 				}); err != nil {
 					c.stats.readRepairFailures.Add(1)
 				}
-			}()
+			}
+			select {
+			case c.backgroundReplicaSem <- struct{}{}:
+				// Register under c.mu, rechecking c.closed — the same
+				// ordering the replica path uses to guarantee every Add
+				// happens-before Close()'s Wait (and to avoid the
+				// "Add called concurrently with Wait" panic). If Close
+				// already won, release the slot and skip: unlike a replica
+				// write there's no synchronous fallback, since a missed
+				// repair is harmless and this must not delay teardown.
+				c.mu.Lock()
+				if !c.closed {
+					c.backgroundReplicaWG.Add(1)
+					c.mu.Unlock()
+					go func() {
+						defer c.backgroundReplicaWG.Done()
+						defer func() { <-c.backgroundReplicaSem }()
+						repair()
+					}()
+				} else {
+					c.mu.Unlock()
+					<-c.backgroundReplicaSem
+				}
+			default:
+			}
 		}
 		return v, true
 	}

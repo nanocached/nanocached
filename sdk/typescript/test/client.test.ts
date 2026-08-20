@@ -1546,7 +1546,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     }
   });
 
-  it("propagates a programming error from a replica leg instead of swallowing it", async () => {
+  it("does not let a programming error from a replica leg clobber an already-successful primary write", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
     try {
@@ -1557,14 +1557,18 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       await client.set(key, "v");
       // ...then stub the replica's own connection to simulate a bug in
       // this SDK's own code, e.g. a TypeError from a bad internal call —
-      // this must NOT be swallowed the same way a dead replica is.
+      // this must NOT be swallowed the same way a dead replica is (it
+      // isn't counted in replicaWriteFailures below), but it also must
+      // not be allowed to discard an already-successful primary write:
+      // the write completed, so set() must resolve, not reject.
       const replicaConnection = (client as any).target.members.get(replica.name).connection;
       mock.method(replicaConnection, "set", () => {
         throw new TypeError("injected programming bug");
       });
 
-      await assert.rejects(client.set(key, "v2"), TypeError);
+      await client.set(key, "v2");
       assert.equal(client.stats().replicaWriteFailures, 0, "a programming error must not be counted as a swallow");
+      assert.equal(await client.get(key), "v2", "the primary's successful write must still have taken effect");
     } finally {
       client.close();
       await cluster.close().catch(() => {});

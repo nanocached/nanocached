@@ -297,6 +297,44 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_a_cancelled_awaiter_does_not_cause_a_redundant_second_dial(self):
+        # The shielded dial task keeps running even if the caller that
+        # started it is cancelled (e.g. a timed-out asyncio.wait_for); the
+        # in-flight entry must only be cleared once that dial task itself
+        # finishes, or a later caller would start a redundant second dial
+        # to the same address instead of sharing the one already running.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.drop_connections()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the FIN",
+                )
+
+                real_open = client._open_node_connection
+                calls = 0
+
+                async def slow_open(address):
+                    nonlocal calls
+                    calls += 1
+                    await asyncio.sleep(0.05)
+                    return await real_open(address)
+
+                client._open_node_connection = slow_open
+
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.get("k"), timeout=0.01)
+
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(calls, 1, "the cancelled awaiter caused a redundant second dial")
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
 
 class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_malformed_value_length_poisons_the_connection(self):
@@ -1172,6 +1210,32 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_close_drains_an_in_flight_read_repair_write_back(self):
+        # The write-back is detached from get_bytes()'s caller, but it must
+        # still be tracked so close() can drain it (same drain contract as
+        # fire_and_forget_replicas — doc/adr/0014-*.md as amended by issue
+        # #47 item 3) instead of leaving it dangling past teardown.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            primary, replica = self.owners_of("k")
+            nodes[replica].store[b"k"] = b"from-replica"
+            nodes[primary].delay_sets(0.08)
+
+            self.assertEqual(await client.get_bytes("k"), b"from-replica")
+            await client.close()
+            self.assertIn(
+                b"k",
+                nodes[primary].store,
+                "close() returned before the read-repair write-back finished",
+            )
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class StatsTests(unittest.IsolatedAsyncioTestCase):
     # stats()/ClientStats: observability for failures swallowed by design
@@ -1311,7 +1375,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await node.close()
 
-    async def test_propagates_a_programming_error_from_a_replica_leg_instead_of_swallowing_it(self):
+    async def test_a_programming_error_from_a_replica_leg_does_not_swallow_or_clobber_a_successful_write(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
@@ -1323,7 +1387,10 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             # ...then stub the replica's own connection to simulate a bug
             # in this SDK's own code, e.g. a TypeError from a bad internal
             # call — this must NOT be swallowed the same way a dead
-            # replica is.
+            # replica is, but it also must not clobber the primary's own
+            # successful result: the write already completed at the
+            # primary by the time the replica leg's bug surfaces, so
+            # set() must return normally rather than raise.
             replica_connection = client._members[replica].connection
 
             async def boom(key: bytes, value: bytes, ttl_seconds: int) -> None:
@@ -1331,8 +1398,10 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
 
             replica_connection.set = boom
 
-            with self.assertRaises(TypeError):
-                await client.set(key, "v2")
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                await client.set(key, "v2")  # must not raise despite the replica bug
+            self.assertIn("injected programming bug", captured.getvalue())
             self.assertEqual(
                 client.stats().replica_write_failures,
                 0,
