@@ -9,13 +9,18 @@
 //! Protocol (ASCII header line, terminated by `\n`; a command may repeat
 //! on the same connection):
 //!
-//!   H <name-length> <r>\n<name>   Heartbeat, identified by name (a random
-//!                             per-process identity, ADR-0009 — not the
-//!                             node's address, which carries no identity
+//!   H <name-length> <r> <token-length>\n<name><token>   Heartbeat,
+//!                             identified by name (a random per-process
+//!                             identity, ADR-0009 — not the node's
+//!                             address, which carries no identity
 //!                             meaning and was already established by
 //!                             `J` on this connection). Only valid for a
 //!                             node already `Joined` (see below) —
-//!                             refreshes its liveness. `r` is the
+//!                             refreshes its liveness. `token` is the
+//!                             node's per-process membership token
+//!                             (issue #34, see `NodeInfo::token`) and
+//!                             must match the one its registration
+//!                             established. `r` is the
 //!                             replication factor this node currently
 //!                             believes (issue #30) — learned from a `M`
 //!                             this node has sent as an ADR-0011 handoff
@@ -46,9 +51,14 @@
 //!                             disagree with what some node in the
 //!                             cluster learned elsewhere.
 //!
-//!   J <name-length> <addr-length>\n<name><addr>   Ask to join (ADR-0008),
-//!                             declaring the node's own name (ADR-0009)
-//!                             and advertised address. Sent once; the
+//!   J <name-length> <port> <token-length>\n<name><token>   Ask to join
+//!                             (ADR-0008), declaring the node's own name
+//!                             (ADR-0009), the port it serves on (the
+//!                             reachable address is composed from this
+//!                             connection's source IP, ADR-0012), and its
+//!                             membership token (issue #34) — the
+//!                             credential every later `P`/`H`/`C` naming
+//!                             this node must present. Sent once; the
 //!                             connection is then held open (no idle
 //!                             timeout applies) rather than closed or
 //!                             reused for anything else, since this is
@@ -60,28 +70,36 @@
 //!                             ordinary heartbeat connection (`H` from
 //!                             here on).
 //!
-//!   P <name-length> <addr-length>\n<name><addr>   Announce (ADR-0010): an
-//!                             already-promoted node (re-)declaring "I am a
-//!                             `Joined` member at this address" — after a
-//!                             heartbeat connection broke, after this
-//!                             process restarted with an empty registry, or
-//!                             to a standby replica it never `J`ed with.
-//!                             Upserts the node straight to `Joined` with no
-//!                             ADR-0008 handoff. Response: `R\n`, after
-//!                             which the connection carries `H` heartbeats,
-//!                             exactly like a `J` connection after
-//!                             promotion. Rejected for a name currently
-//!                             mid-join (`Waiting`/`Joining`).
+//!   P <name-length> <port> <token-length>\n<name><token>   Announce
+//!                             (ADR-0010): an already-promoted node
+//!                             (re-)declaring "I am a `Joined` member at
+//!                             this address" (composed like `J`'s) —
+//!                             after a heartbeat connection broke, after
+//!                             this process restarted with an empty
+//!                             registry, or to a standby replica it never
+//!                             `J`ed with. Upserts the node straight to
+//!                             `Joined` with no ADR-0008 handoff.
+//!                             Response: `R\n`, after which the
+//!                             connection carries `H` heartbeats, exactly
+//!                             like a `J` connection after promotion.
+//!                             Rejected for a name currently mid-join
+//!                             (`Waiting`/`Joining`), and — issue #34 —
+//!                             for a registered name whose stored token
+//!                             doesn't match `token`, so knowing another
+//!                             node's (public, `L`-listed) name is not
+//!                             enough to redirect its traffic.
 //!
-//!   C <name-length> <joining-length>\n<name><joining>   Sent by an
-//!                             already-`Joined` node to report it has
-//!                             finished handing its share of the keyspace
-//!                             off to `joining` (the joining node's name).
-//!                             Naming the join it is for keeps a stale
-//!                             report from an abandoned handoff from being
-//!                             credited to whatever join is pending next.
-//!                             Ignored unless `joining` matches the
-//!                             in-progress join. Response: `A\n`.
+//!   C <name-length> <joining-length> <token-length>\n<name><joining><token>
+//!                             Sent by an already-`Joined` node to report
+//!                             it has finished handing its share of the
+//!                             keyspace off to `joining` (the joining
+//!                             node's name). Naming the join it is for
+//!                             keeps a stale report from an abandoned
+//!                             handoff from being credited to whatever
+//!                             join is pending next. Ignored unless
+//!                             `joining` matches the in-progress join and
+//!                             `token` matches the reporting node's
+//!                             registered one (issue #34). Response: `A\n`.
 //!
 //!   A <secret-length>\n<secret>   Authenticate. Response: `Od\n` on success,
 //!                             `Ed\n` (then the connection closes) if a
@@ -276,16 +294,30 @@ struct NodeInfo {
     /// value again; removed along with the rest of a departed node's
     /// entry.
     reported_replication: Option<usize>,
+    /// The node's per-process membership token (issue #34): a random
+    /// value generated alongside its name (ADR-0009) and presented on
+    /// every `J`/`P`/`H`/`C` naming it. Established by whichever
+    /// registration this replica saw first for the name (`J`, or `P` for
+    /// a name this replica didn't know — a standby, or an amnesiac
+    /// restart; ADR-0010 replicas never talk to each other, so
+    /// first-use is the only place trust can start) and required to
+    /// match on everything after, so knowing a node's public name —
+    /// `L` lists them — is not enough to re-point its address or spoof
+    /// its liveness/handoff reports. Never sent back out: `L` and `M`
+    /// deliberately carry no tokens, or any node/client could
+    /// impersonate any other. Compared via `constant_time_eq`.
+    token: String,
 }
 
 impl NodeInfo {
-    fn new(address: String, state: NodeState) -> Self {
+    fn new(address: String, state: NodeState, token: String) -> Self {
         Self {
             address,
             state,
             last_heartbeat: Instant::now(),
             promoted: Arc::new(Notify::new()),
             reported_replication: None,
+            token,
         }
     }
 }
@@ -666,31 +698,39 @@ enum DiscoveryCommand {
     Heartbeat {
         name: String,
         replication: Option<usize>,
+        token: String,
     },
     List,
     /// ADR-0008: a node asking to join, identified by its name (ADR-0009)
     /// and the port it serves on — the reachable address is composed from
-    /// this connection's own source IP plus that port (ADR-0012). Sent
-    /// once, on a connection the node then holds open to receive the
-    /// `R\n` promotion push.
+    /// this connection's own source IP plus that port (ADR-0012). `token`
+    /// (issue #34) establishes the credential every later command naming
+    /// this node must present — see `NodeInfo::token`. Sent once, on a
+    /// connection the node then holds open to receive the `R\n`
+    /// promotion push.
     Join {
         name: String,
         port: u16,
+        token: String,
     },
     /// ADR-0008: a ready node reporting it has finished handing off its
     /// share of a join, identified by its own name (ADR-0009) and the
     /// joining node's name — so a stale report for an abandoned join can
-    /// never be credited to the current one (issue #5).
+    /// never be credited to the current one (issue #5). `token` must
+    /// match the reporting node's registered one (issue #34).
     Complete {
         name: String,
         joining_name: String,
+        token: String,
     },
     /// ADR-0010: an already-promoted node (re-)declaring membership, with
-    /// the same name/port shape as `Join` — upserted straight to
-    /// `Joined`, no handoff orchestration.
+    /// the same name/port/token shape as `Join` — upserted straight to
+    /// `Joined`, no handoff orchestration. `token` must match a
+    /// registered name's stored one (issue #34).
     Announce {
         name: String,
         port: u16,
+        token: String,
     },
 }
 
@@ -755,6 +795,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
         b"H" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let replication = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -768,14 +809,21 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 0 => None,
                 r => Some(r),
             };
-            let name = parse_string_field(input, header_end, name_length)?;
+            let token_length = parse_length(token_length)?;
+            let (name, token) =
+                parse_two_string_fields(input, header_end, name_length, token_length)?;
 
-            Ok(DiscoveryCommand::Heartbeat { name, replication })
+            Ok(DiscoveryCommand::Heartbeat {
+                name,
+                replication,
+                token,
+            })
         }
 
         b"C" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joining_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -783,15 +831,26 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let name_length = parse_length(name_length)?;
             let joining_length = parse_length(joining_length)?;
-            let (name, joining_name) =
-                parse_two_string_fields(input, header_end, name_length, joining_length)?;
+            let token_length = parse_length(token_length)?;
+            let (name, joining_name, token) = parse_three_string_fields(
+                input,
+                header_end,
+                name_length,
+                joining_length,
+                token_length,
+            )?;
 
-            Ok(DiscoveryCommand::Complete { name, joining_name })
+            Ok(DiscoveryCommand::Complete {
+                name,
+                joining_name,
+                token,
+            })
         }
 
         b"J" | b"P" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let port = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -806,48 +865,28 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 .and_then(|raw| raw.parse().ok())
                 .filter(|port| *port != 0)
                 .ok_or(ParseError::InvalidLength)?;
+            let token_length = parse_length(token_length)?;
             // Same owned-fn-pointer dance as `H`/`C` above: resolve the
             // variant while `command` is still alive, so `input` can be
             // reborrowed mutably below.
-            let make: fn(String, u16) -> DiscoveryCommand = match command {
-                b"J" => |name, port| DiscoveryCommand::Join { name, port },
-                _ => |name, port| DiscoveryCommand::Announce { name, port },
+            let make: fn(String, u16, String) -> DiscoveryCommand = match command {
+                b"J" => |name, port, token| DiscoveryCommand::Join { name, port, token },
+                _ => |name, port, token| DiscoveryCommand::Announce { name, port, token },
             };
-            let name = parse_string_field(input, header_end, name_length)?;
+            let (name, token) =
+                parse_two_string_fields(input, header_end, name_length, token_length)?;
 
-            Ok(make(name, port))
+            Ok(make(name, port, token))
         }
 
         _ => Err(ParseError::InvalidCommand),
     }
 }
 
-/// Parses a single length-prefixed field (a name or an address, both
-/// plain UTF-8 strings) starting right after the header's `\n`.
-fn parse_string_field(
-    input: &mut BytesMut,
-    header_end: usize,
-    length: usize,
-) -> Result<String, ParseError> {
-    if length == 0 {
-        return Err(ParseError::EmptyField);
-    }
-
-    let start = header_end + 1;
-    let end = start.checked_add(length).ok_or(ParseError::InvalidLength)?;
-
-    if input.len() < end {
-        return Err(ParseError::Incomplete);
-    }
-
-    let frame = input.split_to(end);
-    String::from_utf8(frame[start..end].to_vec()).map_err(|_| ParseError::InvalidUtf8)
-}
-
-/// Parses two consecutive length-prefixed fields (`J`'s name then
-/// address), checking both are fully buffered before consuming any of
-/// `input`, so `parse`'s "untouched on `Incomplete`" contract holds even
-/// though this reads across two fields in one call.
+/// Parses two consecutive length-prefixed fields (`H`/`J`/`P`'s name then
+/// token — issue #34), checking both are fully buffered before consuming
+/// any of `input`, so `parse`'s "untouched on `Incomplete`" contract
+/// holds even though this reads across two fields in one call.
 fn parse_two_string_fields(
     input: &mut BytesMut,
     header_end: usize,
@@ -877,6 +916,46 @@ fn parse_two_string_fields(
         .map_err(|_| ParseError::InvalidUtf8)?;
 
     Ok((first, second))
+}
+
+/// Parses three consecutive length-prefixed fields (`C`'s name, joining
+/// name, then token — issue #34), with the same "untouched on
+/// `Incomplete`" contract as `parse_two_string_fields`.
+fn parse_three_string_fields(
+    input: &mut BytesMut,
+    header_end: usize,
+    first_length: usize,
+    second_length: usize,
+    third_length: usize,
+) -> Result<(String, String, String), ParseError> {
+    if first_length == 0 || second_length == 0 || third_length == 0 {
+        return Err(ParseError::EmptyField);
+    }
+
+    let first_start = header_end + 1;
+    let first_end = first_start
+        .checked_add(first_length)
+        .ok_or(ParseError::InvalidLength)?;
+    let second_end = first_end
+        .checked_add(second_length)
+        .ok_or(ParseError::InvalidLength)?;
+    let third_end = second_end
+        .checked_add(third_length)
+        .ok_or(ParseError::InvalidLength)?;
+
+    if input.len() < third_end {
+        return Err(ParseError::Incomplete);
+    }
+
+    let frame = input.split_to(third_end);
+    let first = String::from_utf8(frame[first_start..first_end].to_vec())
+        .map_err(|_| ParseError::InvalidUtf8)?;
+    let second = String::from_utf8(frame[first_end..second_end].to_vec())
+        .map_err(|_| ParseError::InvalidUtf8)?;
+    let third = String::from_utf8(frame[second_end..third_end].to_vec())
+        .map_err(|_| ParseError::InvalidUtf8)?;
+
+    Ok((first, second, third))
 }
 
 fn find_lf(input: &[u8]) -> Option<usize> {
@@ -1324,6 +1403,11 @@ enum JoinRejection {
     /// migration timeout reaps it. Rejected here instead, immediately
     /// and with a clear reason, rather than left to time out.
     MigrateMessageTooLarge { message_len: usize },
+    /// A `J` for a name already registered (`Waiting`/`Joining`) under a
+    /// different token (issue #34): not the same node re-sending its
+    /// join, so it must not share that entry's `Notify` (or anything
+    /// else) — rejected outright.
+    TokenMismatch,
 }
 
 /// Registers `name` as `Waiting` with `address` (a no-op if it's already
@@ -1340,6 +1424,7 @@ async fn start_join(
     replication: usize,
     name: &str,
     address: String,
+    token: String,
 ) -> Result<Arc<Notify>, JoinRejection> {
     let promoted = {
         let mut guard = lock(registry);
@@ -1348,6 +1433,17 @@ async fn start_join(
             .is_some_and(|info| info.state == NodeState::Joined)
         {
             return Err(JoinRejection::AlreadyJoined);
+        }
+
+        // Issue #34: a duplicate `J` (issue #7) is only genuinely the
+        // same node retrying if it presents the same token; anything
+        // else must not be allowed to park on the existing entry's
+        // `Notify` and receive its promotion push.
+        if guard
+            .get(name)
+            .is_some_and(|info| !constant_time_eq(info.token.as_bytes(), token.as_bytes()))
+        {
+            return Err(JoinRejection::TokenMismatch);
         }
 
         // Issue (M-message size vs. `nanocached-node`'s request cap):
@@ -1373,7 +1469,7 @@ async fn start_join(
         }
         let info = guard
             .entry(name.to_string())
-            .or_insert_with(|| NodeInfo::new(address, NodeState::Waiting));
+            .or_insert_with(|| NodeInfo::new(address, NodeState::Waiting, token));
         Arc::clone(&info.promoted)
     };
 
@@ -1392,6 +1488,7 @@ async fn start_join(
 /// Records a ready node's completion report for the in-progress join. If
 /// this was the last of `expected` to report in, promotes the joining
 /// node and lets the next `Waiting` node (if any) start.
+#[allow(clippy::too_many_arguments)]
 async fn handle_complete(
     registry: &Registry,
     current_join: &CurrentJoin,
@@ -1400,7 +1497,26 @@ async fn handle_complete(
     replication: usize,
     reporting_name: &str,
     for_joining_name: &str,
+    token: &str,
 ) {
+    // Issue #34: only the reporting node itself may credit its own
+    // handoff as done — a forged `C` would promote the joining node
+    // before it actually holds the reporter's share of the keyspace. A
+    // reporter with no registry entry can't be verified at all (it was
+    // swept mid-join; its report is moot — `abandon_current_join`'s
+    // machinery owns that case), so it is refused the same way.
+    let token_ok = lock(registry)
+        .get(reporting_name)
+        .is_some_and(|info| constant_time_eq(info.token.as_bytes(), token.as_bytes()));
+    if !token_ok {
+        eprintln!(
+            "WARN ignored handoff-complete report from {reporting_name} for \
+             {for_joining_name}: reporter is not registered or presented the wrong \
+             token (issue #34)"
+        );
+        return;
+    }
+
     let joining_name = {
         let mut join_guard = lock_current_join(current_join);
 
@@ -1995,11 +2111,24 @@ async fn handle_connection(
                     "command sent before authenticating",
                 ));
             }
-            Ok(DiscoveryCommand::Heartbeat { name, replication }) => {
+            Ok(DiscoveryCommand::Heartbeat {
+                name,
+                replication,
+                token,
+            }) => {
+                // Checked before anything is refreshed (issue #34): a
+                // heartbeat presenting the wrong token must not keep an
+                // entry alive — otherwise anyone who learned a name from
+                // `L` could pin a dead node's (or, after a takeover
+                // attempt, a hijacked address's) entry past
+                // `sweep_expired` forever.
                 let refreshed = {
                     let mut guard = lock(&registry);
                     match guard.get_mut(&name) {
-                        Some(info) if info.state == NodeState::Joined => {
+                        Some(info)
+                            if info.state == NodeState::Joined
+                                && constant_time_eq(info.token.as_bytes(), token.as_bytes()) =>
+                        {
                             info.last_heartbeat = Instant::now();
                             // Stored unconditionally (`Some` or `None`)
                             // every heartbeat, not just on a mismatch —
@@ -2015,7 +2144,7 @@ async fn handle_connection(
                 if !refreshed {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "heartbeat from a node that has not joined",
+                        "heartbeat from a node that has not joined (or presented the wrong token)",
                     ));
                 }
 
@@ -2106,7 +2235,7 @@ async fn handle_connection(
                 stream.write_all(response.as_bytes()).await?;
                 continue;
             }
-            Ok(DiscoveryCommand::Join { name, port }) => {
+            Ok(DiscoveryCommand::Join { name, port, token }) => {
                 let addr = format!("{peer_ip}:{port}");
 
                 let promoted = start_join(
@@ -2117,6 +2246,7 @@ async fn handle_connection(
                     config.replication,
                     &name,
                     addr,
+                    token,
                 )
                 .await;
 
@@ -2132,6 +2262,17 @@ async fn handle_connection(
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "join for a node that is already joined",
+                        ));
+                    }
+                    Err(JoinRejection::TokenMismatch) => {
+                        eprintln!(
+                            "WARN rejected join for {name} from {peer_ip}: wrong token for \
+                             an already-registered name — either an impersonation attempt \
+                             (issue #34) or a node reusing another's name"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "join with a token that does not match the registered one",
                         ));
                     }
                     Err(JoinRejection::MigrateMessageTooLarge { message_len }) => {
@@ -2161,18 +2302,34 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok(DiscoveryCommand::Announce { name, port }) => {
+            Ok(DiscoveryCommand::Announce { name, port, token }) => {
                 let addr = format!("{peer_ip}:{port}");
-                // Same bookkeeping as `J`: this connection now belongs to
-                // `name`, so its death runs `on_node_connection_ended`.
-                *connection_name
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
 
                 let rejection = {
                     let mut guard = lock(&registry);
                     let at_capacity = guard.len() >= MAX_REGISTRY_SIZE;
                     match guard.get_mut(&name) {
+                        // Issue #34: an announce for a registered name is
+                        // only the node itself re-declaring if it can
+                        // present the token its registration established
+                        // — checked before the mid-join check below, and
+                        // before this connection claims `name` (further
+                        // below), so a stranger's announce can neither
+                        // re-point the node's address nor, by getting
+                        // itself rejected, have its teardown run
+                        // `on_node_connection_ended` against the real
+                        // node's entry (which would let anyone abort an
+                        // in-progress join by announcing its name).
+                        Some(info)
+                            if !constant_time_eq(info.token.as_bytes(), token.as_bytes()) =>
+                        {
+                            eprintln!(
+                                "WARN rejected announce for {name} from {peer_ip}: wrong \
+                                 token — either an impersonation attempt (issue #34) or a \
+                                 node reusing another's name"
+                            );
+                            Some("announce with a token that does not match the registered one")
+                        }
                         // A name mid-join announcing would corrupt the
                         // ADR-0008 join bookkeeping, and no correct node
                         // does it (announces only happen after promotion).
@@ -2187,7 +2344,10 @@ async fn handle_connection(
                         None if at_capacity => Some("registry is full"),
                         None => {
                             println!("INFO node announced: {name} at {addr} (re-registered)");
-                            guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined));
+                            guard.insert(
+                                name.clone(),
+                                NodeInfo::new(addr, NodeState::Joined, token),
+                            );
                             None
                         }
                     }
@@ -2197,10 +2357,23 @@ async fn handle_connection(
                     return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
                 }
 
+                // Same bookkeeping as `J`, and — like `J` — only now that
+                // the announce has actually been accepted does this
+                // connection own `name`, so its death runs
+                // `on_node_connection_ended` (see the rejection arms
+                // above for why not any earlier).
+                *connection_name
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
+
                 stream.write_all(b"R\n").await?;
                 continue;
             }
-            Ok(DiscoveryCommand::Complete { name, joining_name }) => {
+            Ok(DiscoveryCommand::Complete {
+                name,
+                joining_name,
+                token,
+            }) => {
                 handle_complete(
                     &registry,
                     &current_join,
@@ -2209,6 +2382,7 @@ async fn handle_connection(
                     config.replication,
                     &name,
                     &joining_name,
+                    &token,
                 )
                 .await;
                 stream.write_all(b"A\n").await?;
@@ -2341,19 +2515,20 @@ mod tests {
 
     #[test]
     fn parse_reports_incomplete_while_the_field_body_is_still_arriving() {
-        let mut input = BytesMut::from(&b"H 9 2\n1.2.3"[..]);
+        let mut input = BytesMut::from(&b"H 9 2 5\n1.2.3"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn parse_reads_a_heartbeat_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"H 9 2\nsome-nameL\n"[..]);
+        let mut input = BytesMut::from(&b"H 9 2 5\nsome-nametok-aL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Heartbeat {
                 name: "some-name".to_string(),
                 replication: Some(2),
+                token: "tok-a".to_string(),
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -2363,13 +2538,14 @@ mod tests {
     fn parse_reads_a_heartbeat_with_zero_replication_as_unknown() {
         // `0` is the wire sentinel for "this node has no belief yet"
         // (issue #30) — never a real replication factor.
-        let mut input = BytesMut::from(&b"H 9 0\nsome-name"[..]);
+        let mut input = BytesMut::from(&b"H 9 0 5\nsome-nametok-a"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Heartbeat {
                 name: "some-name".to_string(),
                 replication: None,
+                token: "tok-a".to_string(),
             }
         );
     }
@@ -2381,20 +2557,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_a_heartbeat_missing_the_token_field() {
+        // The pre-issue-#34 frame shape: no token length in the header.
+        let mut input = BytesMut::from(&b"H 9 2\nsome-name"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_rejects_a_heartbeat_with_an_empty_token() {
+        let mut input = BytesMut::from(&b"H 9 2 0\nsome-name"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
     fn parse_rejects_a_heartbeat_with_trailing_arguments() {
-        let mut input = BytesMut::from(&b"H 9 2 extra\nsome-name"[..]);
+        let mut input = BytesMut::from(&b"H 9 2 5 extra\nsome-nametok-a"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
     fn parse_reads_a_join_command_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"J 9 8356\nsome-nameL\n"[..]);
+        let mut input = BytesMut::from(&b"J 9 8356 5\nsome-nametok-aL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Join {
                 name: "some-name".to_string(),
                 port: 8356,
+                token: "tok-a".to_string(),
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -2402,13 +2592,13 @@ mod tests {
 
     #[test]
     fn parse_reports_incomplete_while_a_joins_second_field_is_still_arriving() {
-        let mut input = BytesMut::from(&b"J 9 8356\nsome-na"[..]);
+        let mut input = BytesMut::from(&b"J 9 8356 5\nsome-na"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
 
     #[test]
     fn parse_leaves_input_untouched_when_a_joins_second_field_is_incomplete() {
-        let original = b"J 9 8356\nsome-na".to_vec();
+        let original = b"J 9 8356 5\nsome-nametok".to_vec();
         let mut input = BytesMut::from(&original[..]);
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
         assert_eq!(&input[..], &original[..]);
@@ -2416,13 +2606,14 @@ mod tests {
 
     #[test]
     fn parse_reads_a_complete_command() {
-        let mut input = BytesMut::from(&b"C 9 6\nsome-namejoinerL\n"[..]);
+        let mut input = BytesMut::from(&b"C 9 6 5\nsome-namejoinertok-aL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Complete {
                 name: "some-name".to_string(),
                 joining_name: "joiner".to_string(),
+                token: "tok-a".to_string(),
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -2443,7 +2634,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_an_empty_field() {
-        let mut input = BytesMut::from(&b"H 0 2\n"[..]);
+        let mut input = BytesMut::from(&b"H 0 2 5\n"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
 
@@ -2451,19 +2642,19 @@ mod tests {
     fn parse_rejects_port_zero_in_join() {
         // Port 0 can never be served on — ADR-0012 derives the address
         // from source IP + this port, so a zero here is protocol garbage.
-        let mut input = BytesMut::from(&b"J 9 0\nsome-name"[..]);
+        let mut input = BytesMut::from(&b"J 9 0 5\nsome-nametok-a"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
     fn parse_rejects_a_non_numeric_length() {
-        let mut input = BytesMut::from(&b"H x 2\n"[..]);
+        let mut input = BytesMut::from(&b"H x 2 5\n"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
     }
 
     #[test]
     fn parse_rejects_invalid_utf8_fields() {
-        let mut input = BytesMut::from(&b"H 2 2\n\xff\xfe"[..]);
+        let mut input = BytesMut::from(&b"H 2 2 2\n\xff\xfetk"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidUtf8));
     }
 
@@ -2567,7 +2758,7 @@ mod tests {
         // With no Joined nodes yet, this is the bootstrap case: the join
         // is accepted with nothing to hand off, so promotion is immediate.
         client
-            .write_all(b"J 6 8356\nnode-aH 6 0\nnode-aL\n")
+            .write_all(b"J 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-aL\n")
             .await
             .unwrap();
 
@@ -2630,7 +2821,7 @@ mod tests {
         // This replica is configured with R=2 (above); the node here
         // reports R=1 on its heartbeat — a disagreement.
         client
-            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-a")
+            .write_all(b"J 6 8356 9\nnode-atk-node-aH 6 1 9\nnode-atk-node-a")
             .await
             .unwrap();
 
@@ -2687,7 +2878,7 @@ mod tests {
         // This replica is configured with R=2 (above); the node here
         // reports R=1 on its heartbeat, then asks for `L`.
         client
-            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-aL\n")
+            .write_all(b"J 6 8356 9\nnode-atk-node-aH 6 1 9\nnode-atk-node-aL\n")
             .await
             .unwrap();
 
@@ -2740,7 +2931,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
         first
-            .write_all(b"J 6 8356\nnode-aH 6 1\nnode-aL\n")
+            .write_all(b"J 6 8356 9\nnode-atk-node-aH 6 1 9\nnode-atk-node-aL\n")
             .await
             .unwrap();
 
@@ -2766,7 +2957,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        second.write_all(b"H 6 2\nnode-aL\n").await.unwrap();
+        second
+            .write_all(b"H 6 2 9\nnode-atk-node-aL\n")
+            .await
+            .unwrap();
 
         let expected_second = b"A\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received_second = Vec::new();
@@ -2780,13 +2974,14 @@ mod tests {
 
     #[test]
     fn parse_reads_an_announce_command_and_consumes_only_that_frame() {
-        let mut input = BytesMut::from(&b"P 9 8356\nsome-nameL\n"[..]);
+        let mut input = BytesMut::from(&b"P 9 8356 12\nsome-nametk-some-nameL\n"[..]);
         let command = parse(&mut input).unwrap();
         assert_eq!(
             command,
             DiscoveryCommand::Announce {
                 name: "some-name".to_string(),
                 port: 8356,
+                token: "tk-some-name".to_string(),
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -2828,7 +3023,7 @@ mod tests {
         // heartbeating (A), and visible in L — with no ADR-0008 join
         // machinery involved.
         client
-            .write_all(b"P 6 8356\nnode-aH 6 0\nnode-aL\n")
+            .write_all(b"P 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-aL\n")
             .await
             .unwrap();
 
@@ -2857,7 +3052,11 @@ mod tests {
 
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new("127.0.0.1:1111".to_string(), NodeState::Joined),
+            NodeInfo::new(
+                "127.0.0.1:1111".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
         );
 
         let (mut client, server) = tcp_pair().await;
@@ -2878,7 +3077,10 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
 
-        client.write_all(b"P 6 2222\nnode-a").await.unwrap();
+        client
+            .write_all(b"P 6 2222 9\nnode-atk-node-a")
+            .await
+            .unwrap();
         let mut response = [0u8; 2];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"R\n");
@@ -2887,6 +3089,235 @@ mod tests {
             lock(&registry).get("node-a").unwrap().address,
             "127.0.0.1:2222"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn announce_with_the_wrong_token_cannot_repoint_a_joined_nodes_address() {
+        // Issue #34, the takeover scenario itself: knowing a node's name
+        // (public — `L` lists it) must not be enough to redirect its
+        // traffic; the announce must also present the token the name was
+        // registered with.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1111".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+
+        let connection_name = Arc::new(std::sync::Mutex::new(None));
+        let (mut attacker, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::clone(&connection_name),
+        ));
+
+        attacker
+            .write_all(b"P 6 2222 8\nnode-aevil-tok")
+            .await
+            .unwrap();
+
+        // Rejected: the connection errors out and closes without `R\n`.
+        let mut response = [0u8; 2];
+        assert!(attacker.read_exact(&mut response).await.is_err());
+        assert!(connection_task.await.unwrap().is_err());
+
+        // The real node's registration is untouched...
+        assert_eq!(
+            lock(&registry).get("node-a").unwrap().address,
+            "127.0.0.1:1111"
+        );
+        // ...and the rejected connection never claimed the name, so its
+        // teardown can't run `on_node_connection_ended` against the real
+        // node's entry.
+        assert!(
+            connection_name
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "a rejected announce must not claim the name for its connection's teardown"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rejected_announce_cannot_abort_an_in_progress_join() {
+        // Issue #34's companion DoS: announcing a mid-join name used to
+        // set `connection_name` before rejecting, so the rejected
+        // connection's teardown removed the real (Waiting/Joining) entry
+        // and abandoned the join. The name must only be claimed once the
+        // announce is accepted.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_node_a, _node_b, registry, current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx.clone()).await;
+
+        let connection_name = Arc::new(std::sync::Mutex::new(None));
+        let (mut attacker, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::clone(&connection_name),
+        ));
+
+        attacker
+            .write_all(b"P 6 2222 8\nnode-bevil-tok")
+            .await
+            .unwrap();
+        assert!(connection_task.await.unwrap().is_err());
+
+        assert!(
+            connection_name
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "a rejected announce must not claim the mid-join name"
+        );
+        assert!(
+            lock(&registry).contains_key("node-b"),
+            "the joining node's entry must survive the rejected announce"
+        );
+        assert!(
+            lock_current_join(&current_join).is_some(),
+            "the in-progress join must survive the rejected announce"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_with_the_wrong_token_is_rejected() {
+        // Issue #34: a heartbeat must not refresh (or overwrite the
+        // reported replication belief of) an entry it can't present the
+        // token for — otherwise anyone could keep a dead node's entry
+        // alive past `sweep_expired`.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1111".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+
+        let (mut attacker, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        attacker
+            .write_all(b"H 6 3 8\nnode-aevil-tok")
+            .await
+            .unwrap();
+
+        let mut ack = [0u8; 2];
+        assert!(attacker.read_exact(&mut ack).await.is_err());
+        assert!(connection_task.await.unwrap().is_err());
+        assert_eq!(
+            lock(&registry).get("node-a").unwrap().reported_replication,
+            None,
+            "a wrong-token heartbeat must not record a replication belief"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_announce_for_an_unknown_name_establishes_its_token() {
+        // Issue #34: a name this replica doesn't know (a standby replica,
+        // or an amnesiac restart) is trusted on first use — its announce
+        // both registers it and binds the presented token, which
+        // everything after must match.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = || ConnectionConfig {
+            idle_timeout: Duration::from_secs(5),
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+        };
+
+        let (mut node, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        // First use: announce registers the name and binds tk-node-a; the
+        // same connection's heartbeat (same token) is accepted.
+        node.write_all(b"P 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-a")
+            .await
+            .unwrap();
+        let mut responses = [0u8; 4];
+        node.read_exact(&mut responses).await.unwrap();
+        assert_eq!(&responses, b"R\nA\n");
+
+        // A later connection presenting a different token is rejected.
+        let (mut attacker, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        attacker
+            .write_all(b"H 6 0 8\nnode-aevil-tok")
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        assert!(attacker.read_exact(&mut ack).await.is_err());
+        assert!(connection_task.await.unwrap().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2910,7 +3341,7 @@ mod tests {
             for i in 0..60 {
                 guard.insert(
                     format!("{long_name_prefix}-{i}"),
-                    NodeInfo::new(long_addr.clone(), NodeState::Joined),
+                    NodeInfo::new(long_addr.clone(), NodeState::Joined, "tk".to_string()),
                 );
             }
         }
@@ -2923,6 +3354,7 @@ mod tests {
             2,
             "joining-node",
             "127.0.0.1:9999".to_string(),
+            "tk-joining-node".to_string(),
         )
         .await;
 
@@ -2943,7 +3375,11 @@ mod tests {
 
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new("127.0.0.1:1111".to_string(), NodeState::Waiting),
+            NodeInfo::new(
+                "127.0.0.1:1111".to_string(),
+                NodeState::Waiting,
+                "tk-node-a".to_string(),
+            ),
         );
 
         let (mut client, server) = tcp_pair().await;
@@ -2964,7 +3400,10 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
 
-        client.write_all(b"P 6 2222\nnode-a").await.unwrap();
+        client
+            .write_all(b"P 6 2222 9\nnode-atk-node-a")
+            .await
+            .unwrap();
 
         // The connection is closed with no `R` — the announce was refused.
         let mut buffer = [0u8; 2];
@@ -3002,7 +3441,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        announcing.write_all(b"P 6 8356\nnode-a").await.unwrap();
+        announcing
+            .write_all(b"P 6 8356 9\nnode-atk-node-a")
+            .await
+            .unwrap();
         let mut response = [0u8; 2];
         announcing.read_exact(&mut response).await.unwrap();
         assert_eq!(&response, b"R\n");
@@ -3061,7 +3503,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_a.write_all(b"J 6 9001\nnode-a").await.unwrap();
+        node_a
+            .write_all(b"J 6 9001 9\nnode-atk-node-a")
+            .await
+            .unwrap();
         let mut promoted = [0u8; 2];
         node_a.read_exact(&mut promoted).await.unwrap();
         assert_eq!(&promoted, b"R\n");
@@ -3076,7 +3521,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        node_b
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
 
         for _ in 0..1000 {
             if lock_current_join(&current_join).is_some() {
@@ -3146,10 +3594,16 @@ mod tests {
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b_second.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        node_b_second
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await; // let it park
 
-        node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
         let mut ack = [0u8; 2];
         node_a.read_exact(&mut ack).await.unwrap();
 
@@ -3180,7 +3634,11 @@ mod tests {
         // already handles correctly, see the sibling tests above).
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
         );
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-x".to_string(),
@@ -3209,7 +3667,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b_first.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        node_b_first
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await; // let it park
 
         let (mut node_b_second, server_second) = tcp_pair().await;
@@ -3222,7 +3683,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b_second.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        node_b_second
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await; // let it park too
 
         assert!(lock(&registry).contains_key("node-b"));
@@ -3253,7 +3717,10 @@ mod tests {
             registry_with_a_joined_and_b_waiting(shutdown_rx).await;
 
         // Stale: names a join for "node-x", not the pending one for node-b.
-        node_a.write_all(b"C 6 6\nnode-anode-x").await.unwrap();
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-xtk-node-a")
+            .await
+            .unwrap();
         let mut ack = [0u8; 2];
         node_a.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"A\n");
@@ -3266,7 +3733,10 @@ mod tests {
         );
 
         // The genuine report still promotes.
-        node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
         node_a.read_exact(&mut ack).await.unwrap();
         let mut promoted = [0u8; 2];
         tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut promoted))
@@ -3274,6 +3744,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&promoted, b"R\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_complete_with_the_wrong_token_is_not_credited() {
+        // Issue #34: a forged C would promote the joining node before it
+        // actually holds the reporter's share of the keyspace, so a
+        // report that can't present the reporter's registered token is
+        // ignored (same shape as issue #5's stale-report handling).
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, mut node_b, registry, _current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx).await;
+
+        node_a
+            .write_all(b"C 6 6 8\nnode-anode-bevil-tok")
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_ne!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joined),
+            "a wrong-token C was credited to the join"
+        );
+
+        // The genuine report still promotes.
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
+        node_a.read_exact(&mut ack).await.unwrap();
+        let mut promoted = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut promoted))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&promoted, b"R\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_with_the_wrong_token_for_a_registered_name_is_rejected() {
+        // Issue #34: only the same node retrying (same token) may share a
+        // Waiting entry's promotion `Notify` — see
+        // `JoinRejection::TokenMismatch`.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_node_a, _node_b, registry, current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx.clone()).await;
+
+        let (mut attacker, server) = tcp_pair().await;
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        attacker
+            .write_all(b"J 6 9002 8\nnode-bevil-tok")
+            .await
+            .unwrap();
+        assert!(connection_task.await.unwrap().is_err());
+        assert!(
+            lock(&registry).contains_key("node-b"),
+            "the real node's entry must survive the rejected join"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3325,7 +3872,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_a.write_all(b"J 6 9001\nnode-a").await.unwrap();
+        node_a
+            .write_all(b"J 6 9001 9\nnode-atk-node-a")
+            .await
+            .unwrap();
         let mut node_a_response = [0u8; 2];
         node_a.read_exact(&mut node_a_response).await.unwrap();
         assert_eq!(&node_a_response, b"R\n");
@@ -3343,7 +3893,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        node_b
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
 
         // The write completing only means the OS accepted the bytes, not
         // that the spawned connection task has read and processed them
@@ -3379,7 +3932,10 @@ mod tests {
         // A reports it has finished handing its share off to B. B should
         // now be promoted and receive its own R\n on the connection it's
         // been holding open since it sent J.
-        node_a.write_all(b"C 6 6\nnode-anode-b").await.unwrap();
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
         let mut ack = [0u8; 2];
         node_a.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"A\n");
@@ -3439,7 +3995,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
         node_a
-            .write_all(format!("J 6 {ready_port}\nnode-a").as_bytes())
+            .write_all(format!("J 6 {ready_port} 9\nnode-atk-node-a").as_bytes())
             .await
             .unwrap();
         let mut node_a_response = [0u8; 2];
@@ -3458,7 +4014,10 @@ mod tests {
             shutdown_rx.clone(),
             Arc::new(std::sync::Mutex::new(None)),
         ));
-        node_b.write_all(b"J 6 9002\nnode-b").await.unwrap();
+        node_b
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
 
         for _ in 0..1000 {
             if !received.lock().unwrap().is_empty() {
@@ -3726,7 +4285,11 @@ mod tests {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
         lock(&registry).insert(
             "some-name".to_string(),
-            NodeInfo::new("127.0.0.1:8356".to_string(), NodeState::Joined),
+            NodeInfo::new(
+                "127.0.0.1:8356".to_string(),
+                NodeState::Joined,
+                "tk-some-name".to_string(),
+            ),
         );
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -4021,11 +4584,19 @@ mod tests {
 
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
         );
         lock(&registry).insert(
             "node-c".to_string(),
-            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-c".to_string(),
+            ),
         );
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
@@ -4082,11 +4653,15 @@ mod tests {
 
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new(ready_addr, NodeState::Joined),
+            NodeInfo::new(ready_addr, NodeState::Joined, "tk-node-a".to_string()),
         );
         lock(&registry).insert(
             "node-b".to_string(),
-            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
         );
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
@@ -4117,11 +4692,19 @@ mod tests {
 
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
         );
         lock(&registry).insert(
             "node-b".to_string(),
-            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
         );
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
@@ -4163,11 +4746,19 @@ mod tests {
 
         lock(&registry).insert(
             "node-a".to_string(),
-            NodeInfo::new("127.0.0.1:1".to_string(), NodeState::Joined),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
         );
         lock(&registry).insert(
             "node-b".to_string(),
-            NodeInfo::new("127.0.0.1:2".to_string(), NodeState::Joining),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
         );
 
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
