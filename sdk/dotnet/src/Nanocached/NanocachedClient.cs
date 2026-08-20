@@ -158,7 +158,10 @@ public sealed class NanocachedClient : IDisposable
     // doc/adr/0014-*.md: bounds in-flight background replica writes and
     // lets Close() drain them before tearing down connections.
     private readonly SemaphoreSlim _backgroundReplicaPermits;
-    private readonly ConcurrentDictionary<Task, byte> _backgroundReplicaWrites = new();
+    // The permit count _backgroundReplicaPermits was built with, captured
+    // so Close() can acquire exactly all of them even if a test mutates
+    // the static MaxInFlightBackgroundReplicaWrites afterwards.
+    private readonly int _backgroundReplicaPermitCount;
     private readonly CancellationTokenSource _lifetime = new();
 
     // Observability for failures this client swallows by design — see
@@ -170,6 +173,11 @@ public sealed class NanocachedClient : IDisposable
     private long _refreshFailures;
 
     private volatile bool _closed;
+    // 0 = open, 1 = closed. Gates Close() with Interlocked.Exchange the
+    // same way Connection._closedFlag does: the volatile _closed alone
+    // gives visibility but not atomicity, so two concurrent Close() calls
+    // could both pass a plain check and both run the teardown body.
+    private int _closeCalled;
     private Connection? _single;
     private string? _singleAddress;
     private readonly Dictionary<string, Member> _members = new();
@@ -191,7 +199,8 @@ public sealed class NanocachedClient : IDisposable
         _compress = options.Compress;
         _compressionThreshold = options.CompressionThreshold;
         _fireAndForgetReplicas = options.FireAndForgetReplicas;
-        _backgroundReplicaPermits = new SemaphoreSlim(MaxInFlightBackgroundReplicaWrites, MaxInFlightBackgroundReplicaWrites);
+        _backgroundReplicaPermitCount = MaxInFlightBackgroundReplicaWrites;
+        _backgroundReplicaPermits = new SemaphoreSlim(_backgroundReplicaPermitCount, _backgroundReplicaPermitCount);
         _readRepair = options.ReadRepair;
     }
 
@@ -502,7 +511,7 @@ public sealed class NanocachedClient : IDisposable
     /// the caller lost track of this instance's lifecycle.</summary>
     public void Close()
     {
-        if (_closed)
+        if (Interlocked.Exchange(ref _closeCalled, 1) != 0)
         {
             Console.Error.WriteLine("nanocached: close() called again on an already-closed client");
             return;
@@ -511,9 +520,19 @@ public sealed class NanocachedClient : IDisposable
         _lifetime.Cancel();
         // doc/adr/0014-*.md: give background replica writes a chance to
         // finish before their connections are torn out from under them.
-        // Bounded by MaxInFlightBackgroundReplicaWrites, so this is a
-        // short wait in practice.
-        Task.WaitAll(_backgroundReplicaWrites.Keys.ToArray());
+        // Acquiring every permit — rather than snapshotting the task set —
+        // closes the registration race: a WriteAsync that passed its
+        // _closed check before this call can still be about to start a
+        // background leg, and a snapshot taken in that window would miss
+        // it. Once all permits are held here no new leg can start
+        // (Wait(0) fails, so the leg falls back to the synchronous path),
+        // and each permit is only released after its leg completed.
+        // Bounded by the permit count, so this is a short wait in
+        // practice.
+        for (int i = 0; i < _backgroundReplicaPermitCount; i++)
+        {
+            _backgroundReplicaPermits.Wait();
+        }
         Teardown();
     }
 
@@ -671,13 +690,8 @@ public sealed class NanocachedClient : IDisposable
             if (_fireAndForgetReplicas && _backgroundReplicaPermits.Wait(0))
             {
                 Task background = Task.Run(() => ReplicaWriteAsync(name));
-                _backgroundReplicaWrites[background] = 0;
                 _ = background.ContinueWith(
-                    completed =>
-                    {
-                        _backgroundReplicaWrites.TryRemove(completed, out _);
-                        _backgroundReplicaPermits.Release();
-                    },
+                    completed => _backgroundReplicaPermits.Release(),
                     TaskScheduler.Default);
                 continue;
             }

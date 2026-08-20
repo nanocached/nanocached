@@ -231,9 +231,11 @@ public final class NanocachedClient implements AutoCloseable {
     private final AtomicLong replicaWriteFailures = new AtomicLong();
     private final AtomicLong readRepairFailures = new AtomicLong();
     private final AtomicLong refreshFailures = new AtomicLong();
-    private final java.util.Set<CompletableFuture<Void>> backgroundReplicaWrites =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
     private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
+    // The permit count backgroundReplicaWritePermits was built with,
+    // captured so close() can acquire exactly all of them even if a test
+    // mutates the static maxInFlightBackgroundReplicaWrites afterwards.
+    private int backgroundReplicaWritePermitCount;
 
     /** The address that answered connect() — used both to redial in single
      * mode and as the key for the open-sockets tracker in every mode
@@ -242,6 +244,12 @@ public final class NanocachedClient implements AutoCloseable {
     private String targetKey;
 
     private volatile boolean closed = false;
+    // Gates close() atomically: the volatile boolean above gives
+    // visibility but not atomicity, so two concurrent close() calls could
+    // both pass a plain check and both run the teardown body (the same
+    // check-then-set race Connection.poison() avoids via synchronized).
+    private final java.util.concurrent.atomic.AtomicBoolean closeCalled =
+            new java.util.concurrent.atomic.AtomicBoolean();
     // volatile so a reader sees a redial's new Connection right away.
     // redialLocks (per-slot monitors) give mutual exclusion for the
     // redial itself, but a monitor only guarantees visibility to threads
@@ -423,7 +431,8 @@ public final class NanocachedClient implements AutoCloseable {
         }
         ring = new HashRing(names);
         replication = cluster.replication();
-        backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(maxInFlightBackgroundReplicaWrites);
+        backgroundReplicaWritePermitCount = maxInFlightBackgroundReplicaWrites;
+        backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
         replicaWriters = Executors.newCachedThreadPool(runnable -> {
             Thread thread = new Thread(runnable, "nanocached-replica-writer");
             thread.setDaemon(true);
@@ -592,7 +601,7 @@ public final class NanocachedClient implements AutoCloseable {
      * track of this instance's lifecycle. */
     @Override
     public void close() {
-        if (closed) {
+        if (!closeCalled.compareAndSet(false, true)) {
             System.err.println("nanocached: close() called again on an already-closed client");
             return;
         }
@@ -600,10 +609,17 @@ public final class NanocachedClient implements AutoCloseable {
         if (keepAlive != null) keepAlive.shutdownNow();
         // doc/adr/0014-*.md: give background replica writes a chance to
         // finish before their connections are torn out from under them.
-        // Bounded by maxInFlightBackgroundReplicaWrites, so this is a
-        // short wait in practice.
-        for (CompletableFuture<Void> pending : List.copyOf(backgroundReplicaWrites)) {
-            pending.join();
+        // Acquiring every permit — rather than snapshotting the future
+        // set — closes the registration race: a write() that passed its
+        // closed check before this call can still be about to start a
+        // background leg, and a snapshot taken in that window would miss
+        // it. Once all permits are held here no new leg can start
+        // (tryAcquire fails, so the leg falls back to the synchronous
+        // path), and each permit is only released after its leg
+        // completed. Bounded by the permit count, so this is a short wait
+        // in practice.
+        if (backgroundReplicaWritePermits != null) {
+            backgroundReplicaWritePermits.acquireUninterruptibly(backgroundReplicaWritePermitCount);
         }
         if (replicaWriters != null) replicaWriters.shutdown();
         teardown();
@@ -728,12 +744,9 @@ public final class NanocachedClient implements AutoCloseable {
             // cap, further legs fall back to the synchronous path exactly
             // as with the option off.
             if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
-                CompletableFuture<Void> background = CompletableFuture.runAsync(replicaWrite, replicaWriters);
-                backgroundReplicaWrites.add(background);
-                background.whenComplete((ignoredResult, ignoredError) -> {
-                    backgroundReplicaWritePermits.release();
-                    backgroundReplicaWrites.remove(background);
-                });
+                CompletableFuture.runAsync(replicaWrite, replicaWriters)
+                        .whenComplete((ignoredResult, ignoredError) ->
+                                backgroundReplicaWritePermits.release());
                 continue;
             }
 
@@ -807,11 +820,16 @@ public final class NanocachedClient implements AutoCloseable {
     /** {@code null} on anything {@link Integer#parseInt} would reject —
      * every SDK exception must extend {@link NanocachedException}, so a
      * raw {@link NumberFormatException} must never escape a discovery
-     * response's port field. Mirrors .NET's {@code int.TryParse} handling
-     * at the same spot (Identify.SplitHostPort). */
+     * response's port field. Out-of-range ports are rejected here too:
+     * {@code new InetSocketAddress(host, port)} in {@code Identify.open}
+     * throws a raw {@link IllegalArgumentException} outside 0-65535,
+     * which the get/set/delete reconnect path does not catch. Mirrors
+     * .NET's {@code int.TryParse} handling at the same spot
+     * (Identify.SplitHostPort). */
     private static Integer parsePort(String text) {
         try {
-            return Integer.parseInt(text);
+            int port = Integer.parseInt(text);
+            return port < 0 || port > 65535 ? null : port;
         } catch (NumberFormatException malformed) {
             return null;
         }
