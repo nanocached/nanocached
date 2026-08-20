@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
@@ -143,6 +144,20 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Point-in-time snapshot returned by {@link #stats()}: counters for
+     * failures this client swallows by design instead of surfacing to the
+     * caller — a dead replica leg on a write (doc/adr/0011-*.md,
+     * doc/adr/0014-*.md), a failed background repair of the primary after
+     * read-repair found a value on another owner (doc/adr/0015-*.md), and
+     * a failed node-list refresh attempt or per-node reconnect during one.
+     * None of these ever fail an operation; this is purely observability
+     * so an operator who only watches for thrown exceptions can still
+     * notice replication silently degrading or a node-list refresh stuck
+     * failing.
+     */
+    public record ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures) {}
+
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
 
     public static Options builder() {
@@ -150,8 +165,21 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private static final Duration NODE_LIST_STALE_AFTER = Duration.ofSeconds(30);
-    // The server rejects empty keys, so the keep-alive G needs one byte.
-    private static final byte[] KEEPALIVE_KEY = {0};
+    // Reserved by the SDKs so a real application key can never collide
+    // with it: a GET refreshes the pinged key's server-side LRU recency,
+    // which is exactly why collision would matter — an app using key
+    // {0x00} would previously have had its recency silently refreshed on
+    // every keep-alive tick. The leading 0x00 also keeps this out of any
+    // plausible printable-string keyspace.
+    private static final byte[] KEEPALIVE_KEY = keepAliveKey();
+
+    private static byte[] keepAliveKey() {
+        byte[] name = "nanocached-keepalive".getBytes(StandardCharsets.US_ASCII);
+        byte[] key = new byte[1 + name.length];
+        System.arraycopy(name, 0, key, 1, name.length);
+        return key;
+    }
+
     // TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
     // the protocol's TTL unit throughout (see set()'s ttlSeconds). The
     // original TTL isn't recoverable from a GET response, and repairing
@@ -195,6 +223,14 @@ public final class NanocachedClient implements AutoCloseable {
     private final int compressionThreshold;
     private final boolean fireAndForgetReplicas;
     private final boolean readRepair;
+    // Observability for failures this client swallows by design — see
+    // stats(). AtomicLong because they're incremented from whichever
+    // thread happens to hit the swallow site (foreground calls,
+    // background replica writes, a refresh running on any caller's
+    // thread).
+    private final AtomicLong replicaWriteFailures = new AtomicLong();
+    private final AtomicLong readRepairFailures = new AtomicLong();
+    private final AtomicLong refreshFailures = new AtomicLong();
     private final java.util.Set<CompletableFuture<Void>> backgroundReplicaWrites =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
     private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
@@ -406,6 +442,19 @@ public final class NanocachedClient implements AutoCloseable {
         return closed;
     }
 
+    /**
+     * A snapshot of counters for failures this client swallows by design
+     * (ADR-0011/0014's replica-leg writes, ADR-0015's read-repair, and
+     * node-list refresh) — see {@link ClientStats} for exactly what each
+     * counts. Nothing here ever fails an operation; this exists purely so
+     * an operator can detect replication silently degrading or a
+     * node-list refresh that is stuck failing.
+     */
+    public ClientStats stats() {
+        return new ClientStats(
+                replicaWriteFailures.get(), readRepairFailures.get(), refreshFailures.get());
+    }
+
     /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
      * when the key is missing.
      * @throws UncheckedIOException if the stored value is not valid UTF-8 */
@@ -449,7 +498,9 @@ public final class NanocachedClient implements AutoCloseable {
      * (the original TTL can't be recovered from a GET, and TTL 0 would
      * permanently resurrect already-expired data). Every failure along
      * the way (connection lost, WrongNode, another miss) is swallowed;
-     * nothing here may turn an already-accepted miss into an error. */
+     * nothing here may turn an already-accepted miss into an error. A
+     * failure repairing the primary specifically is counted via
+     * {@link #stats()}'s readRepairFailures. */
     private byte[] tryReadRepair(byte[] key) {
         List<String> names = ownerNames(key);
         for (String name : names) {
@@ -470,8 +521,14 @@ public final class NanocachedClient implements AutoCloseable {
                             connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS);
                             return null;
                         });
-                    } catch (RuntimeException ignored) {
-                        // Swallowed by design — see the doc comment.
+                    } catch (NanocachedException ignored) {
+                        // Swallowed by design — see the doc comment; now
+                        // counted via stats().readRepairFailures. Narrowed
+                        // to the connection layer's own failure types, so
+                        // a programming bug here (e.g. a
+                        // NullPointerException) propagates instead of
+                        // being treated identically to a dead primary.
+                        readRepairFailures.incrementAndGet();
                     }
                 });
             }
@@ -651,10 +708,17 @@ public final class NanocachedClient implements AutoCloseable {
             Runnable replicaWrite = () -> {
                 try {
                     applyReconnecting(() -> memberConnection(replica), op);
-                } catch (RuntimeException ignored) {
+                } catch (NanocachedException ignored) {
                     // Swallowed by design (ADR-0011): a dead or disagreeing
                     // replica leaves the key under-replicated until the next
-                    // node-list refresh, never fails the write.
+                    // node-list refresh, never fails the write. Counted via
+                    // stats().replicaWriteFailures so operators can spot
+                    // silently degrading replication. Narrowed to the
+                    // connection layer's own failure types, covering both
+                    // the fire-and-forget and synchronous-fallback callers
+                    // of this lambda, so a programming bug doesn't get
+                    // treated the same way as a dead replica.
+                    replicaWriteFailures.incrementAndGet();
                 }
             };
 
@@ -851,9 +915,15 @@ public final class NanocachedClient implements AutoCloseable {
                 try {
                     members.put(node.name(), new Member(node.address(), openNodeConnection(node.address())));
                 } catch (IOException | RuntimeException error) {
-                    // Kept silent by design (issue #12): behavior is
-                    // unchanged (this node is retried on the next refresh),
-                    // it just no longer narrates to stderr.
+                    // Left out of the ring for now; the next refresh
+                    // retries it. Silent by design: the stderr narration
+                    // this once had was removed by the #25/#27
+                    // API-unification work — not issue #12, which is only
+                    // the redial-gate pruning above — since a per-node
+                    // connect failure here changes no behavior and isn't
+                    // worth a warning on every refresh. Counted via
+                    // stats().refreshFailures instead.
+                    refreshFailures.incrementAndGet();
                 }
             }
 
@@ -870,6 +940,11 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 identified = Identify.connectAndIdentify(address.host(), address.port(), authSecret, tls);
             } catch (IOException | RuntimeException error) {
+                // Silent by design — refresh is opportunistic/best-effort
+                // and must never fail the caller's operation, consistent
+                // with ADR-0011's eventual-consistency model. The next
+                // refresh retries; counted via stats().refreshFailures.
+                refreshFailures.incrementAndGet();
                 continue;
             }
             if (identified instanceof Identify.NodeTarget node) {

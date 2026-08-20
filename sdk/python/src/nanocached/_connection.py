@@ -20,8 +20,9 @@ from collections.abc import Callable
 
 from ._errors import NanocachedError, WrongNodeError
 
-# The server never stores values above its 1 MiB request limit, so a
-# claimed length beyond this is a corrupt or malicious frame.
+# The server's own request cap is 1 MiB; this constant doubles that as
+# headroom, so a claimed length beyond it is definitely a corrupt or
+# malicious frame, never just a legitimately large value.
 _MAX_VALUE_LENGTH = 2 * 1024 * 1024
 
 
@@ -121,7 +122,13 @@ class Connection:
         every still-pending request with error. Safe to call more than
         once — from a writer noticing a failed write, the read loop
         noticing a failed read, or an explicit close() — only the first
-        call has any effect."""
+        call has any effect. Invariant: no ``await`` may ever be
+        introduced between the ``self._closed`` check below and the
+        ``self._closed = True`` that follows it (nor in the corresponding
+        check inside ``_request``'s locked section) — without that, two
+        coroutines could both observe ``_closed`` as false and interleave
+        past this guard, each running the body below and double-poisoning
+        the connection."""
         if self._closed:
             return
         self._closed = True
@@ -165,9 +172,13 @@ class Connection:
         # matched to this slot by the read loop, so the future is left
         # in _pending (cancelled(), unretrieved) rather than removed,
         # keeping queue order aligned with wire order for every request
-        # behind it (doc/adr/0016-*.md). Mirrors the TypeScript SDK's
-        # Connection, whose plain Promises can't be cancelled out from
-        # under `pending` at all.
+        # behind it (doc/adr/0016-*.md). The TypeScript SDK's Connection
+        # has no cancellation to handle here at all — plain Promises
+        # simply can't be cancelled out from under `pending`. This SDK's
+        # asyncio Tasks can be, so this is a real improvement rather than
+        # just preserving it (ADR-0016): cancellation is supported, and
+        # kept safe by leaving the cancelled future in place instead of
+        # ripping it out from under the read loop.
         return await future
 
     async def _read_loop(self) -> None:

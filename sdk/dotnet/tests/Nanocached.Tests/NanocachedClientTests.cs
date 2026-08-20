@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using Xunit;
@@ -830,6 +831,150 @@ public class NanocachedClientTests
         });
 
         Assert.Null(await client.GetBytesAsync("nowhere"));
+    }
+
+    // ── Stats() と catch の絞り込み ─────────────────────────────────
+
+    [Fact]
+    public async Task ADeadReplicaIncrementsReplicaWriteFailures()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Dispose();
+        await Task.Delay(50);
+
+        Assert.Equal(0, client.Stats().ReplicaWriteFailures);
+        await client.SetAsync("k", "v");
+        Assert.Equal(1, client.Stats().ReplicaWriteFailures);
+    }
+
+    [Fact]
+    public async Task AFailedPrimaryRepairIncrementsReadRepairFailures()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Store[MockNode.KeyOf(Bytes("k"))] = Bytes("from-replica");
+        // The initial GET (and read-repair's own probe) against the
+        // primary must still see a clean miss, so only the later repair
+        // SET is made to fail.
+        cluster.Nodes[owners[0]].AnswerWrongNodeOnSetOnce();
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+
+        Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
+
+        await WaitForAsync(() => client.Stats().ReadRepairFailures > 0, "the failed repair to be counted");
+        Assert.False(cluster.Nodes[owners[0]].Store.ContainsKey(MockNode.KeyOf(Bytes("k"))));
+    }
+
+    [Fact]
+    public async Task AnUnreachableAddressDuringRefreshIncrementsRefreshFailures()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        int deadPort = Wire.UnusedPort();
+
+        // The dead address is tried first on every address walk, so both
+        // the initial connect (which falls over to the real discovery
+        // server) and every later refresh attempt it and fail first.
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ManyAddresses(("127.0.0.1", deadPort), ("127.0.0.1", cluster.Discovery.Port)));
+
+        const string key = "written-after-primary-death";
+        IReadOnlyList<string> owners = OwnersOf(key);
+
+        // Force a node-list refresh (as in WritesRouteAroundADeadPrimaryOnceDiscoveryDropsIt):
+        // the primary dies, discovery already knows, so the first write
+        // attempt fails and forces a refresh that walks _addresses —
+        // hitting deadPort before the real discovery server.
+        cluster.Nodes[owners[0]].Dispose();
+        cluster.Discovery.SetNodes(new[] { (owners[1], cluster.Nodes[owners[1]].Address) });
+        await Task.Delay(50);
+
+        await client.SetAsync(key, "v");
+        Assert.Equal("v", await client.GetAsync(key));
+        Assert.True(client.Stats().RefreshFailures >= 1);
+    }
+
+    // A minimal Stream whose writes throw a plain programming-error
+    // exception (not a connection failure) — for regression-testing that
+    // the narrowed swallow-site catches let such bugs propagate instead
+    // of treating them the same as a dead replica.
+    private sealed class ThrowingStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() { }
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public override int Read(byte[] buffer, int offset, int count) => 0;
+
+        // Never completes — this stream is never actually read from in
+        // the regression test; only the write side needs to misbehave.
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            new(new TaskCompletionSource<int>().Task);
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count) => throw Bug();
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default) =>
+            throw Bug();
+
+        private static InvalidOperationException Bug() =>
+            new("nanocached test: synthetic programming-error bug, not a connection failure");
+    }
+
+    // Swaps a connected cluster member's live connection for one wired to
+    // ThrowingStream. Member and its Connection property are private/
+    // internal, so this reaches them via reflection — the only way to
+    // inject a fault below the public API for this regression test.
+    private static void ReplaceMemberConnection(NanocachedClient client, string name, Connection connection)
+    {
+        FieldInfo membersField = typeof(NanocachedClient)
+            .GetField("_members", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var members = (System.Collections.IDictionary)membersField.GetValue(client)!;
+        object member = members[name]!;
+        PropertyInfo connectionProperty = member.GetType()
+            .GetProperty("Connection", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        connectionProperty.SetValue(member, connection);
+    }
+
+    [Fact]
+    public async Task ANonConnectionExceptionOnAReplicaLegPropagatesInsteadOfBeingSwallowed()
+    {
+        // Regression for the catch-narrowing at the replica-write swallow
+        // site (WriteAsync's ReplicaWriteAsync): only the connection
+        // layer's own failure types are caught there now, so a
+        // programming bug — here, a stubbed connection whose stream
+        // throws InvalidOperationException on write — must propagate
+        // instead of being swallowed identically to a dead replica.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        string replica = OwnersOf("k")[1];
+        ReplaceMemberConnection(client, replica, new Connection(new ThrowingStream()));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => client.SetAsync("k", "v"));
     }
 
     // ── 値の圧縮 (doc/adr/0013-*.md) ──────────────────────────────

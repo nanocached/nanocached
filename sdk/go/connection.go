@@ -21,8 +21,9 @@ import (
 // sequence across concurrent callers, so queue order always matches wire
 // send order.
 // maxValueLength bounds a `V <len>` response before allocation: the
-// server never stores values above its 1 MiB request limit, so anything
-// larger is a corrupt or malicious frame.
+// server's own request cap is 1 MiB; this constant doubles that as
+// headroom, so a claimed length beyond it is definitely a corrupt or
+// malicious frame, never just a legitimately large value.
 const maxValueLength = 2 * 1024 * 1024
 
 // requestTimeout bounds each outstanding request's full round trip

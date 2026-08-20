@@ -13,7 +13,7 @@
 //! across the server's 60s idle timeout.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,9 +31,14 @@ use crate::open_targets;
 // How long the node list may go without a re-fetch from discovery before
 // get/set/delete refreshes it first (checked lazily on use).
 const NODE_LIST_STALE_AFTER: Duration = Duration::from_secs(30);
-// The keep-alive ping: the server rejects empty keys, so it needs at
-// least one byte; a single NUL stays out of any real key space.
-const KEEPALIVE_KEY: &[u8] = &[0];
+// The keep-alive ping key is reserved by the SDKs precisely so a real
+// application key can never collide with it: a leading 0x00 already
+// keeps it out of any UTF-8 key space, and "nanocached-keepalive" makes
+// an accidental binary-key collision vanishingly unlikely too. Collision
+// would matter because a `get` does refresh the server-side LRU recency
+// of whatever key it names — colliding with a real key would silently
+// keep that key artificially "hot" on every keep-alive tick.
+const KEEPALIVE_KEY: &[u8] = b"\x00nanocached-keepalive";
 /// The TTL a read-repair write applies to the primary (doc/adr/0015-*.md).
 /// `get`'s response carries no TTL, so the key's original expiry is
 /// unrecoverable; repairing with `ttl_seconds` 0 (no expiry) would make
@@ -61,6 +66,28 @@ const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
 /// `KEEPALIVE_INTERVAL_MS`.
 #[doc(hidden)]
 pub static MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES: AtomicUsize = AtomicUsize::new(32);
+
+/// Monotonic counters for failures this SDK deliberately swallows
+/// (ADR-0011/0014/0015) — observability for silently degrading
+/// replication or a stuck node-list refresh that would otherwise have no
+/// visible symptom until reads start missing more often than expected.
+/// Returned by [`NanocachedClient::stats`]; never reset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Stats {
+    pub replica_write_failures: u64,
+    pub read_repair_failures: u64,
+    pub refresh_failures: u64,
+}
+
+/// The live, atomically-updated counters [`NanocachedClient::stats`]
+/// snapshots into a [`Stats`]; kept separate so the atomic types stay an
+/// implementation detail of `Inner`.
+#[derive(Default)]
+struct StatsCounters {
+    replica_write_failures: AtomicU64,
+    read_repair_failures: AtomicU64,
+    refresh_failures: AtomicU64,
+}
 
 /// Options for [`NanocachedClient::connect`].
 pub struct Options {
@@ -251,6 +278,7 @@ struct Inner {
     background_replica_permits: Arc<Semaphore>,
     background_replica_cap: usize,
     read_repair: bool,
+    stats: StatsCounters,
 }
 
 impl Inner {
@@ -432,6 +460,7 @@ impl NanocachedClient {
             background_replica_permits: Arc::new(Semaphore::new(background_replica_cap)),
             background_replica_cap,
             read_repair: options.read_repair,
+            stats: StatsCounters::default(),
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -483,6 +512,25 @@ impl NanocachedClient {
 
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// A snapshot of counters for failures this SDK swallows by design
+    /// (ADR-0011/0014/0015) — lets operators detect silently degrading
+    /// replication or a stuck node-list refresh.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            replica_write_failures: self
+                .inner
+                .stats
+                .replica_write_failures
+                .load(Ordering::Relaxed),
+            read_repair_failures: self
+                .inner
+                .stats
+                .read_repair_failures
+                .load(Ordering::Relaxed),
+            refresh_failures: self.inner.stats.refresh_failures.load(Ordering::Relaxed),
+        }
     }
 
     /// Idempotent — but a second call warns (stderr), since it's usually
@@ -578,7 +626,8 @@ impl NanocachedClient {
     /// awaited, no tracking — that same value repairs the true primary in
     /// the background with `READ_REPAIR_TTL`. Every failure along the way
     /// (connection lost, WrongNode, another miss) is swallowed; nothing
-    /// here may turn an already-accepted miss into an error.
+    /// here may turn an already-accepted miss into an error. A failed
+    /// repair write is counted in `stats().read_repair_failures`.
     async fn try_read_repair(&self, key: &[u8]) -> Option<Vec<u8>> {
         let owners = {
             let state = self.inner.state.lock().await;
@@ -602,7 +651,17 @@ impl NanocachedClient {
                         let value = Arc::clone(&owned_value);
                         async move { connection.set(&key, &value, READ_REPAIR_TTL).await }
                     };
-                    let _ = client.apply_reconnecting(Some(&primary), &op).await;
+                    if client
+                        .apply_reconnecting(Some(&primary), &op)
+                        .await
+                        .is_err()
+                    {
+                        client
+                            .inner
+                            .stats
+                            .read_repair_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
             return Some(value);
@@ -754,8 +813,10 @@ impl NanocachedClient {
         // primary's outcome decides; replica failures are swallowed by
         // design (ADR-0011) — a dead or disagreeing replica leaves the key
         // under-replicated until the next node-list refresh, never fails
-        // the write. doc/adr/0014-*.md: with fire_and_forget_replicas, up
-        // to background_replica_cap legs run detached on their own tokio
+        // the write. Counted in `stats().replica_write_failures` so
+        // operators can spot silently degrading replication.
+        // doc/adr/0014-*.md: with fire_and_forget_replicas, up to
+        // background_replica_cap legs run detached on their own tokio
         // task instead of being awaited below — past that cap, further
         // legs fall back to the synchronous path exactly as with the
         // option off.
@@ -771,7 +832,7 @@ impl NanocachedClient {
                         let owned_body = body.to_owned();
                         tokio::spawn(async move {
                             let _permit = permit; // held until this task finishes
-                            match owned_body {
+                            let failed = match owned_body {
                                 OwnedWriteBody::Set { value, ttl_seconds } => {
                                     let value: Arc<[u8]> = Arc::from(value);
                                     let op = move |connection: Arc<Connection>| {
@@ -779,21 +840,33 @@ impl NanocachedClient {
                                         let value = Arc::clone(&value);
                                         async move { connection.set(&key, &value, ttl_seconds).await }
                                     };
-                                    let _ = client.apply_reconnecting(Some(&name), &op).await;
+                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
                                 }
                                 OwnedWriteBody::Delete => {
                                     let op = move |connection: Arc<Connection>| {
                                         let key = Arc::clone(&owned_key);
                                         async move { connection.delete(&key).await }
                                     };
-                                    let _ = client.apply_reconnecting(Some(&name), &op).await;
+                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
                                 }
+                            };
+                            if failed {
+                                client
+                                    .inner
+                                    .stats
+                                    .replica_write_failures
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
                         });
                         continue;
                     }
                 }
-                let _ = self.apply_reconnecting(Some(name), &op).await;
+                if self.apply_reconnecting(Some(name), &op).await.is_err() {
+                    self.inner
+                        .stats
+                        .replica_write_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
         };
         let primary_write = self.apply_reconnecting(Some(primary), &op);
@@ -962,6 +1035,10 @@ impl NanocachedClient {
         let mut state = self.inner.state.lock().await;
         state.last_fetch = Instant::now();
         let Some((nodes, replication)) = fetched else {
+            self.inner
+                .stats
+                .refresh_failures
+                .fetch_add(1, Ordering::Relaxed);
             return;
         };
         let Target::Cluster { members, .. } = &mut state.target else {
@@ -1014,9 +1091,12 @@ impl NanocachedClient {
     /// Walks every address (ADR-0010). Returns `None` — keep the
     /// last-known list — when none can provide one: unreachable, still
     /// inside its startup grace (`B`), no longer a discovery server, or
-    /// knowing no live nodes. Silent by design (issue #12's noisy
-    /// refresh-failure logging was removed): none of this changes
-    /// behavior, so it isn't worth a warning on every stale check.
+    /// knowing no live nodes. Silent by design: this path's noisy
+    /// refresh-failure logging was removed by the #25/#27 API-unification
+    /// work (unlike the redial-gate pruning below, which is issue #12's),
+    /// since none of this changes behavior and isn't worth a warning on
+    /// every stale check — the caller counts it in
+    /// `stats().refresh_failures` instead.
     async fn fetch_node_list(&self) -> Option<(Vec<crate::identify::DiscoveredNode>, usize)> {
         for (host, port) in &self.inner.addresses {
             if let Ok(Identified::Cluster { nodes, replication }) = connect_and_identify(

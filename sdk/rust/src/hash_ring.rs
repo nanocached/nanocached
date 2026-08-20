@@ -1,11 +1,11 @@
 //! Rendezvous (highest-random-weight) hashing over a fixed node list (see
 //! doc/adr/0011-*.md in the nanocached repository). This is deliberately a
 //! byte-for-byte port of the same computation every other nanocached
-//! participant uses (the node's own `src/hash_ring.rs`, the TypeScript,
-//! Python, and Java SDKs) — not just "a" rendezvous hash, but *this
-//! specific* one: if this SDK's ranking disagreed with a node's own copy,
-//! the two would disagree about which nodes hold a key. Cross-language
-//! test vectors pin the pipeline.
+//! participant uses (the node's own `src/hash_ring.rs`, and the
+//! TypeScript, Python, Java, Go, and .NET SDKs) — not just "a" rendezvous
+//! hash, but *this specific* one: if this SDK's ranking disagreed with a
+//! node's own copy, the two would disagree about which nodes hold a key.
+//! Cross-language test vectors pin the pipeline.
 //!
 //! For each (node, key) pair, `score = fmix64(fnv1a(name) ^ fnv1a(key))`;
 //! a key's owners are the `replicas` highest-scoring nodes in descending

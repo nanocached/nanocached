@@ -4,10 +4,10 @@
  * weak high-bit avalanche clustered ring points into narrow bands, skewing
  * node shares by up to ~2×; HRW measures within 2% of fair and yields
  * replica sets for free). This is deliberately a byte-for-byte port of the
- * same computation the Rust side uses (`src/hash_ring.rs`, `src/bin/
- * bench.rs`) — not just "a" rendezvous hash, but *this specific* one: if
- * this SDK's ranking disagreed with a node's own copy, the two would
- * disagree about which nodes hold a key.
+ * same computation every other nanocached participant uses (the Rust
+ * node, the Python/Java/Rust/Go/.NET SDKs) — not just "a" rendezvous
+ * hash, but *this specific* one: if this SDK's ranking disagreed with a
+ * node's own copy, the two would disagree about which nodes hold a key.
  *
  * For each (node, key) pair, `score = fmix64(fnv1a(name) ^ fnv1a(key))`; a
  * key's owners are the `replicas` highest-scoring nodes in descending

@@ -43,8 +43,9 @@ export interface ParsedResponse {
   value?: Buffer;
 }
 
-// The server never stores values above its 1 MiB request limit, so a
-// claimed length beyond this is a corrupt or malicious frame.
+// The server's own request cap is 1 MiB; this constant doubles that as
+// headroom, so a claimed length beyond it is definitely a corrupt or
+// malicious frame, never just a legitimately large value.
 const MAX_VALUE_LENGTH = 2 * 1024 * 1024;
 
 // The longest a legal `V <len>\n` header can ever be: marker + space +

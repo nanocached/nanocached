@@ -8,10 +8,11 @@ import java.util.List;
  * Rendezvous (highest-random-weight) hashing over a fixed node list (see
  * doc/adr/0011-*.md in the nanocached repository). This is deliberately a
  * byte-for-byte port of the same computation every other nanocached
- * participant uses (the Rust node, the TypeScript and Python SDKs) — not
- * just "a" rendezvous hash, but <em>this specific</em> one: if this SDK's
- * ranking disagreed with a node's own copy, the two would disagree about
- * which nodes hold a key. Cross-language test vectors pin the pipeline.
+ * participant uses (the Rust node, the Go, TypeScript, Python, Rust, and
+ * .NET SDKs) — not just "a" rendezvous hash, but <em>this specific</em>
+ * one: if this SDK's ranking disagreed with a node's own copy, the two
+ * would disagree about which nodes hold a key. Cross-language test
+ * vectors pin the pipeline.
  *
  * <p>For each (node, key) pair, {@code score = fmix64(fnv1a(name) ^
  * fnv1a(key))}; a key's owners are the {@code replicas} highest-scoring

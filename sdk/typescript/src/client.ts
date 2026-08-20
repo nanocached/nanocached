@@ -24,6 +24,48 @@ export class AlreadyClosedError extends Error {
   }
 }
 
+// Constructors that only ever show up at a by-design swallow site because
+// of an actual bug in this SDK's own code (or in a caller's arguments,
+// e.g. an invalid ttlSeconds surfacing from encodeSet deep inside a
+// replica leg) — never something nanocached deliberately throws on
+// purpose, which is always a plain Error or one of this SDK's own
+// subclasses (WrongNodeError, ConnectionLostError, DiscoveryBusyError,
+// AlreadyClosedError). isSwallowable below uses this as the discriminator
+// instead of an allowlist of "expected" error classes, since the set of
+// plain Errors a flaky discovery/node can legitimately produce during a
+// refresh (a stale auth secret, a malformed response, …) is open-ended
+// and all of it must stay swallowed, exactly as it is today.
+const PROGRAMMING_ERROR_CONSTRUCTORS = [TypeError, RangeError, ReferenceError, SyntaxError, EvalError, URIError];
+
+/** Whether `error` is safe for a by-design swallow site (replica-leg
+ * writes, read repair, node-list refresh — see stats()/ClientStats) to
+ * absorb. Everything except PROGRAMMING_ERROR_CONSTRUCTORS is: those
+ * indicate an actual bug, which must propagate instead of vanishing
+ * identically to a dead replica or a stuck refresh. */
+function isSwallowable(error: unknown): boolean {
+  return !PROGRAMMING_ERROR_CONSTRUCTORS.some((ctor) => error instanceof ctor);
+}
+
+/** Snapshot of counters for failures this client swallows by design
+ * (ADR-0011/0014/0015) instead of raising them to a caller — observability
+ * for silently degrading replication or a stuck node-list refresh, which
+ * would otherwise be invisible. See NanocachedClient.stats(). */
+export interface ClientStats {
+  /** Replica-leg write failures swallowed during a cluster write
+   * (writeToOwners), whether the leg ran synchronously or as a
+   * fireAndForgetReplicas background write (doc/adr/0011-*.md,
+   * doc/adr/0014-*.md). */
+  replicaWriteFailures: number;
+  /** Failures swallowed while probing owners or writing back the repaired
+   * value during read repair (doc/adr/0015-*.md). */
+  readRepairFailures: number;
+  /** Node-list refresh attempts that failed, and per-node connect
+   * failures swallowed while reconciling a refresh's member list
+   * (refreshNodeList/fetchNodeList) — discovery outages degrade only
+   * topology updates, never already-established cache traffic. */
+  refreshFailures: number;
+}
+
 export interface NanocachedAddress {
   host: string;
   port: number;
@@ -197,6 +239,11 @@ export class NanocachedClient {
    * times. See routedConnection. */
   private readonly reconnects = new Map<string, Promise<Connection>>();
   private keepAliveTimer: NodeJS.Timeout | null = null;
+
+  // Backing counters for stats()/ClientStats — see its doc comment.
+  private replicaWriteFailures = 0;
+  private readRepairFailures = 0;
+  private refreshFailures = 0;
 
   /** The node(s) actually being talked to, by address (for display/
    * introspection — routing itself uses each node's name, not its
@@ -409,6 +456,18 @@ export class NanocachedClient {
     return this.target.kind === "cluster" ? this.target.replication : 1;
   }
 
+  /** Observability for failures this client swallows by design
+   * (ADR-0011/0014/0015) — lets operators detect silently degrading
+   * replication or a stuck node-list refresh. A snapshot, not a live
+   * view; each count is monotonic for the lifetime of this client. */
+  stats(): ClientStats {
+    return {
+      replicaWriteFailures: this.replicaWriteFailures,
+      readRepairFailures: this.readRepairFailures,
+      refreshFailures: this.refreshFailures,
+    };
+  }
+
   /** Resolves the value strictly decoded as UTF-8 — a value that isn't
    * valid UTF-8 rejects (native `TypeError` from `TextDecoder`'s fatal
    * mode), it is never silently replaced. Use `getBytes` for raw bytes,
@@ -445,8 +504,10 @@ export class NanocachedClient {
    * primary) in the background, with TTL READ_REPAIR_TTL_SECONDS (the
    * original TTL can't be recovered from a GET, and TTL 0 would
    * permanently resurrect already-expired data). Every failure along the
-   * way (connection lost, WrongNode, another miss) is swallowed; nothing
-   * here may turn an already-accepted miss into an error. */
+   * way (connection lost, WrongNode, another miss) is swallowed and
+   * counted in stats().readRepairFailures; nothing here may turn an
+   * already-accepted miss into an error — except an actual programming
+   * bug (isSwallowable), which still propagates. */
   private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
     const names = this.ownerNames(key);
     for (const name of names) {
@@ -454,7 +515,9 @@ export class NanocachedClient {
       try {
         const connection = await this.memberConnection(name);
         value = await connection.get(key);
-      } catch {
+      } catch (error) {
+        if (!isSwallowable(error)) throw error;
+        this.readRepairFailures++;
         continue;
       }
       if (value === null) continue;
@@ -462,11 +525,21 @@ export class NanocachedClient {
       const primaryName = names[0];
       const repairValue = value;
       if (primaryName !== undefined) {
-        void this.memberConnection(primaryName)
+        const repaired = this.memberConnection(primaryName)
           .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS))
-          .catch(() => {
+          .catch((error) => {
             // Swallowed by design — see the doc comment.
+            if (!isSwallowable(error)) throw error;
+            this.readRepairFailures++;
           });
+        // This write is detached: tryReadRepair has already returned to
+        // its caller by the time it settles, so an actual programming bug
+        // rethrown above has nowhere left to propagate to. Attach a no-op
+        // catch anyway, synchronously — otherwise Node would flag the
+        // rethrow above as an unhandled rejection (it isn't counted in
+        // readRepairFailures either way, so it stays distinguishable from
+        // a routine swallow to anything inspecting stats()).
+        repaired.catch(() => {});
       }
       return value;
     }
@@ -562,8 +635,14 @@ export class NanocachedClient {
       try {
         const connection = await this.memberConnection(name);
         await op(connection);
-      } catch {
-        // Swallowed by design — see the doc comment.
+      } catch (error) {
+        // Swallowed by design — see the doc comment. Counted in
+        // stats().replicaWriteFailures, whether this leg ran
+        // synchronously or as a fireAndForgetReplicas background write —
+        // both paths share this function. An actual programming bug
+        // (isSwallowable) still propagates.
+        if (!isSwallowable(error)) throw error;
+        this.replicaWriteFailures++;
       }
     };
 
@@ -575,11 +654,29 @@ export class NanocachedClient {
     const synchronousReplicaWrites = replicaNames.map((name) => {
       if (this.fireAndForgetReplicas && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const background = replicaWrite(name);
+        // Now that replicaWrite can legitimately reject (a programming bug
+        // — see isSwallowable), attach a rejection handler synchronously,
+        // in the same tick this promise is created: without it, Node
+        // would flag `background` as an unhandled rejection before
+        // anything else gets a chance to observe it, since nothing else
+        // awaits it until the `.finally` below (or close()'s drain) runs,
+        // possibly ticks later. There is no caller left to propagate a
+        // background write's failure to by the time it settles anyway
+        // (set() already returned), so this is a no-op rather than a real
+        // handler.
+        const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        background.finally(() => this.backgroundReplicaWrites.delete(background));
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
         return Promise.resolve();
       }
-      return replicaWrite(name);
+      const write = replicaWrite(name);
+      // Same reasoning as above: attach a no-op catch synchronously so a
+      // genuine programming bug surfacing here doesn't trip Node's
+      // unhandled-rejection detector before the `finally` below gets a
+      // chance to await this exact promise and propagate the real error
+      // to the caller of set()/delete().
+      write.catch(() => {});
+      return write;
     });
 
     try {
@@ -649,9 +746,11 @@ export class NanocachedClient {
    * Per ADR-2, a discovery outage should degrade only topology updates,
    * not already-established cache traffic — so failure here (discovery
    * unreachable, or a specific new node failing to connect) never throws
-   * out to the get/set/delete call that triggered it. It fails silently,
-   * keeps the current target as-is (skipping just the node that failed to
-   * connect, if only one did), and tries again on the next stale check. */
+   * out to the get/set/delete call that triggered it. It fails silently
+   * (each such failure counted in stats().refreshFailures — see
+   * ClientStats), keeps the current target as-is (skipping just the node
+   * that failed to connect, if only one did), and tries again on the next
+   * stale check. */
   private async refreshNodeList(): Promise<void> {
     if (this.target.kind !== "cluster") return;
     const currentMembers = this.target.members;
@@ -688,7 +787,9 @@ export class NanocachedClient {
         if (nodeIdentified.kind !== "node") {
           // Discovery returned an address that no longer identifies as a
           // cache node — skip it silently, same as any other failure to
-          // connect here (see the doc comment above).
+          // connect here (see the doc comment above), and count it in
+          // stats().refreshFailures.
+          this.refreshFailures++;
           continue;
         }
 
@@ -701,9 +802,13 @@ export class NanocachedClient {
 
         trackOpenTarget(this.url, [nodeIdentified.socket]);
         members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket) });
-      } catch {
+      } catch (error) {
         // Connecting to this new node failed — skip it silently and retry
-        // on the next refresh (see the doc comment above).
+        // on the next refresh (see the doc comment above), counted in
+        // stats().refreshFailures. An actual programming bug
+        // (isSwallowable) still propagates.
+        if (!isSwallowable(error)) throw error;
+        this.refreshFailures++;
       }
     }
 
@@ -728,13 +833,17 @@ export class NanocachedClient {
    * list. Returns `null` — keep the last-known list — when none can
    * provide one: unreachable, still inside its startup grace (`B`), no
    * longer a discovery server, or knowing no live nodes. Fails silently;
-   * see the doc comment on refreshNodeList. */
+   * see the doc comment on refreshNodeList. Each unreachable/erroring
+   * address is counted in stats().refreshFailures. */
   private async fetchNodeList(): Promise<{ nodes: DiscoveredNode[]; replication: number } | null> {
     for (const address of this.addresses) {
       let identified;
       try {
         identified = await connectAndIdentify({ host: address.host, port: address.port, authSecret: this.authSecret, tls: this.tls, ca: this.ca });
-      } catch {
+      } catch (error) {
+        // An actual programming bug (isSwallowable) still propagates.
+        if (!isSwallowable(error)) throw error;
+        this.refreshFailures++;
         continue;
       }
 
@@ -842,8 +951,12 @@ export class NanocachedClient {
    * parseable reply proves liveness and resets the server's idle timer —
    * `N` from a node without the key, or `W` from a clustered node that
    * doesn't own it (there is no dedicated ping in the wire protocol, so
-   * the ping is a real, harmless `G`) — hence errors are swallowed rather
-   * than routed through the wrong-node retry. */
+   * the ping is a real `G` against KEEPALIVE_KEY, a byte sequence reserved
+   * by the SDKs so it can never collide with a real application key — a
+   * `G` does refresh the server's LRU recency of whatever key it names,
+   * so a collision would have silently reset a real key's recency every
+   * tick) — hence errors are swallowed rather than routed through the
+   * wrong-node retry. */
   private startKeepAlive(intervalMs: number): void {
     const timer = setInterval(() => {
       const connections =
@@ -864,6 +977,11 @@ export class NanocachedClient {
   }
 }
 
-// The server rejects empty keys, so the keep-alive `G` needs at least one
-// byte; a single NUL keeps it out of the way of any real key space.
-const KEEPALIVE_KEY = Uint8Array.from([0]);
+// Reserved for keep-alive pings: 0x00 followed by the ASCII bytes of
+// "nanocached-keepalive" (21 bytes total) — not just a single NUL, which
+// is itself a valid application key. A keep-alive `G` refreshes the
+// server's LRU recency of whatever key it names (see startKeepAlive), so
+// an app that happened to use key "\x00" would have had its recency
+// silently reset every tick; this longer, namespaced sequence is reserved
+// by the SDKs so a real application key can never collide with it.
+const KEEPALIVE_KEY = Uint8Array.from([0, ...Buffer.from("nanocached-keepalive", "ascii")]);

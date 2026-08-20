@@ -30,6 +30,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -38,9 +39,14 @@ import (
 // on use).
 const nodeListStaleAfter = 30 * time.Second
 
-// keepaliveKey: the server rejects empty keys, so the keep-alive G needs
-// one byte; a single NUL stays out of any real key space.
-var keepaliveKey = []byte{0}
+// keepaliveKey is reserved by the SDKs precisely so a real application
+// key can never collide with it: a leading 0x00 already keeps it out of
+// any UTF-8 key space, and "nanocached-keepalive" makes an accidental
+// binary-key collision vanishingly unlikely too. Collision would matter
+// because a G does refresh the server-side LRU recency of whatever key
+// it names — colliding with a real key would silently keep that key
+// artificially "hot" on every keep-alive tick.
+var keepaliveKey = []byte("\x00nanocached-keepalive")
 
 // Address is a "host:port" connect target: a single nanocached-node, or
 // one discovery replica (ADR-0010) fronting a cluster.
@@ -124,12 +130,34 @@ type member struct {
 	connection *connection
 }
 
+// Stats holds counters for failures this SDK deliberately swallows
+// (ADR-0011/0014/0015) — observability for silently degrading
+// replication or a stuck node-list refresh that would otherwise have no
+// visible symptom until reads start missing more often than expected.
+// Every field is monotonic and never reset.
+type Stats struct {
+	ReplicaWriteFailures uint64
+	ReadRepairFailures   uint64
+	RefreshFailures      uint64
+}
+
+// clientStats holds the live, atomically-updated counters Stats()
+// snapshots; kept separate from the exported Stats so the atomic types
+// stay an implementation detail.
+type clientStats struct {
+	replicaWriteFailures atomic.Uint64
+	readRepairFailures   atomic.Uint64
+	refreshFailures      atomic.Uint64
+}
+
 // Client is a nanocached client handle.
 type Client struct {
 	mu          sync.Mutex // guards single/members/ring/replication/lastFetch
 	refreshMu   sync.Mutex
 	redialMu    sync.Mutex
 	redialGates map[string]*sync.Mutex
+
+	stats clientStats
 
 	addresses  []Address
 	authSecret []byte
@@ -359,6 +387,17 @@ func (c *Client) IsClosed() bool {
 	return c.closed
 }
 
+// Stats returns a snapshot of counters for failures this SDK swallows by
+// design (ADR-0011/0014/0015) — lets operators detect silently
+// degrading replication or a stuck node-list refresh.
+func (c *Client) Stats() Stats {
+	return Stats{
+		ReplicaWriteFailures: c.stats.replicaWriteFailures.Load(),
+		ReadRepairFailures:   c.stats.readRepairFailures.Load(),
+		RefreshFailures:      c.stats.refreshFailures.Load(),
+	}
+}
+
 // Get returns the key's value as a string; ok is false when the key is
 // missing. string(bytes) is a lossless conversion in Go, so unlike some
 // other nanocached SDKs there is no decode-failure error path — use
@@ -406,7 +445,8 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 // write costs nothing beyond staying in the window this feature narrows
 // for one more read. Every failure along the way (connection lost,
 // WrongNode, another miss) is swallowed; nothing here may turn an
-// already-accepted miss into an error.
+// already-accepted miss into an error. A failed repair write is counted
+// in Stats().ReadRepairFailures.
 func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 	names := c.ownerNames(key)
 	for _, name := range names {
@@ -417,9 +457,11 @@ func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 		if len(names) > 0 {
 			primary := names[0]
 			go func() {
-				_ = c.applyReconnecting(primary, func(conn *connection) error {
+				if err := c.applyReconnecting(primary, func(conn *connection) error {
 					return conn.set(key, v, readRepairTTL)
-				})
+				}); err != nil {
+					c.stats.readRepairFailures.Add(1)
+				}
 			}()
 		}
 		return v, true
@@ -638,9 +680,12 @@ func (c *Client) write(key []byte, op func(conn *connection, primary bool) error
 	// primary's outcome decides; replica failures are swallowed by design
 	// (ADR-0011) — a dead or disagreeing replica leaves the key
 	// under-replicated until the next node-list refresh, never fails the
-	// write.
+	// write. Counted in Stats().ReplicaWriteFailures so operators can spot
+	// silently degrading replication.
 	replicaWrite := func(replica string) {
-		_ = c.applyReconnecting(replica, func(conn *connection) error { return op(conn, false) })
+		if err := c.applyReconnecting(replica, func(conn *connection) error { return op(conn, false) }); err != nil {
+			c.stats.replicaWriteFailures.Add(1)
+		}
 	}
 
 	var replicas sync.WaitGroup
@@ -802,7 +847,17 @@ func (c *Client) refreshNodeList() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lastFetch = time.Now()
-	if !ok || c.ring == nil {
+	if !ok {
+		// Every configured address was unreachable, still warming up, no
+		// longer a discovery server, or knows no live nodes: keep the
+		// last-known list rather than erroring Get/Set/Delete over what
+		// may be a transient hiccup. Silent by design — counted in
+		// Stats().RefreshFailures instead of a log line on every stale
+		// check.
+		c.stats.refreshFailures.Add(1)
+		return
+	}
+	if c.ring == nil {
 		return
 	}
 

@@ -23,6 +23,9 @@ struct NodeState {
     connections: AtomicUsize,
     gets: AtomicUsize,
     wrong_node_replies: AtomicUsize,
+    /// Like `wrong_node_replies`, but only consumed by `S` — isolates a
+    /// repair write's failure from an unrelated `G`.
+    set_wrong_node_replies: AtomicUsize,
     malformed_value_replies: AtomicUsize,
     stored_to_get_replies: AtomicUsize,
     get_delay_ms: AtomicUsize,
@@ -162,12 +165,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
                 *state.last_set_header.lock().unwrap() = Some(header.clone());
-                let reply: &[u8] = if take_wrong_node(&state) {
-                    b"W\n"
-                } else {
-                    state.store.lock().unwrap().insert(key, value);
-                    b"S\n"
-                };
+                let reply: &[u8] =
+                    if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
+                        b"W\n"
+                    } else {
+                        state.store.lock().unwrap().insert(key, value);
+                        b"S\n"
+                    };
                 if stream.get_mut().write_all(reply).await.is_err() {
                     return;
                 }
@@ -1448,6 +1452,109 @@ async fn stays_a_clean_miss_when_no_owner_has_the_value() {
 
     client.close();
     discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── stats() (ADR-0011/0014/0015 swallowed-failure counters) ──────────
+
+#[tokio::test]
+async fn a_dead_replica_counts_a_replica_write_failure_in_stats() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1]).stop(); // the replica is unreachable
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The primary still succeeds; the dead replica must not fail the write.
+    client.set("k", "v", 0).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while client.stats().replica_write_failures == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "replica_write_failures was never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_failed_repair_write_counts_a_read_repair_failure_in_stats() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[1])
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"k".to_vec(), b"from-replica".to_vec());
+    // The repair write back to the primary fails; set_wrong_node_replies
+    // only affects `S`, so the `G` probes leading up to it are unaffected.
+    node_by_name(&nodes, &owners[0])
+        .state
+        .set_wrong_node_replies
+        .fetch_add(1, Ordering::SeqCst);
+
+    let client = NanocachedClient::connect(options(discovery.port).read_repair(true))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client.get_bytes("k").await.unwrap(),
+        Some(b"from-replica".to_vec())
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while client.stats().read_repair_failures == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "read_repair_failures was never counted"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    client.close();
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn refresh_against_an_unreachable_discovery_seed_counts_a_refresh_failure_in_stats() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    discovery.stop(); // the only configured address is now unreachable
+
+    // A WrongNode reply forces with_cluster_retry to call maybe_refresh(true)
+    // (ADR-0010), which now fails against the unreachable discovery seed.
+    let primary = owners_of("k")[0].clone();
+    node_by_name(&nodes, &primary)
+        .state
+        .wrong_node_replies
+        .fetch_add(1, Ordering::SeqCst);
+    let _ = client.get("k").await;
+
+    assert!(
+        client.stats().refresh_failures > 0,
+        "refresh_failures was never counted"
+    );
+
+    client.close();
     for (_, node) in nodes {
         node.stop();
     }

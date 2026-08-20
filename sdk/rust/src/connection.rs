@@ -20,7 +20,9 @@ use tokio::sync::{oneshot, watch, Mutex};
 use crate::error::{Error, Result};
 use crate::identify::Stream;
 
-/// The server never stores values above its 1 MiB request limit.
+/// The server's own request cap is 1 MiB; this constant doubles that as
+/// headroom, so a claimed length beyond it is definitely a corrupt or
+/// malicious frame, never just a legitimately large value.
 const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
 
 /// Bounds a request's full round trip (write + wait for its matched

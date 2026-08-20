@@ -6,7 +6,7 @@ namespace Nanocached;
 /// Rendezvous (highest-random-weight) hashing over a fixed node list (see
 /// doc/adr/0011-*.md in the nanocached repository). This is deliberately a
 /// byte-for-byte port of the same computation every other nanocached
-/// participant uses (the Rust node, the TypeScript/Python/Java/Rust SDKs)
+/// participant uses (the Rust node, the Go/TypeScript/Python/Java/Rust SDKs)
 /// — not just "a" rendezvous hash, but <em>this specific</em> one: if this
 /// SDK's ranking disagreed with a node's own copy, the two would disagree
 /// about which nodes hold a key. Cross-language test vectors pin the

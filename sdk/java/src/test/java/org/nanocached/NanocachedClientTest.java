@@ -876,4 +876,122 @@ class NanocachedClientTest {
             }
         }
     }
+
+    // ── stats() — counters for by-design swallows ──────────────────
+
+    @Test
+    void aDeadReplicaIncrementsReplicaWriteFailuresStat() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "counted-replica-failure";
+                List<String> owners =
+                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                cluster.nodes().get(owners.get(1)).close();
+                Thread.sleep(50);
+
+                assertEquals(0, client.stats().replicaWriteFailures());
+                client.set(key, "v");
+                assertEquals(1, client.stats().replicaWriteFailures());
+            }
+        }
+    }
+
+    @Test
+    void anUnreachableAddressDuringRefreshIncrementsRefreshFailuresStat() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            int dead = MockServers.unusedPort();
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", dead),
+                            new Address("127.0.0.1", cluster.discovery().port()))))) {
+                assertEquals(0, client.stats().refreshFailures());
+
+                // Force a refresh directly rather than waiting out
+                // NODE_LIST_STALE_AFTER — the dead first address is still
+                // walked (and still fails) on every refresh, exactly as it
+                // was on connect().
+                java.lang.reflect.Method refreshNodeList =
+                        NanocachedClient.class.getDeclaredMethod("refreshNodeList");
+                refreshNodeList.setAccessible(true);
+                refreshNodeList.invoke(client);
+
+                assertTrue(client.stats().refreshFailures() >= 1);
+            }
+        }
+    }
+
+    @Test
+    void aFailedRepairWriteIncrementsReadRepairFailuresStat() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            MockNode primary = cluster.nodes().get(owners.get(0));
+            cluster.nodes().get(owners.get(1)).store.put(
+                    MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
+                    "from-replica".getBytes(StandardCharsets.UTF_8));
+            // Delays the primary's reply to the repair write (not the
+            // initial miss, which is a G) long enough that closing the
+            // primary right after getBytes() returns reliably lands before
+            // that write is acknowledged.
+            primary.delaySets(300);
+
+            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+                assertArrayEquals("from-replica".getBytes(StandardCharsets.UTF_8),
+                        client.getBytes("k").orElseThrow());
+
+                primary.close();
+
+                waitFor(() -> client.stats().readRepairFailures() >= 1,
+                        "the repair write to the now-dead primary to fail and be counted");
+            }
+        }
+    }
+
+    @Test
+    void aProgrammingErrorInAReplicaLegPropagatesInsteadOfBeingSwallowed() throws Exception {
+        // Regression for the catch narrowing at write()'s replica-leg
+        // swallow site (part of the stats()/ClientStats work): a
+        // programming bug must not be treated the same way as a dead
+        // replica. ConnectionOp is private, so this drives write()
+        // reflectively with a dynamic-proxy op that throws a
+        // ClassCastException specifically on the replica leg (identified
+        // by thread name — the primary leg runs on the caller's thread,
+        // replica legs on "nanocached-replica-writer").
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                byte[] key = "regression-key".getBytes(StandardCharsets.UTF_8);
+                byte[] value = "v".getBytes(StandardCharsets.UTF_8);
+
+                Class<?> connectionOpClass = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                Object op = java.lang.reflect.Proxy.newProxyInstance(
+                        connectionOpClass.getClassLoader(),
+                        new Class<?>[] {connectionOpClass},
+                        (proxy, method, methodArgs) -> {
+                            if (Thread.currentThread().getName().equals("nanocached-replica-writer")) {
+                                throw new ClassCastException("injected programming bug");
+                            }
+                            Connection connection = (Connection) methodArgs[0];
+                            connection.set(key, value, null);
+                            return null;
+                        });
+
+                java.lang.reflect.Method write =
+                        NanocachedClient.class.getDeclaredMethod("write", byte[].class, connectionOpClass);
+                write.setAccessible(true);
+
+                java.lang.reflect.InvocationTargetException thrown = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> write.invoke(client, key, op));
+
+                boolean sawClassCastException = false;
+                for (Throwable cause = thrown.getCause(); cause != null; cause = cause.getCause()) {
+                    if (cause instanceof ClassCastException) {
+                        sawClassCastException = true;
+                        break;
+                    }
+                }
+                assertTrue(sawClassCastException,
+                        "expected the injected ClassCastException to propagate, got: " + thrown.getCause());
+            }
+        }
+    }
 }

@@ -1242,6 +1242,146 @@ describe("NanocachedClient read repair (doc/adr/0015-*.md)", () => {
   });
 });
 
+describe("NanocachedClient.stats() (observability for by-design swallows)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("starts at zero", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        assert.deepEqual(client.stats(), { replicaWriteFailures: 0, readRepairFailures: 0, refreshFailures: 0 });
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("counts a swallowed replica-write failure when a replica is dead (ADR-0011/0014)", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "written-despite-dead-replica";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await replica.mock.close();
+      await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
+
+      assert.equal(client.stats().replicaWriteFailures, 0);
+      await client.set(key, "v");
+      assert.ok(primary.mock.store.has(key));
+      assert.equal(client.stats().replicaWriteFailures, 1);
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("counts a swallowed read-repair failure when a replica is unreachable (ADR-0015)", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readRepair: true,
+    });
+    try {
+      const key = "read-repair-swallow";
+      const { replica } = cluster.ownerOf(key);
+
+      await replica.mock.close();
+      await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
+
+      assert.equal(client.stats().readRepairFailures, 0);
+      // The primary reports a clean miss, then read repair probes the
+      // (dead) replica and swallows the resulting connection failure.
+      assert.equal(await client.get(key), null);
+      assert.equal(client.stats().readRepairFailures, 1);
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("counts a swallowed refresh failure for an unreachable discovery seed", async () => {
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
+    const deadPort = await unusedPort();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [
+          { host: "127.0.0.1", port: deadPort },
+          { host: "127.0.0.1", port: discovery.port },
+        ],
+      });
+      try {
+        assert.equal(client.stats().refreshFailures, 0);
+        // Forces a fresh fetchNodeList walk: the dead port fails first,
+        // counted as a refresh failure, before discovery answers.
+        await (client as any).refreshNodeList();
+        assert.equal(client.stats().refreshFailures, 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
+    }
+  });
+
+  it("propagates a programming error from a replica leg instead of swallowing it", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "boom-key";
+      const { replica } = cluster.ownerOf(key);
+
+      // Establish real connections to both owners first...
+      await client.set(key, "v");
+      // ...then stub the replica's own connection to simulate a bug in
+      // this SDK's own code, e.g. a TypeError from a bad internal call —
+      // this must NOT be swallowed the same way a dead replica is.
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(replicaConnection, "set", () => {
+        throw new TypeError("injected programming bug");
+      });
+
+      await assert.rejects(client.set(key, "v2"), TypeError);
+      assert.equal(client.stats().replicaWriteFailures, 0, "a programming error must not be counted as a swallow");
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+});
+
 describe("NanocachedClient against a discovery-fronted cluster", () => {
   async function startCluster(): Promise<{
     nodes: Array<{ name: string; mock: MockNode }>;

@@ -63,18 +63,19 @@ func captureStderr(t *testing.T, fn func()) string {
 // ── モックノード ──────────────────────────────────────────────────
 
 type mockNode struct {
-	listener        net.Listener
-	requiredSecret  []byte
-	store           sync.Map // string -> []byte
-	connectionCount atomic.Int32
-	getCount        atomic.Int32
-	wrongNodeLeft   atomic.Int32
-	malformedLeft   atomic.Int32
-	storedToGetLeft atomic.Int32
-	lastSetTTL      atomic.Value // string: the TTL field of the last S, or "none"
-	setDelay        atomic.Int64 // nanoseconds; sleep this long before every S reply
-	conns           sync.Map     // net.Conn -> struct{}
-	silent          atomic.Bool  // once true, every G/S/D is read but never answered
+	listener         net.Listener
+	requiredSecret   []byte
+	store            sync.Map // string -> []byte
+	connectionCount  atomic.Int32
+	getCount         atomic.Int32
+	wrongNodeLeft    atomic.Int32
+	setWrongNodeLeft atomic.Int32 // like wrongNodeLeft, but only consumed by S (for isolating a repair write's failure from an unrelated G)
+	malformedLeft    atomic.Int32
+	storedToGetLeft  atomic.Int32
+	lastSetTTL       atomic.Value // string: the TTL field of the last S, or "none"
+	setDelay         atomic.Int64 // nanoseconds; sleep this long before every S reply
+	conns            sync.Map     // net.Conn -> struct{}
+	silent           atomic.Bool  // once true, every G/S/D is read but never answered
 }
 
 // delaySets makes every future S reply from this node wait d first — for
@@ -211,7 +212,7 @@ func (m *mockNode) serve(conn net.Conn) {
 				time.Sleep(delay)
 			}
 			reply := "S\n"
-			if m.takeWrongNode() {
+			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
 				reply = "W\n"
 			} else {
 				m.store.Store(key, value)
@@ -1383,6 +1384,66 @@ func TestReadRepairStaysACleanMissWhenNoOwnerHasTheValue(t *testing.T) {
 	_, ok, err := client.GetBytes("nowhere")
 	if err != nil || ok {
 		t.Fatalf("GetBytes = ok=%v err=%v, want a clean miss", ok, err)
+	}
+}
+
+// ── Stats() (ADR-0011/0014/0015 swallowed-failure counters) ────────
+
+func TestADeadReplicaCountsAReplicaWriteFailureInStats(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	owners := ownersOf("k")
+	nodes[owners[1]].close() // the replica is unreachable
+	time.Sleep(50 * time.Millisecond)
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err) // the primary still succeeds; the dead replica must not fail the write
+	}
+	waitFor(t, func() bool { return client.Stats().ReplicaWriteFailures > 0 },
+		"ReplicaWriteFailures to be counted")
+}
+
+func TestAFailedRepairWriteCountsAReadRepairFailureInStats(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	const key = "k"
+	owners := ownersOf(key)
+	nodes[owners[1]].store.Store(key, []byte("from-replica"))
+	// The repair write back to the primary fails; setWrongNodeLeft only
+	// affects S, so the G probes leading up to it are unaffected.
+	nodes[owners[0]].setWrongNodeLeft.Add(1)
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value, ok, err := client.GetBytes(key)
+	if err != nil || !ok || string(value) != "from-replica" {
+		t.Fatalf("GetBytes = %q, %v, %v", value, ok, err)
+	}
+	waitFor(t, func() bool { return client.Stats().ReadRepairFailures > 0 },
+		"ReadRepairFailures to be counted")
+}
+
+func TestARefreshAgainstAnUnreachableDiscoverySeedCountsARefreshFailureInStats(t *testing.T) {
+	_, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	_ = discovery.listener.Close() // the only configured address is now unreachable
+	client.maybeRefresh(true)
+
+	if got := client.Stats().RefreshFailures; got == 0 {
+		t.Fatalf("RefreshFailures = %d, want > 0", got)
 	}
 }
 

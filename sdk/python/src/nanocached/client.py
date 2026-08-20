@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from ._compression import compress_value, decompress_value
 from ._connection import Connection
@@ -31,6 +32,43 @@ from ._identify import (
     connect_and_identify,
     split_host_port,
 )
+
+# Errors safe for a by-design swallow site (ADR-0011/0014/0015, node-list
+# refresh) to absorb: this SDK's own error hierarchy, plus OS-level I/O
+# errors (ConnectionError is itself an OSError subclass, kept in the tuple
+# for readability at each call site). Programming errors — TypeError,
+# AttributeError, and the like — are deliberately not in this tuple, so
+# they propagate instead of vanishing identically to a dead replica or a
+# stuck refresh; see _connection.py and _identify.py for what this SDK's
+# own code actually raises.
+_SWALLOWABLE_ERRORS = (NanocachedError, ConnectionError, OSError)
+
+
+@dataclass(frozen=True)
+class ClientStats:
+    """Snapshot of counters for failures this client swallows by design
+    (ADR-0011/0014/0015) instead of raising them to a caller — observability
+    for silently degrading replication or a stuck node-list refresh, which
+    would otherwise be invisible. See ``NanocachedClient.stats()``.
+
+    ``replica_write_failures``: replica-leg write failures swallowed
+    during a cluster write, whether the leg ran synchronously or as a
+    ``fire_and_forget_replicas`` background write (doc/adr/0011-*.md,
+    doc/adr/0014-*.md).
+
+    ``read_repair_failures``: failures swallowed while probing owners or
+    writing back the repaired value during read repair (doc/adr/0015-*.md).
+
+    ``refresh_failures``: node-list refresh attempts that failed, and
+    per-node connect failures swallowed while reconciling a refresh's
+    member list — discovery outages degrade only topology updates, never
+    already-established cache traffic.
+    """
+
+    replica_write_failures: int
+    read_repair_failures: int
+    refresh_failures: int
+
 
 # doc/adr/0013-*.md: values shorter than this (bytes) are never
 # compressed — the per-value overhead of attempting it outweighs the
@@ -50,9 +88,14 @@ _NODE_LIST_STALE_AFTER = 30.0
 # Cross-SDK policy decision, applied identically across all SDKs.
 _READ_REPAIR_TTL = 60
 
-# The keep-alive ping: the server rejects empty keys, so it needs at least
-# one byte; a single NUL stays out of any real key space.
-_KEEPALIVE_KEY = b"\x00"
+# Reserved for keep-alive pings: 0x00 followed by the ASCII bytes of
+# "nanocached-keepalive" (21 bytes total) — not just a single NUL, which
+# is itself a valid application key. A keep-alive G refreshes the server's
+# LRU recency of whatever key it names (see _start_keepalive), so an app
+# that happened to use key "\x00" would have had its recency silently
+# reset every tick; this longer, namespaced sequence is reserved by the
+# SDKs so a real application key can never collide with it.
+_KEEPALIVE_KEY = b"\x00nanocached-keepalive"
 # Half the server's 60s idle timeout; internal (issue #27), mutable only
 # so tests can shorten it.
 _KEEPALIVE_INTERVAL = 30.0
@@ -146,6 +189,10 @@ class NanocachedClient:
         self._refresh_task: asyncio.Task[None] | None = None
         self._redials: dict[str, asyncio.Task[Connection]] = {}
         self._keepalive_task: asyncio.Task[None] | None = None
+        # Backing counters for stats()/ClientStats — see its docstring.
+        self._replica_write_failures = 0
+        self._read_repair_failures = 0
+        self._refresh_failures = 0
 
     # ── 接続 ──────────────────────────────────────────────────────
 
@@ -232,9 +279,11 @@ class NanocachedClient:
         )
 
     def _new_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Connection:
-        """Wraps a freshly identified node socket, tracking it against this
-        client's target key (§7 ③) until it closes — whether via close(),
-        redial replacement, or refresh reconciliation."""
+        """Wraps a freshly identified node socket, incrementing this
+        client's target key in _open_targets (the forgotten-close warning
+        above) and decrementing it again via on_close whenever the
+        connection eventually closes — whether via close(), redial
+        replacement, or refresh reconciliation."""
         assert self._target_key is not None
         key = self._target_key
         _increment_open_target(key)
@@ -259,6 +308,17 @@ class NanocachedClient:
     def replication(self) -> int:
         """How many nodes hold each key (ADR-0011) — 1 against a single node."""
         return self._replication if self._ring is not None else 1
+
+    def stats(self) -> ClientStats:
+        """Observability for failures this client swallows by design
+        (ADR-0011/0014/0015) — lets operators detect silently degrading
+        replication or a stuck node-list refresh. A snapshot, not a live
+        view; each count is monotonic for the lifetime of this client."""
+        return ClientStats(
+            replica_write_failures=self._replica_write_failures,
+            read_repair_failures=self._read_repair_failures,
+            refresh_failures=self._refresh_failures,
+        )
 
     @property
     def closed(self) -> bool:
@@ -289,14 +349,18 @@ class NanocachedClient:
         value repairs the true primary in the background, with TTL
         _READ_REPAIR_TTL (the original TTL can't be recovered from a
         GET, and TTL 0 would permanently resurrect already-expired
-        data). Every failure along the way is swallowed; nothing here
-        may turn an already-accepted miss into an error."""
+        data). Every failure along the way is swallowed and counted in
+        stats().read_repair_failures; nothing here may turn an
+        already-accepted miss into an error — except a genuine
+        programming error (anything outside _SWALLOWABLE_ERRORS), which
+        still propagates."""
         names = self._owner_names(key)
         for name in names:
             try:
                 connection = await self._member_connection(name)
                 value = await connection.get(key)
-            except Exception:
+            except _SWALLOWABLE_ERRORS:
+                self._read_repair_failures += 1
                 continue
             if value is None:
                 continue
@@ -308,8 +372,9 @@ class NanocachedClient:
                     try:
                         connection = await self._member_connection(primary)
                         await connection.set(key, value, _READ_REPAIR_TTL)
-                    except Exception:
-                        pass  # Swallowed by design — see the docstring.
+                    except _SWALLOWABLE_ERRORS:
+                        # Swallowed by design — see the docstring.
+                        self._read_repair_failures += 1
 
                 asyncio.ensure_future(repair())
             return value
@@ -455,11 +520,15 @@ class NanocachedClient:
         async def replica_write(name: str) -> None:
             try:
                 await op(await self._member_connection(name))
-            except Exception:
+            except _SWALLOWABLE_ERRORS:
                 # Swallowed by design (ADR-0011): a dead or disagreeing
                 # replica leaves the key under-replicated until the next
-                # node-list refresh, never fails the write.
-                pass
+                # node-list refresh, never fails the write. Counted in
+                # stats().replica_write_failures, whether this leg ran
+                # synchronously or as a fire_and_forget_replicas
+                # background write — both paths share this function. A
+                # genuine programming error still propagates.
+                self._replica_write_failures += 1
 
         replica_tasks = []
         for name in replicas:
@@ -482,7 +551,14 @@ class NanocachedClient:
             return await op(await self._member_connection(primary))
         finally:
             if replica_tasks:
-                await asyncio.gather(*replica_tasks, return_exceptions=True)
+                # No return_exceptions=True here: replica_write() already
+                # fully handles every expected failure internally (caught
+                # by _SWALLOWABLE_ERRORS, counted in
+                # stats().replica_write_failures, never re-raised), so the
+                # only thing that can still escape a task here is a
+                # genuine programming error — which this await must
+                # propagate to the caller of set()/delete(), not discard.
+                await asyncio.gather(*replica_tasks)
 
     # ── 遅延再接続(issue #1)────────────────────────────────────────
 
@@ -590,8 +666,11 @@ class NanocachedClient:
                 node_host, node_port = split_host_port(node.address)
                 target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
                 if not isinstance(target, NodeTarget):
-                    # Refresh warnings are silent by design (§7 ②) —
-                    # behavior is unchanged, this node is just skipped.
+                    # Refresh is opportunistic/best-effort and must never
+                    # fail the caller's operation (ADR-0011's
+                    # eventual-consistency model) — this node is just
+                    # skipped, counted in stats().refresh_failures.
+                    self._refresh_failures += 1
                     continue
                 if self._closed:
                     # close() ran while we were dialing (issue #10):
@@ -599,8 +678,12 @@ class NanocachedClient:
                     target.writer.close()
                     return
                 self._members[node.name] = _Member(node.address, self._new_connection(target.reader, target.writer))
-            except (NanocachedError, OSError):
-                pass
+            except _SWALLOWABLE_ERRORS:
+                # Same rationale as above: never fail the caller over a
+                # refresh-time connect failure. A genuine programming
+                # error (anything outside _SWALLOWABLE_ERRORS) still
+                # propagates.
+                self._refresh_failures += 1
 
         if self._closed:
             self._teardown()
@@ -611,14 +694,19 @@ class NanocachedClient:
 
     async def _fetch_node_list(self) -> ClusterTarget | None:
         """Walks every address (ADR-0010); None means keep the last-known
-        list. Failures here are silent by design (§7 ②) — behavior is
-        unchanged either way, it just happens without a warning."""
+        list. Failures here are silent by design — refresh is
+        opportunistic/best-effort and must never fail the caller's
+        operation (ADR-0011's eventual-consistency model), so behavior is
+        unchanged either way, it just happens without a warning. Each
+        failed address is counted in stats().refresh_failures."""
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify(
                     address_host, address_port, self._auth_secret, self._ssl_context
                 )
-            except (NanocachedError, OSError):
+            except _SWALLOWABLE_ERRORS:
+                # A genuine programming error still propagates.
+                self._refresh_failures += 1
                 continue
             if isinstance(identified, NodeTarget):
                 identified.writer.close()
@@ -650,7 +738,12 @@ class NanocachedClient:
                         continue  # real traffic already reset the server's timer
                     try:
                         # Any parseable reply proves liveness — `N`, or `W`
-                        # from a non-owner — and resets the idle timer.
+                        # from a non-owner — and resets the idle timer. G
+                        # refreshes the server's LRU recency of whatever
+                        # key it names, which is exactly why
+                        # _KEEPALIVE_KEY has to be a sequence reserved by
+                        # the SDKs: a real application key would have had
+                        # its recency silently reset every tick.
                         await connection.get(_KEEPALIVE_KEY)
                     except Exception:
                         pass

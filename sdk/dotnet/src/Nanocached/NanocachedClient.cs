@@ -83,9 +83,30 @@ public sealed class NanocachedClient : IDisposable
         public bool ReadRepair { get; set; }
     }
 
+    /// <summary>
+    /// Point-in-time snapshot returned by <see cref="Stats"/>: counters
+    /// for failures this client swallows by design instead of surfacing
+    /// to the caller — a dead replica leg on a write (doc/adr/0011-*.md,
+    /// doc/adr/0014-*.md), a failed background repair of the primary
+    /// after read-repair found a value on another owner (doc/adr/0015-*.md),
+    /// and a failed node-list refresh attempt or per-node reconnect
+    /// during one. None of these ever fail an operation; this is purely
+    /// observability so an operator who only watches for thrown
+    /// exceptions can still notice replication silently degrading or a
+    /// node-list refresh stuck failing.
+    /// </summary>
+    public readonly record struct ClientStats(
+        long ReplicaWriteFailures, long ReadRepairFailures, long RefreshFailures);
+
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
-    // The server rejects empty keys, so the keep-alive G needs one byte.
-    private static readonly byte[] KeepaliveKey = { 0 };
+    // Reserved by the SDKs so a real application key can never collide
+    // with it: a GET refreshes the pinged key's server-side LRU recency,
+    // which is exactly why collision would matter — an app using key
+    // {0x00} would previously have had its recency silently refreshed on
+    // every keep-alive tick. The leading 0x00 also keeps this out of any
+    // plausible printable-string keyspace.
+    private static readonly byte[] KeepaliveKey =
+        new byte[] { 0x00 }.Concat(Encoding.ASCII.GetBytes("nanocached-keepalive")).ToArray();
 
     // TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
     // the protocol's TTL unit throughout (see SetAsync's ttlSeconds). The
@@ -139,6 +160,14 @@ public sealed class NanocachedClient : IDisposable
     private readonly SemaphoreSlim _backgroundReplicaPermits;
     private readonly ConcurrentDictionary<Task, byte> _backgroundReplicaWrites = new();
     private readonly CancellationTokenSource _lifetime = new();
+
+    // Observability for failures this client swallows by design — see
+    // Stats(). Interlocked because they're incremented from whichever
+    // thread happens to hit the swallow site (foreground calls,
+    // background replica writes, the keep-alive loop's redials).
+    private long _replicaWriteFailures;
+    private long _readRepairFailures;
+    private long _refreshFailures;
 
     private volatile bool _closed;
     private Connection? _single;
@@ -318,6 +347,20 @@ public sealed class NanocachedClient : IDisposable
 
     public bool IsClosed => _closed;
 
+    /// <summary>
+    /// A snapshot of counters for failures this client swallows by
+    /// design (ADR-0011/0014's replica-leg writes, ADR-0015's
+    /// read-repair, and node-list refresh) — see <see cref="ClientStats"/>
+    /// for exactly what each counts. Nothing here ever fails an
+    /// operation; this exists purely so an operator can detect
+    /// replication silently degrading or a node-list refresh that is
+    /// stuck failing.
+    /// </summary>
+    public ClientStats Stats() => new(
+        Interlocked.Read(ref _replicaWriteFailures),
+        Interlocked.Read(ref _readRepairFailures),
+        Interlocked.Read(ref _refreshFailures));
+
     // Strict — never silently replaces a malformed byte with U+FFFD; a
     // non-UTF-8 value raises DecoderFallbackException instead.
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
@@ -362,7 +405,9 @@ public sealed class NanocachedClient : IDisposable
     /// recovered from a GET, and TTL 0 would permanently resurrect
     /// already-expired data). Every failure along the way (connection
     /// lost, WrongNode, another miss) is swallowed; nothing here may turn
-    /// an already-accepted miss into an error.</summary>
+    /// an already-accepted miss into an error. A failure repairing the
+    /// primary specifically is counted via <see cref="Stats"/>'s
+    /// <c>ReadRepairFailures</c>.</summary>
     private async Task<byte[]?> TryReadRepairAsync(byte[] key)
     {
         IReadOnlyList<string> names = OwnerNames(key);
@@ -394,9 +439,18 @@ public sealed class NanocachedClient : IDisposable
                             return null;
                         }).ConfigureAwait(false);
                     }
-                    catch (Exception)
+                    catch (Exception error) when (error is NanocachedException or IOException
+                        or System.Net.Sockets.SocketException or ObjectDisposedException)
                     {
-                        // Swallowed by design — see the doc comment.
+                        // Swallowed by design — see the doc comment; now
+                        // counted via Stats().ReadRepairFailures. Narrowed
+                        // to the connection layer's own failure types, so
+                        // a programming bug here (e.g. a
+                        // NullReferenceException) propagates instead of
+                        // being treated identically to a dead primary.
+                        // OperationCanceledException is deliberately not
+                        // caught here either — it propagates too.
+                        Interlocked.Increment(ref _readRepairFailures);
                     }
                 });
             }
@@ -584,16 +638,25 @@ public sealed class NanocachedClient : IDisposable
         // primary's outcome decides; replica failures are swallowed by
         // design (ADR-0011) — a dead or disagreeing replica leaves the key
         // under-replicated until the next node-list refresh, never fails
-        // the write.
+        // the write. Now counted via Stats().ReplicaWriteFailures.
         async Task ReplicaWriteAsync(string name)
         {
             try
             {
                 await ApplyReconnectingAsync(name, op).ConfigureAwait(false);
             }
-            catch (Exception)
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException)
             {
-                // Swallowed by design — see above.
+                // Swallowed by design — see above; counted via
+                // Stats().ReplicaWriteFailures. Narrowed to the
+                // connection layer's own failure types (a dead replica, a
+                // lost socket), covering both the fire-and-forget and
+                // synchronous-fallback callers of this local function, so
+                // a programming bug doesn't get treated the same way as a
+                // dead replica. OperationCanceledException is
+                // deliberately not caught here either — it propagates.
+                Interlocked.Increment(ref _replicaWriteFailures);
             }
         }
 
@@ -799,8 +862,12 @@ public sealed class NanocachedClient : IDisposable
             }
             catch (NanocachedException)
             {
+                Interlocked.Increment(ref _refreshFailures);
                 // Left out of the ring for now; the next refresh retries
-                // it. Silent by design (§7 ②) — behavior is unaffected.
+                // it. Silent by design — refresh is opportunistic/
+                // best-effort and must never fail the caller's operation,
+                // consistent with ADR-0011's eventual-consistency model.
+                // Counted via Stats().RefreshFailures.
             }
         }
 
@@ -835,7 +902,11 @@ public sealed class NanocachedClient : IDisposable
             }
             catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
             {
-                // Silent by design (§7 ②) — the next refresh retries.
+                Interlocked.Increment(ref _refreshFailures);
+                // Silent by design — refresh is opportunistic/best-effort
+                // and must never fail the caller's operation, consistent
+                // with ADR-0011's eventual-consistency model. The next
+                // refresh retries; counted via Stats().RefreshFailures.
             }
         }
         return null;

@@ -7,6 +7,7 @@ import unittest
 
 from nanocached import (
     AlreadyClosedError,
+    ClientStats,
     DecompressionError,
     DiscoveryBusyError,
     HashRing,
@@ -1090,6 +1091,148 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             for node in nodes.values():
                 await node.close()
+
+
+class StatsTests(unittest.IsolatedAsyncioTestCase):
+    # stats()/ClientStats: observability for failures swallowed by design
+    # (ADR-0011/0014/0015).
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_starts_at_zero(self):
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                self.assertEqual(
+                    client.stats(),
+                    ClientStats(replica_write_failures=0, read_repair_failures=0, refresh_failures=0),
+                )
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_counts_a_swallowed_replica_write_failure_when_a_replica_is_dead(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "written-despite-dead-replica"
+            primary, replica = self.owners_of(key)
+            await nodes[replica].close()
+            await wait_for(
+                lambda: client._members[replica].connection.closed,
+                "the client to see the FIN",
+            )
+
+            self.assertEqual(client.stats().replica_write_failures, 0)
+            await client.set(key, "v")
+            self.assertIn(key.encode(), nodes[primary].store)
+            self.assertEqual(client.stats().replica_write_failures, 1)
+        finally:
+            client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+    async def test_counts_a_swallowed_read_repair_failure_when_a_replica_is_unreachable(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], read_repair=True
+        )
+        try:
+            key = "read-repair-swallow"
+            primary, replica = self.owners_of(key)
+            await nodes[replica].close()
+            await wait_for(
+                lambda: client._members[replica].connection.closed,
+                "the client to see the FIN",
+            )
+
+            self.assertEqual(client.stats().read_repair_failures, 0)
+            # The primary reports a clean miss, then read repair probes
+            # the (dead) replica and swallows the resulting connection
+            # failure.
+            self.assertIsNone(await client.get_bytes(key))
+            self.assertEqual(client.stats().read_repair_failures, 1)
+        finally:
+            client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+    async def test_counts_a_swallowed_refresh_failure_for_an_unreachable_discovery_seed(self):
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
+        dead = await unused_port()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", dead), ("127.0.0.1", discovery.port)]
+            )
+            try:
+                self.assertEqual(client.stats().refresh_failures, 0)
+                # Forces a fresh _fetch_node_list walk: the dead port fails
+                # first, counted as a refresh failure, before discovery
+                # answers.
+                await client._refresh_node_list()
+                self.assertEqual(client.stats().refresh_failures, 1)
+            finally:
+                client.close()
+        finally:
+            await discovery.close()
+            await node.close()
+
+    async def test_propagates_a_programming_error_from_a_replica_leg_instead_of_swallowing_it(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "boom-key"
+            primary, replica = self.owners_of(key)
+
+            # Establish real connections to both owners first...
+            await client.set(key, "v")
+            # ...then stub the replica's own connection to simulate a bug
+            # in this SDK's own code, e.g. a TypeError from a bad internal
+            # call — this must NOT be swallowed the same way a dead
+            # replica is.
+            replica_connection = client._members[replica].connection
+
+            async def boom(key: bytes, value: bytes, ttl_seconds: int) -> None:
+                raise TypeError("injected programming bug")
+
+            replica_connection.set = boom
+
+            with self.assertRaises(TypeError):
+                await client.set(key, "v2")
+            self.assertEqual(
+                client.stats().replica_write_failures,
+                0,
+                "a programming error must not be counted as a swallow",
+            )
+        finally:
+            client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

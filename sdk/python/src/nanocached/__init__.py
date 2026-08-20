@@ -12,10 +12,11 @@ from ._errors import (
 )
 from ._hashring import HashRing
 from ._identify import DiscoveredNode
-from .client import NanocachedClient
+from .client import ClientStats, NanocachedClient
 
 __all__ = [
     "AlreadyClosedError",
+    "ClientStats",
     "DecompressionError",
     "DiscoveredNode",
     "DiscoveryBusyError",
