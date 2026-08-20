@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { AlreadyClosedError, DiscoveryBusyError, NanocachedClient, WrongNodeError } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING } from "../src/client.js";
+import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -861,6 +862,84 @@ describe("NanocachedClient keep-alive", () => {
         // Every request above reset the idle clock well inside the 60ms
         // interval, so no ping should ever have fired: no `G` at all.
         assert.equal(node.getCount(), 0);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient request timeout (issue #42)", () => {
+  // REQUEST_TIMEOUT_TUNING exists only so these tests can shorten it.
+  const defaultTimeoutMs = REQUEST_TIMEOUT_TUNING.timeoutMs;
+  afterEach(() => {
+    REQUEST_TIMEOUT_TUNING.timeoutMs = defaultTimeoutMs;
+  });
+
+  it("fails a request to a half-open server within the timeout instead of hanging", async () => {
+    // Regression: a server that completes the A handshake but then never
+    // answers a G/S/D used to hang get/set/delete forever — there was no
+    // in-flight request timeout at all.
+    const node = await startMockNode();
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 150;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+      });
+      try {
+        await client.set("k", "v");
+        node.goSilentAfterHandshake();
+
+        const started = Date.now();
+        // The client's retry layer redials once after the first timeout;
+        // the redialed connection times out too, so this settles after
+        // roughly two windows — still bounded.
+        await assert.rejects(
+          client.get("k"),
+          (error: unknown) =>
+            error instanceof Error && /request timed out/.test(error.message),
+        );
+        assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("steady new requests do not postpone half-open detection", async () => {
+    // The deadline is progress-based: new sends must not extend it while
+    // an older request is still waiting (mirrors the Go SDK's regression
+    // test of the same name).
+    const node = await startMockNode();
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 200;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+      });
+      try {
+        await client.set("k", "v");
+        node.goSilentAfterHandshake();
+
+        // New requests keep arriving well inside every deadline window
+        // (once the connection is poisoned they just fail fast).
+        const ticker = setInterval(() => {
+          client.get("more").catch(() => {});
+        }, 50);
+        try {
+          const started = Date.now();
+          await assert.rejects(
+            client.get("k"),
+            (error: unknown) =>
+              error instanceof Error && /request timed out/.test(error.message),
+          );
+          assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
+        } finally {
+          clearInterval(ticker);
+        }
       } finally {
         client.close();
       }

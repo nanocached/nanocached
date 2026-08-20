@@ -41,6 +41,7 @@ final class MockServers {
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
         private volatile boolean failSets = false;
+        private volatile boolean silent = false;
         /** The TTL (whole seconds; 0 if omitted on the wire) from the
          * most recent S request this server received. */
         volatile long lastSetTtl = 0;
@@ -142,6 +143,16 @@ final class MockServers {
             failSets = true;
         }
 
+        /** Makes this node a half-open server from this point on: it
+         * still accepts and completes the A handshake, and still reads
+         * every request frame off the wire (so the TCP stream stays
+         * well-formed), but never writes a reply — regression coverage
+         * for the request timeout (issue #42), mirroring the Go suite's
+         * hook of the same name. */
+        void goSilentAfterHandshake() {
+            silent = true;
+        }
+
         /** Server-side FIN on every open connection, like the idle timeout. */
         void dropConnections() {
             for (Socket socket : sockets) {
@@ -209,6 +220,9 @@ final class MockServers {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             getCount.incrementAndGet();
 
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
                             if (swallowedGets.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                                 break; // no reply — simulates an off-by-one stream desync
                             }
@@ -254,6 +268,9 @@ final class MockServers {
                             // the tag sits after it as the last field.
                             int ttlFieldCount = parts.length - (tagged ? 4 : 3);
                             lastSetTtl = ttlFieldCount > 0 ? Long.parseLong(parts[3]) : 0;
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
                             if (failSets) {
                                 // Reset the connection instead of acking:
                                 // the frame is fully consumed above, so the
@@ -279,6 +296,9 @@ final class MockServers {
                         }
                         case "D" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
                             if (takeWrongNode()) {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {

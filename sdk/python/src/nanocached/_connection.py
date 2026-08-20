@@ -28,6 +28,16 @@ _MAX_VALUE_LENGTH = 2 * 1024 * 1024
 # A tag is a u32 in decimal (ADR-0019).
 _MAX_TAG = 0xFFFFFFFF
 
+# Bounds how long the connection may go without progress while requests
+# are outstanding (issue #42) — each response must arrive within this
+# window of the previous one (or of its own send, when the queue was
+# empty): without it, a half-open server that accepts the TCP connection
+# but never writes back — or stops mid-stream — would hang get/set/delete
+# forever. Generous versus the server's own 10s outbound timeouts, and
+# the same 30s the Go and Rust SDKs use. A module global only so tests
+# can shorten it.
+_REQUEST_TIMEOUT = 30.0
+
 
 # ADR-0019: on a tagged-mode connection every request header carries the
 # client's tag as its last field, and the server echoes it in the
@@ -78,6 +88,12 @@ class Connection:
         self._closed = False
         self._last_used = time.monotonic()
         self._on_close = on_close
+        # The progress-based request deadline (issue #42): armed when the
+        # pending queue goes from empty to non-empty, re-armed by
+        # _read_loop each time a response is dispatched with more still
+        # outstanding, cleared once nothing is. Never fires on an idle
+        # connection.
+        self._deadline_handle: asyncio.TimerHandle | None = None
         self._read_task: asyncio.Task[None] = asyncio.ensure_future(self._read_loop())
 
     @property
@@ -151,6 +167,7 @@ class Connection:
         if self._closed:
             return
         self._closed = True
+        self._clear_deadline()
         pending = list(self._pending)
         self._pending.clear()
         self._writer.close()
@@ -159,6 +176,28 @@ class Connection:
                 future.set_exception(error)
         if self._on_close is not None:
             self._on_close()
+
+    def _arm_deadline(self) -> None:
+        self._clear_deadline()
+        self._deadline_handle = asyncio.get_running_loop().call_later(
+            _REQUEST_TIMEOUT, self._on_request_timeout
+        )
+
+    def _clear_deadline(self) -> None:
+        if self._deadline_handle is not None:
+            self._deadline_handle.cancel()
+            self._deadline_handle = None
+
+    def _on_request_timeout(self) -> None:
+        # Poison, exactly like a read error: rejects the stalled request
+        # and everything pipelined behind it, closes the writer (which
+        # also unblocks the read loop with EOF), and the retry layer
+        # redials.
+        self._poison(
+            ConnectionError(
+                f"nanocached: no response from server within {_REQUEST_TIMEOUT}s (request timed out)"
+            )
+        )
 
     def _claim_tag(self) -> int:
         tag = self._next_tag
@@ -184,6 +223,13 @@ class Connection:
             tag = self._claim_tag() if self._tagged else None
             frame = build(tag)
             self._pending.append((tag, future))
+            # Armed only on the empty→non-empty transition: arming on
+            # *every* request would let a continuous stream of new
+            # requests push the deadline forever ahead of a server that
+            # has stopped answering — exactly the half-open hang the
+            # timeout exists to catch.
+            if len(self._pending) == 1:
+                self._arm_deadline()
             try:
                 self._writer.write(frame)
                 await self._writer.drain()
@@ -254,6 +300,15 @@ class Connection:
                 return
 
             expected_tag, future = self._pending.popleft()
+
+            # Progress-based deadline (see _request): a dispatched
+            # response is progress, so the next-oldest request gets a
+            # fresh window; with nothing left waiting, clear it so an
+            # otherwise-idle connection is never closed by it.
+            if not self._pending:
+                self._clear_deadline()
+            else:
+                self._arm_deadline()
 
             # ADR-0019: on a tagged connection, verify the echoed tag
             # against the request this response is about to answer —

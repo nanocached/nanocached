@@ -54,6 +54,13 @@ export interface MockNode extends MockServerBase {
   /** Makes every future `S` reply wait `ms` first — for tests proving a
    * caller isn't blocked on a slow replica leg (doc/adr/0014-*.md). */
   delaySets(ms: number): void;
+  /** Makes this node a half-open server from this point on: it still
+   * accepts and completes the `A` handshake, and still reads every
+   * request frame off the wire (so the TCP stream stays well-formed),
+   * but never writes a reply — regression coverage for the request
+   * timeout (issue #42), mirroring the Go suite's hook of the same
+   * name. */
+  goSilentAfterHandshake(): void;
 }
 
 export interface MockDiscovery extends MockServerBase {
@@ -140,6 +147,7 @@ export async function startMockNode(
   let gets = 0;
   let setDelayMs = 0;
   let lastSetTtl = 0;
+  let silent = false;
 
   const server = createServer((socket) => {
     connections++;
@@ -189,6 +197,8 @@ export async function startMockNode(
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + keyLength);
             gets++;
+
+            if (silent) break;
 
             if (swallowedGets > 0) {
               swallowedGets--;
@@ -263,6 +273,8 @@ export async function startMockNode(
             const ttlFieldCount = parts.length - (tagged ? 4 : 3);
             lastSetTtl = ttlFieldCount > 0 ? Number(parts[3]) : 0;
 
+            if (silent) break;
+
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
               socket.write(`W${tag}\n`);
@@ -283,6 +295,8 @@ export async function startMockNode(
             if (buffer.length < bodyStart + keyLength) return;
             const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + keyLength);
+
+            if (silent) break;
 
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
@@ -336,6 +350,9 @@ export async function startMockNode(
     },
     delaySets: (ms) => {
       setDelayMs = ms;
+    },
+    goSilentAfterHandshake: () => {
+      silent = true;
     },
     close,
   };

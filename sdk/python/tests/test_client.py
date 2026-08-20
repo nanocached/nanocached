@@ -547,6 +547,80 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
 
+class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
+    # The progress-based request timeout (issue #42); the module-level
+    # constant exists only so these tests can shorten it.
+
+    def setUp(self):
+        from nanocached import _connection as connection_module
+
+        self._connection_module = connection_module
+        self._default_timeout = connection_module._REQUEST_TIMEOUT
+
+    def tearDown(self):
+        self._connection_module._REQUEST_TIMEOUT = self._default_timeout
+
+    async def test_a_request_to_a_half_open_server_fails_within_the_timeout(self):
+        # Regression: a server that completes the A handshake but then
+        # never answers a G/S/D used to hang get/set/delete forever —
+        # there was no in-flight request timeout at all.
+        node = await MockNode().start()
+        try:
+            self._connection_module._REQUEST_TIMEOUT = 0.15
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.go_silent_after_handshake()
+
+                started = asyncio.get_running_loop().time()
+                # The client's retry layer redials once after the first
+                # timeout; the redialed connection times out too, so this
+                # settles after roughly two windows — still bounded.
+                with self.assertRaisesRegex(ConnectionError, "request timed out"):
+                    await client.get("k")
+                self.assertLess(asyncio.get_running_loop().time() - started, 2.0)
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+    async def test_steady_new_requests_do_not_postpone_half_open_detection(self):
+        # The deadline is progress-based: new sends must not extend it
+        # while an older request is still waiting (mirrors the Go SDK's
+        # regression test of the same name).
+        node = await MockNode().start()
+        try:
+            self._connection_module._REQUEST_TIMEOUT = 0.2
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.go_silent_after_handshake()
+
+                async def steady_traffic():
+                    # New requests keep arriving well inside every
+                    # deadline window (once the connection is poisoned
+                    # they just fail fast).
+                    while True:
+                        await asyncio.sleep(0.05)
+                        with contextlib.suppress(Exception):
+                            await client.get("more")
+
+                ticker = asyncio.ensure_future(steady_traffic())
+                try:
+                    started = asyncio.get_running_loop().time()
+                    with self.assertRaisesRegex(ConnectionError, "request timed out"):
+                        await client.get("k")
+                    self.assertLess(asyncio.get_running_loop().time() - started, 2.0)
+                finally:
+                    ticker.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await ticker
+            finally:
+                client.close()
+        finally:
+            await node.close()
+
+
 class AddressesTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_empty_addresses(self):
         with self.assertRaisesRegex(ValueError, "needs a non-empty addresses list"):

@@ -380,6 +380,86 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aRequestToAHalfOpenServerFailsWithinTheTimeoutInsteadOfHanging() throws Exception {
+        // Regression (issue #42): a server that completes the A handshake
+        // but then never answers a G/S/D used to hang get/set/delete
+        // forever in future.join() — there was no in-flight request
+        // timeout at all. The package-visible field exists only so tests
+        // can shorten it.
+        long defaultTimeout = Connection.requestTimeoutMillis;
+        Connection.requestTimeoutMillis = 150;
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                node.goSilentAfterHandshake();
+
+                long started = System.nanoTime();
+                // The client's retry layer redials once after the first
+                // timeout; the redialed connection times out too, so this
+                // settles after roughly two windows — still bounded.
+                NanocachedException error = assertThrows(NanocachedException.class,
+                        () -> client.get("k"));
+                assertTrue(error.getMessage().contains("request timed out"),
+                        "unexpected failure: " + error.getMessage());
+                long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                assertTrue(elapsedMillis < 2_000, "get() took " + elapsedMillis + "ms, want well under 2s");
+            }
+        } finally {
+            Connection.requestTimeoutMillis = defaultTimeout;
+        }
+    }
+
+    @Test
+    void steadyNewRequestsDoNotPostponeHalfOpenDetection() throws Exception {
+        // The deadline is progress-based: new sends must not extend it
+        // while an older request is still waiting (mirrors the Go SDK's
+        // regression test of the same name).
+        long defaultTimeout = Connection.requestTimeoutMillis;
+        Connection.requestTimeoutMillis = 200;
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                node.goSilentAfterHandshake();
+
+                // New requests keep arriving well inside every deadline
+                // window (once the connection is poisoned they just fail
+                // fast).
+                Thread ticker = new Thread(() -> {
+                    try {
+                        while (!Thread.interrupted()) {
+                            Thread.sleep(50);
+                            try {
+                                client.get("more");
+                            } catch (RuntimeException ignored) {
+                                // Expected once the connection is poisoned.
+                            }
+                        }
+                    } catch (InterruptedException done) {
+                        // Test finished.
+                    }
+                }, "test-steady-traffic");
+                ticker.setDaemon(true);
+                ticker.start();
+                try {
+                    long started = System.nanoTime();
+                    NanocachedException error = assertThrows(NanocachedException.class,
+                            () -> client.get("k"));
+                    assertTrue(error.getMessage().contains("request timed out"),
+                            "unexpected failure: " + error.getMessage());
+                    long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                    assertTrue(elapsedMillis < 2_000,
+                            "get() took " + elapsedMillis + "ms, want well under 2s");
+                } finally {
+                    ticker.interrupt();
+                    ticker.join(5_000);
+                }
+            }
+        } finally {
+            Connection.requestTimeoutMillis = defaultTimeout;
+        }
+    }
+
+    @Test
     void closeFiresOnCloseExactlyOnceUnderConcurrency() throws Exception {
         // Java's Connection.poison() already gates on `synchronized (this)
         // { if (closed) return; closed = true; ... }`, so this documents
