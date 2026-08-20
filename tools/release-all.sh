@@ -15,6 +15,8 @@ fail() { echo "error: $1 does not carry version $ver" >&2; exit 1; }
 grep -q "^version = \"$ver\"\$" Cargo.toml                 || fail Cargo.toml
 grep -q "^version = \"$ver\"\$" sdk/rust/Cargo.toml        || fail sdk/rust/Cargo.toml
 grep -q "^version = \"$ver\"\$" sdk/python/pyproject.toml  || fail sdk/python/pyproject.toml
+grep -q "^__version__ = \"$ver\"\$" sdk/python/src/nanocached/__init__.py \
+                                                           || fail 'sdk/python __init__.py (__version__)'
 grep -q "^version = '$ver'\$"   sdk/java/build.gradle      || fail sdk/java/build.gradle
 grep -q "<Version>$ver</Version>" sdk/dotnet/src/Nanocached/Nanocached.csproj \
                                                            || fail Nanocached.csproj

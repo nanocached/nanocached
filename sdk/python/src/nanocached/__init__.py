@@ -28,4 +28,6 @@ __all__ = [
     "WrongNodeError",
 ]
 
-__version__ = "1.0.0"
+# Must match sdk/python/pyproject.toml's `version` — tools/release-all.sh
+# verifies both before tagging a release.
+__version__ = "0.2.0"
