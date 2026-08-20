@@ -909,6 +909,14 @@ public final class NanocachedClient implements AutoCloseable {
         lastFetchNanos = System.nanoTime();
         if (cluster == null) return;
 
+        // Dialing newly listed nodes happens *outside* stateLock
+        // (mirroring .NET's RefreshNodeListAsync): every get/set/delete
+        // routes through stateLock (ownerNames/memberConnection), so a
+        // blocking connect held under it — up to CONNECT_TIMEOUT_MS per
+        // new node — would stall all traffic for the whole dial phase.
+        // Under the lock we only reconcile the member map and collect
+        // which nodes still need a connection.
+        List<DiscoveredNode> toOpen = new ArrayList<>();
         synchronized (stateLock) {
             Map<String, DiscoveredNode> byName = new LinkedHashMap<>();
             for (DiscoveredNode node : cluster.nodes()) byName.put(node.name(), node);
@@ -928,23 +936,38 @@ public final class NanocachedClient implements AutoCloseable {
                 Member existing = members.get(node.name());
                 if (existing != null) {
                     existing.address = node.address();
-                    continue;
-                }
-                try {
-                    members.put(node.name(), new Member(node.address(), openNodeConnection(node.address())));
-                } catch (IOException | RuntimeException error) {
-                    // Left out of the ring for now; the next refresh
-                    // retries it. Silent by design: the stderr narration
-                    // this once had was removed by the #25/#27
-                    // API-unification work — not issue #12, which is only
-                    // the redial-gate pruning above — since a per-node
-                    // connect failure here changes no behavior and isn't
-                    // worth a warning on every refresh. Counted via
-                    // stats().refreshFailures instead.
-                    refreshFailures.incrementAndGet();
+                } else {
+                    toOpen.add(node);
                 }
             }
+        }
 
+        for (DiscoveredNode node : toOpen) {
+            try {
+                Connection connection = openNodeConnection(node.address());
+                synchronized (stateLock) {
+                    if (closed) {
+                        // close() ran while we were dialing (issue #10):
+                        // installing this socket now would leak it.
+                        connection.close();
+                        return;
+                    }
+                    members.put(node.name(), new Member(node.address(), connection));
+                }
+            } catch (IOException | RuntimeException error) {
+                // Left out of the ring for now; the next refresh
+                // retries it. Silent by design: the stderr narration
+                // this once had was removed by the #25/#27
+                // API-unification work — not issue #12, which is only
+                // the redial-gate pruning above — since a per-node
+                // connect failure here changes no behavior and isn't
+                // worth a warning on every refresh. Counted via
+                // stats().refreshFailures instead.
+                refreshFailures.incrementAndGet();
+            }
+        }
+
+        synchronized (stateLock) {
             ring = new HashRing(new ArrayList<>(members.keySet()));
             replication = cluster.replication();
         }
