@@ -19,7 +19,39 @@ function tagField(tag: number | undefined): string {
   return tag === undefined ? "" : ` ${tag}`;
 }
 
+// The longest a request header can ever legally be: marker + space + up to
+// 10-digit key length + space + up to 10-digit value length + space + up to
+// 10-digit TTL + up to 10-digit tag + LF. Rounded well up so MAX_REQUEST_BYTES
+// below can be computed without pushing key+value right up against the
+// server's own limit and letting the header alone tip a request over it.
+const MAX_REQUEST_HEADER_LENGTH = 64;
+
+// Mirrors nanocached-node's own `MAX_REQUEST_SIZE` (src/server.rs, 1 MiB) —
+// the cap on a whole request frame (header + key + value) — minus headroom
+// for the header itself. A `G`/`D` key, or an `S` key+value, beyond this
+// would serialize into a frame the server's `request_is_too_large` check
+// rejects outright with no reply at all, exactly like the bad-TTL case
+// below: that closes the shared, pipelined connection and takes every
+// other in-flight request on it down too.
+export const MAX_REQUEST_BYTES = 1024 * 1024 - MAX_REQUEST_HEADER_LENGTH;
+
+// An empty key (`key_length == 0`) hits `ParseError::EmptyKey` in
+// src/command.rs, which — like a frame that's too large, and like the
+// bad-TTL case in encodeSet below — the server rejects with no reply,
+// closing the shared, pipelined connection and taking every other
+// in-flight request on it down with it. Reject it here, synchronously,
+// before anything is written, for every command that carries a key.
+function checkKey(key: Uint8Array): void {
+  if (key.length === 0) {
+    throw new RangeError("nanocached: key must not be empty");
+  }
+  if (key.length > MAX_REQUEST_BYTES) {
+    throw new RangeError(`nanocached: key exceeds MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${key.length} bytes`);
+  }
+}
+
 export function encodeGet(key: Uint8Array, tag?: number): Buffer {
+  checkKey(key);
   return Buffer.concat([toAscii(`G ${key.length}${tagField(tag)}\n`), key]);
 }
 
@@ -35,6 +67,15 @@ export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, ta
     // it here, synchronously, before anything is written.
     throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
   }
+  checkKey(key);
+  if (key.length + value.length > MAX_REQUEST_BYTES) {
+    // See MAX_REQUEST_BYTES/checkKey above: same server-side rejection, same
+    // poisoned-connection consequence, just measured across key+value
+    // together instead of the key alone.
+    throw new RangeError(
+      `nanocached: key and value together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${key.length + value.length} bytes`,
+    );
+  }
 
   const header =
     ttlSeconds === 0
@@ -44,6 +85,7 @@ export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, ta
 }
 
 export function encodeDelete(key: Uint8Array, tag?: number): Buffer {
+  checkKey(key);
   return Buffer.concat([toAscii(`D ${key.length}${tagField(tag)}\n`), key]);
 }
 

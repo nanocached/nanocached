@@ -140,7 +140,13 @@
 //! no heartbeat to time out — its liveness is tied to the one connection
 //! it opened with `J`, which discovery holds open the whole time; the
 //! registry entry is dropped if that connection dies before promotion. A
-//! `Joined` node that stops sending heartbeats is dropped once
+//! `Waiting` node is additionally dropped (and its connection closed) if it
+//! goes unpromoted past `waiting_timeout_for`, and one source address may
+//! only hold `MAX_WAITING_PER_SOURCE_IP` such registrations at once —
+//! otherwise, with authentication unset, a `J` under a fresh unverifiable
+//! name always succeeds, so nothing would stop one source from parking
+//! `MAX_CONNECTIONS` fake registrations forever. A `Joined` node that stops
+//! sending heartbeats is dropped once
 //! `--liveness-timeout` has elapsed since its last heartbeat; no explicit
 //! "leave" message is required, so this covers both graceful shutdown and
 //! crashes. Because the registry is rebuilt from `P` announces (ADR-0010)
@@ -205,6 +211,27 @@ const MAX_REGISTRY_SIZE: usize = 1 << 16;
 /// oversized `M` is rejected immediately, with a clear log line, rather
 /// than left to time out. See `migrate_message_len`.
 const NODE_MAX_REQUEST_SIZE: usize = 1024 * 1024;
+/// Per-source-IP cooldown between *new* registry insertions via `P`
+/// (issue: `MAX_REGISTRY_SIZE`'s own doc comment above — a bare `P` holds
+/// no connection open, so nothing but that hard ceiling used to bound how
+/// fast a single source could approach it; connect -> `A` -> `P` ->
+/// disconnect, repeated with a fresh name each time, could otherwise fill
+/// the registry in well under a second). Only checked for a name this
+/// replica doesn't already know — a legitimate node re-announcing itself
+/// after a broken heartbeat connection or a restart always refreshes its
+/// own existing entry (see the `P` handler), never touching this limiter,
+/// so normal reconnect traffic is unaffected regardless of how often it
+/// happens. A rejection just delays that source's next attempt; the
+/// node's heartbeat loop redials and retries, so this is a rate limit,
+/// not a permanent block. See `announce_insert_allowed`.
+const ANNOUNCE_INSERT_COOLDOWN: Duration = Duration::from_secs(2);
+/// Bounds `AnnounceLimiter`'s own memory: without this, an attacker who
+/// cycles through source IPs (trivial to spoof/rotate, unlike holding
+/// open `MAX_CONNECTIONS` real connections) could grow the limiter map
+/// itself without bound, defeating the very thing it exists to bound.
+/// Far above any realistic number of distinct legitimate source
+/// addresses in one cluster's network.
+const MAX_ANNOUNCE_LIMITER_ENTRIES: usize = 4096;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// ADR-0008 pattern-3 guard: a ready node can be alive (heartbeating
 /// normally) yet never report `C` for a handoff it's mid-`Migrate` for —
@@ -238,6 +265,43 @@ fn migration_timeout_for(max_entries: usize) -> Duration {
     let scaled = MIGRATION_TIMEOUT_BASE
         + MIGRATION_TIMEOUT_PER_ENTRY.saturating_mul(max_entries.min(u32::MAX as usize) as u32);
     scaled.min(MIGRATION_TIMEOUT_MAX)
+}
+/// Flat slack added on top of `waiting_timeout_for`'s queue-position-scaled
+/// bound, absorbing ordinary scheduling/network jitter around the worst
+/// case rather than being the primary bound itself.
+const WAITING_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
+/// Small per-source-IP cap on concurrent `Waiting`/`Joining` registrations
+/// (issue: with auth unset, an unauthenticated attacker can `J` under
+/// distinct fake names — `wait_for_promotion` holds each such connection
+/// open indefinitely and `sweep_expired` never swept `Waiting`/`Joining`
+/// nodes — up to `MAX_CONNECTIONS`, permanently exhausting connection
+/// slots). Small enough that no legitimate deployment plausibly starts
+/// this many nodes from one address at once, but well above the 1 a
+/// single legitimate node ever needs.
+const MAX_WAITING_PER_SOURCE_IP: usize = 4;
+/// Bounds how long a `Waiting` node's `J` connection is held open before
+/// discovery gives up on it and closes it (issue: see
+/// `MAX_WAITING_PER_SOURCE_IP` — the cap alone still lets a handful of
+/// connections per attacker IP, times many IPs, sit parked forever with
+/// no other node able to use those `MAX_CONNECTIONS` slots; this reclaims
+/// them once no join is plausibly still coming for them).
+///
+/// Only one join runs cluster-wide at a time (ADR-0008), and each one is
+/// itself bounded by `MIGRATION_TIMEOUT_MAX` before `abandon_current_join`
+/// reaps it — so a node that arrived behind `queue_position - 1` other
+/// `Waiting`/`Joining` nodes can legitimately need up to that many multiples
+/// of `MIGRATION_TIMEOUT_MAX` before its own turn ever comes up. Scaling
+/// the bound by `queue_position` — captured once, at registration, in
+/// `NodeInfo::queue_position` — rather than using a flat bound means a
+/// deep but genuine queue is never cut short; scaling instead by whatever
+/// the queue depth happens to be *at sweep time* would be wrong in the
+/// other direction (it shrinks as earlier nodes are promoted/reaped,
+/// which would then retroactively make a node's own elapsed wait look
+/// like a timeout it never actually earned).
+fn waiting_timeout_for(queue_position: usize) -> Duration {
+    MIGRATION_TIMEOUT_MAX
+        .saturating_mul(queue_position.min(u32::MAX as usize) as u32)
+        .saturating_add(WAITING_TIMEOUT_MARGIN)
 }
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -311,10 +375,35 @@ struct NodeInfo {
     /// deliberately carry no tokens, or any node/client could
     /// impersonate any other. Compared via `constant_time_eq`.
     token: String,
+    /// When this entry was created. Only meaningful (like `last_heartbeat`
+    /// above, but for the opposite states) while `state` is `Waiting` —
+    /// left untouched by a duplicate `J` reusing the same entry
+    /// (`start_join`), so a retried join doesn't reset its own bound.
+    /// Backs `waiting_timeout_for`.
+    waiting_since: Instant,
+    /// How many other `Waiting`/`Joining` nodes this one counted itself
+    /// behind (itself included) when it registered — captured once, not
+    /// recomputed as the queue drains; see `waiting_timeout_for` for why.
+    /// Only meaningful while `state` is `Waiting`.
+    queue_position: usize,
 }
 
 impl NodeInfo {
     fn new(address: String, state: NodeState, token: String) -> Self {
+        Self::with_queue_position(address, state, token, 1)
+    }
+
+    /// Like `new`, but records `queue_position` for `waiting_timeout_for`
+    /// — used by `start_join` when registering a genuinely new `Waiting`
+    /// entry, so its wait-timeout bound reflects how many other
+    /// `Waiting`/`Joining` nodes were ahead of it at the moment it joined
+    /// the queue.
+    fn with_queue_position(
+        address: String,
+        state: NodeState,
+        token: String,
+        queue_position: usize,
+    ) -> Self {
         Self {
             address,
             state,
@@ -322,6 +411,8 @@ impl NodeInfo {
             promoted: Arc::new(Notify::new()),
             reported_replication: None,
             token,
+            waiting_since: Instant::now(),
+            queue_position,
         }
     }
 }
@@ -539,6 +630,9 @@ struct ConnectionConfig {
     /// When set, this process's own outbound connections to a node
     /// (sending `M`/`X`) upgrade to TLS; see `connect_client_stream`.
     tls_connector: Option<TlsConnector>,
+    /// Guards new (not refreshing) registry insertions via `P` — see
+    /// `AnnounceLimiter`.
+    announce_limiter: AnnounceLimiter,
 }
 
 /// Reads the shared auth secret from the environment rather than a CLI
@@ -567,6 +661,50 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     }
 
     diff == 0
+}
+
+/// Per-source-IP cooldown state guarding new registry insertions via `P`
+/// (see `ANNOUNCE_INSERT_COOLDOWN`). Bounded itself
+/// (`MAX_ANNOUNCE_LIMITER_ENTRIES`, oldest entry evicted to make room) so
+/// an attacker cycling through source addresses can't grow the limiter's
+/// own memory without bound — the same shape of problem this exists to
+/// solve for the registry, one level down.
+type AnnounceLimiter = Arc<Mutex<FxHashMap<std::net::IpAddr, Instant>>>;
+
+/// Returns whether a new registry insertion from `peer_ip` is allowed
+/// right now, recording `peer_ip` against the current time if so.
+/// `peer_ip` is allowed unless it has a recorded insertion within
+/// `ANNOUNCE_INSERT_COOLDOWN`. Only meant to be called for a genuinely new
+/// name (see the `P` handler) — a refresh of an existing entry must not
+/// consume or be gated by this limiter at all.
+fn announce_insert_allowed(limiter: &AnnounceLimiter, peer_ip: std::net::IpAddr) -> bool {
+    let now = Instant::now();
+    let mut guard = limiter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(last) = guard.get(&peer_ip)
+        && now.duration_since(*last) < ANNOUNCE_INSERT_COOLDOWN
+    {
+        return false;
+    }
+
+    if guard.len() >= MAX_ANNOUNCE_LIMITER_ENTRIES && !guard.contains_key(&peer_ip) {
+        // Evict the single oldest entry to make room. A linear scan, but
+        // this only runs when the (small, bounded) limiter is already
+        // full and a genuinely new source shows up — not on the common
+        // path of a source that's already tracked.
+        if let Some(oldest) = guard
+            .iter()
+            .min_by_key(|&(_, recorded_at)| *recorded_at)
+            .map(|(ip, _)| *ip)
+        {
+            guard.remove(&oldest);
+        }
+    }
+
+    guard.insert(peer_ip, now);
+    true
 }
 
 struct Args {
@@ -1474,6 +1612,10 @@ enum JoinRejection {
     /// join, so it must not share that entry's `Notify` (or anything
     /// else) — rejected outright.
     TokenMismatch,
+    /// This source address already has `MAX_WAITING_PER_SOURCE_IP`
+    /// `Waiting`/`Joining` registrations outstanding (issue: unauthenticated
+    /// `J` connection exhaustion — see `MAX_WAITING_PER_SOURCE_IP`).
+    TooManyWaitingFromSource,
 }
 
 /// Registers `name` as `Waiting` with `address` (a no-op if it's already
@@ -1512,6 +1654,36 @@ async fn start_join(
             return Err(JoinRejection::TokenMismatch);
         }
 
+        // Issue: unauthenticated `J` connection exhaustion — with auth
+        // unset, a `J` under a name this replica has never seen always
+        // registers (there is no proof of identity to fail), so nothing
+        // upstream of here stops one source from doing that up to
+        // `MAX_CONNECTIONS` times with distinct fake names. Cap concurrent
+        // `Waiting`/`Joining` registrations per source address instead.
+        // Only a genuinely new name counts against this — a duplicate `J`
+        // for a name already registered here (the token check above just
+        // confirmed it's the same node) reuses its existing entry rather
+        // than adding one, so it must not double-count against its own
+        // cap. `address` is `{peer_ip}:{port}` (ADR-0012), so the source
+        // is recovered by trimming the port back off; `rsplit_once` finds
+        // the *last* `:`, which lands on the port separator even for an
+        // IPv6 address that itself contains colons.
+        if !guard.contains_key(name) {
+            let source_ip = address
+                .rsplit_once(':')
+                .map_or(address.as_str(), |(ip, _)| ip);
+            let waiting_from_source = guard
+                .values()
+                .filter(|info| {
+                    info.state != NodeState::Joined
+                        && info.address.rsplit_once(':').map(|(ip, _)| ip) == Some(source_ip)
+                })
+                .count();
+            if waiting_from_source >= MAX_WAITING_PER_SOURCE_IP {
+                return Err(JoinRejection::TooManyWaitingFromSource);
+            }
+        }
+
         // Issue (M-message size vs. `nanocached-node`'s request cap):
         // checked against the CURRENT joined roster — a conservative,
         // good-enough estimate for a registration-time check, even
@@ -1537,9 +1709,17 @@ async fn start_join(
         if !guard.contains_key(name) {
             println!("INFO node registered: {name} at {address} (waiting to join)");
         }
-        let info = guard
-            .entry(name.to_string())
-            .or_insert_with(|| NodeInfo::new(address, NodeState::Waiting, token));
+        // Captured once, at registration, for `waiting_timeout_for` — see
+        // `NodeInfo::queue_position`'s doc comment for why this must not
+        // be recomputed later as the queue drains.
+        let queue_position = guard
+            .values()
+            .filter(|info| info.state != NodeState::Joined)
+            .count()
+            + 1;
+        let info = guard.entry(name.to_string()).or_insert_with(|| {
+            NodeInfo::with_queue_position(address, NodeState::Waiting, token, queue_position)
+        });
         Arc::clone(&info.promoted)
     };
 
@@ -1809,7 +1989,11 @@ async fn abandon_current_join(
 /// protocol error — a well-behaved node sends nothing more until
 /// promoted. Deliberately does not apply the ordinary idle timeout: a
 /// node may legitimately wait here far longer than `IDLE_TIMEOUT` while
-/// another node's join is in progress.
+/// another node's join is in progress. It isn't unbounded, though —
+/// `sweep_expired` separately reaps a `Waiting` entry (and wakes this
+/// wait, the same way an abandoned join already does) once
+/// `waiting_timeout_for` has elapsed, so this can still return an error
+/// with no bytes ever having arrived on `stream`.
 async fn wait_for_promotion(
     stream: &mut ServerStream,
     registry: &Registry,
@@ -1901,6 +2085,12 @@ async fn run(
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Issue: `P` (Announce) holds no connection open, so nothing else
+    // bounds how fast a single source can grow the registry toward
+    // `MAX_REGISTRY_SIZE` — see `AnnounceLimiter`. One instance, shared
+    // by every connection via `ConnectionConfig`, for the life of the
+    // process.
+    let announce_limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
         list_ready_at: Instant::now() + startup_grace,
@@ -1908,6 +2098,7 @@ async fn run(
         auth_secret: auth_secret.clone(),
         tls_acceptor,
         tls_connector: tls_connector.clone(),
+        announce_limiter: announce_limiter.clone(),
     };
 
     println!(
@@ -2102,24 +2293,59 @@ async fn sweep_expired(
         tokio::select! {
             _ = ticker.tick() => {
                 let now = Instant::now();
-                // Waiting/Joining nodes hold one long-lived connection
-                // open instead of heartbeating (see NodeInfo::promoted);
-                // their liveness is tied to that connection, not to this
-                // sweep, so only Joined nodes are subject to it.
-                let mut evicted = Vec::new();
+                // Joined nodes are reaped on missed heartbeats. Joining
+                // nodes hold one long-lived connection open instead of
+                // heartbeating (see NodeInfo::promoted) and are bounded
+                // separately, below, by the migration timeout. Waiting
+                // nodes hold a connection open too, but — issue:
+                // unauthenticated `J` connection exhaustion — that alone
+                // doesn't bound how long one can sit unpromoted if it's
+                // never actually going to get its turn (a fake
+                // registration with nothing behind it), so they're also
+                // reaped here once `waiting_timeout_for` has elapsed.
+                let mut heartbeat_evicted = Vec::new();
+                let mut waiting_evicted = Vec::new();
                 lock(&registry).retain(|name, info| {
-                    let keep = info.state != NodeState::Joined
-                        || now.duration_since(info.last_heartbeat) < liveness_timeout;
+                    let keep = match info.state {
+                        NodeState::Joined => {
+                            now.duration_since(info.last_heartbeat) < liveness_timeout
+                        }
+                        NodeState::Waiting => {
+                            now.duration_since(info.waiting_since)
+                                < waiting_timeout_for(info.queue_position)
+                        }
+                        NodeState::Joining => true,
+                    };
                     if !keep {
-                        evicted.push(name.clone());
+                        match info.state {
+                            NodeState::Joined => heartbeat_evicted.push(name.clone()),
+                            NodeState::Waiting => {
+                                waiting_evicted.push((name.clone(), Arc::clone(&info.promoted)));
+                            }
+                            NodeState::Joining => unreachable!("Joining always kept above"),
+                        }
                     }
                     keep
                 });
-                for name in evicted {
+                for name in heartbeat_evicted {
                     eprintln!(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
                         liveness_timeout.as_secs()
                     );
+                }
+                for (name, promoted) in waiting_evicted {
+                    eprintln!(
+                        "WARN node evicted: {name} (never promoted; waiting-to-join timeout \
+                         elapsed — see MAX_WAITING_PER_SOURCE_IP/waiting_timeout_for)"
+                    );
+                    // Same wake-up as `abandon_current_join`/
+                    // `on_node_connection_ended` (issue #4/#9): a
+                    // connection may be parked in `wait_for_promotion` on
+                    // this same `Notify`, and removing the entry without
+                    // waking it would strand that connection (and the
+                    // `MAX_CONNECTIONS` permit it holds) forever.
+                    promoted.notify_waiters();
+                    promoted.notify_one();
                 }
 
                 // ADR-0008 pattern 3: a ready node alive but never
@@ -2364,6 +2590,17 @@ async fn handle_connection(
                             "join with a token that does not match the registered one",
                         ));
                     }
+                    Err(JoinRejection::TooManyWaitingFromSource) => {
+                        eprintln!(
+                            "WARN rejected join for {name} from {peer_ip}: already has \
+                             {MAX_WAITING_PER_SOURCE_IP} Waiting/Joining registrations \
+                             outstanding from this source"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many pending joins already registered from this source",
+                        ));
+                    }
                     Err(JoinRejection::MigrateMessageTooLarge { message_len }) => {
                         eprintln!(
                             "WARN rejected join for {name}: the M message this join would \
@@ -2397,6 +2634,22 @@ async fn handle_connection(
                 let rejection = {
                     let mut guard = lock(&registry);
                     let at_capacity = guard.len() >= MAX_REGISTRY_SIZE;
+                    // Issue: `P` holds no connection open the way `J`
+                    // does, so nothing else bounds how fast one source can
+                    // grow the registry toward `MAX_REGISTRY_SIZE` via
+                    // connect -> `A` -> `P` -> disconnect, repeated under a
+                    // fresh name each time. Only computed (and only ever
+                    // records this source in the limiter) for a genuinely
+                    // new name — a refresh of an existing entry never
+                    // touches the limiter, so a legitimate node's own
+                    // reconnect/re-announce cadence is unaffected no
+                    // matter how frequent. Short-circuits on `at_capacity`
+                    // so a registry that's already full doesn't also spend
+                    // a limiter slot on a source it's about to reject
+                    // anyway. See `announce_insert_allowed`.
+                    let rate_limited = !at_capacity
+                        && !guard.contains_key(&name)
+                        && !announce_insert_allowed(&config.announce_limiter, peer_ip);
                     match guard.get_mut(&name) {
                         // Issue #34: an announce for a registered name is
                         // only the node itself re-declaring if it can
@@ -2431,6 +2684,15 @@ async fn handle_connection(
                             None
                         }
                         None if at_capacity => Some("registry is full"),
+                        None if rate_limited => {
+                            eprintln!(
+                                "WARN rejected announce for {name} from {peer_ip}: too many \
+                                 new registrations from this source within \
+                                 {}s (see ANNOUNCE_INSERT_COOLDOWN)",
+                                ANNOUNCE_INSERT_COOLDOWN.as_secs()
+                            );
+                            Some("too many new announces from this source; retry shortly")
+                        }
                         None => {
                             println!("INFO node announced: {name} at {addr} (re-registered)");
                             guard.insert(
@@ -2788,6 +3050,90 @@ mod tests {
     }
 
     #[test]
+    fn waiting_timeout_for_scales_by_queue_position_and_never_shrinks_below_one_join() {
+        // Only one join runs cluster-wide at a time, and each is itself
+        // bounded by MIGRATION_TIMEOUT_MAX — so a node queued behind N-1
+        // others can legitimately need close to N times that long. A
+        // node with no one ahead of it (position 1) still gets a full
+        // MIGRATION_TIMEOUT_MAX, not zero.
+        assert_eq!(
+            waiting_timeout_for(1),
+            MIGRATION_TIMEOUT_MAX + WAITING_TIMEOUT_MARGIN
+        );
+        assert_eq!(
+            waiting_timeout_for(3),
+            MIGRATION_TIMEOUT_MAX * 3 + WAITING_TIMEOUT_MARGIN
+        );
+        assert!(waiting_timeout_for(1) < waiting_timeout_for(2));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn announce_insert_allowed_blocks_within_the_cooldown_then_allows_after() {
+        let limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        let other_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+
+        assert!(announce_insert_allowed(&limiter, ip));
+        // A second attempt from the same source within the cooldown is
+        // refused...
+        assert!(!announce_insert_allowed(&limiter, ip));
+        // ...but a different source is entirely unaffected by it.
+        assert!(announce_insert_allowed(&limiter, other_ip));
+
+        tokio::time::advance(ANNOUNCE_INSERT_COOLDOWN + Duration::from_millis(1)).await;
+
+        // Once the cooldown has elapsed, the original source is allowed
+        // again.
+        assert!(announce_insert_allowed(&limiter, ip));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn announce_insert_allowed_evicts_the_oldest_entry_once_the_limiter_is_full() {
+        // Regression: an attacker who cycles through source addresses
+        // could otherwise grow `AnnounceLimiter` itself without bound —
+        // defeating the very thing it exists to bound. It must stay a
+        // fixed-size, oldest-evicted map instead.
+        let limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+
+        let first_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(1u32));
+        assert!(announce_insert_allowed(&limiter, first_ip));
+
+        // Fill the limiter to capacity with distinct addresses, spacing
+        // each one out in (virtual) time so every entry has a distinct,
+        // well-ordered timestamp.
+        for i in 2..=MAX_ANNOUNCE_LIMITER_ENTRIES as u32 {
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(announce_insert_allowed(
+                &limiter,
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(i))
+            ));
+        }
+        assert_eq!(
+            limiter
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            MAX_ANNOUNCE_LIMITER_ENTRIES
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let overflow_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            MAX_ANNOUNCE_LIMITER_ENTRIES as u32 + 1,
+        ));
+        assert!(announce_insert_allowed(&limiter, overflow_ip));
+
+        let guard = limiter
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(guard.len(), MAX_ANNOUNCE_LIMITER_ENTRIES);
+        assert!(
+            !guard.contains_key(&first_ip),
+            "the oldest entry should have been evicted to make room"
+        );
+        assert!(guard.contains_key(&overflow_ip));
+    }
+
+    #[test]
     fn server_name_from_addr_strips_brackets_from_a_bracketed_ipv6_host() {
         let name = server_name_from_addr("[::1]:8356").unwrap();
 
@@ -2839,6 +3185,7 @@ mod tests {
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
+                    announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
                 },
                 shutdown_rx,
                 Arc::new(std::sync::Mutex::new(None)),
@@ -2902,6 +3249,7 @@ mod tests {
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
+                    announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
                 },
                 shutdown_rx,
                 Arc::new(std::sync::Mutex::new(None)),
@@ -2959,6 +3307,7 @@ mod tests {
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
+                    announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
                 },
                 shutdown_rx,
                 Arc::new(std::sync::Mutex::new(None)),
@@ -3008,6 +3357,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         // First connection: joins node-a, then a mismatched (R=1)
@@ -3103,6 +3453,7 @@ mod tests {
                     auth_secret: None,
                     tls_acceptor: None,
                     tls_connector: None,
+                    announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
                 },
                 shutdown_rx,
                 Arc::new(std::sync::Mutex::new(None)),
@@ -3164,6 +3515,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3216,6 +3568,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::clone(&connection_name),
@@ -3273,6 +3626,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::clone(&connection_name),
@@ -3333,6 +3687,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3370,6 +3725,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         let (mut node, server) = tcp_pair().await;
@@ -3460,6 +3816,89 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn start_join_rejects_a_new_registration_once_the_source_hits_the_waiting_cap() {
+        // Regression: with auth unset, an unauthenticated attacker can
+        // `J` under distinct fake names from one source without limit —
+        // each held open forever by `wait_for_promotion` — up to
+        // `MAX_CONNECTIONS`. `MAX_WAITING_PER_SOURCE_IP` caps how many
+        // concurrent Waiting/Joining registrations one source may hold.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        // A join already in progress cluster-wide (for some unrelated
+        // node) means every `start_join` call below only registers as
+        // Waiting — it never takes the bootstrap "no Joined nodes yet"
+        // shortcut that would otherwise auto-promote the very first
+        // registration and make it stop counting against the cap.
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: HashSet::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        for i in 0..MAX_WAITING_PER_SOURCE_IP {
+            let result = start_join(
+                &registry,
+                &current_join,
+                &None,
+                &None,
+                2,
+                &format!("attacker-{i}"),
+                "10.0.0.1:9000".to_string(),
+                format!("tk-attacker-{i}"),
+            )
+            .await;
+            assert!(result.is_ok(), "registration {i} should have been admitted");
+        }
+
+        let rejected = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "attacker-overflow",
+            "10.0.0.1:9000".to_string(),
+            "tk-attacker-overflow".to_string(),
+        )
+        .await;
+        let Err(JoinRejection::TooManyWaitingFromSource) = rejected else {
+            panic!("expected a TooManyWaitingFromSource rejection");
+        };
+        assert!(!lock(&registry).contains_key("attacker-overflow"));
+
+        // A different source address is unaffected by this one's cap.
+        let other_source = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "legit-node",
+            "10.0.0.2:9000".to_string(),
+            "tk-legit-node".to_string(),
+        )
+        .await;
+        assert!(other_source.is_ok());
+
+        // A duplicate `J` (issue #7) for a name the capped source already
+        // holds, presenting the same token, reuses that entry rather than
+        // adding a new one, so it must not be blocked by its own cap.
+        let retry = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "attacker-0",
+            "10.0.0.1:9000".to_string(),
+            "tk-attacker-0".to_string(),
+        )
+        .await;
+        assert!(retry.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn announce_for_a_name_mid_join_is_rejected() {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
@@ -3487,6 +3926,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3520,6 +3960,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         // An announce during the grace must work — recovery depends on it.
@@ -3583,6 +4024,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         let (mut node_a, server_a) = tcp_pair().await;
@@ -3675,6 +4117,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
         let (mut node_b_second, server) = tcp_pair().await;
         tokio::spawn(handle_connection(
@@ -3747,6 +4190,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         let (mut node_b_first, server_first) = tcp_pair().await;
@@ -3899,6 +4343,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -3957,6 +4402,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         // Node A joins first. There are no Joined nodes yet, so it's the
@@ -4061,6 +4507,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: None,
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         // A fake ready node: a real listener that expects M and acks it,
@@ -4182,6 +4629,7 @@ mod tests {
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4216,6 +4664,7 @@ mod tests {
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4250,6 +4699,7 @@ mod tests {
                 auth_secret: Some(Bytes::from_static(b"correct-secret")),
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4291,6 +4741,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4326,6 +4777,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
@@ -4385,6 +4837,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -4409,6 +4862,7 @@ mod tests {
                 auth_secret: None,
                 tls_acceptor: None,
                 tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
             },
             shutdown_rx,
             &mut connection_tasks,
@@ -4456,6 +4910,179 @@ mod tests {
         sweep_task.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sweep_expired_drops_a_waiting_node_past_its_bounded_wait_and_wakes_it() {
+        // Regression: with auth unset, an attacker's `J` under a fake
+        // name used to sit `Waiting` forever — `wait_for_promotion`
+        // applies no idle timeout, and `sweep_expired` excluded
+        // Waiting/Joining nodes from its liveness check entirely — one of
+        // `MAX_CONNECTIONS` slots held open with nothing ever reclaiming
+        // it. A `Waiting` node must eventually be reaped even if no join
+        // ever reaches it, and — like an abandoned join (issue #4) — the
+        // connection parked on its `Notify` must be woken, not stranded.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let info = NodeInfo::with_queue_position(
+            "10.0.0.1:9000".to_string(),
+            NodeState::Waiting,
+            "tk-attacker".to_string(),
+            1,
+        );
+        let promoted = Arc::clone(&info.promoted);
+        lock(&registry).insert("attacker".to_string(), info);
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            current_join,
+            None,
+            None,
+            2,
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        // Parked on the same `Notify` a real `wait_for_promotion` call
+        // would be — `notify_one`'s stored-permit semantics mean this
+        // resolves whenever the wake happens, regardless of exactly when
+        // this task itself gets polled relative to it.
+        let woken = tokio::spawn(async move {
+            promoted.notified().await;
+        });
+
+        tokio::task::yield_now().await;
+        // Comfortably below the bound at queue position 1 — must still
+        // be waiting.
+        tokio::time::advance(waiting_timeout_for(1) - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            lock(&registry).contains_key("attacker"),
+            "evicted before its bounded wait elapsed"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        assert!(!lock(&registry).contains_key("attacker"));
+        tokio::time::timeout(Duration::from_secs(5), woken)
+            .await
+            .expect("the Notify was never fired — the connection would be stranded")
+            .unwrap();
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn announce_rate_limits_new_registrations_from_one_source_but_not_refreshes() {
+        // Regression: `P` holds no connection open, so connect -> `A` ->
+        // `P` -> disconnect, repeated under a fresh name each time, used
+        // to be able to fill the registry toward `MAX_REGISTRY_SIZE` as
+        // fast as new connections could be opened. A shared, per-source
+        // cooldown must reject a second *new* name from the same source
+        // shortly after the first, while never gating a refresh of an
+        // already-known name, and never affecting a different source.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let announce_limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+        let peer_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5));
+        let other_peer_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 6));
+
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+            announce_limiter: Arc::clone(&announce_limiter),
+        };
+
+        // First: a new name from this source is admitted.
+        let (mut first, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            peer_ip,
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        first
+            .write_all(b"P 6 8356 9\nnode-atk-node-a")
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        first.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"R\n");
+
+        // Immediately after: a second, different new name from the same
+        // source is refused — the connection closes with no `R`.
+        let (mut second, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            peer_ip,
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        second
+            .write_all(b"P 6 8357 9\nnode-btk-node-b")
+            .await
+            .unwrap();
+        let mut buffer = [0u8; 2];
+        let bytes_read = second.read(&mut buffer).await.unwrap();
+        assert_eq!(
+            bytes_read, 0,
+            "expected the connection to close, got {buffer:?}"
+        );
+        assert!(!lock(&registry).contains_key("node-b"));
+
+        // But re-announcing the SAME, already-registered name from the
+        // same source is never gated by the limiter, no matter how soon.
+        let (mut refresh, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            peer_ip,
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        refresh
+            .write_all(b"P 6 8358 9\nnode-atk-node-a")
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        refresh.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"R\n");
+
+        // A different source is entirely unaffected by this source's
+        // cooldown.
+        let (mut other_source, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            other_peer_ip,
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        other_source
+            .write_all(b"P 6 8359 9\nnode-ctk-node-c")
+            .await
+            .unwrap();
+        let mut response = [0u8; 2];
+        other_source.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"R\n");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn dispatch_connection_serves_commands_over_tls() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -4495,6 +5122,7 @@ mod tests {
             auth_secret: None,
             tls_acceptor: Some(acceptor),
             tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
         };
 
         let server_task = tokio::spawn(async move {

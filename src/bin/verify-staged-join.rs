@@ -47,6 +47,8 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -57,6 +59,29 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BUCKET_WIDTH: Duration = Duration::from_millis(250);
+/// Upper bound on a `G`/`V` reply's declared value length
+/// (`get`/`get_value`). The real server's own inbound request cap is
+/// 1 MiB (`MAX_REQUEST_SIZE`, `src/server.rs`) and this harness never
+/// writes a larger value itself, so a claimed length beyond double that
+/// is definitely a corrupt or malformed frame, never a legitimate reply —
+/// trusting it outright would hand `read_exact_into` a length that could
+/// block waiting for however many bytes a bogus header claims, or drive
+/// an unbounded allocation. Mirrors the SDKs' own `MAX_VALUE_LENGTH`
+/// (e.g. `sdk/rust/src/connection.rs`).
+const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
+/// Upper bound on a discovery `L` entry's declared name/addr length
+/// (`fetch_joined`). ADR-0009 names and `ip:port` addresses are both, in
+/// practice, well under a hundred bytes, and discovery's own inbound
+/// request cap is 4 KiB (`MAX_REQUEST_SIZE`,
+/// `src/bin/nanocached-discovery.rs`) — nothing legitimate can exceed
+/// that either. Same rationale as `MAX_VALUE_LENGTH`.
+const MAX_NAME_OR_ADDR_LENGTH: usize = 4096;
+/// Upper bound on a discovery `L` response's declared entry count
+/// (`fetch_joined`), so a corrupt/malformed header can't drive
+/// `Vec::with_capacity(count)` into an oversized allocation before a
+/// single entry has even been read. Far above any cluster size this
+/// harness's own scenarios ever create.
+const MAX_ROSTER_ENTRIES: usize = 1 << 16;
 
 /// A node's name paired with its dialable address.
 type Roster = Vec<(String, String)>;
@@ -241,6 +266,16 @@ fn spawn_discovery(binary: &Path, log_dir: &Path, port: u16) -> io::Result<Proce
     let child = Command::new(binary)
         .arg("--port")
         .arg(port.to_string())
+        // This harness's module doc comment is explicit: "No TLS/auth
+        // support yet" — it never sends `A`. But both binaries read
+        // `NANOCACHED_AUTH_SECRET` independently of any CLI flag (see
+        // README's Authentication section), so if this process happened
+        // to inherit that variable from whatever shell/CI environment
+        // launched it, the spawned discovery server would require auth
+        // this harness can't provide, and every scenario would fail
+        // opaquely (a rejected `J`/`P`/`L`, not an obvious "auth secret
+        // leaked in") instead of cleanly.
+        .env_remove("NANOCACHED_AUTH_SECRET")
         .kill_on_drop(true)
         .stdout(log_file(log_dir, &format!("discovery-{port}.log"))?)
         .stderr(log_file(log_dir, &format!("discovery-{port}.err.log"))?)
@@ -263,6 +298,11 @@ fn spawn_node(
         .arg(port.to_string())
         .arg("--discovery")
         .arg(discovery_addr)
+        // See `spawn_discovery`'s identical `env_remove`: this harness
+        // never sends `A`, so an inherited secret would make the node
+        // require auth it can't authenticate for either the harness's own
+        // `G`/`S` connections or the node's own heartbeats to discovery.
+        .env_remove("NANOCACHED_AUTH_SECRET")
         .kill_on_drop(true)
         .stdout(log_file(log_dir, &format!("node-{port}.log"))?)
         .stderr(log_file(log_dir, &format!("node-{port}.err.log"))?)
@@ -433,6 +473,18 @@ async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
             )
         })?;
 
+    // A corrupt/malformed header must not drive `Vec::with_capacity`
+    // into an oversized allocation before a single entry is even read —
+    // see `MAX_ROSTER_ENTRIES`.
+    if count > MAX_ROSTER_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "L header declares {count} entries, above MAX_ROSTER_ENTRIES ({MAX_ROSTER_ENTRIES})"
+            ),
+        ));
+    }
+
     let mut nodes = Vec::with_capacity(count);
 
     for _ in 0..count {
@@ -446,6 +498,20 @@ async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
             .next()
             .and_then(|part| part.parse().ok())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad L entry header"))?;
+
+        // See `MAX_NAME_OR_ADDR_LENGTH`: a claimed length this large is
+        // corrupt, not a legitimate name/addr — reject before it drives
+        // `read_exact_into` into blocking on however many bytes a bogus
+        // header claims.
+        if name_length > MAX_NAME_OR_ADDR_LENGTH || addr_length > MAX_NAME_OR_ADDR_LENGTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "L entry header declares name_length={name_length} addr_length={addr_length}, \
+                     above MAX_NAME_OR_ADDR_LENGTH ({MAX_NAME_OR_ADDR_LENGTH})"
+                ),
+            ));
+        }
 
         // +1 for the trailing '\n' discovery writes after each entry's
         // <name><addr> body (see nanocached-discovery.rs's `L` handler).
@@ -485,6 +551,33 @@ enum GetReply {
     WrongNode,
 }
 
+/// Parses the `<length>` out of a `V <length>` response line, rejecting
+/// anything above `MAX_VALUE_LENGTH` before it ever reaches
+/// `read_exact_into` — see that constant's doc comment. Shared by `get`
+/// and `get_value`, which otherwise duplicated this parsing exactly.
+fn parse_value_length(line: &str) -> io::Result<usize> {
+    let length: usize = line
+        .strip_prefix("V ")
+        .and_then(|rest| rest.parse().ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad G response: {line:?}"),
+            )
+        })?;
+
+    if length > MAX_VALUE_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "G response declares length={length}, above MAX_VALUE_LENGTH ({MAX_VALUE_LENGTH})"
+            ),
+        ));
+    }
+
+    Ok(length)
+}
+
 async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Result<GetReply> {
     let mut message = format!("G {}\n", key.len()).into_bytes();
     message.extend_from_slice(key);
@@ -496,15 +589,7 @@ async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Resu
         "N" => Ok(GetReply::Miss),
         "W" => Ok(GetReply::WrongNode),
         _ => {
-            let length: usize = line
-                .strip_prefix("V ")
-                .and_then(|rest| rest.parse().ok())
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("bad G response: {line:?}"),
-                    )
-                })?;
+            let length = parse_value_length(&line)?;
 
             read_exact_into(stream, buf, length).await?;
             let _ = buf.split_to(length);
@@ -528,15 +613,7 @@ async fn get_value(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io
         return Ok(false);
     }
 
-    let length: usize = line
-        .strip_prefix("V ")
-        .and_then(|rest| rest.parse().ok())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad G response: {line:?}"),
-            )
-        })?;
+    let length = parse_value_length(&line)?;
 
     read_exact_into(stream, buf, length).await?;
     let _ = buf.split_to(length);
@@ -829,6 +906,14 @@ async fn run_worker(
 
         if let Some(error) = error {
             eprintln!("worker {worker_id} error against {}: {error}", owners[0].1);
+            // A connect failure (the target node hasn't started listening
+            // yet, or is briefly unreachable around a join) would
+            // otherwise retry in a tight spin loop — pure wasted CPU, and
+            // a flood of one error line per failed attempt. A few
+            // milliseconds is enough to break the spin without
+            // meaningfully slowing recovery once the target is reachable
+            // again.
+            sleep(Duration::from_millis(5)).await;
         }
 
         stats.record(elapsed, ok);
@@ -1258,5 +1343,126 @@ mod tests {
             .collect();
         let ring = Ring::new(&nodes);
         assert_eq!(ring.owners(b"some-key", 10).len(), 3);
+    }
+
+    #[test]
+    fn parse_value_length_accepts_an_ordinary_length() {
+        assert_eq!(parse_value_length("V 5").unwrap(), 5);
+        assert_eq!(parse_value_length("V 0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_value_length_accepts_exactly_max_value_length() {
+        assert_eq!(
+            parse_value_length(&format!("V {MAX_VALUE_LENGTH}")).unwrap(),
+            MAX_VALUE_LENGTH
+        );
+    }
+
+    #[test]
+    fn parse_value_length_rejects_a_length_above_max_value_length() {
+        // Regression: a corrupt or malicious `V <length>` header used to
+        // be trusted outright, so a claimed length far beyond anything
+        // the real server would ever send could drive `read_exact_into`
+        // into blocking on however many bytes the bogus header claims
+        // (or, if it were used to size an allocation, an oversized one).
+        let error = parse_value_length(&format!("V {}", MAX_VALUE_LENGTH + 1))
+            .expect_err("expected an error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn parse_value_length_rejects_a_malformed_line() {
+        assert!(parse_value_length("garbage").is_err());
+        assert!(parse_value_length("V not-a-number").is_err());
+    }
+
+    /// Writes a discovery `L` response's header line — `N <count> <r>` —
+    /// straight to `stream`, for a test acting as a fake discovery server.
+    async fn write_list_header(stream: &mut TcpStream, count: usize, replication: usize) {
+        stream
+            .write_all(format!("N {count} {replication}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_joined_rejects_a_declared_entry_count_above_the_bound() {
+        // Regression: a corrupt/malicious `N <count> <r>` header used to
+        // be trusted outright, so a huge declared `count` could drive
+        // `Vec::with_capacity(count)` into an oversized allocation before
+        // a single entry had even been read — see `MAX_ROSTER_ENTRIES`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"L\n");
+
+            // Never sends a single entry — the bound check must reject
+            // based on the header alone.
+            write_list_header(&mut stream, MAX_ROSTER_ENTRIES + 1, 2).await;
+        });
+
+        let error = fetch_joined(&addr).await.expect_err("expected an error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_joined_rejects_a_declared_entry_name_length_above_the_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"L\n");
+
+            write_list_header(&mut stream, 1, 2).await;
+            // Declares a name_length far beyond anything a real ADR-0009
+            // name is, and never sends a body that large — the bound
+            // check must reject based on the entry header alone.
+            stream
+                .write_all(format!("{} 3\n", MAX_NAME_OR_ADDR_LENGTH + 1).as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let error = fetch_joined(&addr).await.expect_err("expected an error");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_joined_accepts_a_well_formed_response() {
+        // Control test: the new bound checks must not reject an
+        // ordinary, legitimate response.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"L\n");
+
+            write_list_header(&mut stream, 1, 2).await;
+            stream
+                .write_all(b"6 14\nnode-a127.0.0.1:8356\n")
+                .await
+                .unwrap();
+        });
+
+        let (roster, replication) = fetch_joined(&addr).await.unwrap();
+        assert_eq!(replication, 2);
+        assert_eq!(
+            roster,
+            vec![("node-a".to_string(), "127.0.0.1:8356".to_string())]
+        );
+        server.await.unwrap();
     }
 }

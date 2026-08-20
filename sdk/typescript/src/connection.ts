@@ -18,8 +18,15 @@ interface Waiter {
   tag?: number;
 }
 
-function toBytes(value: string | Uint8Array): Buffer {
-  return typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+// Issue: `Buffer.from(uint8array)` copies its input, and every caller here
+// immediately hands the result to `Buffer.concat` (in encodeGet/encodeSet/
+// encodeDelete), which copies again to build the final frame — a Uint8Array
+// key/value paid for two copies where one suffices. `Buffer.concat` accepts
+// plain `Uint8Array` entries directly, so a `Uint8Array` input is returned
+// unchanged here; only the string case needs a fresh Buffer, since encoding
+// text to bytes has no existing buffer to reuse.
+function toBytes(value: string | Uint8Array): Uint8Array {
+  return typeof value === "string" ? Buffer.from(value, "utf8") : value;
 }
 
 /** Bounds how long the connection may go without progress while requests

@@ -62,6 +62,7 @@ public final class NanocachedClient implements AutoCloseable {
         private int compressionThreshold = DEFAULT_COMPRESSION_THRESHOLD;
         private boolean fireAndForgetReplicas;
         private boolean readRepair;
+        private Duration reconnectCooldown = DEFAULT_RECONNECT_COOLDOWN;
 
         /** Discovery replicas (ADR-0010), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -72,6 +73,13 @@ public final class NanocachedClient implements AutoCloseable {
 
         /** Shared secret matching NANOCACHED_AUTH_SECRET on the server. */
         public Options authSecret(String secret) {
+            // A raw NullPointerException here reads like a bug in this
+            // SDK, not a caller mistake — IllegalArgumentException matches
+            // every other validation in this class (issue: audit finding
+            // J3).
+            if (secret == null) {
+                throw new IllegalArgumentException("nanocached: authSecret must not be null");
+            }
             this.authSecret = secret.getBytes(StandardCharsets.UTF_8);
             return this;
         }
@@ -142,6 +150,31 @@ public final class NanocachedClient implements AutoCloseable {
             this.readRepair = enabled;
             return this;
         }
+
+        /** How long, after a reconnect dial to an address fails, that
+         * address is treated as still down — a call routed to it during
+         * this window fails immediately with the original dial error
+         * instead of paying another full connect timeout redialing an
+         * address that just proved unreachable. Default {@code
+         * DEFAULT_RECONNECT_COOLDOWN} (1s). Keep well under the node-list
+         * staleness window ({@code NODE_LIST_STALE_AFTER}, 30s) so a node
+         * that genuinely recovers isn't shut out for long. */
+        public Options reconnectCooldown(Duration cooldown) {
+            // Matches authSecret's null handling above (issue: audit
+            // finding J3) — a raw NullPointerException here would read
+            // like a bug in this SDK, not a caller mistake. A negative
+            // duration is rejected too: it would mean "never cools down
+            // by the time check", i.e. every dial to a known-dead address
+            // would be treated as already past its cooldown instantly —
+            // silently defeating the whole feature rather than failing
+            // loudly at configuration time.
+            if (cooldown == null || cooldown.isNegative()) {
+                throw new IllegalArgumentException(
+                        "nanocached: reconnectCooldown must not be null or negative");
+            }
+            this.reconnectCooldown = cooldown;
+            return this;
+        }
     }
 
     /**
@@ -159,6 +192,25 @@ public final class NanocachedClient implements AutoCloseable {
     public record ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures) {}
 
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
+
+    // See Options.reconnectCooldown. Mirrors sdk/typescript/src/client.ts's
+    // DEFAULT_RECONNECT_COOLDOWN_MS and sdk/python/src/nanocached/client.py's
+    // _DEFAULT_RECONNECT_COOLDOWN.
+    private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMillis(1_000);
+
+    // The server rejects (and drops the connection for) any request frame
+    // over MAX_REQUEST_SIZE (src/server.rs), 1 MiB — a hard cap on the
+    // *whole* frame, header included. Validating key/value length against
+    // that exact number would still let a caller build a frame that trips
+    // it once the "G "/"S "/"D "/lengths/ttl/tag header text and framing
+    // are added, so this constant carries 1 KiB of headroom for that
+    // header — comfortably more than any header this SDK ever writes
+    // (issue: audit finding J2). Catching an oversize request here, before
+    // it ever reaches Connection, avoids the confusing alternative of the
+    // server silently closing the connection with no response (a bare
+    // key+value length rejection is never sent back — see
+    // request_is_too_large in server.rs).
+    private static final int MAX_REQUEST_BYTES = 1024 * 1024 - 1024;
 
     public static Options builder() {
         return new Options();
@@ -223,6 +275,25 @@ public final class NanocachedClient implements AutoCloseable {
     private final int compressionThreshold;
     private final boolean fireAndForgetReplicas;
     private final boolean readRepair;
+    private final long reconnectCooldownNanos;
+    /** Per-address reconnect cooldown (see {@link Options#reconnectCooldown}):
+     * the address of the most recently failed dial, and how long it stays
+     * "down" before another dial to it is attempted. Keyed by address, not
+     * slot — {@link #memberConnection}'s slot (node name) can be
+     * reassigned to a different address by a refresh, but the address
+     * itself is what's actually unreachable. Mirrors TypeScript's
+     * reconnectCooldowns. */
+    private final ConcurrentHashMap<String, CooldownEntry> reconnectCooldowns = new ConcurrentHashMap<>();
+
+    private static final class CooldownEntry {
+        final long untilNanos;
+        final RuntimeException error;
+
+        CooldownEntry(long untilNanos, RuntimeException error) {
+            this.untilNanos = untilNanos;
+            this.error = error;
+        }
+    }
     // Observability for failures this client swallows by design — see
     // stats(). AtomicLong because they're incremented from whichever
     // thread happens to hit the swallow site (foreground calls,
@@ -288,7 +359,7 @@ public final class NanocachedClient implements AutoCloseable {
     private NanocachedClient(
             List<Address> addresses, byte[] authSecret, SSLContext tls,
             boolean compress, int compressionThreshold, boolean fireAndForgetReplicas,
-            boolean readRepair) {
+            boolean readRepair, Duration reconnectCooldown) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
@@ -296,6 +367,7 @@ public final class NanocachedClient implements AutoCloseable {
         this.compressionThreshold = compressionThreshold;
         this.fireAndForgetReplicas = fireAndForgetReplicas;
         this.readRepair = readRepair;
+        this.reconnectCooldownNanos = reconnectCooldown.toNanos();
     }
 
     public static NanocachedClient connect(Options options) {
@@ -308,7 +380,7 @@ public final class NanocachedClient implements AutoCloseable {
         NanocachedClient client = new NanocachedClient(
                 options.addresses, options.authSecret, sslContext,
                 options.compress, options.compressionThreshold, options.fireAndForgetReplicas,
-                options.readRepair);
+                options.readRepair, options.reconnectCooldown);
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, ADR-0010), or knows no live
@@ -490,6 +562,7 @@ public final class NanocachedClient implements AutoCloseable {
      * probes the remaining owners before being accepted as final
      * (doc/adr/0015-*.md). */
     public Optional<byte[]> getBytes(byte[] key) {
+        validateKey(key);
         beforeOperation();
         byte[] value = withWrongNodeRetry(() -> read(key, connection -> connection.get(key)));
         if (value == null && readRepair && ring != null) {
@@ -574,6 +647,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new IllegalArgumentException(
                     "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
+        validateKeyAndValue(key, value);
         beforeOperation();
         byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
@@ -592,8 +666,43 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** Returns whether the key existed before this call. */
     public boolean delete(byte[] key) {
+        validateKey(key);
         beforeOperation();
         return withWrongNodeRetry(() -> write(key, connection -> connection.delete(key)));
+    }
+
+    /** Rejects an empty key or one so large that {@code "G "}/{@code "D "}
+     * plus the key alone would already risk tripping the server's
+     * MAX_REQUEST_SIZE (issue: audit finding J2) — checked synchronously,
+     * before any connection is touched, mirroring {@link #set(byte[],
+     * byte[], long)}'s ttlSeconds check. */
+    private static void validateKey(byte[] key) {
+        if (key.length == 0) {
+            throw new IllegalArgumentException("nanocached: key must not be empty");
+        }
+        if (key.length > MAX_REQUEST_BYTES) {
+            throw new IllegalArgumentException(
+                    "nanocached: key is " + key.length + " bytes, which exceeds the "
+                            + MAX_REQUEST_BYTES + "-byte request limit (server MAX_REQUEST_SIZE, "
+                            + "src/server.rs, is 1 MiB)");
+        }
+    }
+
+    /** As {@link #validateKey}, plus rejects a key+value pair too large
+     * for a single {@code S} request to have any chance of fitting under
+     * the server's MAX_REQUEST_SIZE (issue: audit finding J2). Checked
+     * against the caller-supplied value, before compression — compression
+     * only ever shrinks what actually goes on the wire, so this is the
+     * conservative (never falsely permissive) side to check. */
+    private static void validateKeyAndValue(byte[] key, byte[] value) {
+        validateKey(key);
+        long total = (long) key.length + value.length;
+        if (total > MAX_REQUEST_BYTES) {
+            throw new IllegalArgumentException(
+                    "nanocached: key (" + key.length + " bytes) + value (" + value.length
+                            + " bytes) = " + total + " bytes, which exceeds the " + MAX_REQUEST_BYTES
+                            + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+        }
     }
 
     /** Idempotent (later get/set/delete throw {@link NanocachedException.AlreadyClosed}),
@@ -770,9 +879,33 @@ public final class NanocachedClient implements AutoCloseable {
 
         synchronized (redialLocks.computeIfAbsent("", slot -> new Object())) {
             if (single.isClosed()) {
-                single = openNodeConnectionOrThrow(singleAddress);
+                single = dialWithCooldown(singleAddress);
             }
             return single;
+        }
+    }
+
+    /** Redials {@code address}, honoring the per-address reconnect
+     * cooldown (see {@link #reconnectCooldowns}): an address whose dial
+     * just failed stays "down" for {@code reconnectCooldownNanos}, so a
+     * burst of calls routed to it — or one call every keep-alive tick —
+     * fails immediately with the same error the dial itself produced,
+     * instead of each paying another full connect timeout in turn.
+     * Callers must hold the redial lock for the relevant slot. */
+    private Connection dialWithCooldown(String address) {
+        CooldownEntry cooldown = reconnectCooldowns.get(address);
+        if (cooldown != null && System.nanoTime() < cooldown.untilNanos) {
+            throw cooldown.error;
+        }
+
+        try {
+            Connection connection = openNodeConnectionOrThrow(address);
+            reconnectCooldowns.remove(address);
+            return connection;
+        } catch (RuntimeException error) {
+            reconnectCooldowns.put(
+                    address, new CooldownEntry(System.nanoTime() + reconnectCooldownNanos, error));
+            throw error;
         }
     }
 
@@ -802,7 +935,7 @@ public final class NanocachedClient implements AutoCloseable {
                 member = current;
             }
             if (!member.connection.isClosed()) return member.connection;
-            Connection connection = openNodeConnectionOrThrow(member.address);
+            Connection connection = dialWithCooldown(member.address);
             member.connection = connection;
             return connection;
         }

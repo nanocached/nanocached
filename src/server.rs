@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -995,13 +995,14 @@ async fn handle_connection(
                 // ADR-0008: this key may be one an in-progress handoff is
                 // moving to a joining node — see `migration_target_for`.
                 if let Some(node_context) = &config.node_context
-                    && let Some(joining_addr) = migration_target_for(node_context, &key)
+                    && let Some(target) = migration_target_for(node_context, &key)
                     && let Err(error) =
-                        set_on_joining_node(node_context, &joining_addr, &key, &value, ttl).await
+                        set_on_joining_node(node_context, &target, &key, &value, ttl).await
                 {
                     eprintln!(
                         "WARN failed to forward a concurrent SET for a migrating key to \
-                         {joining_addr}: {error}"
+                         {}: {error}",
+                        target.addr
                     );
                 }
 
@@ -1021,13 +1022,13 @@ async fn handle_connection(
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 if let Some(node_context) = &config.node_context
-                    && let Some(joining_addr) = migration_target_for(node_context, &key)
-                    && let Err(error) =
-                        delete_on_joining_node(node_context, &joining_addr, &key).await
+                    && let Some(target) = migration_target_for(node_context, &key)
+                    && let Err(error) = delete_on_joining_node(node_context, &target, &key).await
                 {
                     eprintln!(
                         "WARN failed to forward a concurrent DELETE for a migrating key to \
-                         {joining_addr}: {error}"
+                         {}: {error}",
+                        target.addr
                     );
                 }
 
@@ -1516,6 +1517,27 @@ struct ActiveMigration {
     /// `A <entries>` ack again — see `MigrationOutcome::DuplicateAcked`.
     acked_entries: Option<usize>,
     abort_requested: Arc<AtomicBool>,
+    /// Persistent connection to the joining node, shared by every
+    /// `set_on_joining_node`/`delete_on_joining_node` call this handoff's
+    /// concurrent client writes trigger (see `migration_target_for` and
+    /// `ForwardTarget`) — issue: those two used to call
+    /// `connect_and_authenticate` fresh per forwarded write, opening (and
+    /// leaking to TIME_WAIT) a new TCP+TLS+Auth connection every time,
+    /// the same ephemeral-port exhaustion `run_migration`'s own bulk
+    /// transfer already learned to avoid by reusing one connection for
+    /// every key (see this struct's own doc comment on that, and
+    /// `run_migration`'s). `None` when there is no live connection yet,
+    /// or right after an I/O error drops the last one; the next forward
+    /// reconnects. A `tokio::sync::Mutex`, not `std::sync`, since a
+    /// connection is held across the `.await`s of writing a command and
+    /// reading its ack, one forwarded write at a time (concurrent
+    /// forwards for this same handoff simply queue behind each other —
+    /// they'd have to serialize on the wire regardless, being one TCP
+    /// stream). Deliberately scoped per-`ActiveMigration`, not shared
+    /// across migrations: a fresh migration means a different joining
+    /// node, so it must start with no connection rather than possibly
+    /// reusing one dialed to whatever node the previous handoff targeted.
+    forward_connection: Arc<AsyncMutex<Option<ClientStream>>>,
 }
 
 /// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
@@ -1659,6 +1681,7 @@ impl MigrationGuard {
             forwarding_grace: Duration::ZERO,
             acked_entries: None,
             abort_requested: Arc::clone(&abort_requested),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
 
@@ -2196,30 +2219,147 @@ async fn send_set(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound set timed out"))?
 }
 
+/// What a concurrent client write needs to forward itself to an
+/// in-flight handoff's joining node (see `migration_target_for`):
+/// where to reach it, and the persistent connection to reuse for the
+/// forward — shared with every other forwarded write for this same
+/// migration (`ActiveMigration::forward_connection`) rather than each
+/// dialing its own.
+struct ForwardTarget {
+    addr: String,
+    connection: Arc<AsyncMutex<Option<ClientStream>>>,
+}
+
 /// Bounded by `FORWARD_TIMEOUT` as a single whole — see that constant's
 /// doc comment for why this can't just rely on `connect_and_authenticate`
 /// and `send_set`'s own per-leg `OUTBOUND_IO_TIMEOUT`s: this call runs
 /// synchronously inside a client's connection task (`handle_connection`'s
 /// `S` handling), so its worst case directly stalls that client's
 /// pipeline.
+///
+/// Issue: this used to call `connect_and_authenticate` fresh on every
+/// call, opening (and, once dropped, leaking into TIME_WAIT) a brand new
+/// TCP+TLS+Auth connection per forwarded write — the same ephemeral-port
+/// exhaustion `run_migration`'s own bulk transfer already learned to
+/// avoid (see `ActiveMigration`'s doc comment on
+/// `forward_connection`). Reuses `target.connection` instead, connecting
+/// only when there isn't already a live connection there.
 async fn set_on_joining_node(
     node_context: &NodeContext,
-    joining_addr: &str,
+    target: &ForwardTarget,
     key: &[u8],
     value: &[u8],
     ttl: Option<Duration>,
 ) -> io::Result<()> {
-    timeout(FORWARD_TIMEOUT, async {
-        let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
-        send_set(&mut stream, key, value, ttl).await
-    })
+    forward_on_shared_connection(
+        node_context,
+        target,
+        ForwardedWrite::Set { key, value, ttl },
+    )
     .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "forwarding the write to the joining node timed out",
-        )
-    })?
+}
+
+/// A client write being forwarded to the joining node during its
+/// handoff — the two kinds `forward_on_shared_connection` knows how to
+/// put on the shared connection.
+enum ForwardedWrite<'a> {
+    Set {
+        key: &'a [u8],
+        value: &'a [u8],
+        ttl: Option<Duration>,
+    },
+    Delete {
+        key: &'a [u8],
+    },
+}
+
+impl ForwardedWrite<'_> {
+    fn timed_out_message(&self) -> &'static str {
+        match self {
+            ForwardedWrite::Set { .. } => "forwarding the write to the joining node timed out",
+            ForwardedWrite::Delete { .. } => "forwarding the delete to the joining node timed out",
+        }
+    }
+
+    async fn send(self, stream: &mut ClientStream) -> io::Result<()> {
+        match self {
+            ForwardedWrite::Set { key, value, ttl } => send_set(stream, key, value, ttl).await,
+            ForwardedWrite::Delete { key } => {
+                stream.write_all(&delete_message(key)).await?;
+
+                let mut ack = [0u8; 2];
+                stream.read_exact(&mut ack).await?;
+
+                if &ack != b"D\n" && &ack != b"N\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "joining node did not acknowledge the forwarded delete",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The one place a forwarded write touches `ForwardTarget::connection`:
+/// takes the shared connection (dialing it if there is none), sends
+/// `write` on it, and — crucially — resets the slot to `None` whenever
+/// the stream's state is no longer known to be clean: after the send
+/// fails, and after the whole forward times out.
+///
+/// The timeout case is why the guard is taken *outside* the
+/// `timeout_at`: cancelling a future that holds the guard drops the
+/// guard but runs none of its cleanup, so a forward that timed out
+/// mid-write (a partial `S` frame on the wire) would have left the
+/// desynced stream in place for the next forward to reuse, which would
+/// then read the *previous* forward's late ack as its own. Holding the
+/// guard across the deadline lets the timeout branch clear the slot
+/// itself. Waiting for the guard still counts against the same
+/// `FORWARD_TIMEOUT` deadline, so the call as a whole stays bounded even
+/// when another forward is holding the connection.
+async fn forward_on_shared_connection(
+    node_context: &NodeContext,
+    target: &ForwardTarget,
+    write: ForwardedWrite<'_>,
+) -> io::Result<()> {
+    let timed_out_message = write.timed_out_message();
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, timed_out_message);
+    let deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
+
+    let mut connection = tokio::time::timeout_at(deadline, target.connection.lock())
+        .await
+        .map_err(|_| timed_out())?;
+
+    let result = tokio::time::timeout_at(deadline, async {
+        if connection.is_none() {
+            *connection = Some(connect_and_authenticate(node_context, &target.addr).await?);
+        }
+        // Just ensured `Some` above (and nothing else can steal the slot
+        // back to `None` while this guard is held).
+        let stream = connection
+            .as_mut()
+            .expect("connection was just established");
+        write.send(stream).await
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            // The connection's state after a failed write/read is
+            // unknown (e.g. a partial write) — drop it so the next
+            // forward reconnects rather than risk a desynced stream,
+            // mirroring `run_migration`'s own per-key retry on its
+            // separate connection.
+            *connection = None;
+            Err(error)
+        }
+        Err(_elapsed) => {
+            *connection = None;
+            Err(timed_out())
+        }
+    }
 }
 
 /// This node's own current view of cluster membership, if it has one yet
@@ -2241,11 +2381,11 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
 }
 
 /// If a handoff is currently in flight and `key` is one it's moving (per
-/// its `after_ring`), returns the joining node's address — for
-/// `handle_connection` to also propagate a client's `S`/`D` for that key
-/// there, so the joining node doesn't end up serving a stale value once
-/// promoted (see doc/adr/0008's Consequences).
-fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String> {
+/// its `after_ring`), returns where to forward it — for `handle_connection`
+/// to also propagate a client's `S`/`D` for that key there, so the
+/// joining node doesn't end up serving a stale value once promoted (see
+/// doc/adr/0008's Consequences).
+fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<ForwardTarget> {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -2271,44 +2411,25 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String
                 .after_ring
                 .is_owner(key, &active.joining_name, active.replication)
         })
-        .map(|active| active.joining_addr.clone())
+        .map(|active| ForwardTarget {
+            addr: active.joining_addr.clone(),
+            connection: Arc::clone(&active.forward_connection),
+        })
 }
 
-/// Forwards a client's `D` for `key` to `joining_addr`, mirroring
-/// `set_on_joining_node` but for deletes — see `migration_target_for`.
-/// Accepts either `D\n` (the key was present there too) or `N\n` (it
-/// hadn't arrived yet, e.g. this delete raced ahead of the migration
-/// task's own send of it) as a successful delivery. Bounded by
+/// Forwards a client's `D` for `key` to `target`, mirroring
+/// `set_on_joining_node` but for deletes — see `migration_target_for` and
+/// `ForwardTarget`. Accepts either `D\n` (the key was present there too)
+/// or `N\n` (it hadn't arrived yet, e.g. this delete raced ahead of the
+/// migration task's own send of it) as a successful delivery. Bounded by
 /// `FORWARD_TIMEOUT` as a single whole, same reasoning as
-/// `set_on_joining_node`.
+/// `set_on_joining_node`, and reuses `target.connection` the same way.
 async fn delete_on_joining_node(
     node_context: &NodeContext,
-    joining_addr: &str,
+    target: &ForwardTarget,
     key: &[u8],
 ) -> io::Result<()> {
-    timeout(FORWARD_TIMEOUT, async {
-        let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
-
-        stream.write_all(&delete_message(key)).await?;
-
-        let mut ack = [0u8; 2];
-        stream.read_exact(&mut ack).await?;
-
-        if &ack != b"D\n" && &ack != b"N\n" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "joining node did not acknowledge the forwarded delete",
-            ));
-        }
-        io::Result::Ok(())
-    })
-    .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            "forwarding the delete to the joining node timed out",
-        )
-    })?
+    forward_on_shared_connection(node_context, target, ForwardedWrite::Delete { key }).await
 }
 
 async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::Result<()> {
@@ -2603,8 +2724,13 @@ mod tests {
             request_tx: mpsc::channel(1).0,
         };
 
+        let target = ForwardTarget {
+            addr: joining_addr,
+            connection: Arc::new(AsyncMutex::new(None)),
+        };
+
         let forward_task = tokio::spawn(async move {
-            set_on_joining_node(&node_context, &joining_addr, b"name", b"Alice", None).await
+            set_on_joining_node(&node_context, &target, b"name", b"Alice", None).await
         });
 
         tokio::task::yield_now().await;
@@ -2629,6 +2755,155 @@ mod tests {
 
         joining_task.abort();
         let _ = release_set_tx.send(());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forwarded_writes_to_a_joining_node_reuse_one_connection() {
+        // Regression: `set_on_joining_node`/`delete_on_joining_node` used
+        // to call `connect_and_authenticate` fresh on every call — connect
+        // -> auth -> set/delete -> disconnect, once per concurrent client
+        // write racing an in-progress handoff — exhausting ephemeral ports
+        // the same way `run_migration`'s own bulk transfer already
+        // learned to avoid (see `ActiveMigration::forward_connection`'s
+        // doc comment). A `ForwardTarget` shared across calls (as
+        // `migration_target_for` hands out for one migration) must reuse
+        // a single connection instead.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+
+            // Two SETs and a DELETE, all forwarded separately below, must
+            // all land on this one accepted connection.
+            for _ in 0..2 {
+                let mut buffer = [0u8; 256];
+                let bytes_read = connection.read(&mut buffer).await.unwrap();
+                assert!(bytes_read > 0);
+                connection.write_all(b"S\n").await.unwrap();
+            }
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0);
+            connection.write_all(b"D\n").await.unwrap();
+
+            let second_connection =
+                timeout(Duration::from_millis(200), joining_listener.accept()).await;
+            assert!(
+                second_connection.is_err(),
+                "expected every forwarded write to reuse the same connection"
+            );
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+        };
+
+        // Exactly what `migration_target_for` would hand every concurrent
+        // client write racing the same handoff: the same `addr` and the
+        // same shared `connection`.
+        let target = ForwardTarget {
+            addr: joining_addr,
+            connection: Arc::new(AsyncMutex::new(None)),
+        };
+
+        set_on_joining_node(&node_context, &target, b"name", b"Alice", None)
+            .await
+            .unwrap();
+        set_on_joining_node(&node_context, &target, b"age", b"30", None)
+            .await
+            .unwrap();
+        delete_on_joining_node(&node_context, &target, b"name")
+            .await
+            .unwrap();
+
+        joining_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forward_that_times_out_does_not_leave_its_connection_for_the_next_forward() {
+        // Regression: the shared forwarding connection was only reset on
+        // an *error* from the send, inside the `timeout` future. A forward
+        // that timed out instead (frame written, ack never read) had that
+        // future — and its cleanup — dropped, so the half-used connection
+        // stayed in the slot and the next forward reused it, reading the
+        // previous forward's late ack as its own. After a timeout the
+        // next forward must dial a fresh connection.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+
+        // Real I/O (connect, write) runs on the real clock; only the ack
+        // wait is fast-forwarded, by pausing the clock once the joining
+        // side has the frame in hand — a paused clock auto-advances past
+        // `FORWARD_TIMEOUT` the moment nothing else is runnable, but it
+        // also races real loopback I/O against timers, so it must not be
+        // on while a connect is in flight.
+        let (frame_received_tx, frame_received_rx) = oneshot::channel::<()>();
+        let joining_task = tokio::spawn(async move {
+            let (mut first, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = first.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0);
+            let _ = frame_received_tx.send(());
+            // Never ack the first SET — hold the connection open (no EOF,
+            // so the forward can only end by timing out) until a second
+            // connection arrives, which is the behaviour under test.
+            // Well past FORWARD_TIMEOUT: while the clock is paused the
+            // runtime auto-advances to the *earliest* pending timer, so a
+            // bound shorter than the forward's own deadline would fire
+            // first and abort this side before the forward times out.
+            let (mut second, _) = timeout(Duration::from_secs(60), joining_listener.accept())
+                .await
+                .expect("the forward after a timeout must dial a fresh connection")
+                .unwrap();
+            let bytes_read = second.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0);
+            second.write_all(b"S\n").await.unwrap();
+            drop(first);
+        });
+
+        let node_context = Arc::new(NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+        });
+        let target = Arc::new(ForwardTarget {
+            addr: joining_addr,
+            connection: Arc::new(AsyncMutex::new(None)),
+        });
+
+        let first_forward = tokio::spawn({
+            let node_context = Arc::clone(&node_context);
+            let target = Arc::clone(&target);
+            async move { set_on_joining_node(&node_context, &target, b"name", b"Alice", None).await }
+        });
+        frame_received_rx.await.unwrap();
+        tokio::time::pause();
+        let error = first_forward.await.unwrap().unwrap_err();
+        tokio::time::resume();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            target.connection.lock().await.is_none(),
+            "a timed-out forward must not leave its connection in the shared slot"
+        );
+
+        set_on_joining_node(&node_context, &target, b"age", b"30", None)
+            .await
+            .unwrap();
+
+        joining_task.await.unwrap();
     }
 
     #[test]
@@ -3257,8 +3532,8 @@ mod tests {
         // concurrent client write for a key in the joiner's top-R still
         // needs forwarding.
         assert_eq!(
-            migration_target_for(&node_context, b"key-0").as_deref(),
-            Some(joining_addr.as_str()),
+            migration_target_for(&node_context, b"key-0").map(|target| target.addr),
+            Some(joining_addr.clone()),
         );
         // ...but sweeping must no longer be paused by the lingering entry
         // (only a *running* transfer pauses it).
@@ -3358,9 +3633,10 @@ mod tests {
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
         });
 
-        assert_eq!(migration_target_for(&node_context, b"key-0"), None);
+        assert!(migration_target_for(&node_context, b"key-0").is_none());
         assert!(
             node_context.active_migration.lock().unwrap().is_none(),
             "an expired forwarding entry should be cleared lazily"
@@ -3386,6 +3662,7 @@ mod tests {
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![
@@ -3424,6 +3701,7 @@ mod tests {
             forwarding_grace: Duration::ZERO,
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
         let after_ring = Arc::new(HashRing::new(vec![

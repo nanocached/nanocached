@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 
 /**
@@ -178,6 +179,15 @@ final class Identify {
             SSLSocket socket =
                     (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
             socket.setSoTimeout(CONNECT_TIMEOUT_MS);
+            // Without this, the JDK verifies the certificate chain but
+            // never checks it was actually issued to `host` — a valid
+            // cert for any other name would be accepted, defeating TLS
+            // entirely (audit finding J1). HTTPS-style endpoint
+            // identification is exactly hostname verification without
+            // pulling in HTTPS itself.
+            SSLParameters params = socket.getSSLParameters();
+            params.setEndpointIdentificationAlgorithm("HTTPS");
+            socket.setSSLParameters(params);
             socket.startHandshake();
             return socket;
         } catch (IOException error) {

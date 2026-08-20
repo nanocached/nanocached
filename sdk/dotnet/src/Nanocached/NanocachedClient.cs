@@ -81,6 +81,15 @@ public sealed class NanocachedClient : IDisposable
         /// value (doc/adr/0015-*.md). Off by default. Costs extra reads
         /// only on the misses this actually applies to.</summary>
         public bool ReadRepair { get; set; }
+
+        /// <summary>How long, after a reconnect dial to an address fails,
+        /// that address is treated as still down — a call routed to it
+        /// during this window fails immediately with the original dial
+        /// error instead of paying another full connect timeout redialing
+        /// an address that just proved unreachable. Default 1 second. Keep
+        /// well under <c>NodeListStaleAfter</c> (30s) so a node that
+        /// genuinely recovers isn't shut out for long.</summary>
+        public TimeSpan ReconnectCooldown { get; set; } = TimeSpan.FromMilliseconds(1000);
     }
 
     /// <summary>
@@ -97,6 +106,20 @@ public sealed class NanocachedClient : IDisposable
     /// </summary>
     public readonly record struct ClientStats(
         long ReplicaWriteFailures, long ReadRepairFailures, long RefreshFailures);
+
+    // The server rejects (and drops the connection for) any request frame
+    // over MAX_REQUEST_SIZE (src/server.rs), 1 MiB — a hard cap on the
+    // *whole* frame, header included. Validating key/value length against
+    // that exact number would still let a caller build a frame that trips
+    // it once the "G "/"S "/"D "/lengths/ttl/tag header text and framing
+    // are added, so this constant carries 1 KiB of headroom for that
+    // header — comfortably more than any header this SDK ever writes
+    // (audit finding D2). Catching an oversize request here, before it
+    // ever reaches Connection, avoids the confusing alternative of the
+    // server silently closing the connection with no response (see
+    // request_is_too_large in server.rs — an over-limit frame gets no
+    // reply at all).
+    private const int MaxRequestBytes = 1024 * 1024 - 1024;
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
     // Reserved by the SDKs so a real application key can never collide
@@ -155,6 +178,15 @@ public sealed class NanocachedClient : IDisposable
     private readonly int _compressionThreshold;
     private readonly bool _fireAndForgetReplicas;
     private readonly bool _readRepair;
+    private readonly TimeSpan _reconnectCooldown;
+    /// <summary>Per-address reconnect cooldown (see
+    /// <see cref="Options.ReconnectCooldown"/>): the address of the most
+    /// recently failed dial, and how long it stays "down" before another
+    /// dial to it is attempted. Keyed by address, not slot — a member's
+    /// slot (node name) can be reassigned to a different address by a
+    /// refresh, but the address itself is what's actually unreachable.
+    /// Mirrors TypeScript's reconnectCooldowns.</summary>
+    private readonly ConcurrentDictionary<string, (DateTime Until, Exception Error)> _reconnectCooldowns = new();
     // doc/adr/0014-*.md: bounds in-flight background replica writes and
     // lets Close() drain them before tearing down connections.
     private readonly SemaphoreSlim _backgroundReplicaPermits;
@@ -210,6 +242,7 @@ public sealed class NanocachedClient : IDisposable
         _backgroundReadRepairPermitCount = MaxInFlightBackgroundReadRepairs;
         _backgroundReadRepairPermits = new SemaphoreSlim(_backgroundReadRepairPermitCount, _backgroundReadRepairPermitCount);
         _readRepair = options.ReadRepair;
+        _reconnectCooldown = options.ReconnectCooldown;
     }
 
     /// <summary>Builds the internal TLS options for every dial this client
@@ -236,9 +269,30 @@ public sealed class NanocachedClient : IDisposable
 
         return new SslClientAuthenticationOptions
         {
-            RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+            RemoteCertificateValidationCallback = (_, certificate, _, sslPolicyErrors) =>
             {
                 if (certificate is null) return false;
+
+                // D1: SslStream already checked the presented certificate's
+                // identity against SslClientAuthenticationOptions.TargetHost
+                // (set to the dialed host in Identify.OpenAsync) before
+                // calling this callback — a name mismatch is reported here,
+                // not thrown, precisely so a callback like this one gets a
+                // chance to override it. The custom chain build below only
+                // ever re-validates the *trust* leg (does this leaf chain to
+                // our private CA?); it says nothing about whether the leaf
+                // was issued to the host we actually connected to. Without
+                // this check, any certificate this private CA ever issued —
+                // for any hostname — would be accepted for every host,
+                // silently defeating hostname verification. Only the
+                // trust-chain error is ours to override; a name mismatch (or
+                // no certificate at all) stays fatal.
+                if ((sslPolicyErrors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0
+                    || (sslPolicyErrors & SslPolicyErrors.RemoteCertificateNotAvailable) != 0)
+                {
+                    return false;
+                }
+
                 using var chain = new X509Chain();
                 chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
                 chain.ChainPolicy.CustomTrustStore.Clear();
@@ -256,6 +310,11 @@ public sealed class NanocachedClient : IDisposable
         {
             throw new ArgumentException(
                 "nanocached: connect() needs a non-empty addresses list", nameof(options));
+        }
+        if (options.ReconnectCooldown < TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options), "nanocached: ReconnectCooldown must not be negative");
         }
 
         var client = new NanocachedClient(options);
@@ -403,6 +462,7 @@ public sealed class NanocachedClient : IDisposable
     /// (doc/adr/0015-*.md).</summary>
     public async Task<byte[]?> GetBytesAsync(byte[] key)
     {
+        ValidateKey(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         byte[]? value = await WithClusterRetryAsync(
             () => ReadAsync(key, connection => connection.GetAsync(key))).ConfigureAwait(false);
@@ -479,7 +539,25 @@ public sealed class NanocachedClient : IDisposable
                 // missed repair is harmless, so there is no synchronous
                 // fallback to await here the way replica writes have.
                 _ = background.ContinueWith(
-                    completed => _backgroundReadRepairPermits.Release(),
+                    completed =>
+                    {
+                        // D3: the try/catch inside `background` already
+                        // swallows every expected failure and counts it via
+                        // ReadRepairFailures — this observes whatever
+                        // *escaped* that (a real bug, or the deliberately
+                        // uncaught OperationCanceledException from Close()).
+                        // Reading .Exception both marks it observed (an
+                        // unfaulted background Task's exception would
+                        // otherwise vanish silently — no logger callback
+                        // exists in this SDK to hand it to instead) and
+                        // gets it counted in the one diagnostic channel
+                        // Stats() already exposes for this failure mode.
+                        if (completed.Exception is not null)
+                        {
+                            Interlocked.Increment(ref _readRepairFailures);
+                        }
+                        _backgroundReadRepairPermits.Release();
+                    },
                     TaskScheduler.Default);
             }
             return value;
@@ -502,6 +580,7 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(ttlSeconds), $"nanocached: ttlSeconds must be non-negative, got {ttlSeconds}");
         }
+        ValidateKeyAndValue(key, value);
         byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
         await BeforeOperationAsync().ConfigureAwait(false);
         await WithClusterRetryAsync<object?>(async () =>
@@ -520,9 +599,52 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>Returns whether the key existed before this call.</summary>
     public async Task<bool> DeleteAsync(byte[] key)
     {
+        ValidateKey(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
             () => WriteAsync(key, connection => connection.DeleteAsync(key))).ConfigureAwait(false);
+    }
+
+    /// <summary>Rejects an empty key, or one so large that a bare
+    /// <c>"G "</c>/<c>"D "</c> header plus the key alone would already risk
+    /// tripping the server's MAX_REQUEST_SIZE (audit finding D2) — checked
+    /// synchronously, before any connection is touched, mirroring
+    /// <see cref="SetAsync(byte[], byte[], long)"/>'s ttlSeconds
+    /// check.</summary>
+    private static void ValidateKey(byte[] key)
+    {
+        if (key.Length == 0)
+        {
+            throw new ArgumentException("nanocached: key must not be empty", nameof(key));
+        }
+        if (key.Length > MaxRequestBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(key),
+                $"nanocached: key is {key.Length} bytes, which exceeds the {MaxRequestBytes}-byte "
+                + "request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+        }
+    }
+
+    /// <summary>As <see cref="ValidateKey"/>, plus rejects a key+value pair
+    /// too large for a single <c>S</c> request to have any chance of
+    /// fitting under the server's MAX_REQUEST_SIZE (audit finding D2).
+    /// Checked against the caller-supplied value, before compression —
+    /// compression only ever shrinks what actually goes on the wire, so
+    /// this is the conservative (never falsely permissive) side to
+    /// check.</summary>
+    private static void ValidateKeyAndValue(byte[] key, byte[] value)
+    {
+        ValidateKey(key);
+        long total = (long)key.Length + value.Length;
+        if (total > MaxRequestBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(value),
+                $"nanocached: key ({key.Length} bytes) + value ({value.Length} bytes) = {total} bytes, "
+                + $"which exceeds the {MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, "
+                + "src/server.rs, is 1 MiB)");
+        }
     }
 
     /// <summary>Idempotent; later operations throw <see cref="AlreadyClosedException"/>.
@@ -565,6 +687,14 @@ public sealed class NanocachedClient : IDisposable
 
     private void Teardown()
     {
+        // D4: Cancel() alone never released the CancellationTokenSource
+        // itself — only cancelling the tokens issued from it — so every
+        // Close()/failed-connect Teardown() leaked one. Cancel() first
+        // (idempotent, and a no-op if Close() already called it above) so
+        // a token still in flight observes cancellation before the source
+        // beneath it goes away.
+        _lifetime.Cancel();
+        _lifetime.Dispose();
         lock (_stateLock)
         {
             _single?.Close();
@@ -717,7 +847,21 @@ public sealed class NanocachedClient : IDisposable
             {
                 Task background = Task.Run(() => ReplicaWriteAsync(name));
                 _ = background.ContinueWith(
-                    completed => _backgroundReplicaPermits.Release(),
+                    completed =>
+                    {
+                        // D3: ReplicaWriteAsync's own try/catch already
+                        // swallows and counts every expected failure — this
+                        // observes whatever escaped it (a real bug, or the
+                        // deliberately uncaught OperationCanceledException
+                        // from Close()) instead of letting it vanish as an
+                        // unobserved task exception, and counts it in the
+                        // same ReplicaWriteFailures Stats() already exposes.
+                        if (completed.Exception is not null)
+                        {
+                            Interlocked.Increment(ref _replicaWriteFailures);
+                        }
+                        _backgroundReplicaPermits.Release();
+                    },
                     TaskScheduler.Default);
                 continue;
             }
@@ -760,7 +904,7 @@ public sealed class NanocachedClient : IDisposable
             (_, address, current) = SnapshotSlot(slot);
             if (!current.IsClosed) return current;
 
-            Connection fresh = await OpenNodeConnectionAsync(address).ConfigureAwait(false);
+            Connection fresh = await DialWithCooldownAsync(address).ConfigureAwait(false);
             lock (_stateLock)
             {
                 if (slot is null)
@@ -783,6 +927,34 @@ public sealed class NanocachedClient : IDisposable
         finally
         {
             gate.Release();
+        }
+    }
+
+    /// <summary>Redials <paramref name="address"/>, honoring the
+    /// per-address reconnect cooldown (see <see cref="_reconnectCooldowns"/>):
+    /// an address whose dial just failed stays "down" for
+    /// <see cref="_reconnectCooldown"/>, so a burst of calls routed to it —
+    /// or one call every keep-alive tick — fails immediately with the same
+    /// error the dial itself produced, instead of each paying another full
+    /// connect timeout in turn. Callers must hold the slot's redial
+    /// gate.</summary>
+    private async Task<Connection> DialWithCooldownAsync(string address)
+    {
+        if (_reconnectCooldowns.TryGetValue(address, out var cooldown) && DateTime.UtcNow < cooldown.Until)
+        {
+            throw cooldown.Error;
+        }
+
+        try
+        {
+            Connection connection = await OpenNodeConnectionAsync(address).ConfigureAwait(false);
+            _reconnectCooldowns.TryRemove(address, out _);
+            return connection;
+        }
+        catch (NanocachedException error)
+        {
+            _reconnectCooldowns[address] = (DateTime.UtcNow + _reconnectCooldown, error);
+            throw;
         }
     }
 

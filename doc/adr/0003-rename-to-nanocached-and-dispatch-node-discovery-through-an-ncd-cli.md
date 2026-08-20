@@ -8,6 +8,8 @@ Accepted
 
 Amended by [4. Split the Docker image into separate node and discovery images](0004-split-the-docker-image-into-separate-node-and-discovery-images.md)
 
+`bench` (`src/bin/bench.rs`) was removed from the repository in #29 (a load-test client living in `src/bin/` read as product surface; see commit 97c83fe) — every mention of it below is historical context from when this decision was made, not a reference to current code.
+
 ## Context
 
 The project was named `kvelo`, and its binaries (`kvelo`, `bench`,

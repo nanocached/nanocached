@@ -10,6 +10,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -20,8 +22,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.nanocached.MockServers.MockDiscovery;
 import org.nanocached.MockServers.MockNode;
+import org.nanocached.MockServers.Tls;
 import org.nanocached.NanocachedClient.Address;
 
 @Timeout(30)
@@ -122,6 +126,69 @@ class NanocachedClientTest {
                 assertEquals(Optional.of("v"), client.get("k"));
             }
         }
+    }
+
+    // Audit finding J2: an empty key, or a key+value pair large enough to
+    // risk the server's MAX_REQUEST_SIZE (src/server.rs, 1 MiB), must be
+    // rejected synchronously — before any bytes reach the connection —
+    // exactly like the ttlSeconds check above.
+    @Test
+    void rejectsEmptyKeysOnGetSetDelete() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[] emptyKey = new byte[0];
+                assertThrows(IllegalArgumentException.class, () -> client.get(emptyKey));
+                assertThrows(IllegalArgumentException.class, () -> client.getBytes(emptyKey));
+                assertThrows(IllegalArgumentException.class,
+                        () -> client.set(emptyKey, "v".getBytes(StandardCharsets.UTF_8)));
+                assertThrows(IllegalArgumentException.class, () -> client.delete(emptyKey));
+                assertThrows(IllegalArgumentException.class, () -> client.get(""));
+                assertThrows(IllegalArgumentException.class, () -> client.set("", "v"));
+                assertThrows(IllegalArgumentException.class, () -> client.delete(""));
+
+                // Rejected client-side, before any request frame — no
+                // second connection beyond the initial connect() above.
+                assertEquals(1, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void rejectsOversizeKeyOrKeyPlusValueBeforeTouchingTheConnection() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                // Force the connection open first so connectionCount only
+                // reflects the (successful) warm-up, not the rejections
+                // below.
+                client.set("warm", "up");
+                int connectionsBeforeRejections = node.connectionCount.get();
+
+                byte[] oversizeKey = new byte[1024 * 1024];
+                assertThrows(IllegalArgumentException.class, () -> client.get(oversizeKey));
+                assertThrows(IllegalArgumentException.class, () -> client.delete(oversizeKey));
+                assertThrows(IllegalArgumentException.class,
+                        () -> client.set(oversizeKey, "v".getBytes(StandardCharsets.UTF_8)));
+
+                // A modest key with a value large enough to push key+value
+                // over the limit must be rejected too.
+                byte[] smallKey = "k".getBytes(StandardCharsets.UTF_8);
+                byte[] oversizeValue = new byte[1024 * 1024];
+                assertThrows(IllegalArgumentException.class, () -> client.set(smallKey, oversizeValue));
+
+                // None of the above should have opened another connection.
+                assertEquals(connectionsBeforeRejections, node.connectionCount.get());
+                // And the connection already open must still be usable.
+                assertEquals(Optional.of("up"), client.get("warm"));
+            }
+        }
+    }
+
+    // Audit finding J3: a null authSecret must fail the same way every
+    // other invalid Options value does (IllegalArgumentException), not
+    // with a raw NullPointerException from inside String#getBytes.
+    @Test
+    void authSecretRejectsNull() {
+        assertThrows(IllegalArgumentException.class, () -> NanocachedClient.builder().authSecret(null));
     }
 
     @Test
@@ -361,6 +428,79 @@ class NanocachedClientTest {
                 Thread.sleep(50); // let the FIN land
                 assertEquals(Optional.of("v"), client.get("k"));
                 assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void reconnectCooldownSkipsARedialToAKnownDeadAddress() throws Exception {
+        try (MockNode node = new MockNode()) {
+            int port = node.port();
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", port).reconnectCooldown(Duration.ofMillis(200)))) {
+                client.set("k", "v");
+                node.close();
+
+                // Nothing listens on `port` anymore, so this redial fails
+                // fast with a connection-refused error and starts the
+                // cooldown window for that address.
+                NanocachedException.ConnectionFailed firstError = assertThrows(
+                        NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+
+                // A listener now sits on the same port and answers
+                // immediately with bytes the identify handshake rejects
+                // outright — deliberately not a bare close/reset (the
+                // shape that triggers connectAndIdentify's legacy-server
+                // fallback redial, Identify.java), so each dial against it
+                // fails after exactly one connection, letting
+                // `connections` below tell "cooldown skipped the dial"
+                // apart from "cooldown let it through" unambiguously.
+                java.util.concurrent.atomic.AtomicInteger connections =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                java.util.Set<java.net.Socket> acceptedSockets =
+                        java.util.concurrent.ConcurrentHashMap.newKeySet();
+                try (java.net.ServerSocket garbage = new java.net.ServerSocket(port)) {
+                    Thread acceptor = new Thread(() -> {
+                        while (!garbage.isClosed()) {
+                            try {
+                                java.net.Socket socket = garbage.accept();
+                                connections.incrementAndGet();
+                                acceptedSockets.add(socket);
+                                socket.getOutputStream().write("XXX".getBytes(StandardCharsets.US_ASCII));
+                                socket.getOutputStream().flush();
+                            } catch (java.io.IOException stop) {
+                                return;
+                            }
+                        }
+                    }, "garbage-accept");
+                    acceptor.setDaemon(true);
+                    acceptor.start();
+
+                    // Still within the cooldown window: rejects with the
+                    // cached failure — the very same exception instance —
+                    // near-instantly, without dialing the listener at all.
+                    long started = System.nanoTime();
+                    NanocachedException.ConnectionFailed secondError = assertThrows(
+                            NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                    long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                    assertTrue(elapsedMillis < 100,
+                            "expected a cooldown-fast rejection, took " + elapsedMillis + "ms");
+                    assertEquals(0, connections.get(), "the cooldown did not prevent a redial");
+                    assertTrue(firstError == secondError,
+                            "expected the exact same cached exception, not a fresh one");
+
+                    // Once the cooldown window has passed, the address is
+                    // dialed again, this time reaching the listener.
+                    Thread.sleep(250);
+                    NanocachedException thirdError = assertThrows(
+                            NanocachedException.class, () -> client.get("k"));
+                    assertTrue(thirdError.getMessage().contains("unexpected response to A"),
+                            thirdError.getMessage());
+                    assertEquals(1, connections.get(),
+                            "the address was never redialed after the cooldown elapsed");
+
+                    for (java.net.Socket socket : acceptedSockets) socket.close();
+                }
             }
         }
     }
@@ -1313,6 +1453,49 @@ class NanocachedClientTest {
                 // Two dials: the extended attempt the server slammed
                 // shut, then the plain fallback that stuck.
                 assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    // ── TLS hostname verification (audit finding J1) ────────────────
+    //
+    // Certificates are generated per-test with the JDK's own `keytool`
+    // (see MockServers.Tls) rather than a bundled/pre-generated PEM: that
+    // keeps the certificate's notBefore/notAfter always valid without a
+    // maintenance burden, and needs no TLS/crypto test dependency this
+    // SDK doesn't otherwise have.
+
+    @Test
+    void tlsRejectsACertificateForADifferentHostname(@TempDir Path tempDir) throws Exception {
+        // A cert that is otherwise perfectly valid (self-signed, but
+        // trusted directly via ca()) except its SAN names a host the
+        // client never dialed. Before the J1 fix this was accepted
+        // outright — SSLContext verifies the chain but never checked the
+        // identity it was issued to.
+        Tls.Generated cert = Tls.generate(tempDir, "wrong-host", "dns:wrong.example.test");
+        try (MockNode node = MockNode.withTls(cert.serverContext())) {
+            NanocachedException error = assertThrows(NanocachedException.class, () ->
+                    NanocachedClient.connect(single("127.0.0.1", node.port())
+                            .tls(true)
+                            .ca(cert.pemCert())));
+            // Surfaces as an ordinary connection failure — never a silent
+            // fallback to an unverified connection.
+            assertTrue(error instanceof NanocachedException.ConnectionFailed, error.toString());
+        }
+    }
+
+    @Test
+    void tlsAcceptsACertificateForTheMatchingHostname(@TempDir Path tempDir) throws Exception {
+        // The client dials "127.0.0.1"; the JDK's HTTPS endpoint
+        // identification checks a numeric host against the cert's
+        // iPAddress SAN entries (RFC 2818), so the cert must carry one.
+        Tls.Generated cert = Tls.generate(tempDir, "127.0.0.1", "ip:127.0.0.1");
+        try (MockNode node = MockNode.withTls(cert.serverContext())) {
+            try (NanocachedClient client = NanocachedClient.connect(single("127.0.0.1", node.port())
+                    .tls(true)
+                    .ca(cert.pemCert()))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
             }
         }
     }

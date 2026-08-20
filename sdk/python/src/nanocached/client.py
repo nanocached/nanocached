@@ -79,6 +79,15 @@ _DEFAULT_COMPRESSION_THRESHOLD = 256
 # get/set/delete refreshes it first (checked lazily on use).
 _NODE_LIST_STALE_AFTER = 30.0
 
+# Default for NanocachedClient.connect's reconnect_cooldown: how long,
+# after a reconnect dial to an address fails, that address is treated as
+# still down — a call routed to it during this window fails immediately
+# with the original dial error instead of paying another full
+# CONNECT_DEADLINE (5s, _identify.py) redialing an address that just
+# proved unreachable. Keep well under _NODE_LIST_STALE_AFTER so a node
+# that genuinely recovers isn't shut out for long.
+_DEFAULT_RECONNECT_COOLDOWN = 1.0
+
 # TTL (whole seconds — the protocol's TTL unit throughout, see
 # _encode_set in _connection.py) a read-repair write uses
 # (doc/adr/0015-*.md). The original TTL isn't recoverable from a GET
@@ -107,6 +116,23 @@ _KEEPALIVE_INTERVAL = 30.0
 # tests can shrink it, mirroring _KEEPALIVE_INTERVAL.
 _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
 
+# The longest a request header can ever legally be: marker + space + up to
+# 10-digit key length + space + up to 10-digit value length + space + up
+# to 10-digit TTL + up to 10-digit tag + LF (see _encode_get/_encode_set/
+# _encode_delete in _connection.py). Rounded well up so _MAX_REQUEST_BYTES
+# below can be computed without pushing key+value right up against the
+# server's own limit and letting the header alone tip a request over it.
+_MAX_REQUEST_HEADER_BYTES = 64
+
+# Mirrors nanocached-node's own MAX_REQUEST_SIZE (src/server.rs, 1 MiB) —
+# the cap on a whole request frame (header + key + value) — minus headroom
+# for the header itself. A G/D key, or an S key+value, beyond this would
+# serialize into a frame the server's request_is_too_large check rejects
+# outright with no reply at all — like an invalid ttl_seconds below, that
+# closes the shared, pipelined connection and takes every other in-flight
+# request on it down too.
+_MAX_REQUEST_BYTES = 1024 * 1024 - _MAX_REQUEST_HEADER_BYTES
+
 
 def _warn(message: str) -> None:
     print(message, file=sys.stderr)
@@ -114,6 +140,33 @@ def _warn(message: str) -> None:
 
 def _to_bytes(value: str | bytes) -> bytes:
     return value.encode("utf-8") if isinstance(value, str) else bytes(value)
+
+
+def _check_key(key_bytes: bytes) -> None:
+    """An empty key (``key_length == 0``) hits ``ParseError::EmptyKey`` in
+    src/command.rs, which — like a frame that's too large — the server
+    rejects with no reply, closing the shared, pipelined connection and
+    taking every other in-flight request on it down with it. Raised here,
+    synchronously, before anything is written, for every command that
+    carries a key."""
+    if len(key_bytes) == 0:
+        raise ValueError("nanocached: key must not be empty")
+    if len(key_bytes) > _MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"nanocached: key exceeds MAX_REQUEST_BYTES ({_MAX_REQUEST_BYTES} bytes), got {len(key_bytes)} bytes"
+        )
+
+
+def _check_key_and_value(key_bytes: bytes, value_bytes: bytes) -> None:
+    """Same server-side rejection and poisoned-connection consequence as
+    _check_key, just measured across key+value together instead of the
+    key alone — see _MAX_REQUEST_BYTES."""
+    _check_key(key_bytes)
+    total = len(key_bytes) + len(value_bytes)
+    if total > _MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"nanocached: key and value together exceed MAX_REQUEST_BYTES ({_MAX_REQUEST_BYTES} bytes), got {total} bytes"
+        )
 
 
 def _build_ssl_context(tls: bool, ca: str | os.PathLike | None) -> ssl_module.SSLContext | None:
@@ -194,6 +247,11 @@ class NanocachedClient:
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
         self._redials: dict[str, asyncio.Task[Connection]] = {}
+        self._reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN
+        # Per-address reconnect cooldown (see _redial) — keyed by address
+        # (not slot, which cluster mode can reassign across a refresh),
+        # each entry is (monotonic deadline, the error that dial raised).
+        self._redial_cooldowns: dict[str, tuple[float, BaseException]] = {}
         self._keepalive_task: asyncio.Task[None] | None = None
         # Backing counters for stats()/ClientStats — see its docstring.
         self._replica_write_failures = 0
@@ -214,6 +272,7 @@ class NanocachedClient:
         compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD,
         fire_and_forget_replicas: bool = False,
         read_repair: bool = False,
+        reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
@@ -226,6 +285,7 @@ class NanocachedClient:
         client._compression_threshold = compression_threshold
         client._fire_and_forget_replicas = fire_and_forget_replicas
         client._read_repair = read_repair
+        client._reconnect_cooldown = reconnect_cooldown
 
         # Walk the addresses until one yields a working target; an address
         # that is unreachable, warming up (`B`, ADR-0010), or knows no live
@@ -343,6 +403,7 @@ class NanocachedClient:
         With ``read_repair``, a clean miss probes the remaining owners
         before being accepted as final (doc/adr/0015-*.md)."""
         key_bytes = _to_bytes(key)
+        _check_key(key_bytes)
         await self._before_operation()
         value = await self._with_wrong_node_retry(
             lambda: self._read(key_bytes, lambda connection: connection.get(key_bytes))
@@ -420,6 +481,7 @@ class NanocachedClient:
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
         if self._compress:
             value_bytes = compress_value(value_bytes, self._compression_threshold)
+        _check_key_and_value(key_bytes, value_bytes)
         await self._before_operation()
         await self._with_wrong_node_retry(
             lambda: self._write(
@@ -430,6 +492,7 @@ class NanocachedClient:
     async def delete(self, key: str | bytes) -> bool:
         """Returns whether the key existed before this call."""
         key_bytes = _to_bytes(key)
+        _check_key(key_bytes)
         await self._before_operation()
         return await self._with_wrong_node_retry(
             lambda: self._write(key_bytes, lambda connection: connection.delete(key_bytes))
@@ -451,6 +514,24 @@ class NanocachedClient:
         self._closed = True
         if self._keepalive_task is not None:
             self._keepalive_task.cancel()
+
+        # A node-list refresh or a redial (issue #1) can still be running
+        # in the background — shielded from whichever caller originally
+        # triggered it, per asyncio.shield's own doc comment on _redial —
+        # after that caller has already moved on (e.g. a timed-out
+        # asyncio.wait_for). Drained here the same way
+        # _background_replica_writes already is: awaited (not cancelled),
+        # so a redial that's about to succeed still gets to adopt its
+        # connection — which _teardown() below then actually closes,
+        # rather than leaking it past close() — and so its exception, if
+        # any, is retrieved here instead of surfacing later as an
+        # "exception was never retrieved" warning with nothing left to
+        # report it to.
+        pending = list(self._redials.values())
+        if self._refresh_task is not None:
+            pending.append(self._refresh_task)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
         if self._background_replica_writes:
             await asyncio.gather(
@@ -621,11 +702,33 @@ class NanocachedClient:
         if in_flight is not None:
             return await asyncio.shield(in_flight)
 
+        # Per-address reconnect cooldown: an address whose dial just
+        # failed stays "down" for self._reconnect_cooldown seconds, so a
+        # burst of calls routed to it — or one call every keep-alive tick
+        # — fails immediately with the same error the dial itself
+        # produced, instead of each paying another full CONNECT_DEADLINE
+        # (5s, _identify.py) in turn.
+        cooldown = self._redial_cooldowns.get(address)
+        if cooldown is not None:
+            until, error = cooldown
+            if time.monotonic() < until:
+                raise error
+
         task = asyncio.ensure_future(self._open_and_adopt(slot, address))
         self._redials[slot] = task
-        task.add_done_callback(
-            lambda t: self._redials.pop(slot, None) if self._redials.get(slot) is t else None
-        )
+
+        def _on_redial_done(t: "asyncio.Task[Connection]") -> None:
+            if self._redials.get(slot) is t:
+                self._redials.pop(slot, None)
+            if t.cancelled():
+                return
+            error = t.exception()
+            if error is not None:
+                self._redial_cooldowns[address] = (time.monotonic() + self._reconnect_cooldown, error)
+            else:
+                self._redial_cooldowns.pop(address, None)
+
+        task.add_done_callback(_on_redial_done)
         return await asyncio.shield(task)
 
     async def _open_and_adopt(self, slot: str, address: str) -> Connection:

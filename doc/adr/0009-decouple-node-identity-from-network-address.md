@@ -11,6 +11,8 @@ Builds on [2. Client-side consistent hashing with a lightweight self-hosted disc
 [7. Encode server type in the auth response, for a unified connect()](0007-encode-server-type-in-the-auth-response-for-a-unified-connect.md),
 and [8. Staged node join with discovery-orchestrated data handoff](0008-staged-node-join-with-discovery-orchestrated-data-handoff.md)
 
+`bench` (`src/bin/bench.rs`) was removed from the repository in #29 (a load-test client living in `src/bin/` read as product surface; see commit 97c83fe) — every mention of it below is historical context from when this decision was made, not a reference to current code.
+
 ## Context
 
 [[0002]] and everything built on it so far (the TypeScript client's

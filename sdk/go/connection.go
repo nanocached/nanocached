@@ -87,15 +87,20 @@ func newConnection(conn net.Conn, onClose func(), tagged bool) *connection {
 	return c
 }
 
-// tagField renders a request's doc/adr/0019-*.md tag as its trailing
-// header field on a tagged connection, or nothing on an untagged one —
-// matching protocol.ts's tagField exactly. Untagged mode is byte-for-byte
-// identical to the pre-0019 wire format.
-func tagField(tagged bool, tag uint32) string {
+// appendTagField appends a request's doc/adr/0019-*.md tag as its
+// trailing header field (" <tag>") to buf on a tagged connection, or
+// nothing on an untagged one — the same wire shape a fmt.Sprintf(" %d",
+// tag) would produce, built here with strconv.AppendUint straight into
+// the frame buffer instead, to avoid the allocate-a-string-then-copy-it-in
+// round trip fmt.Sprintf costs on every single request (issue #47 audit
+// item G2). Untagged mode remains byte-for-byte identical to the
+// pre-0019 wire format.
+func appendTagField(buf []byte, tagged bool, tag uint32) []byte {
 	if !tagged {
-		return ""
+		return buf
 	}
-	return fmt.Sprintf(" %d", tag)
+	buf = append(buf, ' ')
+	return strconv.AppendUint(buf, uint64(tag), 10)
 }
 
 // deadConnection is a pre-poisoned placeholder for a newly discovered
@@ -123,7 +128,10 @@ func (c *connection) idle() time.Duration {
 
 func (c *connection) get(key []byte) ([]byte, bool, error) {
 	marker, value, err := c.request(func(tag uint32) []byte {
-		return append([]byte(fmt.Sprintf("G %d%s\n", len(key), tagField(c.tagged, tag))), key...)
+		frame := append([]byte("G "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+		frame = appendTagField(frame, c.tagged, tag)
+		frame = append(frame, '\n')
+		return append(frame, key...)
 	})
 	if err != nil {
 		return nil, false, err
@@ -142,13 +150,17 @@ func (c *connection) get(key []byte) ([]byte, bool, error) {
 
 func (c *connection) set(key, value []byte, ttlSeconds int64) error {
 	marker, _, err := c.request(func(tag uint32) []byte {
-		var header string
-		if ttlSeconds < 0 {
-			header = fmt.Sprintf("S %d %d%s\n", len(key), len(value), tagField(c.tagged, tag))
-		} else {
-			header = fmt.Sprintf("S %d %d %d%s\n", len(key), len(value), ttlSeconds, tagField(c.tagged, tag))
+		frame := append([]byte("S "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(value)), 10)
+		if ttlSeconds >= 0 {
+			frame = append(frame, ' ')
+			frame = strconv.AppendInt(frame, ttlSeconds, 10)
 		}
-		return append(append([]byte(header), key...), value...)
+		frame = appendTagField(frame, c.tagged, tag)
+		frame = append(frame, '\n')
+		frame = append(frame, key...)
+		return append(frame, value...)
 	})
 	if err != nil {
 		return err
@@ -165,7 +177,10 @@ func (c *connection) set(key, value []byte, ttlSeconds int64) error {
 
 func (c *connection) delete(key []byte) (bool, error) {
 	marker, _, err := c.request(func(tag uint32) []byte {
-		return append([]byte(fmt.Sprintf("D %d%s\n", len(key), tagField(c.tagged, tag))), key...)
+		frame := append([]byte("D "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+		frame = appendTagField(frame, c.tagged, tag)
+		frame = append(frame, '\n')
+		return append(frame, key...)
 	})
 	if err != nil {
 		return false, err

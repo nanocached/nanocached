@@ -390,9 +390,18 @@ internal sealed class Connection
                 // disposed-stream error is just its echo (issue #42's CI
                 // race: this dequeue can beat CloseWithReason's drain to
                 // the stalled request).
+                // Whatever the cause, the waiter must see a
+                // ConnectionLostException: the README promises every
+                // failure extends NanocachedException, and the client's
+                // retry layer only redials on ConnectionLostException — a
+                // raw EndOfStreamException (server FIN landing while a
+                // request was in flight) used to escape both.
                 if (_pending.TryDequeue(out var failed))
                 {
-                    failed.Tcs.TrySetException(_closeReason ?? error);
+                    Exception cause = _closeReason ?? error;
+                    failed.Tcs.TrySetException(cause is ConnectionLostException
+                        ? cause
+                        : new ConnectionLostException($"nanocached: connection failed: {cause.Message}", cause));
                 }
                 Close();
                 return;

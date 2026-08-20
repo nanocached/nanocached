@@ -58,6 +58,56 @@ pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
 /// savings. Only meaningful when `compress(true)`.
 const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
 
+/// See [`Options::reconnect_cooldown`].
+const DEFAULT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// The server's own request cap (src/server.rs's `MAX_REQUEST_SIZE`) is 1
+/// MiB for the *entire* frame — header line plus key plus value; a
+/// request over that limit is rejected by simply closing the connection
+/// without a response (poisoning whatever else is pipelined behind it on
+/// that same connection). This reserves 256 bytes of headroom for the
+/// header itself (marker byte, decimal lengths, an optional TTL, ADR-0019's
+/// tag field, spaces, the trailing newline — always comfortably under
+/// this even for the largest fields), so a key+value that clears
+/// `MAX_REQUEST_BYTES` is guaranteed to fit under the server's own cap and
+/// never trips that connection-poisoning rejection (issue #47 audit item
+/// R1; see README's "Errors" section).
+const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
+
+/// Rejects an empty key before any network I/O: the server's protocol has
+/// no way to represent a zero-length key request that doesn't collide
+/// with other framing, so it responds by closing the connection outright
+/// — silently poisoning every other request already pipelined on that
+/// connection (see src/command.rs's `rejects_empty_key_for_get` et al.).
+/// Catching it here client-side, as `Error::InvalidArgument`, both gives
+/// the caller a clear synchronous error and avoids that blast radius
+/// entirely.
+fn validate_key(key: &[u8]) -> Result<()> {
+    if key.is_empty() {
+        return Err(Error::InvalidArgument(
+            "nanocached: key must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// `validate_key` plus a `MAX_REQUEST_BYTES` bound on `key.len() +
+/// value.len()` — anything past it can never fit the server's own 1 MiB
+/// request cap, so failing fast here is strictly better than sending a
+/// frame the server can only reject by silently closing the connection.
+fn validate_key_and_value(key: &[u8], value: &[u8]) -> Result<()> {
+    validate_key(key)?;
+    if key.len() + value.len() > MAX_REQUEST_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "nanocached: key ({} bytes) + value ({} bytes) exceeds MAX_REQUEST_BYTES ({} bytes)",
+            key.len(),
+            value.len(),
+            MAX_REQUEST_BYTES
+        )));
+    }
+    Ok(())
+}
+
 /// doc/adr/0014-*.md: bounds how many replica writes a single client may
 /// have running in the background at once when `fire_and_forget_replicas`
 /// is enabled — once the cap is reached, further replica legs fall back
@@ -99,6 +149,7 @@ pub struct Options {
     compression_threshold: usize,
     fire_and_forget_replicas: bool,
     read_repair: bool,
+    reconnect_cooldown: Duration,
 }
 
 impl Default for Options {
@@ -112,6 +163,7 @@ impl Default for Options {
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             fire_and_forget_replicas: false,
             read_repair: false,
+            reconnect_cooldown: DEFAULT_RECONNECT_COOLDOWN,
         }
     }
 }
@@ -210,6 +262,22 @@ impl Options {
         self.read_repair = enabled;
         self
     }
+
+    /// How long, after a reconnect dial to an address fails, that address
+    /// is treated as still down — a request routed to it during this
+    /// window fails immediately with the original dial error instead of
+    /// paying another full `CONNECT_DEADLINE` (5s) redialing an address
+    /// that just proved unreachable. Default 1 second. Keep it well under
+    /// the 30-second node-list refresh interval so a node that genuinely
+    /// recovers isn't shut out for long.
+    ///
+    /// Pass [`Duration::ZERO`] to disable the cooldown — every request
+    /// that finds the address's connection dead pays its own full dial
+    /// attempt instead of reusing a cached failure.
+    pub fn reconnect_cooldown(mut self, duration: Duration) -> Self {
+        self.reconnect_cooldown = duration;
+        self
+    }
 }
 
 struct Member {
@@ -259,6 +327,14 @@ enum Target {
 struct Inner {
     state: Mutex<State>,
     redials: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-address reconnect cooldown (see [`Options::reconnect_cooldown`]):
+    /// the address of the most recently failed dial, and how long it
+    /// stays "down" before another dial to it is attempted. Keyed by
+    /// address, not slot — a cluster refresh can reassign a slot (node
+    /// name) to a different address, but the address itself is what's
+    /// actually unreachable.
+    reconnect_cooldowns: Mutex<HashMap<String, (Instant, Error)>>,
+    reconnect_cooldown: Duration,
     addresses: Vec<(String, u16)>,
     auth_secret: Option<String>,
     tls: Option<TlsConfig>,
@@ -318,7 +394,7 @@ impl NanocachedClient {
             ));
         }
 
-        let tls = resolve_tls(options.tls, options.ca.as_deref())?;
+        let tls = resolve_tls(options.tls, options.ca.as_deref()).await?;
         let compress = resolve_compression(options.compress)?;
         let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
 
@@ -453,6 +529,8 @@ impl NanocachedClient {
                 last_fetch: Instant::now(),
             }),
             redials: Mutex::new(HashMap::new()),
+            reconnect_cooldowns: Mutex::new(HashMap::new()),
+            reconnect_cooldown: options.reconnect_cooldown,
             addresses: options.addresses,
             auth_secret: options.auth_secret,
             tls,
@@ -587,6 +665,7 @@ impl NanocachedClient {
     /// remaining owners before being accepted as final (doc/adr/0015-*.md).
     pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
+        validate_key(key)?;
         self.before_operation().await?;
         let mut value = self
             .with_cluster_retry(|| {
@@ -684,6 +763,7 @@ impl NanocachedClient {
         ttl_seconds: u64,
     ) -> Result<()> {
         let key = key.as_ref();
+        validate_key_and_value(key, value.as_ref())?;
         self.before_operation().await?;
         let owned_compressed;
         let value: &[u8] = if self.inner.compress {
@@ -708,6 +788,7 @@ impl NanocachedClient {
     /// Returns whether the key existed before this call.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         let key = key.as_ref();
+        validate_key(key)?;
         self.before_operation().await?;
         self.with_cluster_retry(|| {
             self.write(key, WriteBody::Delete, |connection| async move {
@@ -974,7 +1055,42 @@ impl NanocachedClient {
             }
         }
 
-        let (stream, tagged) = self.open_node_stream(&address).await?;
+        // Per-address reconnect cooldown (see `Inner::reconnect_cooldowns`'
+        // own doc comment): an address whose dial just failed stays "down"
+        // for `reconnect_cooldown`, so a burst of requests routed to it —
+        // or one request every keep-alive tick — fails immediately with
+        // the same error the dial itself produced, instead of each paying
+        // another full `CONNECT_DEADLINE` in turn.
+        {
+            let cooldowns = self.inner.reconnect_cooldowns.lock().await;
+            if let Some((until, error)) = cooldowns.get(&address) {
+                if Instant::now() < *until {
+                    return Err(error.clone());
+                }
+            }
+        }
+
+        let dial_result = self.open_node_stream(&address).await;
+        let (stream, tagged) = match dial_result {
+            Ok(v) => {
+                let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
+                cooldowns.remove(&address);
+                v
+            }
+            Err(error) => {
+                if self.inner.reconnect_cooldown > Duration::ZERO {
+                    let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
+                    cooldowns.insert(
+                        address.clone(),
+                        (
+                            Instant::now() + self.inner.reconnect_cooldown,
+                            error.clone(),
+                        ),
+                    );
+                }
+                return Err(error);
+            }
+        };
         let connection = Arc::new(Connection::new(
             stream,
             self.inner.tracking_key.clone(),

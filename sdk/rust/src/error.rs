@@ -1,7 +1,12 @@
 use std::fmt;
 
 /// Every error this SDK returns on its own behalf.
-#[derive(Debug)]
+///
+/// `Clone` so a failed reconnect dial's error can be cached (per-address
+/// reconnect cooldown, `Options::reconnect_cooldown`) and handed back
+/// verbatim to every caller that hits the cooldown window, instead of
+/// only the dial's own original caller ever seeing it.
+#[derive(Debug, Clone)]
 pub enum Error {
     /// get/set/delete after `close()`; `close()` itself is idempotent.
     AlreadyClosed,
