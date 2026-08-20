@@ -147,7 +147,30 @@ const MAX_CONNECTIONS: usize = 1024;
 /// ~20-byte messages, growing the registry (and every `L` response built
 /// from it) without bound until liveness sweep catches up. This caps that.
 /// Far above any realistic cluster size, so legitimate nodes never hit it.
+///
+/// This alone doesn't bound `M`'s wire size, though — see
+/// `NODE_MAX_REQUEST_SIZE` and `start_join`'s own size check, which is
+/// what actually keeps a large registry from producing an `M` a node
+/// will refuse to even parse.
 const MAX_REGISTRY_SIZE: usize = 1 << 16;
+/// `nanocached-node`'s own inbound request-size cap (`MAX_REQUEST_SIZE`,
+/// `src/server.rs`) — the two binaries share no modules by design (see
+/// this file's own module doc comment), so this is a separate constant
+/// kept in sync by convention, the same way the migration-timeout pair
+/// in doc/adr/0017-*.md already is. An `M` this process sends
+/// (`send_migrate`) is, from the receiving node's point of view, just
+/// another request subject to that cap; `M`'s payload is dominated by
+/// the `joined` roster (one entry per currently-`Joined` node), so with
+/// `MAX_REGISTRY_SIZE` (65536) worth of nodes it can exceed this cap
+/// long before a legitimate join's own data volume ever could — at
+/// which point the node rejects the connection outright (issue: `M`
+/// too large for `MAX_REQUEST_SIZE`) and the join silently stalls until
+/// discovery's own size-derived migration timeout (doc/adr/0017-*.md)
+/// reaps it, with no clearer signal than that. `start_join` checks
+/// against this up front instead, so an admission that would produce an
+/// oversized `M` is rejected immediately, with a clear log line, rather
+/// than left to time out. See `migrate_message_len`.
+const NODE_MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 /// ADR-0008 pattern-3 guard: a ready node can be alive (heartbeating
 /// normally) yet never report `C` for a handoff it's mid-`Migrate` for —
@@ -386,8 +409,18 @@ fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
 
 /// Parses the host portion of a `host:port` address into a TLS server name
 /// for certificate verification, accepting either a DNS name or IP address.
+/// A bracketed IPv6 host (`[::1]:8356`, required so the port's `:` is
+/// unambiguous) has its brackets stripped before conversion — left in,
+/// `ServerName::try_from` rejects the string both as an IP (brackets
+/// aren't part of the address) and as a DNS name (`[`/`]` aren't valid
+/// there either), so TLS to an IPv6 address would otherwise always fail.
+/// Mirrors `nanocached-node`'s own copy in `src/server.rs`.
 fn server_name_from_addr(addr: &str) -> io::Result<ServerName<'static>> {
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
 
     ServerName::try_from(host.to_string()).map_err(|error| {
         io::Error::new(
@@ -1045,6 +1078,40 @@ async fn send_migrate_with_retry(
     Err(last_error.expect("the loop above runs at least once"))
 }
 
+/// Builds the exact bytes `send_migrate` puts on the wire for `M`:
+/// `M {joining_name_len} {joining_addr_len} {joined.len()} {replication}\n`
+/// followed by `joining_name` + `joining_addr`, then one
+/// `{name_len} {addr_len}\n{name}{addr}` per entry in `joined`. Factored
+/// out of `send_migrate` so `start_join`'s `NODE_MAX_REQUEST_SIZE` check
+/// can compute this message's real length (`.len()` on the result) using
+/// the actual wire format, rather than a hand-maintained estimate that
+/// could silently drift out of sync with it.
+fn build_migrate_message(
+    joining_name: &str,
+    joining_addr: &str,
+    joined: &[(String, String)],
+    replication: usize,
+) -> Vec<u8> {
+    let mut message = format!(
+        "M {} {} {} {}\n",
+        joining_name.len(),
+        joining_addr.len(),
+        joined.len(),
+        replication
+    )
+    .into_bytes();
+    message.extend_from_slice(joining_name.as_bytes());
+    message.extend_from_slice(joining_addr.as_bytes());
+
+    for (name, addr) in joined {
+        message.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
+        message.extend_from_slice(name.as_bytes());
+        message.extend_from_slice(addr.as_bytes());
+    }
+
+    message
+}
+
 /// Connects to `address` (a `Joined` node) as a client, sends `M` with the
 /// joining node's identity and the full `joined` roster (ADR-0009 names +
 /// addresses), and waits for the `A <entries>\n` acknowledgment —
@@ -1082,22 +1149,7 @@ async fn send_migrate(
         }
     }
 
-    let mut message = format!(
-        "M {} {} {} {}\n",
-        joining_name.len(),
-        joining_addr.len(),
-        joined.len(),
-        replication
-    )
-    .into_bytes();
-    message.extend_from_slice(joining_name.as_bytes());
-    message.extend_from_slice(joining_addr.as_bytes());
-
-    for (name, addr) in joined {
-        message.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
-        message.extend_from_slice(name.as_bytes());
-        message.extend_from_slice(addr.as_bytes());
-    }
+    let message = build_migrate_message(joining_name, joining_addr, joined, replication);
 
     stream.write_all(&message).await?;
 
@@ -1232,16 +1284,29 @@ fn promote_to_joined(registry: &Registry, name: &str) {
     }
 }
 
+/// Why `start_join` refused a registration.
+#[derive(Debug)]
+enum JoinRejection {
+    /// A `J` for an already-`Joined` name is spurious (a correct node
+    /// re-registers with `P`, never `J`) and must be rejected rather
+    /// than parked: its `Notify` was already consumed by the original
+    /// promotion, so `wait_for_promotion` would block on it forever,
+    /// holding a `MAX_CONNECTIONS` permit until the process exits.
+    /// Repeated, that exhausts the connection semaphore.
+    AlreadyJoined,
+    /// Admitting this node would make the `M` this join eventually sends
+    /// exceed `NODE_MAX_REQUEST_SIZE` — the node on the other end would
+    /// just reject it outright, stalling the join until discovery's own
+    /// migration timeout reaps it. Rejected here instead, immediately
+    /// and with a clear reason, rather than left to time out.
+    MigrateMessageTooLarge { message_len: usize },
+}
+
 /// Registers `name` as `Waiting` with `address` (a no-op if it's already
 /// registered — this must not downgrade a node already past `Waiting`)
 /// and attempts to start it toward `Joined` immediately. Returns the
 /// `Notify` its connection should hold open and wait on for promotion, or
-/// `None` if the name is already `Joined` — a `J` for an
-/// already-promoted node is spurious (a correct node re-registers with
-/// `P`, never `J`) and must be rejected rather than parked: its `Notify`
-/// was already consumed by the original promotion, so `wait_for_promotion`
-/// would block on it forever, holding a `MAX_CONNECTIONS` permit until the
-/// process exits. Repeated, that exhausts the connection semaphore.
+/// a `JoinRejection` if it didn't register this node at all.
 #[allow(clippy::too_many_arguments)]
 async fn start_join(
     registry: &Registry,
@@ -1251,15 +1316,35 @@ async fn start_join(
     replication: usize,
     name: &str,
     address: String,
-) -> Option<Arc<Notify>> {
+) -> Result<Arc<Notify>, JoinRejection> {
     let promoted = {
         let mut guard = lock(registry);
         if guard
             .get(name)
             .is_some_and(|info| info.state == NodeState::Joined)
         {
-            return None;
+            return Err(JoinRejection::AlreadyJoined);
         }
+
+        // Issue (M-message size vs. `nanocached-node`'s request cap):
+        // checked against the CURRENT joined roster — a conservative,
+        // good-enough estimate for a registration-time check, even
+        // though other `Waiting` nodes ahead of this one in the queue
+        // could grow the roster further by the time this join's own `M`
+        // actually goes out (only ever making the real message bigger,
+        // never smaller, so this can under- but never over-admit). See
+        // `NODE_MAX_REQUEST_SIZE` and `build_migrate_message`.
+        let joined_now: Vec<(String, String)> = guard
+            .iter()
+            .filter(|(_, info)| info.state == NodeState::Joined)
+            .map(|(joined_name, info)| (joined_name.clone(), info.address.clone()))
+            .collect();
+        let message_len =
+            build_migrate_message(name, &address, &joined_now, replication).len();
+        if message_len > NODE_MAX_REQUEST_SIZE {
+            return Err(JoinRejection::MigrateMessageTooLarge { message_len });
+        }
+
         if !guard.contains_key(name) {
             println!("INFO node registered: {name} at {address} (waiting to join)");
         }
@@ -1278,7 +1363,7 @@ async fn start_join(
     )
     .await;
 
-    Some(promoted)
+    Ok(promoted)
 }
 
 /// Records a ready node's completion report for the in-progress join. If
@@ -1861,10 +1946,6 @@ async fn handle_connection(
     let mut authenticated = config.auth_secret.is_none();
 
     loop {
-        if *shutdown_rx.borrow() {
-            return Ok(());
-        }
-
         match parse(&mut received) {
             Ok(DiscoveryCommand::Auth(secret)) => {
                 let accepted = match &config.auth_secret {
@@ -1972,15 +2053,34 @@ async fn handle_connection(
                 )
                 .await;
 
-                // A spurious `J` for an already-`Joined` name: reject
-                // rather than park forever. `connection_name` is left unset
-                // so this connection's teardown can't run cleanup against
-                // the real node still registered under that name.
-                let Some(promoted) = promoted else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "join for a node that is already joined",
-                    ));
+                // `connection_name` is left unset on either rejection, so
+                // this connection's teardown can't run cleanup against a
+                // real node registered under that name (there isn't
+                // one, in both cases below).
+                let promoted = match promoted {
+                    Ok(promoted) => promoted,
+                    // A spurious `J` for an already-`Joined` name: reject
+                    // rather than park forever — see `JoinRejection`.
+                    Err(JoinRejection::AlreadyJoined) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "join for a node that is already joined",
+                        ));
+                    }
+                    Err(JoinRejection::MigrateMessageTooLarge { message_len }) => {
+                        eprintln!(
+                            "WARN rejected join for {name}: the M message this join would \
+                             require ({message_len} bytes) exceeds nanocached-node's own \
+                             request-size cap ({NODE_MAX_REQUEST_SIZE} bytes) — the registry \
+                             is too large to admit another node without nodes rejecting the \
+                             handoff outright; see NODE_MAX_REQUEST_SIZE"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "registry too large to admit a new node: the resulting M message \
+                             would exceed the node-side request cap",
+                        ));
+                    }
                 };
 
                 // Only now that the join is staged does this connection own
@@ -2054,6 +2154,17 @@ async fn handle_connection(
                     format!("{error:?}"),
                 ));
             }
+        }
+
+        // Issue #6: checked here — only once `parse` has drained every
+        // complete command already buffered (an `Incomplete` result means
+        // there isn't one) — rather than at the top of the loop, so a
+        // shutdown signal that arrives mid-pipeline doesn't silently drop
+        // a second/third request that arrived in the same read as the
+        // first and needs no further I/O to answer. Mirrors
+        // `nanocached-node`'s own fix in `src/server.rs`.
+        if *shutdown_rx.borrow() {
+            return Ok(());
         }
 
         received.reserve(READ_CHUNK_SIZE);
@@ -2326,6 +2437,34 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"a much longer value"));
     }
 
+    #[test]
+    fn server_name_from_addr_strips_brackets_from_a_bracketed_ipv6_host() {
+        let name = server_name_from_addr("[::1]:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("::1").unwrap());
+    }
+
+    #[test]
+    fn server_name_from_addr_handles_a_full_bracketed_ipv6_host() {
+        let name = server_name_from_addr("[2001:db8::1]:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("2001:db8::1").unwrap());
+    }
+
+    #[test]
+    fn server_name_from_addr_still_handles_a_plain_ipv4_host() {
+        let name = server_name_from_addr("127.0.0.1:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("127.0.0.1").unwrap());
+    }
+
+    #[test]
+    fn server_name_from_addr_still_handles_a_dns_name() {
+        let name = server_name_from_addr("node-a.example.com:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("node-a.example.com").unwrap());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn join_then_heartbeat_then_list_reports_the_registered_node() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2547,6 +2686,52 @@ mod tests {
             lock(&registry).get("node-a").unwrap().address,
             "127.0.0.1:2222"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_join_rejects_a_registration_that_would_make_m_exceed_the_node_request_cap() {
+        // Regression: with a large enough `joined` roster, the `M`
+        // `try_begin_next_join` would eventually send for this
+        // registration exceeds `nanocached-node`'s own
+        // `MAX_REQUEST_SIZE` (1 MiB, src/server.rs) — the node would
+        // just reject the connection outright and the join would stall
+        // until discovery's own migration timeout reaps it. Uses
+        // deliberately long names/addresses so a modest node count
+        // (rather than tens of thousands, as a real cluster hitting this
+        // would have) is enough to cross the cap in a fast unit test.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+
+        let long_name_prefix = "x".repeat(10_000);
+        let long_addr = format!("127.0.0.1:1{}", "y".repeat(10_000));
+        {
+            let mut guard = lock(&registry);
+            for i in 0..60 {
+                guard.insert(
+                    format!("{long_name_prefix}-{i}"),
+                    NodeInfo::new(long_addr.clone(), NodeState::Joined),
+                );
+            }
+        }
+
+        let result = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "joining-node",
+            "127.0.0.1:9999".to_string(),
+        )
+        .await;
+
+        let Err(JoinRejection::MigrateMessageTooLarge { message_len }) = result else {
+            panic!("expected a MigrateMessageTooLarge rejection");
+        };
+        assert!(message_len > NODE_MAX_REQUEST_SIZE);
+
+        // Rejected outright: the node must not have been registered.
+        assert!(!lock(&registry).contains_key("joining-node"));
     }
 
     #[tokio::test(flavor = "current_thread")]

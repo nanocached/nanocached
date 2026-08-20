@@ -29,6 +29,16 @@ const MAX_CONNECTIONS: usize = 1024;
 /// (`tools/capacity-planner.html`) already modeled capacity as a function
 /// of it.
 pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+/// How long a connection may go without completing a full request before
+/// `handle_connection` disconnects it. Slowloris resistance: the deadline
+/// this bounds is anchored to the last time a full command was *parsed*
+/// (or to accept-time, before any command has completed) — not to the
+/// last byte read. Resetting it on every read, as an earlier version did,
+/// let a client that trickles in one byte just under this interval apart
+/// hold a `MAX_CONNECTIONS` permit forever without ever finishing a
+/// request. The practical consequence: a legitimate request must arrive
+/// in full within this long of the previous one completing, not merely
+/// send *some* bytes that often.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounds a response write (issue #4) — see `write_response`. Shorter
 /// than `IDLE_TIMEOUT`: that one tolerates a normal gap between a
@@ -61,16 +71,39 @@ fn forwarding_grace(entries_sent: usize) -> Duration {
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bounds every outbound dial, write, and ack read this node makes toward
-/// another node — the migration handoff (`run_migration`) and the
-/// concurrent forwarding of client `S`/`D` to a joiner
+/// Bounds each individual outbound dial, write, and ack read this node
+/// makes toward another node — the migration handoff (`run_migration`) and
+/// the concurrent forwarding of client `S`/`D` to a joiner
 /// (`set_on_joining_node`/`delete_on_joining_node`). Without it, a joiner
 /// that accepts TCP but never answers (crashed-but-socket-open, a
-/// blackholed route, no keepalive configured) blocks the forwarding call
+/// blackholed route, no keepalive configured) blocks a single leg (the
+/// dial, the TLS handshake, the auth round trip, or the write/ack)
 /// forever while it still holds a `MAX_CONNECTIONS` permit; enough such
 /// requests during one stalled migration exhaust every permit. Mirrors
 /// discovery's own `OUTBOUND_IO_TIMEOUT`.
+///
+/// This is a *per-leg* bound, not a bound on the whole forwarding call —
+/// `connect_and_authenticate` (dial + optional TLS + optional auth) and
+/// `send_set`/the delete equivalent each apply it separately, so a joiner
+/// that's merely slow (rather than fully unresponsive) at every leg could
+/// still stack up to several multiples of this before failing. See
+/// `FORWARD_TIMEOUT` for the bound that actually caps the whole call.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Caps the *entire* forward-to-joiner operation — dial, TLS, auth, and
+/// the write/ack — that `set_on_joining_node`/`delete_on_joining_node`
+/// run synchronously inside a client's connection task while a migration
+/// is forwarding concurrent writes (see the `S`/`D` handling in
+/// `handle_connection`). Without this outer bound, those calls only had
+/// `OUTBOUND_IO_TIMEOUT` applied per leg (connect, then TLS, then auth,
+/// then the set/delete round trip), so a joiner that's merely slow — not
+/// unresponsive — at every leg could stall the client's whole pipeline
+/// for close to 4x `OUTBOUND_IO_TIMEOUT`. Set equal to `OUTBOUND_IO_TIMEOUT`
+/// so the worst case for a client write during migration is one multiple
+/// of it, not several; `run_migration`'s own connection (a background
+/// task, not inline with a client) intentionally keeps the per-leg
+/// bounds instead, since it already retries per `KEY_TRANSFER_ATTEMPTS`
+/// and stalling it doesn't hold a client's connection open.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_CHUNK_SIZE: usize = 1024;
 /// How many times `run_migration` tries to transfer a single key to the
 /// joining node (reconnecting between tries) before giving up on the
@@ -216,8 +249,18 @@ fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
 
 /// Parses the host portion of a `host:port` address into a TLS server name
 /// for certificate verification, accepting either a DNS name or IP address.
+/// A bracketed IPv6 host (`[::1]:8356`, required so the port's `:` is
+/// unambiguous) has its brackets stripped before conversion — left in,
+/// `ServerName::try_from` rejects the string both as an IP (brackets
+/// aren't part of the address) and as a DNS name (`[`/`]` aren't valid
+/// there either), so TLS to an IPv6 address would otherwise always fail.
+/// Mirrors `nanocached-discovery`'s own copy in `src/bin/nanocached-discovery.rs`.
 fn server_name_from_addr(addr: &str) -> io::Result<ServerName<'static>> {
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
 
     ServerName::try_from(host.to_string()).map_err(|error| {
         io::Error::new(
@@ -642,8 +685,26 @@ async fn handle_connection(
     // starts already authenticated.
     let mut authenticated = config.auth_secret.is_none();
 
+    // Slowloris resistance: anchored to accept-time here, then re-anchored
+    // to `now + config.idle_timeout` below every time `parse` completes a
+    // full command — see the comment there and `IDLE_TIMEOUT`'s own doc
+    // comment for why this is `now + idle_timeout` at those two moments
+    // specifically, rather than on every byte read.
+    let mut deadline = Instant::now() + config.idle_timeout;
+
     loop {
-        match parse(&mut received) {
+        let parsed = parse(&mut received);
+
+        // Only a fully parsed command extends the deadline — an
+        // `Incomplete` result (more bytes needed) leaves it untouched, so
+        // a client that trickles bytes in without ever finishing a
+        // command can't renew its own budget one byte at a time. See
+        // `IDLE_TIMEOUT`'s doc comment.
+        if parsed.is_ok() {
+            deadline = Instant::now() + config.idle_timeout;
+        }
+
+        match parsed {
             Ok(Command::Auth { secret }) => {
                 let accepted = match &config.auth_secret {
                     Some(expected) => constant_time_eq(&secret, expected),
@@ -705,14 +766,26 @@ async fn handle_connection(
                 };
 
                 // doc/adr/0017-*.md: sizes discovery's migration timeout.
-                // A cache task that's already gone (shutting down) can't
-                // answer this count; 0 is a safe default here since
-                // `run_migration` below will independently discover the
-                // same unavailability and abort on its own.
-                let entries_to_send =
-                    count_entries_to_send(&node_context, &joining_name, &joined, replication)
-                        .await
-                        .unwrap_or(0);
+                // Issue (perf): one `list_entries` snapshot here, reused
+                // by both `entries_to_send_count` (for this count) and
+                // `run_migration` (for the actual transfer) below,
+                // instead of each independently cloning the whole cache —
+                // see `entries_to_send_count`'s own comment. `None` if
+                // the cache task is already gone (shutting down); 0 is a
+                // safe default for the count here since `run_migration`
+                // independently checks for the same `None` and aborts on
+                // its own.
+                let entries_snapshot = list_entries(&node_context.request_tx).await;
+                let entries_to_send = entries_snapshot.as_deref().map_or(0, |entries| {
+                    entries_to_send_count(
+                        entries,
+                        &before_ring,
+                        &after_ring,
+                        &node_context.name,
+                        &joining_name,
+                        replication,
+                    )
+                });
 
                 write_response(
                     &mut stream,
@@ -738,6 +811,7 @@ async fn handle_connection(
                         before_ring,
                         after_ring,
                         migration_guard,
+                        entries_snapshot,
                     )))
                     .await;
 
@@ -893,10 +967,17 @@ async fn handle_connection(
 
         received.reserve(READ_CHUNK_SIZE);
 
+        // Bounded by time remaining until `deadline`, not by a fresh
+        // `config.idle_timeout` on every read — see `deadline`'s own
+        // comment above. If `deadline` has already passed (a trickled
+        // read landed after it), `remaining` is zero and this fires
+        // immediately instead of granting another read.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+
         let bytes_read = tokio::select! {
             _ = shutdown_rx.changed() => return Ok(()),
 
-            result = timeout(config.idle_timeout, stream.read_buf(&mut received)) => {
+            result = timeout(remaining, stream.read_buf(&mut received)) => {
                 result.map_err(|_| {
                     io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -1427,9 +1508,10 @@ impl Drop for MigrationGuard {
 /// discovery always lists this node in the roster (it only sends `M` to
 /// `Joined` members), but the sender/displaced computations downstream
 /// are meaningless without self in the "before" set, so this makes that
-/// structural rather than trusted. Shared by `count_entries_to_send`,
-/// `handle_connection` (to reserve `MigrationGuard` before acknowledging
-/// `M` — see `Response::MigrationRejected`), and `run_migration`.
+/// structural rather than trusted. Called once by `handle_connection`
+/// (to reserve `MigrationGuard` before acknowledging `M` — see
+/// `Response::MigrationRejected`, and to size `entries_to_send_count`),
+/// with the resulting rings then also handed to `run_migration`.
 fn migration_rings(
     node_context: &NodeContext,
     joining_name: &str,
@@ -1445,35 +1527,43 @@ fn migration_rings(
     (HashRing::new(before_members), HashRing::new(after_members))
 }
 
-/// doc/adr/0017-*.md: counts how many of this node's entries it will
+/// doc/adr/0017-*.md: counts how many of `entries` this node will
 /// actually send to the joining node, mirroring the sender/displaced
 /// predicate `run_migration` computes for real (the old primary for a
 /// key is the one designated sender — a key can be affected by the join
-/// without this node being the one that sends it). Called once, after
-/// `M` reserves a `MigrationGuard`, purely to size discovery's migration
-/// timeout — not a transfer plan. `None` if the cache task is already
-/// unavailable; `run_migration` will independently discover the same
-/// thing and abort.
-async fn count_entries_to_send(
-    node_context: &NodeContext,
+/// without this node being the one that sends it). Purely to size
+/// discovery's migration timeout — not a transfer plan.
+///
+/// Takes `entries` (a `list_entries` snapshot) rather than fetching its
+/// own: this and `run_migration`'s own transfer loop used to each call
+/// `list_entries` independently — two full clones of the cache off of
+/// the single-threaded cache actor per `M`, back to back, each blocking
+/// every other request the actor handles for its duration. `M`'s caller
+/// (`handle_connection`) now takes one snapshot and passes it to both,
+/// halving that stall. This does mean a concurrent write racing the
+/// snapshot could shift the true count slightly by the time transfer
+/// actually happens — already true before this change (the snapshot was
+/// never a transfer plan either way; `run_migration` re-checks every
+/// key's live value before sending it regardless, see its own comment).
+/// A chunked/budgeted listing (mirroring `sweep`'s `SWEEP_BUDGET`) would
+/// avoid the clone-the-whole-cache cost entirely, but needs the
+/// migration protocol to support resuming a partial listing — a larger
+/// change than this bug fix warrants.
+fn entries_to_send_count(
+    entries: &[(Bytes, Bytes, Option<Duration>)],
+    before_ring: &HashRing,
+    after_ring: &HashRing,
+    self_name: &str,
     joining_name: &str,
-    joined: &[(String, String)],
     replication: usize,
-) -> Option<usize> {
-    let (before_ring, after_ring) = migration_rings(node_context, joining_name, joined);
-    let self_name = node_context.name.as_str();
-
-    let entries = list_entries(&node_context.request_tx).await?;
-
-    Some(
-        entries
-            .iter()
-            .filter(|(key, _, _)| {
-                after_ring.is_owner(key, joining_name, replication)
-                    && before_ring.owners(key, replication).first() == Some(&self_name)
-            })
-            .count(),
-    )
+) -> usize {
+    entries
+        .iter()
+        .filter(|(key, _, _)| {
+            after_ring.is_owner(key, joining_name, replication)
+                && before_ring.owners(key, replication).first() == Some(&self_name)
+        })
+        .count()
 }
 
 /// ADR-0008 (generalized by ADR-0011): triggered by an incoming `M`.
@@ -1518,6 +1608,14 @@ async fn count_entries_to_send(
 /// acknowledged, so a rejection (see `Response::MigrationRejected`) can
 /// be reported on the same ack instead of the caller being told
 /// `MigrationAccepted` and then silently getting nothing.
+///
+/// Also takes `entries` already fetched by `handle_connection` (the same
+/// `list_entries` snapshot it used to compute `entries_to_send_count`),
+/// rather than fetching its own — see `entries_to_send_count`'s comment
+/// on why one snapshot is now shared instead of each side cloning the
+/// whole cache independently. `None` here means the cache task was
+/// already unavailable when `handle_connection` took the snapshot.
+#[allow(clippy::too_many_arguments)]
 async fn run_migration(
     node_context: NodeContext,
     joining_name: String,
@@ -1526,10 +1624,11 @@ async fn run_migration(
     before_ring: HashRing,
     after_ring: Arc<HashRing>,
     migration_guard: MigrationGuard,
+    entries: Option<Vec<(Bytes, Bytes, Option<Duration>)>>,
 ) {
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 
-    let entries = match list_entries(&node_context.request_tx).await {
+    let entries = match entries {
         Some(entries) => entries,
         None => {
             eprintln!("WARN migration to {joining_name} aborted: cache task is unavailable");
@@ -1882,6 +1981,12 @@ async fn send_set(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound set timed out"))?
 }
 
+/// Bounded by `FORWARD_TIMEOUT` as a single whole — see that constant's
+/// doc comment for why this can't just rely on `connect_and_authenticate`
+/// and `send_set`'s own per-leg `OUTBOUND_IO_TIMEOUT`s: this call runs
+/// synchronously inside a client's connection task (`handle_connection`'s
+/// `S` handling), so its worst case directly stalls that client's
+/// pipeline.
 async fn set_on_joining_node(
     node_context: &NodeContext,
     joining_addr: &str,
@@ -1889,8 +1994,17 @@ async fn set_on_joining_node(
     value: &[u8],
     ttl: Option<Duration>,
 ) -> io::Result<()> {
-    let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
-    send_set(&mut stream, key, value, ttl).await
+    timeout(FORWARD_TIMEOUT, async {
+        let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
+        send_set(&mut stream, key, value, ttl).await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "forwarding the write to the joining node timed out",
+        )
+    })?
 }
 
 /// This node's own current view of cluster membership, if it has one yet
@@ -1949,15 +2063,17 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<String
 /// `set_on_joining_node` but for deletes — see `migration_target_for`.
 /// Accepts either `D\n` (the key was present there too) or `N\n` (it
 /// hadn't arrived yet, e.g. this delete raced ahead of the migration
-/// task's own send of it) as a successful delivery.
+/// task's own send of it) as a successful delivery. Bounded by
+/// `FORWARD_TIMEOUT` as a single whole, same reasoning as
+/// `set_on_joining_node`.
 async fn delete_on_joining_node(
     node_context: &NodeContext,
     joining_addr: &str,
     key: &[u8],
 ) -> io::Result<()> {
-    let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
+    timeout(FORWARD_TIMEOUT, async {
+        let mut stream = connect_and_authenticate(node_context, joining_addr).await?;
 
-    timeout(OUTBOUND_IO_TIMEOUT, async {
         stream.write_all(&delete_message(key)).await?;
 
         let mut ack = [0u8; 2];
@@ -1972,7 +2088,12 @@ async fn delete_on_joining_node(
         io::Result::Ok(())
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound delete timed out"))?
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "forwarding the delete to the joining node timed out",
+        )
+    })?
 }
 
 async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::Result<()> {
@@ -2158,6 +2279,124 @@ mod tests {
         let error = connection_task.await.unwrap().unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn handle_connection_times_out_on_trickled_bytes_that_never_complete_a_request() {
+        // Slowloris regression: before this fix, every byte read reset
+        // the idle deadline to `now + IDLE_TIMEOUT`, regardless of
+        // whether it completed a command — so a client sending one byte
+        // just under `IDLE_TIMEOUT` apart could hold a `MAX_CONNECTIONS`
+        // permit forever without ever finishing a request. The deadline
+        // must instead be anchored to the last *completed* parse (or to
+        // accept-time, before any request has completed).
+        let (mut client, server) = tcp_pair().await;
+
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+
+        // Trickle in a single byte of an otherwise-incomplete `Get`
+        // command just under the original deadline (accept +
+        // IDLE_TIMEOUT). A read-resetting deadline would treat this as
+        // grounds for another full IDLE_TIMEOUT.
+        tokio::time::advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        client.write_all(b"G").await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Past the original deadline, but nowhere near what a
+        // read-resetting deadline would have allowed (another ~59s).
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let error = connection_task.await.unwrap().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn set_on_joining_node_bounds_the_whole_forward_even_when_every_leg_individually_succeeds()
+     {
+        // Regression: `set_on_joining_node` used to only bound each leg
+        // (connect, TLS, auth, the set/ack round trip) separately via
+        // `OUTBOUND_IO_TIMEOUT`, so a joining node that responded to each
+        // leg just slowly enough to never trip that leg's own timeout
+        // could still hold the whole call — and the client connection
+        // task forwarding it inline — open for a multiple of
+        // `OUTBOUND_IO_TIMEOUT`. `FORWARD_TIMEOUT` now bounds the entire
+        // operation as one whole, regardless of how far along it got.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+
+        let (release_auth_tx, release_auth_rx) = oneshot::channel::<()>();
+        let (release_set_tx, release_set_rx) = oneshot::channel::<()>();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            // Answers auth, then withholds the SET ack — both gated on
+            // the test releasing them, so elapsed *virtual* time is
+            // entirely under the test's control.
+            let _ = release_auth_rx.await;
+            let _ = connection.write_all(b"On\n").await;
+            let _ = release_set_rx.await;
+            let _ = connection.write_all(b"S\n").await;
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: Some(Bytes::from_static(b"shared-secret")),
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+        };
+
+        let forward_task = tokio::spawn(async move {
+            set_on_joining_node(
+                &node_context,
+                &joining_addr,
+                b"name",
+                b"Alice",
+                None,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+
+        // The auth leg succeeds well under its own per-leg timeout...
+        tokio::time::advance(OUTBOUND_IO_TIMEOUT - Duration::from_secs(1)).await;
+        let _ = release_auth_tx.send(());
+        tokio::task::yield_now().await;
+
+        // ...so under the old per-leg-only bound, the SET/ack leg would
+        // get a fresh `OUTBOUND_IO_TIMEOUT` window of its own starting
+        // now, well past `FORWARD_TIMEOUT`'s deadline (measured from the
+        // call's start). It's never released here.
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let result = forward_task.await.unwrap();
+        let error = result.expect_err(
+            "expected the overall FORWARD_TIMEOUT to fire even though each leg individually \
+             stayed under OUTBOUND_IO_TIMEOUT",
+        );
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        joining_task.abort();
+        let _ = release_set_tx.send(());
     }
 
     #[test]
@@ -2468,6 +2707,34 @@ mod tests {
         assert!(!constant_time_eq(b"short", b"a much longer value"));
     }
 
+    #[test]
+    fn server_name_from_addr_strips_brackets_from_a_bracketed_ipv6_host() {
+        let name = server_name_from_addr("[::1]:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("::1").unwrap());
+    }
+
+    #[test]
+    fn server_name_from_addr_handles_a_full_bracketed_ipv6_host() {
+        let name = server_name_from_addr("[2001:db8::1]:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("2001:db8::1").unwrap());
+    }
+
+    #[test]
+    fn server_name_from_addr_still_handles_a_plain_ipv4_host() {
+        let name = server_name_from_addr("127.0.0.1:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("127.0.0.1").unwrap());
+    }
+
+    #[test]
+    fn server_name_from_addr_still_handles_a_dns_name() {
+        let name = server_name_from_addr("node-a.example.com:8356").unwrap();
+
+        assert_eq!(name, ServerName::try_from("node-a.example.com").unwrap());
+    }
+
     async fn send_command(request_tx: &mpsc::Sender<CacheRequest>, command: Command) -> Response {
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -2583,6 +2850,8 @@ mod tests {
         )
         .unwrap();
 
+        let entries = list_entries(&request_tx).await;
+
         run_migration(
             node_context.clone(),
             "joiner-0".to_string(),
@@ -2591,6 +2860,7 @@ mod tests {
             before_ring,
             after_ring,
             migration_guard,
+            entries,
         )
         .await;
 

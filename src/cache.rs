@@ -175,6 +175,22 @@ impl Cache {
     /// migration task, to compute which of these a newly joining node now
     /// owns. Uses `LruCache::iter`, not `get`, so listing entries doesn't
     /// itself perturb recency.
+    ///
+    /// Clones every key and value (cloning `Bytes` is cheap — a refcount
+    /// bump, not a copy — but the `Vec` itself and its iteration are
+    /// still O(entries)), and runs synchronously on the single cache
+    /// actor task (`run_cache` in `src/server.rs`), so calling this
+    /// blocks every other request the actor handles for as long as it
+    /// takes to walk the whole cache. `src/server.rs`'s `handle_connection`
+    /// (the `M` handler) takes exactly one such snapshot per migration
+    /// and reuses it for both sizing discovery's migration timeout
+    /// (`entries_to_send_count`) and the actual transfer (`run_migration`),
+    /// rather than calling this twice — halving, not eliminating, that
+    /// stall. A chunked/budgeted listing (mirroring `sweep`'s
+    /// `SWEEP_BUDGET`, see `run_sweep`) would avoid the whole-cache clone
+    /// entirely, but needs the migration protocol to support resuming a
+    /// partial listing across multiple round trips instead of one; left
+    /// as a larger follow-up rather than folded into that fix.
     pub fn entries(&self) -> Vec<(Bytes, Bytes, Option<Duration>)> {
         self.entries_at(Instant::now())
     }
