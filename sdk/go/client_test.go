@@ -1091,9 +1091,9 @@ func TestConnectingToASilentServerFailsWithinTheDeadline(t *testing.T) {
 		}
 	}()
 
-	original := handshakeDeadline
-	handshakeDeadline = 100 * time.Millisecond
-	defer func() { handshakeDeadline = original }()
+	original := connectDeadline
+	connectDeadline = 100 * time.Millisecond
+	defer func() { connectDeadline = original }()
 
 	started := time.Now()
 	_, err = Connect(Config{Addresses: []Address{addr(listener.Addr().String())}})

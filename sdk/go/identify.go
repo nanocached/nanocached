@@ -46,19 +46,25 @@ type identified struct {
 // (doc/adr/0007-*.md). A node's conn is handed back live; a discovery
 // connection is used once for L and closed, returning the name/address
 // list and the cluster's replication factor R (doc/adr/0009, 0010, 0011).
-// handshakeDeadline bounds the identify exchange after the dial: a
-// server that accepts the TCP connection but never answers (a blackholed
-// address behaves the same way) must not hang the caller. A variable
+// connectDeadline bounds one whole connect attempt — dial, TLS
+// handshake, and the identify exchange share a single 5s budget, the
+// same shape as the other five SDKs (issue #47 item 1: the previous
+// 10s-dial + 5s-handshake staging made Go's worst-case failover ~3x
+// the others'). A server that accepts the TCP connection but never
+// answers (a blackholed address behaves the same way) must not hang
+// the caller. The ADR-0019 legacy fallback's redial gets a fresh
+// budget, matching the per-attempt deadlines elsewhere. A variable
 // only so tests can shorten it.
-var handshakeDeadline = 5 * time.Second
+var connectDeadline = 5 * time.Second
 
 func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config) (*identified, error) {
-	conn, err := open(address, tlsConfig)
+	deadline := time.Now().Add(connectDeadline)
+	conn, err := open(address, tlsConfig, deadline)
 	if err != nil {
 		return nil, connectionLost("could not connect to "+address, err)
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
+	_ = conn.SetDeadline(deadline)
 	result, err := identify(conn, address, authSecret, true)
 	if err != nil {
 		_ = conn.Close()
@@ -70,11 +76,12 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 		// replying — redial once with the plain form and run the
 		// connection untagged (the pre-0019 behavior, desync window
 		// included).
-		conn, err = open(address, tlsConfig)
+		deadline = time.Now().Add(connectDeadline)
+		conn, err = open(address, tlsConfig, deadline)
 		if err != nil {
 			return nil, connectionLost("could not connect to "+address, err)
 		}
-		_ = conn.SetDeadline(time.Now().Add(handshakeDeadline))
+		_ = conn.SetDeadline(deadline)
 		result, err = identify(conn, address, authSecret, false)
 		if err != nil {
 			_ = conn.Close()
@@ -101,8 +108,12 @@ func isLegacyServerSignal(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
-func open(address string, tlsConfig *tls.Config) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: 10 * time.Second}
+// open dials (and, with TLS, handshakes) within the attempt's shared
+// absolute deadline — see connectDeadline. tls.DialWithDialer applies
+// the dialer's deadline to the TLS handshake too, so the whole attempt
+// stays inside one budget.
+func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, error) {
+	dialer := net.Dialer{Deadline: deadline}
 	if tlsConfig == nil {
 		conn, err := dialer.Dial("tcp", address)
 		if err != nil {
