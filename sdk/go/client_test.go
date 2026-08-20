@@ -1209,6 +1209,48 @@ func TestARequestToAHalfOpenServerFailsWithinTheTimeoutAndCloseReturns(t *testin
 	}
 }
 
+func TestSteadyNewRequestsDoNotPostponeHalfOpenDetection(t *testing.T) {
+	// Regression: the deadline used to be re-armed on *every* new
+	// request, so steady traffic against a server that had gone silent
+	// pushed it forever ahead and the oldest pending request was never
+	// timed out. The deadline is progress-based now — new sends must not
+	// extend it while an older request is still waiting.
+	original := requestTimeout
+	requestTimeout = 200 * time.Millisecond
+	defer func() { requestTimeout = original }()
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	node.goSilentAfterHandshake()
+
+	// New requests keep arriving well inside every deadline window
+	// (once the connection is poisoned they just fail fast).
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+				_, _, _ = client.Get("more")
+			}
+		}
+	}()
+
+	started := time.Now()
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get against a half-open connection under steady traffic = %v, want ErrConnectionLost", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("Get took %v, want well under 2s", elapsed)
+	}
+}
+
 // ── addresses ─────────────────────────────────────────────────────
 
 func TestRejectsAMissingTarget(t *testing.T) {

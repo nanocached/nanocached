@@ -26,12 +26,14 @@ import (
 // malicious frame, never just a legitimately large value.
 const maxValueLength = 2 * 1024 * 1024
 
-// requestTimeout bounds each outstanding request's full round trip
-// (write + wait for its matched response): without it, a half-open
-// server that accepts the TCP connection but never writes back — or
-// stops mid-stream — would hang Get/Set/Delete forever in readLoop's
-// blocking Read, wedging every other pending caller behind it (and,
-// transitively, Close(), which waits on background replica writes).
+// requestTimeout bounds how long the connection may go without progress
+// while requests are outstanding — each response must arrive within
+// this window of the previous one (or of its own send, when the queue
+// was empty): without it, a half-open server that accepts the TCP
+// connection but never writes back — or stops mid-stream — would hang
+// Get/Set/Delete forever in readLoop's blocking Read, wedging every
+// other pending caller behind it (and, transitively, Close(), which
+// waits on background replica writes).
 // Generous versus the server's own 10s outbound timeouts. A variable
 // only so tests can shorten it.
 var requestTimeout = 30 * time.Second
@@ -252,11 +254,17 @@ func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, error
 	c.nextTag++ // wraps at the uint32's own width, matching the wire
 	frame := build(tag)
 	c.pending = append(c.pending, pendingRequest{ch: resultCh, tag: tag})
-	// requestTimeout bounds this request while it's outstanding; reset
-	// on every new request so the deadline always reflects the newest
-	// thing waiting on an answer. readLoop clears it once nothing is
-	// outstanding, so an idle connection is never closed by this alone.
-	_ = c.conn.SetDeadline(time.Now().Add(requestTimeout))
+	// requestTimeout is progress-based: the deadline is armed when the
+	// queue goes from empty to non-empty, re-armed by readLoop each time
+	// a response is dispatched with more still outstanding, and cleared
+	// once nothing is. Arming it here on *every* request instead would
+	// let a continuous stream of new requests push the deadline forever
+	// ahead of a server that has stopped answering — exactly the
+	// half-open hang requestTimeout exists to catch. An idle connection
+	// is never closed by this alone.
+	if len(c.pending) == 1 {
+		_ = c.conn.SetDeadline(time.Now().Add(requestTimeout))
+	}
 	_, writeErr := c.conn.Write(frame)
 	c.mu.Unlock()
 
@@ -294,6 +302,21 @@ func (c *connection) readLoop() {
 			c.pending = c.pending[1:]
 		}
 		noneOutstanding := len(c.pending) == 0
+		if haveReq {
+			// Progress-based deadline (see request()): a dispatched
+			// response is progress, so the next-oldest request gets a
+			// fresh window; with nothing left waiting, clear it so an
+			// otherwise-idle connection is never closed by it
+			// (keep-alive pings excepted — they arm their own deadline
+			// via request() like any other call). Under c.mu so this
+			// can't race a concurrent request() arming the deadline for
+			// a request this locked section didn't see.
+			if noneOutstanding {
+				_ = c.conn.SetDeadline(time.Time{})
+			} else {
+				_ = c.conn.SetDeadline(time.Now().Add(requestTimeout))
+			}
+		}
 		c.mu.Unlock()
 
 		// An unsolicited "busy" response means the server hit its
@@ -326,13 +349,6 @@ func (c *connection) readLoop() {
 			return
 		}
 
-		if noneOutstanding {
-			// Nothing left waiting on an answer: clear requestTimeout's
-			// deadline so an otherwise-idle connection is never closed
-			// by it (keep-alive pings excepted — they set their own
-			// deadline via request() like any other call).
-			_ = c.conn.SetDeadline(time.Time{})
-		}
 		req.ch <- roundTripResult{marker: marker, value: value}
 	}
 }

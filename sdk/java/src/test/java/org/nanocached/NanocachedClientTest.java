@@ -922,6 +922,80 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aSlowNewNodeDuringRefreshDoesNotStallOperations() throws Exception {
+        // Regression: refreshNodeList used to dial newly listed nodes
+        // while holding stateLock — the same lock every get/set/delete
+        // needs for routing — so one unresponsive new node stalled all
+        // traffic for the whole dial. Dials now happen outside the lock.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                client.set("k", "v");
+
+                // A "new" node that accepts the TCP connection but never
+                // answers identify: the refresh's dial to it blocks until
+                // the socket is closed below.
+                try (java.net.ServerSocket silent = new java.net.ServerSocket(0)) {
+                    // The dial may connect more than once (the ADR-0019
+                    // legacy fallback redials after the first connection
+                    // dies), so accept in a loop and track every socket.
+                    List<java.net.Socket> acceptedSockets =
+                            java.util.Collections.synchronizedList(new ArrayList<>());
+                    Thread acceptor = new Thread(() -> {
+                        try {
+                            while (true) acceptedSockets.add(silent.accept());
+                        } catch (java.io.IOException ignored) {
+                            // Server socket closed.
+                        }
+                    }, "test-silent-accept");
+                    acceptor.setDaemon(true);
+                    acceptor.start();
+
+                    List<DiscoveredNode> extended = new ArrayList<>(cluster.discovery().nodes);
+                    extended.add(new DiscoveredNode(
+                            "11111111-2222-3333-4444-555555555555",
+                            "127.0.0.1:" + silent.getLocalPort()));
+                    cluster.discovery().nodes = extended;
+
+                    java.lang.reflect.Method refreshNodeList =
+                            NanocachedClient.class.getDeclaredMethod("refreshNodeList");
+                    refreshNodeList.setAccessible(true);
+                    Thread refresher = new Thread(() -> {
+                        try {
+                            refreshNodeList.invoke(client);
+                        } catch (ReflectiveOperationException ignored) {
+                            // The dial's IOException is swallowed by
+                            // refreshNodeList itself; anything else fails
+                            // the elapsed-time assertion below anyway.
+                        }
+                    }, "test-refresher");
+                    refresher.setDaemon(true);
+                    refresher.start();
+
+                    // Only once the refresher is provably parked in the
+                    // dial does the timing assertion mean anything.
+                    waitFor(() -> !acceptedSockets.isEmpty(), "the refresh to reach the silent node");
+
+                    long started = System.nanoTime();
+                    assertEquals(Optional.of("v"), client.get("k"));
+                    long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                    assertTrue(elapsedMillis < 2_000,
+                            "get() stalled " + elapsedMillis + "ms behind the refresh's dial");
+
+                    // Unblock the refresher so it finishes inside this
+                    // test: stop further redials first, then kill the
+                    // in-flight connections.
+                    silent.close();
+                    synchronized (acceptedSockets) {
+                        for (java.net.Socket socket : acceptedSockets) socket.close();
+                    }
+                    refresher.join(5_000);
+                    assertFalse(refresher.isAlive(), "refresher did not finish");
+                }
+            }
+        }
+    }
+
+    @Test
     void aFailedRepairWriteIncrementsReadRepairFailuresStat() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
