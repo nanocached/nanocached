@@ -957,7 +957,11 @@ impl NanocachedClient {
         }
 
         let (stream, tagged) = self.open_node_stream(&address).await?;
-        let connection = Arc::new(Connection::new(stream, self.inner.tracking_key.clone(), tagged));
+        let connection = Arc::new(Connection::new(
+            stream,
+            self.inner.tracking_key.clone(),
+            tagged,
+        ));
 
         let mut state = self.inner.state.lock().await;
         if self.inner.closed.load(Ordering::SeqCst) {

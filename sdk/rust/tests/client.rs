@@ -200,8 +200,7 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 } else {
                     match state.store.lock().unwrap().get(&key) {
                         Some(value) => {
-                            let mut frame =
-                                format!("V {}{tag_suffix}\n", value.len()).into_bytes();
+                            let mut frame = format!("V {}{tag_suffix}\n", value.len()).into_bytes();
                             frame.extend_from_slice(value);
                             frame
                         }
@@ -223,13 +222,12 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
                 *state.last_set_header.lock().unwrap() = Some(header.clone());
-                let reply =
-                    if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
-                        format!("W{tag_suffix}\n")
-                    } else {
-                        state.store.lock().unwrap().insert(key, value);
-                        format!("S{tag_suffix}\n")
-                    };
+                let reply = if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
+                    format!("W{tag_suffix}\n")
+                } else {
+                    state.store.lock().unwrap().insert(key, value);
+                    format!("S{tag_suffix}\n")
+                };
                 if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                     return;
                 }
@@ -1685,7 +1683,9 @@ async fn tags_catch_an_off_by_one_desync_before_any_caller_sees_wrong_data() {
 
     client.set("k", "v", 0).await.unwrap();
 
-    node.state.swallow_get_replies.fetch_add(1, Ordering::SeqCst);
+    node.state
+        .swallow_get_replies
+        .fetch_add(1, Ordering::SeqCst);
     let (first, second) = tokio::join!(client.get("a"), client.get("k"));
 
     // The one misdelivery this test exists to catch — "a" surfacing
