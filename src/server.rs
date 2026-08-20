@@ -309,6 +309,12 @@ struct NodeContext {
     /// This node's own random per-process identity (ADR-0009), needed to
     /// identify this node as the sender when it reports `C`.
     name: String,
+    /// This node's per-process membership token (issue #34), generated
+    /// alongside `name` with the same lifetime and never persisted or
+    /// shared with anything but the discovery servers — presented on
+    /// `J`/`P`/`H`/`C` so nothing that merely knows this node's public
+    /// name (every `L` response lists it) can speak for it.
+    token: String,
     discovery_addr: String,
     /// Set while `run_migration` is active, cleared when it finishes (see
     /// `MigrationGuard`). Serves two purposes: `run_sweep` checks it and
@@ -426,6 +432,10 @@ pub(crate) async fn run(
     // with a discovery server at all.
     let node_context = heartbeat.as_ref().map(|config| NodeContext {
         name: Uuid::new_v4().to_string(),
+        // A second, independent UUID: the name is public (`L` lists it),
+        // so it can't double as the credential proving this node is the
+        // one behind it (issue #34).
+        token: Uuid::new_v4().to_string(),
         // The primary (ADR-0010) — where `C` completion reports go,
         // matching where `J` was sent.
         discovery_addr: config.discovery_addrs[0].clone(),
@@ -440,6 +450,7 @@ pub(crate) async fn run(
         (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
             config,
             node_context.name.clone(),
+            node_context.token.clone(),
             Arc::clone(&known_ring),
             shutdown_rx.clone(),
         ))),
@@ -1042,17 +1053,23 @@ async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>, max_memory_byte
 /// connection's own source IP plus that port (ADR-0012). Discovery holds
 /// this connection open and pushes `R\n` on it once this node is promoted
 /// to `Joined`.
-fn join_message(name: &str, port: u16) -> Vec<u8> {
-    let mut message = format!("J {} {port}\n", name.len()).into_bytes();
+/// `token` is this node's per-process membership token (issue #34),
+/// generated alongside `name` and presented on every command naming this
+/// node — the discovery server binds it to `name` at registration and
+/// rejects any later `P`/`H`/`C` for the name that doesn't present it.
+fn join_message(name: &str, port: u16, token: &str) -> Vec<u8> {
+    let mut message = format!("J {} {port} {}\n", name.len(), token.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(token.as_bytes());
     message
 }
 
 /// ADR-0010: same shape as `join_message`, but declares an
 /// already-promoted member — no handoff orchestration on the other end.
-fn announce_message(name: &str, port: u16) -> Vec<u8> {
-    let mut message = format!("P {} {port}\n", name.len()).into_bytes();
+fn announce_message(name: &str, port: u16, token: &str) -> Vec<u8> {
+    let mut message = format!("P {} {port} {}\n", name.len(), token.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(token.as_bytes());
     message
 }
 
@@ -1064,9 +1081,16 @@ fn announce_message(name: &str, port: u16) -> Vec<u8> {
 /// one yet — never a real replication factor (discovery validates every
 /// `--replication-factor` is at least 1), so it's an unambiguous "unknown"
 /// sentinel on the wire.
-fn heartbeat_message(name: &str, replication: Option<usize>) -> Vec<u8> {
-    let mut message = format!("H {} {}\n", name.len(), replication.unwrap_or(0)).into_bytes();
+fn heartbeat_message(name: &str, replication: Option<usize>, token: &str) -> Vec<u8> {
+    let mut message = format!(
+        "H {} {} {}\n",
+        name.len(),
+        replication.unwrap_or(0),
+        token.len()
+    )
+    .into_bytes();
     message.extend_from_slice(name.as_bytes());
+    message.extend_from_slice(token.as_bytes());
     message
 }
 
@@ -1128,6 +1152,7 @@ enum DiscoveryRole {
 async fn send_heartbeats(
     config: HeartbeatConfig,
     name: String,
+    token: String,
     known_ring: KnownRing,
     shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -1149,6 +1174,7 @@ async fn send_heartbeats(
             config.auth_secret.clone(),
             config.tls_connector.clone(),
             name.clone(),
+            token.clone(),
             Arc::clone(&known_ring),
             role,
             shutdown_rx.clone(),
@@ -1171,12 +1197,13 @@ async fn register_with_discovery(
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     name: String,
+    token: String,
     known_ring: KnownRing,
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let join = join_message(&name, port);
-    let announce = announce_message(&name, port);
+    let join = join_message(&name, port, &token);
+    let announce = announce_message(&name, port, &token);
 
     // A standby must not announce a node the primary hasn't promoted yet:
     // that would make it visible in the standby's `L` before its ADR-0008
@@ -1269,7 +1296,7 @@ async fn register_with_discovery(
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .as_ref()
                                 .map(|membership| membership.replication);
-                            let heartbeat = heartbeat_message(&name, replication);
+                            let heartbeat = heartbeat_message(&name, replication, &token);
 
                             if !matches!(
                                 timeout(OUTBOUND_IO_TIMEOUT, stream.write_all(&heartbeat)).await,
@@ -1341,14 +1368,17 @@ fn delete_message(key: &[u8]) -> Vec<u8> {
 
 /// ADR-0008: reports to discovery that this node (identified by `name`,
 /// ADR-0009) has finished handing off its share of the current join.
-/// `C <name-len> <joining-len>\n<name><joining>` — the completion report
-/// names both the reporting node and the join it is for (issue #5): a
-/// bare name let a stale report from an abandoned handoff be credited to
-/// whatever join happened to be pending next.
-fn complete_message(name: &str, joining_name: &str) -> Vec<u8> {
-    let mut message = format!("C {} {}\n", name.len(), joining_name.len()).into_bytes();
+/// `C <name-len> <joining-len> <token-len>\n<name><joining><token>` — the
+/// completion report names both the reporting node and the join it is
+/// for (issue #5): a bare name let a stale report from an abandoned
+/// handoff be credited to whatever join happened to be pending next.
+/// `token` proves the report really comes from `name` (issue #34).
+fn complete_message(name: &str, joining_name: &str, token: &str) -> Vec<u8> {
+    let mut message =
+        format!("C {} {} {}\n", name.len(), joining_name.len(), token.len()).into_bytes();
     message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(joining_name.as_bytes());
+    message.extend_from_slice(token.as_bytes());
     message
 }
 
@@ -2222,7 +2252,11 @@ async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::
     }
 
     stream
-        .write_all(&complete_message(&node_context.name, joining_name))
+        .write_all(&complete_message(
+            &node_context.name,
+            joining_name,
+            &node_context.token,
+        ))
         .await?;
 
     let mut ack = [0u8; 2];
@@ -2460,6 +2494,7 @@ mod tests {
 
         let node_context = NodeContext {
             name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:0".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
@@ -2924,6 +2959,7 @@ mod tests {
 
         let node_context = NodeContext {
             name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
             discovery_addr,
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
@@ -3037,24 +3073,24 @@ mod tests {
     #[test]
     fn heartbeat_message_declares_the_name_length_before_the_name() {
         assert_eq!(
-            heartbeat_message("some-name", Some(2)),
-            b"H 9 2\nsome-name".to_vec()
+            heartbeat_message("some-name", Some(2), "tk-some-name"),
+            b"H 9 2 12\nsome-nametk-some-name".to_vec()
         );
     }
 
     #[test]
     fn heartbeat_message_encodes_an_unknown_replication_belief_as_zero() {
         assert_eq!(
-            heartbeat_message("some-name", None),
-            b"H 9 0\nsome-name".to_vec()
+            heartbeat_message("some-name", None, "tk-some-name"),
+            b"H 9 0 12\nsome-nametk-some-name".to_vec()
         );
     }
 
     #[test]
     fn join_message_declares_the_name_length_and_the_port() {
         assert_eq!(
-            join_message("some-name", 8356),
-            b"J 9 8356\nsome-name".to_vec()
+            join_message("some-name", 8356, "tk-some-name"),
+            b"J 9 8356 12\nsome-nametk-some-name".to_vec()
         );
     }
 
@@ -3077,8 +3113,8 @@ mod tests {
     #[test]
     fn complete_message_declares_the_name_length_before_the_name() {
         assert_eq!(
-            complete_message("some-name", "joiner"),
-            b"C 9 6\nsome-namejoiner".to_vec()
+            complete_message("some-name", "joiner", "tk-some-name"),
+            b"C 9 6 12\nsome-namejoinertk-some-name".to_vec()
         );
     }
 
@@ -3090,6 +3126,7 @@ mod tests {
         let (request_tx, _request_rx) = mpsc::channel(1);
         let node_context = NodeContext {
             name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
             discovery_addr: "127.0.0.1:1".to_string(),
             active_migration: Arc::new(Mutex::new(None)),
             known_ring: Arc::new(Mutex::new(None)),
@@ -3275,6 +3312,7 @@ mod tests {
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
@@ -3314,7 +3352,7 @@ mod tests {
         assert_eq!(*joining_received.lock().unwrap(), expected_set);
         assert_eq!(
             *discovery_received.lock().unwrap(),
-            complete_message("ready-node", "joiner-107")
+            complete_message("ready-node", "joiner-107", "tk-ready-node")
         );
 
         joining_task.await.unwrap();
@@ -3405,6 +3443,7 @@ mod tests {
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
@@ -3442,7 +3481,7 @@ mod tests {
         let complete = discovery_task.await.unwrap();
         assert_eq!(
             complete,
-            complete_message("ready-node", "joiner-107"),
+            complete_message("ready-node", "joiner-107", "tk-ready-node"),
             "exactly one migration must run and report completion"
         );
 
@@ -3503,6 +3542,7 @@ mod tests {
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
@@ -3609,6 +3649,7 @@ mod tests {
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
@@ -3782,6 +3823,7 @@ mod tests {
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
@@ -3832,7 +3874,7 @@ mod tests {
         );
         assert_eq!(
             *discovery_received.lock().unwrap(),
-            complete_message("ready-node", "joiner-107")
+            complete_message("ready-node", "joiner-107", "tk-ready-node")
         );
 
         joining_task.await.unwrap();
@@ -3895,6 +3937,7 @@ mod tests {
                 tls_acceptor: None,
                 node_context: Some(NodeContext {
                     name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
                     discovery_addr,
                     active_migration: Arc::new(Mutex::new(None)),
                     known_ring: Arc::new(Mutex::new(None)),
@@ -3953,13 +3996,13 @@ mod tests {
         cache_task.await.unwrap();
     }
 
-    /// Parses a `J <name-length> <port>\n<name>` message (the only one
-    /// whose shape the test doesn't already know, since its name is a
-    /// random UUID generated inside `send_heartbeats`) and asserts every
-    /// subsequent message in `received` is the matching
-    /// `H <name-length> <r>\n<name>` heartbeat for that same name — `r=0`
-    /// (unknown), since none of these tests give it a `KnownRing` with a
-    /// membership belief set.
+    /// Parses a `J <name-length> <port> <token-length>\n<name><token>`
+    /// message (the only one whose shape the test doesn't already know,
+    /// since its name is a random UUID generated inside `send_heartbeats`)
+    /// and asserts every subsequent message in `received` is the matching
+    /// `H <name-length> <r> <token-length>\n<name><token>` heartbeat for
+    /// that same name and token — `r=0` (unknown), since none of these
+    /// tests give it a `KnownRing` with a membership belief set.
     fn assert_join_then_heartbeats(received: &[Vec<u8>], port: u16) {
         assert!(
             received.len() >= 4,
@@ -3974,14 +4017,16 @@ mod tests {
 
         let name_length: usize = header.next().unwrap().parse().unwrap();
         let sent_port: u16 = header.next().unwrap().parse().unwrap();
+        let token_length: usize = header.next().unwrap().parse().unwrap();
         assert_eq!(header.next(), None);
         assert_eq!(sent_port, port);
 
         let body = &join[header_end + 1..];
         let name = &body[..name_length];
-        assert_eq!(body.len(), name_length);
+        let token = &body[name_length..];
+        assert_eq!(body.len(), name_length + token_length);
 
-        let expected_heartbeat = format!("H {} 0\n{name}", name.len());
+        let expected_heartbeat = format!("H {} 0 {}\n{name}{token}", name.len(), token.len());
         for message in &received[1..] {
             assert_eq!(message, expected_heartbeat.as_bytes());
         }
@@ -4000,6 +4045,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         )
@@ -4052,6 +4098,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -4114,6 +4161,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::clone(&known_ring),
             shutdown_rx,
         ));
@@ -4139,14 +4187,14 @@ mod tests {
         assert!(
             heartbeats
                 .iter()
-                .any(|message| message.starts_with(b"H 9 0\n")),
+                .any(|message| message.starts_with(b"H 9 0 12\n")),
             "expected at least one heartbeat reporting the unknown (0) belief before \
              known_ring was set, got {heartbeats:?}"
         );
         assert!(
             heartbeats
                 .iter()
-                .any(|message| message.starts_with(b"H 9 3\n")),
+                .any(|message| message.starts_with(b"H 9 3 12\n")),
             "expected at least one heartbeat reporting the newly known replication factor \
              (3) after known_ring was set, got {heartbeats:?}"
         );
@@ -4207,6 +4255,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -4224,8 +4273,8 @@ mod tests {
 
         let registrations = registrations.lock().unwrap();
         assert!(registrations.len() >= 2, "node never re-registered");
-        assert_eq!(registrations[0], b"J 9 8356\ntest-node");
-        assert_eq!(registrations[1], b"P 9 8356\ntest-node");
+        assert_eq!(registrations[0], b"J 9 8356 12\ntest-nodetk-test-node");
+        assert_eq!(registrations[1], b"P 9 8356 12\ntest-nodetk-test-node");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4268,8 +4317,14 @@ mod tests {
             let (mut connection, _) = standby_listener.accept().await.unwrap();
             let mut buffer = [0u8; 128];
             let bytes_read = connection.read(&mut buffer).await.unwrap();
-            standby_events.lock().unwrap().push("announced".to_string());
-            assert_eq!(&buffer[..bytes_read], b"P 9 14\ntest-node127.0.0.1:8356");
+            // Recorded as an event (checked by the test body) rather than
+            // asserted here: this task is aborted, never awaited, so a
+            // panic in it would be silently swallowed — which is exactly
+            // how a stale pre-ADR-0012 assertion survived here unnoticed.
+            standby_events.lock().unwrap().push(format!(
+                "announced:{}",
+                String::from_utf8_lossy(&buffer[..bytes_read])
+            ));
             connection.write_all(b"R\n").await.unwrap();
 
             loop {
@@ -4294,6 +4349,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -4303,7 +4359,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| event == "announced")
+                .any(|event| event.starts_with("announced"))
             {
                 break;
             }
@@ -4315,7 +4371,10 @@ mod tests {
         fake_primary.abort();
         fake_standby.abort();
 
-        assert_eq!(*events.lock().unwrap(), vec!["promoted", "announced"]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["promoted", "announced:P 9 8356 12\ntest-nodetk-test-node"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4336,6 +4395,7 @@ mod tests {
                 tls_connector: None,
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -4488,6 +4548,7 @@ mod tests {
                 tls_connector: Some(connector),
             },
             "test-node".to_string(),
+            "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
