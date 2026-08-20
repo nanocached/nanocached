@@ -103,8 +103,7 @@ let options = Options::new()
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL —
-the wire protocol's `G` response never returns one to preserve — and,
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
 unlike fire-and-forget replica writes, is uncapped and not drained on
 `close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
@@ -118,7 +117,7 @@ healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
 operations are idempotent). There is nothing to configure.
 
-Every dial (connect, redial, refresh) is bounded by a 10-second
+Every dial (connect, redial, refresh) is bounded by a 5-second
 connect deadline covering the TCP connect and handshake, so a node
 whose address has become a blackhole (a dead cloud instance) fails
 over instead of hanging.
@@ -198,6 +197,10 @@ rather than bloated.
 - It shares no code with the server (the repository's independence
   rule); the hash pipeline is pinned to cross-language test vectors that
   the server, TypeScript, Python, and Java implementations also assert.
+- Every failure is a variant of the one `Error` enum. Caller mistakes
+  are `Error::InvalidArgument` — this SDK's `Result`-based idiom for
+  what the other SDKs raise as host-language builtins (issue #47);
+  authentication failure surfaces as `Error::Protocol`.
 
 ## License
 

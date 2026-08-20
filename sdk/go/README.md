@@ -99,8 +99,7 @@ client, err := nanocached.Connect(nanocached.Config{
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL — the
-wire protocol's `G` response never returns one to preserve — and, unlike
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and, unlike
 fire-and-forget replica writes, is uncapped and not drained on `Close()`:
 this only fires on an already-rare clean miss, and losing one costs
 nothing beyond staying in the window for one more read.
@@ -178,8 +177,12 @@ unchanged rather than bloated.
   replication-aware `L`/`W`); it requires an up-to-date server. The hash
   pipeline is pinned to cross-language test vectors that the server and
   the TypeScript/Python/Java/Rust/.NET SDKs also assert.
-- Errors: `ErrClosed`, `ErrWrongNode`, `ErrDiscoveryBusy`, and
-  `ErrConnectionLost` are sentinels for `errors.Is`.
+- Errors: `ErrClosed`, `ErrWrongNode`, `ErrDiscoveryBusy`,
+  `ErrConnectionLost`, `ErrAuthenticationFailed`, and `ErrDecompression`
+  are sentinels for `errors.Is`. Caller mistakes (an invalid TTL, an
+  empty address list) surface as ordinary errors outside the sentinel
+  set — they indicate a bug in the calling code, not a nanocached
+  failure; this convention is shared across the SDKs (issue #47).
 - `Close()` is idempotent; calling it a second time warns to stderr
   instead of erroring. `Connect()` also warns to stderr if it's called
   for a single address that a previous, still-open connection from this

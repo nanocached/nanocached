@@ -108,8 +108,7 @@ client = await NanocachedClient.connect(
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL —
-the wire protocol's `G` response never returns one to preserve — and,
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
 unlike fire-and-forget replica writes, is uncapped and not drained on
 `close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
@@ -191,6 +190,11 @@ media, random bytes) is passed through unchanged rather than bloated.
   prints a warning ("was close() forgotten?"); this check is skipped for
   multi-address configs, where concurrent clients sharing an address list
   are legitimate.
+- Caller mistakes (a negative `ttl_seconds`, an empty address list)
+  raise host-language builtins (`ValueError`), not `NanocachedError` —
+  the SDK's error family covers failures the server or network produced,
+  a convention shared across the SDKs (issue #47). Authentication
+  failure is `AuthenticationError`, a `NanocachedError` subclass.
 
 ## License
 

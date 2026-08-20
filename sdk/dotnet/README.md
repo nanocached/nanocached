@@ -109,8 +109,7 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
 
 Closes the narrow window after a primary restart where a replica still
 holds a key its (fresh) primary doesn't, at the cost of extra reads only
-on the misses that hit that window. The repair write carries no TTL —
-the wire protocol's `G` response never returns one to preserve — and,
+on the misses that hit that window. The repair write carries a fixed 60-second TTL — the wire protocol's `G` response never returns the original one to preserve, and no TTL at all would immortalize already-expired keys — and,
 unlike fire-and-forget replica writes, is uncapped and not drained on
 `Close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
@@ -194,6 +193,15 @@ single configured address while a previous connection to it is still
 open — a sign `close()` was forgotten. Neither warning fires for
 multi-address configs, since legitimate concurrent clients would make
 that a false positive.
+
+## Errors
+
+Every exception this SDK throws extends `NanocachedException` —
+including `AuthenticationFailedException` for a rejected secret — so one
+catch clause covers "an expected nanocached failure". Caller mistakes
+(an invalid TTL, an empty address list) throw `ArgumentException`
+instead: they indicate a bug in the calling code, not a nanocached
+failure, a convention shared across the SDKs (issue #47).
 
 ## Build
 

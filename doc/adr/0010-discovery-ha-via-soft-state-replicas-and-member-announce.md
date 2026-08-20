@@ -96,6 +96,15 @@ refresh), so losing any one discovery replica costs clients nothing.
 casing — in all six SDKs, and the identifier `seeds` this ADR
 originally proposed appears nowhere in the source.)*
 
+When a node-list refresh brings in a node the client hasn't seen
+before, *when* that node is dialed is a blessed per-SDK trade-off
+(issue #47 item 2), not drift: Go and Rust dial lazily on first use (a
+placeholder dead connection until then, favoring refresh latency),
+while Python/TypeScript/Java/.NET dial eagerly during the refresh
+(favoring first-request latency to the new node). Both are correct —
+neither is observable as anything but a latency difference — so each
+SDK keeps its shape.
+
 One asymmetry, uniform across all six SDKs, is deliberate: when a
 configured address answers `A` as a **cache node** rather than a
 discovery server, bootstrap **stops** there — the client pins itself to
