@@ -246,10 +246,16 @@ export class Connection {
 
       // An unsolicited "busy" response means the server hit its connection
       // limit right after accept and is about to close the connection; it
-      // isn't an answer to anything we sent.
+      // isn't an answer to anything we sent. Poison immediately (issue
+      // #45), like the other five SDKs and the tag-mismatch path below —
+      // waiting for the server's follow-up FIN would let the client keep
+      // writing requests into a connection the server has already
+      // declared it is abandoning.
       if (parsed.response.kind === "busy" && this.pending.length === 0) {
+        this.closed = true;
         this.lastError = new NanocachedError("nanocached: server rejected the connection (connection limit reached)");
-        continue;
+        this.socket.destroy();
+        return;
       }
 
       const waiter = this.pending.shift();

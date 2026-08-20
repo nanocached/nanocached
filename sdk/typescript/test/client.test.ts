@@ -912,6 +912,41 @@ describe("NanocachedError base class (issue #44)", () => {
   });
 });
 
+describe("unsolicited busy response (issue #45)", () => {
+  it("poisons the connection the moment the frame arrives", async () => {
+    // Regression: an unsolicited `B` (connection-limit busy) only
+    // recorded lastError and kept parsing — the connection died only
+    // when the server's follow-up FIN landed, and until then the client
+    // could keep writing requests into it. It must be poisoned
+    // immediately, like the other five SDKs.
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      // Unsolicited busy with nothing pending — and deliberately NO
+      // server-side close afterwards: the client must not need the FIN.
+      socket.write("B\n");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+
+      await waitFor(() => connection.isClosed(), "the busy frame to poison the connection");
+      assert.ok(socket.destroyed, "the client must destroy the socket itself");
+      await assert.rejects(connection.get("k"), /connection limit reached/);
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("NanocachedClient request timeout (issue #42)", () => {
   // REQUEST_TIMEOUT_TUNING exists only so these tests can shorten it.
   const defaultTimeoutMs = REQUEST_TIMEOUT_TUNING.timeoutMs;
