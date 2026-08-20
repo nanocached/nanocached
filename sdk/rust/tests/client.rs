@@ -675,9 +675,9 @@ async fn rejects_use_after_close() {
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
     client.close().await;
     client.close().await; // idempotent (also warns on stderr — see
-                    // close_called_twice_warns_once_on_stderr, which
-                    // captures that separately since this harness
-                    // doesn't otherwise observe it).
+                          // close_called_twice_warns_once_on_stderr, which
+                          // captures that separately since this harness
+                          // doesn't otherwise observe it).
     assert!(client.is_closed());
     assert!(matches!(client.get("k").await, Err(Error::AlreadyClosed)));
     node.stop();

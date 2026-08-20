@@ -74,6 +74,14 @@ internal sealed class Connection
     // from `synchronized`.
     private int _closedFlag;
 
+    // The reason CloseWithReason was closing for, published before the
+    // stream is disposed. The read loop wakes from that dispose with a
+    // bare ObjectDisposedException and races CloseWithReason's own drain
+    // for the oldest pending entry — whoever wins, the caller must see
+    // the *reason* (e.g. the issue-#42 request timeout), not the disposed
+    // stream's noise.
+    private volatile Exception? _closeReason;
+
     // The progress-based request deadline (issue #42): armed when the
     // outstanding count goes 0→1, re-armed by the read loop each time a
     // response is dispatched with more still outstanding, cleared once
@@ -177,6 +185,7 @@ internal sealed class Connection
     private void CloseWithReason(Exception reason)
     {
         if (Interlocked.Exchange(ref _closedFlag, 1) != 0) return;
+        _closeReason = reason;
         Volatile.Write(ref _deadlineTicks, 0);
         _watchdog.Dispose();
         _stream.Dispose();
@@ -368,10 +377,15 @@ internal sealed class Connection
                 // oldest pending request specifically, not the
                 // connection in general; Close() drains everyone else
                 // with a generic "connection closed" instead, since
-                // their responses were never received at all.
+                // their responses were never received at all. When the
+                // read failed because CloseWithReason disposed the stream
+                // under us, its recorded reason is the root cause and the
+                // disposed-stream error is just its echo (issue #42's CI
+                // race: this dequeue can beat CloseWithReason's drain to
+                // the stalled request).
                 if (_pending.TryDequeue(out var failed))
                 {
-                    failed.Tcs.TrySetException(error);
+                    failed.Tcs.TrySetException(_closeReason ?? error);
                 }
                 Close();
                 return;
