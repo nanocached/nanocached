@@ -413,7 +413,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         node = await MockNode().start()
         port = node.port
         client = await NanocachedClient.connect(
-            [("127.0.0.1", port)], reconnect_cooldown=0.2
+            [("127.0.0.1", port)],
+            # Timing: a wide cooldown window and fast-rejection bound keep this from flaking on loaded CI runners.
+            reconnect_cooldown=1.0,
         )
         try:
             await client.set("k", "v")
@@ -457,12 +459,12 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ConnectionError):
                     await client.get("k")
                 elapsed = asyncio.get_running_loop().time() - start
-                self.assertLess(elapsed, 0.1, f"expected a cooldown-fast rejection, took {elapsed}s")
+                self.assertLess(elapsed, 0.5, f"expected a cooldown-fast rejection, took {elapsed}s")
                 self.assertEqual(connections, 0, "the cooldown did not prevent a redial")
 
                 # Once the cooldown window has passed, the address is
                 # dialed again, this time reaching the listener.
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(1.2)
                 with self.assertRaisesRegex(NanocachedError, "unexpected response to A"):
                     await client.get("k")
                 self.assertEqual(

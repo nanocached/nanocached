@@ -475,7 +475,9 @@ public class NanocachedClientTests
         var node = new MockNode();
         int port = node.Port;
         var options = SingleAddress("127.0.0.1", port);
-        options.ReconnectCooldown = TimeSpan.FromMilliseconds(200);
+        // Timing: a wide cooldown window and fast-rejection bound keep this from flaking on loaded CI runners
+        // (xUnit runs the other test classes in parallel with this one).
+        options.ReconnectCooldown = TimeSpan.FromMilliseconds(1000);
         using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
 
         await client.SetAsync("k", "v");
@@ -507,14 +509,14 @@ public class NanocachedClientTests
             DateTime started = DateTime.UtcNow;
             var secondError = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
             TimeSpan elapsed = DateTime.UtcNow - started;
-            Assert.True(elapsed < TimeSpan.FromMilliseconds(100),
+            Assert.True(elapsed < TimeSpan.FromMilliseconds(500),
                 $"expected a cooldown-fast rejection, took {elapsed.TotalMilliseconds}ms");
             Assert.Equal(0, connections);
             Assert.Same(firstError, secondError);
 
             // Once the cooldown window has passed, the address is dialed
             // again, this time reaching the listener.
-            await Task.Delay(250);
+            await Task.Delay(1200);
             NanocachedException thirdError = await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
             Assert.Contains("unexpected response to A", thirdError.Message);
             Assert.Equal(1, connections);

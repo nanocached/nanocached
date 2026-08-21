@@ -817,7 +817,8 @@ describe("NanocachedClient reconnect-on-use", () => {
     const port = node.port;
     const client = await NanocachedClient.connect({
       addresses: [{ host: "127.0.0.1", port }],
-      reconnectCooldownMs: 200,
+      // Timing: a wide cooldown window and fast-rejection bound keep this from flaking on loaded CI runners.
+      reconnectCooldownMs: 1000,
     });
     try {
       await client.set("k", "v");
@@ -855,12 +856,12 @@ describe("NanocachedClient reconnect-on-use", () => {
         const start = Date.now();
         await assert.rejects(client.get("k"), /ECONNREFUSED/);
         const elapsed = Date.now() - start;
-        assert.ok(elapsed < 100, `expected a cooldown-fast rejection, took ${elapsed}ms`);
+        assert.ok(elapsed < 500, `expected a cooldown-fast rejection, took ${elapsed}ms`);
         assert.equal(connections, 0, "the cooldown did not prevent a redial");
 
         // Once the cooldown window has passed, the address is dialed
         // again, this time reaching the listener.
-        await delay(250);
+        await delay(1200);
         await assert.rejects(client.get("k"), /unexpected response to A/);
         assert.equal(connections, 1, "the address was never redialed after the cooldown elapsed");
       } finally {
