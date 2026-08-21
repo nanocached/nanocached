@@ -4,10 +4,18 @@ All notable changes to the Rust SDK are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow the `sdk/rust/vX.Y.Z` tags.
 
-## [Unreleased]
+## [0.2.0] - 2026-08-22
+
+First aligned release of the server and all six SDKs at one version.
+0.1.x were pipeline-validation releases; as a pre-1.0 line, breaking
+changes ship without a deprecation cycle and are listed below.
 
 ### Changed
 
+- **Breaking: `Client::close` is now `pub async fn`.** It drains in-flight
+  fire-and-forget replica writes before returning, so a process that
+  closes and exits no longer drops replica writes that were still being
+  sent. Callers must `.await` it (PR #48).
 - **Breaking: added `Error::Authentication`, a new variant of the `Error`
   enum.** The server rejecting the `A` handshake's secret (no secret
   configured when the server requires one, or a wrong one) used to fold
@@ -66,5 +74,5 @@ follow the `sdk/rust/vX.Y.Z` tags.
 - First tag-driven release of the aligned SDK line (see the repository
   release history for earlier changes).
 
-[Unreleased]: https://github.com/nanocached/nanocached/compare/sdk/rust/v0.1.1...HEAD
+[0.2.0]: https://github.com/nanocached/nanocached/compare/sdk/rust/v0.1.1...sdk/rust/v0.2.0
 [0.1.1]: https://github.com/nanocached/nanocached/releases/tag/sdk/rust/v0.1.1
