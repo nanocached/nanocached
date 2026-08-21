@@ -169,43 +169,44 @@ impl Cache {
         }
     }
 
-    /// A point-in-time snapshot of every non-expired entry, each with its
-    /// remaining TTL (not the original one, so a transferred entry expires
-    /// at the same wall-clock time it would have here). For ADR-0008's
-    /// migration task, to compute which of these a newly joining node now
-    /// owns. Uses `LruCache::iter`, not `get`, so listing entries doesn't
-    /// itself perturb recency.
+    /// A point-in-time snapshot of every non-expired key. For ADR-0008's
+    /// migration task: both of its consumers only ever need the key, never
+    /// a value or TTL captured here. `entries_to_send_count` (in
+    /// `src/server.rs`) filters purely on key membership in the before/
+    /// after hash rings, and `run_migration` re-peeks each key's *live*
+    /// value and TTL right before sending it (`peek_entry`, below) rather
+    /// than trusting anything captured in an earlier snapshot — a
+    /// concurrent client write between this snapshot and that key's turn
+    /// must win, so a stale value/TTL captured here would only ever be
+    /// thrown away unused. Uses `LruCache::iter`, not `get`, so listing
+    /// keys doesn't itself perturb recency.
     ///
-    /// Clones every key and value (cloning `Bytes` is cheap — a refcount
-    /// bump, not a copy — but the `Vec` itself and its iteration are
-    /// still O(entries)), and runs synchronously on the single cache
-    /// actor task (`run_cache` in `src/server.rs`), so calling this
-    /// blocks every other request the actor handles for as long as it
-    /// takes to walk the whole cache. `src/server.rs`'s `handle_connection`
-    /// (the `M` handler) takes exactly one such snapshot per migration
-    /// and reuses it for both sizing discovery's migration timeout
-    /// (`entries_to_send_count`) and the actual transfer (`run_migration`),
-    /// rather than calling this twice — halving, not eliminating, that
-    /// stall. A chunked/budgeted listing (mirroring `sweep`'s
-    /// `SWEEP_BUDGET`, see `run_sweep`) would avoid the whole-cache clone
-    /// entirely, but needs the migration protocol to support resuming a
-    /// partial listing across multiple round trips instead of one; left
-    /// as a larger follow-up rather than folded into that fix.
-    pub fn entries(&self) -> Vec<(Bytes, Bytes, Option<Duration>)> {
-        self.entries_at(Instant::now())
+    /// Used to clone every key *and* value *and* compute each one's
+    /// remaining TTL in this same synchronous walk — real work (issue
+    /// #19's audit) for data neither consumer above ever looked at once
+    /// `peek_entry` re-checks it live anyway. Now clones only the key
+    /// (cloning `Bytes` is cheap — a refcount bump, not a copy — but the
+    /// `Vec` itself and its iteration are still O(entries)), and this
+    /// still runs synchronously on the single cache actor task
+    /// (`run_cache` in `src/server.rs`), so calling this still blocks
+    /// every other request the actor handles for as long as it takes to
+    /// walk the whole cache — the walk itself isn't chunked/budgeted (that
+    /// would need the migration protocol to support resuming a partial
+    /// listing across multiple round trips instead of one; left as a
+    /// larger follow-up), only the per-entry value/TTL work it used to
+    /// also do is gone. `src/server.rs`'s `handle_connection` (the `M`
+    /// handler) takes exactly one such snapshot per migration and reuses
+    /// it for both `entries_to_send_count` and `run_migration`, rather
+    /// than calling this twice.
+    pub fn keys(&self) -> Vec<Bytes> {
+        self.keys_at(Instant::now())
     }
 
-    fn entries_at(&self, now: Instant) -> Vec<(Bytes, Bytes, Option<Duration>)> {
+    fn keys_at(&self, now: Instant) -> Vec<Bytes> {
         self.entries
             .iter()
             .filter(|(_, entry)| !entry.is_expired_at(now))
-            .map(|(key, entry)| {
-                let remaining_ttl = entry
-                    .expires_at
-                    .map(|expires_at| expires_at.saturating_duration_since(now));
-
-                (key.clone(), entry.value.clone(), remaining_ttl)
-            })
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
@@ -629,46 +630,23 @@ mod tests {
     }
 
     #[test]
-    fn entries_includes_every_stored_key_with_its_value() {
+    fn keys_includes_every_stored_key() {
         let mut cache = Cache::new(UNBOUNDED);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
 
-        let mut entries = cache.entries();
-        entries.sort_by(|(a, ..), (b, ..)| a.cmp(b));
+        let mut keys = cache.keys();
+        keys.sort();
 
         assert_eq!(
-            entries,
-            vec![
-                (Bytes::from_static(b"a"), Bytes::from_static(b"1"), None),
-                (Bytes::from_static(b"b"), Bytes::from_static(b"2"), None),
-            ]
+            keys,
+            vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")]
         );
     }
 
     #[test]
-    fn entries_reports_the_remaining_ttl_not_the_original_one() {
-        let mut cache = Cache::new(UNBOUNDED);
-
-        cache.set_with_ttl(
-            Bytes::from_static(b"name"),
-            Bytes::from_static(b"Alice"),
-            Duration::from_secs(10),
-        );
-
-        let later = Instant::now() + Duration::from_secs(4);
-        let entries = cache.entries_at(later);
-
-        assert_eq!(entries.len(), 1);
-        let (_, _, remaining_ttl) = &entries[0];
-        // 10s TTL minus the 4s that "elapsed" leaves ~6s, not the original 10s.
-        assert!(remaining_ttl.unwrap() <= Duration::from_secs(6));
-        assert!(remaining_ttl.unwrap() > Duration::from_secs(5));
-    }
-
-    #[test]
-    fn entries_excludes_expired_keys() {
+    fn keys_excludes_expired_keys() {
         let mut cache = Cache::new(UNBOUNDED);
 
         cache.set_with_ttl(
@@ -679,20 +657,20 @@ mod tests {
 
         let future = Instant::now() + Duration::from_secs(6);
 
-        assert_eq!(cache.entries_at(future), Vec::new());
+        assert_eq!(cache.keys_at(future), Vec::<Bytes>::new());
     }
 
     #[test]
-    fn entries_does_not_disturb_lru_order() {
+    fn keys_does_not_disturb_lru_order() {
         let mut cache = Cache::new(7 + 2 * ENTRY_OVERHEAD_BYTES);
 
         cache.set(Bytes::from_static(b"a"), Bytes::from_static(b"XX")); // used 3
         cache.set(Bytes::from_static(b"b"), Bytes::from_static(b"XX")); // used 6
 
-        // If listing entries touched recency the same way `get` does, "a"
+        // If listing keys touched recency the same way `get` does, "a"
         // would become most-recently-used here and survive the eviction
         // below instead of "b".
-        let _ = cache.entries();
+        let _ = cache.keys();
 
         cache.set(Bytes::from_static(b"c"), Bytes::from_static(b"XXX")); // evicts "a" (still LRU)
 

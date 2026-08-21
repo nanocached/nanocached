@@ -45,9 +45,15 @@ pub enum Response {
     /// re-fetch `L` from discovery and recompute where the key belongs,
     /// not trust this node to know or proxy the request.
     WrongNode,
-    /// Internal-only (ADR-0008), in answer to `Command::ListEntries` —
-    /// never encoded for a wire client, see `encode`.
+    /// Internal-only (ADR-0008), in answer to `Command::PeekEntry` — zero
+    /// or one entry, each with its remaining TTL. Never encoded for a wire
+    /// client, see `encode`.
     Entries(Vec<(Bytes, Bytes, Option<Duration>)>),
+    /// Internal-only (ADR-0008), in answer to `Command::ListEntries` — a
+    /// keys-only snapshot (see `Cache::keys`'s doc comment for why this
+    /// carries no values or TTLs). Never encoded for a wire client, see
+    /// `encode`.
+    Keys(Vec<Bytes>),
     /// Internal-only (ADR-0008), in answer to `Command::MarkMigrated`.
     Marked,
     /// Internal-only (ADR-0008), in answer to `Command::UnmarkMigrated`.
@@ -84,7 +90,7 @@ impl Response {
                 encoded
             }
 
-            Self::Entries(_) | Self::Marked | Self::Unmarked | Self::Swept(_) => {
+            Self::Entries(_) | Self::Keys(_) | Self::Marked | Self::Unmarked | Self::Swept(_) => {
                 unreachable!(
                     "internal-only response (ADR-0008): never sent to a wire client, only \
                      matched directly in Rust by the migration task"
