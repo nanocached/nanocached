@@ -84,7 +84,7 @@ type Config struct {
 	// shrink the value) the value is stored as-is behind the marker
 	// byte, to avoid bloating small values with compression overhead.
 	// Zero means DefaultCompressionThreshold. Only meaningful when
-	// Compress is true.
+	// Compress is true. Negative is rejected by Connect.
 	CompressionThreshold int
 	// FireAndForgetReplicas lets Set/SetBytes/Delete return as soon as
 	// the primary owner acks, letting replica legs finish in the
@@ -103,10 +103,15 @@ type Config struct {
 	// it during this window fails immediately with the original dial
 	// error instead of paying another full 5-second connect deadline
 	// redialing an address that just proved unreachable. Zero means
-	// DefaultReconnectCooldown (1s). Keep it well under nodeListStaleAfter
-	// (30s) so a node that genuinely recovers isn't shut out for long. A
-	// negative value disables the cooldown entirely — every request that
-	// finds a dead connection pays its own full dial attempt.
+	// DefaultReconnectCooldown (1s) — the zero value of Config can't
+	// distinguish "not specified" from "explicitly zero", so zero has to
+	// mean "default". Keep it well under nodeListStaleAfter (30s) so a
+	// node that genuinely recovers isn't shut out for long. A negative
+	// value disables the cooldown entirely — every request that finds a
+	// dead connection pays its own full dial attempt. This mirrors the
+	// Rust SDK's Options::reconnect_cooldown (where Duration::ZERO also
+	// means "default") and its Options::disable_reconnect_cooldown()
+	// (the equivalent of a negative value here).
 	ReconnectCooldown time.Duration
 }
 
@@ -341,6 +346,10 @@ func Connect(config Config) (*Client, error) {
 	if len(config.Addresses) == 0 {
 		return nil, fmt.Errorf("nanocached: connect() needs a non-empty addresses list")
 	}
+	if config.CompressionThreshold < 0 {
+		return nil, fmt.Errorf(
+			"nanocached: CompressionThreshold must not be negative, got %d", config.CompressionThreshold)
+	}
 
 	tlsConfig, err := buildTLSConfig(config)
 	if err != nil {
@@ -545,13 +554,14 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	return value, ok, err
 }
 
-// tryReadRepair probes every owner of key, in rank order, for a value the
-// normal read path already reported missing. The first owner that has it
-// wins: its value is returned, and a best-effort write repairs the primary
-// in the background (doc/adr/0015-*.md) with readRepairTTL. The background
-// write is bounded and drained exactly like a fire-and-forget replica
-// write: it takes a backgroundReplicaSem slot and is tracked on
-// backgroundReplicaWG so Close() waits for it, and no more than
+// tryReadRepair probes the remaining owners of key — every owner but the
+// primary, which the normal read path already probed and got a clean miss
+// from — in rank order, for a value. The first one that has it wins: its
+// value is returned, and a best-effort write repairs the primary in the
+// background (doc/adr/0015-*.md) with readRepairTTL. The background write
+// is bounded and drained exactly like a fire-and-forget replica write: it
+// takes a backgroundReplicaSem slot and is tracked on backgroundReplicaWG
+// so Close() waits for it, and no more than
 // maxInFlightBackgroundReplicaWrites run at once. Past the cap the repair
 // for this miss is simply skipped — it's opportunistic, so a later miss
 // repairs the key instead, and it must never add latency or unbounded
@@ -561,7 +571,10 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 // counted in Stats().ReadRepairFailures.
 func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 	names := c.ownerNames(key)
-	for _, name := range names {
+	if len(names) == 0 {
+		return nil, false
+	}
+	for _, name := range names[1:] {
 		v, found, err := c.get(name, key)
 		if err != nil || !found {
 			continue

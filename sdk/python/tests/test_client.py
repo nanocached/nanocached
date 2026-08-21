@@ -607,6 +607,29 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_an_unverified_untagged_trailing_byte_poisons_the_connection(self):
+        # Audit finding: the untagged fast path read the trailing byte
+        # after S/D/N/W with readexactly(1) but never checked it was
+        # `\n`. The TypeScript SDK's protocol.ts already validates this
+        # (tryParseResponse) and raises a desync error; mirror that here
+        # instead of silently accepting a tagged-shaped reply (`S1\n`) on
+        # an untagged connection.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                node.answer_malformed_status_once()
+                with self.assertRaisesRegex(ConnectionError, "desynced"):
+                    await client.get("k")
+
+                # The poisoned connection redials transparently on next use.
+                self.assertIsNone(await client.get("k"))
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
     async def test_a_cancelled_request_does_not_poison_the_connection(self):
         # doc/adr/0016-*.md: pipelining leaves an abandoned request
         # (asyncio.wait_for) in the pending queue rather than removing
@@ -1742,6 +1765,56 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 0,
                 "a programming error must not be counted as a swallow",
             )
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+    async def test_a_replica_bug_propagates_when_the_primary_also_fails(self):
+        # Issue #3 (audit finding): when the primary leg fails with a
+        # swallowable error (here, a dead node the retry layer would
+        # otherwise just redial around) *and* a replica leg raises a
+        # genuine programming bug, the bug must not be buried in a
+        # stderr warning behind the primary's own — comparatively
+        # mundane — failure; it must propagate instead. Mirrors the
+        # TypeScript SDK's writeToOwners (`replicaBug ? replicaBug.reason
+        # : primary.error` — see its own comment for the reasoning: a
+        # replica-leg bug is a strictly worse sign than an error this SDK
+        # already treats as swallowable at every other by-design swallow
+        # site).
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "both-legs-fail"
+            primary, replica = self.owners_of(key)
+
+            # Establish real connections to both owners first...
+            await client.set(key, "v")
+
+            # ...then kill the primary's node outright, so the primary
+            # leg fails with a swallowable connection error (ECONNREFUSED
+            # on redial) instead of succeeding...
+            await nodes[primary].close()
+            await wait_for(
+                lambda: client._members[primary].connection.closed,
+                "the client to see the FIN",
+            )
+
+            # ...and stub the replica's own connection to simulate a bug
+            # in this SDK's own code.
+            replica_connection = client._members[replica].connection
+
+            async def boom(key: bytes, value: bytes, ttl_seconds: int) -> None:
+                raise TypeError("injected programming bug")
+
+            replica_connection.set = boom
+
+            with self.assertRaisesRegex(TypeError, "injected programming bug"):
+                await client.set(key, "v2")
         finally:
             await client.close()
             await discovery.close()

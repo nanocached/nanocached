@@ -1029,6 +1029,18 @@ func TestWireFormatIsUntouchedWhenCompressIsOff(t *testing.T) {
 	}
 }
 
+func TestConnectRejectsANegativeCompressionThreshold(t *testing.T) {
+	node := startMockNode(t, nil)
+	_, err := Connect(Config{
+		Addresses:            []Address{addr(node.address())},
+		Compress:             true,
+		CompressionThreshold: -1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "CompressionThreshold must not be negative") {
+		t.Fatalf("Connect with a negative CompressionThreshold = %v, want a rejection", err)
+	}
+}
+
 func TestCompressesAtOrAboveTheThresholdAndDecompressesBack(t *testing.T) {
 	node := startMockNode(t, nil)
 	client, err := Connect(Config{
@@ -2049,6 +2061,12 @@ func TestReadRepairFindsAValueOnAReplicaAndRepairsThePrimary(t *testing.T) {
 		t.Fatalf("GetBytes = %q, %v, %v", value, ok, err)
 	}
 
+	// The primary must not be re-probed by read repair — it already
+	// missed once on the normal read path.
+	if got := nodes[owners[0]].getCount.Load(); got != 1 {
+		t.Fatalf("primary getCount = %d, want 1 (read repair must not re-probe it)", got)
+	}
+
 	if !waitUntil(t, 2*time.Second, func() bool { return nodes[owners[0]].hasKey(key) }) {
 		t.Fatal("the primary was never repaired")
 	}
@@ -2058,7 +2076,8 @@ func TestReadRepairFindsAValueOnAReplicaAndRepairsThePrimary(t *testing.T) {
 }
 
 func TestReadRepairStaysACleanMissWhenNoOwnerHasTheValue(t *testing.T) {
-	_, discovery := startCluster(t, 2)
+	nodes, discovery := startCluster(t, 2)
+	owners := ownersOf("nowhere")
 	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
 	if err != nil {
 		t.Fatal(err)
@@ -2068,6 +2087,14 @@ func TestReadRepairStaysACleanMissWhenNoOwnerHasTheValue(t *testing.T) {
 	_, ok, err := client.GetBytes("nowhere")
 	if err != nil || ok {
 		t.Fatalf("GetBytes = ok=%v err=%v, want a clean miss", ok, err)
+	}
+
+	// Every owner is probed exactly once: the primary by the normal read
+	// path, the rest by read repair — never the primary twice.
+	for _, name := range owners {
+		if got := nodes[name].getCount.Load(); got != 1 {
+			t.Fatalf("owner %s getCount = %d, want exactly 1", name, got)
+		}
 	}
 }
 

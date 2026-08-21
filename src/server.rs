@@ -5,10 +5,11 @@ use crate::response::Response;
 use bytes::{Bytes, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::io::BufReader;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,19 @@ use uuid::Uuid;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
+/// Coarse cap on how many live connections a single source IP may hold at
+/// once, layered under the global `MAX_CONNECTIONS` semaphore (issue: no
+/// per-source-IP limit — a single misbehaving or compromised peer could
+/// otherwise claim the entire `MAX_CONNECTIONS` budget by itself,
+/// starving every other client, without the global semaphore ever
+/// reporting anything unusual). Deliberately coarse, not a tight
+/// per-client budget: a pooled application host — many worker processes
+/// or threads sharing one egress IP, or a fleet behind one NAT — can
+/// legitimately hold a large number of concurrent connections to this
+/// cache, and this guard exists only to stop one source from
+/// monopolising the whole server, not to bound ordinary legitimate
+/// concurrency. See `try_acquire_per_ip`.
+const MAX_CONNECTIONS_PER_IP: usize = 256;
 /// Default for `--max-memory` (issue #19): the cap was previously a fixed
 /// constant with no way to tune it, even though the capacity planner
 /// (`tools/capacity-planner.html`) already modeled capacity as a function
@@ -104,6 +118,9 @@ const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// bounds instead, since it already retries per `KEY_TRANSFER_ATTEMPTS`
 /// and stalling it doesn't hold a client's connection open.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `run`'s accept loop pauses after an accept error worth
+/// backing off from — see `should_backoff_after_accept_error`.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const READ_CHUNK_SIZE: usize = 1024;
 /// How many times `run_migration` tries to transfer a single key to the
 /// joining node (reconnecting between tries) before giving up on the
@@ -392,6 +409,25 @@ fn is_fd_exhaustion(error: &io::Error) -> bool {
     }
 }
 
+/// Whether `run`'s accept loop should pause briefly (`ACCEPT_ERROR_BACKOFF`,
+/// below) after `error` rather than immediately retrying `accept`. On Unix
+/// this is exactly `is_fd_exhaustion`: any other accept failure there
+/// (`ECONNABORTED` and friends) is typically a one-off, per-connection
+/// condition safe to retry right away. `is_fd_exhaustion` is hard-coded
+/// `false` on non-Unix targets (no portable stable `ErrorKind` for the
+/// underlying errno — see its own doc comment), which would otherwise
+/// leave every accept error on those targets retried with *no* backoff at
+/// all — including a persistent one (the process genuinely is out of
+/// descriptors, or some other sustained condition), busy-looping this
+/// branch hot instead of ever yielding. Back off on every accept error on
+/// non-Unix instead: more conservative than Unix's precise check (an
+/// occasional one-off failure there now also pays the pause), but a
+/// bounded 100ms delay per failed accept is a small cost to avoid an
+/// unbounded busy-loop on a sustained one.
+fn should_backoff_after_accept_error(error: &io::Error) -> bool {
+    is_fd_exhaustion(error) || cfg!(not(unix))
+}
+
 async fn shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -422,6 +458,7 @@ pub(crate) async fn run(
 
     let (request_tx, request_rx) = mpsc::channel(1024);
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -545,13 +582,17 @@ pub(crate) async fn run(
                         // condition. Log and keep the loop running instead.
                         eprintln!("WARN accept failed: {error}");
 
-                        // EMFILE/ENFILE mean this process (or the system)
-                        // is out of file descriptors; looping straight
-                        // back to `accept` would spin this branch hot
-                        // until one frees up, so back off briefly rather
-                        // than busy-looping.
-                        if is_fd_exhaustion(&error) {
-                            sleep(Duration::from_millis(100)).await;
+                        // EMFILE/ENFILE (Unix) mean this process (or the
+                        // system) is out of file descriptors; looping
+                        // straight back to `accept` would spin this
+                        // branch hot until one frees up, so back off
+                        // briefly rather than busy-looping. Non-Unix
+                        // targets can't identify that specific condition
+                        // (see `is_fd_exhaustion`) and back off on every
+                        // accept error instead — see
+                        // `should_backoff_after_accept_error`.
+                        if should_backoff_after_accept_error(&error) {
+                            sleep(ACCEPT_ERROR_BACKOFF).await;
                         }
 
                         continue;
@@ -563,6 +604,7 @@ pub(crate) async fn run(
                     address,
                     request_tx.clone(),
                     Arc::clone(&connection_limit),
+                    Arc::clone(&per_ip_connections),
                     connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
@@ -615,11 +657,99 @@ pub(crate) async fn run(
     Ok(())
 }
 
+/// Live connection counts per source IP, backing `MAX_CONNECTIONS_PER_IP`
+/// (see that constant). A plain `Mutex<HashMap<..>>` rather than anything
+/// fancier: every access here is a brief increment/decrement with no I/O
+/// under the lock, and every accepted connection already pays for a
+/// `Semaphore` acquisition on the shared `connection_limit`, so this adds
+/// no bottleneck relative to that existing one.
+type PerIpConnections = Arc<Mutex<HashMap<IpAddr, usize>>>;
+
+/// Releases one `MAX_CONNECTIONS_PER_IP` slot on drop — the per-IP
+/// counterpart to the `Semaphore` permit `dispatch_connection` already
+/// holds for `MAX_CONNECTIONS` (`_connection_permit`, which frees itself
+/// the same way).
+struct PerIpConnectionGuard {
+    counts: PerIpConnections,
+    ip: IpAddr,
+}
+
+impl Drop for PerIpConnectionGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                // Don't let a long-lived server accumulate one entry per
+                // distinct IP that has ever connected, most of which will
+                // never connect again.
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Reserves one of `MAX_CONNECTIONS_PER_IP` slots for `ip`, or `None` if
+/// it's already at the cap — see `MAX_CONNECTIONS_PER_IP`.
+fn try_acquire_per_ip(counts: &PerIpConnections, ip: IpAddr) -> Option<PerIpConnectionGuard> {
+    let mut guard = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let count = guard.entry(ip).or_insert(0);
+    if *count >= MAX_CONNECTIONS_PER_IP {
+        return None;
+    }
+    *count += 1;
+    drop(guard);
+
+    Some(PerIpConnectionGuard {
+        counts: Arc::clone(counts),
+        ip,
+    })
+}
+
+/// Best-effort "Busy" reply on `stream` before the caller drops it —
+/// shared by every over-limit rejection in `dispatch_connection`
+/// (`MAX_CONNECTIONS` and, per source IP, `MAX_CONNECTIONS_PER_IP`). A
+/// TLS-configured server has no plaintext channel to answer on before the
+/// handshake completes (ADR-0006: no plaintext fallback once TLS is set)
+/// — it just closes. A plaintext server can still reply on the raw
+/// stream. Bounded by `TLS_HANDSHAKE_TIMEOUT` (reused rather than a new
+/// constant: a peer that never reads this reply must not leak the task by
+/// leaving the write pending indefinitely — the same reasoning as the
+/// handshake itself).
+async fn reject_over_limit(
+    mut stream: TcpStream,
+    address: SocketAddr,
+    tls_acceptor: &Option<TlsAcceptor>,
+) {
+    if tls_acceptor.is_none() {
+        let busy = Response::Busy.encode();
+
+        match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(&busy)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("WARN failed to send busy response to {address}: {error}");
+            }
+            Err(_) => {
+                eprintln!("WARN sending busy response to {address} timed out");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_connection(
     stream: TcpStream,
     address: SocketAddr,
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
+    per_ip_connections: PerIpConnections,
     config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
@@ -641,29 +771,21 @@ fn dispatch_connection(
         let permit = match connection_limit.try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                // A TLS-configured server has no plaintext channel to
-                // answer "Busy" on before the handshake completes
-                // (ADR-0006: no plaintext fallback once TLS is set) — it
-                // just closes. A plaintext server can still reply on the
-                // raw stream.
-                if config.tls_acceptor.is_none() {
-                    let busy = Response::Busy.encode();
-                    let mut stream = stream;
+                reject_over_limit(stream, address, &config.tls_acceptor).await;
+                return;
+            }
+        };
 
-                    // Bound the write: a peer that never reads must not
-                    // leak this task by leaving the write pending
-                    // indefinitely.
-                    match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(&busy)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            eprintln!("WARN failed to send busy response to {address}: {error}");
-                        }
-                        Err(_) => {
-                            eprintln!("WARN sending busy response to {address} timed out");
-                        }
-                    }
-                }
-
+        // No per-source-IP connection limit: without this, a single
+        // source could hold `MAX_CONNECTIONS` connections all by itself
+        // and starve every other client, even though the global
+        // semaphore above isn't literally exhausted until the very last
+        // one. Reserved before the TLS handshake for the same reason as
+        // the global permit (issue #5) — see `MAX_CONNECTIONS_PER_IP`.
+        let per_ip_permit = match try_acquire_per_ip(&per_ip_connections, address.ip()) {
+            Some(permit) => permit,
+            None => {
+                reject_over_limit(stream, address, &config.tls_acceptor).await;
                 return;
             }
         };
@@ -686,6 +808,7 @@ fn dispatch_connection(
         println!("INFO accepted connection from {address}");
 
         let _connection_permit = permit;
+        let _per_ip_permit = per_ip_permit;
 
         if let Err(error) =
             handle_connection(stream, address, request_tx, config, shutdown_rx).await
@@ -889,8 +1012,8 @@ async fn handle_connection(
                 };
 
                 // doc/adr/0017-*.md: sizes discovery's migration timeout.
-                // Issue (perf): one `list_entries` snapshot here, reused
-                // by both `entries_to_send_count` (for this count) and
+                // Issue (perf): one `list_keys` snapshot here, reused by
+                // both `entries_to_send_count` (for this count) and
                 // `run_migration` (for the actual transfer) below,
                 // instead of each independently cloning the whole cache —
                 // see `entries_to_send_count`'s own comment. `None` if
@@ -898,10 +1021,10 @@ async fn handle_connection(
                 // safe default for the count here since `run_migration`
                 // independently checks for the same `None` and aborts on
                 // its own.
-                let entries_snapshot = list_entries(&node_context.request_tx).await;
-                let entries_to_send = entries_snapshot.as_deref().map_or(0, |entries| {
+                let keys_snapshot = list_keys(&node_context.request_tx).await;
+                let entries_to_send = keys_snapshot.as_deref().map_or(0, |keys| {
                     entries_to_send_count(
-                        entries,
+                        keys,
                         &before_ring,
                         &after_ring,
                         &node_context.name,
@@ -940,7 +1063,7 @@ async fn handle_connection(
                         before_ring,
                         after_ring,
                         migration_guard,
-                        entries_snapshot,
+                        keys_snapshot,
                     )))
                     .await;
 
@@ -1037,14 +1160,23 @@ async fn handle_connection(
                 // moving to a joining node — see `migration_target_for`.
                 if let Some(node_context) = &config.node_context
                     && let Some(target) = migration_target_for(node_context, &key)
-                    && let Err(error) =
-                        set_on_joining_node(node_context, &target, &key, &value, ttl).await
                 {
-                    eprintln!(
-                        "WARN failed to forward a concurrent SET for a migrating key to \
-                         {}: {error}",
-                        target.addr
-                    );
+                    // Handed to `run`'s own loop via `migration_tx`
+                    // (mirroring the `M` handler above), not awaited
+                    // inline — see `forward_with_retries`'s own doc
+                    // comment for why.
+                    let _ = config
+                        .migration_tx
+                        .send(Box::pin(forward_with_retries(
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Set {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                            },
+                        )))
+                        .await;
                 }
 
                 continue;
@@ -1064,13 +1196,15 @@ async fn handle_connection(
 
                 if let Some(node_context) = &config.node_context
                     && let Some(target) = migration_target_for(node_context, &key)
-                    && let Err(error) = delete_on_joining_node(node_context, &target, &key).await
                 {
-                    eprintln!(
-                        "WARN failed to forward a concurrent DELETE for a migrating key to \
-                         {}: {error}",
-                        target.addr
-                    );
+                    let _ = config
+                        .migration_tx
+                        .send(Box::pin(forward_with_retries(
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Delete { key: key.clone() },
+                        )))
+                        .await;
                 }
 
                 continue;
@@ -1812,17 +1946,18 @@ fn migration_rings(
     (HashRing::new(before_members), HashRing::new(after_members))
 }
 
-/// doc/adr/0017-*.md: counts how many of `entries` this node will
-/// actually send to the joining node, mirroring the sender/displaced
-/// predicate `run_migration` computes for real (the old primary for a
-/// key is the one designated sender — a key can be affected by the join
-/// without this node being the one that sends it). Purely to size
-/// discovery's migration timeout — not a transfer plan.
+/// doc/adr/0017-*.md: counts how many of `keys` this node will actually
+/// send to the joining node, mirroring the sender/displaced predicate
+/// `run_migration` computes for real (the old primary for a key is the
+/// one designated sender — a key can be affected by the join without
+/// this node being the one that sends it). Purely to size discovery's
+/// migration timeout — not a transfer plan.
 ///
-/// Takes `entries` (a `list_entries` snapshot) rather than fetching its
-/// own: this and `run_migration`'s own transfer loop used to each call
-/// `list_entries` independently — two full clones of the cache off of
-/// the single-threaded cache actor per `M`, back to back, each blocking
+/// Takes `keys` (a `list_keys` snapshot) rather than fetching its own:
+/// this and `run_migration`'s own transfer loop used to each call
+/// `list_entries` (then a full key+value+TTL clone, see `Cache::keys`'s
+/// doc comment) independently — two full clones of the cache off of the
+/// single-threaded cache actor per `M`, back to back, each blocking
 /// every other request the actor handles for its duration. `M`'s caller
 /// (`handle_connection`) now takes one snapshot and passes it to both,
 /// halving that stall. This does mean a concurrent write racing the
@@ -1835,16 +1970,15 @@ fn migration_rings(
 /// migration protocol to support resuming a partial listing — a larger
 /// change than this bug fix warrants.
 fn entries_to_send_count(
-    entries: &[(Bytes, Bytes, Option<Duration>)],
+    keys: &[Bytes],
     before_ring: &HashRing,
     after_ring: &HashRing,
     self_name: &str,
     joining_name: &str,
     replication: usize,
 ) -> usize {
-    entries
-        .iter()
-        .filter(|(key, _, _)| {
+    keys.iter()
+        .filter(|key| {
             after_ring.is_owner(key, joining_name, replication)
                 && before_ring.owners(key, replication).first() == Some(&self_name)
         })
@@ -1894,12 +2028,15 @@ fn entries_to_send_count(
 /// be reported on the same ack instead of the caller being told
 /// `MigrationAccepted` and then silently getting nothing.
 ///
-/// Also takes `entries` already fetched by `handle_connection` (the same
-/// `list_entries` snapshot it used to compute `entries_to_send_count`),
+/// Also takes `keys` already fetched by `handle_connection` (the same
+/// `list_keys` snapshot it used to compute `entries_to_send_count`),
 /// rather than fetching its own — see `entries_to_send_count`'s comment
 /// on why one snapshot is now shared instead of each side cloning the
 /// whole cache independently. `None` here means the cache task was
-/// already unavailable when `handle_connection` took the snapshot.
+/// already unavailable when `handle_connection` took the snapshot. Only
+/// ever the key of each candidate entry (never a value or TTL, see
+/// `Cache::keys`'s doc comment): this loop re-peeks the live value/TTL
+/// for every key it actually sends, below.
 #[allow(clippy::too_many_arguments)]
 async fn run_migration(
     node_context: NodeContext,
@@ -1909,12 +2046,12 @@ async fn run_migration(
     before_ring: HashRing,
     after_ring: Arc<HashRing>,
     migration_guard: MigrationGuard,
-    entries: Option<Vec<(Bytes, Bytes, Option<Duration>)>>,
+    keys: Option<Vec<Bytes>>,
 ) {
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 
-    let entries = match entries {
-        Some(entries) => entries,
+    let keys = match keys {
+        Some(keys) => keys,
         None => {
             eprintln!("WARN migration to {joining_name} aborted: cache task is unavailable");
             return;
@@ -1927,7 +2064,7 @@ async fn run_migration(
 
     let self_name = node_context.name.as_str();
 
-    for (key, _, _) in entries {
+    for key in keys {
         if migration_guard.abort_requested.load(Ordering::SeqCst) {
             break;
         }
@@ -2070,9 +2207,7 @@ async fn run_migration(
     migration_guard.completed(sent_count);
 }
 
-async fn list_entries(
-    request_tx: &mpsc::Sender<CacheRequest>,
-) -> Option<Vec<(Bytes, Bytes, Option<Duration>)>> {
+async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Bytes>> {
     let (response_tx, response_rx) = oneshot::channel();
 
     request_tx
@@ -2084,7 +2219,7 @@ async fn list_entries(
         .ok()?;
 
     match response_rx.await.ok()? {
-        Response::Entries(entries) => Some(entries),
+        Response::Keys(keys) => Some(keys),
         _ => None,
     }
 }
@@ -2349,6 +2484,51 @@ impl ForwardedWrite<'_> {
     }
 }
 
+/// Owned counterpart to `ForwardedWrite`, for a forward that must outlive
+/// the client connection task that triggered it. `handle_connection`'s
+/// `S`/`D` handling hands one of these to `forward_with_retries`, which
+/// (see that function's own doc comment) is spawned via `migration_tx`
+/// rather than run inline — a spawned `MigrationTask` is `'static`, so it
+/// can't borrow `key`/`value` off `handle_connection`'s own stack frame
+/// the way the single-shot `ForwardedWrite` does.
+enum OwnedForwardedWrite {
+    Set {
+        key: Bytes,
+        value: Bytes,
+        ttl: Option<Duration>,
+    },
+    Delete {
+        key: Bytes,
+    },
+}
+
+impl OwnedForwardedWrite {
+    /// Attempts this write once via `set_on_joining_node`/
+    /// `delete_on_joining_node` — the same single-attempt primitives
+    /// `forward_with_retries` used to call directly, now wrapped in its
+    /// retry loop instead of replaced by a new code path.
+    async fn attempt(&self, node_context: &NodeContext, target: &ForwardTarget) -> io::Result<()> {
+        match self {
+            OwnedForwardedWrite::Set { key, value, ttl } => {
+                set_on_joining_node(node_context, target, key, value, *ttl).await
+            }
+            OwnedForwardedWrite::Delete { key } => {
+                delete_on_joining_node(node_context, target, key).await
+            }
+        }
+    }
+
+    /// Names the write kind for the WARN logs `forward_with_retries`
+    /// emits — mirrors the `SET`/`DELETE` wire command letters informally,
+    /// not the actual `S`/`D` protocol bytes.
+    fn kind(&self) -> &'static str {
+        match self {
+            OwnedForwardedWrite::Set { .. } => "SET",
+            OwnedForwardedWrite::Delete { .. } => "DELETE",
+        }
+    }
+}
+
 /// The one place a forwarded write touches `ForwardTarget::connection`:
 /// takes the shared connection (dialing it if there is none), sends
 /// `write` on it, and — crucially — resets the slot to `None` whenever
@@ -2407,6 +2587,68 @@ async fn forward_on_shared_connection(
             Err(timed_out())
         }
     }
+}
+
+/// Retries a forwarded write's `forward_on_shared_connection` call up to
+/// `KEY_TRANSFER_ATTEMPTS` times — the same budget `run_migration`'s bulk
+/// transfer gives each key (see `KEY_TRANSFER_ATTEMPTS`). Previously the
+/// concurrent-write forward path (`handle_connection`'s `S`/`D` handling,
+/// via `set_on_joining_node`/`delete_on_joining_node`) called
+/// `forward_on_shared_connection` exactly once and only logged on
+/// failure, unlike the bulk transfer's own per-key retry loop — a single
+/// transient failure on the shared forwarding connection (a reset TCP
+/// connection, a joining node that's momentarily too busy to ack) would
+/// permanently drop a concurrent client's write, even though the exact
+/// same blip is tolerated during the bulk handoff.
+///
+/// Spawned via `migration_tx` (mirroring how the `M` handler already
+/// hands `run_migration` itself to `run`'s own loop — see
+/// `ConnectionConfig::migration_tx`) rather than awaited inline in
+/// `handle_connection`, which is where `set_on_joining_node`/
+/// `delete_on_joining_node` used to be called from directly.
+/// `forward_on_shared_connection` is deliberately bounded to a single
+/// `FORWARD_TIMEOUT` specifically so a client's connection is never
+/// stalled by more than one multiple of it (see that constant's own doc
+/// comment, which spells out the same "worst case: one multiple, not
+/// several" reasoning this respects); retrying it up to
+/// `KEY_TRANSFER_ATTEMPTS` times *inline*, the way this now does to match
+/// `run_migration`'s own per-key resilience, would multiply that worst
+/// case by up to 3x and hold up every command queued behind it on this
+/// connection. Running the retries in the background — the client's own
+/// `S`/`D` response was already written before this is spawned — keeps
+/// this connection's stall at zero while still giving the forward the
+/// same retry budget the bulk transfer gets. The trade-off: a client that
+/// immediately re-reads the same key from a *different* node than the one
+/// this forward eventually reaches can observe a brief window where the
+/// forward hasn't landed yet — already true of the single-attempt design
+/// this replaces (see `forwarding_grace`, which exists precisely because
+/// that window isn't instant), just now bounded by up to
+/// `KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT` instead of one.
+async fn forward_with_retries(
+    node_context: NodeContext,
+    target: ForwardTarget,
+    write: OwnedForwardedWrite,
+) {
+    for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+        match write.attempt(&node_context, &target).await {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!(
+                    "WARN failed to forward a concurrent {} for a migrating key to {} \
+                     (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}",
+                    write.kind(),
+                    target.addr
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "WARN permanently failed to forward a concurrent {} for a migrating key to {} after \
+         {KEY_TRANSFER_ATTEMPTS} attempts",
+        write.kind(),
+        target.addr
+    );
 }
 
 /// This node's own current view of cluster membership, if it has one yet
@@ -2953,6 +3195,69 @@ mod tests {
         joining_task.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_with_retries_recovers_from_a_single_transient_failure() {
+        // Regression: a concurrent client SET/DELETE forwarded to a
+        // joining node mid-migration used to call
+        // `forward_on_shared_connection` exactly once (via
+        // `set_on_joining_node`/`delete_on_joining_node`) — unlike
+        // `run_migration`'s own bulk transfer, which retries each key up
+        // to `KEY_TRANSFER_ATTEMPTS` times. A single transient failure on
+        // the shared forwarding connection (e.g. the joining node resets
+        // it) would silently and permanently drop the client's write.
+        // `forward_with_retries` must retry with the same budget and
+        // succeed once a later attempt lands.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+
+        let joining_task = tokio::spawn(async move {
+            // First attempt: accept, then drop the connection without
+            // ever acknowledging the SET — a transient failure.
+            let (first, _) = joining_listener.accept().await.unwrap();
+            drop(first);
+
+            // Second attempt (the retry, on a fresh connection — the
+            // shared slot is cleared on failure, see
+            // `forward_on_shared_connection`): actually acknowledge it.
+            let (mut second, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = second.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0);
+            second.write_all(b"S\n").await.unwrap();
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+        };
+
+        let target = ForwardTarget {
+            addr: joining_addr,
+            connection: Arc::new(AsyncMutex::new(None)),
+        };
+
+        // If this never retried, the joining task would hang forever
+        // waiting for its second `accept` and this test would time out.
+        forward_with_retries(
+            node_context,
+            target,
+            OwnedForwardedWrite::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        joining_task.await.unwrap();
+    }
+
     #[test]
     fn maximum_request_size_is_one_mebibyte() {
         assert_eq!(MAX_REQUEST_SIZE, 1_048_576);
@@ -2980,6 +3285,36 @@ mod tests {
         )));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn should_backoff_after_accept_error_matches_fd_exhaustion_on_unix() {
+        // On Unix the two checks are meant to agree exactly: fd exhaustion
+        // (and nothing else) is worth backing off from.
+        assert!(should_backoff_after_accept_error(
+            &io::Error::from_raw_os_error(24) // EMFILE
+        ));
+        assert!(!should_backoff_after_accept_error(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn should_backoff_after_accept_error_backs_off_on_every_error_on_non_unix() {
+        // Regression: `is_fd_exhaustion` is hard-coded `false` off Unix
+        // (no portable errno check for EMFILE/ENFILE there), which used
+        // to mean the accept loop's backoff never triggered on non-Unix
+        // targets at all — a sustained accept failure would busy-loop
+        // instead of yielding. Every accept error must back off there,
+        // not just the ones `is_fd_exhaustion` can't even recognize.
+        assert!(!is_fd_exhaustion(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
+        assert!(should_backoff_after_accept_error(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
+    }
+
     #[test]
     fn request_size_below_limit_is_allowed() {
         assert!(!request_is_too_large(MAX_REQUEST_SIZE - 1));
@@ -2998,6 +3333,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_connection_when_connection_limit_is_reached() {
         let connection_limit = Arc::new(Semaphore::new(1));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let (request_tx, _request_rx) = mpsc::channel(1);
 
         let (_first_client, first_server) = tcp_pair().await;
@@ -3011,6 +3347,7 @@ mod tests {
             first_address,
             request_tx.clone(),
             Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -3035,6 +3372,7 @@ mod tests {
             second_address,
             request_tx.clone(),
             Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -3060,6 +3398,122 @@ mod tests {
 
         assert!(connection_tasks.is_empty());
         assert_eq!(connection_limit.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_connection_when_the_per_ip_connection_limit_is_reached() {
+        // Regression: `MAX_CONNECTIONS` alone lets a single source IP hold
+        // every one of the global permits by itself, starving every other
+        // client, without the global semaphore ever reporting anything
+        // unusual short of the very last permit. `MAX_CONNECTIONS_PER_IP`
+        // must reject a source once it individually reaches its own cap,
+        // independent of how much global headroom remains.
+        let connection_limit = Arc::new(Semaphore::new(10));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let (request_tx, _request_rx) = mpsc::channel(1);
+
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // Stands in for `MAX_CONNECTIONS_PER_IP - 1` other already-live
+        // connections from this IP, without actually dispatching that
+        // many for the test.
+        per_ip_connections
+            .lock()
+            .unwrap()
+            .insert(ip, MAX_CONNECTIONS_PER_IP - 1);
+
+        let (_first_client, first_server) = tcp_pair().await;
+        let first_address = SocketAddr::new(ip, 9000);
+
+        let mut connection_tasks = JoinSet::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        dispatch_connection(
+            first_server,
+            first_address,
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        );
+
+        // Let the task run far enough to reserve its per-IP slot and
+        // settle into its read loop — this is the connection that fills
+        // the cap exactly.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            per_ip_connections.lock().unwrap().get(&ip).copied(),
+            Some(MAX_CONNECTIONS_PER_IP)
+        );
+
+        let (mut second_client, second_server) = tcp_pair().await;
+        let second_address = SocketAddr::new(ip, 9001);
+
+        dispatch_connection(
+            second_server,
+            second_address,
+            request_tx.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+            &mut connection_tasks,
+        );
+
+        // Reading to EOF drives the over-limit task to completion: it
+        // replies "Busy" and closes without acquiring a per-IP slot.
+        let mut response = Vec::new();
+        second_client.read_to_end(&mut response).await.unwrap();
+
+        assert_eq!(response, b"B\n");
+        assert_eq!(
+            per_ip_connections.lock().unwrap().get(&ip).copied(),
+            Some(MAX_CONNECTIONS_PER_IP),
+            "the rejected connection must not have reserved a slot"
+        );
+        // The global limit was never the bottleneck here.
+        assert!(connection_limit.available_permits() >= 8);
+
+        connection_tasks.abort_all();
+
+        while connection_tasks.join_next().await.is_some() {}
+    }
+
+    #[test]
+    fn try_acquire_per_ip_denies_once_the_cap_is_reached_and_frees_the_slot_on_drop() {
+        let counts: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            guards.push(try_acquire_per_ip(&counts, ip).expect("under the per-IP cap"));
+        }
+
+        assert!(
+            try_acquire_per_ip(&counts, ip).is_none(),
+            "the per-IP cap must reject a connection once MAX_CONNECTIONS_PER_IP is reached"
+        );
+
+        // A different source IP has its own, independent budget.
+        let other_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert!(try_acquire_per_ip(&counts, other_ip).is_some());
+
+        // Dropping one guard frees its slot for the same IP again.
+        guards.pop();
+        assert!(try_acquire_per_ip(&counts, ip).is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3533,7 +3987,7 @@ mod tests {
         )
         .unwrap_new();
 
-        let entries = list_entries(&request_tx).await;
+        let keys = list_keys(&request_tx).await;
 
         run_migration(
             node_context.clone(),
@@ -3543,7 +3997,7 @@ mod tests {
             before_ring,
             after_ring,
             migration_guard,
-            entries,
+            keys,
         )
         .await;
 
@@ -5228,6 +5682,7 @@ mod tests {
         let (request_tx, request_rx) = mpsc::channel(1);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
         let connection_limit = Arc::new(Semaphore::new(1));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let config = ConnectionConfig {
@@ -5247,6 +5702,7 @@ mod tests {
                 peer_addr,
                 request_tx,
                 connection_limit,
+                per_ip_connections,
                 config,
                 shutdown_rx,
                 &mut connection_tasks,

@@ -8,6 +8,19 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Changed
 
+- **Breaking: `Options::reconnect_cooldown(Duration::ZERO)` now means "use
+  the default" (1s) instead of disabling the cooldown.** This aligns the
+  Rust SDK with the Go SDK, whose zero-value `Config.ReconnectCooldown`
+  can't distinguish "not specified" from "explicitly zero" and so has
+  always treated zero as "default". To disable the cooldown, call the new
+  `Options::disable_reconnect_cooldown()` instead (the Go SDK's
+  equivalent is a negative `Config.ReconnectCooldown`). Anyone who was
+  passing `Duration::ZERO` to disable the cooldown must switch to
+  `disable_reconnect_cooldown()`.
+- Read repair (`Options::read_repair(true)`) no longer re-probes the
+  primary on a clean miss — it already missed there on the normal read
+  path. It now probes only the remaining owners, matching its
+  documentation and saving one redundant `G` per repaired miss.
 - **MSRV raised from 1.75 to 1.85.** The declared `rust-version = "1.75"`
   was never a real floor: `zeroize` 1.9 (pulled in through `rustls` by the
   default `tls` feature) requires edition 2024, i.e. Cargo 1.85 or newer.
@@ -16,6 +29,21 @@ follow the `sdk/rust/vX.Y.Z` tags.
 - The crate declares an empty `[workspace]` so Cargo no longer walks up
   to the repository-root server manifest when building from a checkout
   (PR #52). No effect on consumers from crates.io.
+
+### Fixed
+
+- `Options::auth_secret("")` now normalizes to no secret (`None`),
+  matching the other SDKs. Previously it sent an explicit zero-length
+  secret on the wire, which the server rejects as `EmptySecret` and
+  closes without replying — surfacing as an opaque `ConnectionLost`
+  instead of connecting as if no `auth_secret` had been given at all.
+
+### Performance
+
+- `HashRing::owners` (used on every routing decision, under the client's
+  routing lock) now selects just the top `replicas` nodes instead of
+  fully sorting the whole node list — `O(n)` average instead of
+  `O(n log n)` in the cluster size. Output is unchanged.
 
 ## [0.1.1]
 

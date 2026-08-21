@@ -144,13 +144,28 @@ export class Connection {
     const error = new ConnectionLostError(
       `nanocached: response "${response.kind}" does not match the request (connection desynced)`,
     );
-    // Mark closed synchronously — destroy()'s 'close' event only lands on
-    // a later tick, and the client's retry layer re-checks isClosed()
-    // before then to decide whether to redial.
+    this.poison(error);
+    return error;
+  }
+
+  /** Marks the connection closed, clears the request timer, and destroys
+   * the socket — every fatal path (a kind mismatch, a tag mismatch, an
+   * unsolicited busy response, the request timeout, and a failed write)
+   * converges here, mirroring the Python SDK's `_poison()`
+   * (_connection.py), which every one of its own fatal paths already
+   * goes through. Marking closed synchronously matters: destroy()'s
+   * 'close' event only lands on a later tick, and the client's retry
+   * layer re-checks isClosed() before then to decide whether to redial.
+   * Rejecting every still-pending waiter (including whichever one
+   * triggered this) is left to the 'close' handler this destroy() call
+   * guarantees will fire. Safe to call more than once — only the first
+   * call has any effect. */
+  private poison(error: Error): void {
+    if (this.closed) return;
     this.closed = true;
     this.lastError = error;
+    this.clearRequestTimer();
     this.socket.destroy();
-    return error;
   }
 
   close(): void {
@@ -197,10 +212,17 @@ export class Connection {
 
       this.socket.write(frame, (error) => {
         if (error) {
-          const index = this.pending.indexOf(waiter);
-          if (index !== -1) this.pending.splice(index, 1);
-          if (this.pending.length === 0) this.clearRequestTimer();
-          reject(error);
+          // A write can fail (EPIPE, ECONNRESET, ...) after the frame
+          // went only partially onto the wire — desyncing every request
+          // pipelined behind this one, not just this one. Poison the
+          // whole connection like the other fatal paths instead of
+          // splicing out and rejecting just this waiter: that used to
+          // leave everything else pending until the 30s request timeout
+          // eventually noticed the socket was dead. Mirrors Python's
+          // `_poison()` on any write OSError (_connection.py:233-247);
+          // `waiter` (and every other still-pending waiter) is rejected
+          // by the 'close' handler this triggers.
+          this.poison(new ConnectionLostError(`nanocached: connection failed: ${error.message}`));
         }
       });
     });
@@ -259,9 +281,7 @@ export class Connection {
       // writing requests into a connection the server has already
       // declared it is abandoning.
       if (parsed.response.kind === "busy" && this.pending.length === 0) {
-        this.closed = true;
-        this.lastError = new NanocachedError("nanocached: server rejected the connection (connection limit reached)");
-        this.socket.destroy();
+        this.poison(new NanocachedError("nanocached: server rejected the connection (connection limit reached)"));
         return;
       }
 
@@ -284,9 +304,7 @@ export class Connection {
         const error = new ConnectionLostError(
           `nanocached: response tag ${parsed.response.tag} does not answer request tag ${waiter.tag} (connection desynced)`,
         );
-        this.closed = true;
-        this.lastError = error;
-        this.socket.destroy();
+        this.poison(error);
         // The shifted waiter is no longer in `pending`, so onClose won't
         // reach it — reject it here; the rest drain on the close event.
         waiter.reject(error);
@@ -300,16 +318,16 @@ export class Connection {
   private armRequestTimer(): void {
     this.clearRequestTimer();
     this.requestTimer = setTimeout(() => {
-      // Poison, exactly like a read error: mark closed synchronously and
-      // destroy the socket — the 'close' event then rejects every pending
-      // waiter (the stalled request and everything pipelined behind it)
-      // with this error, and the client's retry layer redials.
-      this.lastError = new ConnectionLostError(
-        `nanocached: no response from server within ${REQUEST_TIMEOUT_TUNING.timeoutMs}ms (request timed out)`,
-      );
-      this.closed = true;
+      // Poison, exactly like a read error: the 'close' event then
+      // rejects every pending waiter (the stalled request and everything
+      // pipelined behind it) with this error, and the client's retry
+      // layer redials.
       this.requestTimer = null;
-      this.socket.destroy();
+      this.poison(
+        new ConnectionLostError(
+          `nanocached: no response from server within ${REQUEST_TIMEOUT_TUNING.timeoutMs}ms (request timed out)`,
+        ),
+      );
     }, REQUEST_TIMEOUT_TUNING.timeoutMs);
   }
 

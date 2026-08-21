@@ -120,7 +120,10 @@ original dial error instead of each paying another full 5-second connect
 timeout. Keep it short — a node that genuinely recovers is shut out for
 at most this long. A zero `Config.ReconnectCooldown` means the default;
 set it negative to disable the cooldown entirely (every request that
-finds a dead connection pays its own full dial attempt).
+finds a dead connection pays its own full dial attempt). This mirrors
+the Rust SDK, where `Options::reconnect_cooldown(Duration::ZERO)` also
+means "use the default" and `Options::disable_reconnect_cooldown()` is
+the equivalent of a negative value here.
 
 ## Authentication and TLS
 

@@ -699,25 +699,40 @@ class NanocachedClient:
                 continue
             replica_tasks.append(asyncio.ensure_future(replica_write(name)))
 
+        primary_error: BaseException | None = None
         try:
             result = await op(await self._member_connection(primary))
-        finally:
-            if replica_tasks:
-                # replica_write() already fully handles every expected
-                # failure internally (caught by _SWALLOWABLE_ERRORS,
-                # counted in stats().replica_write_failures, never
-                # re-raised), so the only thing that can still escape a
-                # task here is a genuine programming error. It must not
-                # be silently dropped — but raising it from this finally
-                # would replace whatever the try above just produced,
-                # discarding a successful primary result (or masking the
-                # primary's own exception) even though the write already
-                # completed. return_exceptions=True keeps that from
-                # happening; the bug is still surfaced, just via a
-                # warning rather than by clobbering the primary outcome.
-                for outcome in await asyncio.gather(*replica_tasks, return_exceptions=True):
-                    if isinstance(outcome, BaseException):
-                        _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+        except BaseException as error:  # noqa: BLE001 - decided below, not swallowed
+            result = None
+            primary_error = error
+
+        replica_bug: BaseException | None = None
+        if replica_tasks:
+            # replica_write() already fully handles every expected
+            # failure internally (caught by _SWALLOWABLE_ERRORS, counted
+            # in stats().replica_write_failures, never re-raised), so the
+            # only thing that can still escape a task here is a genuine
+            # programming error. It must not be silently dropped — but
+            # must never override an already-successful primary write
+            # (the write happened, so raising here would misreport a
+            # completed write as failed): return_exceptions=True keeps
+            # that from happening; the bug is only ever surfaced this way
+            # — instead of just via a warning — when the primary itself
+            # also failed, same as before. Mirrors the TypeScript SDK's
+            # writeToOwners: `replicaBug ? replicaBug.reason :
+            # primary.error` (see its own comment for the full
+            # reasoning). Only the first such bug is surfaced this way,
+            # same as TypeScript; any further ones are still warned.
+            for outcome in await asyncio.gather(*replica_tasks, return_exceptions=True):
+                if not isinstance(outcome, BaseException):
+                    continue
+                if primary_error is not None and replica_bug is None:
+                    replica_bug = outcome
+                else:
+                    _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+
+        if primary_error is not None:
+            raise replica_bug if replica_bug is not None else primary_error
         return result
 
     # ── 遅延再接続(issue #1)────────────────────────────────────────

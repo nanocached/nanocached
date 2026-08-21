@@ -134,9 +134,12 @@ let options = Options::new()
 ```
 
 Keep it well under the 30-second node-list refresh interval so a node
-that genuinely recovers isn't shut out for long; pass
-`Duration::ZERO` to disable it entirely (every request that finds a dead
-connection pays its own full dial attempt).
+that genuinely recovers isn't shut out for long. `Duration::ZERO` means
+"use the default" (matching the Go SDK's zero-value `Config`, which
+can't tell "not specified" apart from "explicitly zero"); call
+`.disable_reconnect_cooldown()` to disable it entirely instead (every
+request that finds a dead connection pays its own full dial attempt) —
+the Go SDK's equivalent is a negative `Config.ReconnectCooldown`.
 
 ## Authentication and TLS
 

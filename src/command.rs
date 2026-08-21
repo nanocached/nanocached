@@ -23,9 +23,10 @@ pub enum Command {
         key: Bytes,
     },
     /// Internal-only (ADR-0008): never produced by `parse()`, constructed
-    /// directly by the migration task to snapshot every entry this node
+    /// directly by the migration task to snapshot every key this node
     /// currently holds, to compute which ones a newly joining node now
-    /// owns. See `Response::Entries`.
+    /// owns. See `Response::Keys` and `Cache::keys`'s doc comment for why
+    /// this is keys-only rather than full entries.
     ListEntries,
     /// Internal-only (ADR-0008): the migration task's live re-check of a
     /// single key's current value right before sending it, instead of
@@ -131,7 +132,7 @@ impl Command {
                 }
             }
 
-            Self::ListEntries => Response::Entries(cache.entries()),
+            Self::ListEntries => Response::Keys(cache.keys()),
 
             Self::PeekEntry { key } => {
                 Response::Entries(cache.peek_entry(&key).into_iter().collect())
@@ -878,17 +879,13 @@ mod tests {
     }
 
     #[test]
-    fn list_entries_returns_every_stored_entry() {
+    fn list_entries_returns_every_stored_key() {
         let mut cache = Cache::new(usize::MAX);
         cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
 
         assert_eq!(
             Command::ListEntries.execute(&mut cache),
-            Response::Entries(vec![(
-                Bytes::from_static(b"name"),
-                Bytes::from_static(b"Alice"),
-                None
-            )])
+            Response::Keys(vec![Bytes::from_static(b"name")])
         );
     }
 

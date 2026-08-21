@@ -1048,6 +1048,70 @@ describe("unsolicited busy response (issue #45)", () => {
   });
 });
 
+describe("a failed write poisons the connection (audit finding)", () => {
+  it("marks the connection closed and rejects other in-flight requests promptly, not after the 30s timeout", async () => {
+    // Regression: Connection.send()'s write callback only spliced the
+    // failing waiter out of `pending` and rejected it — unlike
+    // mismatch(), the request-timer handler, and onData's tag-mismatch
+    // path (and unlike the Python SDK's _connection.py, which _poison()s
+    // on any write OSError), it never marked the connection closed or
+    // destroyed the socket. Every other in-flight request was left
+    // pending, with nothing left to notice the socket was dead until the
+    // 30s request timeout eventually fired.
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+      // Never reply — the point is to prove a *write* failure alone
+      // poisons the connection, independent of anything the server does.
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+
+      // Sent while the socket is still healthy, so its write succeeds
+      // and it's left genuinely pending — proving it gets swept up by
+      // the poison triggered below, not just failing on its own write.
+      const secondRequest = connection.get("second");
+
+      // Stub the next write to fail, the way a dead peer (EPIPE,
+      // ECONNRESET) would, without actually breaking the socket —
+      // deterministic, and doesn't depend on OS-level timing.
+      const writeMock = mock.method(
+        socket,
+        "write",
+        ((_data: unknown, cb?: (error?: Error) => void) => {
+          if (typeof cb === "function") cb(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+          return true;
+        }) as typeof socket.write,
+      );
+
+      try {
+        const started = Date.now();
+        await assert.rejects(connection.get("first"), /connection failed/);
+        assert.equal(connection.isClosed(), true);
+        assert.ok(socket.destroyed, "the client must destroy the socket itself");
+        await assert.rejects(secondRequest, /connection failed/);
+        assert.ok(
+          Date.now() - started < 2_000,
+          "other in-flight requests must not wait for the 30s request timeout",
+        );
+      } finally {
+        writeMock.mock.restore();
+      }
+    } finally {
+      for (const socket of serverSockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("NanocachedClient request timeout (issue #42)", () => {
   // REQUEST_TIMEOUT_TUNING exists only so these tests can shorten it.
   const defaultTimeoutMs = REQUEST_TIMEOUT_TUNING.timeoutMs;
