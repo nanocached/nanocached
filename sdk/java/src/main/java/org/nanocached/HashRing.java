@@ -108,6 +108,10 @@ public final class HashRing {
 
     /** The key's primary — {@code owners(key, 1).get(0)}. */
     public String route(byte[] key) {
-        return owners(key, 1).get(0);
+        List<String> owners = owners(key, 1);
+        if (owners.isEmpty()) {
+            throw new IllegalStateException("nanocached: hash ring has no nodes");
+        }
+        return owners.get(0);
     }
 }

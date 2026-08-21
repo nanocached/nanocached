@@ -1395,9 +1395,19 @@ async fn try_begin_next_join(
         let (name, joining_addr, joined, ready_tokens) = {
             let mut reg = lock(registry);
 
+            // Strictly in arrival order: `waiting_timeout_for`'s bound
+            // (and `queue_position`) assume a node is served once the
+            // ones ahead of it are, which a plain `FxHashMap` walk does
+            // not give — its (unseeded, deterministic) iteration order
+            // would let whoever picks the right names keep cutting in.
             let next_waiting = reg
                 .iter()
-                .find(|(_, info)| info.state == NodeState::Waiting)
+                .filter(|(_, info)| info.state == NodeState::Waiting)
+                .min_by(|(name_a, a), (name_b, b)| {
+                    a.waiting_since
+                        .cmp(&b.waiting_since)
+                        .then_with(|| name_a.cmp(name_b))
+                })
                 .map(|(name, info)| (name.clone(), info.address.clone()));
 
             let Some((name, joining_addr)) = next_waiting else {
@@ -1966,8 +1976,21 @@ async fn start_join(
             .count()
             + 1;
         let info = guard.entry(name.to_string()).or_insert_with(|| {
-            NodeInfo::with_queue_position(address, NodeState::Waiting, token, queue_position)
+            NodeInfo::with_queue_position(
+                address.clone(),
+                NodeState::Waiting,
+                token,
+                queue_position,
+            )
         });
+        // A duplicate `J` from a node still waiting its turn carries its
+        // current address (ADR-0012: derived from this very connection),
+        // which may differ from the first registration's — same as
+        // `apply_announce_to_existing` does for `P`. Not once `Joining`:
+        // the in-flight handoff was dispatched against the recorded one.
+        if info.state == NodeState::Waiting {
+            info.address = address;
+        }
         // Issue #3/#9: unconditionally overwritten on every accepted `J`
         // for this name — including a duplicate reusing an existing
         // Waiting/Joining entry — so this always names the most recently
@@ -3460,6 +3483,22 @@ async fn main() -> ExitCode {
         },
         None => None,
     };
+
+    // Inbound and outbound TLS are configured independently (this server
+    // is dialled by nodes/clients *and* dials nodes for `M`/`X`, which
+    // carry the recipient's membership token). Half-configuring it is
+    // easy to do and otherwise silent.
+    match (&tls_acceptor, &tls_connector) {
+        (Some(_), None) => eprintln!(
+            "discovery: WARN TLS is enabled for inbound connections only (no --tls-ca): \
+             outbound M/X to nodes — and the membership tokens they carry — go out in plaintext"
+        ),
+        (None, Some(_)) => eprintln!(
+            "discovery: WARN TLS is enabled for outbound connections only (no --tls-cert/--tls-key): \
+             inbound J/P/H/L — and the tokens and secrets they carry — arrive in plaintext"
+        ),
+        _ => {}
+    }
 
     let address = format!("{}:{}", args.host, args.port);
     if let Err(err) = run(

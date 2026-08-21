@@ -28,9 +28,31 @@ if ! git diff --quiet HEAD; then
     exit 1
 fi
 
+# Resumable: a push that fails partway (network, expired auth) leaves some
+# components released and others not, so a re-run must pick up where it
+# stopped — a tag already created locally is reused if it points at HEAD
+# (and refused otherwise), and one already on the remote is skipped.
+head="$(git rev-parse HEAD)"
 for tag in "sdk/rust/v$ver" "sdk/python/v$ver" "sdk/go/v$ver" "sdk/java/v$ver" \
            "sdk/typescript/v$ver" "sdk/dotnet/v$ver" "server/v$ver"; do
-    git tag "$tag"
+    if local_target="$(git rev-parse -q --verify "refs/tags/$tag^{commit}")"; then
+        if [ "$local_target" != "$head" ]; then
+            echo "error: tag $tag already exists locally but points at $local_target, not HEAD ($head)" >&2
+            exit 1
+        fi
+    else
+        git tag "$tag"
+    fi
+
+    if remote_target="$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)" && [ -n "$remote_target" ]; then
+        if [ "$remote_target" != "$head" ]; then
+            echo "error: tag $tag already exists on origin but points at $remote_target, not HEAD ($head)" >&2
+            exit 1
+        fi
+        echo "skip: $tag is already on origin"
+        continue
+    fi
+
     git push origin "$tag"
     sleep 2
 done

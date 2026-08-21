@@ -1,5 +1,5 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
-use crate::command::{Command, ParseError, parse, parse_tagged};
+use crate::command::{Command, MigrateProgress, ParseError, parse_resumable};
 use crate::hash_ring::HashRing;
 use crate::response::Response;
 use bytes::{Bytes, BytesMut};
@@ -614,10 +614,23 @@ pub(crate) async fn run(
         }
     }
 
+    // Keep servicing `migration_rx` while draining: a connection task that
+    // is mid-request when shutdown lands may still hand a forwarded write
+    // (or the tail of a handoff) to this channel, and with the main loop
+    // gone nobody would spawn it — the client would have its `S`/`D` acked
+    // and the forward silently dropped, and with the 4-slot buffer full
+    // the sender would block until the `abort_all` below killed it.
     let connections_finished = timeout(SHUTDOWN_TIMEOUT, async {
-        while let Some(result) = connection_tasks.join_next().await {
-            if let Err(error) = result {
-                eprintln!("WARN connection task failed: {error}");
+        while !connection_tasks.is_empty() {
+            tokio::select! {
+                result = connection_tasks.join_next() => {
+                    if let Some(Err(error)) = result {
+                        eprintln!("WARN connection task failed: {error}");
+                    }
+                }
+                Some(task) = migration_rx.recv() => {
+                    connection_tasks.spawn(task);
+                }
             }
         }
     })
@@ -885,12 +898,12 @@ async fn handle_connection(
     // verify request/response alignment before dispatching.
     let mut tagged = false;
 
+    // See `command::parse_resumable`: reset by it on anything but
+    // `Incomplete`, which is exactly when `received`'s front changes.
+    let mut parse_progress = MigrateProgress::default();
+
     loop {
-        let parsed = if tagged {
-            parse_tagged(&mut received)
-        } else {
-            parse(&mut received).map(|command| (command, None))
-        };
+        let parsed = parse_resumable(&mut received, tagged, &mut parse_progress);
 
         // Only a fully parsed command extends the deadline — an
         // `Incomplete` result (more bytes needed) leaves it untouched, so
@@ -1484,7 +1497,17 @@ async fn register_with_discovery(
             return;
         }
 
-        match connect_client_stream(&discovery_addr, tls_connector.as_ref()).await {
+        // Bounded by `OUTBOUND_IO_TIMEOUT` + `TLS_HANDSHAKE_TIMEOUT` on its
+        // own, but that is longer than `SHUTDOWN_TIMEOUT` and `run` awaits
+        // this task without one — so also give up the moment shutdown
+        // lands, rather than making a node whose discovery server is
+        // unreachable take ~30s to exit.
+        let connected = tokio::select! {
+            _ = shutdown_rx.changed() => return,
+            result = connect_client_stream(&discovery_addr, tls_connector.as_ref()) => result,
+        };
+
+        match connected {
             Ok(mut stream) => {
                 let authenticated = match &auth_secret {
                     Some(secret) => {
@@ -2654,8 +2677,20 @@ async fn forward_with_retries(
 /// This node's own current view of cluster membership, if it has one yet
 /// (see `NodeContext::known_ring`) says `key` isn't this node's to serve
 /// anymore.
+///
+/// Not while the handoff that displaced `key` is still forwarding, though
+/// (`migration_target_for`): `known_ring` flips as soon as *this node's*
+/// share of a join is done, but discovery only publishes the joiner in `L`
+/// once *every* ready node has reported `C` — which, with size-derived
+/// timeouts (doc/adr/0017), can be minutes after a small node finishes.
+/// In that gap a client's `L` still names this node as the owner and a
+/// refresh-and-retry gets the very same list, so rejecting here would make
+/// the key plainly unavailable (an error, not a miss) for R=1. Serving it
+/// locally — and forwarding `S`/`D` to the joiner, which the handlers
+/// already do for exactly this window — is what keeps the join invisible
+/// to clients. Once the window closes the rejection below takes over.
 fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
-    node_context
+    let displaced = node_context
         .known_ring
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2666,7 +2701,9 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
             !membership
                 .ring
                 .is_owner(key, &node_context.name, membership.replication)
-        })
+        });
+
+    displaced && migration_target_for(node_context, key).is_none()
 }
 
 /// If a handoff is currently in flight and `key` is one it's moving (per
@@ -4039,9 +4076,11 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        // And the flipped membership now rejects the displaced key while
-        // still serving the kept one.
-        assert!(wrong_node(&node_context, b"key-3"));
+        // The flipped membership says the displaced key is no longer this
+        // node's — but it keeps being served (and forwarded) for as long
+        // as the handoff's forwarding window is open, since discovery
+        // hasn't published the joiner yet; the kept key is served as ever.
+        assert!(!wrong_node(&node_context, b"key-3"));
         assert!(!wrong_node(&node_context, b"key-0"));
 
         // Issue #3: this node's own share being done must NOT close the
@@ -4066,6 +4105,17 @@ mod tests {
                 .is_some(),
             "the completed handoff should carry its completion stamp"
         );
+
+        // Window closed: now the displaced key is rejected (and the
+        // lingering slot is cleared lazily), the kept one still served.
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_mut().unwrap();
+            active.completed_at = Some(Instant::now() - active.forwarding_grace);
+        }
+        assert!(wrong_node(&node_context, b"key-3"));
+        assert!(!wrong_node(&node_context, b"key-0"));
+        assert!(node_context.active_migration.lock().unwrap().is_none());
 
         joining_task.await.unwrap();
         discovery_task.await.unwrap();

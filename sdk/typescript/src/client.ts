@@ -566,7 +566,10 @@ export class NanocachedClient {
    * propagates. */
   private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
     const names = this.ownerNames(key);
-    for (const name of names) {
+    // Every owner but the primary, which the normal read path already
+    // probed and got a clean miss from (same as the Rust, Go, Java and
+    // .NET SDKs).
+    for (const name of names.slice(1)) {
       let value: Buffer | null;
       try {
         const connection = await this.memberConnection(name);

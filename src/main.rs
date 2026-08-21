@@ -210,6 +210,23 @@ async fn main() -> ExitCode {
         None => None,
     };
 
+    // Inbound (`--tls-cert`/`--tls-key`: clients, discovery's `M`/`X`,
+    // peers' handoffs) and outbound (`--tls-ca`: this node's `J`/`P`/`H`
+    // to discovery and its handoffs to joiners) TLS are independent
+    // settings; half-configuring them is easy and otherwise silent.
+    match (&tls_acceptor, &tls_connector, args.discovery.is_none()) {
+        (Some(_), None, false) => eprintln!(
+            "nanocached-node: WARN TLS is enabled for inbound connections only (no --tls-ca): \
+             registration, heartbeats and handoffs to other nodes — and the membership token \
+             they carry — go out in plaintext"
+        ),
+        (None, Some(_), _) => eprintln!(
+            "nanocached-node: WARN TLS is enabled for outbound connections only \
+             (no --tls-cert/--tls-key): client traffic and incoming M/X arrive in plaintext"
+        ),
+        _ => {}
+    }
+
     let address = format!("{}:{}", args.host, args.port);
     let auth_secret = read_auth_secret();
     let heartbeat = match args.discovery {

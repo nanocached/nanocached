@@ -122,5 +122,13 @@ public sealed class HashRing
     }
 
     /// <summary>The key's primary — <c>Owners(key, 1)[0]</c>.</summary>
-    public string Route(ReadOnlySpan<byte> key) => Owners(key, 1)[0];
+    public string Route(ReadOnlySpan<byte> key)
+    {
+        IReadOnlyList<string> owners = Owners(key, 1);
+        if (owners.Count == 0)
+        {
+            throw new InvalidOperationException("nanocached: hash ring has no nodes");
+        }
+        return owners[0];
+    }
 }
