@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,6 +65,7 @@ public final class NanocachedClient implements AutoCloseable {
         private boolean fireAndForgetReplicas;
         private boolean readRepair;
         private Duration reconnectCooldown = DEFAULT_RECONNECT_COOLDOWN;
+        private boolean reconnectCooldownDisabled;
 
         /** Discovery replicas (ADR-0010), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -72,7 +74,15 @@ public final class NanocachedClient implements AutoCloseable {
             return this;
         }
 
-        /** Shared secret matching NANOCACHED_AUTH_SECRET on the server. */
+        /** Shared secret matching NANOCACHED_AUTH_SECRET on the server. An
+         * empty secret is the same as none, matching the other SDKs: sent
+         * literally, an empty string would reach the wire as an explicit
+         * zero-length secret, which the server rejects (EmptySecret) and
+         * closes without replying — turning what should be "no auth
+         * configured" into an opaque {@link NanocachedException.ConnectionFailed}
+         * instead of the clear {@link NanocachedException.AuthenticationFailed}
+         * a missing secret against a server that requires one already
+         * gives. */
         public Options authSecret(String secret) {
             // A raw NullPointerException here reads like a bug in this
             // SDK, not a caller mistake — IllegalArgumentException matches
@@ -81,7 +91,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (secret == null) {
                 throw new IllegalArgumentException("nanocached: authSecret must not be null");
             }
-            this.authSecret = secret.getBytes(StandardCharsets.UTF_8);
+            this.authSecret = secret.isEmpty() ? null : secret.getBytes(StandardCharsets.UTF_8);
             return this;
         }
 
@@ -125,7 +135,12 @@ public final class NanocachedClient implements AutoCloseable {
         /** Values shorter than this (in bytes) are never compressed — the
          * per-value overhead of attempting it outweighs the savings. Only
          * meaningful when {@link #compress} is enabled. Default {@value
-         * #DEFAULT_COMPRESSION_THRESHOLD}. */
+         * #DEFAULT_COMPRESSION_THRESHOLD}. Negative is rejected by {@link
+         * #connect} — a negative threshold would otherwise silently force
+         * every set() to attempt compression regardless of value size,
+         * since no value's length is ever less than a negative number
+         * (issue: audit finding; mirrors the Go SDK's identical
+         * Connect-time check). */
         public Options compressionThreshold(int bytes) {
             this.compressionThreshold = bytes;
             return this;
@@ -159,7 +174,18 @@ public final class NanocachedClient implements AutoCloseable {
          * address that just proved unreachable. Default {@code
          * DEFAULT_RECONNECT_COOLDOWN} (1s). Keep well under the node-list
          * staleness window ({@code NODE_LIST_STALE_AFTER}, 30s) so a node
-         * that genuinely recovers isn't shut out for long. */
+         * that genuinely recovers isn't shut out for long.
+         *
+         * <p>{@link Duration#ZERO} means "use the default", not "disable
+         * it" — this matches the Go SDK's zero-value {@code Config}
+         * (whose {@code ReconnectCooldown} field, simply left unset,
+         * can't distinguish "not specified" from "explicitly zero", so
+         * zero has to mean "default" there) and the Rust SDK's {@code
+         * Options::reconnect_cooldown}, for cross-SDK consistency even
+         * though this builder can tell "never called" apart on its own.
+         * Call {@link #disableReconnectCooldown()} to actually disable
+         * the cooldown — the Go SDK's equivalent is a negative {@code
+         * Config.ReconnectCooldown}. */
         public Options reconnectCooldown(Duration cooldown) {
             // Matches authSecret's null handling above (issue: audit
             // finding J3) — a raw NullPointerException here would read
@@ -168,12 +194,28 @@ public final class NanocachedClient implements AutoCloseable {
             // by the time check", i.e. every dial to a known-dead address
             // would be treated as already past its cooldown instantly —
             // silently defeating the whole feature rather than failing
-            // loudly at configuration time.
+            // loudly at configuration time. (Disabling the feature
+            // outright is still possible — see disableReconnectCooldown()
+            // — just not as a side effect of a duration that reads like
+            // "immediately".)
             if (cooldown == null || cooldown.isNegative()) {
                 throw new IllegalArgumentException(
                         "nanocached: reconnectCooldown must not be null or negative");
             }
-            this.reconnectCooldown = cooldown;
+            this.reconnectCooldown = cooldown.isZero() ? DEFAULT_RECONNECT_COOLDOWN : cooldown;
+            this.reconnectCooldownDisabled = false;
+            return this;
+        }
+
+        /** Disables the per-address reconnect cooldown entirely: every
+         * call that finds an address's connection dead pays its own full
+         * dial attempt instead of reusing a cached failure. See
+         * {@link #reconnectCooldown} for what the cooldown is; the Go
+         * SDK's equivalent of this method is a negative {@code
+         * Config.ReconnectCooldown}, and the Rust SDK's is {@code
+         * Options::disable_reconnect_cooldown()}. */
+        public Options disableReconnectCooldown() {
+            this.reconnectCooldownDisabled = true;
             return this;
         }
     }
@@ -189,8 +231,18 @@ public final class NanocachedClient implements AutoCloseable {
      * so an operator who only watches for thrown exceptions can still
      * notice replication silently degrading or a node-list refresh stuck
      * failing.
+     *
+     * @param backgroundWriteBugs a genuine programming bug (never an
+     * expected failure — those are already counted above) that escaped a
+     * background replica write or read-repair write-back. Unlike the
+     * other counters, this must never legitimately increase; it exists so
+     * a bug in this SDK's own background-write handling can't vanish
+     * silently the way an ignored {@code CompletableFuture.whenComplete}
+     * error previously could (issue: audit finding). Also logged to
+     * stderr when it happens — see {@link #reportBackgroundWriteBug}.
      */
-    public record ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures) {}
+    public record ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures,
+            long backgroundWriteBugs) {}
 
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
 
@@ -288,6 +340,12 @@ public final class NanocachedClient implements AutoCloseable {
     private final boolean fireAndForgetReplicas;
     private final boolean readRepair;
     private final long reconnectCooldownNanos;
+    /** {@code true} when {@link Options#disableReconnectCooldown()} was
+     * called: {@link #dialWithCooldown} then never records a cooldown
+     * entry at all, so every dial to a known-dead address still pays its
+     * own full connect attempt (see {@link Options#reconnectCooldown}'s
+     * doc for the Duration.ZERO-means-default rule this complements). */
+    private final boolean reconnectCooldownDisabled;
     /** Per-address reconnect cooldown (see {@link Options#reconnectCooldown}):
      * the address of the most recently failed dial, and how long it stays
      * "down" before another dial to it is attempted. Keyed by address, not
@@ -314,6 +372,7 @@ public final class NanocachedClient implements AutoCloseable {
     private final AtomicLong replicaWriteFailures = new AtomicLong();
     private final AtomicLong readRepairFailures = new AtomicLong();
     private final AtomicLong refreshFailures = new AtomicLong();
+    private final AtomicLong backgroundWriteBugs = new AtomicLong();
     private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
     // The permit count backgroundReplicaWritePermits was built with,
     // captured so close() can acquire exactly all of them even if a test
@@ -371,7 +430,7 @@ public final class NanocachedClient implements AutoCloseable {
     private NanocachedClient(
             List<Address> addresses, byte[] authSecret, SSLContext tls,
             boolean compress, int compressionThreshold, boolean fireAndForgetReplicas,
-            boolean readRepair, Duration reconnectCooldown) {
+            boolean readRepair, Duration reconnectCooldown, boolean reconnectCooldownDisabled) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
@@ -380,6 +439,7 @@ public final class NanocachedClient implements AutoCloseable {
         this.fireAndForgetReplicas = fireAndForgetReplicas;
         this.readRepair = readRepair;
         this.reconnectCooldownNanos = reconnectCooldown.toNanos();
+        this.reconnectCooldownDisabled = reconnectCooldownDisabled;
     }
 
     public static NanocachedClient connect(Options options) {
@@ -387,12 +447,21 @@ public final class NanocachedClient implements AutoCloseable {
             throw new IllegalArgumentException(
                     "nanocached: connect() needs a non-empty addresses list");
         }
+        // Mirrors the Go SDK's Connect-time rejection: a negative
+        // threshold would otherwise silently force every set() to
+        // attempt compression regardless of value size (issue: audit
+        // finding).
+        if (options.compressionThreshold < 0) {
+            throw new IllegalArgumentException(
+                    "nanocached: compressionThreshold must not be negative, got "
+                            + options.compressionThreshold);
+        }
 
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
         NanocachedClient client = new NanocachedClient(
                 options.addresses, options.authSecret, sslContext,
                 options.compress, options.compressionThreshold, options.fireAndForgetReplicas,
-                options.readRepair, options.reconnectCooldown);
+                options.readRepair, options.reconnectCooldown, options.reconnectCooldownDisabled);
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, ADR-0010), or knows no live
@@ -553,7 +622,32 @@ public final class NanocachedClient implements AutoCloseable {
      */
     public ClientStats stats() {
         return new ClientStats(
-                replicaWriteFailures.get(), readRepairFailures.get(), refreshFailures.get());
+                replicaWriteFailures.get(), readRepairFailures.get(), refreshFailures.get(),
+                backgroundWriteBugs.get());
+    }
+
+    /** Inspects a background replica write's ({@code fireAndForgetReplicas},
+     * or read-repair's write-back to the primary) outcome. Both Runnables
+     * already swallow every expected failure internally (the replica
+     * leg's {@code NanocachedException} catch in {@link #write}, counted
+     * via {@link #replicaWriteFailures}; the read-repair leg's identical
+     * catch in {@link #tryReadRepair}, counted via {@link
+     * #readRepairFailures}), so {@code error} here is only ever non-null
+     * for a genuine programming bug that escaped one of those catches —
+     * it must not vanish silently the way an ignored {@code
+     * CompletableFuture.whenComplete} error previously did (issue: audit
+     * finding). Counted in {@link #backgroundWriteBugs}, a stat distinct
+     * from the expected-failure counters above, and logged to stderr —
+     * this class's existing way of surfacing something a caller can't
+     * otherwise observe (see the forgotten-close warning in {@link
+     * #connect}). Mirrors .NET's {@code NanocachedClient.cs} background-task
+     * {@code ContinueWith} handling of the same case, though .NET folds it
+     * back into its single expected-failure counter for lack of a logger
+     * to hand the bug to instead; this SDK has one, so it gets both. */
+    private void reportBackgroundWriteBug(Throwable error) {
+        if (error == null) return;
+        backgroundWriteBugs.incrementAndGet();
+        System.err.println("nanocached: a background write raised an unexpected error: " + error);
     }
 
     /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
@@ -592,26 +686,32 @@ public final class NanocachedClient implements AutoCloseable {
         return Optional.of(compress ? Compression.decompressValue(value) : value);
     }
 
-    /** doc/adr/0015-*.md: probes every owner of {@code key}, in rank
-     * order, for a value the normal read path already reported missing.
-     * The first owner that has it wins: its value is returned, and —
-     * detached, not awaited, no tracking — that same value repairs the
-     * true primary in the background, with TTL READ_REPAIR_TTL_SECONDS
-     * (the original TTL can't be recovered from a GET, and TTL 0 would
-     * permanently resurrect already-expired data). Every failure along
-     * the way (connection lost, WrongNode, another miss) is swallowed;
-     * nothing here may turn an already-accepted miss into an error. A
-     * failure repairing the primary specifically is counted via
-     * {@link #stats()}'s readRepairFailures. The write-back is bounded by
-     * — and drained on {@link #close()} through — the same
-     * {@link #backgroundReplicaWritePermits} pool as a fireAndForgetReplicas
+    /** doc/adr/0015-*.md: probes the remaining owners of {@code key} —
+     * every owner but the primary, which the normal read path already
+     * probed and got a clean miss from — in rank order, for a value
+     * (issue: audit finding, tryReadRepair used to re-probe the primary
+     * too, wasting a redundant GET on the one owner already known to
+     * have missed; mirrors the Rust/Go SDKs' identical fix). The first
+     * one that has it wins: its value is returned, and — detached, not
+     * awaited, no tracking — that same value repairs the true primary in
+     * the background, with TTL READ_REPAIR_TTL_SECONDS (the original TTL
+     * can't be recovered from a GET, and TTL 0 would permanently
+     * resurrect already-expired data). Every failure along the way
+     * (connection lost, WrongNode, another miss) is swallowed; nothing
+     * here may turn an already-accepted miss into an error. A failure
+     * repairing the primary specifically is counted via {@link
+     * #stats()}'s readRepairFailures. The write-back is bounded by — and
+     * drained on {@link #close()} through — the same {@link
+     * #backgroundReplicaWritePermits} pool as a fireAndForgetReplicas
      * replica leg (doc/adr/0014-*.md): past the cap, the repair for this
      * miss is simply skipped, since read repair is opportunistic and a
      * later miss on the same key repairs it (issue: audit finding,
      * unbounded/undrained read-repair write-backs). */
     private byte[] tryReadRepair(byte[] key) {
         List<String> names = ownerNames(key);
-        for (String name : names) {
+        if (names.isEmpty()) return null;
+        String primary = names.get(0);
+        for (String name : names.subList(1, names.size())) {
             byte[] value;
             try {
                 value = applyReconnecting(() -> memberConnection(name), connection -> connection.get(key));
@@ -620,8 +720,7 @@ public final class NanocachedClient implements AutoCloseable {
             }
             if (value == null) continue;
 
-            if (!names.isEmpty() && backgroundReplicaWritePermits.tryAcquire()) {
-                String primary = names.get(0);
+            if (backgroundReplicaWritePermits.tryAcquire()) {
                 byte[] repairValue = value;
                 Runnable repair = () -> {
                     try {
@@ -641,8 +740,15 @@ public final class NanocachedClient implements AutoCloseable {
                 };
                 try {
                     CompletableFuture.runAsync(repair, replicaWriters)
-                            .whenComplete((ignoredResult, ignoredError) ->
-                                    backgroundReplicaWritePermits.release());
+                            .whenComplete((ignoredResult, error) -> {
+                                backgroundReplicaWritePermits.release();
+                                // error is non-null only for a genuine bug
+                                // that escaped repair's own catch above —
+                                // see reportBackgroundWriteBug (issue:
+                                // audit finding, background writes
+                                // silently discarding this).
+                                reportBackgroundWriteBug(error);
+                            });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut replicaWriters down concurrently — see
                     // the matching handling in write(). The repair is
@@ -798,10 +904,32 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    /** Closes every connection this attempt opened. Called both from
+     * {@link #close()} (after it has already drained/shut down {@link
+     * #replicaWriters}/{@link #keepAlive} itself) and from {@link
+     * #connect}'s catch blocks whenever anything after {@link
+     * #openCluster} fails — including {@link #startKeepAlive} itself
+     * throwing, which can happen after openCluster already built {@link
+     * #replicaWriters} and {@link #backgroundReplicaWritePermits}. That
+     * second caller used to leave replicaWriters running (its daemon
+     * threads survive until the executor is GC'd) and its permits
+     * un-drained, because this method only ever closed connections
+     * (issue: audit finding, connect()-failure teardown missing
+     * replicaWriters/keepAlive). Shutting them down here too — redundant
+     * but harmless when {@link #close()} already did it, a no-op when
+     * they were never created — makes this method a complete teardown of
+     * everything a partially-succeeded connect() attempt could have
+     * built, not just its sockets. */
     private void teardown() {
         synchronized (stateLock) {
             if (single != null) single.close();
             for (Member member : members.values()) member.connection.close();
+        }
+        if (keepAlive != null) {
+            keepAlive.shutdownNow();
+        }
+        if (replicaWriters != null) {
+            replicaWriters.shutdown();
         }
     }
 
@@ -926,8 +1054,15 @@ public final class NanocachedClient implements AutoCloseable {
             if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
                 try {
                     CompletableFuture.runAsync(replicaWrite, replicaWriters)
-                            .whenComplete((ignoredResult, ignoredError) ->
-                                    backgroundReplicaWritePermits.release());
+                            .whenComplete((ignoredResult, error) -> {
+                                backgroundReplicaWritePermits.release();
+                                // error is non-null only for a genuine bug
+                                // that escaped replicaWrite's own catch
+                                // above — see reportBackgroundWriteBug
+                                // (issue: audit finding, background writes
+                                // silently discarding this).
+                                reportBackgroundWriteBug(error);
+                            });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut replicaWriters down concurrently: the
                     // permit was already acquired, but the task was never
@@ -944,13 +1079,65 @@ public final class NanocachedClient implements AutoCloseable {
             replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
 
+        T value = null;
+        RuntimeException primaryError = null;
         try {
-            return applyReconnecting(() -> memberConnection(names.get(0)), op);
-        } finally {
-            for (CompletableFuture<Void> pending : replicaWrites) {
+            value = applyReconnecting(() -> memberConnection(names.get(0)), op);
+        } catch (RuntimeException error) {
+            primaryError = error;
+        }
+
+        // Always drain the synchronous replica legs — for close()'s
+        // tracking, and so a genuine replica-leg bug (a RuntimeException
+        // that escaped replicaWrite's own NanocachedException-only catch
+        // above) doesn't linger as an unobserved CompletableFuture
+        // failure — but never let one override an already-successful
+        // primary write: the write happened, so throwing here despite
+        // that would misreport a completed write as failed. This used to
+        // be a plain `finally { pending.join(); }`, whose
+        // CompletionException — thrown even when the primary's try block
+        // had already returned normally — silently replaced a successful
+        // result, or masked the primary's own exception, with a raw,
+        // un-narrowed CompletionException that (unlike everything else
+        // this SDK throws) didn't even extend NanocachedException (issue:
+        // audit finding). Mirrors the TypeScript SDK's writeToOwners
+        // (client.ts) / the Python SDK's _write() (client.py): a genuine
+        // replica bug is only ever surfaced by throwing when the primary
+        // itself also failed — any other one is still counted/logged via
+        // reportBackgroundWriteBug, the same as a fireAndForgetReplicas
+        // leg's bug above.
+        RuntimeException replicaBug = null;
+        for (CompletableFuture<Void> pending : replicaWrites) {
+            try {
                 pending.join();
+            } catch (CompletionException wrapped) {
+                RuntimeException bug = unwrapReplicaBug(wrapped);
+                if (primaryError != null && replicaBug == null) {
+                    replicaBug = bug;
+                } else {
+                    reportBackgroundWriteBug(bug);
+                }
             }
         }
+
+        if (primaryError != null) {
+            throw replicaBug != null ? replicaBug : primaryError;
+        }
+        return value;
+    }
+
+    /** Unwraps a replica leg's {@link CompletionException} (from {@link
+     * CompletableFuture#join}) down to the raw bug that caused it — a
+     * {@code Runnable} run via {@link CompletableFuture#runAsync} can
+     * only ever throw unchecked, and replicaWrite's own catch already
+     * narrows to {@code NanocachedException}, so whatever reaches here is
+     * a genuine programming bug. Every exception escaping this SDK's
+     * public API must extend {@link NanocachedException} or be the raw
+     * bug itself — never a {@link CompletionException} (issue: audit
+     * finding, see {@link #write}). */
+    private static RuntimeException unwrapReplicaBug(CompletionException wrapped) {
+        Throwable cause = wrapped.getCause();
+        return cause instanceof RuntimeException runtime ? runtime : wrapped;
     }
 
     /** Submits {@code replicaWrite} to {@link #replicaWriters}, falling
@@ -1002,8 +1189,14 @@ public final class NanocachedClient implements AutoCloseable {
             reconnectCooldowns.remove(address);
             return connection;
         } catch (RuntimeException error) {
-            reconnectCooldowns.put(
-                    address, new CooldownEntry(System.nanoTime() + reconnectCooldownNanos, error));
+            // disableReconnectCooldown() (Options): never record a
+            // cooldown entry at all, so every dial to this address keeps
+            // paying its own full connect attempt instead of ever
+            // hitting the fast-rejection branch above.
+            if (!reconnectCooldownDisabled) {
+                reconnectCooldowns.put(
+                        address, new CooldownEntry(System.nanoTime() + reconnectCooldownNanos, error));
+            }
             throw error;
         }
     }

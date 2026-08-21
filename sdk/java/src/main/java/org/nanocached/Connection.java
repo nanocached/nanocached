@@ -340,8 +340,12 @@ final class Connection {
     // bytes with no '\n' would grow readLine()'s buffer without bound,
     // gated only by requestTimeoutMillis rather than failing fast — mirrors
     // .NET's Connection.MaxHeaderLineLength and Rust's 4 KiB (issue: audit
-    // finding, unbounded readLine).
-    private static final int MAX_HEADER_LINE_LENGTH = 4096;
+    // finding, unbounded readLine). Package-private (not private): shared
+    // with Identify.java's own readLine, which bounds the discovery
+    // server's `N <count> <r>`/entry header lines against the same
+    // failure mode (issue: audit finding J-readLine — Identify's readLine
+    // had no cap at all).
+    static final int MAX_HEADER_LINE_LENGTH = 4096;
 
     /** This connection's only reader, for its whole lifetime — nothing
      * else may read from {@code in}. Consumes responses off the wire and
