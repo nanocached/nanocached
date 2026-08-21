@@ -43,6 +43,27 @@ class NanocachedClientTest {
         }
     }
 
+    /** Calls {@code get} until it fails with a {@link
+     * NanocachedException.ConnectionFailed} (see
+     * reconnectCooldownSkipsARedialToAKnownDeadAddress for why the first
+     * call after a node closes is not asserted on directly), returning
+     * that failure. */
+    private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (true) {
+            try {
+                client.get("k");
+            } catch (NanocachedException.ConnectionFailed failure) {
+                return failure;
+            }
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for a get to fail against the closed node");
+            }
+            Thread.sleep(5);
+        }
+    }
+
     /** Single-target connect, mirroring the removed connect(host, port) shorthand. */
     private static NanocachedClient connect(String host, int port) {
         return NanocachedClient.connect(single(host, port));
@@ -489,8 +510,17 @@ class NanocachedClientTest {
                 // Nothing listens on `port` anymore, so this redial fails
                 // fast with a connection-refused error and starts the
                 // cooldown window for that address.
-                NanocachedException.ConnectionFailed firstError = assertThrows(
-                        NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                //
+                // Polled rather than asserted on the very first get: on
+                // GitHub's ubuntu runners this first call intermittently
+                // returned normally (~1 in 3 runs on main, 2026-08-21),
+                // i.e. the connection did not yet observe the closed
+                // node. The exact mechanism was not pinned down (it never
+                // reproduced locally, 25/25 clean on a 1-CPU Linux
+                // container), so the test only requires that the failure
+                // shows up promptly, which is all the cooldown assertions
+                // below depend on.
+                NanocachedException.ConnectionFailed firstError = firstConnectionFailure(client);
 
                 // A listener now sits on the same port and answers
                 // immediately with bytes the identify handshake rejects
@@ -567,7 +597,7 @@ class NanocachedClientTest {
                     single("127.0.0.1", port).reconnectCooldown(Duration.ZERO))) {
                 client.set("k", "v");
                 node.close();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                firstConnectionFailure(client);
 
                 java.util.concurrent.atomic.AtomicInteger connections =
                         new java.util.concurrent.atomic.AtomicInteger();
@@ -617,14 +647,7 @@ class NanocachedClientTest {
                 // connection-refused failure) is ever taken — so poll
                 // until the failure shows up instead of asserting on the
                 // very first call.
-                waitFor(() -> {
-                    try {
-                        client.get("k");
-                        return false;
-                    } catch (NanocachedException.ConnectionFailed expected) {
-                        return true;
-                    }
-                }, "the redial to the closed node to fail with ConnectionFailed");
+                firstConnectionFailure(client);
 
                 java.util.Set<java.net.Socket> acceptedSockets =
                         java.util.concurrent.ConcurrentHashMap.newKeySet();
