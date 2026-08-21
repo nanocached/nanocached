@@ -34,6 +34,7 @@ class MockNode:
         self._unterminated_value_replies = 0
         self.unterminated_value_bytes_sent = 0
         self._stored_to_get_replies = 0
+        self._malformed_status_replies = 0
         self._get_delay = 0.0
         self._set_delay = 0.0
         self._silent = False
@@ -82,6 +83,13 @@ class MockNode:
         """Reply `S` to the next G — a well-formed frame of the wrong kind,
         as a desynced (off-by-one) stream would produce."""
         self._stored_to_get_replies += 1
+
+    def answer_malformed_status_once(self) -> None:
+        """Reply with a tagged-shaped fixed response (e.g. `S1\\n`) to the
+        next G on an untagged connection — the byte after the marker is
+        never LF, as a server that tagged a response on an untagged
+        connection (or some other desync) would produce."""
+        self._malformed_status_replies += 1
 
     def delay_next_get(self, seconds: float) -> None:
         """Hold the next G's response, so a test can abandon the request
@@ -171,6 +179,11 @@ class MockNode:
                     if self._stored_to_get_replies > 0:
                         self._stored_to_get_replies -= 1
                         writer.write(b"S" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if self._malformed_status_replies > 0:
+                        self._malformed_status_replies -= 1
+                        writer.write(b"S1\n")
                         await writer.drain()
                         continue
                     if self._malformed_value_replies > 0:

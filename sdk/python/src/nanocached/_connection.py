@@ -364,7 +364,17 @@ class Connection:
                 if len(header) < 2 or header[0:1] != b" ":
                     raise ConnectionError("nanocached: response is missing its tag (connection desynced)")
                 return marker, None, self._parse_tag(header[1:-1])
-            await self._reader.readexactly(1)  # the trailing '\n'
+            trailer = await self._reader.readexactly(1)
+            # The untagged form is always exactly `<marker>\n` — a byte
+            # other than LF here means the server tagged a response on an
+            # untagged connection (or some other desync), and every later
+            # response would be misaligned too. Mirrors the TypeScript
+            # SDK's protocol.ts (tryParseResponse) (issue: audit finding,
+            # unverified trailing byte on the untagged fast path).
+            if trailer != b"\n":
+                raise ConnectionError(
+                    "nanocached: unexpected byte after response marker (connection desynced)"
+                )
             return marker, None, None
 
         if marker == b"B":
