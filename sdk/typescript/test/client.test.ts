@@ -333,6 +333,38 @@ describe("NanocachedClient value compression (doc/adr/0013-*.md)", () => {
     }
   });
 
+  it("rejects an oversized value before compression, even if it would compress under the cap", async () => {
+    // Regression (issue #47 audit item 3): the request-size cap must be
+    // checked against the *original* value, matching Python's set() —
+    // not the compressed frame, which a highly repetitive value can
+    // shrink well under MAX_REQUEST_BYTES even though the uncompressed
+    // value the caller asked to store never could have fit the server's
+    // own request cap.
+    const { MAX_REQUEST_BYTES } = await import("../src/protocol.js");
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 16,
+      });
+      try {
+        const oversized = Buffer.alloc(MAX_REQUEST_BYTES + 1000, "a"); // DEFLATE-friendly
+        await assert.rejects(client.set("k", oversized), RangeError);
+        // Rejected before any I/O — the key was never written.
+        assert.equal(node.store.has("k"), false);
+
+        // Still usable afterward — none of the above touched the wire.
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("leaves a value below compressionThreshold unmarked-but-prefixed on the wire", async () => {
     const node = await startMockNode();
     try {
@@ -656,6 +688,63 @@ describe("NanocachedClient reconnect-on-use", () => {
       for (const socket of accepted) socket.destroy();
       await new Promise<void>((resolve) => silent.close(() => resolve()));
     }
+  });
+
+  it("shares one deadline budget across the dial and the handshake read, instead of a fresh one for each", async () => {
+    // Regression (issue #47 audit item 3): the dial and the ack read used
+    // to each get their own independent deadlineMs-long timer, so a dial
+    // that ate most of the budget still left the read phase a full fresh
+    // budget — up to ~2x the configured deadline overall. Simulate a slow
+    // dial by stubbing Date.now to report a large jump right after
+    // connectSocket resolves (the dial itself is still near-instant on
+    // loopback; only the clock the deadline math reads from is fooled),
+    // then assert the ack-read phase only gets what's left of the budget.
+    const { createServer } = await import("node:net");
+    const accepted = new Set<import("node:net").Socket>();
+    const silent = createServer((socket) => {
+      accepted.add(socket);
+      socket.on("error", () => {});
+    });
+    const port = await new Promise<number>((resolve) => {
+      silent.listen(0, "127.0.0.1", () => {
+        resolve((silent.address() as { port: number }).port);
+      });
+    });
+    const realNow = Date.now;
+    let calls = 0;
+    const nowMock = mock.method(Date, "now", () => {
+      calls++;
+      // Call #1 is identifyOnce's `startedAt`, taken before the dial;
+      // every call after that (inside remainingDeadline, once the dial
+      // has resolved) reports as if 450 of the 500ms budget were already
+      // spent on it, leaving only ~50ms for the read phase.
+      return calls === 1 ? realNow() : realNow() + 450;
+    });
+    try {
+      const { connectAndIdentify } = await import("../src/identify.js");
+      const started = process.hrtime.bigint();
+      await assert.rejects(
+        connectAndIdentify({ host: "127.0.0.1", port, connectDeadlineMs: 500 }),
+        /no response from server within/,
+      );
+      const elapsedMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+      // A fresh, undoubled budget would wait close to another 500ms here;
+      // a shared budget only has the ~50ms simulated remainder left.
+      assert.ok(elapsedMs < 250, `expected the read phase to use only the remaining budget, took ${elapsedMs}ms`);
+    } finally {
+      nowMock.mock.restore();
+      for (const socket of accepted) socket.destroy();
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+    }
+  });
+
+  it("remainingDeadline subtracts elapsed time from the shared budget, clamped at zero", async () => {
+    const { remainingDeadline } = await import("../src/identify.js");
+    const now = Date.now();
+    assert.equal(remainingDeadline(500, now), 500);
+    assert.ok(remainingDeadline(500, now - 450) <= 50);
+    assert.ok(remainingDeadline(500, now - 450) > 0);
+    assert.equal(remainingDeadline(500, now - 999_999), 0);
   });
 
   it("an `N` header with no newline fails promptly instead of buffering forever", async () => {
@@ -1775,6 +1864,29 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
         assert.equal(client.stats().refreshFailures, 0);
         // Forces a fresh fetchNodeList walk: the dead port fails first,
         // counted as a refresh failure, before discovery answers.
+        await (client as any).refreshNodeList();
+        assert.equal(client.stats().refreshFailures, 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
+    }
+  });
+
+  it("counts a swallowed refresh failure when a discovery server reports no live nodes", async () => {
+    // Regression (issue #47 audit item 7): a discovery server that's up
+    // but knows no live nodes is just as unusable for a refresh as one
+    // that's unreachable, and must be counted the same way.
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        assert.equal(client.stats().refreshFailures, 0);
+        discovery.setNodes([]);
+        // Forces a fresh fetchNodeList walk against the now-empty
+        // discovery response.
         await (client as any).refreshNodeList();
         assert.equal(client.stats().refreshFailures, 1);
       } finally {

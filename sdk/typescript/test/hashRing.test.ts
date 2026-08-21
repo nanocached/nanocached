@@ -45,6 +45,13 @@ describe("HashRing", () => {
     }
   });
 
+  it("throws instead of silently returning undefined when routing on an empty ring", () => {
+    // Regression (issue #47 audit item 6): owners(key, 1)[0] used to
+    // return undefined uncaught.
+    const ring = new HashRing([]);
+    assert.throws(() => ring.route(Buffer.from("k")), RangeError);
+  });
+
   it("routes deterministically", () => {
     const ring = new HashRing(nodes);
     for (let i = 0; i < 50; i++) {

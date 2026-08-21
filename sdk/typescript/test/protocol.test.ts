@@ -209,6 +209,23 @@ describe("tagged frames (doc/adr/0019-*.md)", () => {
     assert.throws(() => tryParseResponse(Buffer.from("V 5\nAlice"), true), /invalid value header/);
   });
 
+  it("rejects a tag field that isn't strictly decimal digits", () => {
+    // Regression (issue #47 audit item 4): bare `Number(field)` also
+    // accepts scientific notation, leading whitespace, and a leading
+    // sign — any of which would parse a desynced/corrupt tag field as if
+    // it were a legitimate one.
+    assert.throws(() => tryParseResponse(Buffer.from("S 1e2\n"), true), /invalid response tag/);
+    assert.throws(() => tryParseResponse(Buffer.from("S  5\n"), true), /invalid response tag/);
+    assert.throws(() => tryParseResponse(Buffer.from("S +5\n"), true), /invalid response tag/);
+  });
+
+  it("still parses an ordinary all-digit tag", () => {
+    assert.deepEqual(tryParseResponse(Buffer.from("S 100\n"), true), {
+      response: { kind: "stored", tag: 100 },
+      consumed: 6,
+    });
+  });
+
   it("keeps the unsolicited busy response bare in tagged mode", () => {
     assert.deepEqual(tryParseResponse(Buffer.from("B\n"), true), {
       response: { kind: "busy" },

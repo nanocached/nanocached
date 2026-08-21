@@ -63,4 +63,10 @@ class HashRing:
 
     def route(self, key: bytes) -> str:
         """The key's primary — ``owners(key, 1)[0]``."""
+        if not self._nodes:
+            # owners(key, 1) would silently return [], and [0] on that is a
+            # bare IndexError — not one of this SDK's own error types.
+            # Matches this SDK's own convention for other eager
+            # input-validation errors (e.g. client.py's ttl_seconds check).
+            raise ValueError("nanocached: cannot route on an empty hash ring")
         return self.owners(key, 1)[0]

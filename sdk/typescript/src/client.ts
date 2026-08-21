@@ -6,6 +6,7 @@ import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
+import { checkKeyAndValue } from "./protocol.js";
 
 export { ConnectionLostError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
@@ -625,9 +626,17 @@ export class NanocachedClient {
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    const outgoing = this.compress
-      ? compressValue(typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value), this.compressionThreshold)
-      : value;
+    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    const valueBytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+    // Validate the *original* value's size before compressing, matching
+    // Python's Set (issue #47 audit item 3) — an oversized value must be
+    // rejected outright, not silently forwarded just because DEFLATE
+    // happens to shrink it under the cap. Re-checked after compression
+    // too, purely as a defense-in-depth backstop should compressValue
+    // ever grow a value instead of shrinking it (encodeSet, reached
+    // through connection.set below, does that second check).
+    checkKeyAndValue(keyBytes, valueBytes);
+    const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
     return this.withWrongNodeRetry(() =>
       this.target.kind === "single"
         ? this.singleConnection().then((connection) => connection.set(key, outgoing, ttlSeconds))
@@ -955,6 +964,12 @@ export class NanocachedClient {
       }
 
       if (identified.nodes.length === 0) {
+        // A discovery server that's up but knows no live nodes is just as
+        // unusable for this refresh as one that's unreachable — count it
+        // the same way, matching the initial connect() path's treatment
+        // of an empty node list as a real failure (issue #47 audit item
+        // 7), not a silent skip.
+        this.refreshFailures++;
         continue;
       }
 

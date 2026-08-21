@@ -545,7 +545,9 @@ class NanocachedClient:
         finished and the connections are torn down (doc/adr/0014-*.md as
         amended by issue #47 item 3 — the drain contract every SDK now
         shares); a coroutine since then, the same shape aiohttp's
-        ``ClientSession.close`` has."""
+        ``ClientSession.close`` has. This SDK also waits for any in-flight
+        background node-list refresh or redial (issue #1) to finish before
+        returning — a guarantee the other SDKs' close() does not make."""
         if self._closed:
             _warn("nanocached: close() called again on an already-closed client")
             return

@@ -4,6 +4,7 @@ import io
 import os
 import ssl
 import unittest
+from unittest import mock
 
 from nanocached import (
     AlreadyClosedError,
@@ -533,15 +534,20 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
 class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_malformed_value_length_poisons_the_connection(self):
         # Regression for issue #8: a garbage `V <len>` header desyncs the
-        # stream; the connection must be poisoned and the error must be
-        # connection-classified, so the next request redials cleanly.
+        # stream; the connection must be poisoned so the next request
+        # redials cleanly. Raises NanocachedError, not ConnectionError —
+        # this is this SDK's own wire-frame-parse violation (issue #47
+        # audit item 5), matching the TypeScript SDK's protocol.ts, which
+        # raises its own plain NanocachedError uniformly for every raw
+        # parse violation; _read_loop's except clause still catches and
+        # poisons on either type, so this is a type-consistency fix only.
         node = await MockNode().start()
         try:
             client = await NanocachedClient.connect([("127.0.0.1", node.port)])
             try:
                 await client.set("k", "v")
                 node.answer_malformed_value_once()
-                with self.assertRaises(ConnectionError):
+                with self.assertRaises(NanocachedError):
                     await client.get("k")
 
                 self.assertEqual(await client.get("k"), "v")
@@ -613,13 +619,60 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         # `\n`. The TypeScript SDK's protocol.ts already validates this
         # (tryParseResponse) and raises a desync error; mirror that here
         # instead of silently accepting a tagged-shaped reply (`S1\n`) on
-        # an untagged connection.
+        # an untagged connection. Raises NanocachedError, not
+        # ConnectionError (issue #47 audit item 5) — see the malformed-
+        # value-length regression test above for why.
         node = await MockNode().start()
         try:
             client = await NanocachedClient.connect([("127.0.0.1", node.port)])
             try:
                 node.answer_malformed_status_once()
-                with self.assertRaisesRegex(ConnectionError, "desynced"):
+                with self.assertRaisesRegex(NanocachedError, "desynced"):
+                    await client.get("k")
+
+                # The poisoned connection redials transparently on next use.
+                self.assertIsNone(await client.get("k"))
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_tagged_response_missing_its_tag_poisons_the_connection(self):
+        # A tagged connection's fixed-form replies (S/D/N/W) must always
+        # carry a trailing ` <tag>` field; a reply that omits it (as this
+        # one does, `N\n` instead of `N <tag>\n`) desyncs the stream just
+        # like an untagged connection's unverified trailing byte above.
+        # Raises NanocachedError, not ConnectionError (issue #47 audit
+        # item 5) — see the malformed-value-length regression test for why.
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                node.answer_missing_tag_once()
+                with self.assertRaisesRegex(NanocachedError, "missing its tag"):
+                    await client.get("k")
+
+                # The poisoned connection redials transparently on next use.
+                self.assertIsNone(await client.get("k"))
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_tagged_response_with_an_invalid_tag_value_poisons_the_connection(self):
+        # _parse_tag's own invalid-value path (issue #47 audit item 5):
+        # a non-numeric tag field (`V 1 abc\n1` instead of `V 1 <tag>\n1`)
+        # is protocol garbage distinct from the missing-tag desync above.
+        # Raises NanocachedError, not ConnectionError — see the
+        # malformed-value-length regression test for why.
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                node.answer_invalid_tag_value_once()
+                with self.assertRaisesRegex(NanocachedError, "invalid response tag"):
                     await client.get("k")
 
                 # The poisoned connection redials transparently on next use.
@@ -1901,6 +1954,43 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
                 # Two dials: the extended attempt the server slammed shut,
+                # then the plain fallback that stuck.
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_reset_while_writing_the_extended_auth_frame_also_falls_back_to_untagged(self):
+        # Regression (issue #47 audit item 2): the legacy-server-fallback
+        # guard used to wrap only the ack *read* (_identify.py), not the
+        # `A ... T` write that precedes it. A pre-0019 server can slam the
+        # door as soon as it sees the extended frame — a reaction to what
+        # we sent, not to us waiting for a reply — so the door-slam can
+        # just as well show up as a write-time ConnectionResetError as a
+        # read-time one. MockNode's close_on_extended_auth (used by the
+        # test above) closes after reading the header, which in practice
+        # surfaces on the read side regardless of where the guard starts;
+        # to pin down the write-time path specifically, patch
+        # StreamWriter.write so sending the extended `A ... T` frame
+        # itself raises ConnectionResetError, exactly as if the peer had
+        # already reset by the time the client tried to write.
+        node = await MockNode().start()
+        try:
+            real_write = asyncio.StreamWriter.write
+
+            def flaky_write(writer, data):
+                if data.startswith(b"A ") and b" T" in data.split(b"\n", 1)[0]:
+                    raise ConnectionResetError("simulated reset reacting to the extended A frame")
+                return real_write(writer, data)
+
+            with mock.patch.object(asyncio.StreamWriter, "write", flaky_write):
+                client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                # Transparently retried untagged — still fully usable.
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                # Two dials: the extended attempt that reset on write,
                 # then the plain fallback that stuck.
                 self.assertEqual(node.connection_count, 2)
             finally:

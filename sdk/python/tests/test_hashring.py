@@ -60,6 +60,14 @@ class HashRingTests(unittest.TestCase):
         for node, count in counts.items():
             self.assertLess(abs(count - fair) / fair, 0.15, f"{node} got {count}/{total}")
 
+    def test_routing_on_an_empty_ring_raises_value_error(self):
+        # Regression (issue #47 audit item 6): owners(key, 1) on an empty
+        # ring returns [], and [0] on that used to raise a bare
+        # IndexError — not one of this SDK's own error types.
+        ring = HashRing([])
+        with self.assertRaises(ValueError):
+            ring.route(b"k")
+
 
 if __name__ == "__main__":
     unittest.main()
