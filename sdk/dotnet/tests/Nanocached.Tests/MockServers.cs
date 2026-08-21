@@ -41,6 +41,7 @@ public sealed class MockNode : IDisposable
     private int _malformedValueReplies;
     private int _storedToGetReplies;
     private int _wrongNodeOnSetReplies;
+    private int _extraByteOnSetReplies;
     private volatile int _setDelayMillis;
     private volatile bool _silent;
     private long _lastSetTtl;
@@ -98,6 +99,15 @@ public sealed class MockNode : IDisposable
     /// tests that need a node to keep answering GET normally while a
     /// later SET against it (e.g. a read-repair write) fails.</summary>
     public void AnswerWrongNodeOnSetOnce() => Interlocked.Increment(ref _wrongNodeOnSetReplies);
+
+    /// <summary>Queue a one-off malformed reply to the next S on an
+    /// untagged connection: <c>S1\n</c> instead of the well-formed
+    /// two-byte <c>S\n</c> — an extra byte between the marker and the
+    /// trailing '\n', as if the server had (bogusly) tagged this reply on
+    /// a connection that never asked for tags. Regression coverage for
+    /// the untagged fast path's trailing-byte validation
+    /// (Connection.cs's ExpectLfAsync).</summary>
+    public void AnswerExtraByteOnSetOnce() => Interlocked.Increment(ref _extraByteOnSetReplies);
 
     /// <summary>Holds every future S reply for <paramref name="millis"/>
     /// first — for tests proving a caller isn't blocked on a slow replica
@@ -245,6 +255,11 @@ public sealed class MockNode : IDisposable
                         if (_setDelayMillis > 0)
                         {
                             await Task.Delay(_setDelayMillis);
+                        }
+                        if (!tagged && TakeOne(ref _extraByteOnSetReplies))
+                        {
+                            await Wire.WriteAsync(stream, "S1\n");
+                            break;
                         }
                         if (TakeOne(ref _wrongNodeOnSetReplies) || TakeWrongNode())
                         {

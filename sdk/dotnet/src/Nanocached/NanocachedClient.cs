@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net.Security;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -36,7 +37,13 @@ public sealed class NanocachedClient : IDisposable
         /// refresh walk this list until one yields a working target.</summary>
         public List<(string Host, int Port)> Addresses { get; } = new();
 
-        /// <summary>Shared secret matching NANOCACHED_AUTH_SECRET on the server.</summary>
+        /// <summary>Shared secret matching NANOCACHED_AUTH_SECRET on the
+        /// server. An empty string is the same as none, matching the
+        /// other SDKs: sent literally, an empty secret would reach the
+        /// wire as an explicit zero-length secret, which the server
+        /// rejects and closes the connection for without replying —
+        /// turning what should be "no auth configured" into an opaque
+        /// <see cref="ConnectionLostException"/>.</summary>
         public string? AuthSecret { get; set; }
 
         /// <summary>Connect over TLS. Defaults to the platform/system
@@ -63,7 +70,8 @@ public sealed class NanocachedClient : IDisposable
         /// <summary>Values shorter than this (in bytes) are never
         /// compressed — the per-value overhead of attempting it outweighs
         /// the savings. Only meaningful when <see cref="Compress"/> is
-        /// true. Default 256.</summary>
+        /// true. Default 256. Negative is rejected by
+        /// <see cref="ConnectAsync(Options)"/>.</summary>
         public int CompressionThreshold { get; set; } = 256;
 
         /// <summary>Let SetAsync/DeleteAsync return as soon as the primary
@@ -88,8 +96,30 @@ public sealed class NanocachedClient : IDisposable
         /// error instead of paying another full connect timeout redialing
         /// an address that just proved unreachable. Default 1 second. Keep
         /// well under <c>NodeListStaleAfter</c> (30s) so a node that
-        /// genuinely recovers isn't shut out for long.</summary>
+        /// genuinely recovers isn't shut out for long.
+        ///
+        /// <para><see cref="TimeSpan.Zero"/> means "use the default"
+        /// (1 second), not "disable it" — this field already carries its
+        /// own default value above, so zero is only ever seen here when a
+        /// caller explicitly sets it back to zero, matching the Go SDK's
+        /// zero-value <c>Config.ReconnectCooldown</c> and the Rust SDK's
+        /// <c>Duration::ZERO</c>. To disable the cooldown entirely — every
+        /// request that finds an address's connection dead pays its own
+        /// full dial attempt instead of reusing a cached failure — set
+        /// <see cref="DisableReconnectCooldown"/> instead (the Go SDK's
+        /// equivalent is a negative <c>Config.ReconnectCooldown</c>; Rust's
+        /// and Java's is their own <c>disableReconnectCooldown()</c>).
+        /// Rejected as invalid if set negative; use
+        /// <see cref="DisableReconnectCooldown"/> to disable, not a
+        /// negative value.</para></summary>
         public TimeSpan ReconnectCooldown { get; set; } = TimeSpan.FromMilliseconds(1000);
+
+        /// <summary>Disables the per-address reconnect cooldown entirely:
+        /// every request that finds an address's connection dead pays its
+        /// own full dial attempt instead of reusing a cached failure. See
+        /// <see cref="ReconnectCooldown"/> for what the cooldown is. Off
+        /// by default.</summary>
+        public bool DisableReconnectCooldown { get; set; }
     }
 
     /// <summary>
@@ -179,7 +209,13 @@ public sealed class NanocachedClient : IDisposable
     private readonly int _compressionThreshold;
     private readonly bool _fireAndForgetReplicas;
     private readonly bool _readRepair;
-    private readonly TimeSpan _reconnectCooldown;
+    // Resolved from Options.ReconnectCooldown/DisableReconnectCooldown:
+    // null means disabled (Options.DisableReconnectCooldown was set); a
+    // caller-specified TimeSpan.Zero resolves to DefaultReconnectCooldown
+    // (see Options.ReconnectCooldown's doc comment) — never stored here as
+    // literal zero, so DialWithCooldownAsync never has to special-case it.
+    private readonly TimeSpan? _reconnectCooldown;
+    private static readonly TimeSpan DefaultReconnectCooldown = TimeSpan.FromMilliseconds(1000);
     /// <summary>Per-address reconnect cooldown (see
     /// <see cref="Options.ReconnectCooldown"/>): the address of the most
     /// recently failed dial, and how long it stays "down" before another
@@ -233,7 +269,9 @@ public sealed class NanocachedClient : IDisposable
     private NanocachedClient(Options options)
     {
         _addresses = options.Addresses.ToList();
-        _authSecret = options.AuthSecret is null ? null : Encoding.UTF8.GetBytes(options.AuthSecret);
+        // Empty is the same as none (see Options.AuthSecret's doc comment)
+        // — matches the other SDKs.
+        _authSecret = string.IsNullOrEmpty(options.AuthSecret) ? null : Encoding.UTF8.GetBytes(options.AuthSecret);
         _tls = BuildTlsOptions(options);
         _compress = options.Compress;
         _compressionThreshold = options.CompressionThreshold;
@@ -243,7 +281,11 @@ public sealed class NanocachedClient : IDisposable
         _backgroundReadRepairPermitCount = MaxInFlightBackgroundReadRepairs;
         _backgroundReadRepairPermits = new SemaphoreSlim(_backgroundReadRepairPermitCount, _backgroundReadRepairPermitCount);
         _readRepair = options.ReadRepair;
-        _reconnectCooldown = options.ReconnectCooldown;
+        _reconnectCooldown = options.DisableReconnectCooldown
+            ? null
+            : options.ReconnectCooldown == TimeSpan.Zero
+                ? DefaultReconnectCooldown
+                : options.ReconnectCooldown;
     }
 
     /// <summary>Builds the internal TLS options for every dial this client
@@ -315,7 +357,15 @@ public sealed class NanocachedClient : IDisposable
         if (options.ReconnectCooldown < TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(options), "nanocached: ReconnectCooldown must not be negative");
+                nameof(options),
+                "nanocached: ReconnectCooldown must not be negative; set DisableReconnectCooldown "
+                + "instead of a negative value to disable it");
+        }
+        if (options.CompressionThreshold < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                $"nanocached: CompressionThreshold must not be negative, got {options.CompressionThreshold}");
         }
 
         var client = new NanocachedClient(options);
@@ -474,11 +524,12 @@ public sealed class NanocachedClient : IDisposable
         return value is null || !_compress ? value : Compression.DecompressValue(value);
     }
 
-    /// <summary>doc/adr/0015-*.md: probes every owner of <paramref
-    /// name="key"/>, in rank order, for a value the normal read path
-    /// already reported missing. The first owner that has it wins: its
-    /// value is returned, and — detached, not awaited, but bounded and
-    /// tracked via <see cref="_backgroundReadRepairPermits"/> the same way
+    /// <summary>doc/adr/0015-*.md: probes the remaining owners of
+    /// <paramref name="key"/> — every owner but the primary, which the
+    /// normal read path already probed and got a clean miss from — in
+    /// rank order, for a value. The first one that has it wins: its value
+    /// is returned, and — detached, not awaited, but bounded and tracked
+    /// via <see cref="_backgroundReadRepairPermits"/> the same way
     /// <see cref="_backgroundReplicaPermits"/> bounds replica writes —
     /// that same value repairs the true primary in the background, with
     /// TTL <see cref="ReadRepairTtlSeconds"/> (the original TTL can't be
@@ -491,7 +542,8 @@ public sealed class NanocachedClient : IDisposable
     private async Task<byte[]?> TryReadRepairAsync(byte[] key)
     {
         IReadOnlyList<string> names = OwnerNames(key);
-        foreach (string name in names)
+        if (names.Count == 0) return null;
+        foreach (string name in names.Skip(1))
         {
             byte[]? value;
             try
@@ -505,7 +557,7 @@ public sealed class NanocachedClient : IDisposable
             }
             if (value is null) continue;
 
-            if (names.Count > 0 && _backgroundReadRepairPermits.Wait(0))
+            if (_backgroundReadRepairPermits.Wait(0))
             {
                 string primary = names[0];
                 byte[] repairValue = value;
@@ -870,14 +922,65 @@ public sealed class NanocachedClient : IDisposable
             replicaWrites.Add(ReplicaWriteAsync(name));
         }
 
+        // Run the primary and capture its outcome instead of just
+        // `await`-ing it — a `finally { await Task.WhenAll(replicaWrites); }`
+        // here would let an uncaught exception from a replica leg (a
+        // genuine programming bug; every *expected* failure is already
+        // caught inside ReplicaWriteAsync above) REPLACE the try block's
+        // outcome: a successful primary write would come back as an
+        // exception, or the primary's own real error would be silently
+        // discarded in favor of the replica bug. Mirrors the TypeScript
+        // SDK's writeToOwners (client.ts, ~767-789).
+        T result = default!;
+        Exception? primaryError = null;
         try
         {
-            return await ApplyReconnectingAsync(names[0], op).ConfigureAwait(false);
+            result = await ApplyReconnectingAsync(names[0], op).ConfigureAwait(false);
         }
-        finally
+        catch (Exception error)
         {
-            await Task.WhenAll(replicaWrites).ConfigureAwait(false);
+            primaryError = error;
         }
+
+        // Always drain every replica leg — for Close()'s tracking (issue
+        // #12/#14) and so a genuine replica-leg bug doesn't linger
+        // unobserved — but never let one override an already-successful
+        // primary write: the write happened, so throwing here despite
+        // that would misreport a completed write as failed. A replica bug
+        // is only ever surfaced by throwing when the primary itself also
+        // failed; only the first such bug is surfaced this way, same as
+        // TypeScript — any further ones are just logged, same as a
+        // successful primary's replica bugs always are.
+        Exception? replicaBug = null;
+        foreach (Task replicaWrite in replicaWrites)
+        {
+            try
+            {
+                await replicaWrite.ConfigureAwait(false);
+            }
+            catch (Exception outcome)
+            {
+                if (primaryError is not null && replicaBug is null)
+                {
+                    replicaBug = outcome;
+                }
+                else
+                {
+                    Console.Error.WriteLine(
+                        $"nanocached: a replica write raised an unexpected error: {outcome}");
+                }
+            }
+        }
+
+        if (primaryError is not null)
+        {
+            // ExceptionDispatchInfo preserves the original stack trace —
+            // without it, re-throwing an exception caught earlier and held
+            // across the awaits above would show this rethrow as the
+            // exception's origin instead of where it actually happened.
+            ExceptionDispatchInfo.Capture(replicaBug ?? primaryError).Throw();
+        }
+        return result;
     }
 
     // ── 遅延再接続 ────────────────────────────────────────────────
@@ -954,7 +1057,13 @@ public sealed class NanocachedClient : IDisposable
         }
         catch (NanocachedException error)
         {
-            _reconnectCooldowns[address] = (DateTime.UtcNow + _reconnectCooldown, error);
+            // null means Options.DisableReconnectCooldown was set — every
+            // request that finds this address's connection dead pays its
+            // own full dial attempt instead of reusing a cached failure.
+            if (_reconnectCooldown is TimeSpan resolvedCooldown)
+            {
+                _reconnectCooldowns[address] = (DateTime.UtcNow + resolvedCooldown, error);
+            }
             throw;
         }
     }

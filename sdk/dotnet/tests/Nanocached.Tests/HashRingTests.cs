@@ -56,6 +56,50 @@ public class HashRingTests
     }
 
     [Fact]
+    public void OwnersMatchesANaiveFullSortReferenceAcrossReplicaCounts()
+    {
+        // Owners now selects the top-R via bounded insertion instead of
+        // sorting every node under NanocachedClient's routing lock on
+        // every call (audit finding). This pins its output
+        // byte-identical to the straightforward "score everything, sort,
+        // then take" reference it replaced, across R's edge cases (0, 1,
+        // half the cluster, exactly the cluster size, and one over it)
+        // plus a run of pseudo-random keys. Mirrors the Rust SDK's
+        // owners_matches_a_naive_full_sort_reference test
+        // (sdk/rust/src/hash_ring.rs) and the Go SDK's TestOwnersMatchesNaiveFullSort.
+        string[] nodeNames = Enumerable.Range(0, 37).Select(i => $"node-{i}").ToArray();
+        var ring = new HashRing(nodeNames);
+        int len = nodeNames.Length;
+
+        var rng = new Random(0xC0FFEE);
+        foreach (int replicas in new[] { 0, 1, len / 2, len, len + 1, len + 10 })
+        {
+            for (int i = 0; i < 200; i++)
+            {
+                byte[] key = Bytes($"fuzz-key-{rng.Next()}");
+                IReadOnlyList<string> actual = ring.Owners(key, replicas);
+                IReadOnlyList<string> expected = NaiveOwners(nodeNames, key, replicas);
+                Assert.Equal(expected, actual);
+            }
+        }
+    }
+
+    /// <summary>The reference implementation Owners used to be — sort
+    /// every node's score, then take the front — kept independent of
+    /// HashRing.Owners' own bounded-insertion logic so it can serve as a
+    /// ground truth for the property test above.</summary>
+    private static IReadOnlyList<string> NaiveOwners(string[] nodeNames, byte[] key, int replicas)
+    {
+        ulong keyHash = HashRing.Fnv1a(key);
+        List<(ulong Score, string Node)> scored = nodeNames
+            .Select(node => (Score: HashRing.Fmix64(HashRing.Fnv1a(Bytes(node)) ^ keyHash), Node: node))
+            .OrderByDescending(pair => pair.Score)
+            .ThenBy(pair => pair.Node, StringComparer.Ordinal)
+            .ToList();
+        return scored.Take(Math.Min(replicas, scored.Count)).Select(pair => pair.Node).ToArray();
+    }
+
+    [Fact]
     public void SpreadsKeysEvenly()
     {
         var ring = new HashRing(Nodes);

@@ -127,7 +127,9 @@ An address whose redial just failed is treated as still down for
 `ReconnectCooldown` (default 1 second): requests routed to it during that
 window fail immediately with the original dial error instead of each
 paying another full connect timeout. Keep it short — a node that
-genuinely recovers is shut out for at most this long.
+genuinely recovers is shut out for at most this long. `TimeSpan.Zero`
+means "use the default", not "disable it" — set `DisableReconnectCooldown`
+instead to make every request pay its own full dial attempt.
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(
@@ -135,6 +137,7 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
     {
         Addresses = { ("cache.internal", 8357) },
         ReconnectCooldown = TimeSpan.FromMilliseconds(1000), // default
+        // DisableReconnectCooldown = true, // opt out of the cooldown entirely
     });
 ```
 
@@ -149,6 +152,9 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
         Tls = true,                 // system trust store
     });
 ```
+
+An empty `AuthSecret` is the same as leaving it `null` — matching the
+other SDKs — not a literal zero-length secret.
 
 For a private CA, point `Ca` at a PEM file of trusted root certificate(s)
 — it replaces the default trust store and is only consulted when `Tls`

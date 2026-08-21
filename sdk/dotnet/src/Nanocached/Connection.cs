@@ -499,7 +499,7 @@ internal sealed class Connection
             {
                 if (!_tagged)
                 {
-                    await ReadByteAsync().ConfigureAwait(false); // the trailing '\n'
+                    await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
                     return (marker, null, null);
                 }
 
@@ -521,7 +521,7 @@ internal sealed class Connection
             case (byte)'B':
                 // Busy is unsolicited and always bare (ADR-0019) — never
                 // tagged, even on a tagged connection.
-                await ReadByteAsync().ConfigureAwait(false); // the trailing '\n'
+                await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
                 return (marker, null, null);
             default:
                 // A garbage marker means the stream is desynced; poison
@@ -551,6 +551,27 @@ internal sealed class Connection
     {
         await _stream.ReadExactlyAsync(_readByteBuffer).ConfigureAwait(false);
         return _readByteBuffer[0];
+    }
+
+    /// <summary>Consumes one byte and verifies it is '\n' — used for the
+    /// untagged fixed-shape responses (S/D/N/W/B), which are exactly two
+    /// bytes on the wire. A byte other than '\n' here means the streams
+    /// are desynced (e.g. a server that unexpectedly tagged a response on
+    /// an untagged connection) and every later response would be
+    /// misaligned too, so this must poison the connection rather than
+    /// silently discard the extra byte. Mirrors the Java SDK's
+    /// expectLf() (Connection.java:492-498). Throwing here relies on the
+    /// same path every other ReadResponseAsync failure already uses:
+    /// ReadLoopAsync's catch classifies this as a ConnectionLostException
+    /// and poisons the connection via Close().</summary>
+    private async Task ExpectLfAsync()
+    {
+        byte value = await ReadByteAsync().ConfigureAwait(false);
+        if (value != (byte)'\n')
+        {
+            throw new ConnectionLostException(
+                "nanocached: unexpected byte after response marker (connection desynced)");
+        }
     }
 
     /// <summary>Reads up to (and consuming) the next '\n'.</summary>

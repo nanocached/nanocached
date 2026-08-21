@@ -210,6 +210,24 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task EmptyAuthSecretBehavesAsNoSecret()
+    {
+        // Regression: AuthSecret = "" used to be sent literally, reaching
+        // the wire as an explicit zero-length secret ("A 0\n") — which a
+        // real server rejects (and this mock's `secret.Length > 0` check
+        // mirrors) as EmptySecret and closes the connection without
+        // replying, turning what should be "no auth configured" into an
+        // opaque AuthenticationFailedException/ConnectionLostException.
+        // An empty AuthSecret must behave exactly like a null one.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new NanocachedClient.Options { Addresses = { ("127.0.0.1", node.Port) }, AuthSecret = "" });
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+    }
+
+    [Fact]
     public async Task WrongNodePropagatesInSingleMode()
     {
         using var node = new MockNode();
@@ -343,6 +361,28 @@ public class NanocachedClientTests
 
         await client.SetAsync("k", "v");
         node.AnswerStoredToGetOnce();
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task AnExtraByteAfterAnUntaggedResponseMarkerPoisonsTheConnectionAndRetriesTransparently()
+    {
+        // Regression: the untagged fast path (S/D/N/W) used to read the
+        // trailing byte with ReadByteAsync() and discard it unchecked
+        // instead of verifying it is '\n' — a byte other than '\n' here
+        // means the streams are desynced (e.g. the server tagged a
+        // response, "S1\n", on a connection that never asked for tags)
+        // and every later response would be misaligned too. Mirrors
+        // Java's expectLf() (Connection.java:492-498). The
+        // connection-classified error is healed by the built-in
+        // redial-and-retry-once, exactly like
+        // AMismatchedResponseKindPoisonsTheConnection.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        node.AnswerExtraByteOnSetOnce();
+        await client.SetAsync("k", "v");
         Assert.Equal("v", await client.GetAsync("k"));
         Assert.Equal(2, node.ConnectionCount);
     }
@@ -520,6 +560,95 @@ public class NanocachedClientTests
             NanocachedException thirdError = await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
             Assert.Contains("unexpected response to A", thirdError.Message);
             Assert.Equal(1, connections);
+        }
+        finally
+        {
+            garbage.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task RejectsANegativeReconnectCooldown()
+    {
+        // Cross-SDK contract (mirrors Rust/Go): a negative
+        // ReconnectCooldown is invalid — DisableReconnectCooldown is the
+        // only supported way to disable the cooldown.
+        var options = SingleAddress("127.0.0.1", Wire.UnusedPort());
+        options.ReconnectCooldown = TimeSpan.FromMilliseconds(-1);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => NanocachedClient.ConnectAsync(options));
+    }
+
+    [Fact]
+    public async Task ZeroReconnectCooldownMeansTheDefaultNotDisabled()
+    {
+        // Cross-SDK contract change: TimeSpan.Zero used to disable the
+        // cooldown entirely; it now means "use the default" (1s), matching
+        // the Go SDK's zero-value Config.ReconnectCooldown and the Rust
+        // SDK's Duration::ZERO. Same shape as
+        // ReconnectCooldownSkipsARedialToAKnownDeadAddress, but with an
+        // explicit TimeSpan.Zero standing in for "unset".
+        var node = new MockNode();
+        int port = node.Port;
+        var options = SingleAddress("127.0.0.1", port);
+        options.ReconnectCooldown = TimeSpan.Zero;
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+
+        await client.SetAsync("k", "v");
+        node.Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        var firstError = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
+
+        int connections = 0;
+        var garbage = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
+        garbage.Start();
+        _ = AcceptAndAnswerGarbageAsync(garbage, () => Interlocked.Increment(ref connections));
+        try
+        {
+            // Still within the (default, ~1s) cooldown window: rejects
+            // with the cached failure near-instantly, without dialing the
+            // listener at all — proving zero resolved to the default
+            // instead of disabling the cooldown.
+            var secondError = await Assert.ThrowsAsync<ConnectionLostException>(() => client.GetAsync("k"));
+            Assert.Equal(0, connections);
+            Assert.Same(firstError, secondError);
+        }
+        finally
+        {
+            garbage.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task DisableReconnectCooldownRedialsEveryTime()
+    {
+        // Options.DisableReconnectCooldown is this SDK's equivalent of
+        // Rust's disable_reconnect_cooldown() / Java's
+        // disableReconnectCooldown() / Go's negative
+        // Config.ReconnectCooldown: every request that finds the
+        // connection dead pays its own full dial attempt instead of
+        // reusing a cached failure.
+        var node = new MockNode();
+        int port = node.Port;
+        var options = SingleAddress("127.0.0.1", port);
+        options.DisableReconnectCooldown = true;
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+
+        await client.SetAsync("k", "v");
+        node.Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        int connections = 0;
+        var garbage = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
+        garbage.Start();
+        _ = AcceptAndAnswerGarbageAsync(garbage, () => Interlocked.Increment(ref connections));
+        try
+        {
+            // Unlike the cooldown-enabled case, each call dials again —
+            // no cooldown window is ever recorded.
+            await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
+            await Assert.ThrowsAsync<NanocachedException>(() => client.GetAsync("k"));
+            Assert.Equal(2, connections);
         }
         finally
         {
@@ -1082,6 +1211,30 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ReadRepairProbesOnlyTheRemainingOwnersNotThePrimary()
+    {
+        // Regression: TryReadRepairAsync used to re-probe every owner,
+        // including the primary that the normal read path had already
+        // just probed for a clean miss — a redundant GET against a
+        // connection that's about to be repaired anyway.
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Store[MockNode.KeyOf(Bytes("k"))] = Bytes("from-replica");
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+
+        Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
+
+        // Exactly one GET on the primary: the normal read path's own
+        // clean-miss probe. Read repair itself must not probe it again.
+        Assert.Equal(1, cluster.Nodes[owners[0]].GetCount);
+    }
+
+    [Fact]
     public async Task StaysACleanMissWhenNoOwnerHasTheValue()
     {
         using Cluster cluster = StartCluster(replication: 2);
@@ -1220,14 +1373,23 @@ public class NanocachedClientTests
     }
 
     [Fact]
-    public async Task ANonConnectionExceptionOnAReplicaLegPropagatesInsteadOfBeingSwallowed()
+    public async Task ANonConnectionExceptionOnASynchronousReplicaLegIsLoggedButDoesNotFailASuccessfulPrimaryWrite()
     {
-        // Regression for the catch-narrowing at the replica-write swallow
-        // site (WriteAsync's ReplicaWriteAsync): only the connection
-        // layer's own failure types are caught there now, so a
-        // programming bug — here, a stubbed connection whose stream
-        // throws InvalidOperationException on write — must propagate
-        // instead of being swallowed identically to a dead replica.
+        // Regression for WriteAsync's primary/replica join (issue: audit
+        // finding — a `finally { await Task.WhenAll(replicaWrites); }`
+        // let an uncaught replica-leg bug REPLACE the try block's outcome,
+        // turning a successful primary write into a thrown exception).
+        // The catch-narrowing at the replica-write swallow site
+        // (ReplicaWriteAsync) still only catches the connection layer's
+        // own failure types, so a programming bug — here, a stubbed
+        // connection whose stream throws InvalidOperationException on
+        // write — still escapes it and must not be silently dropped
+        // (counted identically to a dead replica's
+        // Stats().ReplicaWriteFailures); but since the primary write
+        // already succeeded, SetAsync must report success, with the bug
+        // only logged to stderr. Mirrors the TypeScript SDK's
+        // writeToOwners (client.ts, ~767-789) and the Python SDK's
+        // equivalent _warn() path.
         using Cluster cluster = StartCluster(replication: 2);
         using NanocachedClient client =
             await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
@@ -1235,7 +1397,50 @@ public class NanocachedClientTests
         string replica = OwnersOf("k")[1];
         ReplaceMemberConnection(client, replica, new Connection(new ThrowingStream()));
 
+        string output = await CaptureStderrAsync(async () => await client.SetAsync("k", "v"));
+
+        Assert.Contains("nanocached: a replica write raised an unexpected error", output);
+        Assert.Equal(0, client.Stats().ReplicaWriteFailures);
+        Assert.Equal("v", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task WhenThePrimaryFailsAndAReplicaLegBugsTooTheReplicaBugIsThrown()
+    {
+        // Second of the three finally-join combinations (see the test
+        // above and the one below): primary failure AND a replica leg
+        // that throws a non-SDK exception (a programming bug, not one of
+        // the connection-layer failure types ReplicaWriteAsync already
+        // swallows) — the bug must win, since the primary write itself
+        // never landed anywhere and this is the only signal that
+        // something is badly wrong with the replica leg too.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[0]].Dispose(); // the primary dies
+        await Task.Delay(50); // let the FIN land
+        ReplaceMemberConnection(client, owners[1], new Connection(new ThrowingStream()));
+
         await Assert.ThrowsAsync<InvalidOperationException>(() => client.SetAsync("k", "v"));
+    }
+
+    [Fact]
+    public async Task WhenThePrimaryFailsAndReplicasAreFineThePrimarysOwnErrorPropagates()
+    {
+        // Third combination: primary failure with no replica bug (the
+        // replica leg is healthy) — the primary's own error must
+        // propagate, not be masked or replaced.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[0]].Dispose(); // the primary dies; the replica stays healthy
+        await Task.Delay(50); // let the FIN land
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.SetAsync("k", "v"));
     }
 
     // Audit finding D3: when the failing replica leg instead runs in the
@@ -1302,6 +1507,17 @@ public class NanocachedClientTests
             Compress = true,
             CompressionThreshold = threshold,
         };
+
+    [Fact]
+    public async Task RejectsANegativeCompressionThreshold()
+    {
+        // A negative CompressionThreshold used to be accepted silently,
+        // always compressing (Compression.CompressValue treats "shorter
+        // than a negative threshold" as never true). Reject it up front,
+        // like the other invalid-option checks in ConnectAsync.
+        var options = CompressingOptions(Wire.UnusedPort(), threshold: -1);
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => NanocachedClient.ConnectAsync(options));
+    }
 
     [Fact]
     public async Task WireFormatIsUntouchedWhenCompressIsOff()
