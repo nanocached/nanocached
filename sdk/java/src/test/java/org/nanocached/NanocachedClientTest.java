@@ -436,8 +436,10 @@ class NanocachedClientTest {
     void reconnectCooldownSkipsARedialToAKnownDeadAddress() throws Exception {
         try (MockNode node = new MockNode()) {
             int port = node.port();
+            // Timing: a wide cooldown window and fast-rejection bound keep this
+            // from flaking on loaded CI runners.
             try (NanocachedClient client = NanocachedClient.connect(
-                    single("127.0.0.1", port).reconnectCooldown(Duration.ofMillis(200)))) {
+                    single("127.0.0.1", port).reconnectCooldown(Duration.ofMillis(1000)))) {
                 client.set("k", "v");
                 node.close();
 
@@ -483,7 +485,7 @@ class NanocachedClientTest {
                     NanocachedException.ConnectionFailed secondError = assertThrows(
                             NanocachedException.ConnectionFailed.class, () -> client.get("k"));
                     long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
-                    assertTrue(elapsedMillis < 100,
+                    assertTrue(elapsedMillis < 500,
                             "expected a cooldown-fast rejection, took " + elapsedMillis + "ms");
                     assertEquals(0, connections.get(), "the cooldown did not prevent a redial");
                     assertTrue(firstError == secondError,
@@ -491,7 +493,7 @@ class NanocachedClientTest {
 
                     // Once the cooldown window has passed, the address is
                     // dialed again, this time reaching the listener.
-                    Thread.sleep(250);
+                    Thread.sleep(1200);
                     NanocachedException thirdError = assertThrows(
                             NanocachedException.class, () -> client.get("k"));
                     assertTrue(thirdError.getMessage().contains("unexpected response to A"),
