@@ -23,7 +23,7 @@ func TestFnv1aMatchesPublishedVectors(t *testing.T) {
 }
 
 func TestMatchesCrossLanguageScoreVectors(t *testing.T) {
-	// Pinned outputs of the full ADR-0011 score pipeline — the Rust node
+	// Pinned outputs of the full client-side replication score pipeline — the Rust node
 	// and the TypeScript/Python/Java/Rust/.NET SDKs assert these too.
 	if got := fmix64(0); got != 0 {
 		t.Errorf("fmix64(0) = %#x", got)

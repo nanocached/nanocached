@@ -5,7 +5,7 @@ namespace Nanocached.Tests;
 
 public class CompressionTests
 {
-    // doc/adr/0013-*.md: one canonical plaintext and its raw-DEFLATE
+    // Value compression: one canonical plaintext and its raw-DEFLATE
     // compressed bytes (produced once via Python's zlib, level 6,
     // wbits=-15), hardcoded identically into every SDK's test suite — the
     // same duplicated-pinned-constant pattern the hash-ring FNV-1a/score

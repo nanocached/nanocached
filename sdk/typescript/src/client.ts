@@ -50,17 +50,17 @@ function isSwallowable(error: unknown): boolean {
 }
 
 /** Snapshot of counters for failures this client swallows by design
- * (ADR-0011/0014/0015) instead of raising them to a caller — observability
+ * (client-side replication / fire-and-forget replica writes / read repair) instead of raising them to a caller — observability
  * for silently degrading replication or a stuck node-list refresh, which
  * would otherwise be invisible. See NanocachedClient.stats(). */
 export interface ClientStats {
   /** Replica-leg write failures swallowed during a cluster write
    * (writeToOwners), whether the leg ran synchronously or as a
-   * fireAndForgetReplicas background write (doc/adr/0011-*.md,
-   * doc/adr/0014-*.md). */
+   * fireAndForgetReplicas background write (client-side replication,
+   * Fire-and-forget replica writes). */
   replicaWriteFailures: number;
   /** Failures swallowed while probing owners or writing back the repaired
-   * value during read repair (doc/adr/0015-*.md). */
+   * value during read repair (read repair). */
   readRepairFailures: number;
   /** Node-list refresh attempts that failed, and per-node connect
    * failures swallowed while reconciling a refresh's member list
@@ -76,7 +76,7 @@ export interface NanocachedAddress {
 
 export interface NanocachedClientOptions {
   /** Connect targets: one or more nanocached-node or nanocached-discovery
-   * addresses (ADR-0010), tried in order. A one-element list is the
+   * addresses (discovery HA), tried in order. A one-element list is the
    * single-target case — there is no separate host/port shorthand. Both
    * the initial connect and every later node-list refresh walk this list
    * until one provides a node list, so losing any one discovery replica
@@ -102,10 +102,10 @@ export interface NanocachedClientOptions {
    * error. */
   ca?: string;
   /** Transparently compress values above `compressionThreshold` on `set`
-   * and decompress them on `get`/`getBytes` (doc/adr/0013-*.md). Off by
+   * and decompress them on `get`/`getBytes` (value compression). Off by
    * default. **Every client that reads or writes a given set of keys must
    * agree on this setting** — it is a per-keyspace format decision, not a
-   * per-client preference; see the ADR's Consequences before enabling
+   * per-client preference; take care before enabling
    * this against an existing keyspace another client may still touch
    * with `compress` off. */
   compress?: boolean;
@@ -115,7 +115,7 @@ export interface NanocachedClientOptions {
   compressionThreshold?: number;
   /** Let `set`/`delete` return as soon as the primary owner acks,
    * letting replica legs finish in the background instead of waiting
-   * for them too (doc/adr/0014-*.md). Off by default. Unlike `compress`,
+   * for them too (fire-and-forget replica writes). Off by default. Unlike `compress`,
    * this is a pure latency/durability trade for this client's own
    * writes — it carries no wire format and needs no agreement with other
    * clients. */
@@ -123,7 +123,7 @@ export interface NanocachedClientOptions {
   /** On a clean miss (the key's first-reached owner reports it missing),
    * probe the remaining owners before accepting that, and repair the
    * primary in the background if one still has the value
-   * (doc/adr/0015-*.md). Off by default. Costs extra reads only on the
+   * (read repair). Off by default. Costs extra reads only on the
    * misses this actually applies to. */
   readRepair?: boolean;
   /** How long, after a reconnect dial to an address fails, that address is
@@ -141,7 +141,7 @@ const DEFAULT_RECONNECT_COOLDOWN_MS = 1_000;
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
-// TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
+// TTL a read-repair write uses (read repair), in whole seconds —
 // the protocol's TTL unit throughout (see encodeSet in protocol.ts). The
 // original TTL isn't recoverable from a GET response, and repairing with
 // TTL 0 (no expiry) would permanently resurrect data that was legitimately
@@ -152,7 +152,7 @@ const READ_REPAIR_TTL_SECONDS = 60;
 
 /** Bounds how many replica writes a single client may have running in
  * the background at once when `fireAndForgetReplicas` is enabled
- * (doc/adr/0014-*.md) — once the cap is reached, further replica legs
+ * (fire-and-forget replica writes) — once the cap is reached, further replica legs
  * fall back to running synchronously, the same as with the option off.
  * A mutable object only so tests can shrink it, mirroring
  * KEEPALIVE_TUNING. */
@@ -201,10 +201,10 @@ interface ClusterMember {
 
 type Target =
   | { kind: "single"; connection: Connection }
-  // `members` is keyed by node *name* (doc/adr/0009-*.md), matching what
+  // `members` is keyed by node *name* (node identity decoupled from address), matching what
   // `ring.owners()` returns — not by address, which carries no identity
   // meaning and is only used to open connections. `replication` is
-  // discovery's R (ADR-0011), learned from the same `L` response as the
+  // discovery's R (client-side replication), learned from the same `L` response as the
   // member list.
   | { kind: "cluster"; ring: HashRing; members: Map<string, ClusterMember>; replication: number };
 
@@ -247,7 +247,7 @@ function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void 
  * single nanocached-node or a nanocached-discovery server fronting a
  * cluster — `connect()` doesn't take a separate option or shape for either
  * case, it finds out from the server's own response to the connection
- * handshake (see doc/adr/0007-*.md). Callers never need to know or care
+ * handshake (see the server type in the auth response). Callers never need to know or care
  * which they're talking to.
  *
  * This establishes the connection(s) and routing table, and exposes
@@ -278,7 +278,7 @@ export class NanocachedClient {
 
   /** The node(s) actually being talked to, by address (for display/
    * introspection — routing itself uses each node's name, not its
-   * address, see doc/adr/0009-*.md): `[url]` in single mode, or the set of
+   * address, see node identity decoupled from address): `[url]` in single mode, or the set of
    * nodes this instance currently holds a connection to in cluster mode —
    * kept current by maybeRefreshNodeList(), which reconciles `target`'s
    * ring/connections to match (see refreshNodeList). */
@@ -291,7 +291,7 @@ export class NanocachedClient {
      * winning discovery server's address in cluster mode. */
     readonly url: string,
     nodeUrls: readonly string[],
-    /** Every configured address (ADR-0010) — what fetchNodeList walks on a
+    /** Every configured address (discovery HA) — what fetchNodeList walks on a
      * refresh, not just the address that happened to win the initial
      * connect. */
     private readonly addresses: readonly NanocachedAddress[],
@@ -311,7 +311,7 @@ export class NanocachedClient {
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
   }
 
-  /** doc/adr/0014-*.md: replica writes currently running in the
+  /** fire-and-forget replica writes: replica writes currently running in the
    * background (fireAndForgetReplicas) — close() drains these before
    * tearing down connections instead of abandoning them. */
   private readonly backgroundReplicaWrites = new Set<Promise<void>>();
@@ -332,7 +332,7 @@ export class NanocachedClient {
     const reconnectCooldownMs = options.reconnectCooldownMs ?? DEFAULT_RECONNECT_COOLDOWN_MS;
 
     // Walk the addresses in order until one yields a working target. An
-    // address is skipped when it's unreachable, answers `B` (ADR-0010
+    // address is skipped when it's unreachable, answers `B` (discovery HA
     // startup grace), or knows no live nodes — the next replica may do
     // better.
     let lastError: Error | null = null;
@@ -393,7 +393,7 @@ export class NanocachedClient {
         continue;
       }
 
-      // Keyed by name (doc/adr/0009-*.md), not address — see `Target`.
+      // Keyed by name (node identity decoupled from address), not address — see `Target`.
       const sockets = new Map<string, { socket: Socket | TLSSocket; tagged: boolean }>();
 
       try {
@@ -452,7 +452,7 @@ export class NanocachedClient {
   }
 
   /** Resolves only after every in-flight background replica write has
-   * finished and the connections are torn down (doc/adr/0014-*.md as
+   * finished and the connections are torn down (fire-and-forget replica writes as
    * amended by issue #47 item 3 — the drain contract every SDK now
    * shares). Callers that don't await keep the old fire-and-forget
    * behavior: `closed` flips synchronously, and teardown still happens
@@ -497,14 +497,14 @@ export class NanocachedClient {
     for (const member of this.target.members.values()) member.connection.close();
   }
 
-  /** How many nodes hold each key (ADR-0011) — discovery's replication
+  /** How many nodes hold each key (client-side replication) — discovery's replication
    * factor in cluster mode, 1 against a single node. */
   get replication(): number {
     return this.target.kind === "cluster" ? this.target.replication : 1;
   }
 
   /** Observability for failures this client swallows by design
-   * (ADR-0011/0014/0015) — lets operators detect silently degrading
+   * (client-side replication / fire-and-forget replica writes / read repair) — lets operators detect silently degrading
    * replication or a stuck node-list refresh. A snapshot, not a live
    * view; each count is monotonic for the lifetime of this client. */
   stats(): ClientStats {
@@ -526,9 +526,9 @@ export class NanocachedClient {
 
   /** The raw-bytes companion to `get`: same routing/retry/cluster
    * behavior, no decoding. Transparently decompresses when `compress` is
-   * enabled (doc/adr/0013-*.md). With `readRepair`, a clean miss probes
+   * enabled (value compression). With `readRepair`, a clean miss probes
    * the remaining owners before being accepted as final
-   * (doc/adr/0015-*.md). */
+   * (read repair). */
   async getBytes(key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
@@ -544,7 +544,7 @@ export class NanocachedClient {
     return decompressValue(value);
   }
 
-  /** doc/adr/0015-*.md: probes every owner of `key`, in rank order, for a
+  /** read repair: probes every owner of `key`, in rank order, for a
    * value the normal read path already reported missing. The first
    * owner that has it wins: its value is returned, and — detached, not
    * awaited by this method's own caller — that same value repairs
@@ -553,7 +553,7 @@ export class NanocachedClient {
    * GET, and TTL 0 would permanently resurrect already-expired data).
    * That write-back is bounded and tracked the same way a
    * fireAndForgetReplicas replica write is (FIRE_AND_FORGET_TUNING.maxInFlight,
-   * backgroundReplicaWrites — doc/adr/0014-*.md), so close() drains it too
+   * backgroundReplicaWrites — fire-and-forget replica writes), so close() drains it too
    * and an unlucky run of misses can't spawn unbounded background writes;
    * past the cap, the repair for that miss is simply skipped — read
    * repair is opportunistic, so a later miss on the same key repairs it.
@@ -583,7 +583,7 @@ export class NanocachedClient {
       const primaryName = names[0];
       const repairValue = value;
       // Bounded and tracked the same way a fireAndForgetReplicas replica
-      // write is (doc/adr/0014-*.md) — reusing backgroundReplicaWrites and
+      // write is (fire-and-forget replica writes) — reusing backgroundReplicaWrites and
       // FIRE_AND_FORGET_TUNING.maxInFlight — so close() drains this
       // write-back too instead of abandoning it, and this can't grow
       // unbounded the way an untracked spawn-per-miss would. Past the
@@ -625,7 +625,7 @@ export class NanocachedClient {
   /** `ttlSeconds` (whole seconds, default 0) is when the key expires; 0
    * means no expiry. Must be a non-negative integer. Transparently
    * compresses values at or above `compressionThreshold` when `compress`
-   * is enabled (doc/adr/0013-*.md). */
+   * is enabled (value compression). */
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
@@ -658,7 +658,7 @@ export class NanocachedClient {
     );
   }
 
-  /** The names of `key`'s top-R owners, primary first (ADR-0011). Only
+  /** The names of `key`'s top-R owners, primary first (client-side replication). Only
    * meaningful in cluster mode. */
   private ownerNames(key: string | Uint8Array): string[] {
     if (this.target.kind !== "cluster") return [];
@@ -666,7 +666,7 @@ export class NanocachedClient {
     return this.target.ring.owners(keyBytes, this.target.replication);
   }
 
-  /** Cluster read (ADR-0011): ask the key's owners in rank order,
+  /** Cluster read (client-side replication): ask the key's owners in rank order,
    * falling through to the next one only on a connection-level failure —
    * a replica is a hedge against a *dead* holder, not an extra lookup on
    * every miss (a `notFound` from a live owner is the answer). A `W`
@@ -699,7 +699,7 @@ export class NanocachedClient {
     throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
   }
 
-  /** Cluster write (ADR-0011): fan the operation out to every owner in
+  /** Cluster write (client-side replication): fan the operation out to every owner in
    * parallel. The primary's outcome is the operation's outcome — a
    * successful primary write is always what's returned, even if a
    * replica leg goes on to hit a genuine bug — replica failures are
@@ -732,7 +732,7 @@ export class NanocachedClient {
       }
     };
 
-    // doc/adr/0014-*.md: with fireAndForgetReplicas, up to
+    // Fire-and-forget replica writes: with fireAndForgetReplicas, up to
     // FIRE_AND_FORGET_TUNING.maxInFlight replica legs run in the
     // background instead of being waited for below — past that cap,
     // further legs fall back to the synchronous path exactly as with the
@@ -801,7 +801,7 @@ export class NanocachedClient {
     throw replicaBug ? replicaBug.reason : primary.error;
   }
 
-  /** Runs `operation`; if a routed-to node answers `W` (ADR-0008: it
+  /** Runs `operation`; if a routed-to node answers `W` (staged node join: it
    * doesn't hold this key per its own view of cluster membership — this
    * client's routing table is stale), forces a node-list refresh and
    * retries the whole operation once against the fresh ranking. A second
@@ -857,7 +857,7 @@ export class NanocachedClient {
    * connections to newly listed ones, and leaves unchanged nodes' existing
    * connections (and any in-flight requests on them) alone.
    *
-   * Per ADR-2, a discovery outage should degrade only topology updates,
+   * By design, a discovery outage should degrade only topology updates,
    * not already-established cache traffic — so failure here (discovery
    * unreachable, or a specific new node failing to connect) never throws
    * out to the get/set/delete call that triggered it. It fails silently
@@ -875,7 +875,7 @@ export class NanocachedClient {
       return;
     }
 
-    // Reconciled by name (doc/adr/0009-*.md), not address — see `Target`.
+    // Reconciled by name (node identity decoupled from address), not address — see `Target`.
     const nodeByName = new Map<string, DiscoveredNode>(identified.nodes.map((node) => [node.name, node]));
     const members = new Map<string, ClusterMember>(currentMembers);
 
@@ -943,7 +943,7 @@ export class NanocachedClient {
     this.lastNodeListFetch = Date.now();
   }
 
-  /** Walks every configured address (ADR-0010) in order for a fresh node
+  /** Walks every configured address (discovery HA) in order for a fresh node
    * list. Returns `null` — keep the last-known list — when none can
    * provide one: unreachable, still inside its startup grace (`B`), no
    * longer a discovery server, or knowing no live nodes. Fails silently;

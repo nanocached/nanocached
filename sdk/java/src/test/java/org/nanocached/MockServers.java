@@ -34,12 +34,12 @@ final class MockServers {
         final AtomicInteger connectionCount = new AtomicInteger();
         final AtomicInteger getCount = new AtomicInteger();
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
-        /** ADR-0019: queued one-off replies that echo the WRONG tag (the
-         * request's tag + 1) — the desync a pre-ADR-0019 stream
+        /** echoed response tags: queued one-off replies that echo the WRONG tag (the
+         * request's tag + 1) — the desync a pre-tag stream
          * misalignment would produce. Only takes effect on a tagged
          * connection. */
         private final AtomicInteger wrongTagReplies = new AtomicInteger();
-        /** ADR-0019: swallows the next G entirely (no reply) — the
+        /** echoed response tags: swallows the next G entirely (no reply) — the
          * off-by-one stream desync where every later response answers
          * the previous request. */
         private final AtomicInteger swallowedGets = new AtomicInteger();
@@ -61,12 +61,12 @@ final class MockServers {
          * most recent S request this server received. */
         volatile long lastSetTtl = 0;
         private final byte[] requiredSecret;
-        /** ADR-0019: acknowledge an extended `A ... T` with `OnT\n` and
+        /** echoed response tags: acknowledge an extended `A ... T` with `OnT\n` and
          * echo tags on that connection's G/S/D replies. Off by default so
          * the bulk of the suite keeps exercising the legacy untagged
          * path. */
         private final boolean supportTags;
-        /** ADR-0019: behave like a pre-0019 server — an extended
+        /** echoed response tags: behave like a pre-0019 server — an extended
          * `A ... T` is a parse error, so close the connection without
          * replying. */
         private final boolean closeOnExtendedAuth;
@@ -82,13 +82,13 @@ final class MockServers {
             this(requiredSecret, false, false, null);
         }
 
-        /** ADR-0019: a node that negotiates tags — accepts `A ... T`
+        /** echoed response tags: a node that negotiates tags — accepts `A ... T`
          * with `OnT\n` and echoes tags on that connection's replies. */
         static MockNode withTagSupport() throws IOException {
             return new MockNode(null, true, false, null);
         }
 
-        /** ADR-0019: a pre-0019 node — the extended `A ... T` is a parse
+        /** echoed response tags: a pre-0019 node — the extended `A ... T` is a parse
          * error, so it closes the connection without replying, forcing
          * the caller's transparent untagged fallback. */
         static MockNode legacyServer() throws IOException {
@@ -131,14 +131,14 @@ final class MockServers {
         }
 
         /** Queue a one-off reply for the next G request on a tagged
-         * connection that echoes the WRONG tag (ADR-0019). */
+         * connection that echoes the WRONG tag (echoed response tags). */
         void answerWrongTagOnce() {
             wrongTagReplies.incrementAndGet();
         }
 
         /** Swallow the next G request entirely (no reply) — the
          * off-by-one stream desync where every later response answers
-         * the previous request (ADR-0019). */
+         * the previous request (echoed response tags). */
         void swallowGetOnce() {
             swallowedGets.incrementAndGet();
         }
@@ -170,7 +170,7 @@ final class MockServers {
 
         /** Holds every future S reply for {@code millis} first — for tests
          * proving a caller isn't blocked on a slow replica leg
-         * (doc/adr/0014-*.md). */
+         * (fire-and-forget replica writes). */
         void delaySets(long millis) {
             setDelayMillis = millis;
         }
@@ -243,7 +243,7 @@ final class MockServers {
             try (socket) {
                 InputStream in = socket.getInputStream();
                 OutputStream out = socket.getOutputStream();
-                // ADR-0019: set when this connection's `A ... T` was
+                // Echoed response tags: set when this connection's `A ... T` was
                 // acknowledged — its requests then carry a trailing tag
                 // the replies must echo.
                 boolean tagged = false;
@@ -281,7 +281,7 @@ final class MockServers {
                             }
                             if (tagged && takeWrongTag()) {
                                 // Echo the WRONG tag (the request's tag +
-                                // 1) — the desync a pre-ADR-0019 stream
+                                // 1) — the desync a pre-tag stream
                                 // misalignment would produce.
                                 long wrongTag = Long.parseLong(parts[2]) + 1;
                                 out.write(("N " + wrongTag + "\n").getBytes(StandardCharsets.US_ASCII));
@@ -466,7 +466,7 @@ final class MockServers {
                     String[] parts = readLine(in).split(" ");
                     if (parts[0].equals("A")) {
                         in.readNBytes(Integer.parseInt(parts[1]));
-                        // ADR-0019: echo the tag capability — clients send
+                        // Echoed response tags: echo the tag capability — clients send
                         // the extended A before knowing which kind of
                         // server answered. Discovery itself never tags
                         // requests (L is a one-shot), but the ack must

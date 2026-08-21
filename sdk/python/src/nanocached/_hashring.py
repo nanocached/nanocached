@@ -1,5 +1,5 @@
 """Rendezvous (highest-random-weight) hashing over a fixed node list (see
-doc/adr/0011-*.md). This is deliberately a byte-for-byte port of the same
+Client-side replication). This is deliberately a byte-for-byte port of the same
 computation every other nanocached participant uses (the Rust node, the
 TypeScript/Java/Rust/Go/.NET SDKs) — not just "a" rendezvous hash, but
 *this specific* one: if this SDK's ranking disagreed with a node's own
@@ -11,7 +11,7 @@ key's owners are the ``replicas`` highest-scoring nodes in descending score
 order (ties — effectively impossible at 64 bits — break toward the
 lexicographically smaller name), and its primary is the top one.
 
-Built from node *names*, not addresses (doc/adr/0009-*.md).
+Built from node *names*, not addresses (node identity decoupled from address).
 """
 
 from __future__ import annotations

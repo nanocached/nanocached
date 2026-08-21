@@ -6,7 +6,7 @@ import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 /**
- * doc/adr/0013-*.md: transparent, opt-in value compression. Values are
+ * Value compression: transparent, opt-in value compression. Values are
  * prefixed with a one-byte marker once {@code compress} is enabled on a
  * client — {@code 0x00} for stored-as-is (below threshold, or
  * compression didn't shrink it), {@code 0x01} for raw-DEFLATE-compressed
@@ -67,7 +67,7 @@ final class Compression {
     /**
      * The get/getBytes counterpart to {@link #compressValue}. Only ever
      * called when {@code compress} is enabled on this client — see
-     * doc/adr/0013-*.md.
+     * Value compression.
      */
     static byte[] decompressValue(byte[] value) {
         if (value.length == 0) {
@@ -114,7 +114,7 @@ final class Compression {
                         throw new NanocachedException.DecompressionFailed(
                                 "nanocached: failed to decompress a value marked as compressed — "
                                         + "did every client sharing this key enable compress "
-                                        + "(doc/adr/0013-*.md)? (truncated DEFLATE stream)");
+                                        + "(value compression)? (truncated DEFLATE stream)");
                     }
                     total += produced;
                 }
@@ -127,7 +127,7 @@ final class Compression {
             } catch (DataFormatException error) {
                 throw new NanocachedException.DecompressionFailed(
                         "nanocached: failed to decompress a value marked as compressed — did every "
-                                + "client sharing this key enable compress (doc/adr/0013-*.md)? ("
+                                + "client sharing this key enable compress (value compression)? ("
                                 + error.getMessage() + ")",
                         error);
             } finally {
@@ -138,7 +138,7 @@ final class Compression {
         throw new NanocachedException.DecompressionFailed(
                 "nanocached: unrecognized compression marker byte " + (marker & 0xFF)
                         + " — was this value written by a client with compress disabled "
-                        + "(doc/adr/0013-*.md)?");
+                        + "(value compression)?");
     }
 
     private static byte[] prefixed(byte marker, byte[] body) {

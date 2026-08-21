@@ -7,7 +7,7 @@ use std::time::Duration;
 pub enum Command {
     Auth {
         secret: Bytes,
-        /// ADR-0019: the client sent `A <len> T\n` — it wants response
+        /// Echoed response tags: the client sent `A <len> T\n` — it wants response
         /// tags echoed on this connection's `G`/`S`/`D` replies.
         tagging: bool,
     },
@@ -22,13 +22,13 @@ pub enum Command {
     Delete {
         key: Bytes,
     },
-    /// Internal-only (ADR-0008): never produced by `parse()`, constructed
+    /// Internal-only (staged node join): never produced by `parse()`, constructed
     /// directly by the migration task to snapshot every key this node
     /// currently holds, to compute which ones a newly joining node now
     /// owns. See `Response::Keys` and `Cache::keys`'s doc comment for why
     /// this is keys-only rather than full entries.
     ListEntries,
-    /// Internal-only (ADR-0008): the migration task's live re-check of a
+    /// Internal-only (staged node join): the migration task's live re-check of a
     /// single key's current value right before sending it, instead of
     /// trusting `ListEntries`'s snapshot (which may be stale by the time
     /// this key's turn comes up). Answered with `Response::Entries`
@@ -37,30 +37,30 @@ pub enum Command {
     PeekEntry {
         key: Bytes,
     },
-    /// Internal-only (ADR-0008): marks a key as handed off to another
+    /// Internal-only (staged node join): marks a key as handed off to another
     /// node during a migration this node was the source for. `Sweep`
     /// reclaims marked entries later.
     MarkMigrated {
         key: Bytes,
     },
-    /// Internal-only (ADR-0008): reverses `MarkMigrated` for a key whose
+    /// Internal-only (staged node join): reverses `MarkMigrated` for a key whose
     /// migration was cancelled (see `Command::CancelMigration`), so
     /// `Sweep` doesn't reclaim it after all.
     UnmarkMigrated {
         key: Bytes,
     },
-    /// Internal-only (ADR-0008): the active-deletion pass, run
+    /// Internal-only (staged node join): the active-deletion pass, run
     /// periodically by a background task. Reclaims every marked entry
     /// and, since TTL expiry is otherwise only checked lazily on access,
     /// also proactively removes anything already past its TTL.
     Sweep,
-    /// ADR-0008: sent by discovery to a `Joined` node when a new node is
+    /// Staged node join: sent by discovery to a `Joined` node when a new node is
     /// joining, so this node can compute (via `HashRing`) how each of its
-    /// own keys' top-R owner set changes (ADR-0011). `joining_name`/
+    /// own keys' top-R owner set changes (client-side replication). `joining_name`/
     /// `joining_addr` identify the joining node; `joined` is every
-    /// currently-`Joined` node (ADR-0009 names, including this one) — the
+    /// currently-`Joined` node (node identity decoupled from address names, including this one) — the
     /// "before" roster, to which `joining_name` is the "after" addition.
-    /// `replication` is discovery's replication factor R (ADR-0011) — the
+    /// `replication` is discovery's replication factor R (client-side replication) — the
     /// single source nodes learn R from.
     ///
     /// `token` is *this receiving node's own* membership token (issue #34),
@@ -69,7 +69,7 @@ pub enum Command {
     /// knows it. This closes the gap where any holder of the shared secret
     /// (every client) could otherwise send `M` directly and make the node
     /// stream its cache to an attacker-chosen address. It does not violate
-    /// ADR-0018's "tokens are never sent back out" invariant: the token in
+    /// Per-node membership tokens's "tokens are never sent back out" invariant: the token in
     /// an `M` is the *recipient's* own token (which it already holds and no
     /// client knows), never some other node's.
     Migrate {
@@ -79,7 +79,7 @@ pub enum Command {
         joined: Vec<(String, String)>,
         replication: usize,
     },
-    /// ADR-0008: sent by discovery to a ready node to abandon a handoff
+    /// Staged node join: sent by discovery to a ready node to abandon a handoff
     /// it's mid-`Migrate` for — a ready or joining node died, or
     /// discovery gave up waiting on a completion report. `joining_name`
     /// identifies which handoff to abandon (a node only ever has one
@@ -159,7 +159,7 @@ pub enum ParseError {
     InvalidLength,
     EmptyKey,
     EmptySecret,
-    /// A name/address field in `M` (ADR-0008/0009) was declared with
+    /// A name/address field in `M` (staged node join / node identity decoupled from address) was declared with
     /// length 0.
     EmptyField,
     /// A name/address field in `M` wasn't valid UTF-8.
@@ -176,7 +176,7 @@ pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
     parse_with_mode(input, false, &mut MigrateProgress::default()).map(|(command, _)| command)
 }
 
-/// ADR-0019: `parse` for a connection whose `A ... T` negotiation
+/// Echoed response tags: `parse` for a connection whose `A ... T` negotiation
 /// succeeded. `G`/`S`/`D` headers must carry the client's tag as their
 /// last field, returned alongside for the response to echo; commands
 /// that never carry one (`A`, `M`, `X`) return `None`.
@@ -239,7 +239,7 @@ fn parse_with_mode(
         b"A" => {
             let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
-            // ADR-0019: an optional literal `T` requests tagged mode.
+            // Echoed response tags: an optional literal `T` requests tagged mode.
             // Accepted regardless of the connection's current mode, since
             // this is the field that *establishes* the mode.
             let tagging = match parts.next() {
@@ -629,7 +629,7 @@ fn decode_field(frame: &[u8], start: usize, length: usize) -> Result<String, Par
     String::from_utf8(frame[start..start + length].to_vec()).map_err(|_| ParseError::InvalidUtf8)
 }
 
-/// ADR-0019: in tagged mode the next header field is the required
+/// Echoed response tags: in tagged mode the next header field is the required
 /// request tag; in untagged mode there is nothing to consume.
 fn parse_trailing_tag<'a>(
     parts: &mut impl Iterator<Item = &'a [u8]>,
@@ -642,7 +642,7 @@ fn parse_trailing_tag<'a>(
     parse_tag(parts.next().ok_or(ParseError::InvalidLength)?).map(Some)
 }
 
-/// ADR-0019: a tag is a u32 in the same decimal encoding as every
+/// Echoed response tags: a tag is a u32 in the same decimal encoding as every
 /// length field.
 fn parse_tag(input: &[u8]) -> Result<u32, ParseError> {
     u32::try_from(parse_length(input)?).map_err(|_| ParseError::InvalidLength)

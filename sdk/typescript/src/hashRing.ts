@@ -1,6 +1,6 @@
 /**
  * Rendezvous (highest-random-weight) hashing over a fixed node list (see
- * doc/adr/0011-*.md, which replaced ADR-0002's virtual-node ring: FNV-1a's
+ * Client-side replication, which replaced client-side consistent hashing with a discovery server's virtual-node ring: FNV-1a's
  * weak high-bit avalanche clustered ring points into narrow bands, skewing
  * node shares by up to ~2×; HRW measures within 2% of fair and yields
  * replica sets for free). This is deliberately a byte-for-byte port of the
@@ -14,7 +14,7 @@
  * score order (ties — effectively impossible at 64 bits — break toward the
  * lexicographically smaller name), and its primary is the top one.
  *
- * Built from node *names*, not addresses (doc/adr/0009-*.md) — `owners`
+ * Built from node *names*, not addresses (node identity decoupled from address) — `owners`
  * returns names, which the caller then looks up in a separate name ->
  * address map to actually open connections.
  */

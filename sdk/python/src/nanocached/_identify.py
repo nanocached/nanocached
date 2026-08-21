@@ -1,10 +1,10 @@
 """Connect-and-identify: dials ``host:port``, authenticates, and figures
 out from the server's own ``A`` response whether it reached a cache node
 (``On``) or a discovery server (``Od``) — the caller never says which it
-expects (doc/adr/0007-*.md). A node's streams are handed back live, ready
+expects (the server type in the auth response). A node's streams are handed back live, ready
 for ``G``/``S``/``D``; a discovery connection is used once for ``L`` and
 closed, returning the name/address list and the cluster's replication
-factor R (doc/adr/0009, 0010, 0011)."""
+factor R (node identity, discovery HA, replication)."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ _MAX_NODE_LIST_RESPONSE_LENGTH = 16 * 1024 * 1024
 @dataclass(frozen=True)
 class DiscoveredNode:
     """A node's hash-ring identity (a random per-process UUID) and its
-    network address — two different things since doc/adr/0009-*.md."""
+    network address — two different things since node identity decoupled from address."""
 
     name: str
     address: str
@@ -53,7 +53,7 @@ class DiscoveredNode:
 class NodeTarget:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
-    # ADR-0019: whether the node accepted the extended `A ... T` — when
+    # Echoed response tags: whether the node accepted the extended `A ... T` — when
     # true, this connection's `G`/`S`/`D` traffic must carry tags and its
     # responses echo them; false means an older node answered the plain-`A`
     # fallback.
@@ -69,10 +69,10 @@ class ClusterTarget:
 class _LegacyServerSignal(Exception):
     """Internal-only: raised when the extended `A ... T` auth attempt hit a
     connection-closed-shaped failure while reading the identify response —
-    the signal a pre-ADR-0019 server gives by treating the extended form as
+    the signal a legacy pre-tag server gives by treating the extended form as
     a parse error and closing without replying. Caught by
     connect_and_identify to trigger the transparent untagged fallback
-    (doc/adr/0019-*.md); never escapes this module."""
+    (echoed response tags); never escapes this module."""
 
 
 def split_host_port(address: str) -> tuple[str, int]:
@@ -96,7 +96,7 @@ async def connect_and_identify(
     try:
         return await _connect_and_identify_with_deadline(host, port, auth_secret, ssl_context, request_tags=True)
     except _LegacyServerSignal:
-        # ADR-0019 transparent fallback: a pre-0019 server treats the
+        # Echoed response tags transparent fallback: a pre-0019 server treats the
         # extended `A ... T` as a parse error and closes without replying
         # — redial once with the plain form and run the connection
         # untagged (the pre-0019 behavior, desync window included).
@@ -133,7 +133,7 @@ async def _connect_and_identify(
         secret = auth_secret if auth_secret is not None else _NO_SECRET_PLACEHOLDER
         tag_field = b" T" if request_tags else b""
 
-        # ADR-0019: read 3 bytes first. `byte[2] == '\n'` is the
+        # Echoed response tags: read 3 bytes first. `byte[2] == '\n'` is the
         # traditional fixed-width ack (`On\n`/`En\n`/`Od\n`/`Ed\n`),
         # tagging disabled. `byte[2] == 'T'` means one more byte follows,
         # which must be `\n` (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`), tagging
@@ -234,7 +234,7 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
             f"nanocached: unexpected response from discovery server: {header[:-1]!r}"
         )
 
-    # `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+    # `N <count> <r>\n` (client-side replication) — the replication factor rides along.
     fields = header[2:-1].split(b" ")
     if len(fields) != 2:
         raise NanocachedError("nanocached: invalid node-list header in discovery response")

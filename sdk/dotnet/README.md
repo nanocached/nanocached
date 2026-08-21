@@ -33,7 +33,7 @@ byte[]? raw = await client.GetBytesAsync("greeting");
 Keys and values accept `string` (UTF-8 encoded) everywhere, with `byte[]`
 overloads of `GetAsync`/`GetBytesAsync`/`SetAsync`/`DeleteAsync` for raw
 bytes. The client is thread-safe; requests are pipelined per connection
-(doc/adr/0016-*.md) — concurrent callers on the same connection each pay
+(request pipelining) — concurrent callers on the same connection each pay
 only their own network latency, not everyone else's ahead of them.
 
 ## Addresses and discovery replicas
@@ -71,7 +71,7 @@ and one retry.
 Off by default. `SetAsync`/`DeleteAsync` normally wait for every replica
 leg to finish, same as the primary. Enabling `FireAndForgetReplicas`
 returns as soon as the primary acks, letting replica legs finish in the
-background (doc/adr/0014-*.md):
+background (fire-and-forget replica writes):
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(
@@ -96,7 +96,7 @@ connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `ReadRepair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (doc/adr/0015-*.md):
+background if one still has the value (read repair):
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(
@@ -176,7 +176,7 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
 
 Off by default. When enabled, values at or above `CompressionThreshold`
 bytes are transparently DEFLATE-compressed on `Set`/`SetAsync` and
-decompressed on `Get`/`GetAsync`/`GetBytesAsync` (doc/adr/0013-\*.md):
+decompressed on `Get`/`GetAsync`/`GetBytesAsync` (value compression):
 
 ```csharp
 using NanocachedClient client = await NanocachedClient.ConnectAsync(

@@ -74,15 +74,15 @@ type mockNode struct {
 	setWrongNodeLeft atomic.Int32 // like wrongNodeLeft, but only consumed by S (for isolating a repair write's failure from an unrelated G)
 	malformedLeft    atomic.Int32
 	storedToGetLeft  atomic.Int32
-	wrongTagLeft     atomic.Int32 // doc/adr/0019-*.md: echo the wrong tag on the next G on a tagged connection
-	swallowLeft      atomic.Int32 // doc/adr/0019-*.md: swallow the next G entirely (no reply)
+	wrongTagLeft     atomic.Int32 // echoed response tags: echo the wrong tag on the next G on a tagged connection
+	swallowLeft      atomic.Int32 // echoed response tags: swallow the next G entirely (no reply)
 	lastSetTTL       atomic.Value // string: the TTL field of the last S, or "none"
 	setDelay         atomic.Int64 // nanoseconds; sleep this long before every S reply
 	conns            sync.Map     // net.Conn -> struct{}
 	silent           atomic.Bool  // once true, every G/S/D is read but never answered
 }
 
-// mockNodeOpts configures a startMockNode server's doc/adr/0019-*.md
+// mockNodeOpts configures a startMockNode server's echoed response tags
 // (response tags) behavior. Immutable for the server's whole lifetime —
 // set once at construction, like requiredSecret — so acceptLoop's
 // goroutine never races a test goroutine mutating it later.
@@ -91,7 +91,7 @@ type mockNodeOpts struct {
 	// tags on that connection's G/S/D replies. Off by default so the bulk
 	// of the suite keeps exercising the legacy untagged path.
 	supportTags bool
-	// closeOnExtendedAuth: behave like a pre-doc/adr/0019-*.md server — an
+	// closeOnExtendedAuth: behave like a legacy pre-tag server — an
 	// extended `A ... T` is a parse error, so close the connection without
 	// replying.
 	closeOnExtendedAuth bool
@@ -99,19 +99,19 @@ type mockNodeOpts struct {
 
 // delaySets makes every future S reply from this node wait d first — for
 // tests proving a caller isn't blocked on a slow replica leg
-// (doc/adr/0014-*.md).
+// (fire-and-forget replica writes).
 func (m *mockNode) delaySets(d time.Duration) { m.setDelay.Store(int64(d)) }
 
 // goSilentAfterHandshake makes this node a half-open server from this
 // point on: it still accepts and completes the A handshake, and still
 // reads every request frame off the wire (so the TCP stream stays
 // well-formed), but never writes a reply — regression coverage for a
-// request-level I/O timeout (issue tracked alongside doc/adr/0016-*.md).
+// request-level I/O timeout (issue tracked alongside request pipelining).
 func (m *mockNode) goSilentAfterHandshake() { m.silent.Store(true) }
 
 // answerWrongTagOnce queues a one-off reply for the next G request on a
 // tagged connection that echoes the wrong tag (the request's tag + 1) —
-// the desync a pre-doc/adr/0019-*.md stream misalignment would produce.
+// the desync a pre-tag stream misalignment would produce.
 func (m *mockNode) answerWrongTagOnce() { m.wrongTagLeft.Add(1) }
 
 // swallowGetOnce swallows the next G request entirely (no reply) — the
@@ -178,7 +178,7 @@ func (m *mockNode) serve(conn net.Conn) {
 		_ = conn.Close()
 	}()
 	reader := bufio.NewReader(conn)
-	// doc/adr/0019-*.md: set once this connection's `A ... T` is
+	// Echoed response tags: set once this connection's `A ... T` is
 	// acknowledged — its requests then carry a trailing tag the replies
 	// must echo.
 	tagged := false
@@ -225,7 +225,7 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			if tagged && m.takeOne(&m.wrongTagLeft) {
 				// Echo the wrong tag (the request's tag + 1) — the desync
-				// a pre-doc/adr/0019-*.md stream misalignment would
+				// a pre-tag stream misalignment would
 				// produce.
 				requestTag := atoiOrPanic(parts[len(parts)-1])
 				if _, err := conn.Write([]byte(fmt.Sprintf("N %d\n", requestTag+1))); err != nil {
@@ -383,7 +383,7 @@ func (m *mockDiscovery) serve(conn net.Conn) {
 		switch parts[0] {
 		case "A":
 			mustRead(reader, atoiOrPanic(parts[1]))
-			// doc/adr/0019-*.md: echo the tag capability — clients send
+			// Echoed response tags: echo the tag capability — clients send
 			// the extended A before knowing which kind of server
 			// answered. Discovery itself never uses tags (a single L per
 			// connection), but still has to parse this reply either way.
@@ -598,7 +598,7 @@ func TestAnInvalidRequestDoesNotPoisonConcurrentValidRequestsOnTheSameConnection
 	// Key/size validation runs before any network I/O, so an invalid call
 	// (empty key) never touches the wire at all — and so can never desync
 	// or poison a connection that other, valid, concurrent requests are
-	// pipelined on (doc/adr/0016-*.md).
+	// pipelined on (request pipelining).
 	node := startMockNode(t, nil)
 	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
@@ -693,7 +693,7 @@ func TestTtlZeroMeansNoExpiryAndAPositiveTtlIsSentAsIs(t *testing.T) {
 // TestPipelinesConcurrentRequestsOnOneConnection is the same shape as
 // the TypeScript SDK's own pipelining test: N concurrent requests on a
 // single connection, each independently verified to round-trip its own
-// value (doc/adr/0016-*.md) — a bug in matching responses to the right
+// value (request pipelining) — a bug in matching responses to the right
 // caller in send order would show up as swapped or wrong values here.
 func TestPipelinesConcurrentRequestsOnOneConnection(t *testing.T) {
 	node := startMockNode(t, nil)
@@ -745,7 +745,7 @@ func TestPipelinesConcurrentRequestsOnOneConnection(t *testing.T) {
 	}
 }
 
-// ── doc/adr/0019-*.md 応答タグ ───────────────────────────────────────
+// ── echoed response tags 応答タグ ───────────────────────────────────────
 
 // TestPipelinesConcurrentRequestsOnOneConnectionTagged is
 // TestPipelinesConcurrentRequestsOnOneConnection's shape against a
@@ -810,7 +810,7 @@ func TestPipelinesConcurrentRequestsOnOneConnectionTagged(t *testing.T) {
 }
 
 // TestASwallowedResponseDesyncsAndIsCaughtBeforeDispatchTagged is the
-// exact misdelivery doc/adr/0016-*.md left open: the server never answers
+// exact misdelivery request pipelining left open: the server never answers
 // the first GET (swallowGetOnce), so the second GET's response arrives at
 // the first GET's pending slot. Without tags the first caller would
 // receive the second's value as a plausible, exception-free wrong answer;
@@ -919,7 +919,7 @@ func TestAWrongResponseTagPoisonsTheConnection(t *testing.T) {
 }
 
 // TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer: an old
-// (pre-doc/adr/0019-*.md) server treats the extended `A ... T` as a parse
+// (pre-tag) server treats the extended `A ... T` as a parse
 // error and closes without replying; the client must redial once with the
 // plain form and run untagged — transparently, with the same results.
 func TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer(t *testing.T) {
@@ -1038,7 +1038,7 @@ func TestConnectWarnsWhenAPreviousConnectionToTheSameAddressIsStillOpen(t *testi
 	}
 }
 
-// ── 値の圧縮 (doc/adr/0013-*.md) ────────────────────────────────────
+// ── 値の圧縮 (value compression) ────────────────────────────────────
 
 func TestWireFormatIsUntouchedWhenCompressIsOff(t *testing.T) {
 	node := startMockNode(t, nil)
@@ -1183,7 +1183,7 @@ func TestReadingALegacyValueWithCompressEnabledErrorsClearly(t *testing.T) {
 	node := startMockNode(t, nil)
 
 	// A legacy/uncompressed writer's value whose first byte happens to
-	// collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+	// collide with the DEFLATE marker (0x01) — value compression's
 	// documented hazard of enabling Compress against a keyspace other
 	// clients still touch without it. The remaining bytes are chosen to
 	// reliably fail DEFLATE decoding (raw DEFLATE has no checksum, so not
@@ -1990,7 +1990,7 @@ func TestFansDeletesOutToEveryOwner(t *testing.T) {
 	}
 }
 
-// ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────────
+// ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────────
 
 // A "did it wait for the mock's delay" assertion can't compare the
 // measured elapsed time against the delay exactly: time.Sleep only
@@ -2125,7 +2125,7 @@ func TestCloseDrainsInFlightBackgroundReplicaWrites(t *testing.T) {
 	}
 }
 
-// ── read repair (doc/adr/0015-*.md) ────────────────────────────────
+// ── read repair (read repair) ────────────────────────────────
 
 func TestByDefaultACleanMissOnThePrimaryIsNotRepaired(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
@@ -2202,7 +2202,7 @@ func TestReadRepairStaysACleanMissWhenNoOwnerHasTheValue(t *testing.T) {
 	}
 }
 
-// ── Stats() (ADR-0011/0014/0015 swallowed-failure counters) ────────
+// ── Stats() (client-side replication / fire-and-forget replica writes / read repair swallowed-failure counters) ────────
 
 func TestADeadReplicaCountsAReplicaWriteFailureInStats(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)

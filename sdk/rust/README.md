@@ -27,7 +27,7 @@ value as UTF-8 with a strict decoder — a value that isn't valid UTF-8
 returns `Error::InvalidUtf8` rather than lossily replacing the invalid
 bytes; use `get_bytes` when a value might not be text. The client is a
 cheaply cloneable handle — clones share one set of connections. Requests
-are pipelined per connection (doc/adr/0016-*.md) — concurrent callers on
+are pipelined per connection (request pipelining) — concurrent callers on
 the same connection each pay only their own network latency, not
 everyone else's ahead of them.
 
@@ -71,7 +71,7 @@ timeout): the failed attempt forces a node-list refresh and one retry.
 Off by default. `set`/`delete` normally wait for every replica leg to
 finish, same as the primary. Enabling `fire_and_forget_replicas` returns
 as soon as the primary acks, letting replica legs finish in the
-background (doc/adr/0014-*.md):
+background (fire-and-forget replica writes):
 
 ```rust
 let options = Options::new()
@@ -93,7 +93,7 @@ finished and the connections are torn down.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `read_repair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (doc/adr/0015-*.md):
+background if one still has the value (read repair):
 
 ```rust
 let options = Options::new()
@@ -189,7 +189,7 @@ let options = Options::new()
 
 Off by default. When enabled, values at or above `compression_threshold`
 bytes are transparently DEFLATE-compressed on `set` and decompressed on
-`get`/`get_bytes` (doc/adr/0013-\*.md). Behind the `compression` feature,
+`get`/`get_bytes` (value compression). Behind the `compression` feature,
 enabled by default alongside `tls`:
 
 ```rust

@@ -1,6 +1,6 @@
 package nanocached
 
-// doc/adr/0013-*.md: transparent, opt-in value compression. Values are
+// Value compression: transparent, opt-in value compression. Values are
 // prefixed with a one-byte marker once Config.Compress is enabled —
 // compressionMarkerRaw (0x00) for stored-as-is (below threshold, or
 // compression didn't shrink it), compressionMarkerDeflate (0x01) for
@@ -50,7 +50,7 @@ func compressValue(value []byte, threshold int) []byte {
 
 // decompressValue is the Get/GetBytes counterpart to compressValue. Only
 // ever called when Config.Compress is enabled on this client — see
-// doc/adr/0013-*.md.
+// Value compression.
 func decompressValue(value []byte) ([]byte, error) {
 	if len(value) == 0 {
 		return nil, decompressionFailed(
@@ -71,7 +71,7 @@ func decompressValue(value []byte) ([]byte, error) {
 		if err != nil {
 			return nil, decompressionFailed(
 				"failed to decompress a value marked as compressed — did every client sharing " +
-					"this key enable compress (doc/adr/0013-*.md)?: " + err.Error())
+					"this key enable compress (value compression)?: " + err.Error())
 		}
 		if len(out) > maxDecompressedLength {
 			return nil, decompressionFailed(
@@ -81,7 +81,7 @@ func decompressValue(value []byte) ([]byte, error) {
 	default:
 		return nil, decompressionFailed(
 			"unrecognized compression marker byte — was this value written by a client with " +
-				"compress disabled (doc/adr/0013-*.md)?")
+				"compress disabled (value compression)?")
 	}
 }
 

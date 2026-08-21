@@ -2,7 +2,7 @@
 //! speaking the cache protocol (`G`/`S`/`D` — the `A` identify exchange
 //! happens in `identify` before a `Connection` exists). Requests are
 //! pipelined onto the socket and matched to responses in send order
-//! (doc/adr/0016-*.md): a dedicated read task, spawned in `new`, consumes
+//! (request pipelining): a dedicated read task, spawned in `new`, consumes
 //! responses and dispatches each to the oldest still-pending request,
 //! since nanocached-node itself only ever answers in the order it
 //! received requests. Enqueuing the pending slot and writing the frame
@@ -70,14 +70,14 @@ pub static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 /// A raw response marker byte plus its value bytes (`V` only) — what the
 /// read task parses off the wire, before `get`/`set`/`delete` convert it
 /// into a [`ResponseKind`] or a `WrongNode`/protocol error. The echoed
-/// tag (ADR-0019), when present, is verified against the pending slot's
+/// tag (echoed response tags), when present, is verified against the pending slot's
 /// expected tag by the read loop itself and never reaches this type — see
 /// `WireResponse`.
 type RawResponse = (u8, Option<Vec<u8>>);
 type RawResponseSender = oneshot::Sender<Result<RawResponse>>;
 
 /// A pending request's queue slot: the sender its response ultimately
-/// resolves, plus — on a tagged connection (ADR-0019) — the tag it was
+/// resolves, plus — on a tagged connection (echoed response tags) — the tag it was
 /// sent with, which the read loop checks the response's echoed tag
 /// against before handing the response off. `tag` is always `None` on an
 /// untagged connection, and simply unused.
@@ -92,10 +92,10 @@ struct WriteState {
     /// as connection-lost rather than reusing a torn-down half.
     write_half: Option<WriteHalf<Stream>>,
     pending: VecDeque<PendingSlot>,
-    /// ADR-0019: this connection's tag counter, a u32 wrapping at its
+    /// Echoed response tags: this connection's tag counter, a u32 wrapping at its
     /// width — claimed under this same lock, in the same critical section
     /// that enqueues the pending slot and writes the frame, so tag order
-    /// can never skew from queue/wire order (ADR-0016's invariant).
+    /// can never skew from queue/wire order (request pipelining's invariant).
     /// Unused (stays 0) on an untagged connection.
     next_tag: u32,
 }
@@ -111,7 +111,7 @@ struct Shared {
     /// `open_targets`) — `None` for the pre-poisoned `dead()` placeholder,
     /// which never opened a socket and so was never counted.
     tracking_key: Option<String>,
-    /// ADR-0019: negotiated during identify (see `identify::Identified`) —
+    /// Echoed response tags: negotiated during identify (see `identify::Identified`) —
     /// when true, every request carries a tag the server echoes, and the
     /// read loop verifies the echo against the oldest pending slot before
     /// resolving it.
@@ -261,7 +261,7 @@ impl Connection {
     pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self
             .request(|tag| {
-                // ADR-0019: a tagged connection's request header carries
+                // Echoed response tags: a tagged connection's request header carries
                 // the claimed tag as its last field; `tag` is `None` on an
                 // untagged connection, in which case the frame is exactly
                 // the pre-0019 bytes.
@@ -286,7 +286,7 @@ impl Connection {
     pub(crate) async fn set(&self, key: &[u8], value: &[u8], ttl_seconds: u64) -> Result<()> {
         match self
             .request(|tag| {
-                // ADR-0019: the tag, when present, is always the last
+                // Echoed response tags: the tag, when present, is always the last
                 // header field — after the TTL when there is one.
                 let header = match (ttl_seconds, tag) {
                     (0, None) => format!("S {} {}\n", key.len(), value.len()),
@@ -384,10 +384,10 @@ impl Connection {
                 Ordering::SeqCst,
             );
 
-            // ADR-0019: claim this connection's next tag (if tagged) and
+            // Echoed response tags: claim this connection's next tag (if tagged) and
             // build the frame in the same critical section that enqueues
             // the pending slot and writes it, so tag order can never skew
-            // from queue/wire order (ADR-0016's invariant). `None` on an
+            // from queue/wire order (request pipelining's invariant). `None` on an
             // untagged connection produces exactly the pre-0019 frame.
             let tag = if self.shared.tagged {
                 let tag = state.next_tag;
@@ -435,7 +435,7 @@ impl Connection {
     /// still pending behind this one may already have been resolved with
     /// misaligned data by the time this runs — an inherent limitation of
     /// matching-by-order pipelining shared with the TypeScript SDK's
-    /// Connection (doc/adr/0016-*.md), not something this SDK introduces.
+    /// Connection (request pipelining), not something this SDK introduces.
     fn mismatch(&self, kind: &ResponseKind) -> Error {
         let name = match kind {
             ResponseKind::Value(_) => "value",
@@ -453,7 +453,7 @@ impl Connection {
 /// This connection's only reader, for its whole lifetime — nothing else
 /// may read from `read_half`. Consumes responses off the wire and
 /// dispatches each to the oldest pending request (FIFO —
-/// doc/adr/0016-*.md), until told to stop (poisoned by any of the
+/// Request pipelining), until told to stop (poisoned by any of the
 /// triggers in `Shared::mark_closed`) or a read itself fails.
 async fn read_loop(
     mut read_half: ReadHalf<Stream>,
@@ -512,7 +512,7 @@ async fn read_loop(
             return;
         };
 
-        // ADR-0019: on a tagged connection, verify the echoed tag against
+        // Echoed response tags: on a tagged connection, verify the echoed tag against
         // the request this response is about to answer — *before* it can
         // reach any caller. A mismatch means the streams are misaligned;
         // unlike the caller-side kind check (`mismatch()`), catching it
@@ -597,7 +597,7 @@ async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
 }
 
 /// A marker byte, its value bytes (`V` only), and — on a tagged
-/// connection (ADR-0019) — the tag it echoed, straight off the wire
+/// connection (echoed response tags) — the tag it echoed, straight off the wire
 /// before the read loop has verified that tag against anything. Only
 /// `read_one_response`/`read_loop` ever see this third field; once
 /// verified it's stripped down to a plain [`RawResponse`] before being
@@ -610,7 +610,7 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
         b'V' => {
             let header = read_line(read_half).await?;
             let header = header.trim();
-            // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019) —
+            // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags) —
             // the tag rides as a second field on the same header line.
             let (length_field, tag) = if tagged {
                 let mut fields = header.splitn(2, ' ');
@@ -642,7 +642,7 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
         }
         b'B' => {
             // `B` (busy) is always untagged — unsolicited, sent before
-            // auth (and so before tagging) even completes (ADR-0019).
+            // auth (and so before tagging) even completes (echoed response tags).
             read_half.read_u8().await?; // the trailing '\n'
             Ok((marker, None, None))
         }
@@ -663,7 +663,7 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
     }
 }
 
-/// Parses a response's echoed tag (ADR-0019): a `u32` in decimal,
+/// Parses a response's echoed tag (echoed response tags): a `u32` in decimal,
 /// matching the wire width the client itself claims tags from.
 fn parse_tag(field: &str) -> Result<u32> {
     field

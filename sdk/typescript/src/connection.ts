@@ -13,7 +13,7 @@ import {
 interface Waiter {
   resolve: (response: ParsedResponse) => void;
   reject: (error: Error) => void;
-  /** ADR-0019: the tag this request was sent with, which its response
+  /** echoed response tags: the tag this request was sent with, which its response
    * must echo — `undefined` on untagged connections. */
   tag?: number;
 }
@@ -40,7 +40,7 @@ function toBytes(value: string | Uint8Array): Uint8Array {
 export const REQUEST_TIMEOUT_TUNING = { timeoutMs: 30_000 };
 
 
-/** Thrown by get/set/delete when the node answers `W` (ADR-0008): per its
+/** Thrown by get/set/delete when the node answers `W` (staged node join): per its
  * own current view of cluster membership, this node no longer (or not yet)
  * owns the key — the caller's routing table is stale. Carries no
  * forwarding address; `NanocachedClient` catches this to re-fetch the node
@@ -83,7 +83,7 @@ export function isConnectionError(error: unknown): boolean {
  */
 export class Connection {
   private readonly socket: Socket | TLSSocket;
-  /** ADR-0019: negotiated during identify — when true, every request
+  /** echoed response tags: negotiated during identify — when true, every request
    * carries a tag the server echoes, and `onData` verifies the echo
    * against the oldest waiter before resolving it. */
   private readonly tagged: boolean;
@@ -195,8 +195,8 @@ export class Connection {
 
     return new Promise((resolve, reject) => {
       // The tag is claimed in the same synchronous span that enqueues the
-      // waiter and writes the frame (ADR-0016's enqueue+write atomicity),
-      // so tag order can never skew from queue/wire order (ADR-0019).
+      // waiter and writes the frame (request pipelining's enqueue+write atomicity),
+      // so tag order can never skew from queue/wire order (echoed response tags).
       const tag = this.tagged ? this.claimTag() : undefined;
       // Build before enqueueing: an encoder that rejects its input (e.g.
       // encodeSet's TTL check) must fail with nothing queued, or the next
@@ -295,7 +295,7 @@ export class Connection {
       if (this.pending.length === 0) this.clearRequestTimer();
       else this.armRequestTimer();
 
-      // ADR-0019: on a tagged connection, verify the echoed tag against
+      // Echoed response tags: on a tagged connection, verify the echoed tag against
       // the request this response is about to answer — *before* it can
       // reach any caller. A mismatch means the streams are misaligned;
       // unlike the caller-side kind check (`mismatch()`), catching it

@@ -20,7 +20,7 @@ public class HashRingTests
     [Fact]
     public void MatchesCrossLanguageScoreVectors()
     {
-        // Pinned outputs of the full ADR-0011 score pipeline — the Rust
+        // Pinned outputs of the full client-side replication score pipeline — the Rust
         // node and the TypeScript/Python/Java/Rust SDKs assert these too.
         Assert.Equal(0UL, HashRing.Fmix64(0));
         Assert.Equal(0xb456bcfc34c2cb2cUL, HashRing.Fmix64(1));

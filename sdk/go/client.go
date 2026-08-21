@@ -3,10 +3,10 @@
 //
 // A Config's Addresses may name either a single nanocached-node or
 // discovery server(s) fronting a cluster — Connect finds out from the
-// server's own handshake response (doc/adr/0007-*.md), so calling code
+// server's own handshake response (the server type in the auth response), so calling code
 // is identical either way.
 //
-// Cluster mode implements ADR-0011 client-side replication: writes fan
+// Cluster mode implements client-side replication client-side replication: writes fan
 // out to each key's top-R owners (the primary's result decides; a dead
 // replica never fails a write), reads ask the primary and fall over to
 // the next owner only when the holder is unreachable. Dead connections
@@ -16,7 +16,7 @@
 // idle timeout.
 //
 // The Client is safe for concurrent use. Requests are pipelined per
-// connection (doc/adr/0016-*.md): concurrent callers on the same
+// connection (request pipelining): concurrent callers on the same
 // connection each pay only their own network latency, not everyone
 // else's ahead of them.
 package nanocached
@@ -49,7 +49,7 @@ const nodeListStaleAfter = 30 * time.Second
 var keepaliveKey = []byte("\x00nanocached-keepalive")
 
 // Address is a "host:port" connect target: a single nanocached-node, or
-// one discovery replica (ADR-0010) fronting a cluster.
+// one discovery replica (discovery HA) fronting a cluster.
 type Address struct {
 	Host string
 	Port int
@@ -62,7 +62,7 @@ func (a Address) String() string {
 // Config configures Connect.
 type Config struct {
 	// Addresses lists connect targets, tried in order — one entry for a
-	// single node, or every discovery replica (ADR-0010) for a cluster.
+	// single node, or every discovery replica (discovery HA) for a cluster.
 	Addresses []Address
 	// AuthSecret matches NANOCACHED_AUTH_SECRET on the server; empty
 	// means no authentication configured.
@@ -75,7 +75,7 @@ type Config struct {
 	CA string
 	// Compress transparently DEFLATE-compresses values at or above
 	// CompressionThreshold on Set/SetBytes and decompresses them on
-	// Get/GetBytes (doc/adr/0013-*.md). Off by default. Every client that
+	// Get/GetBytes (value compression). Off by default. Every client that
 	// reads or writes a given set of keys must agree on Compress — it is
 	// a per-keyspace format decision, not a per-client preference.
 	Compress bool
@@ -88,14 +88,14 @@ type Config struct {
 	CompressionThreshold int
 	// FireAndForgetReplicas lets Set/SetBytes/Delete return as soon as
 	// the primary owner acks, letting replica legs finish in the
-	// background instead of waiting for them too (doc/adr/0014-*.md).
+	// background instead of waiting for them too (fire-and-forget replica writes).
 	// Off by default. Unlike Compress, this is a pure latency/durability
 	// trade for this client's own writes — it carries no wire format and
 	// needs no agreement with other clients.
 	FireAndForgetReplicas bool
 	// ReadRepair probes the remaining owners on a clean primary miss and
 	// repairs the gap in the background if one still holds the value
-	// (doc/adr/0015-*.md). Off by default. Costs extra reads only on the
+	// (read repair). Off by default. Costs extra reads only on the
 	// misses it actually applies to.
 	ReadRepair bool
 	// ReconnectCooldown is how long, after a reconnect dial to an address
@@ -152,7 +152,7 @@ const DefaultReconnectCooldown = time.Second
 // over that limit is rejected by simply closing the connection without a
 // response, which poisons whatever else is pipelined behind it on that
 // same connection. This reserves 256 bytes of headroom for the header
-// itself (marker byte, decimal lengths, an optional TTL, ADR-0019's tag
+// itself (marker byte, decimal lengths, an optional TTL, echoed response tags's tag
 // field, spaces, the trailing newline — always comfortably under this
 // even for the largest fields), so a key+value that clears maxRequestBytes
 // is guaranteed to fit under the server's own cap (issue #47 audit item
@@ -202,7 +202,7 @@ func validateKeyAndValue(key string, valueLen int) error {
 
 // maxInFlightBackgroundReplicaWrites bounds how many replica writes a
 // single client may have running in the background at once when
-// FireAndForgetReplicas is enabled (doc/adr/0014-*.md) — once the cap is
+// FireAndForgetReplicas is enabled (fire-and-forget replica writes) — once the cap is
 // reached, further replica legs fall back to running synchronously, the
 // same as with the option off. A variable only so tests can shrink it.
 var maxInFlightBackgroundReplicaWrites = 32
@@ -213,7 +213,7 @@ var maxInFlightBackgroundReplicaWrites = 32
 var keepAliveInterval = 30 * time.Second
 
 // readRepairTTL is the TTL a read-repair write applies to the primary
-// (doc/adr/0015-*.md). G's response carries no TTL, so the key's
+// (read repair). G's response carries no TTL, so the key's
 // original expiry is unrecoverable; repairing with TTL 0 would make an
 // expiring key immortal, permanently resurrecting data the primary had
 // correctly let expire. 60s bounds the overshoot instead — a key
@@ -236,7 +236,7 @@ type redialCooldown struct {
 }
 
 // Stats holds counters for failures this SDK deliberately swallows
-// (ADR-0011/0014/0015) — observability for silently degrading
+// (client-side replication / fire-and-forget replica writes / read repair) — observability for silently degrading
 // replication or a stuck node-list refresh that would otherwise have no
 // visible symptom until reads start missing more often than expected.
 // Every field is monotonic and never reset.
@@ -285,7 +285,7 @@ type Client struct {
 	fireAndForgetReplicas bool
 	// backgroundReplicaSem bounds in-flight background replica writes;
 	// backgroundReplicaWG lets Close() drain them before tearing down
-	// connections (doc/adr/0014-*.md).
+	// connections (fire-and-forget replica writes).
 	backgroundReplicaSem chan struct{}
 	backgroundReplicaWG  sync.WaitGroup
 
@@ -400,7 +400,7 @@ func Connect(config Config) (*Client, error) {
 	}
 
 	// Walk the addresses until one yields a working target; an address
-	// that is unreachable, warming up (B, ADR-0010), or knows no live
+	// that is unreachable, warming up (B, discovery HA), or knows no live
 	// nodes is skipped — the next replica may do better.
 	var lastError error
 	for _, addr := range client.addresses {
@@ -496,7 +496,7 @@ func (c *Client) openCluster(result *identified) error {
 
 // ── 公開 API ──────────────────────────────────────────────────────
 
-// Replication reports how many nodes hold each key (ADR-0011) — 1
+// Replication reports how many nodes hold each key (client-side replication) — 1
 // against a single node.
 func (c *Client) Replication() int {
 	c.mu.Lock()
@@ -515,7 +515,7 @@ func (c *Client) IsClosed() bool {
 }
 
 // Stats returns a snapshot of counters for failures this SDK swallows by
-// design (ADR-0011/0014/0015) — lets operators detect silently
+// design (client-side replication / fire-and-forget replica writes / read repair) — lets operators detect silently
 // degrading replication or a stuck node-list refresh.
 func (c *Client) Stats() Stats {
 	return Stats{
@@ -539,9 +539,9 @@ func (c *Client) Get(key string) (value string, ok bool, err error) {
 
 // GetBytes returns the key's raw value; ok is false when the key is
 // missing. Transparently decompresses when Config.Compress is enabled
-// (doc/adr/0013-*.md). With Config.ReadRepair, a clean miss probes the
+// (value compression). With Config.ReadRepair, a clean miss probes the
 // remaining owners before being accepted as final, repairing the gap in
-// the background if one still holds the value (doc/adr/0015-*.md).
+// the background if one still holds the value (read repair).
 func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	if err := validateKey(key); err != nil {
 		return nil, false, err
@@ -571,7 +571,7 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 // primary, which the normal read path already probed and got a clean miss
 // from — in rank order, for a value. The first one that has it wins: its
 // value is returned, and a best-effort write repairs the primary in the
-// background (doc/adr/0015-*.md) with readRepairTTL. The background write
+// background (read repair) with readRepairTTL. The background write
 // is bounded and drained exactly like a fire-and-forget replica write: it
 // takes a backgroundReplicaSem slot and is tracked on backgroundReplicaWG
 // so Close() waits for it, and no more than
@@ -649,7 +649,7 @@ func (c *Client) Set(key, value string, ttlSeconds int64) error {
 // SetBytes stores the raw value under the key. ttlSeconds is a whole
 // number of seconds; 0 means no expiry, negative is rejected.
 // Transparently compresses values at or above Config.CompressionThreshold
-// when Config.Compress is enabled (doc/adr/0013-*.md).
+// when Config.Compress is enabled (value compression).
 func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 	if err := validateKeyAndValue(key, len(value)); err != nil {
 		return err
@@ -688,7 +688,7 @@ func (c *Client) Delete(key string) (existed bool, err error) {
 	err = c.withClusterRetry(func() error {
 		return c.write(keyBytes, func(conn *connection, primary bool) error {
 			e, opErr := conn.delete(keyBytes)
-			// Only the primary's answer decides (ADR-0011) — and only the
+			// Only the primary's answer decides (client-side replication) — and only the
 			// primary leg may touch `existed`: the replica legs run on
 			// other goroutines, so writing it there would both race and
 			// let a replica's answer overwrite the primary's.
@@ -714,7 +714,7 @@ func (c *Client) Close() {
 	c.closed = true
 	close(c.stopKeepalive)
 	c.mu.Unlock()
-	// doc/adr/0014-*.md: give background replica writes (if any) a chance
+	// Fire-and-forget replica writes: give background replica writes (if any) a chance
 	// to finish before their connections are torn out from under them.
 	// Bounded by maxInFlightBackgroundReplicaWrites, so this is a short
 	// wait in practice.
@@ -853,7 +853,7 @@ func (c *Client) write(key []byte, op func(conn *connection, primary bool) error
 
 	// Fan out to the replicas concurrently with the primary write. The
 	// primary's outcome decides; replica failures are swallowed by design
-	// (ADR-0011) — a dead or disagreeing replica leaves the key
+	// (client-side replication) — a dead or disagreeing replica leaves the key
 	// under-replicated until the next node-list refresh, never fails the
 	// write. Counted in Stats().ReplicaWriteFailures so operators can spot
 	// silently degrading replication.
@@ -865,7 +865,7 @@ func (c *Client) write(key []byte, op func(conn *connection, primary bool) error
 
 	var replicas sync.WaitGroup
 	for _, name := range names[1:] {
-		// doc/adr/0014-*.md: with FireAndForgetReplicas, try to run this
+		// Fire-and-forget replica writes: with FireAndForgetReplicas, try to run this
 		// leg in the background instead of waiting for it — but only up
 		// to maxInFlightBackgroundReplicaWrites; past that cap, fall back
 		// to the synchronous path below exactly as with the option off.
@@ -1095,7 +1095,7 @@ func (c *Client) refreshNodeList() {
 	c.redialMu.Unlock()
 }
 
-// fetchNodeList walks every configured address (ADR-0010); ok=false
+// fetchNodeList walks every configured address (discovery HA); ok=false
 // means keep the last-known list.
 func (c *Client) fetchNodeList() ([]discoveredNode, int, bool) {
 	for _, addr := range c.addresses {

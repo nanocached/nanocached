@@ -36,7 +36,7 @@ via `GetBytes`/`SetBytes` for binary data — `Get` decodes with a plain
 `string(bytes)` conversion, which in Go is always lossless, so unlike
 some other nanocached SDKs there is no decode-failure case to handle.
 The client is safe for concurrent use; requests are pipelined per
-connection (doc/adr/0016-*.md) — concurrent callers on the same
+connection (request pipelining) — concurrent callers on the same
 connection each pay only their own network latency, not everyone
 else's ahead of them.
 
@@ -65,7 +65,7 @@ timeout): the failed attempt forces a node-list refresh and one retry.
 Off by default. `Set`/`SetBytes`/`Delete` normally wait for every
 replica leg to finish, same as the primary. Enabling
 `FireAndForgetReplicas` returns as soon as the primary acks, letting
-replica legs finish in the background (doc/adr/0014-*.md):
+replica legs finish in the background (fire-and-forget replica writes):
 
 ```go
 client, err := nanocached.Connect(nanocached.Config{
@@ -88,7 +88,7 @@ connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `ReadRepair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (doc/adr/0015-*.md):
+background if one still has the value (read repair):
 
 ```go
 client, err := nanocached.Connect(nanocached.Config{
@@ -157,7 +157,7 @@ negative `ttlSeconds` is rejected before any network call.
 
 Off by default. When enabled, values at or above `CompressionThreshold`
 bytes are transparently DEFLATE-compressed on `Set`/`SetBytes` and
-decompressed on `Get`/`GetBytes` (doc/adr/0013-\*.md):
+decompressed on `Get`/`GetBytes` (value compression):
 
 ```go
 client, err := nanocached.Connect(nanocached.Config{

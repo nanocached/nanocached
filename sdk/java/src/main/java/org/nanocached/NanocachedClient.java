@@ -38,9 +38,9 @@ import javax.net.ssl.TrustManagerFactory;
  * The public client. An address (or an addresses list) may name either a
  * single nanocached-node or discovery server(s) fronting a cluster —
  * {@code connect()} finds out from the server's own handshake response
- * (doc/adr/0007-*.md), so calling code is identical either way.
+ * (the server type in the auth response), so calling code is identical either way.
  *
- * <p>Cluster mode implements ADR-0011 client-side replication: writes fan
+ * <p>Cluster mode implements client-side replication client-side replication: writes fan
  * out to each key's top-R owners (the primary's result decides; a dead
  * replica never fails a write), reads ask the primary and fall over to
  * the next owner only when the holder is unreachable. Dead connections
@@ -67,7 +67,7 @@ public final class NanocachedClient implements AutoCloseable {
         private Duration reconnectCooldown = DEFAULT_RECONNECT_COOLDOWN;
         private boolean reconnectCooldownDisabled;
 
-        /** Discovery replicas (ADR-0010), tried in order for connect and every
+        /** Discovery replicas (discovery HA), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
         public Options addresses(List<Address> addresses) {
             this.addresses.addAll(addresses);
@@ -121,11 +121,10 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         /** Transparently compress values above {@link #compressionThreshold}
-         * on set and decompress them on get/getBytes (doc/adr/0013-*.md).
+         * on set and decompress them on get/getBytes (value compression).
          * Off by default. <b>Every client that reads or writes a given set
          * of keys must agree on this setting</b> — it is a per-keyspace
-         * format decision, not a per-client preference; see the ADR's
-         * Consequences before enabling this against an existing keyspace
+         * format decision, not a per-client preference; take care before enabling this against an existing keyspace
          * another client may still touch with {@code compress} off. */
         public Options compress(boolean enabled) {
             this.compress = enabled;
@@ -148,7 +147,7 @@ public final class NanocachedClient implements AutoCloseable {
 
         /** Let set/delete return as soon as the primary owner acks, letting
          * replica legs finish in the background instead of waiting for them
-         * too (doc/adr/0014-*.md). Off by default. Unlike {@link #compress},
+         * too (fire-and-forget replica writes). Off by default. Unlike {@link #compress},
          * this is a pure latency/durability trade for this client's own
          * writes — it carries no wire format and needs no agreement with
          * other clients. */
@@ -160,7 +159,7 @@ public final class NanocachedClient implements AutoCloseable {
         /** On a clean miss (the key's first-reached owner reports it
          * missing), probe the remaining owners before accepting that, and
          * repair the primary in the background if one still has the value
-         * (doc/adr/0015-*.md). Off by default. Costs extra reads only on
+         * (read repair). Off by default. Costs extra reads only on
          * the misses this actually applies to. */
         public Options readRepair(boolean enabled) {
             this.readRepair = enabled;
@@ -223,9 +222,9 @@ public final class NanocachedClient implements AutoCloseable {
     /**
      * Point-in-time snapshot returned by {@link #stats()}: counters for
      * failures this client swallows by design instead of surfacing to the
-     * caller — a dead replica leg on a write (doc/adr/0011-*.md,
-     * doc/adr/0014-*.md), a failed background repair of the primary after
-     * read-repair found a value on another owner (doc/adr/0015-*.md), and
+     * caller — a dead replica leg on a write (client-side replication,
+     * Fire-and-forget replica writes), a failed background repair of the primary after
+     * read-repair found a value on another owner (read repair), and
      * a failed node-list refresh attempt or per-node reconnect during one.
      * None of these ever fail an operation; this is purely observability
      * so an operator who only watches for thrown exceptions can still
@@ -286,7 +285,7 @@ public final class NanocachedClient implements AutoCloseable {
         return key;
     }
 
-    // TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
+    // TTL a read-repair write uses (read repair), in whole seconds —
     // the protocol's TTL unit throughout (see set()'s ttlSeconds). The
     // original TTL isn't recoverable from a GET response, and repairing
     // with TTL 0 (no expiry) would permanently resurrect data that was
@@ -295,7 +294,7 @@ public final class NanocachedClient implements AutoCloseable {
     // policy decision, applied identically across all SDKs.
     private static final long READ_REPAIR_TTL_SECONDS = 60;
     static volatile long keepAliveIntervalMillis = 30_000;
-    // doc/adr/0014-*.md: bounds how many replica writes a single client
+    // Fire-and-forget replica writes: bounds how many replica writes a single client
     // may have running in the background at once when
     // fireAndForgetReplicas is enabled — once the cap is reached, further
     // replica legs fall back to running synchronously, the same as with
@@ -464,7 +463,7 @@ public final class NanocachedClient implements AutoCloseable {
                 options.readRepair, options.reconnectCooldown, options.reconnectCooldownDisabled);
 
         // Walk the addresses until one yields a working target; an address
-        // that is unreachable, warming up (B, ADR-0010), or knows no live
+        // that is unreachable, warming up (B, discovery HA), or knows no live
         // nodes is skipped — the next replica may do better.
         RuntimeException lastError = null;
         for (Address address : client.addresses) {
@@ -603,7 +602,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     // ── 公開 API ──────────────────────────────────────────────────
 
-    /** How many nodes hold each key (ADR-0011) — 1 against a single node. */
+    /** How many nodes hold each key (client-side replication) — 1 against a single node. */
     public int replication() {
         return ring != null ? replication : 1;
     }
@@ -614,7 +613,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     /**
      * A snapshot of counters for failures this client swallows by design
-     * (ADR-0011/0014's replica-leg writes, ADR-0015's read-repair, and
+     * (replica-leg writes, read repair, and
      * node-list refresh) — see {@link ClientStats} for exactly what each
      * counts. Nothing here ever fails an operation; this exists purely so
      * an operator can detect replication silently degrading or a
@@ -672,9 +671,9 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** Returns the raw value, or {@code Optional.empty()} when the key is
      * missing. Transparently decompresses when {@code compress} is
-     * enabled (doc/adr/0013-*.md). With {@code readRepair}, a clean miss
+     * enabled (value compression). With {@code readRepair}, a clean miss
      * probes the remaining owners before being accepted as final
-     * (doc/adr/0015-*.md). */
+     * (read repair). */
     public Optional<byte[]> getBytes(byte[] key) {
         validateKey(key);
         beforeOperation();
@@ -686,7 +685,7 @@ public final class NanocachedClient implements AutoCloseable {
         return Optional.of(compress ? Compression.decompressValue(value) : value);
     }
 
-    /** doc/adr/0015-*.md: probes the remaining owners of {@code key} —
+    /** read repair: probes the remaining owners of {@code key} —
      * every owner but the primary, which the normal read path already
      * probed and got a clean miss from — in rank order, for a value
      * (issue: audit finding, tryReadRepair used to re-probe the primary
@@ -703,7 +702,7 @@ public final class NanocachedClient implements AutoCloseable {
      * #stats()}'s readRepairFailures. The write-back is bounded by — and
      * drained on {@link #close()} through — the same {@link
      * #backgroundReplicaWritePermits} pool as a fireAndForgetReplicas
-     * replica leg (doc/adr/0014-*.md): past the cap, the repair for this
+     * replica leg (fire-and-forget replica writes): past the cap, the repair for this
      * miss is simply skipped, since read repair is opportunistic and a
      * later miss on the same key repairs it (issue: audit finding,
      * unbounded/undrained read-repair write-backs). */
@@ -785,7 +784,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** {@code ttlSeconds == 0} means no expiry. Transparently compresses
      * values at or above {@code compressionThreshold} when {@code
-     * compress} is enabled (doc/adr/0013-*.md). */
+     * compress} is enabled (value compression). */
     public void set(byte[] key, byte[] value, long ttlSeconds) {
         if (ttlSeconds < 0) {
             throw new IllegalArgumentException(
@@ -863,7 +862,7 @@ public final class NanocachedClient implements AutoCloseable {
             keepAlive.shutdownNow();
             awaitTerminationQuietly(keepAlive);
         }
-        // doc/adr/0014-*.md: give background replica writes a chance to
+        // Fire-and-forget replica writes: give background replica writes a chance to
         // finish before their connections are torn out from under them.
         // Acquiring every permit — rather than snapshotting the future
         // set — closes the registration race: a write() that passed its
@@ -1033,7 +1032,7 @@ public final class NanocachedClient implements AutoCloseable {
                 try {
                     applyReconnecting(() -> memberConnection(replica), op);
                 } catch (NanocachedException ignored) {
-                    // Swallowed by design (ADR-0011): a dead or disagreeing
+                    // Swallowed by design (client-side replication): a dead or disagreeing
                     // replica leaves the key under-replicated until the next
                     // node-list refresh, never fails the write. Counted via
                     // stats().replicaWriteFailures so operators can spot
@@ -1046,7 +1045,7 @@ public final class NanocachedClient implements AutoCloseable {
                 }
             };
 
-            // doc/adr/0014-*.md: with fireAndForgetReplicas, up to
+            // Fire-and-forget replica writes: with fireAndForgetReplicas, up to
             // maxInFlightBackgroundReplicaWrites legs run in the
             // background instead of being waited for below — past that
             // cap, further legs fall back to the synchronous path exactly
@@ -1404,7 +1403,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Walks every address (ADR-0010); {@code null} means keep the
+    /** Walks every address (discovery HA); {@code null} means keep the
      * last-known list. */
     private Identify.ClusterTarget fetchNodeList() {
         for (Address address : addresses) {
@@ -1414,7 +1413,7 @@ public final class NanocachedClient implements AutoCloseable {
             } catch (IOException | RuntimeException error) {
                 // Silent by design — refresh is opportunistic/best-effort
                 // and must never fail the caller's operation, consistent
-                // with ADR-0011's eventual-consistency model. The next
+                // with client-side replication's eventual-consistency model. The next
                 // refresh retries; counted via stats().refreshFailures.
                 refreshFailures.incrementAndGet();
                 continue;

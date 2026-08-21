@@ -13,7 +13,7 @@ class Fnv1aTests(unittest.TestCase):
 
 class CrossLanguageVectorTests(unittest.TestCase):
     def test_matches_rust_and_typescript_exactly(self):
-        # Pinned outputs of the full ADR-0011 score pipeline — the Rust and
+        # Pinned outputs of the full client-side replication score pipeline — the Rust and
         # TypeScript implementations assert these exact values too.
         self.assertEqual(fmix64(0), 0)
         self.assertEqual(fmix64(1), 0xB456BCFC34C2CB2C)

@@ -9,7 +9,7 @@ namespace Nanocached;
 /// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c> — the <c>A</c> identify
 /// exchange happens in <see cref="Identify"/> before a Connection exists).
 /// Requests are pipelined onto the socket and matched to responses in send
-/// order (doc/adr/0016-*.md): a dedicated read loop, started in the
+/// order (request pipelining): a dedicated read loop, started in the
 /// constructor, consumes responses and dispatches each to the oldest
 /// still-pending request, since nanocached-node itself only ever answers in
 /// the order it received requests. <see cref="Stream"/> supports one
@@ -18,7 +18,7 @@ namespace Nanocached;
 /// frame happen under one semaphore, so concurrent callers' queue order
 /// always matches the order their frames actually hit the wire.
 ///
-/// <para>doc/adr/0019-*.md: when <see cref="_tagged"/> (negotiated during
+/// <para>echoed response tags: when <see cref="_tagged"/> (negotiated during
 /// identify), every request carries a per-connection tag as its header's
 /// last field, and the server echoes it in the response. The tag is
 /// claimed inside the same enqueue+write critical section as the pending
@@ -60,11 +60,11 @@ internal sealed class Connection
 
     private readonly Stream _stream;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
-    /// <summary>ADR-0019: negotiated during identify — when true, every
+    /// <summary>echoed response tags: negotiated during identify — when true, every
     /// request carries a tag the server echoes, and the read loop verifies
     /// the echo against the oldest pending slot before resolving it.</summary>
     private readonly bool _tagged;
-    // A u32 wrapping counter (ADR-0019), claimed only inside the
+    // A u32 wrapping counter (echoed response tags), claimed only inside the
     // _writeGate critical section — never touched concurrently, so no
     // Interlocked ceremony is needed here the way _closedFlag needs one.
     private uint _nextTag;
@@ -105,7 +105,7 @@ internal sealed class Connection
     // gate, so the last one to run always matches the current count.
     private readonly object _deadlineGate = new();
 
-    /// <summary><paramref name="tagged"/> (ADR-0019): whether identify
+    /// <summary><paramref name="tagged"/> (echoed response tags): whether identify
     /// negotiated tagged mode for this connection. <paramref name="onClosed"/>,
     /// when given, fires exactly once — the first time this connection
     /// actually closes — no matter how many call sites call
@@ -186,7 +186,7 @@ internal sealed class Connection
 
     /// <summary>Same idempotency as <see cref="Close"/>, but drains every
     /// still-pending request with <paramref name="reason"/> instead of the
-    /// generic closed error — used by the ADR-0019 tag check below so that
+    /// generic closed error — used by the echoed response tags tag check below so that
     /// every request behind a desynced one is rejected with a message that
     /// actually says so, not a generic "connection closed".</summary>
     private void CloseWithReason(Exception reason)
@@ -254,7 +254,7 @@ internal sealed class Connection
         return frame;
     }
 
-    /// <summary>ADR-0019: on a tagged connection every request header's
+    /// <summary>echoed response tags: on a tagged connection every request header's
     /// last field is the client's tag; an untagged connection's wire bytes
     /// are unchanged from before this field existed.</summary>
     private static string TagField(uint? tag) => tag is null ? "" : $" {tag}";
@@ -268,9 +268,9 @@ internal sealed class Connection
     /// still pending behind this one may already have been resolved with
     /// misaligned data by the time this runs — an inherent limitation of
     /// matching-by-order pipelining shared with the TypeScript SDK's
-    /// Connection (doc/adr/0016-*.md), not something this SDK introduces.
+    /// Connection (request pipelining), not something this SDK introduces.
     /// This is the second line of defense: on a tagged connection, the
-    /// read loop's own tag check (ADR-0019) normally catches a desync like
+    /// read loop's own tag check (echoed response tags) normally catches a desync like
     /// this before any response is ever handed to a caller.
     /// </summary>
     private ConnectionLostException Mismatch(byte marker)
@@ -299,7 +299,7 @@ internal sealed class Connection
     /// the write-gate critical section, after the tag is claimed but
     /// before anything is enqueued — an encoder that rejects its input
     /// must fail with nothing queued, or the next response would resolve
-    /// an orphaned waiter and desync the stream (ADR-0019).</param>
+    /// an orphaned waiter and desync the stream (echoed response tags).</param>
     private async Task<(byte Marker, byte[]? Value)> RequestAsync(Func<uint?, byte[]> buildFrame)
     {
         if (IsClosed)
@@ -318,8 +318,8 @@ internal sealed class Connection
                 throw new ConnectionLostException("nanocached: connection is closed");
             }
             _sinceLastUse.Restart();
-            // ADR-0019: the tag is claimed in the same critical section
-            // that enqueues the waiter and writes the frame (ADR-0016's
+            // Echoed response tags: the tag is claimed in the same critical section
+            // that enqueues the waiter and writes the frame (request pipelining's
             // enqueue+write atomicity), so tag order can never skew from
             // queue/wire order.
             uint? tag = _tagged ? ClaimTag() : null;
@@ -365,7 +365,7 @@ internal sealed class Connection
     /// <summary>This connection's only reader, for its whole lifetime —
     /// nothing else may read from <see cref="_stream"/>. Consumes
     /// responses off the wire and dispatches each to the oldest pending
-    /// request (FIFO — doc/adr/0016-*.md), until a read fails.</summary>
+    /// request (FIFO — request pipelining), until a read fails.</summary>
     private async Task ReadLoopAsync()
     {
         while (true)
@@ -431,7 +431,7 @@ internal sealed class Connection
             // connection limit right after accept and is about to close
             // the connection; it isn't an answer to anything we sent
             // (mirrors the TypeScript SDK's Connection.onData). Busy is
-            // always untagged (ADR-0019) — it is never a reply to a
+            // always untagged (echoed response tags) — it is never a reply to a
             // specific request.
             if (response.Marker == (byte)'B')
             {
@@ -460,7 +460,7 @@ internal sealed class Connection
                 return;
             }
 
-            // ADR-0019: on a tagged connection, verify the echoed tag
+            // Echoed response tags: on a tagged connection, verify the echoed tag
             // against the request this response is about to answer —
             // *before* it can reach any caller. A mismatch means the
             // streams are misaligned; unlike the caller-side kind check
@@ -491,7 +491,7 @@ internal sealed class Connection
         {
             case (byte)'V':
             {
-                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019).
+                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags).
                 string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
                 if (fields.Length != (_tagged ? 2 : 1))
                 {
@@ -540,7 +540,7 @@ internal sealed class Connection
                 return (marker, null, tag);
             }
             case (byte)'B':
-                // Busy is unsolicited and always bare (ADR-0019) — never
+                // Busy is unsolicited and always bare (echoed response tags) — never
                 // tagged, even on a tagged connection.
                 await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
                 return (marker, null, null);

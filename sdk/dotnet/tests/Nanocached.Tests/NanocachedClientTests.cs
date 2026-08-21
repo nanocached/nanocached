@@ -169,7 +169,7 @@ public class NanocachedClientTests
     {
         // Same shape as the TypeScript SDK's own pipelining test: N
         // concurrent requests on a single connection, each independently
-        // verified to round-trip its own value (doc/adr/0016-*.md) — a
+        // verified to round-trip its own value (request pipelining) — a
         // bug in matching responses to the right caller in send order
         // would show up as swapped or wrong values here.
         using var node = new MockNode();
@@ -1071,7 +1071,7 @@ public class NanocachedClientTests
         }
     }
 
-    // ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────
+    // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     // A "did it wait for the mock's delay" assertion can't compare the
     // measured elapsed time against the delay exactly: Task.Delay's timer
@@ -1175,7 +1175,7 @@ public class NanocachedClientTests
             "Close() returned before the background replica write finished");
     }
 
-    // ── read repair (doc/adr/0015-*.md) ────────────────────────────
+    // ── read repair (read repair) ────────────────────────────
 
     [Fact]
     public async Task ByDefaultACleanMissOnThePrimaryIsNotRepaired()
@@ -1504,7 +1504,7 @@ public class NanocachedClientTests
         Assert.Empty(unobserved);
     }
 
-    // ── 値の圧縮 (doc/adr/0013-*.md) ──────────────────────────────
+    // ── 値の圧縮 (value compression) ──────────────────────────────
 
     private static NanocachedClient.Options CompressingOptions(int port, int threshold = 256) =>
         new()
@@ -1590,7 +1590,7 @@ public class NanocachedClientTests
         using var node = new MockNode();
 
         // A legacy/uncompressed writer's value whose first byte happens to
-        // collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+        // collide with the DEFLATE marker (0x01) — value compression's
         // documented hazard of enabling Compress against a keyspace other
         // clients still touch without it. The remaining bytes are chosen
         // to reliably fail DEFLATE decoding (raw DEFLATE has no checksum,
@@ -1602,7 +1602,7 @@ public class NanocachedClientTests
         await Assert.ThrowsAsync<DecompressionException>(() => reader.GetBytesAsync("k"));
     }
 
-    // ── response tags (doc/adr/0019-*.md) ───────────────────────────
+    // ── response tags (echoed response tags) ───────────────────────────
 
     [Fact]
     public async Task PipelinesConcurrentRequestsOnATaggedConnection()
@@ -1647,10 +1647,10 @@ public class NanocachedClientTests
     [Fact]
     public async Task ASwallowedResponseDesyncIsCaughtBeforeAnyCallerSeesWrongData()
     {
-        // The exact misdelivery ADR-0016 left open: the server (as a
+        // The exact misdelivery request pipelining left open: the server (as a
         // stand-in for any off-by-one stream corruption) never answers the
         // first GET, so the second GET's response arrives at the first
-        // GET's pending slot. Without the ADR-0019 tag check, the first
+        // GET's pending slot. Without the echoed response tags tag check, the first
         // caller would receive the second's value as a plausible,
         // exception-free wrong answer — the classic desync. The tag check
         // must catch this before either caller sees anything wrong, and

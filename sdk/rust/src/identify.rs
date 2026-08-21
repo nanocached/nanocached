@@ -1,10 +1,10 @@
 //! Connect-and-identify: dials `host:port`, authenticates, and figures
 //! out from the server's own `A` response whether it reached a cache node
 //! (`On`) or a discovery server (`Od`) — the caller never says which it
-//! expects (doc/adr/0007-*.md). A node's stream is handed back live; a
+//! expects (the server type in the auth response). A node's stream is handed back live; a
 //! discovery connection is used once for `L` and dropped, returning the
 //! name/address list and the cluster's replication factor R
-//! (doc/adr/0009, 0010, 0011).
+//! (node identity, discovery HA, replication).
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -35,7 +35,7 @@ const MAX_NODE_FIELD_LENGTH: usize = 64 * 1024;
 const MAX_NODE_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A node's hash-ring identity (a random per-process UUID) and its
-/// network address — two different things since doc/adr/0009-*.md.
+/// network address — two different things since node identity decoupled from address.
 #[derive(Debug, Clone)]
 pub struct DiscoveredNode {
     pub name: String,
@@ -204,7 +204,7 @@ fn build_tls_config(ca: Option<&std::path::Path>) -> Result<TlsConfig> {
 pub(crate) enum Identified {
     Node {
         stream: Stream,
-        /// ADR-0019: the node accepted the extended `A ... T`, so this
+        /// Echoed response tags: the node accepted the extended `A ... T`, so this
         /// socket's `G`/`S`/`D` traffic must carry tags and its responses
         /// echo them; `false` means an older node answered the plain-`A`
         /// fallback (see `connect_and_identify`).
@@ -232,7 +232,7 @@ pub(crate) async fn connect_and_identify(
     match run_identify_attempt(host, port, auth_secret, tls, deadline, true).await {
         Ok(identified) => Ok(identified),
         Err(AuthFailure::LegacyServer) => {
-            // ADR-0019 transparent fallback: a pre-0019 server treats the
+            // Echoed response tags transparent fallback: a pre-0019 server treats the
             // extended `A ... T` as a parse error and closes without
             // replying — redial once with the plain form and run the
             // connection untagged (the pre-0019 behavior, desync window
@@ -316,7 +316,7 @@ async fn do_connect_and_identify(
     let mut stream = BufReader::new(stream);
 
     let secret = auth_secret.unwrap_or(NO_SECRET_PLACEHOLDER);
-    // ADR-0019: always send the extended form — a `T` after the secret
+    // Echoed response tags: always send the extended form — a `T` after the secret
     // length asks the server to echo tags on this connection's G/S/D
     // traffic. A pre-0019 server can't parse this and slams the door
     // (see `classify_auth_io_error`/`connect_and_identify`'s fallback).
@@ -438,7 +438,7 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
         )));
     };
 
-    // `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+    // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
     let mut fields = rest.split(' ');
     let (count, replication) = match (fields.next(), fields.next(), fields.next()) {
         (Some(count), Some(replication), None) => (

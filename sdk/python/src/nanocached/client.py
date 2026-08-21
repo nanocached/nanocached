@@ -1,9 +1,9 @@
 """The public client. An ``addresses`` list may name either a single
 nanocached-node or discovery server(s) fronting a cluster — ``connect()``
-finds out from the server's own handshake response (doc/adr/0007-*.md), so
+finds out from the server's own handshake response (the server type in the auth response), so
 calling code is identical either way.
 
-Cluster mode implements ADR-0011 client-side replication: writes fan out to
+Cluster mode implements client-side replication client-side replication: writes fan out to
 each key's top-R owners (the primary's result decides; a dead replica never
 fails a write), reads ask the primary and fall over to the next owner only
 when the holder is unreachable. Dead connections are redialed lazily on use
@@ -33,7 +33,7 @@ from ._identify import (
     split_host_port,
 )
 
-# Errors safe for a by-design swallow site (ADR-0011/0014/0015, node-list
+# Errors safe for a by-design swallow site (client-side replication / fire-and-forget replica writes / read repair, node-list
 # refresh) to absorb: this SDK's own error hierarchy, plus OS-level I/O
 # errors (ConnectionError is itself an OSError subclass, kept in the tuple
 # for readability at each call site). Programming errors — TypeError,
@@ -47,17 +47,17 @@ _SWALLOWABLE_ERRORS = (NanocachedError, ConnectionError, OSError)
 @dataclass(frozen=True)
 class ClientStats:
     """Snapshot of counters for failures this client swallows by design
-    (ADR-0011/0014/0015) instead of raising them to a caller — observability
+    (client-side replication / fire-and-forget replica writes / read repair) instead of raising them to a caller — observability
     for silently degrading replication or a stuck node-list refresh, which
     would otherwise be invisible. See ``NanocachedClient.stats()``.
 
     ``replica_write_failures``: replica-leg write failures swallowed
     during a cluster write, whether the leg ran synchronously or as a
-    ``fire_and_forget_replicas`` background write (doc/adr/0011-*.md,
-    doc/adr/0014-*.md).
+    ``fire_and_forget_replicas`` background write (client-side replication,
+    Fire-and-forget replica writes).
 
     ``read_repair_failures``: failures swallowed while probing owners or
-    writing back the repaired value during read repair (doc/adr/0015-*.md).
+    writing back the repaired value during read repair (read repair).
 
     ``refresh_failures``: node-list refresh attempts that failed, and
     per-node connect failures swallowed while reconciling a refresh's
@@ -70,7 +70,7 @@ class ClientStats:
     refresh_failures: int
 
 
-# doc/adr/0013-*.md: values shorter than this (bytes) are never
+# Value compression: values shorter than this (bytes) are never
 # compressed — the per-value overhead of attempting it outweighs the
 # savings. Only meaningful when compress=True.
 _DEFAULT_COMPRESSION_THRESHOLD = 256
@@ -90,7 +90,7 @@ _DEFAULT_RECONNECT_COOLDOWN = 1.0
 
 # TTL (whole seconds — the protocol's TTL unit throughout, see
 # _encode_set in _connection.py) a read-repair write uses
-# (doc/adr/0015-*.md). The original TTL isn't recoverable from a GET
+# (read repair). The original TTL isn't recoverable from a GET
 # response, and repairing with TTL 0 (no expiry) would permanently
 # resurrect data that was legitimately expiring; 60s bounds the overshoot
 # instead — an immortal key just gets re-repaired on a later miss.
@@ -109,7 +109,7 @@ _KEEPALIVE_KEY = b"\x00nanocached-keepalive"
 # so tests can shorten it.
 _KEEPALIVE_INTERVAL = 30.0
 
-# doc/adr/0014-*.md, amended by doc/adr/0015-*.md (issue #47 audit item
+# Fire-and-forget replica writes, amended by read repair (issue #47 audit item
 # 5): bounds how many replica writes a single client may have running in
 # the background at once, combined across fire_and_forget_replicas writes
 # (_write()) *and* read-repair write-backs (_try_read_repair()) — one
@@ -303,7 +303,7 @@ class NanocachedClient:
         client._reconnect_cooldown = reconnect_cooldown
 
         # Walk the addresses until one yields a working target; an address
-        # that is unreachable, warming up (`B`, ADR-0010), or knows no live
+        # that is unreachable, warming up (`B`, discovery HA), or knows no live
         # nodes is skipped — the next replica may do better.
         last_error: Exception | None = None
         for address_host, address_port in client._addresses:
@@ -367,7 +367,7 @@ class NanocachedClient:
         above) and decrementing it again via on_close whenever the
         connection eventually closes — whether via close(), redial
         replacement, or refresh reconciliation. ``tagged`` is the identify
-        exchange's own ADR-0019 negotiation result, threaded straight
+        exchange's own echoed response tags negotiation result, threaded straight
         through to Connection."""
         assert self._target_key is not None
         key = self._target_key
@@ -393,12 +393,12 @@ class NanocachedClient:
 
     @property
     def replication(self) -> int:
-        """How many nodes hold each key (ADR-0011) — 1 against a single node."""
+        """How many nodes hold each key (client-side replication) — 1 against a single node."""
         return self._replication if self._ring is not None else 1
 
     def stats(self) -> ClientStats:
         """Observability for failures this client swallows by design
-        (ADR-0011/0014/0015) — lets operators detect silently degrading
+        (client-side replication / fire-and-forget replica writes / read repair) — lets operators detect silently degrading
         replication or a stuck node-list refresh. A snapshot, not a live
         view; each count is monotonic for the lifetime of this client."""
         return ClientStats(
@@ -414,9 +414,9 @@ class NanocachedClient:
     async def get_bytes(self, key: str | bytes) -> bytes | None:
         """The raw companion to get(): no UTF-8 decoding, so it never
         raises on a value that isn't valid UTF-8. Transparently
-        decompresses when ``compress`` is enabled (doc/adr/0013-*.md).
+        decompresses when ``compress`` is enabled (value compression).
         With ``read_repair``, a clean miss probes the remaining owners
-        before being accepted as final (doc/adr/0015-*.md)."""
+        before being accepted as final (read repair)."""
         key_bytes = _to_bytes(key)
         _check_key(key_bytes)
         await self._before_operation()
@@ -430,7 +430,7 @@ class NanocachedClient:
         return decompress_value(value)
 
     async def _try_read_repair(self, key: bytes) -> bytes | None:
-        """doc/adr/0015-*.md: probes the remaining owners of ``key`` —
+        """read repair: probes the remaining owners of ``key`` —
         every owner but the primary, which the normal read path already
         probed and got a clean miss from (same as the Rust, Go, Java and
         .NET SDKs) — in rank order, for a value the normal read path
@@ -507,7 +507,7 @@ class NanocachedClient:
         expiry. Negative values are rejected eagerly, before any I/O.
         Transparently compresses values at or above
         ``compression_threshold`` when ``compress`` is enabled
-        (doc/adr/0013-*.md)."""
+        (value compression)."""
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
             raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
@@ -544,7 +544,7 @@ class NanocachedClient:
         instance's lifecycle, so — unlike the first — it warns.
 
         Returns only after every in-flight background replica write has
-        finished and the connections are torn down (doc/adr/0014-*.md as
+        finished and the connections are torn down (fire-and-forget replica writes as
         amended by issue #47 item 3 — the drain contract every SDK now
         shares); a coroutine since then, the same shape aiohttp's
         ``ClientSession.close`` has. This SDK also waits for any in-flight
@@ -669,7 +669,7 @@ class NanocachedClient:
             try:
                 await op(await self._member_connection(name))
             except _SWALLOWABLE_ERRORS:
-                # Swallowed by design (ADR-0011): a dead or disagreeing
+                # Swallowed by design (client-side replication): a dead or disagreeing
                 # replica leaves the key under-replicated until the next
                 # node-list refresh, never fails the write. Counted in
                 # stats().replica_write_failures, whether this leg ran
@@ -681,7 +681,7 @@ class NanocachedClient:
 
         replica_tasks = []
         for name in replicas:
-            # doc/adr/0014-*.md: with fire_and_forget_replicas, up to
+            # Fire-and-forget replica writes: with fire_and_forget_replicas, up to
             # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES legs — shared with
             # read-repair write-backs, see _background_replica_writes'
             # own comment in __init__ (issue #47 audit item 5) — run in
@@ -878,7 +878,7 @@ class NanocachedClient:
                 target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
                 if not isinstance(target, NodeTarget):
                     # Refresh is opportunistic/best-effort and must never
-                    # fail the caller's operation (ADR-0011's
+                    # fail the caller's operation (client-side replication's
                     # eventual-consistency model) — this node is just
                     # skipped, counted in stats().refresh_failures.
                     self._refresh_failures += 1
@@ -906,10 +906,10 @@ class NanocachedClient:
         self._replication = cluster.replication
 
     async def _fetch_node_list(self) -> ClusterTarget | None:
-        """Walks every address (ADR-0010); None means keep the last-known
+        """Walks every address (discovery HA); None means keep the last-known
         list. Failures here are silent by design — refresh is
         opportunistic/best-effort and must never fail the caller's
-        operation (ADR-0011's eventual-consistency model), so behavior is
+        operation (client-side replication's eventual-consistency model), so behavior is
         unchanged either way, it just happens without a warning. Each
         failed address is counted in stats().refresh_failures."""
         for address_host, address_port in self._addresses:

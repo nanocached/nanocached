@@ -70,13 +70,13 @@ cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 
 The node sends a heartbeat every 5 seconds; the discovery server derives
 the node's reachable address from that connection's own source IP plus
-the node's port (`doc/adr/0012-*.md`), so containerized deployments need
+the node's port (addresses derived from the registration connection), so containerized deployments need
 no address configuration. Omit `--discovery` to run standalone.
 (Asymmetric port mapping — e.g. Docker's `-p 9999:8356` — is
 unsupported: it is NAT, which the cluster design already excludes.)
 
 `--discovery` accepts a comma-separated list of discovery replicas
-(`doc/adr/0010-*.md`): the node registers with and heartbeats to all of
+(discovery HA): the node registers with and heartbeats to all of
 them, but only the first — the primary — ever orchestrates its join. Every
 node in a cluster must list the same addresses in the same order:
 
@@ -311,7 +311,7 @@ above carry nothing to verify against. A connection whose `A` carried the
 header must end with a client-chosen tag (a u32 in decimal), and the
 response echoes it as its own last field, so a client can verify the
 pairing before trusting the answer
-([ADR-0019](doc/adr/0019-echoed-response-tags-close-the-pipeline-desync-window.md)).
+(echoed response tags).
 
 ```text
 G <key-length> <tag>\n<key>
@@ -419,7 +419,7 @@ make mutants-diff MUTANTS_BASE=origin/main MUTANTS_JOBS=2
 
 `src/bin/nanocached-discovery.rs` is a standalone cluster-membership
 registry that cache nodes and client SDKs use to find each other for
-horizontal scaling (see `doc/adr/0002-*.md` for the design rationale). It
+horizontal scaling (see client-side consistent hashing with a discovery server for the design rationale). It
 has no dependency on nanocached's own protocol modules.
 
 ```sh
@@ -433,7 +433,7 @@ It supports the same `NANOCACHED_AUTH_SECRET`-based authentication and
 `A` handshake and TLS handshake to it as clients do to a cache node.
 
 `--replication-factor <n>` (default 2, min 1) sets how many nodes hold
-each key (`doc/adr/0011-*.md`): keys are ranked by rendezvous hashing and
+each key (client-side replication): keys are ranked by rendezvous hashing and
 live on their top-R nodes, so any single node death costs no cached data —
 reads fail over to the next owner. Discovery is R's single source of
 truth: clients learn it from the `L` response, nodes from `M`. Effective
@@ -442,7 +442,7 @@ single-copy behavior.
 
 Discovery's registry is soft state, rebuilt from node announces, so it can
 run as several independent replicas with no coordination between them
-(`doc/adr/0010-*.md`): point every node's `--discovery` (and every SDK
+(discovery HA): point every node's `--discovery` (and every SDK
 client's `addresses`) at the same list of replicas, and losing any one replica
 — including the primary — costs neither cache traffic nor client
 bootstrap. Only *joins* need the primary up. After a (re)start, a replica
@@ -452,7 +452,7 @@ half-recovered node list.
 
 **Each replica needs its own stable, individually addressable name (or a
 stable IP) — this is an operational requirement the system does not
-verify.** ADR-0010's contract is that every node and client holds the
+verify.** discovery HA's contract is that every node and client holds the
 *same list of replicas in the same order*; a single DNS name that
 round-robins across several replicas (or a multi-value discovery service,
 e.g. AWS Cloud Map's multi-value routing) breaks that, since which

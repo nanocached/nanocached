@@ -10,11 +10,11 @@ pub enum Response {
     Busy,
     AuthOk,
     Unauthorized,
-    /// ADR-0008: acknowledges an `M` (migrate) request was received and
+    /// Staged node join: acknowledges an `M` (migrate) request was received and
     /// parsed — not that the handoff it kicks off has finished. That
     /// completion is reported separately, node-to-discovery, via `C`.
     /// Carries how many of this node's entries it's the designated
-    /// sender for (doc/adr/0017-*.md) — a one-off count taken before any
+    /// sender for (size-derived migration timeout) — a one-off count taken before any
     /// transfer starts, purely so discovery can size its migration
     /// timeout, not a transfer plan.
     MigrationAccepted(usize),
@@ -33,32 +33,32 @@ pub enum Response {
     /// retries via the existing `send_migrate_with_retry` path instead of
     /// being told the handoff started when it never did.
     MigrationRejected,
-    /// ADR-0008: acknowledges an `X` (cancel migration) request was
+    /// Staged node join: acknowledges an `X` (cancel migration) request was
     /// received and parsed — not that any in-progress handoff it names
     /// was actually found and aborted (a cancel for an already-finished
     /// or never-started handoff is a safe no-op on the node's side).
     MigrationCancelled,
-    /// ADR-0008: this node no longer (or not yet) owns the key a `G`/`S`/
+    /// Staged node join: this node no longer (or not yet) owns the key a `G`/`S`/
     /// `D` named, per this node's own current view of cluster membership
     /// (see `NodeContext::known_ring`) — the client's view of `L` is
     /// stale. Carries no forwarding address; the client is expected to
     /// re-fetch `L` from discovery and recompute where the key belongs,
     /// not trust this node to know or proxy the request.
     WrongNode,
-    /// Internal-only (ADR-0008), in answer to `Command::PeekEntry` — zero
+    /// Internal-only (staged node join), in answer to `Command::PeekEntry` — zero
     /// or one entry, each with its remaining TTL. Never encoded for a wire
     /// client, see `encode`.
     Entries(Vec<(Bytes, Bytes, Option<Duration>)>),
-    /// Internal-only (ADR-0008), in answer to `Command::ListEntries` — a
+    /// Internal-only (staged node join), in answer to `Command::ListEntries` — a
     /// keys-only snapshot (see `Cache::keys`'s doc comment for why this
     /// carries no values or TTLs). Never encoded for a wire client, see
     /// `encode`.
     Keys(Vec<Bytes>),
-    /// Internal-only (ADR-0008), in answer to `Command::MarkMigrated`.
+    /// Internal-only (staged node join), in answer to `Command::MarkMigrated`.
     Marked,
-    /// Internal-only (ADR-0008), in answer to `Command::UnmarkMigrated`.
+    /// Internal-only (staged node join), in answer to `Command::UnmarkMigrated`.
     Unmarked,
-    /// Internal-only (ADR-0008), in answer to `Command::Sweep` — how many
+    /// Internal-only (staged node join), in answer to `Command::Sweep` — how many
     /// entries the sweep actually removed.
     Swept(usize),
 }
@@ -92,14 +92,14 @@ impl Response {
 
             Self::Entries(_) | Self::Keys(_) | Self::Marked | Self::Unmarked | Self::Swept(_) => {
                 unreachable!(
-                    "internal-only response (ADR-0008): never sent to a wire client, only \
+                    "internal-only response (staged node join): never sent to a wire client, only \
                      matched directly in Rust by the migration task"
                 )
             }
         }
     }
 
-    /// ADR-0019: tagged-mode encoding — echoes the request's tag as the
+    /// Echoed response tags: tagged-mode encoding — echoes the request's tag as the
     /// response's last header field, so the client's read loop can verify
     /// request/response alignment before dispatching to a caller. Only
     /// responses to `G`/`S`/`D` (the pipelined commands) have a tagged
@@ -121,11 +121,11 @@ impl Response {
                 encoded
             }
 
-            _ => unreachable!("only G/S/D responses have a tagged form (ADR-0019)"),
+            _ => unreachable!("only G/S/D responses have a tagged form (echoed response tags)"),
         }
     }
 
-    /// ADR-0019: identity reply to an extended `A <len> T` — echoes the
+    /// Echoed response tags: identity reply to an extended `A <len> T` — echoes the
     /// tag capability as a `T` between the server-type byte and the LF
     /// (`OnT\n`/`EnT\n`), sent only to clients that asked, so a plain `A`
     /// keeps the exact three-byte reply older SDKs hard-read.
@@ -133,7 +133,9 @@ impl Response {
         match self {
             Self::AuthOk => b"OnT\n".to_vec(),
             Self::Unauthorized => b"EnT\n".to_vec(),
-            _ => unreachable!("only identity replies have a tag-capability form (ADR-0019)"),
+            _ => unreachable!(
+                "only identity replies have a tag-capability form (echoed response tags)"
+            ),
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! This binary has no dependency on the cache server's own modules —
 //! `nanocached-node` and `nanocached-discovery` share no modules by
-//! design (doc/adr/0017-*.md); its protocol is unrelated to nanocached's
+//! design (size-derived migration timeout); its protocol is unrelated to nanocached's
 //! cache protocol, so nothing is shared. Run it via `ncd discovery start`,
 //! or directly as `nanocached-discovery`.
 //!
@@ -11,7 +11,7 @@
 //!
 //!   H <name-length> <r> <token-length>\n<name><token>   Heartbeat,
 //!                             identified by name (a random per-process
-//!                             identity, ADR-0009 — not the node's
+//!                             identity, node identity decoupled from address — not the node's
 //!                             address, which carries no identity
 //!                             meaning and was already established by
 //!                             `J` on this connection). Only valid for a
@@ -23,13 +23,13 @@
 //!                             established. `r` is the
 //!                             replication factor this node currently
 //!                             believes (issue #30) — learned from a `M`
-//!                             this node has sent as an ADR-0011 handoff
+//!                             this node has sent as an client-side replication handoff
 //!                             source, or `0` if it hasn't sent one yet
 //!                             and so has no belief to report. When `r` is
 //!                             nonzero and disagrees with this replica's
 //!                             own `--replication-factor`, the mismatch is
 //!                             logged loudly and recorded (not rejected —
-//!                             see ADR-0010, replicas never reconcile
+//!                             see discovery HA, replicas never reconcile
 //!                             membership with each other); unlike
 //!                             membership, replication factor is static
 //!                             config, so a recorded mismatch — once it
@@ -44,7 +44,7 @@
 //!                             followed by `count` entries, each
 //!                             `<name-length> <addr-length>\n<name><addr>\n`
 //!                             — note the trailing newline after every
-//!                             entry. `name` (ADR-0009) is what hash-ring
+//!                             entry. `name` (node identity decoupled from address) is what hash-ring
 //!                             computations use; `addr` is only for opening
 //!                             a connection. Refused with
 //!                             `B\n` (connection then closed) if a STRICT
@@ -61,10 +61,10 @@
 //!                             learned elsewhere.
 //!
 //!   J <name-length> <port> <token-length>\n<name><token>   Ask to join
-//!                             (ADR-0008), declaring the node's own name
-//!                             (ADR-0009), the port it serves on (the
+//!                             (staged node join), declaring the node's own name
+//!                             (node identity decoupled from address), the port it serves on (the
 //!                             reachable address is composed from this
-//!                             connection's source IP, ADR-0012), and its
+//!                             connection's source IP, addresses derived from the registration connection), and its
 //!                             membership token (issue #34) — the
 //!                             credential every later `P`/`H`/`C` naming
 //!                             this node must present. Sent once; the
@@ -80,14 +80,14 @@
 //!                             here on).
 //!
 //!   P <name-length> <port> <token-length>\n<name><token>   Announce
-//!                             (ADR-0010): an already-promoted node
+//!                             (discovery HA): an already-promoted node
 //!                             (re-)declaring "I am a `Joined` member at
 //!                             this address" (composed like `J`'s) —
 //!                             after a heartbeat connection broke, after
 //!                             this process restarted with an empty
 //!                             registry, or to a standby replica it never
 //!                             `J`ed with. Upserts the node straight to
-//!                             `Joined` with no ADR-0008 handoff.
+//!                             `Joined` with no staged node join handoff.
 //!                             Response: `R\n`, after which the
 //!                             connection carries `H` heartbeats, exactly
 //!                             like a `J` connection after promotion.
@@ -129,13 +129,13 @@
 //! If the connection limit has been reached, the server responds with
 //! `B\n` and closes the connection instead of accepting the command. `L`
 //! is answered the same way (`B\n`, connection closed) during the startup
-//! grace period (ADR-0010, one liveness-timeout long): after a restart the
+//! grace period (discovery HA, one liveness-timeout long): after a restart the
 //! registry re-fills from `P` announces within about one heartbeat
 //! interval, and until the grace has passed a fresh client must not build
 //! a ring from the partial list. All other commands work during the grace
 //! — recovery itself depends on them.
 //!
-//! A node moves through three states (ADR-0008): `Waiting` (registered via
+//! A node moves through three states (staged node join): `Waiting` (registered via
 //! `J`, but either another join is already in progress or its handoff
 //! hasn't started), `Joining` (actively receiving its handoff from every
 //! `Joined` node), and `Joined` (handoff complete, included in `L`
@@ -157,10 +157,10 @@
 //! sending heartbeats is dropped once
 //! `--liveness-timeout` has elapsed since its last heartbeat; no explicit
 //! "leave" message is required, so this covers both graceful shutdown and
-//! crashes. Because the registry is rebuilt from `P` announces (ADR-0010)
+//! crashes. Because the registry is rebuilt from `P` announces (discovery HA)
 //! within about one heartbeat interval, this process can be restarted at
 //! any time and self-heals with no data movement, modulo any join in
-//! progress at the time (not yet designed — see `doc/adr/0008-*.md`); it
+//! progress at the time (not yet designed — see staged node join); it
 //! can also run as several independent replicas that each converge on the
 //! same registry by listening to the same nodes.
 
@@ -229,7 +229,7 @@ const MAX_REGISTRY_SIZE: usize = 1 << 16;
 /// `src/server.rs`) — the two binaries share no modules by design (see
 /// this file's own module doc comment), so this is a separate constant
 /// kept in sync by convention, the same way the migration-timeout pair
-/// in doc/adr/0017-*.md already is. An `M` this process sends
+/// in size-derived migration timeout already is. An `M` this process sends
 /// (`send_migrate`) is, from the receiving node's point of view, just
 /// another request subject to that cap; `M`'s payload is dominated by
 /// the `joined` roster (one entry per currently-`Joined` node), so with
@@ -237,7 +237,7 @@ const MAX_REGISTRY_SIZE: usize = 1 << 16;
 /// long before a legitimate join's own data volume ever could — at
 /// which point the node rejects the connection outright (issue: `M`
 /// too large for `MAX_REQUEST_SIZE`) and the join silently stalls until
-/// discovery's own size-derived migration timeout (doc/adr/0017-*.md)
+/// discovery's own size-derived migration timeout (size-derived migration timeout)
 /// reaps it, with no clearer signal than that. `start_join` checks
 /// against this up front instead, so an admission that would produce an
 /// oversized `M` is rejected immediately, with a clear log line, rather
@@ -265,14 +265,14 @@ const ANNOUNCE_INSERT_COOLDOWN: Duration = Duration::from_secs(2);
 /// addresses in one cluster's network.
 const MAX_ANNOUNCE_LIMITER_ENTRIES: usize = 4096;
 const DEFAULT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
-/// ADR-0008 pattern-3 guard: a ready node can be alive (heartbeating
+/// Staged node join pattern-3 guard: a ready node can be alive (heartbeating
 /// normally) yet never report `C` for a handoff it's mid-`Migrate` for —
 /// no TCP-level signal distinguishes "legitimately still working" from
 /// "stuck" (a lost ack, a bug), so this is a plain timeout. Past it,
 /// `abandon_current_join` scraps the join and sends every ready node an
 /// `X` to roll back, exactly as it does when a node's connection dies
 /// outright (patterns 1/2). Size-derived rather than flat
-/// (doc/adr/0017-*.md): a large, legitimate join shouldn't get reaped
+/// (size-derived migration timeout): a large, legitimate join shouldn't get reaped
 /// just for being large, so the bound scales with the largest entry
 /// count any ready node reported acknowledging its `M`
 /// (`PendingJoin::max_entries`). Both constants are hardcoded, not
@@ -333,7 +333,7 @@ const MAX_WAITING_TOTAL: usize = 32;
 /// no other node able to use those `MAX_CONNECTIONS` slots; this reclaims
 /// them once no join is plausibly still coming for them).
 ///
-/// Only one join runs cluster-wide at a time (ADR-0008), and each one is
+/// Only one join runs cluster-wide at a time (staged node join), and each one is
 /// itself bounded by `MIGRATION_TIMEOUT_MAX` before `abandon_current_join`
 /// reaps it — so a node that arrived behind `queue_position - 1` other
 /// `Waiting`/`Joining` nodes can legitimately need up to that many multiples
@@ -407,7 +407,7 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// never answers freezes the single sweep task — and with it all
 /// liveness eviction — and can hang shutdown indefinitely.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
-/// ADR-0008 known gap (issue #20): a ready node that never received `M` —
+/// Staged node join known gap (issue #20): a ready node that never received `M` —
 /// a transient connect/write/ack failure, not a rejection — never hands
 /// off and never sweeps, stalling the join until `migration_timeout_for`
 /// reaps it. Retrying the send absorbs exactly that class of hiccup,
@@ -419,7 +419,7 @@ const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// parse time (`parse_two_string_fields`/`parse_three_string_fields`).
 /// Both `nanocached-node` and `verify-staged-join` only ever generate a
 /// v4 UUID (`Uuid::new_v4().to_string()`, 36 bytes — see `src/server.rs`,
-/// ADR-0009) for a name, so 128 is far more headroom than any legitimate
+/// Node identity decoupled from address) for a name, so 128 is far more headroom than any legitimate
 /// value ever needs, while still bounding how much of `MAX_REQUEST_SIZE`
 /// — and, more to the point, how much of every registry entry
 /// (`NodeInfo`, keyed by name) and every `L`/`M` response listing it —
@@ -430,7 +430,7 @@ const MAX_NAME_LENGTH: usize = 128;
 /// (`NodeInfo::token`, issue #34) as `MAX_NAME_LENGTH`.
 const MAX_TOKEN_LENGTH: usize = 128;
 
-/// A registered node's place in the ADR-0008 join lifecycle: `Waiting`
+/// A registered node's place in the staged node join join lifecycle: `Waiting`
 /// (registered, asked to join, but another join is already in progress)
 /// -> `Joining` (actively receiving its handoff) -> `Joined` (handoff
 /// complete, included in `L` responses, now heartbeating normally). There
@@ -446,7 +446,7 @@ enum NodeState {
 struct NodeInfo {
     /// How to open a connection to this node (a client's `G`/`S`/`D`, or,
     /// per [[0008]], a ready node's handoff). Carries no identity meaning
-    /// — see ADR-0009 — the registry's key (this node's random per-process
+    /// — see node identity decoupled from address — the registry's key (this node's random per-process
     /// name) is what hashing and lookups use.
     address: String,
     state: NodeState,
@@ -463,7 +463,7 @@ struct NodeInfo {
     promoted: Arc<Notify>,
     /// The replication factor this node last reported believing, via
     /// `H`'s `r` field (issue #30) — `None` until its first heartbeat
-    /// that reports one (a node that hasn't sent an ADR-0011 handoff `M`
+    /// that reports one (a node that hasn't sent an client-side replication handoff `M`
     /// yet has no belief to report, and so does not vote — see below).
     /// Unlike membership, replication factor is static operator config:
     /// the `L` handler refuses to serve `config.replication` only once a
@@ -475,11 +475,11 @@ struct NodeInfo {
     /// of a departed node's entry.
     reported_replication: Option<usize>,
     /// The node's per-process membership token (issue #34): a random
-    /// value generated alongside its name (ADR-0009) and presented on
+    /// value generated alongside its name (node identity decoupled from address) and presented on
     /// every `J`/`P`/`H`/`C` naming it. Established by whichever
     /// registration this replica saw first for the name (`J`, or `P` for
     /// a name this replica didn't know — a standby, or an amnesiac
-    /// restart; ADR-0010 replicas never talk to each other, so
+    /// restart; discovery HA replicas never talk to each other, so
     /// first-use is the only place trust can start) and required to
     /// match on everything after, so knowing a node's public name —
     /// `L` lists them — is not enough to re-point its address or spoof
@@ -562,17 +562,17 @@ fn next_connection_id() -> u64 {
     NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Keyed by name (ADR-0009's random per-process node identity), not
+/// Keyed by name (node identity decoupled from address's random per-process node identity), not
 /// address — see `NodeInfo::address`.
 type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
 
-/// Tracks the single in-progress join (ADR-0008: only one node moves
+/// Tracks the single in-progress join (staged node join: only one node moves
 /// through `Waiting` -> `Joining` at a time). `expected` snapshots, at
 /// join start, every ready node this join is waiting on and the token
 /// (issue #34) it presented at that moment — name -> token, not a plain
 /// `HashSet<String>`. This is a security fix, not a convenience: names
 /// are public via `L`, and an unknown name is trust-on-first-use for
-/// `J`/`P` (ADR-0018), so if `handle_complete` instead checked a
+/// `J`/`P` (per-node membership tokens), so if `handle_complete` instead checked a
 /// reporter's token against whatever the *live* registry entry holds, an
 /// attacker could wait for a ready node to be evicted (see
 /// `sweep_expired`'s own mid-join-eviction handling below, and the
@@ -581,13 +581,13 @@ type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
 /// a handoff that member never performed — forging join completion.
 /// Checking against this snapshot instead means only the token that was
 /// actually registered when the join began can ever complete it.
-/// `completed` accumulates the names (ADR-0009) of ready nodes that have
+/// `completed` accumulates the names (node identity decoupled from address) of ready nodes that have
 /// reported finishing their handoff via `C`; once it covers all of
 /// `expected`, the joining node is promoted. `started_at` backs the
 /// timeout that catches a ready node that's alive but never reports in
 /// (see `abandon_current_join`, `migration_timeout_for`), sized from
 /// `max_entries` — the largest entry count any ready node has reported
-/// acknowledging its `M` so far (doc/adr/0017-*.md), updated as each of
+/// acknowledging its `M` so far (size-derived migration timeout), updated as each of
 /// `try_begin_next_join`'s parallel sends resolves. Starts at 0 (the
 /// bound is just `MIGRATION_TIMEOUT_BASE` until the first ack arrives).
 struct PendingJoin {
@@ -600,7 +600,7 @@ struct PendingJoin {
 
 type CurrentJoin = Arc<Mutex<Option<PendingJoin>>>;
 
-/// The node registry and ADR-0008 join-orchestration state, bundled since
+/// The node registry and staged node join join-orchestration state, bundled since
 /// every connection needs both and they're always threaded through
 /// together (keeps `dispatch_connection`'s argument count down).
 #[derive(Clone)]
@@ -613,7 +613,7 @@ struct ClusterState {
 /// single type, so the rest of the connection-handling code doesn't need to
 /// know which is in play. Generic over the plain (`P`) and TLS (`T`) stream
 /// types since this process both accepts connections (`ServerStream`, TLS
-/// terminated by `TlsAcceptor`) and, since ADR-0008 added `M`/`X`, also
+/// terminated by `TlsAcceptor`) and, since staged node join added `M`/`X`, also
 /// opens its own outbound ones to nodes (`ClientStream`, TLS via
 /// `TlsConnector`) — the two use different `tokio_rustls` stream types.
 enum MaybeTls<P, T> {
@@ -773,12 +773,12 @@ async fn connect_client_stream(
 #[derive(Clone)]
 struct ConnectionConfig {
     idle_timeout: Duration,
-    /// ADR-0010 startup grace: until this instant, `L` answers `B\n`
+    /// Discovery HA startup grace: until this instant, `L` answers `B\n`
     /// instead of a node list — after a restart the registry re-fills from
     /// announces within about one heartbeat interval, and serving the
     /// partial list to a bootstrapping client would hand it a wrong ring.
     list_ready_at: Instant,
-    /// ADR-0011: the replication factor this process distributes (see
+    /// Client-side replication: the replication factor this process distributes (see
     /// `Args::replication_factor`).
     replication: usize,
     auth_secret: Option<Bytes>,
@@ -899,7 +899,7 @@ fn apply_announce_to_existing(
                 "announce with a token that does not match the registered one",
             ))
         }
-        // A name mid-join announcing would corrupt the ADR-0008 join
+        // A name mid-join announcing would corrupt the staged node join join
         // bookkeeping, and no correct node does it (announces only
         // happen after promotion).
         Some(info) if info.state != NodeState::Joined => {
@@ -918,10 +918,10 @@ struct Args {
     host: String,
     port: u16,
     liveness_timeout: Duration,
-    /// ADR-0010: how long after startup `L` keeps answering `B\n` while
+    /// Discovery HA: how long after startup `L` keeps answering `B\n` while
     /// the registry re-fills from announces. `None` (the default) means
     /// "same as the liveness timeout".
-    /// ADR-0011: the cluster's replication factor R — how many nodes hold
+    /// Client-side replication: the cluster's replication factor R — how many nodes hold
     /// each key. This process is R's single source of truth: clients learn
     /// it from `L`, nodes from `M`.
     replication_factor: usize,
@@ -1023,7 +1023,7 @@ Usage: nanocached-discovery [options]
   --port <port>                 bind port (default 8357)
   --liveness-timeout <secs>     drop a node after this many seconds without
                                  a heartbeat (default 15)
-  --replication-factor <n>      how many nodes hold each key (ADR-0011);
+  --replication-factor <n>      how many nodes hold each key (client-side replication);
                                  distributed to clients via L and to nodes
                                  via M (default 2, min 1)
   --tls-cert <path>             PEM certificate chain; requires TLS on
@@ -1038,7 +1038,7 @@ Usage: nanocached-discovery [options]
 
 #[derive(Debug, PartialEq, Eq)]
 enum DiscoveryCommand {
-    /// `tagging` (ADR-0019): the client sent `A <len> T\n`, asking for
+    /// `tagging` (echoed response tags): the client sent `A <len> T\n`, asking for
     /// echoed response tags. Discovery never tags anything (its post-auth
     /// traffic is the one-shot `L`), but must accept and echo the flag,
     /// because a client doesn't know which kind of server it dialed until
@@ -1048,7 +1048,7 @@ enum DiscoveryCommand {
         tagging: bool,
     },
     /// A refresh from an already-`Joined` node, identified by its name
-    /// (ADR-0009) — its address was already established by `Join` on this
+    /// (node identity decoupled from address) — its address was already established by `Join` on this
     /// same connection. `replication` (issue #30) is the replication
     /// factor this node currently believes, or `None` if it doesn't know
     /// yet (the wire's `0` sentinel — see the module docs).
@@ -1058,9 +1058,9 @@ enum DiscoveryCommand {
         token: String,
     },
     List,
-    /// ADR-0008: a node asking to join, identified by its name (ADR-0009)
+    /// Staged node join: a node asking to join, identified by its name (node identity decoupled from address)
     /// and the port it serves on — the reachable address is composed from
-    /// this connection's own source IP plus that port (ADR-0012). `token`
+    /// this connection's own source IP plus that port (addresses derived from the registration connection). `token`
     /// (issue #34) establishes the credential every later command naming
     /// this node must present — see `NodeInfo::token`. Sent once, on a
     /// connection the node then holds open to receive the `R\n`
@@ -1070,8 +1070,8 @@ enum DiscoveryCommand {
         port: u16,
         token: String,
     },
-    /// ADR-0008: a ready node reporting it has finished handing off its
-    /// share of a join, identified by its own name (ADR-0009) and the
+    /// Staged node join: a ready node reporting it has finished handing off its
+    /// share of a join, identified by its own name (node identity decoupled from address) and the
     /// joining node's name — so a stale report for an abandoned join can
     /// never be credited to the current one (issue #5). `token` must
     /// match the reporting node's registered one (issue #34).
@@ -1080,7 +1080,7 @@ enum DiscoveryCommand {
         joining_name: String,
         token: String,
     },
-    /// ADR-0010: an already-promoted node (re-)declaring membership, with
+    /// Discovery HA: an already-promoted node (re-)declaring membership, with
     /// the same name/port/token shape as `Join` — upserted straight to
     /// `Joined`, no handoff orchestration. `token` must match a
     /// registered name's stored one (issue #34).
@@ -1115,7 +1115,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
         b"A" => {
             let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
-            // ADR-0019: an optional literal `T` requests tagged mode.
+            // Echoed response tags: an optional literal `T` requests tagged mode.
             let tagging = match parts.next() {
                 None => false,
                 Some(b"T") => true,
@@ -1221,7 +1221,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             }
 
             let name_length = parse_length(name_length)?;
-            // ADR-0012: the node declares only the port it serves on; the
+            // Addresses derived from the registration connection: the node declares only the port it serves on; the
             // reachable address is composed with this connection's source
             // IP. Port 0 can never be served on, so reject it.
             let port: u16 = std::str::from_utf8(port)
@@ -1371,7 +1371,7 @@ fn lock_current_join(current_join: &CurrentJoin) -> std::sync::MutexGuard<'_, Op
 /// and starts it toward `Joined`: promoted straight to `Joined` if there
 /// are no `Joined` nodes yet to hand data off from (the bootstrap case —
 /// nothing to receive), otherwise moved to `Joining` with a `PendingJoin`
-/// tracking every currently-`Joined` node (by name, ADR-0009) as one it
+/// tracking every currently-`Joined` node (by name, node identity decoupled from address) as one it
 /// must receive a `C` from before promotion, and sent an `M` (concurrently,
 /// one connection per ready node) telling it to start its handoff.
 async fn try_begin_next_join(
@@ -1510,17 +1510,17 @@ async fn try_begin_next_join(
             Ok((ready_name, Err(error))) => {
                 // Every individual attempt (see `send_migrate_with_retry`)
                 // was already logged; this is the final, permanent
-                // failure. ADR-0008 still doesn't define recovery beyond
+                // failure. Staged node join still doesn't define recovery beyond
                 // this point (issue #20's second gap) — the join stalls
                 // until discovery's own size-derived migration timeout
-                // (doc/adr/0017-*.md) reaps it.
+                // (size-derived migration timeout) reaps it.
                 eprintln!(
                     "WARN permanently failed to send M to {ready_name} after \
                      {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
                 );
             }
             Ok((_, Ok(entries))) => {
-                // doc/adr/0017-*.md: sizes the migration timeout by the
+                // Size-derived migration timeout: sizes the migration timeout by the
                 // largest handoff any ready node reported — a report for
                 // a since-abandoned/replaced join (this one's slot
                 // already moved on to a different `joining_name`) must
@@ -1538,7 +1538,7 @@ async fn try_begin_next_join(
     }
 }
 
-/// Bounded retry for `M`'s delivery (issue #20 / ADR-0008 Consequences):
+/// Bounded retry for `M`'s delivery (issue #20 / staged-join handoff design):
 /// tries up to `MIGRATE_SEND_ATTEMPTS` times, logging each failed attempt,
 /// with a fresh connection every time (`send_migrate` owns its own
 /// connect) since a failed write/read leaves the previous connection's
@@ -1630,13 +1630,13 @@ fn build_migrate_message(
 }
 
 /// Connects to `address` (a `Joined` node) as a client, sends `M` with the
-/// joining node's identity and the full `joined` roster (ADR-0009 names +
+/// joining node's identity and the full `joined` roster (node identity decoupled from address names +
 /// addresses), and waits for the `A <entries>\n` acknowledgment —
 /// confirmation that `M` was received and parsed, not that the handoff it
 /// kicks off (which happens asynchronously on the node's side) has
 /// finished; that's reported separately, node-to-discovery, via `C`.
 /// Returns the entry count the ack reports, purely for sizing this join's
-/// migration timeout (doc/adr/0017-*.md) — not otherwise used here.
+/// migration timeout (size-derived migration timeout) — not otherwise used here.
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate(
     token: &str,
@@ -1907,7 +1907,7 @@ async fn start_join(
         // for a name already registered here (the token check above just
         // confirmed it's the same node) reuses its existing entry rather
         // than adding one, so it must not double-count against its own
-        // cap. `address` is `{peer_ip}:{port}` (ADR-0012), so the source
+        // cap. `address` is `{peer_ip}:{port}` (addresses derived from the registration connection), so the source
         // is recovered by trimming the port back off; `rsplit_once` finds
         // the *last* `:`, which lands on the port separator even for an
         // IPv6 address that itself contains colons.
@@ -1984,7 +1984,7 @@ async fn start_join(
             )
         });
         // A duplicate `J` from a node still waiting its turn carries its
-        // current address (ADR-0012: derived from this very connection),
+        // current address (addresses derived from the registration connection: derived from this very connection),
         // which may differ from the first registration's — same as
         // `apply_announce_to_existing` does for `P`. Not once `Joining`:
         // the in-flight handoff was dispatched against the recorded one.
@@ -2047,7 +2047,7 @@ async fn handle_complete(
         // let an attacker wait for `sweep_expired` (or a connection drop)
         // to evict the real ready node, re-register its now-free name
         // under a token of the attacker's own choosing (names are public
-        // via `L`; an unknown name is trust-on-first-use, ADR-0018), and
+        // via `L`; an unknown name is trust-on-first-use, per-node membership tokens), and
         // then send a `C` crediting a handoff that member never
         // performed. A reporter not in `expected` at all — never a ready
         // member of this join, or already evicted from it by the
@@ -2129,7 +2129,7 @@ async fn handle_complete(
 /// interval regardless. A ready member that's truly gone (crashed, or
 /// genuinely stuck) is instead caught by `sweep_expired`'s size-derived
 /// `migration_timeout_for` — the same size-aware grace
-/// doc/adr/0017-*.md introduced so a large, legitimate join doesn't get
+/// Size-derived migration timeout introduced so a large, legitimate join doesn't get
 /// reaped just for being large; abandoning here too would bypass that
 /// grace entirely and reintroduce the flat-timeout failure mode the
 /// size-derived design replaced.
@@ -2585,7 +2585,7 @@ fn try_acquire_per_ip(
 /// (`MAX_CONNECTIONS` and, per source IP, `MAX_CONNECTIONS_PER_IP`).
 /// Mirrors `src/server.rs`'s own `reject_over_limit`. A TLS-configured
 /// server has no plaintext channel to answer on before the handshake
-/// completes (ADR-0006: no plaintext fallback once TLS is set) — it just
+/// completes (TLS support: no plaintext fallback once TLS is set) — it just
 /// closes. A plaintext server can still reply on the raw stream. Bounded
 /// by `TLS_HANDSHAKE_TIMEOUT` (reused rather than a new constant: a peer
 /// that never reads this reply must not leak the task by leaving the
@@ -2799,7 +2799,7 @@ async fn sweep_expired(
                 // until `migration_timeout_for` eventually reaps it, or —
                 // worse — sit there long enough for an attacker to
                 // re-register the now-free name (names are public via `L`;
-                // an unknown name is trust-on-first-use, ADR-0018) and
+                // an unknown name is trust-on-first-use, per-node membership tokens) and
                 // forge a `C` for a handoff that member never performed.
                 // `handle_complete`'s token-snapshot check already closes
                 // that specific forgery, but abandoning immediately is
@@ -2841,7 +2841,7 @@ async fn sweep_expired(
                     promoted.notify_one();
                 }
 
-                // ADR-0008 pattern 3: a ready node alive but never
+                // Staged node join pattern 3: a ready node alive but never
                 // reporting `C` (see `migration_timeout_for`).
                 let timed_out = lock_current_join(&current_join)
                     .as_ref()
@@ -2882,7 +2882,7 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
 async fn handle_connection(
     mut stream: ServerStream,
     // The connection's source IP: combined with the port a `J`/`P`
-    // declares, it IS the node's address (ADR-0012).
+    // declares, it IS the node's address (addresses derived from the registration connection).
     peer_ip: std::net::IpAddr,
     registry: Registry,
     current_join: CurrentJoin,
@@ -2951,7 +2951,7 @@ async fn handle_connection(
                     None => true,
                 };
 
-                // ADR-0019: echo the tag capability only to a client that
+                // Echoed response tags: echo the tag capability only to a client that
                 // asked — a plain `A` keeps the exact three-byte reply
                 // older SDKs hard-read.
                 let (ok, err): (&[u8], &[u8]) = if tagging {
@@ -3017,13 +3017,13 @@ async fn handle_connection(
                 }
 
                 // Issue #30: the node's own belief (learned from a `M` it
-                // sent as an ADR-0011 handoff source) may disagree with
+                // sent as an client-side replication handoff source) may disagree with
                 // this replica's configured value — every discovery
                 // replica takes its own `--replication-factor` flag and
-                // nothing else validates they agree (ADR-0010 deliberately
+                // nothing else validates they agree (discovery HA deliberately
                 // keeps replicas from talking to each other). Membership
                 // itself is soft state that's expected to converge as
-                // nodes join, leave, and heartbeat, so ADR-0010's "never
+                // nodes join, leave, and heartbeat, so discovery HA's "never
                 // reconcile, just log" applies there — but replication
                 // factor is static operator config, not membership, and a
                 // persistent disagreement means this replica's own
@@ -3040,7 +3040,7 @@ async fn handle_connection(
                     eprintln!(
                         "WARN node {name} reports replication factor {reported}, but this \
                          discovery replica is configured with --replication-factor \
-                         {} — every replica must agree (see doc/adr/0010-*.md); a client \
+                         {} — every replica must agree (see discovery HA); a client \
                          or node that learned R from a different replica may be running \
                          with a different fan-out/failover width right now",
                         config.replication
@@ -3052,7 +3052,7 @@ async fn handle_connection(
             }
             Ok(DiscoveryCommand::List) => {
                 if Instant::now() < config.list_ready_at {
-                    // ADR-0010 startup grace — see `ConnectionConfig::
+                    // Discovery HA startup grace — see `ConnectionConfig::
                     // list_ready_at`. Same `B\n`-then-close shape as the
                     // connection-limit rejection: "can't serve you right
                     // now, retry", which the SDK maps to trying its next
@@ -3076,7 +3076,7 @@ async fn handle_connection(
                 // reporting nodes have learned a different value than have
                 // confirmed this one, at which point it's this replica,
                 // not the dissenters, that's most likely the one that's
-                // wrong. A node that hasn't sent an ADR-0011 handoff `M`
+                // wrong. A node that hasn't sent an client-side replication handoff `M`
                 // yet (`reported_replication` is `None`) doesn't vote
                 // either way. Same `B\n`-then-close shape as the
                 // startup-grace refusal just above: "can't serve you right
@@ -3123,7 +3123,7 @@ async fn handle_connection(
                              --replication-factor {} (a strict majority) — dissenting: {} — \
                              discovery replicas have drifted out of alignment; the operator \
                              must align --replication-factor across every replica (see \
-                             doc/adr/0010-*.md)",
+                             Discovery HA)",
                             dissenting.len(),
                             dissenting.len() + agreeing,
                             config.replication,
@@ -3504,7 +3504,7 @@ async fn main() -> ExitCode {
     if let Err(err) = run(
         &address,
         args.liveness_timeout,
-        // The startup grace (ADR-0010) is the liveness window by
+        // The startup grace (discovery HA) is the liveness window by
         // definition: it exists so every live member has had time to
         // re-announce before L is served, and that time IS the liveness
         // timeout. Not separately configurable.
@@ -3592,7 +3592,7 @@ mod tests {
     #[test]
     fn parse_rejects_a_heartbeat_whose_name_exceeds_max_name_length() {
         // Both a node's name and token are v4 UUIDs (36 bytes) in
-        // practice (ADR-0009, issue #34) — MAX_NAME_LENGTH/
+        // practice (node identity decoupled from address, issue #34) — MAX_NAME_LENGTH/
         // MAX_TOKEN_LENGTH bound the field at parse time regardless, so
         // an oversized declared length can't bloat a registry entry or
         // every `L`/`M` response that lists it.
@@ -3708,7 +3708,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_port_zero_in_join() {
-        // Port 0 can never be served on — ADR-0012 derives the address
+        // Port 0 can never be served on — addresses derived from the registration connection derives the address
         // from source IP + this port, so a zero here is protocol garbage.
         let mut input = BytesMut::from(&b"J 9 0 5\nsome-nametok-a"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
@@ -3962,7 +3962,7 @@ mod tests {
     async fn a_heartbeat_reporting_a_mismatched_replication_factor_is_still_acked() {
         // Issue #30: a mismatch is logged and recorded, not rejected —
         // this replica has no way to tell which side is actually
-        // misconfigured (ADR-0010 keeps replicas from reconciling
+        // misconfigured (discovery HA keeps replicas from reconciling
         // membership with each other), so the node must stay `Joined`
         // and keep heartbeating normally. (Recording the mismatch does
         // make this replica start refusing `L` — see
@@ -4360,8 +4360,8 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(address).await.unwrap();
-        // ADR-0010: an announce lands straight in `Joined` — promoted (R),
-        // heartbeating (A), and visible in L — with no ADR-0008 join
+        // Discovery HA: an announce lands straight in `Joined` — promoted (R),
+        // heartbeating (A), and visible in L — with no staged node join join
         // machinery involved.
         client
             .write_all(b"P 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-aL\n")
@@ -4956,7 +4956,7 @@ mod tests {
 
         let config = || ConnectionConfig {
             idle_timeout: Duration::from_secs(5),
-            // Still inside the ADR-0010 grace for the whole test.
+            // Still inside the discovery HA grace for the whole test.
             list_ready_at: Instant::now() + Duration::from_secs(60),
             replication: 2,
             auth_secret: None,
@@ -5384,7 +5384,7 @@ mod tests {
     async fn a_forged_complete_after_a_ready_members_eviction_and_reregistration_is_rejected() {
         // Issue #34 forged-completion fix (see `PendingJoin::expected`'s
         // doc comment): node names are public via `L`, and `P` for an
-        // unknown name is trust-on-first-use (ADR-0018) — so once a ready
+        // unknown name is trust-on-first-use (per-node membership tokens) — so once a ready
         // member's registry entry is gone for any reason, an attacker can
         // re-register its name under a token of their own choosing. Before
         // this fix, `handle_complete` checked a `C`'s token against
@@ -5405,7 +5405,7 @@ mod tests {
         // An attacker re-registers the now-free name with a token of its
         // own choosing — trust-on-first-use accepts it, exactly as it
         // would for a legitimate standby learning the name for the first
-        // time (ADR-0018).
+        // time (per-node membership tokens).
         let config = ConnectionConfig {
             idle_timeout: IDLE_TIMEOUT,
             list_ready_at: Instant::now(),
@@ -6242,7 +6242,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
 
-        // ADR-0019: discovery never tags anything, but a client doesn't
+        // Echoed response tags: discovery never tags anything, but a client doesn't
         // know which kind of server it dialed until `A`'s reply — so the
         // capability must still be accepted and echoed here.
         client.write_all(b"A 8 T\nanything").await.unwrap();
@@ -7144,7 +7144,7 @@ mod tests {
         })));
 
         // Node B (the joining node itself) disconnects before being
-        // promoted (ADR-0008 pattern: the joining node dies mid-handoff).
+        // promoted (staged node join pattern: the joining node dies mid-handoff).
         // `0` matches the connection id `NodeInfo::new` defaults to for an
         // entry built directly rather than through `start_join`.
         on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 0).await;
@@ -7299,7 +7299,7 @@ mod tests {
         sweep_task.await.unwrap();
     }
 
-    // doc/adr/0017-*.md: the whole point of the size-derived timeout — a
+    // Size-derived migration timeout: the whole point of the size-derived timeout — a
     // join moving a lot of data must not be abandoned just for taking
     // longer than the old flat default would have allowed.
     #[tokio::test(flavor = "current_thread", start_paused = true)]

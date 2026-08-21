@@ -174,7 +174,7 @@ describe("tryParseResponse", () => {
   });
 });
 
-describe("tagged frames (doc/adr/0019-*.md)", () => {
+describe("tagged frames (echoed response tags)", () => {
   it("appends the tag as the last request header field", () => {
     assert.deepEqual(encodeGet(Buffer.from("key"), 7), Buffer.from("G 3 7\nkey"));
     assert.deepEqual(encodeDelete(Buffer.from("key"), 8), Buffer.from("D 3 8\nkey"));

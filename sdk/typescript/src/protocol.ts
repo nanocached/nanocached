@@ -12,7 +12,7 @@ function toAscii(text: string): Buffer {
   return Buffer.from(text, "ascii");
 }
 
-// ADR-0019: on a tagged-mode connection every request header carries the
+// Echoed response tags: on a tagged-mode connection every request header carries the
 // client's tag as its last field, and the server echoes it in the
 // response — `tag === undefined` is the untagged (pre-0019) form.
 function tagField(tag: number | undefined): string {
@@ -105,7 +105,7 @@ export function encodeDelete(key: Uint8Array, tag?: number): Buffer {
 export interface ParsedResponse {
   kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode";
   value?: Buffer;
-  /** ADR-0019: the echoed request tag, present on every response parsed
+  /** echoed response tags: the echoed request tag, present on every response parsed
    * in tagged mode except the unsolicited `busy`. */
   tag?: number;
 }
@@ -123,7 +123,7 @@ const MAX_VALUE_LENGTH = 2 * 1024 * 1024;
 // unboundedly (issue #12 follow-up).
 const MAX_VALUE_HEADER_LENGTH = 2 + String(MAX_VALUE_LENGTH).length + 1;
 
-// A tag is a u32 in decimal (ADR-0019) — the longest a tagged
+// A tag is a u32 in decimal (echoed response tags) — the longest a tagged
 // fixed-response frame (`S <tag>\n`) can ever be. Bounds the header
 // search the same way MAX_VALUE_HEADER_LENGTH does for `V`.
 const MAX_TAG = 0xffffffff;
@@ -131,7 +131,7 @@ const MAX_TAGGED_FIXED_FRAME_LENGTH = 2 + String(MAX_TAG).length + 1;
 
 // The longest a complete `V` frame can ever be: its header plus the
 // value body — including the echoed tag a tagged-mode header carries
-// (`V <len> <tag>\n`, ADR-0019), so a legal near-max frame arriving in
+// (`V <len> <tag>\n`, echoed response tags), so a legal near-max frame arriving in
 // chunks is never mistaken for a desynced one. Exported so Connection
 // can bound total per-frame accumulation as a backstop covering every
 // response kind, not just the header search above.
@@ -165,7 +165,7 @@ function parseTag(field: string): number {
 
 /** Parses one response frame from the front of `buf`, returning `null`
  * while more bytes are still needed. Matches `Response::encode` (and,
- * with `tagged`, `Response::encode_with_tag` — ADR-0019) on the Rust
+ * with `tagged`, `Response::encode_with_tag` — echoed response tags) on the Rust
  * side exactly. In tagged mode every response carries a trailing echoed
  * tag, except `busy`, which is unsolicited and always bare. */
 export function tryParseResponse(buf: Buffer, tagged = false): { response: ParsedResponse; consumed: number } | null {
@@ -221,7 +221,7 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         return null;
       }
 
-      // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019).
+      // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags).
       const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
       if (fields.length !== (tagged ? 2 : 1)) {
         throw new NanocachedError("nanocached: invalid value header in response");

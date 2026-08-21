@@ -1,10 +1,10 @@
 //! Rendezvous (highest-random-weight) hashing over a fixed node list (see
-//! ADR 0011, which replaced ADR 0002's virtual-node ring: FNV-1a's weak
+//! Client-side replication, which replaced client-side consistent hashing with a discovery server's virtual-node ring: FNV-1a's weak
 //! high-bit avalanche clustered each node's ring points into narrow bands,
 //! skewing shares by up to ~2×; HRW measures within 2% of fair and yields
 //! replica sets for free). A byte-for-byte port of the same algorithm all
 //! six SDKs use — not shared with them via a common library (this project's
-//! binaries don't share code that way, see ADR 0006), just the same
+//! binaries don't share code that way, see TLS support), just the same
 //! computation independently implemented, the way any two independent
 //! nanocached clients must agree on it.
 //!
@@ -13,14 +13,14 @@
 //! score order (ties — effectively impossible at 64 bits — break toward
 //! the lexicographically smaller name), and its primary is the top one.
 //! Adding a node never reorders the existing nodes relative to each other,
-//! which is what keeps ADR 0011's join handoff and replica cleanup local:
+//! which is what keeps client-side replication's join handoff and replica cleanup local:
 //! per affected key, exactly one node is displaced from the top-R.
 //!
-//! `nanocached-node` needs this for ADR 0008's join: an already-ready node
+//! `nanocached-node` needs this for staged node join's join: an already-ready node
 //! must compute, for each key it holds, how the key's top-R changes when a
 //! new node is added — who sends the joining node its copy (the old
 //! primary), and whether this node's own copy just became dead (displaced
-//! from rank R, see ADR 0011).
+//! from rank R, see client-side replication).
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn adding_a_node_never_reorders_the_existing_nodes() {
-        // The HRW property ADR-0011's handoff and cleanup rules rest on.
+        // The HRW property client-side replication's handoff and cleanup rules rest on.
         let before = ring(&["a", "b", "c"]);
         let after = ring(&["a", "b", "c", "d"]);
 

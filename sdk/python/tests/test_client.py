@@ -108,7 +108,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_pipelines_concurrent_requests_on_one_connection(self):
         # Same shape as the TypeScript SDK's own pipelining test: N
         # concurrent requests on a single connection, each independently
-        # verified to round-trip its own value (doc/adr/0016-*.md) — a
+        # verified to round-trip its own value (request pipelining) — a
         # bug in matching responses to the right caller in send order
         # would show up as swapped or wrong values here.
         client = await self.connect()
@@ -237,7 +237,7 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompressionTests(unittest.IsolatedAsyncioTestCase):
-    """doc/adr/0013-*.md."""
+    """value compression."""
 
     async def asyncSetUp(self):
         self.node = await MockNode().start()
@@ -319,7 +319,7 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         writer = await self.connect()
         try:
             # A legacy/uncompressed writer's value whose first byte happens
-            # to collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+            # to collide with the DEFLATE marker (0x01) — value compression's
             # documented hazard of enabling compress against a keyspace
             # other clients still touch without it.
             await writer.set("k", bytes([0x01, 2, 3, 4]))
@@ -684,7 +684,7 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
     async def test_a_cancelled_request_does_not_poison_the_connection(self):
-        # doc/adr/0016-*.md: pipelining leaves an abandoned request
+        # Request pipelining: pipelining leaves an abandoned request
         # (asyncio.wait_for) in the pending queue rather than removing
         # it — its still-coming response is discarded by the read loop
         # once the future is seen to be cancelled, and every request
@@ -1279,7 +1279,7 @@ class ReplicationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
-    # doc/adr/0014-*.md
+    # Fire-and-forget replica writes
 
     # A "did it wait for the mock's delay" assertion can't compare the
     # measured elapsed time against the delay exactly: asyncio.sleep()'s
@@ -1448,7 +1448,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             nodes[replica].delay_sets(0.08)
 
             await client.set("k", "v")
-            # The drain contract (ADR-0014 as amended by issue #47 item
+            # The drain contract (fire-and-forget replica writes as amended by issue #47 item
             # 3): close() returns only after the in-flight replica write
             # finished.
             await client.close()
@@ -1464,7 +1464,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
-    # doc/adr/0015-*.md
+    # Read repair
 
     async def start_cluster(self):
         node_a = await MockNode().start()
@@ -1537,7 +1537,7 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
     async def test_close_drains_an_in_flight_read_repair_write_back(self):
         # The write-back is detached from get_bytes()'s caller, but it must
         # still be tracked so close() can drain it (same drain contract as
-        # fire_and_forget_replicas — doc/adr/0014-*.md as amended by issue
+        # fire_and_forget_replicas — fire-and-forget replica writes as amended by issue
         # #47 item 3) instead of leaving it dangling past teardown.
         nodes, discovery = await self.start_cluster()
         try:
@@ -1593,7 +1593,7 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
-    # doc/adr/0014-*.md as amended by doc/adr/0015-*.md (issue #47 audit
+    # Fire-and-forget replica writes as extended to read repair (issue #47 audit
     # item 5): fire_and_forget_replicas writes and read-repair write-backs
     # draw from ONE shared admission pool of at most
     # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES, not one independent cap per
@@ -1675,7 +1675,7 @@ class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
 
 class StatsTests(unittest.IsolatedAsyncioTestCase):
     # stats()/ClientStats: observability for failures swallowed by design
-    # (ADR-0011/0014/0015).
+    # (client-side replication / fire-and-forget replica writes / read repair).
 
     async def start_cluster(self):
         node_a = await MockNode().start()
@@ -1904,8 +1904,8 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
-    # doc/adr/0019-*.md: echoed response tags close the pipeline desync
-    # window ADR-0016 left open. Mirrors the TypeScript SDK's own
+    # Echoed response tags: echoed response tags close the pipeline desync
+    # window request pipelining left open. Mirrors the TypeScript SDK's own
     # "NanocachedClient response tags" suite.
 
     async def test_negotiates_tags_and_round_trips_pipelined_requests(self):
@@ -1926,7 +1926,7 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
     async def test_a_desynced_stream_is_caught_by_the_tag_check_before_any_caller_sees_wrong_data(self):
-        # The exact misdelivery ADR-0016 left open: the server (as a
+        # The exact misdelivery request pipelining left open: the server (as a
         # stand-in for any off-by-one stream corruption) never answers
         # the first GET, so the second GET's response arrives at the
         # first GET's pending slot. Without tags the first caller would

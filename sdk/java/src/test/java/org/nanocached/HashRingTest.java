@@ -28,7 +28,7 @@ class HashRingTest {
 
     @Test
     void matchesCrossLanguageScoreVectors() {
-        // Pinned outputs of the full ADR-0011 score pipeline — the Rust,
+        // Pinned outputs of the full client-side replication score pipeline — the Rust,
         // TypeScript, and Python implementations assert these too.
         assertEquals(0L, HashRing.fmix64(0));
         assertEquals(0xb456bcfc34c2cb2cL, HashRing.fmix64(1));

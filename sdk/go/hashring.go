@@ -1,7 +1,7 @@
 package nanocached
 
 // HashRing is rendezvous (highest-random-weight) hashing over a fixed
-// node list (see doc/adr/0011-*.md in the nanocached repository). This is
+// node list (the client-side replication design). This is
 // deliberately a byte-for-byte port of the same computation every other
 // nanocached participant uses (the Rust node, the TypeScript/Python/Java/
 // Rust/.NET SDKs) — not just "a" rendezvous hash, but *this specific*
@@ -14,7 +14,7 @@ package nanocached
 // score order (ties — effectively impossible at 64 bits — break toward
 // the lexicographically smaller name), and its primary is the top one.
 //
-// Built from node *names*, not addresses (doc/adr/0009-*.md).
+// Built from node *names*, not addresses (node identity decoupled from address).
 type HashRing struct {
 	nodes      []string
 	nodeHashes []uint64
