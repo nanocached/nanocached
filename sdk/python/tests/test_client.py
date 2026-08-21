@@ -1330,6 +1330,31 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_cancelling_a_write_does_not_wait_for_the_replica_leg(self):
+        # asyncio.wait_for around set() must bound the call: a cancellation
+        # delivered while the primary write is in flight used to be caught
+        # (CancelledError is a BaseException) and held until every
+        # synchronous replica leg had finished too.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_sets(0.3)
+                nodes[replica].delay_sets(0.3)
+
+                start = asyncio.get_running_loop().time()
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.set("k", "v"), timeout=0.05)
+                elapsed = asyncio.get_running_loop().time() - start
+                self.assertLess(elapsed, 0.3)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_returns_as_soon_as_the_primary_acks_when_enabled(self):
         nodes, discovery = await self.start_cluster()
         try:

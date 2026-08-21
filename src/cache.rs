@@ -92,10 +92,8 @@ impl Cache {
         // chunk (which may span an entire pipelined batch) alive just to
         // retain a few bytes of it, so re-copy into right-sized allocations
         // here, where the invariant is actually enforced for every caller.
-        let key = Bytes::copy_from_slice(&key);
         let value = Bytes::copy_from_slice(&value);
 
-        let key_len = key.len();
         let value_len = value.len();
         let entry = Entry { value, expires_at };
 
@@ -104,9 +102,17 @@ impl Cache {
         // this one to the next sweep (it would silently delete it).
         self.clear_migrated_mark(&key[..]);
 
-        match self.entries.put(key, entry) {
-            Some(replaced) => self.used_bytes = self.used_bytes - replaced.value.len() + value_len,
-            None => self.used_bytes += key_len + value_len + ENTRY_OVERHEAD_BYTES,
+        // An overwrite keeps the stored key (`LruCache::put` would too, and
+        // discard the copy), so only copy the key for a genuinely new
+        // entry. `get_mut` promotes to most-recently-used like `put`.
+        if let Some(existing) = self.entries.get_mut(&key[..]) {
+            let replaced = std::mem::replace(existing, entry);
+            self.used_bytes = self.used_bytes - replaced.value.len() + value_len;
+        } else {
+            let key = Bytes::copy_from_slice(&key);
+            let key_len = key.len();
+            self.entries.put(key, entry);
+            self.used_bytes += key_len + value_len + ENTRY_OVERHEAD_BYTES;
         }
 
         // Evict least-recently-used entries until the cache fits its memory

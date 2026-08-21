@@ -42,16 +42,18 @@ overall request-size limit (1 MiB per request on a node).</p>
 
 <h2 id="a">A — authenticate</h2>
 <pre><code>A &lt;secret-length&gt;\n&lt;secret&gt;</code></pre>
-<p>Responds <code>O\n</code> on success or <code>E\n</code> followed by
-the server closing the connection. If the server has no auth secret
+<p>Responds <code>On\n</code> on success or <code>En\n</code> followed by
+the server closing the connection (<code>Od\n</code>/<code>Ed\n</code>
+from a discovery server — the second byte always names the server type,
+see the note below). If the server has no auth secret
 configured, <code>A</code> always succeeds. If it does, every other
 command is rejected with <code>E\n</code> (and the connection closed)
 until a matching <code>A</code> has been sent.</p>
-<div class="note">SDKs send an extended handshake and receive
-<code>On</code>/<code>Od</code> (node/discovery) instead of a bare
-<code>O</code> — that one extra byte is how a client discovers what kind
-of server it reached and adapts, with no configuration. Plain
-<code>A</code> as documented here always works. SDKs additionally append
+<div class="note">The second byte (<code>n</code>/<code>d</code> —
+node/discovery) is how a client discovers what kind of server it
+reached and adapts, with no configuration; it is sent whether or not
+the secret was accepted, and whatever form of <code>A</code> was used.
+SDKs additionally append
 a <code>T</code> field (<code>A &lt;secret-length&gt; T\n</code>) to
 request <a href="#tags">response tags</a>; a server that supports them
 echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>

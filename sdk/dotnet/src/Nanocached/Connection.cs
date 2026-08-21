@@ -407,7 +407,14 @@ internal sealed class Connection
                 return;
             }
 
-            bool wasEmpty = _pending.IsEmpty;
+            // One atomic dequeue, not an IsEmpty check followed by a
+            // TryDequeue: the two are separate operations on a lock-free
+            // queue, and a request enqueued between them by a concurrent
+            // RequestAsync would be dequeued here yet judged "unsolicited"
+            // by the stale emptiness read — and, popped from the queue,
+            // never completed by Close()'s drain either (a caller awaiting
+            // forever). Every other SDK does this under the write lock;
+            // here the single TryDequeue is the atomic step.
             bool dispatched = _pending.TryDequeue(out var pending);
 
             // Progress-based deadline (see RequestAsync): a dispatched
@@ -426,13 +433,27 @@ internal sealed class Connection
             // (mirrors the TypeScript SDK's Connection.onData). Busy is
             // always untagged (ADR-0019) — it is never a reply to a
             // specific request.
-            if (response.Marker == (byte)'B' && wasEmpty)
+            if (response.Marker == (byte)'B')
             {
-                Close();
+                if (!dispatched)
+                {
+                    Close();
+                    return;
+                }
+
+                // A busy marker while a request was waiting answers
+                // nothing — the streams are misaligned just as surely as
+                // a wrong tag. The dequeued request must be failed here
+                // (the drain can no longer reach it), and everything
+                // behind it poisoned the same way.
+                var busyDesync = new ConnectionLostException(
+                    "nanocached: unexpected busy response while a request was pending (connection desynced)");
+                CloseWithReason(busyDesync);
+                pending.Tcs.TrySetException(busyDesync);
                 return;
             }
 
-            if (pending.Tcs is null)
+            if (!dispatched)
             {
                 // Unsolicited and not the known busy case — desync.
                 Close();

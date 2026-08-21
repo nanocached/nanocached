@@ -172,6 +172,17 @@ impl Drop for WriteGuard<'_> {
     }
 }
 
+/// Safety net for a `Connection` discarded without `close()`: the read
+/// task only exits on the shutdown signal, so without this it — and the
+/// socket it holds — would outlive the handle for as long as the server
+/// kept the connection open. Every current call site does call `close()`
+/// first, in which case this is a no-op (`mark_closed` is idempotent).
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.shared.mark_closed(&self.shutdown);
+    }
+}
+
 impl Connection {
     /// `tracking_key` is the client's winning connect address ("host:port"
     /// of whichever configured address answered `connect()`) — every
@@ -519,6 +530,25 @@ async fn read_loop(
             // than the generic "connection closed" drain_pending would
             // otherwise give it.
             let _ = slot.tx.send(Err(Error::ConnectionLost(message.clone())));
+            drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
+            return;
+        }
+
+        // A marker that answers no request kind at all (the only one a
+        // server ever emits is `B`, and that only before identify) means
+        // the streams are misaligned just as surely as a wrong tag: the
+        // popped slot wasn't answered, and nothing queued behind it is
+        // lined up with what comes next. Handing it to the caller as a
+        // plain `Protocol` error would leave the connection open and
+        // permanently off by one — poison it here instead, the same way
+        // as a tag mismatch (mirrors Go's `default: mismatch`).
+        if !matches!(marker, b'V' | b'N' | b'S' | b'D' | b'W') {
+            let message = format!(
+                "nanocached: unexpected response from server: {} (connection desynced)",
+                marker as char
+            );
+            shared.mark_closed(&shutdown_tx);
+            let _ = slot.tx.send(Err(Error::Protocol(message.clone())));
             drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
             return;
         }

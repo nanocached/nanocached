@@ -154,6 +154,13 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   const type = buf[1];
 
   const accepted = status === 0x4f /* 'O' */;
+  if (status === 0x42 /* 'B' */) {
+    // The node is at its connection limit and closes right after this
+    // (see nanocached-node's reject_over_limit). Connection-classified
+    // so the client's retry/cooldown layer treats it like any other
+    // failed dial instead of surfacing a generic protocol error.
+    throw new ConnectionLostError("nanocached: the server is at its connection limit (busy)");
+  }
   if (!accepted && status !== 0x45 /* 'E' */) {
     throw new NanocachedError("nanocached: unexpected response to A");
   }

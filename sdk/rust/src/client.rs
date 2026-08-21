@@ -857,8 +857,7 @@ impl NanocachedClient {
         ttl_seconds: u64,
     ) -> Result<()> {
         let key = key.as_ref();
-        validate_key_and_value(key, value.as_ref())?;
-        self.before_operation().await?;
+        validate_key(key)?;
         let owned_compressed;
         let value: &[u8] = if self.inner.compress {
             owned_compressed = crate::compression::compress_value(
@@ -869,6 +868,11 @@ impl NanocachedClient {
         } else {
             value.as_ref()
         };
+        // Sized against what actually goes on the wire — the compressed
+        // form when compression is on — like the other SDKs, so a large
+        // but compressible value isn't refused for its raw size.
+        validate_key_and_value(key, value)?;
+        self.before_operation().await?;
         self.with_cluster_retry(|| {
             self.write(
                 key,

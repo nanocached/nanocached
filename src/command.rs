@@ -171,21 +171,63 @@ pub enum ParseError {
 /// bytes are removed from `input` via `BytesMut::split_to`, and the
 /// returned command's key/value share that removed chunk's allocation
 /// (no copy). On `Incomplete`, `input` is left untouched.
+#[cfg(test)]
 pub fn parse(input: &mut BytesMut) -> Result<Command, ParseError> {
-    parse_with_mode(input, false).map(|(command, _)| command)
+    parse_with_mode(input, false, &mut MigrateProgress::default()).map(|(command, _)| command)
 }
 
 /// ADR-0019: `parse` for a connection whose `A ... T` negotiation
 /// succeeded. `G`/`S`/`D` headers must carry the client's tag as their
 /// last field, returned alongside for the response to echo; commands
 /// that never carry one (`A`, `M`, `X`) return `None`.
+#[cfg(test)]
 pub fn parse_tagged(input: &mut BytesMut) -> Result<(Command, Option<u32>), ParseError> {
-    parse_with_mode(input, true)
+    parse_with_mode(input, true, &mut MigrateProgress::default())
+}
+
+/// `parse`/`parse_tagged` for a connection's read loop, which calls this
+/// again every time more bytes arrive after an `Incomplete`. `progress`
+/// carries how far an `M` roster scan got on the previous attempt, so a
+/// large `M` frame trickling in `READ_CHUNK_SIZE` at a time is validated
+/// once overall instead of from entry #1 on every read (which was
+/// quadratic in the roster size — and, since this parse runs before the
+/// connection authenticates, a cheap pre-auth CPU exhaustion vector on
+/// the single-threaded runtime). The caller must reset `progress` (or
+/// hand in a fresh one) whenever `input`'s front changes for any reason
+/// other than bytes being appended — i.e. after every successfully
+/// parsed command.
+pub fn parse_resumable(
+    input: &mut BytesMut,
+    tagged: bool,
+    progress: &mut MigrateProgress,
+) -> Result<(Command, Option<u32>), ParseError> {
+    let parsed = parse_with_mode(input, tagged, progress);
+
+    if !matches!(parsed, Err(ParseError::Incomplete)) {
+        *progress = MigrateProgress::default();
+    }
+
+    parsed
+}
+
+/// How far `parse_migrate`'s read-only roster scan got before running out
+/// of buffered bytes — see `parse_resumable`. Only meaningful while the
+/// same `M` frame is still the front of the buffer, which `header_end`
+/// and `joined_count` guard against (a different frame at the front is
+/// vanishingly unlikely to match both, and `input.len() >= cursor` is
+/// re-checked before any recorded span is trusted).
+#[derive(Debug, Default)]
+pub struct MigrateProgress {
+    header_end: usize,
+    joined_count: usize,
+    cursor: usize,
+    entry_spans: Vec<(usize, usize, usize, usize)>,
 }
 
 fn parse_with_mode(
     input: &mut BytesMut,
     tagged: bool,
+    progress: &mut MigrateProgress,
 ) -> Result<(Command, Option<u32>), ParseError> {
     let header_end = find_lf(&input[..]).ok_or(ParseError::Incomplete)?;
     let header = &input[..header_end];
@@ -398,17 +440,29 @@ fn parse_with_mode(
             parse_migrate(
                 input,
                 header_end,
-                token_length,
-                joining_name_length,
-                joining_addr_length,
-                joined_count,
-                replication,
+                MigrateHeader {
+                    token_length,
+                    joining_name_length,
+                    joining_addr_length,
+                    joined_count,
+                    replication,
+                },
+                progress,
             )
             .map(|command| (command, None))
         }
 
         _ => Err(ParseError::InvalidCommand),
     }
+}
+
+/// `M`'s already-parsed header fields, as `parse_migrate` needs them.
+struct MigrateHeader {
+    token_length: usize,
+    joining_name_length: usize,
+    joining_addr_length: usize,
+    joined_count: usize,
+    replication: usize,
 }
 
 /// Parses `M`'s body: the joining node's own name+address, followed by
@@ -423,12 +477,17 @@ fn parse_with_mode(
 fn parse_migrate(
     input: &mut BytesMut,
     header_end: usize,
-    token_length: usize,
-    joining_name_length: usize,
-    joining_addr_length: usize,
-    joined_count: usize,
-    replication: usize,
+    header: MigrateHeader,
+    progress: &mut MigrateProgress,
 ) -> Result<Command, ParseError> {
+    let MigrateHeader {
+        token_length,
+        joining_name_length,
+        joining_addr_length,
+        joined_count,
+        replication,
+    } = header;
+
     if token_length == 0 || joining_name_length == 0 || joining_addr_length == 0 {
         return Err(ParseError::EmptyField);
     }
@@ -460,9 +519,77 @@ fn parse_migrate(
     // `M 3 3 <huge>\n...` would otherwise make `Vec::with_capacity` request
     // terabytes and abort the process. Grow as real entries are confirmed
     // present instead — capacity then tracks the buffer, which is bounded.
-    let mut entry_spans = Vec::new();
+    //
+    // Resume from wherever the previous attempt's scan stopped when it is
+    // still describing this very frame (see `MigrateProgress`); otherwise
+    // start over from the first entry.
+    let resumable = progress.header_end == header_end
+        && progress.joined_count == joined_count
+        && progress.cursor >= cursor
+        && progress.entry_spans.len() <= joined_count
+        && input.len() >= progress.cursor;
+    let mut entry_spans = if resumable {
+        cursor = progress.cursor;
+        std::mem::take(&mut progress.entry_spans)
+    } else {
+        Vec::new()
+    };
+    *progress = MigrateProgress {
+        header_end,
+        joined_count,
+        cursor,
+        entry_spans: Vec::new(),
+    };
 
-    for _ in 0..joined_count {
+    let scanned = scan_joined_entries(input, cursor, joined_count, &mut entry_spans);
+
+    // Whatever got confirmed stays confirmed (`Incomplete` included): the
+    // next attempt resumes after the last complete entry.
+    progress.cursor = entry_spans
+        .last()
+        .map_or(cursor, |(_, _, addr_start, addr_length)| {
+            addr_start + addr_length
+        });
+    progress.entry_spans = entry_spans;
+
+    cursor = scanned?;
+    let entry_spans = std::mem::take(&mut progress.entry_spans);
+
+    // Everything needed is present: consume the whole frame in one go and
+    // decode each field from the now-owned `frame`.
+    let frame = input.split_to(cursor);
+
+    let token = decode_field(&frame, token_start, token_length)?;
+    let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
+    let joining_addr = decode_field(&frame, joining_addr_start, joining_addr_length)?;
+
+    let mut joined = Vec::with_capacity(joined_count);
+    for (name_start, name_length, addr_start, addr_length) in entry_spans {
+        let name = decode_field(&frame, name_start, name_length)?;
+        let addr = decode_field(&frame, addr_start, addr_length)?;
+        joined.push((name, addr));
+    }
+
+    Ok(Command::Migrate {
+        token,
+        joining_name,
+        joining_addr,
+        joined,
+        replication,
+    })
+}
+
+/// `parse_migrate`'s read-only roster scan: appends one span per fully
+/// buffered entry to `entry_spans`, starting after the ones already there,
+/// and returns the cursor just past the last one. On `Incomplete`,
+/// `entry_spans` holds every entry confirmed so far.
+fn scan_joined_entries(
+    input: &[u8],
+    mut cursor: usize,
+    joined_count: usize,
+    entry_spans: &mut Vec<(usize, usize, usize, usize)>,
+) -> Result<usize, ParseError> {
+    for _ in entry_spans.len()..joined_count {
         let entry_header_end = cursor + find_lf(&input[cursor..]).ok_or(ParseError::Incomplete)?;
         let mut entry_parts = input[cursor..entry_header_end].split(|byte| *byte == b' ');
         let name_length = entry_parts.next().ok_or(ParseError::InvalidLength)?;
@@ -495,28 +622,7 @@ fn parse_migrate(
         cursor = entry_end;
     }
 
-    // Everything needed is present: consume the whole frame in one go and
-    // decode each field from the now-owned `frame`.
-    let frame = input.split_to(cursor);
-
-    let token = decode_field(&frame, token_start, token_length)?;
-    let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
-    let joining_addr = decode_field(&frame, joining_addr_start, joining_addr_length)?;
-
-    let mut joined = Vec::with_capacity(joined_count);
-    for (name_start, name_length, addr_start, addr_length) in entry_spans {
-        let name = decode_field(&frame, name_start, name_length)?;
-        let addr = decode_field(&frame, addr_start, addr_length)?;
-        joined.push((name, addr));
-    }
-
-    Ok(Command::Migrate {
-        token,
-        joining_name,
-        joining_addr,
-        joined,
-        replication,
-    })
+    Ok(cursor)
 }
 
 fn decode_field(frame: &[u8], start: usize, length: usize) -> Result<String, ParseError> {
@@ -986,6 +1092,70 @@ mod tests {
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
         assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn parse_resumable_picks_a_migrate_roster_scan_up_where_it_left_off() {
+        // Feed a frame one byte at a time and check (a) the result equals
+        // the one-shot parse, (b) each retry only re-scans from the last
+        // fully-buffered entry, never from entry #1.
+        let frame = b"M 6 14 3 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\n\
+                      node-c127.0.0.1:83586 14\nnode-d127.0.0.1:8359G 1\nx";
+        let mut expected = BytesMut::from(&frame[..]);
+        let expected = parse(&mut expected).unwrap();
+
+        let mut input = BytesMut::new();
+        let mut progress = MigrateProgress::default();
+        let mut entries_seen = 0;
+        let mut parsed = None;
+
+        for (index, byte) in frame.iter().enumerate() {
+            input.extend_from_slice(&[*byte]);
+
+            match parse_resumable(&mut input, false, &mut progress) {
+                Err(ParseError::Incomplete) => {
+                    // Never regresses: the recorded spans only grow.
+                    assert!(
+                        progress.entry_spans.len() >= entries_seen,
+                        "at byte {index}"
+                    );
+                    entries_seen = progress.entry_spans.len();
+                }
+                Ok((command, None)) => {
+                    parsed = Some(command);
+                    break;
+                }
+                other => panic!("unexpected {other:?} at byte {index}"),
+            }
+        }
+
+        assert_eq!(parsed.unwrap(), expected);
+        assert_eq!(
+            entries_seen, 2,
+            "the last entry completes together with the frame"
+        );
+        // Consumed the frame (the trailing `G` hasn't been fed yet) and
+        // reset for whatever comes next.
+        assert!(input.is_empty());
+        assert_eq!(progress.entry_spans.len(), 0);
+        assert_eq!(progress.cursor, 0);
+    }
+
+    #[test]
+    fn parse_resumable_ignores_progress_recorded_for_a_different_frame() {
+        let mut progress = MigrateProgress {
+            header_end: 12,
+            joined_count: 2,
+            cursor: 1_000_000,
+            entry_spans: vec![(0, 0, 0, 0)],
+        };
+        let mut input = buf(
+            b"M 6 14 2 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358",
+        );
+
+        let (command, _) = parse_resumable(&mut input, false, &mut progress).unwrap();
+
+        assert!(matches!(command, Command::Migrate { joined, .. } if joined.len() == 2));
     }
 
     #[test]

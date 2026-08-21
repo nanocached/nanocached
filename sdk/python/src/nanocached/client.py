@@ -430,9 +430,11 @@ class NanocachedClient:
         return decompress_value(value)
 
     async def _try_read_repair(self, key: bytes) -> bytes | None:
-        """doc/adr/0015-*.md: probes every owner of ``key``, in rank
-        order, for a value the normal read path already reported
-        missing. The first owner that has it wins: its value is
+        """doc/adr/0015-*.md: probes the remaining owners of ``key`` —
+        every owner but the primary, which the normal read path already
+        probed and got a clean miss from (same as the Rust, Go, Java and
+        .NET SDKs) — in rank order, for a value the normal read path
+        already reported missing. The first owner that has it wins: its value is
         returned, and — detached from the caller, which already has its
         value — that same value repairs the true primary in the
         background, with TTL _READ_REPAIR_TTL (the original TTL can't be
@@ -455,7 +457,7 @@ class NanocachedClient:
         an error — except a genuine programming error (anything outside
         _SWALLOWABLE_ERRORS), which still propagates."""
         names = self._owner_names(key)
-        for name in names:
+        for name in names[1:]:
             try:
                 connection = await self._member_connection(name)
                 value = await connection.get(key)
@@ -704,6 +706,12 @@ class NanocachedClient:
         primary_error: BaseException | None = None
         try:
             result = await op(await self._member_connection(primary))
+        except asyncio.CancelledError:
+            # The caller gave up on this call (asyncio.wait_for, task
+            # cancellation): propagate right away instead of first
+            # waiting on every synchronous replica leg below — those
+            # finish on their own, and swallow their own failures.
+            raise
         except BaseException as error:  # noqa: BLE001 - decided below, not swallowed
             result = None
             primary_error = error
