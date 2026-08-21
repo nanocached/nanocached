@@ -50,17 +50,42 @@ class NanocachedClientTest {
      * that failure. */
     private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client)
             throws InterruptedException {
+        return firstConnectionFailure(client, -1);
+    }
+
+    private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client, int port)
+            throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;
+        Object lastResult = null;
         while (true) {
             try {
-                client.get("k");
+                lastResult = client.get("k");
             } catch (NanocachedException.ConnectionFailed failure) {
                 return failure;
             }
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("timed out waiting for a get to fail against the closed node");
+                throw new AssertionError("timed out waiting for a get to fail against the closed node; "
+                        + "last get returned " + lastResult + "; stats=" + client.stats()
+                        + "; listeners on port " + port + ": " + listeners(port));
             }
             Thread.sleep(5);
+        }
+    }
+
+    /** Diagnostic only: what (if anything) is listening on {@code port},
+     * per `ss`, for the CI-only failure mode where a get keeps succeeding
+     * against a closed mock node. */
+    private static String listeners(int port) {
+        if (port < 0) return "(port unknown)";
+        try {
+            Process ss = new ProcessBuilder("sh", "-c", "ss -tlnp 2>/dev/null | grep ':" + port + " ' ; "
+                    + "ss -tnp 2>/dev/null | grep ':" + port + " '")
+                    .redirectErrorStream(true).start();
+            String out = new String(ss.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            ss.waitFor();
+            return out.isBlank() ? "(none)" : out.strip();
+        } catch (Exception e) {
+            return "(ss unavailable: " + e + ")";
         }
     }
 
@@ -520,7 +545,7 @@ class NanocachedClientTest {
                 // container), so the test only requires that the failure
                 // shows up promptly, which is all the cooldown assertions
                 // below depend on.
-                NanocachedException.ConnectionFailed firstError = firstConnectionFailure(client);
+                NanocachedException.ConnectionFailed firstError = firstConnectionFailure(client, port);
 
                 // A listener now sits on the same port and answers
                 // immediately with bytes the identify handshake rejects
@@ -597,7 +622,7 @@ class NanocachedClientTest {
                     single("127.0.0.1", port).reconnectCooldown(Duration.ZERO))) {
                 client.set("k", "v");
                 node.close();
-                firstConnectionFailure(client);
+                firstConnectionFailure(client, port);
 
                 java.util.concurrent.atomic.AtomicInteger connections =
                         new java.util.concurrent.atomic.AtomicInteger();
@@ -647,7 +672,7 @@ class NanocachedClientTest {
                 // connection-refused failure) is ever taken — so poll
                 // until the failure shows up instead of asserting on the
                 // very first call.
-                firstConnectionFailure(client);
+                firstConnectionFailure(client, port);
 
                 java.util.Set<java.net.Socket> acceptedSockets =
                         java.util.concurrent.ConcurrentHashMap.newKeySet();
