@@ -6,6 +6,13 @@ Date: 2026-08-20
 
 Accepted — implemented on `fix/python-version-drift` (issue #34, node side).
 
+Amended 2026-08-21 (PR #52 audit) to close the matching gap on the
+discovery side of the same handshake: `C` (handoff complete) is now
+verified against a per-join snapshot of each ready member's token, and a
+ready member evicted mid-join abandons the join. See
+[Amendment 2026-08-21](#amendment-2026-08-21-verify-c-against-a-per-join-token-snapshot)
+below.
+
 Builds on [5. Shared-secret authentication via environment variable](0005-shared-secret-authentication-via-environment-variable.md),
 [8. Staged node join with discovery-orchestrated data handoff](0008-staged-node-join-with-discovery-orchestrated-data-handoff.md),
 and [18. Per-node ephemeral token authentication for membership commands](0018-per-node-ephemeral-token-authentication-for-membership-commands.md)
@@ -92,3 +99,58 @@ difference.
   `build_migrate_message`, the node's `command.rs` parser and
   `handle_connection`, both test suites). SDKs are untouched because
   neither `M` nor `X` is an SDK-facing frame.
+
+## Amendment 2026-08-21: verify `C` against a per-join token snapshot
+
+### Context
+
+[[0018]] made `C <reporter> <joining> <token>` carry the reporter's
+membership token, and `handle_complete` verified it against the token
+*currently registered* under `reporter`'s name. That left a window the
+PR #52 audit found: `PendingJoin::expected` was a set of ready-node
+names, `sweep_expired` dropped a `Joined` entry on missed heartbeats
+without touching the current join, and registration under a name with
+no entry is trust-on-first-use ([[0009]]). So once a ready member
+crashed or partitioned mid-join for longer than the liveness timeout,
+its now-unclaimed name (public via `L`) could be re-registered by anyone
+holding the shared secret with a token of their choosing, and a `C`
+carrying *that* token was accepted — crediting a handoff that never
+happened. If it was the last outstanding member, the joining node was
+promoted without the keys the evicted member owned: exactly the silent
+data unavailability [[0008]] and [[0009]] exist to prevent.
+
+### Decision
+
+Two changes, both in `nanocached-discovery`, no wire change:
+
+- `PendingJoin::expected` is a `name → token` map snapshotted in
+  `try_begin_next_join` from the ready members as they were when the
+  join began. `handle_complete` verifies the presented token against
+  that snapshot (constant-time), never against the live registry. A
+  name re-registered after the snapshot was taken carries a different
+  token and is refused, regardless of what the registry says now.
+- When `sweep_expired` evicts a `Joined` node that is in `expected` and
+  not yet in `completed`, it calls `abandon_current_join` ("ready member
+  evicted mid-join") rather than leaving the join to run out the
+  size-derived migration timeout ([[0017]]). The member that was
+  supposed to hand its keys over is gone; nothing it could still report
+  would be trustworthy, and the joining node rejoins the queue as
+  before.
+
+This is the discovery-side counterpart of the node-side rule above: a
+token proves identity only if it is compared against the identity the
+*sender of the original command* had in mind, not against whoever holds
+the name at verification time.
+
+### Consequences
+
+- A forged `C` after eviction + re-registration is rejected; the
+  join is abandoned at eviction time instead, so a join that has lost a
+  member fails fast rather than hanging until the migration timeout.
+- A ready member that merely loses its heartbeat connection (not its
+  registry entry) is still handled as before (issue #10): `C` travels on
+  its own connection, so a heartbeat hiccup alone neither abandons the
+  join nor changes the snapshot.
+- The `M` size estimate still stands in the joining node's token length
+  for every recipient's; `MAX_TOKEN_LENGTH` (128 bytes, also added in
+  PR #52) now bounds how far a non-UUID token could skew it.
