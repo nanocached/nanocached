@@ -1082,6 +1082,92 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void closeRacingConcurrentWritesNeverThrowsARawExecutorException() throws Exception {
+        // Issue: audit finding — a set() straggling past close() (which
+        // has already shut down replicaWriters) must never let a raw
+        // RejectedExecutionException escape from the replica-write
+        // submission, whether it went through the fire-and-forget path or
+        // the synchronous-fallback one: every failure this SDK throws
+        // extends NanocachedException. A tight burst of concurrent
+        // writers overlapping a concurrent close() reliably lands at
+        // least one call in the race window this fix closes.
+        try (Cluster cluster = startCluster(2)) {
+            NanocachedClient client = connectFireAndForget(cluster.discovery().port());
+
+            int threadCount = 8;
+            Thread[] threads = new Thread[threadCount];
+            List<Throwable> unexpected = java.util.Collections.synchronizedList(new ArrayList<>());
+            java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
+            for (int i = 0; i < threadCount; i++) {
+                int index = i;
+                threads[i] = new Thread(() -> {
+                    while (!stop.get()) {
+                        try {
+                            client.set("k" + index, "v");
+                        } catch (NanocachedException expected) {
+                            // AlreadyClosed/ConnectionFailed once close() wins — fine.
+                        } catch (Throwable other) {
+                            unexpected.add(other);
+                            return;
+                        }
+                    }
+                }, "test-racing-writer-" + i);
+                threads[i].start();
+            }
+
+            Thread.sleep(20); // let the writers get going before close() lands among them
+            client.close();
+            stop.set(true);
+            for (Thread thread : threads) thread.join(5_000);
+
+            assertTrue(unexpected.isEmpty(), "unexpected exception(s): " + unexpected);
+        }
+    }
+
+    @Test
+    void closeRacingConcurrentReadRepairNeverThrowsARawExecutorException() throws Exception {
+        // Same race as above, for read repair's background write-back
+        // (~line 600's replicaWriters.execute before this fix) — every
+        // get() below finds the value only on the replica, so every call
+        // triggers a repair write-back racing close().
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            cluster.nodes().get(owners.get(1)).store.put(
+                    MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
+                    "from-replica".getBytes(StandardCharsets.UTF_8));
+
+            NanocachedClient client = connectWithReadRepair(cluster.discovery().port());
+
+            int threadCount = 8;
+            Thread[] threads = new Thread[threadCount];
+            List<Throwable> unexpected = java.util.Collections.synchronizedList(new ArrayList<>());
+            java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
+            for (int i = 0; i < threadCount; i++) {
+                threads[i] = new Thread(() -> {
+                    while (!stop.get()) {
+                        try {
+                            client.getBytes("k");
+                        } catch (NanocachedException expected) {
+                            // AlreadyClosed/ConnectionFailed once close() wins — fine.
+                        } catch (Throwable other) {
+                            unexpected.add(other);
+                            return;
+                        }
+                    }
+                }, "test-racing-reader-" + i);
+                threads[i].start();
+            }
+
+            Thread.sleep(20);
+            client.close();
+            stop.set(true);
+            for (Thread thread : threads) thread.join(5_000);
+
+            assertTrue(unexpected.isEmpty(), "unexpected exception(s): " + unexpected);
+        }
+    }
+
     // ── read repair (doc/adr/0015-*.md) ────────────────────────────
 
     private static NanocachedClient connectWithReadRepair(int port) {
@@ -1433,6 +1519,52 @@ class NanocachedClientTest {
                 node.answerWrongTagOnce();
                 NanocachedException error = assertThrows(NanocachedException.class,
                         () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+                assertTrue(error.getMessage().contains("desynced"), error.getMessage());
+                assertTrue(connection.isClosed());
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    @Test
+    void aResponseHeaderThatNeverTerminatesFailsFast() throws Exception {
+        // MAX_HEADER_LINE_LENGTH (issue: audit finding): a malicious or
+        // buggy node streaming a `V` header with no '\n' must not be able
+        // to grow readLine()'s buffer without bound — it must fail fast
+        // instead, gated only by this cap rather than the (much longer)
+        // request timeout.
+        try (MockNode node = new MockNode()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                node.answerRunawayHeaderOnce();
+                NanocachedException error = assertThrows(NanocachedException.class,
+                        () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+                assertTrue(error.getMessage().contains("too long"), error.getMessage());
+                assertTrue(connection.isClosed());
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    @Test
+    void anUnexpectedByteAfterAnUntaggedResponseMarkerDesyncsTheConnection() throws Exception {
+        // Issue: audit finding — the untagged `N`/`S`/`D`/`W`/`B` forms
+        // are always exactly two bytes on the wire (marker + '\n'); the
+        // second byte was never actually verified to be '\n' before this
+        // fix, silently accepting a desynced stream instead of poisoning
+        // the connection.
+        try (MockNode node = new MockNode()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                node.answerBadTrailerOnce();
+                NanocachedException error = assertThrows(NanocachedException.class,
+                        () -> connection.get("missing".getBytes(StandardCharsets.UTF_8)));
                 assertTrue(error.getMessage().contains("desynced"), error.getMessage());
                 assertTrue(connection.isClosed());
             } finally {

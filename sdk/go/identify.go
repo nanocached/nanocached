@@ -104,8 +104,14 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 // (unwrapped) error of this shape from the tagged handshake's write/read
 // step, so checking it here can't misclassify an unrelated connectionLost-
 // wrapped failure (e.g. a later L/node-list read) as a legacy signal.
+// io.ErrUnexpectedEOF is included alongside io.EOF: readFull now goes
+// through io.ReadFull (issue #47 audit), which reports a
+// partial-then-closed read as ErrUnexpectedEOF rather than plain EOF —
+// still the same "closed before any reply" signature, matching Rust's
+// classify_auth_io_error treating UnexpectedEof the same as a clean EOF.
 func isLegacyServerSignal(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
 }
 
 // open dials (and, with TLS, handshakes) within the attempt's shared
@@ -251,7 +257,7 @@ const (
 )
 
 func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
-	header, err := reader.ReadString('\n')
+	header, err := readLine(reader)
 	if err != nil {
 		return nil, 0, connectionLost("node-list read failed", err)
 	}
@@ -282,7 +288,7 @@ func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 	nodes := make([]discoveredNode, 0, count)
 	total := 0
 	for i := 0; i < count; i++ {
-		entry, err := reader.ReadString('\n')
+		entry, err := readLine(reader)
 		if err != nil {
 			return nil, 0, connectionLost("node-list read failed", err)
 		}

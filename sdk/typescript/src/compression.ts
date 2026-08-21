@@ -60,7 +60,14 @@ export function decompressValue(value: Buffer): Buffer {
   const marker = value[0];
   const body = value.subarray(1);
 
-  if (marker === MARKER_RAW) return Buffer.from(body);
+  // No copy needed here: by the time `value` reaches this function it's
+  // already a standalone Buffer — protocol.ts's tryParseResponse builds it
+  // with `Buffer.from(buf.subarray(...))`, which copies out of the
+  // connection's shared, reused read buffer at parse time. `body` is a
+  // view onto that already-independent memory, not onto anything the
+  // connection can later overwrite, so returning the view directly is
+  // safe (issue: audit finding, redundant copy on the uncompressed path).
+  if (marker === MARKER_RAW) return body;
 
   if (marker === MARKER_DEFLATE) {
     try {

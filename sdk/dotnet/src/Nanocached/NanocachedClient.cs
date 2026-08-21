@@ -112,14 +112,15 @@ public sealed class NanocachedClient : IDisposable
     // *whole* frame, header included. Validating key/value length against
     // that exact number would still let a caller build a frame that trips
     // it once the "G "/"S "/"D "/lengths/ttl/tag header text and framing
-    // are added, so this constant carries 1 KiB of headroom for that
-    // header — comfortably more than any header this SDK ever writes
-    // (audit finding D2). Catching an oversize request here, before it
-    // ever reaches Connection, avoids the confusing alternative of the
-    // server silently closing the connection with no response (see
-    // request_is_too_large in server.rs — an over-limit frame gets no
-    // reply at all).
-    private const int MaxRequestBytes = 1024 * 1024 - 1024;
+    // are added, so this constant carries headroom for that header —
+    // comfortably more than any header this SDK ever writes (audit finding
+    // D2). 256 bytes, standardized across every SDK (Go/Rust's original
+    // value; Java's and TypeScript's headroom constants match). Catching
+    // an oversize request here, before it ever reaches Connection, avoids
+    // the confusing alternative of the server silently closing the
+    // connection with no response (see request_is_too_large in server.rs
+    // — an over-limit frame gets no reply at all).
+    private const int MaxRequestBytes = 1024 * 1024 - 256;
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
     // Reserved by the SDKs so a real application key can never collide

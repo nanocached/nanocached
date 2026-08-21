@@ -69,15 +69,62 @@ impl HashRing {
 
         // Descending by score; ties toward the lexicographically smaller
         // name. Total order, so every implementation agrees.
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.truncate(replicas);
+        let by_score = |a: &(u64, &str), b: &(u64, &str)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+
+        let top = replicas.min(scored.len());
+        if top > 0 && top < scored.len() {
+            // Only the top `replicas` are ever returned, so avoid paying
+            // for a full O(n log n) sort of every node in the cluster on
+            // every lookup: `select_nth_unstable_by` partitions in O(n)
+            // so `scored[..top]` holds exactly the `top` best-ranked
+            // nodes by `by_score` (in arbitrary order within that
+            // prefix), leaving only those `top` elements to actually
+            // sort below.
+            scored.select_nth_unstable_by(top - 1, by_score);
+        }
+        scored.truncate(top);
+        scored.sort_unstable_by(by_score);
 
         scored.into_iter().map(|(_, node)| node).collect()
     }
 
     /// Whether `name` is one of the key's `replicas` owners.
     pub fn is_owner(&self, key: &[u8], name: &str, replicas: usize) -> bool {
-        self.owners(key, replicas).contains(&name)
+        if replicas == 0 {
+            return false;
+        }
+
+        let Some(name_index) = self.nodes.iter().position(|node| node == name) else {
+            return false;
+        };
+
+        // Avoids `owners`'s `Vec` allocations (the scored buffer and its
+        // output) entirely: `name` is an owner iff fewer than `replicas`
+        // other nodes outrank it by the same order `owners` sorts
+        // by, which this can count directly and — unlike building and
+        // sorting the whole scored list — give up on as soon as that
+        // count is reached, without scoring the rest of the cluster.
+        let key_hash = fnv1a(key);
+        let name_score = fmix64(self.node_hashes[name_index] ^ key_hash);
+
+        let mut better_ranked = 0usize;
+        for (node_hash, node) in self.node_hashes.iter().zip(&self.nodes) {
+            if node == name {
+                continue;
+            }
+
+            let score = fmix64(node_hash ^ key_hash);
+            let ranks_better = score > name_score || (score == name_score && node.as_str() < name);
+
+            if ranks_better {
+                better_ranked += 1;
+                if better_ranked >= replicas {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// The key's primary — `owners(key, 1)[0]`. Panics on an empty ring,

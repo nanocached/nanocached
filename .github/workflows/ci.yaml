@@ -117,6 +117,22 @@ jobs:
         working-directory: sdk/rust
         run: cargo test --all-features
 
+      - name: Install MSRV toolchain (1.85.0)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master (unreleased; no tags to pin instead)
+        with:
+          toolchain: 1.85.0
+
+      # The repo-root `rust-toolchain.toml` pins 1.96, which shadows any
+      # toolchain requested here unless overridden — without this, the
+      # steps above never actually exercise the crate's declared
+      # `rust-version = "1.85"` (Cargo.toml), so it could silently drift
+      # from what's checked here.
+      - name: Check MSRV compiles
+        working-directory: sdk/rust
+        env:
+          RUSTUP_TOOLCHAIN: 1.85.0
+        run: cargo check --all-features
+
   dotnet-sdk:
     runs-on: ubuntu-latest
     timeout-minutes: 15

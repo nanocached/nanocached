@@ -373,6 +373,25 @@ pub(crate) struct HeartbeatConfig {
     pub(crate) tls_connector: Option<TlsConnector>,
 }
 
+/// Whether `error` is the OS reporting the process (EMFILE) or the whole
+/// system (ENFILE) is out of file descriptors — the two `accept` failures
+/// worth backing off from rather than retrying immediately. Unix-only:
+/// there's no portable stable `ErrorKind` for either, and this project's
+/// Docker images and dev platforms (Linux, macOS) share these errno
+/// values.
+fn is_fd_exhaustion(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(23) | Some(24)) // ENFILE, EMFILE
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 async fn shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -515,7 +534,29 @@ pub(crate) async fn run(
             }
 
             result = listener.accept() => {
-                let (stream, address) = result?;
+                let (stream, address) = match result {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        // A single failed `accept` (ECONNABORTED, EMFILE,
+                        // ENFILE, ENOBUFS, ...) used to be propagated with
+                        // `?`, taking the whole listener — and every
+                        // connection it was already serving — down over
+                        // what is usually a transient, per-attempt
+                        // condition. Log and keep the loop running instead.
+                        eprintln!("WARN accept failed: {error}");
+
+                        // EMFILE/ENFILE mean this process (or the system)
+                        // is out of file descriptors; looping straight
+                        // back to `accept` would spin this branch hot
+                        // until one frees up, so back off briefly rather
+                        // than busy-looping.
+                        if is_fd_exhaustion(&error) {
+                            sleep(Duration::from_millis(100)).await;
+                        }
+
+                        continue;
+                    }
+                };
 
                 dispatch_connection(
                     stream,
@@ -1387,13 +1428,19 @@ async fn register_with_discovery(
                                 break;
                             }
 
+                            // Timed out like the write above: without this,
+                            // a discovery server that accepts the
+                            // heartbeat but never acks (crashed-but-
+                            // socket-open, blackholed route) would hang
+                            // this loop forever instead of falling through
+                            // to the redial below.
                             let mut ack = [0u8; 2];
                             let read_ack = tokio::select! {
                                 _ = shutdown_rx.changed() => return,
-                                result = stream.read_exact(&mut ack) => result,
+                                result = timeout(OUTBOUND_IO_TIMEOUT, stream.read_exact(&mut ack)) => result,
                             };
 
-                            if read_ack.is_err() || &ack != b"A\n" {
+                            if !matches!(read_ack, Ok(Ok(_))) || &ack != b"A\n" {
                                 break;
                             }
 
@@ -2914,6 +2961,23 @@ mod tests {
     #[test]
     fn maximum_cache_memory_is_256_mebibytes() {
         assert_eq!(MAX_CACHE_MEMORY_BYTES, 268_435_456);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_is_detected_for_emfile_and_enfile() {
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn fd_exhaustion_is_not_reported_for_other_accept_errors() {
+        // ECONNABORTED (Linux: 103) — a recoverable per-connection failure,
+        // but not one that means the process is out of descriptors, so it
+        // shouldn't trigger the backoff.
+        assert!(!is_fd_exhaustion(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
     }
 
     #[test]
@@ -5055,6 +5119,67 @@ mod tests {
         assert!(accepted.is_ok(), "expected a retried connection attempt");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_heartbeats_redials_when_the_ack_never_arrives() {
+        // Regression: the heartbeat ack's `read_exact` had no timeout,
+        // unlike the write right above it — a discovery server that
+        // accepted a heartbeat but never acked (crashed-but-socket-open,
+        // a blackholed route) would hang this connection forever instead
+        // of giving up within `OUTBOUND_IO_TIMEOUT` and redialing.
+        //
+        // Real time, not `start_paused`, on purpose: this exercises a
+        // genuine multi-round-trip TCP handshake (connect, join, "R\n",
+        // heartbeat) racing the timeout, and paused time's auto-advance
+        // can jump the virtual clock past a timer before that real I/O
+        // has actually completed.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+
+        let (redialed_tx, redialed_rx) = oneshot::channel::<()>();
+        let fake_discovery = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            // Promotes immediately without reading the join request
+            // first — the client's write lands in the OS buffer
+            // regardless of read order, and this leg only cares about
+            // timing the ack that follows, not the join's contents.
+            first.write_all(b"R\n").await.unwrap();
+            // Deliberately never read or ack the heartbeat that
+            // follows, and never close the connection either — only a
+            // timeout, not a read error, should end this leg.
+
+            // A second connection means the ack leg gave up and
+            // `register_with_discovery` redialed.
+            let _ = listener.accept().await;
+            let _ = redialed_tx.send(());
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            "test-node".to_string(),
+            "tk-test-node".to_string(),
+            Arc::new(Mutex::new(None)),
+            shutdown_rx,
+        ));
+
+        let redialed = timeout(OUTBOUND_IO_TIMEOUT + Duration::from_secs(5), redialed_rx).await;
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
+
+        assert!(
+            matches!(redialed, Ok(Ok(()))),
+            "expected the ack timeout to fire and trigger a redial within OUTBOUND_IO_TIMEOUT"
+        );
+    }
+
     /// Installs rustls's default crypto provider if nothing else has yet;
     /// safe to call from multiple tests since a second, redundant install is
     /// just ignored rather than treated as an error.
@@ -5140,6 +5265,11 @@ mod tests {
         let mut response = vec![0_u8; expected.len()];
         tls.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
+
+        // Without this, `server_task` only completes once
+        // `handle_connection` hits `IDLE_TIMEOUT` (60s) rather than seeing
+        // the client close.
+        tls.shutdown().await.unwrap();
 
         server_task.await.unwrap();
         cache_task.await.unwrap();

@@ -1413,6 +1413,85 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
       await cluster.close();
     }
   });
+
+  it("close() loops its drain instead of only awaiting one snapshot (issue #47 item 3)", async () => {
+    // A single `if (size > 0) await Promise.allSettled([...snapshot])`
+    // misses a leg that registers itself while that one await is already
+    // in flight — e.g. a set() mid-maybeRefreshNodeList() when close()
+    // takes its snapshot. Reproduced directly here (rather than racing
+    // real I/O timing, which can't guarantee landing in that window):
+    // register a second leg from inside the first leg's own completion,
+    // exactly modeling "one more leg shows up mid-drain".
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const backgroundWrites: Set<Promise<void>> = (client as any).backgroundReplicaWrites;
+
+      let secondLegStarted = false;
+      let secondLegDone = false;
+      const firstLeg = new Promise<void>((resolve) => setTimeout(resolve, 20)).then(() => {
+        secondLegStarted = true;
+        const secondLeg = new Promise<void>((resolve) => setTimeout(resolve, 20)).then(() => {
+          secondLegDone = true;
+        });
+        backgroundWrites.add(secondLeg);
+        secondLeg.finally(() => backgroundWrites.delete(secondLeg));
+      });
+      backgroundWrites.add(firstLeg);
+      firstLeg.finally(() => backgroundWrites.delete(firstLeg));
+
+      await client.close();
+
+      assert.ok(secondLegStarted, "test setup: the second leg never registered");
+      assert.ok(secondLegDone, "close() resolved before a leg registered mid-drain finished");
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("close() waits for a replica write racing its own drain instead of abandoning it (issue #47 item 3)", async () => {
+    // End-to-end companion to the deterministic loop test above: a burst
+    // of real writes overlapping a concurrent close() — some inevitably
+    // land between acking on the primary and registering their replica
+    // leg right as close() takes its snapshot. Not guaranteed to hit that
+    // exact window on every run, but the assertion holds regardless:
+    // nothing may land on the replica after close() has already resolved
+    // — if it does, a leg was abandoned mid-drain instead of waited for.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const { replica } = cluster.ownerOf("k");
+      replica.mock.delaySets(15);
+
+      const total = 40;
+      const writes: Promise<void>[] = [];
+      let closePromise: Promise<void> | null = null;
+      for (let i = 0; i < total; i++) {
+        writes.push(client.set(`k${i}`, "v").catch(() => {}));
+        if (i === Math.floor(total / 2) && closePromise === null) {
+          closePromise = client.close();
+        }
+      }
+      await Promise.all(writes);
+      await closePromise;
+
+      const sizeAtClose = replica.mock.store.size;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(
+        replica.mock.store.size,
+        sizeAtClose,
+        "a replica write landed after close() had already resolved — it was abandoned mid-drain",
+      );
+    } finally {
+      await cluster.close();
+    }
+  });
 });
 
 describe("NanocachedClient read repair (doc/adr/0015-*.md)", () => {

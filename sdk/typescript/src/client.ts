@@ -472,7 +472,16 @@ export class NanocachedClient {
       this.keepAliveTimer = null;
     }
 
-    if (this.backgroundReplicaWrites.size > 0) {
+    // A loop, not a single snapshot-and-await: registerBackgroundReplicaWrite
+    // rechecks `this.closed` before adding to the set, so the window for a
+    // leg to be registered after this line has mostly closed already — but
+    // a write() that read `this.closed === false` a moment before this
+    // method flipped it, and is now between that read and actually adding
+    // its leg, can still land one after the first await settles. Looping
+    // until the set is genuinely empty catches that leg too instead of
+    // abandoning it mid-flight when teardownConnections runs (issue #47
+    // item 3 / audit finding, mirroring the Go and Rust SDKs' drain loops).
+    while (this.backgroundReplicaWrites.size > 0) {
       await Promise.allSettled([...this.backgroundReplicaWrites]);
     }
     this.teardownConnections();
@@ -576,7 +585,15 @@ export class NanocachedClient {
       // unbounded the way an untracked spawn-per-miss would. Past the
       // cap, skip the repair for this miss; it's opportunistic, so a
       // later miss on the same key repairs it.
-      if (primaryName !== undefined && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+      // `!this.closed` is rechecked here, synchronously and immediately
+      // before this leg is ever registered in backgroundReplicaWrites —
+      // no await happens between this check and the `.add()` below, so
+      // close()'s own drain can't race a leg into existence after it
+      // already took its snapshot (issue #47 item 3 / audit finding). When
+      // closed, the repair is simply skipped, same as when the cap is
+      // already reached — read repair is opportunistic, so a later miss
+      // repairs it.
+      if (primaryName !== undefined && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const repaired = this.memberConnection(primaryName)
           .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS))
           .catch((error) => {
@@ -709,7 +726,16 @@ export class NanocachedClient {
     // further legs fall back to the synchronous path exactly as with the
     // option off.
     const synchronousReplicaWrites = replicaNames.map((name) => {
-      if (this.fireAndForgetReplicas && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+      // `!this.closed` is rechecked here, synchronously and immediately
+      // before this leg is ever registered in backgroundReplicaWrites —
+      // no await happens between this check and the `.add()` below, so
+      // close()'s own drain can't race a leg into existence after it
+      // already took its snapshot (issue #47 item 3 / audit finding). When
+      // closed, this falls through to the synchronous branch below instead,
+      // exactly as if fireAndForgetReplicas were off — that leg is awaited
+      // by this very call via Promise.allSettled below, so it can't outlive
+      // close()'s teardown either.
+      if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const background = replicaWrite(name);
         // Now that replicaWrite can legitimately reject (a programming bug
         // — see isSwallowable), attach a rejection handler synchronously,
