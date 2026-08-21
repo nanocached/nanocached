@@ -112,11 +112,15 @@ func (r *HashRing) Owners(key []byte, replicas int) []string {
 	return owners
 }
 
-// Route returns the key's primary — Owners(key, 1)[0]. Panics on an
-// empty ring.
-func (r *HashRing) Route(key []byte) string {
+// Route returns the key's primary — Owners(key, 1)[0]. On an empty ring
+// there is no primary to return, so it reports an error (wrapping
+// ErrInvalidArgument, matching every other client-side validation
+// failure caught before any network I/O) instead of panicking — a public
+// API shouldn't crash its caller's process over a construction-time
+// mistake it can hand back as an ordinary error instead.
+func (r *HashRing) Route(key []byte) (string, error) {
 	if len(r.nodes) == 0 {
-		panic("nanocached: HashRing.Route called on an empty ring")
+		return "", invalidArgument("nanocached: HashRing.Route called on an empty ring")
 	}
-	return r.Owners(key, 1)[0]
+	return r.Owners(key, 1)[0], nil
 }

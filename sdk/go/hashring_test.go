@@ -1,6 +1,7 @@
 package nanocached
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -141,13 +142,14 @@ func TestAddingANodeNeverReordersExistingNodes(t *testing.T) {
 	}
 }
 
-func TestRoutePanicsOnAnEmptyRing(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("Route on an empty ring did not panic")
-		}
-	}()
-	NewHashRing(nil).Route([]byte("k"))
+func TestRouteErrorsOnAnEmptyRing(t *testing.T) {
+	node, err := NewHashRing(nil).Route([]byte("k"))
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+	if node != "" {
+		t.Fatalf("node = %q, want empty", node)
+	}
 }
 
 func TestSpreadsKeysEvenly(t *testing.T) {
@@ -156,7 +158,11 @@ func TestSpreadsKeysEvenly(t *testing.T) {
 	counts := map[string]int{}
 	const total = 3000
 	for i := 0; i < total; i++ {
-		counts[ring.Route([]byte(fmt.Sprintf("key-%d", i)))]++
+		node, err := ring.Route([]byte(fmt.Sprintf("key-%d", i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[node]++
 	}
 	fair := float64(total) / float64(len(nodes))
 	for node, count := range counts {

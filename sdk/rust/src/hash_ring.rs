@@ -14,6 +14,8 @@
 //!
 //! Built from node *names*, not addresses (doc/adr/0009-*.md).
 
+use crate::error::{Error, Result};
+
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in bytes {
@@ -80,9 +82,17 @@ impl HashRing {
         scored.into_iter().map(|(_, node)| node).collect()
     }
 
-    /// The key's primary — `owners(key, 1)[0]`. Panics on an empty ring.
-    pub fn route(&self, key: &[u8]) -> &str {
-        self.owners(key, 1)[0]
+    /// The key's primary — `owners(key, 1)[0]`. Returns
+    /// `Err(Error::InvalidArgument)` on an empty ring instead of panicking
+    /// (there is no node to name as primary), matching how every other
+    /// public entry point in this crate reports "the caller passed
+    /// something that could never be meant" rather than aborting.
+    pub fn route(&self, key: &[u8]) -> Result<&str> {
+        self.owners(key, 1).into_iter().next().ok_or_else(|| {
+            Error::InvalidArgument(
+                "nanocached: HashRing::route called on an empty ring".to_string(),
+            )
+        })
     }
 }
 
@@ -174,6 +184,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn route_on_an_empty_ring_returns_invalid_argument_instead_of_panicking() {
+        let empty = HashRing::new(vec![]);
+        assert!(matches!(empty.route(b"k"), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn route_on_a_non_empty_ring_returns_the_primary() {
+        let ring = ring(&["node-a", "node-b", "node-c"]);
+        assert_eq!(ring.route(b"alpha").unwrap(), ring.owners(b"alpha", 1)[0]);
     }
 
     #[test]

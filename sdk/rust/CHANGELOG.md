@@ -8,6 +8,16 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Changed
 
+- **Breaking: added `Error::Authentication`, a new variant of the `Error`
+  enum.** The server rejecting the `A` handshake's secret (no secret
+  configured when the server requires one, or a wrong one) used to fold
+  into `Error::Protocol`; it's now its own `Error::Authentication`
+  variant, matching the Go/TypeScript/Python SDKs (`ErrAuthenticationFailed`
+  / `AuthenticationError`) and letting callers distinguish a non-transient
+  credentials problem — retrying with the same configuration can never
+  succeed — from a genuine wire-protocol violation. Any code that
+  exhaustively matches on `Error` (no wildcard `_`/catch-all arm) will
+  fail to compile until it adds an arm for `Error::Authentication`.
 - **Breaking: `Options::reconnect_cooldown(Duration::ZERO)` now means "use
   the default" (1s) instead of disabling the cooldown.** This aligns the
   Rust SDK with the Go SDK, whose zero-value `Config.ReconnectCooldown`
@@ -29,6 +39,12 @@ follow the `sdk/rust/vX.Y.Z` tags.
 - The crate declares an empty `[workspace]` so Cargo no longer walks up
   to the repository-root server manifest when building from a checkout
   (PR #52). No effect on consumers from crates.io.
+- **Breaking: `HashRing::route` now returns `Result<&str>` instead of
+  `&str`.** Calling it on an empty ring used to panic (index out of
+  bounds); it now returns `Err(Error::InvalidArgument)` instead, matching
+  how the rest of this crate's public API reports a caller error. Callers
+  using `route`'s return value directly as a `&str` need to unwrap or
+  otherwise handle the new `Result`.
 
 ### Fixed
 

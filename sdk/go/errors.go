@@ -38,6 +38,27 @@ var (
 	// (doc/adr/0013-*.md's compatibility caveat: every client touching a
 	// given keyspace must agree on Compress), not a transient failure.
 	ErrDecompression = errors.New("nanocached: failed to decompress a value")
+
+	// ErrProtocol wraps a malformed or unexpected response frame — the
+	// server sent bytes that don't parse as the wire protocol at all
+	// (a garbage value header/length, an unparsable tag, an unknown
+	// marker byte, an over-long header line), as opposed to a genuine
+	// I/O failure (EOF, reset, timeout) that just happens to also end
+	// the connection. Both still poison the connection the same way —
+	// this only changes the error TYPE a caller sees, not the "this
+	// connection is dead" handling: a corrupt frame is arguably not
+	// transient in the way a dropped socket is, so callers that want to
+	// tell the two apart can (issue #47 audit item G4; Rust's
+	// Error::Protocol and TypeScript's bare NanocachedError vs.
+	// ConnectionLostError draw the same line).
+	ErrProtocol = errors.New("nanocached: protocol violation")
+
+	// ErrInvalidArgument is returned by client-side argument validation
+	// that runs before any network I/O: an empty or oversized key, a
+	// key+value pair too large for the server's own request cap, or an
+	// invalid TTL. Never transient — retrying with the same arguments
+	// cannot succeed.
+	ErrInvalidArgument = errors.New("nanocached: invalid argument")
 )
 
 func connectionLost(context string, cause error) error {
@@ -49,4 +70,12 @@ func connectionLost(context string, cause error) error {
 
 func decompressionFailed(context string) error {
 	return errors.Join(ErrDecompression, errors.New(context))
+}
+
+func protocolError(context string) error {
+	return errors.Join(ErrProtocol, errors.New(context))
+}
+
+func invalidArgument(context string) error {
+	return errors.Join(ErrInvalidArgument, errors.New(context))
 }

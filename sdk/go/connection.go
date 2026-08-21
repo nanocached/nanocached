@@ -2,6 +2,7 @@ package nanocached
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -316,7 +317,18 @@ func (c *connection) readLoop() {
 	for {
 		marker, value, tag, err := c.readOneResponse()
 		if err != nil {
-			c.poison(connectionLost("connection failed", err))
+			// A malformed/unexpected frame is already classified as
+			// ErrProtocol by readOneResponse — pass it through as-is
+			// instead of also rewrapping it as ErrConnectionLost, so
+			// callers can tell a protocol violation apart from a genuine
+			// I/O failure (issue #47 audit item G4). Everything else here
+			// is a real I/O error (EOF, reset, timeout, ...) and keeps the
+			// existing ErrConnectionLost classification.
+			if errors.Is(err, ErrProtocol) {
+				c.poison(err)
+			} else {
+				c.poison(connectionLost("connection failed", err))
+			}
 			return
 		}
 
@@ -404,13 +416,13 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			wantFields = 2
 		}
 		if len(fields) != wantFields {
-			return 0, nil, 0, fmt.Errorf("invalid value header in response")
+			return 0, nil, 0, protocolError("invalid value header in response")
 		}
 		// Lengths beyond the server's own 1 MiB request cap are protocol
 		// garbage — reject before allocating.
 		length, err := strconv.Atoi(fields[0])
 		if err != nil || length < 0 || length > maxValueLength {
-			return 0, nil, 0, fmt.Errorf("invalid value length in response")
+			return 0, nil, 0, protocolError("invalid value length in response")
 		}
 		var responseTag uint32
 		if c.tagged {
@@ -447,7 +459,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 		header = strings.TrimSuffix(header, "\n")
 		field, ok := strings.CutPrefix(header, " ")
 		if !ok {
-			return 0, nil, 0, fmt.Errorf("response is missing its tag (connection desynced)")
+			return 0, nil, 0, protocolError("response is missing its tag (connection desynced)")
 		}
 		responseTag, err := parseTag(field)
 		if err != nil {
@@ -455,7 +467,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 		}
 		return marker, nil, responseTag, nil
 	default:
-		return 0, nil, 0, fmt.Errorf("unexpected response from server: %c", marker)
+		return 0, nil, 0, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
 	}
 }
 
@@ -464,7 +476,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 func parseTag(field string) (uint32, error) {
 	tag, err := strconv.ParseUint(field, 10, 32)
 	if err != nil {
-		return 0, fmt.Errorf("invalid response tag")
+		return 0, protocolError("invalid response tag")
 	}
 	return uint32(tag), nil
 }
@@ -488,8 +500,8 @@ func readLine(reader *bufio.Reader) (string, error) {
 			return string(line), nil
 		}
 		if len(line) > maxHeaderLineLength {
-			return string(line), fmt.Errorf(
-				"nanocached: response header line exceeds %d bytes without a terminator", maxHeaderLineLength)
+			return string(line), protocolError(fmt.Sprintf(
+				"nanocached: response header line exceeds %d bytes without a terminator", maxHeaderLineLength))
 		}
 	}
 }

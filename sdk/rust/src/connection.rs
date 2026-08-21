@@ -532,24 +532,37 @@ async fn read_loop(
 
 /// Rejects every request still queued, and drops the write half so the
 /// socket actually closes now rather than waiting for the last
-/// `Connection` clone to drop. When `first_error` is given, it's
-/// delivered to whichever request was oldest — the one whose response
-/// actually failed to parse, if that's why the read loop is exiting;
-/// every other still-queued request gets a generic "connection closed",
-/// since their responses were never received at all.
+/// `Connection` clone to drop. When `first_error` is given — the specific
+/// error that actually triggered the read loop's exit (a malformed
+/// frame, a tag mismatch, a read failure) — every still-queued request
+/// gets a *clone* of that same error, matching the Go/TypeScript/Python
+/// SDKs: none of them have any better answer for "why did my request
+/// never get a response" than the one error that's actually known to be
+/// true, so broadcasting a generic "connection closed" to everyone but
+/// the oldest request only threw that information away for no reason
+/// (`Error`'s `Clone` derive exists precisely to make this cheap — see
+/// its doc comment in error.rs). When `first_error` is `None` — the
+/// read loop was told to shut down (`close()`, or another poison trigger
+/// with no parseable cause of its own) rather than having failed a read
+/// itself — there is no specific cause to attribute, so every request
+/// still falls back to the generic "connection closed".
 async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
     let mut state = shared.write_state.lock().await;
     state.write_half = None;
-    let mut pending = state.pending.drain(..);
-    if let Some(error) = first_error {
-        if let Some(slot) = pending.next() {
-            let _ = slot.tx.send(Err(error));
+    let pending = state.pending.drain(..);
+    match first_error {
+        Some(error) => {
+            for slot in pending {
+                let _ = slot.tx.send(Err(error.clone()));
+            }
         }
-    }
-    for slot in pending {
-        let _ = slot.tx.send(Err(Error::ConnectionLost(
-            "nanocached: connection closed".to_string(),
-        )));
+        None => {
+            for slot in pending {
+                let _ = slot.tx.send(Err(Error::ConnectionLost(
+                    "nanocached: connection closed".to_string(),
+                )));
+            }
+        }
     }
 }
 

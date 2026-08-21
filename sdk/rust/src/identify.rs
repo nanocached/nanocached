@@ -370,12 +370,18 @@ async fn do_connect_and_identify(
         )));
     }
     if ack[0] == b'E' {
+        // A well-formed rejection of the secret itself — not a protocol
+        // violation — so it maps to `Error::Authentication`, never
+        // `Error::Protocol` (a genuine "the server sent something the
+        // wire protocol doesn't allow" case; see the two `ack[0]`/`ack[1]`
+        // shape checks above) or `Error::ConnectionLost` (which implies a
+        // redial might help; retrying with the same secret never will).
         return Err(AuthFailure::Other(if auth_secret.is_none() {
-            Error::Protocol(format!(
+            Error::Authentication(format!(
                 "nanocached: {host}:{port} requires authentication, but no auth_secret was given"
             ))
         } else {
-            Error::Protocol("nanocached: authentication failed".to_string())
+            Error::Authentication("nanocached: authentication failed".to_string())
         }));
     }
 
@@ -554,6 +560,72 @@ mod tests {
             started.elapsed()
         );
         holder.abort();
+    }
+
+    /// A minimal server that always rejects the `A` handshake with `En\n`
+    /// (or `EnT\n` if the client asked for tags) — standing in for both
+    /// "the server requires a secret and none was given" and "the
+    /// configured secret is wrong": from the wire's point of view these
+    /// are the same well-formed rejection, and `run_identify_attempt`
+    /// only tells them apart by whether `auth_secret` was `None`.
+    async fn spawn_auth_rejecting_server() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut stream = BufReader::new(&mut socket);
+            let Ok(header) = read_line(&mut stream).await else {
+                return;
+            };
+            let parts: Vec<&str> = header.split(' ').collect();
+            let Ok(secret_len) = parts[1].parse::<usize>() else {
+                return;
+            };
+            let mut secret = vec![0u8; secret_len];
+            if stream.read_exact(&mut secret).await.is_err() {
+                return;
+            }
+            let reply: &[u8] = if parts.get(2) == Some(&"T") {
+                b"EnT\n"
+            } else {
+                b"En\n"
+            };
+            let _ = socket.write_all(reply).await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn a_missing_required_secret_is_error_authentication_not_protocol() {
+        // Fix 3: the server rejecting a handshake that carried no secret
+        // at all (this SDK's `auth_secret` unset) must map to
+        // `Error::Authentication`, never `Error::Protocol` — it's a
+        // well-formed, non-transient rejection, not a wire violation.
+        let port = spawn_auth_rejecting_server().await;
+        let result = connect_and_identify("127.0.0.1", port, None, None, CONNECT_DEADLINE).await;
+        match result {
+            Err(Error::Authentication(message)) => {
+                assert!(message.contains("requires authentication"), "{message:?}");
+            }
+            Ok(_) => panic!("connect_and_identify succeeded, want Err(Error::Authentication(_))"),
+            Err(other) => panic!("{other}, want Error::Authentication"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wrong_secret_is_error_authentication_not_protocol() {
+        let port = spawn_auth_rejecting_server().await;
+        let result =
+            connect_and_identify("127.0.0.1", port, Some(b"wrong"), None, CONNECT_DEADLINE).await;
+        match result {
+            Err(Error::Authentication(message)) => {
+                assert!(message.contains("authentication failed"), "{message:?}");
+            }
+            Ok(_) => panic!("connect_and_identify succeeded, want Err(Error::Authentication(_))"),
+            Err(other) => panic!("{other}, want Error::Authentication"),
+        }
     }
 
     #[cfg(feature = "tls")]

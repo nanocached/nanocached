@@ -28,9 +28,16 @@ use crate::identify::{
 };
 use crate::open_targets;
 
-// How long the node list may go without a re-fetch from discovery before
-// get/set/delete refreshes it first (checked lazily on use).
-const NODE_LIST_STALE_AFTER: Duration = Duration::from_secs(30);
+/// How long, in milliseconds, the node list may go without a re-fetch from
+/// discovery before get/set/delete refreshes it first (checked lazily on
+/// use). Read fresh on every `maybe_refresh` call rather than once at
+/// connect, mirroring `connection::REQUEST_TIMEOUT_MS` —
+/// `#[doc(hidden)]` purely as a test hook so a single-flight-coalescing
+/// test can shrink the staleness window instead of waiting out the real
+/// 30s default; a test that lowers it should restore it immediately after
+/// the one check it means to affect.
+#[doc(hidden)]
+pub static NODE_LIST_STALE_AFTER_MS: AtomicU64 = AtomicU64::new(30_000);
 // The keep-alive ping key is reserved by the SDKs precisely so a real
 // application key can never collide with it: a leading 0x00 already
 // keeps it out of any UTF-8 key space, and "nanocached-keepalive" makes
@@ -74,19 +81,32 @@ const DEFAULT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(1);
 /// R1; see README's "Errors" section).
 const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
 
-/// Rejects an empty key before any network I/O: the server's protocol has
+/// Rejects an empty key, or one that alone already exceeds
+/// `MAX_REQUEST_BYTES`, before any network I/O: the server's protocol has
 /// no way to represent a zero-length key request that doesn't collide
-/// with other framing, so it responds by closing the connection outright
-/// — silently poisoning every other request already pipelined on that
-/// connection (see src/command.rs's `rejects_empty_key_for_get` et al.).
-/// Catching it here client-side, as `Error::InvalidArgument`, both gives
-/// the caller a clear synchronous error and avoids that blast radius
-/// entirely.
+/// with other framing, and a key past the server's own 1 MiB request cap
+/// can never be stored either way — both cases get exactly one reply from
+/// the server: closing the connection outright, silently poisoning every
+/// other request already pipelined on that connection (see
+/// src/command.rs's `rejects_empty_key_for_get` et al., and this module's
+/// `MAX_REQUEST_BYTES` doc comment). `get`/`delete` call this directly (no
+/// value to bound), so without the size check here an oversized key on
+/// either of those paths would sail straight past client-side validation
+/// and only be caught by the server slamming the connection shut (issue
+/// #47 audit item R1 follow-up). Catching both cases here client-side, as
+/// `Error::InvalidArgument`, gives the caller a clear synchronous error
+/// and avoids that blast radius entirely.
 fn validate_key(key: &[u8]) -> Result<()> {
     if key.is_empty() {
         return Err(Error::InvalidArgument(
             "nanocached: key must not be empty".to_string(),
         ));
+    }
+    if key.len() > MAX_REQUEST_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "nanocached: key exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES} bytes), got {} bytes",
+            key.len()
+        )));
     }
     Ok(())
 }
@@ -95,6 +115,10 @@ fn validate_key(key: &[u8]) -> Result<()> {
 /// value.len()` — anything past it can never fit the server's own 1 MiB
 /// request cap, so failing fast here is strictly better than sending a
 /// frame the server can only reject by silently closing the connection.
+/// The combined check below is redundant whenever `validate_key` alone
+/// already rejects an oversized key, but stays as its own check since a
+/// key comfortably under the bound can still push the combined total over
+/// it once `value` is added.
 fn validate_key_and_value(key: &[u8], value: &[u8]) -> Result<()> {
     validate_key(key)?;
     if key.len() + value.len() > MAX_REQUEST_BYTES {
@@ -383,6 +407,16 @@ enum Target {
 struct Inner {
     state: Mutex<State>,
     redials: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Single-flight gate for `maybe_refresh`/`refresh_node_list`: without
+    /// it, every concurrent caller that observes a stale (or forced)
+    /// node list independently redials discovery, so a burst of
+    /// concurrent `WrongNode` replies (or requests that all land right as
+    /// the list goes stale) can fan out into many redundant discovery
+    /// round trips at once. Held only across the re-check-then-refresh
+    /// sequence in `maybe_refresh` — never across `state`, and never
+    /// across other I/O — mirroring Go's `Client.refreshMu` (sdk/go's
+    /// `client.go`) and this struct's own `redials` gate for dialing.
+    refresh_gate: Mutex<()>,
     /// Per-address reconnect cooldown (see [`Options::reconnect_cooldown`]):
     /// the address of the most recently failed dial, and how long it
     /// stays "down" before another dial to it is attempted. Keyed by
@@ -587,6 +621,7 @@ impl NanocachedClient {
                 last_fetch: Instant::now(),
             }),
             redials: Mutex::new(HashMap::new()),
+            refresh_gate: Mutex::new(()),
             reconnect_cooldowns: Mutex::new(HashMap::new()),
             reconnect_cooldown: options.reconnect_cooldown.resolve(),
             addresses: options.addresses,
@@ -1209,13 +1244,40 @@ impl NanocachedClient {
         }
     }
 
+    /// Two-phase check-then-refresh, mirroring Go's `Client.maybeRefresh`:
+    /// the first check (under `state` alone) cheaply short-circuits the
+    /// common case of a fresh list without ever touching `refresh_gate`.
+    /// Once a caller decides a refresh is needed, it queues on
+    /// `refresh_gate` rather than dialing immediately — and, critically,
+    /// re-checks staleness under `state` again *after* acquiring the gate,
+    /// since a concurrent caller may have already refreshed while this one
+    /// was waiting. Without that re-check, N callers that all observed
+    /// staleness at once would simply serialize N redundant discovery
+    /// round trips instead of coalescing into one. Only one lock is ever
+    /// held at a time — `state` is always dropped before awaiting
+    /// `refresh_gate` or any I/O, matching every other lock in this file.
     async fn maybe_refresh(&self, force: bool) {
         {
             let state = self.inner.state.lock().await;
             if matches!(state.target, Target::Single { .. }) {
                 return;
             }
-            if !force && state.last_fetch.elapsed() < NODE_LIST_STALE_AFTER {
+            if !force
+                && state.last_fetch.elapsed()
+                    < Duration::from_millis(NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst))
+            {
+                return;
+            }
+        }
+
+        let _gate = self.inner.refresh_gate.lock().await;
+        {
+            let state = self.inner.state.lock().await;
+            if !force
+                && state.last_fetch.elapsed()
+                    < Duration::from_millis(NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst))
+            {
+                // Someone else refreshed while we were waiting for the gate.
                 return;
             }
         }
@@ -1307,5 +1369,35 @@ impl NanocachedClient {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_key_rejects_a_key_over_max_request_bytes() {
+        // A key alone past MAX_REQUEST_BYTES can never fit the server's
+        // own request cap, so `validate_key` — called directly by both
+        // `get_bytes` and `delete`, not just via `validate_key_and_value`
+        // — must reject it on its own, not just an empty key (issue #47
+        // audit item R1 follow-up).
+        let oversized = vec![0u8; MAX_REQUEST_BYTES + 1];
+        assert!(matches!(
+            validate_key(&oversized),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn validate_key_accepts_a_key_right_at_max_request_bytes() {
+        let boundary = vec![0u8; MAX_REQUEST_BYTES];
+        assert!(validate_key(&boundary).is_ok());
+    }
+
+    #[test]
+    fn validate_key_rejects_an_empty_key() {
+        assert!(matches!(validate_key(b""), Err(Error::InvalidArgument(_))));
     }
 }

@@ -270,6 +270,16 @@ fn take_one(counter: &AtomicUsize) -> bool {
 struct MockDiscovery {
     nodes: Arc<Mutex<Vec<(String, String)>>>,
     warming: Arc<Mutex<bool>>,
+    /// How many `L` (node-list) requests this discovery server has ever
+    /// received — for the single-flight coalescing regression (Fix 2):
+    /// without coalescing, a burst of concurrent callers that all observe
+    /// a stale node list would each redial discovery independently.
+    l_requests: Arc<AtomicUsize>,
+    /// Artificial delay (ms) before answering `L` — held at 0 normally;
+    /// a test raises this to widen the window during which concurrent
+    /// callers can pile up behind the single-flight gate instead of the
+    /// first request finishing before the others even start.
+    l_delay_ms: Arc<AtomicUsize>,
     port: u16,
     shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -278,12 +288,16 @@ impl MockDiscovery {
     async fn start(nodes: Vec<(String, String)>, replication: usize) -> Self {
         let nodes = Arc::new(Mutex::new(nodes));
         let warming = Arc::new(Mutex::new(false));
+        let l_requests = Arc::new(AtomicUsize::new(0));
+        let l_delay_ms = Arc::new(AtomicUsize::new(0));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         let accept_nodes = Arc::clone(&nodes);
         let accept_warming = Arc::clone(&warming);
+        let accept_l_requests = Arc::clone(&l_requests);
+        let accept_l_delay_ms = Arc::clone(&l_delay_ms);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -292,7 +306,16 @@ impl MockDiscovery {
                         let Ok((socket, _)) = accepted else { return };
                         let nodes = Arc::clone(&accept_nodes);
                         let warming = Arc::clone(&accept_warming);
-                        tokio::spawn(serve_discovery(socket, nodes, warming, replication));
+                        let l_requests = Arc::clone(&accept_l_requests);
+                        let l_delay_ms = Arc::clone(&accept_l_delay_ms);
+                        tokio::spawn(serve_discovery(
+                            socket,
+                            nodes,
+                            warming,
+                            replication,
+                            l_requests,
+                            l_delay_ms,
+                        ));
                     }
                 }
             }
@@ -301,6 +324,8 @@ impl MockDiscovery {
         Self {
             nodes,
             warming,
+            l_requests,
+            l_delay_ms,
             port,
             shutdown,
         }
@@ -316,6 +341,8 @@ async fn serve_discovery(
     nodes: Arc<Mutex<Vec<(String, String)>>>,
     warming: Arc<Mutex<bool>>,
     replication: usize,
+    l_requests: Arc<AtomicUsize>,
+    l_delay_ms: Arc<AtomicUsize>,
 ) {
     let mut stream = BufReader::new(socket);
     loop {
@@ -331,6 +358,11 @@ async fn serve_discovery(
                 }
             }
             "L" => {
+                l_requests.fetch_add(1, Ordering::SeqCst);
+                let delay = l_delay_ms.load(Ordering::SeqCst);
+                if delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                }
                 if *warming.lock().unwrap() {
                     let _ = stream.get_mut().write_all(b"B\n").await;
                     return;
@@ -643,19 +675,27 @@ async fn authenticates() {
     assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
     client.close().await;
 
+    // Both rejection shapes are `Error::Authentication` (Fix 3), not
+    // `Error::Protocol` — the server gave a well-formed answer rejecting
+    // the secret, not a malformed one, and neither is transient: retrying
+    // with the same configuration can never succeed.
     let missing = NanocachedClient::connect(options(node.port)).await;
-    assert!(missing
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("requires authentication"));
+    match missing {
+        Err(Error::Authentication(message)) => {
+            assert!(message.contains("requires authentication"), "{message:?}");
+        }
+        Ok(_) => panic!("connect() with no secret succeeded, want Error::Authentication"),
+        Err(other) => panic!("connect() with no secret = {other}, want Error::Authentication"),
+    }
 
     let wrong = NanocachedClient::connect(options(node.port).auth_secret("wrong")).await;
-    assert!(wrong
-        .err()
-        .unwrap()
-        .to_string()
-        .contains("authentication failed"));
+    match wrong {
+        Err(Error::Authentication(message)) => {
+            assert!(message.contains("authentication failed"), "{message:?}");
+        }
+        Ok(_) => panic!("connect() with a wrong secret succeeded, want Error::Authentication"),
+        Err(other) => panic!("connect() with a wrong secret = {other}, want Error::Authentication"),
+    }
     node.stop();
 }
 
@@ -734,6 +774,55 @@ async fn a_malformed_value_length_poisons_the_connection_and_retries_transparent
     let value = client.get("k").await.unwrap();
     assert_eq!(value, Some("v".to_string()));
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn drain_pending_broadcasts_the_specific_triggering_error_to_every_queued_request() {
+    // Regression (Fix 5): drain_pending used to hand the oldest pending
+    // request the specific error that killed the read loop, but every
+    // OTHER still-queued request only got a generic "connection closed" —
+    // losing the actual cause. It now clones the same specific error to
+    // every pending request. Delaying the first G (still holding it
+    // unpopped in `pending` when the malformed reply arrives) while
+    // firing several more concurrently ensures all of them are still
+    // queued when the read loop dies.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    node.state.get_delay_ms.store(300, Ordering::SeqCst);
+    node.state
+        .malformed_value_replies
+        .fetch_add(1, Ordering::SeqCst);
+
+    let mut gets = Vec::new();
+    for i in 0..6 {
+        let client = client.clone();
+        gets.push(tokio::spawn(async move {
+            client.get(format!("queued-{i}")).await
+        }));
+    }
+
+    let mut messages = Vec::new();
+    for task in gets {
+        match task.await.unwrap() {
+            Err(Error::Protocol(message)) => messages.push(message),
+            other => panic!("expected Error::Protocol for every queued request, got {other:?}"),
+        }
+    }
+
+    assert_eq!(messages.len(), 6);
+    let first = messages[0].clone();
+    assert!(
+        messages.iter().all(|message| *message == first),
+        "want every queued request to receive the exact same error, got {messages:?}"
+    );
+    assert!(
+        first.contains("invalid value length"),
+        "want the specific triggering error, not a generic \"connection closed\": {first:?}"
+    );
 
     client.close().await;
     node.stop();
@@ -841,6 +930,36 @@ async fn rejects_a_key_and_value_that_would_exceed_the_servers_request_cap() {
         matches!(result, Err(Error::InvalidArgument(_))),
         "expected InvalidArgument, got {result:?}"
     );
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn rejects_an_oversized_key_on_get_and_delete_without_touching_the_network() {
+    // Regression: get_bytes/delete used to call validate_key (which only
+    // checked emptiness), not validate_key_and_value — so an oversized key
+    // on either path sailed past client-side validation and would only be
+    // caught by the server closing the connection without a response
+    // (poisoning every other pipelined request on it). validate_key itself
+    // now bounds MAX_REQUEST_BYTES, so both are rejected synchronously
+    // before any bytes hit the wire — verified below by checking no extra
+    // connection was ever dialed.
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let oversized_key = vec![b'k'; MAX_REQUEST_BYTES + 1];
+    assert!(matches!(
+        client.get_bytes(oversized_key.clone()).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.delete(oversized_key).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    // Only connect()'s own dial ever reached the node.
     assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
 
     client.close().await;
@@ -1780,6 +1899,61 @@ async fn refresh_against_an_unreachable_discovery_seed_counts_a_refresh_failure_
     );
 
     client.close().await;
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_stale_refreshes_coalesce_into_a_single_discovery_round_trip() {
+    // Regression (Fix 2): maybe_refresh used to check staleness, drop the
+    // lock, then unconditionally redial discovery — so N callers that all
+    // observed the node list as stale at once each independently redialed,
+    // instead of coalescing into one refresh. NODE_LIST_STALE_AFTER_MS is
+    // lowered here (a #[doc(hidden)] test hook, mirroring
+    // KEEPALIVE_INTERVAL_MS/REQUEST_TIMEOUT_MS) so the list goes stale
+    // almost immediately instead of waiting out the real 30s default; the
+    // mock discovery's L handler is given an artificial delay so the
+    // winning refresh is still in flight while every other concurrent
+    // caller reaches the single-flight gate, proving they actually queue
+    // behind it rather than merely finishing too fast to overlap.
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    // connect()'s own L already landed; only refreshes from here on count.
+    let before = discovery.l_requests.load(Ordering::SeqCst);
+
+    let default_stale_after = nanocached::NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst);
+    nanocached::NODE_LIST_STALE_AFTER_MS.store(50, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await; // let the list actually go stale
+    discovery.l_delay_ms.store(200, Ordering::SeqCst);
+
+    let mut gets = Vec::new();
+    for i in 0..12 {
+        let client = client.clone();
+        gets.push(tokio::spawn(async move {
+            client.get(format!("coalesce-{i}")).await
+        }));
+    }
+    for task in gets {
+        // Every concurrent get() must still resolve successfully — the
+        // coalesced refresh must not error or hang out any of the callers
+        // that only observed it, rather than performing it themselves.
+        task.await.unwrap().unwrap();
+    }
+
+    discovery.l_delay_ms.store(0, Ordering::SeqCst);
+    nanocached::NODE_LIST_STALE_AFTER_MS.store(default_stale_after, Ordering::SeqCst);
+
+    assert_eq!(
+        discovery.l_requests.load(Ordering::SeqCst) - before,
+        1,
+        "want exactly one coalesced discovery refresh despite 12 concurrent stale triggers"
+    );
+
+    client.close().await;
+    discovery.stop();
     for (_, node) in nodes {
         node.stop();
     }
