@@ -2,13 +2,19 @@
 name = "nanocached"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "Async client SDK for nanocached, a tiny distributed cache with client-side replication"
 license = "MIT"
 homepage = "https://nanocached.org"
 repository = "https://github.com/nanocached/nanocached"
 keywords = ["nanocached", "cache", "distributed", "client", "sdk"]
 categories = ["caching", "asynchronous"]
+
+# Standalone crate: stop Cargo from walking up to the repo-root
+# `Cargo.toml` (the server) in search of a workspace. Besides keeping the
+# two builds independent, older Cargo (the MSRV checked in CI) cannot
+# even parse the root manifest's newer TOML syntax.
+[workspace]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "sync", "time", "rt", "macros"] }

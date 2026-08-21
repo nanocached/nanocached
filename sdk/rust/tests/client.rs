@@ -891,7 +891,7 @@ async fn a_response_header_without_a_terminator_is_rejected_instead_of_growing_u
         // socket open) — the client must give up on its own instead of
         // waiting for either more bytes or an EOF.
         let mut frame = b"V".to_vec();
-        frame.extend(std::iter::repeat(b'9').take(8192));
+        frame.extend(std::iter::repeat_n(b'9', 8192));
         let _ = stream.get_mut().write_all(&frame).await;
         std::future::pending::<()>().await;
     });
