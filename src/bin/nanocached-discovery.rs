@@ -32,9 +32,11 @@
 //!                             see ADR-0010, replicas never reconcile
 //!                             membership with each other); unlike
 //!                             membership, replication factor is static
-//!                             config, so a recorded mismatch makes this
-//!                             replica refuse `L` until it clears — see
-//!                             below. Response: `A\n`.
+//!                             config, so a recorded mismatch — once it
+//!                             becomes a strict majority of voting nodes,
+//!                             not merely one — makes this replica refuse
+//!                             `L` until it clears — see below. Response:
+//!                             `A\n`.
 //!
 //!   L\n                       List currently `Joined` nodes. Response:
 //!                             `N <count> <replication>\n` (the replication
@@ -45,14 +47,18 @@
 //!                             entry. `name` (ADR-0009) is what hash-ring
 //!                             computations use; `addr` is only for opening
 //!                             a connection. Refused with
-//!                             `B\n` (connection then closed) if any
-//!                             currently-`Joined` node's last heartbeat
-//!                             reported a replication factor different
-//!                             from this replica's own (issue #30) — this
-//!                             replica's `config.replication`, which this
-//!                             response embeds, is then a value known to
-//!                             disagree with what some node in the
-//!                             cluster learned elsewhere.
+//!                             `B\n` (connection then closed) if a STRICT
+//!                             MAJORITY of currently-`Joined` nodes whose
+//!                             last heartbeat reported a replication-
+//!                             factor belief disagree with this replica's
+//!                             own (issue #30, amended: not merely "any",
+//!                             which would let one misconfigured or
+//!                             behind-the-times node deny `L` to the whole
+//!                             cluster by itself) — a tie does not refuse.
+//!                             This replica's `config.replication`, which
+//!                             this response embeds, is then a value known
+//!                             to disagree with what most of the cluster
+//!                             learned elsewhere.
 //!
 //!   J <name-length> <port> <token-length>\n<name><token>   Ask to join
 //!                             (ADR-0008), declaring the node's own name
@@ -141,11 +147,13 @@
 //! it opened with `J`, which discovery holds open the whole time; the
 //! registry entry is dropped if that connection dies before promotion. A
 //! `Waiting` node is additionally dropped (and its connection closed) if it
-//! goes unpromoted past `waiting_timeout_for`, and one source address may
-//! only hold `MAX_WAITING_PER_SOURCE_IP` such registrations at once —
-//! otherwise, with authentication unset, a `J` under a fresh unverifiable
-//! name always succeeds, so nothing would stop one source from parking
-//! `MAX_CONNECTIONS` fake registrations forever. A `Joined` node that stops
+//! goes unpromoted past `waiting_timeout_for`, one source address may only
+//! hold `MAX_WAITING_PER_SOURCE_IP` such registrations at once, and no more
+//! than `MAX_WAITING_TOTAL` may be outstanding cluster-wide — otherwise,
+//! with authentication unset, a `J` under a fresh unverifiable name always
+//! succeeds, so nothing would stop one source (or many sources acting in
+//! concert) from parking `MAX_CONNECTIONS` fake registrations forever. A
+//! `Joined` node that stops
 //! sending heartbeats is dropped once
 //! `--liveness-timeout` has elapsed since its last heartbeat; no explicit
 //! "leave" message is required, so this covers both graceful shutdown and
@@ -167,6 +175,7 @@ use std::io::BufReader;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -279,6 +288,21 @@ const WAITING_TIMEOUT_MARGIN: Duration = Duration::from_secs(60);
 /// this many nodes from one address at once, but well above the 1 a
 /// single legitimate node ever needs.
 const MAX_WAITING_PER_SOURCE_IP: usize = 4;
+/// Global cap on concurrent `Waiting`/`Joining` registrations, across every
+/// source address (issue: join-queue starvation — `MAX_WAITING_PER_SOURCE_IP`
+/// alone only bounds how many one source can hold, not how deep the queue
+/// can get in total; many distinct sources, each within their own per-IP
+/// cap, could still queue enough nodes behind each other that a late
+/// arrival's `waiting_timeout_for` bound — scaled by queue position —
+/// stretches implausibly long before `sweep_expired` gives up on it. Only
+/// a genuinely new name counts against this, exactly like
+/// `MAX_WAITING_PER_SOURCE_IP` — a duplicate `J` reusing an existing entry
+/// must not double-count. Far above any realistic number of nodes
+/// legitimately joining a cluster at once, but small enough that even the
+/// deepest permitted queue keeps `waiting_timeout_for`'s worst case (see
+/// `MAX_WAITING_TIMEOUT_POSITIONS`, which bounds it independently of this
+/// constant) in a sane range. See `start_join`.
+const MAX_WAITING_TOTAL: usize = 32;
 /// Bounds how long a `Waiting` node's `J` connection is held open before
 /// discovery gives up on it and closes it (issue: see
 /// `MAX_WAITING_PER_SOURCE_IP` — the cap alone still lets a handful of
@@ -300,9 +324,26 @@ const MAX_WAITING_PER_SOURCE_IP: usize = 4;
 /// like a timeout it never actually earned).
 fn waiting_timeout_for(queue_position: usize) -> Duration {
     MIGRATION_TIMEOUT_MAX
-        .saturating_mul(queue_position.min(u32::MAX as usize) as u32)
+        .saturating_mul(queue_position.min(MAX_WAITING_TIMEOUT_POSITIONS) as u32)
         .saturating_add(WAITING_TIMEOUT_MARGIN)
 }
+/// Caps the queue-position multiplier `waiting_timeout_for` applies
+/// (issue: join-queue starvation — `MAX_WAITING_TOTAL` bounds the queue's
+/// concurrent *size*, but nothing previously bounded how long a single
+/// node queued deep within that allowance might have to wait for its own
+/// turn; the multiplier scaled with `queue_position` unconditionally, so
+/// the bound grew without limit as the queue got deeper). Below
+/// `MAX_WAITING_TOTAL` on purpose: even the deepest permitted queue then
+/// has a fixed worst case —
+/// `MAX_WAITING_TIMEOUT_POSITIONS * MIGRATION_TIMEOUT_MAX +
+/// WAITING_TIMEOUT_MARGIN` (about 16 hours at the current constants),
+/// rather than `MAX_WAITING_TOTAL * MIGRATION_TIMEOUT_MAX` (about 64
+/// hours) — a range an operator would consider the join simply failed
+/// long before `sweep_expired` ever gave up on it. A node queued behind
+/// more than `MAX_WAITING_TIMEOUT_POSITIONS - 1` others is still served
+/// in order — this only clamps how long it's willing to keep waiting
+/// before giving up and letting its own `J` connection be reclaimed.
+const MAX_WAITING_TIMEOUT_POSITIONS: usize = 8;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounds how long a connection may hold one of `MAX_CONNECTIONS` open
 /// without ever successfully parsing a single complete command (issue:
@@ -392,13 +433,15 @@ struct NodeInfo {
     /// The replication factor this node last reported believing, via
     /// `H`'s `r` field (issue #30) — `None` until its first heartbeat
     /// that reports one (a node that hasn't sent an ADR-0011 handoff `M`
-    /// yet has no belief to report). Unlike membership, replication
-    /// factor is static operator config: the `L` handler refuses to
-    /// serve `config.replication` while any currently-`Joined` node's
-    /// value here disagrees with it. Overwritten on every heartbeat, so
-    /// a past mismatch is cleared the moment the node reports a matching
-    /// value again; removed along with the rest of a departed node's
-    /// entry.
+    /// yet has no belief to report, and so does not vote — see below).
+    /// Unlike membership, replication factor is static operator config:
+    /// the `L` handler refuses to serve `config.replication` only once a
+    /// STRICT MAJORITY of `Joined` nodes with a non-`None` value here
+    /// disagree with it (issue #30 amendment — a lone dissenter must not
+    /// be able to deny `L` to the whole cluster by itself). Overwritten
+    /// on every heartbeat, so a past mismatch is cleared the moment the
+    /// node reports a matching value again; removed along with the rest
+    /// of a departed node's entry.
     reported_replication: Option<usize>,
     /// The node's per-process membership token (issue #34): a random
     /// value generated alongside its name (ADR-0009) and presented on
@@ -424,6 +467,22 @@ struct NodeInfo {
     /// recomputed as the queue drains; see `waiting_timeout_for` for why.
     /// Only meaningful while `state` is `Waiting`.
     queue_position: usize,
+    /// The id (`next_connection_id`) of the connection currently recorded
+    /// as owning this registration — i.e. whichever `J` most recently
+    /// (re-)established or reused it. Only meaningful while `state` is
+    /// `Waiting`/`Joining`, same as `waiting_since`/`queue_position` above
+    /// (issue #3/#9: `on_node_connection_ended`, previously keyed only by
+    /// name, couldn't tell a duplicate `J`'s now-superseded original
+    /// connection dying — harmless, since the newer connection is still
+    /// live and this node's join must proceed normally — from this node's
+    /// only connection dying, which must remove the entry / abandon a join
+    /// it owns. `start_join` overwrites this on every accepted `J` for the
+    /// name, including a duplicate reusing an existing entry, so it always
+    /// names the most recent connection). Defaults to `0`, which
+    /// `next_connection_id` never hands out (it starts at 1) — the
+    /// sentinel for an entry no live connection currently owns, e.g. one
+    /// `P` (Announce) created directly, or a test constructs directly.
+    owner_connection_id: u64,
 }
 
 impl NodeInfo {
@@ -451,8 +510,25 @@ impl NodeInfo {
             token,
             waiting_since: Instant::now(),
             queue_position,
+            owner_connection_id: 0,
         }
     }
+}
+
+/// Source of unique per-accepted-connection ids (issue #3/#9), consumed by
+/// `NodeInfo::owner_connection_id` to tell which of possibly several
+/// connections registered under the same name (a duplicate `J`, issue #7)
+/// is the one currently live — see `on_node_connection_ended`. A single
+/// global counter rather than something threaded through
+/// `ConnectionConfig`/`ClusterState`: there's no state to share besides
+/// monotonically increasing values, exactly one of which every accepted
+/// connection needs for the life of the process. Starts at 1, not 0: `0`
+/// is `NodeInfo::owner_connection_id`'s default/no-owner sentinel, so it
+/// must never be handed out to a real connection.
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_connection_id() -> u64 {
+    NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Keyed by name (ADR-0009's random per-process node identity), not
@@ -1733,13 +1809,21 @@ enum JoinRejection {
     /// `Waiting`/`Joining` registrations outstanding (issue: unauthenticated
     /// `J` connection exhaustion — see `MAX_WAITING_PER_SOURCE_IP`).
     TooManyWaitingFromSource,
+    /// `MAX_WAITING_TOTAL` `Waiting`/`Joining` registrations are already
+    /// outstanding cluster-wide (issue: join-queue starvation — see
+    /// `MAX_WAITING_TOTAL`).
+    TooManyWaitingTotal,
 }
 
 /// Registers `name` as `Waiting` with `address` (a no-op if it's already
 /// registered — this must not downgrade a node already past `Waiting`)
 /// and attempts to start it toward `Joined` immediately. Returns the
 /// `Notify` its connection should hold open and wait on for promotion, or
-/// a `JoinRejection` if it didn't register this node at all.
+/// a `JoinRejection` if it didn't register this node at all. `connection_id`
+/// (issue #3/#9, `next_connection_id`) is recorded as the registration's
+/// current owner regardless of whether this call creates a fresh entry or
+/// reuses an existing one (a duplicate `J`) — see
+/// `NodeInfo::owner_connection_id`.
 #[allow(clippy::too_many_arguments)]
 async fn start_join(
     registry: &Registry,
@@ -1750,6 +1834,7 @@ async fn start_join(
     name: &str,
     address: String,
     token: String,
+    connection_id: u64,
 ) -> Result<Arc<Notify>, JoinRejection> {
     let promoted = {
         let mut guard = lock(registry);
@@ -1786,6 +1871,21 @@ async fn start_join(
         // the *last* `:`, which lands on the port separator even for an
         // IPv6 address that itself contains colons.
         if !guard.contains_key(name) {
+            // Issue: join-queue starvation — checked before the per-source
+            // cap below so a source still under its own `
+            // MAX_WAITING_PER_SOURCE_IP` allowance can't keep registering
+            // once the cluster-wide queue is already as deep as
+            // `MAX_WAITING_TOTAL` permits; see that constant's own doc
+            // comment. Only a genuinely new name counts, same rationale as
+            // the per-source cap just below.
+            let waiting_total = guard
+                .values()
+                .filter(|info| info.state != NodeState::Joined)
+                .count();
+            if waiting_total >= MAX_WAITING_TOTAL {
+                return Err(JoinRejection::TooManyWaitingTotal);
+            }
+
             let source_ip = address
                 .rsplit_once(':')
                 .map_or(address.as_str(), |(ip, _)| ip);
@@ -1837,6 +1937,12 @@ async fn start_join(
         let info = guard.entry(name.to_string()).or_insert_with(|| {
             NodeInfo::with_queue_position(address, NodeState::Waiting, token, queue_position)
         });
+        // Issue #3/#9: unconditionally overwritten on every accepted `J`
+        // for this name — including a duplicate reusing an existing
+        // Waiting/Joining entry — so this always names the most recently
+        // accepted connection as the owner, never a stale one. See
+        // `NodeInfo::owner_connection_id`.
+        info.owner_connection_id = connection_id;
         Arc::clone(&info.promoted)
     };
 
@@ -1938,12 +2044,25 @@ async fn handle_complete(
 }
 
 /// Called whenever any node's connection to discovery ends (cleanly or
-/// not), by name. A Waiting/Joining node has no liveness signal besides
+/// not), by name and by that connection's own id (`next_connection_id`,
+/// issue #3/#9). A Waiting/Joining node has no liveness signal besides
 /// this one connection (see `NodeInfo::promoted`'s doc comment), so its
 /// registry entry is removed outright; a `Joined` node keeps relying on
 /// `sweep_expired`'s timeout instead, since an ordinary connection
 /// hiccup — reconnecting for the next heartbeat, say — shouldn't evict it
 /// (this fires once per connection, not once per heartbeat).
+///
+/// This is a no-op — no removal, no `abandon_current_join` — unless
+/// `connection_id` matches `NodeInfo::owner_connection_id`, i.e. this was
+/// the connection currently recorded as owning `name`'s registration
+/// (issue #3/#9: a node re-dials with a duplicate `J` — a supported
+/// scenario, issue #7/#9 — and `start_join` hands ownership to the new
+/// connection immediately; when the OLDER, now-superseded connection
+/// later notices it's dead and reports in here, that must not disturb a
+/// registration — or an in-progress join — the newer, still-live
+/// connection now owns. Keyed only by name, this used to abandon a
+/// perfectly healthy in-progress join whenever that stale connection
+/// finally got around to closing).
 ///
 /// If `name` turns out to be the current join's own Waiting/Joining
 /// node — it died mid-handoff, its only liveness signal gone — the whole
@@ -1967,18 +2086,16 @@ async fn on_node_connection_ended(
     tls_connector: &Option<TlsConnector>,
     replication: usize,
     name: &str,
+    connection_id: u64,
 ) {
-    let removed = {
+    let (removed, owns_entry) = {
         let mut guard = lock(registry);
-        let was_waiting_or_joining = guard
-            .get(name)
-            .is_some_and(|info| info.state != NodeState::Joined);
+        let owns_entry = guard.get(name).is_some_and(|info| {
+            info.state != NodeState::Joined && info.owner_connection_id == connection_id
+        });
 
-        if was_waiting_or_joining {
-            guard.remove(name)
-        } else {
-            None
-        }
+        let removed = if owns_entry { guard.remove(name) } else { None };
+        (removed, owns_entry)
     };
 
     if let Some(info) = removed {
@@ -1995,12 +2112,15 @@ async fn on_node_connection_ended(
         info.promoted.notify_one();
     }
 
-    // Only the current join's own Waiting/Joining node dying abandons it
-    // here — see this function's doc comment for why a ready member's
-    // connection dying deliberately does not.
-    let is_current_joining_node = lock_current_join(current_join)
-        .as_ref()
-        .is_some_and(|pending| pending.joining_name == name);
+    // Only the current join's own Waiting/Joining node dying — and only
+    // when this ending connection was actually its recorded owner (see
+    // this function's own doc comment, issue #3/#9) — abandons it here.
+    // A ready member's connection dying deliberately never does, for the
+    // separate reason explained above.
+    let is_current_joining_node = owns_entry
+        && lock_current_join(current_join)
+            .as_ref()
+            .is_some_and(|pending| pending.joining_name == name);
 
     if is_current_joining_node {
         abandon_current_join(
@@ -2312,8 +2432,7 @@ async fn run(
                     connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
-                )
-                .await;
+                );
             }
         }
     }
@@ -2344,63 +2463,92 @@ async fn run(
     Ok(())
 }
 
-async fn dispatch_connection(
-    mut stream: TcpStream,
+fn dispatch_connection(
+    stream: TcpStream,
     address: SocketAddr,
     cluster_state: ClusterState,
     connection_limit: Arc<Semaphore>,
     config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
-) -> bool {
+) {
+    // Every request/response is small; without this, the kernel may delay
+    // small writes waiting to coalesce with more data (Nagle's algorithm).
     let _ = stream.set_nodelay(true);
 
-    // Checked before the (potentially expensive) TLS handshake below, not
-    // after: gating on the connection limit only once a handshake has
-    // already been paid for defeats its purpose as a resource-exhaustion
-    // guard under overload, since an unbounded number of handshakes could
-    // run concurrently while every one of them is ultimately rejected
-    // anyway.
-    let permit = match connection_limit.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            // A plain connection can still be told "busy" politely. A TLS
-            // client expects a handshake, not plaintext, on this socket —
-            // performing that handshake just to say "busy" is exactly the
-            // cost this early check exists to avoid, so just drop it.
-            if config.tls_acceptor.is_none()
-                && let Err(error) = stream.write_all(b"B\n").await
-            {
-                eprintln!("WARN failed to send busy response to {address}: {error}");
-            }
-
-            return false;
-        }
-    };
-
-    let stream: ServerStream = match &config.tls_acceptor {
-        Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
-            Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
-            Ok(Err(error)) => {
-                eprintln!("WARN TLS handshake with {address} failed: {error}");
-                return false;
-            }
-            Err(_) => {
-                eprintln!("WARN TLS handshake with {address} timed out");
-                return false;
-            }
-        },
-        None => MaybeTls::Plain(stream),
-    };
-
+    // CRITICAL — everything below (the connection-limit check, the TLS
+    // handshake, and the over-limit "Busy" reply) runs inside the spawned
+    // task, never inline here in `run`'s accept loop. This used to await
+    // the TLS handshake right here, before `connection_tasks.spawn`: with
+    // `#[tokio::main(flavor = "current_thread")]` there is only ever one
+    // OS thread driving every future, so a client that stalled its
+    // ClientHello blocked `run`'s `select!` — freezing new-connection
+    // accepts, shutdown detection, and connection-task reaping — for up
+    // to `TLS_HANDSHAKE_TIMEOUT` (10s). Mirrors `src/server.rs`'s own
+    // `dispatch_connection`; see its comments for more detail.
     connection_tasks.spawn(async move {
+        // Checked before the (potentially expensive) TLS handshake below,
+        // not after: gating on the connection limit only once a handshake
+        // has already been paid for defeats its purpose as a resource-
+        // exhaustion guard under overload, since an unbounded number of
+        // handshakes could otherwise run concurrently while every one of
+        // them is ultimately rejected anyway. Acquired *before* the
+        // handshake so a peer can't spend handshake CPU/fds past
+        // `MAX_CONNECTIONS` just by dialing and stalling — only a
+        // permit-holding connection ever performs one.
+        let permit = match connection_limit.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // A TLS-configured server has no plaintext channel to
+                // answer "Busy" on before the handshake completes — it
+                // just closes. A plaintext server can still reply on the
+                // raw stream.
+                if config.tls_acceptor.is_none() {
+                    let mut stream = stream;
+
+                    // Bound the write: a peer that never reads must not
+                    // leak this task by leaving the write pending
+                    // indefinitely.
+                    match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(b"B\n")).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("WARN failed to send busy response to {address}: {error}");
+                        }
+                        Err(_) => {
+                            eprintln!("WARN sending busy response to {address} timed out");
+                        }
+                    }
+                }
+
+                return;
+            }
+        };
+
+        let stream: ServerStream = match &config.tls_acceptor {
+            Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                Ok(Ok(tls_stream)) => MaybeTls::Tls(Box::new(tls_stream)),
+                Ok(Err(error)) => {
+                    eprintln!("WARN TLS handshake with {address} failed: {error}");
+                    return;
+                }
+                Err(_) => {
+                    eprintln!("WARN TLS handshake with {address} timed out");
+                    return;
+                }
+            },
+            None => MaybeTls::Plain(stream),
+        };
+
         let _connection_permit = permit;
-        // Written once this connection identifies itself via `J` (a plain
-        // client connection never does, and stays `None`) — read
+
+        // Written once this connection identifies itself via `J`/`P` (a
+        // plain client connection never does, and stays `None`) — read
         // afterward, regardless of how `handle_connection` exits, so
         // `on_node_connection_ended` runs uniformly instead of needing a
-        // cleanup call at every one of its internal return points.
-        let connection_name: Arc<std::sync::Mutex<Option<String>>> =
+        // cleanup call at every one of its internal return points. See
+        // `handle_connection`'s own doc comment on this parameter for why
+        // it carries a connection id alongside the name.
+        let connection_name: Arc<std::sync::Mutex<Option<(String, u64)>>> =
             Arc::new(std::sync::Mutex::new(None));
 
         let result = handle_connection(
@@ -2418,12 +2566,12 @@ async fn dispatch_connection(
             eprintln!("WARN connection error from {address}: {error}");
         }
 
-        let name = connection_name
+        let identity = connection_name
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
 
-        if let Some(name) = name {
+        if let Some((name, connection_id)) = identity {
             on_node_connection_ended(
                 &cluster_state.registry,
                 &cluster_state.current_join,
@@ -2431,12 +2579,11 @@ async fn dispatch_connection(
                 &config.tls_connector,
                 config.replication,
                 &name,
+                connection_id,
             )
             .await;
         }
     });
-
-    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2575,8 +2722,21 @@ async fn handle_connection(
     current_join: CurrentJoin,
     config: ConnectionConfig,
     mut shutdown_rx: watch::Receiver<bool>,
-    connection_name: Arc<std::sync::Mutex<Option<String>>>,
+    // Written once this connection identifies itself via `J`/`P` (a plain
+    // client connection never does, and stays `None`) — read afterward,
+    // regardless of how this function exits, so the caller's
+    // `on_node_connection_ended` cleanup runs uniformly instead of needing
+    // a call at every one of this function's internal return points.
+    // Carries the connection's own id (`next_connection_id`, issue #3/#9)
+    // alongside the name so that cleanup can tell this connection apart
+    // from a duplicate `J` that has since superseded it — see
+    // `NodeInfo::owner_connection_id`.
+    connection_name: Arc<std::sync::Mutex<Option<(String, u64)>>>,
 ) -> io::Result<()> {
+    // Issue #3/#9: this connection's own identity, established once here
+    // regardless of whether it ever sends a `J` — only actually consulted
+    // if it does (see the `Join` arm below and `connection_name` above).
+    let connection_id = next_connection_id();
     let mut received = BytesMut::new();
     // No secret configured means auth isn't required, so every connection
     // starts already authenticated.
@@ -2714,47 +2874,94 @@ async fn handle_connection(
                     return Ok(());
                 }
 
-                // Issue #30: refuse to serve `config.replication` (the R
-                // this response embeds) if any currently-`Joined` node's
-                // last heartbeat reported a different one — see
-                // `NodeInfo::reported_replication` and the heartbeat
-                // handler's comment above for why replication factor gets
-                // this treatment and membership doesn't. Same `B\n`-then-
-                // close shape as the startup-grace refusal just above:
-                // "can't serve you right now, retry" is exactly as
-                // appropriate here, since a client bootstrapping now would
-                // otherwise compute a replica set some node in the
-                // cluster already disagrees with.
-                // The mismatch guard and the served roster are read under
-                // one lock acquisition so they're a consistent snapshot: a
-                // concurrent heartbeat/leave can't slip between "no node
-                // disagrees on replication" and the roster we then serve,
-                // which would otherwise let a `B\n`-worthy state be served
-                // as a valid `N` list (or vice versa) for one request.
-                let (mismatched_replication, nodes) = {
+                // Issue #30 (amended, HIGH-severity follow-up): refuse to
+                // serve `config.replication` (the R this response embeds)
+                // when a strict MAJORITY of currently-`Joined` nodes that
+                // have reported a belief disagree with it — not merely
+                // "any" — see `NodeInfo::reported_replication` and the
+                // heartbeat handler's comment above for why replication
+                // factor gets this treatment and membership doesn't. A
+                // single dissenting node (a straggler that hasn't sent its
+                // own `M` yet, or one genuinely misconfigured) must not be
+                // able to DoS `L` for the whole cluster by itself — voting
+                // is the difference: this replica's own
+                // `--replication-factor` is only worth doubting once more
+                // reporting nodes have learned a different value than have
+                // confirmed this one, at which point it's this replica,
+                // not the dissenters, that's most likely the one that's
+                // wrong. A node that hasn't sent an ADR-0011 handoff `M`
+                // yet (`reported_replication` is `None`) doesn't vote
+                // either way. Same `B\n`-then-close shape as the
+                // startup-grace refusal just above: "can't serve you right
+                // now, retry" is exactly as appropriate here, since a
+                // client bootstrapping now would otherwise compute a
+                // replica set most of the cluster already disagrees with.
+                // The vote tally and the served roster are read under one
+                // lock acquisition so they're a consistent snapshot: a
+                // concurrent heartbeat/leave can't slip between "no
+                // majority disagrees on replication" and the roster we
+                // then serve, which would otherwise let a `B\n`-worthy
+                // state be served as a valid `N` list (or vice versa) for
+                // one request.
+                let (agreeing, dissenting, nodes) = {
                     let guard = lock(&registry);
-                    let mismatched = guard.values().any(|info| {
-                        info.state == NodeState::Joined
-                            && info
-                                .reported_replication
-                                .is_some_and(|r| r != config.replication)
-                    });
+                    let mut agreeing = 0usize;
+                    let mut dissenting: Vec<String> = Vec::new();
+                    for (name, info) in guard.iter() {
+                        if info.state != NodeState::Joined {
+                            continue;
+                        }
+                        match info.reported_replication {
+                            Some(r) if r == config.replication => agreeing += 1,
+                            Some(_) => dissenting.push(name.clone()),
+                            None => {}
+                        }
+                    }
                     let nodes: Vec<(String, String)> = guard
                         .iter()
                         .filter(|(_, info)| info.state == NodeState::Joined)
                         .map(|(name, info)| (name.clone(), info.address.clone()))
                         .collect();
-                    (mismatched, nodes)
+                    (agreeing, dissenting, nodes)
                 };
-                if mismatched_replication {
-                    eprintln!(
-                        "WARN refusing L: a Joined node's last heartbeat reported a \
-                         replication factor different from this replica's own \
-                         --replication-factor {} — discovery replicas have drifted out of \
-                         alignment; the operator must align --replication-factor across \
-                         every replica (see doc/adr/0010-*.md)",
-                        config.replication
-                    );
+                // A tie does not refuse: strictly more dissenters than
+                // agreers is required, so e.g. 1-vs-1 (or 0-vs-0, the
+                // common case) is served.
+                let refuse = dissenting.len() > agreeing;
+                if !dissenting.is_empty() {
+                    if refuse {
+                        eprintln!(
+                            "WARN refusing L: {} of {} voting Joined nodes report a \
+                             replication factor different from this replica's own \
+                             --replication-factor {} (a strict majority) — dissenting: {} — \
+                             discovery replicas have drifted out of alignment; the operator \
+                             must align --replication-factor across every replica (see \
+                             doc/adr/0010-*.md)",
+                            dissenting.len(),
+                            dissenting.len() + agreeing,
+                            config.replication,
+                            dissenting.join(", ")
+                        );
+                    } else {
+                        // Logged per request rather than rate-limited or
+                        // deduplicated against a remembered dissenter set:
+                        // simpler, and a persistent single dissenter — the
+                        // expected case this branch exists for — logs no
+                        // more often than `L` itself is called, which is
+                        // not a hot path.
+                        eprintln!(
+                            "WARN L served despite {} of {} voting Joined nodes reporting a \
+                             replication factor different from this replica's own \
+                             --replication-factor {} — not yet a strict majority, so still \
+                             served, but worth investigating: {}",
+                            dissenting.len(),
+                            dissenting.len() + agreeing,
+                            config.replication,
+                            dissenting.join(", ")
+                        );
+                    }
+                }
+                if refuse {
                     stream.write_all(b"B\n").await?;
                     return Ok(());
                 }
@@ -2777,6 +2984,7 @@ async fn handle_connection(
                     &name,
                     addr,
                     token,
+                    connection_id,
                 )
                 .await;
 
@@ -2830,13 +3038,25 @@ async fn handle_connection(
                              would exceed the node-side request cap",
                         ));
                     }
+                    Err(JoinRejection::TooManyWaitingTotal) => {
+                        eprintln!(
+                            "WARN rejected join for {name} from {peer_ip}: \
+                             {MAX_WAITING_TOTAL} Waiting/Joining registrations are already \
+                             outstanding cluster-wide"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "too many pending joins already registered cluster-wide",
+                        ));
+                    }
                 };
 
                 // Only now that the join is staged does this connection own
                 // `name`, so its death runs `on_node_connection_ended`.
                 *connection_name
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((name.clone(), connection_id));
 
                 wait_for_promotion(&mut stream, &registry, &name, promoted, shutdown_rx.clone())
                     .await?;
@@ -2931,10 +3151,16 @@ async fn handle_connection(
                 // the announce has actually been accepted does this
                 // connection own `name`, so its death runs
                 // `on_node_connection_ended` (see the rejection arms
-                // above for why not any earlier).
+                // above for why not any earlier). The connection id
+                // recorded here is never actually consulted — a `P`-
+                // registered node is always `Joined`, and
+                // `on_node_connection_ended` never removes a `Joined`
+                // entry regardless of ownership — but is included for
+                // uniformity with the `J` path.
                 *connection_name
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(name.clone());
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((name.clone(), connection_id));
 
                 stream.write_all(b"R\n").await?;
                 continue;
@@ -3354,6 +3580,29 @@ mod tests {
         assert!(waiting_timeout_for(1) < waiting_timeout_for(2));
     }
 
+    #[test]
+    fn waiting_timeout_for_saturates_at_max_waiting_timeout_positions() {
+        // Issue: join-queue starvation — without a cap on the multiplier,
+        // a deep queue's tail could wait an implausibly long multiple of
+        // `MIGRATION_TIMEOUT_MAX`. Positions at and beyond
+        // `MAX_WAITING_TIMEOUT_POSITIONS` must all get the same, capped
+        // bound rather than continuing to scale.
+        assert_eq!(
+            waiting_timeout_for(MAX_WAITING_TIMEOUT_POSITIONS),
+            MIGRATION_TIMEOUT_MAX * MAX_WAITING_TIMEOUT_POSITIONS as u32 + WAITING_TIMEOUT_MARGIN
+        );
+        assert_eq!(
+            waiting_timeout_for(MAX_WAITING_TIMEOUT_POSITIONS + 1),
+            waiting_timeout_for(MAX_WAITING_TIMEOUT_POSITIONS),
+            "a queue position past the cap must not keep scaling the bound"
+        );
+        assert_eq!(
+            waiting_timeout_for(MAX_WAITING_TOTAL),
+            waiting_timeout_for(MAX_WAITING_TIMEOUT_POSITIONS),
+            "even the deepest position MAX_WAITING_TOTAL permits stays at the cap"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn announce_insert_allowed_blocks_within_the_cooldown_then_allows_after() {
         let limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
@@ -3699,6 +3948,164 @@ mod tests {
             received_second.extend_from_slice(&chunk[..bytes_read]);
         }
         assert_eq!(received_second, expected_second);
+    }
+
+    /// A `Joined` `NodeInfo` with a given `reported_replication`, for the
+    /// majority-rule `L` tests below — built by direct field assignment
+    /// (bypassing a real heartbeat) since only the recorded belief, not
+    /// how it got there, matters to `L`'s vote tally.
+    fn joined_node_reporting(addr: &str, token: &str, reported: Option<usize>) -> NodeInfo {
+        let mut info = NodeInfo::new(addr.to_string(), NodeState::Joined, token.to_string());
+        info.reported_replication = reported;
+        info
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn l_is_served_despite_a_single_dissenter_among_a_majority() {
+        // HIGH-severity amendment to issue #30: one Joined node reporting
+        // a mismatched replication factor must not be able to deny `L` to
+        // the whole cluster by itself. Three nodes agree with this
+        // replica's R=2; one dissents (reports R=1) — not a strict
+        // majority, so `L` is still served.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        {
+            let mut guard = lock(&registry);
+            for i in 0..3 {
+                guard.insert(
+                    format!("agree-{i}"),
+                    joined_node_reporting(&format!("127.0.0.1:{}", 9000 + i), "tk-agree", Some(2)),
+                );
+            }
+            guard.insert(
+                "dissent-0".to_string(),
+                joined_node_reporting("127.0.0.1:9100", "tk-dissent-0", Some(1)),
+            );
+        }
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        client.write_all(b"L\n").await.unwrap();
+        let expected = b"N 4 2\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn l_refuses_when_dissenters_form_a_strict_majority() {
+        // Companion to the test above: two dissenting nodes (R=1) against
+        // only one agreeing node (R=2) IS a strict majority, so `L` must
+        // refuse exactly as the pre-amendment "any dissenter" rule did.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "agree-0".to_string(),
+                joined_node_reporting("127.0.0.1:9000", "tk-agree-0", Some(2)),
+            );
+            for i in 0..2 {
+                guard.insert(
+                    format!("dissent-{i}"),
+                    joined_node_reporting(
+                        &format!("127.0.0.1:{}", 9100 + i),
+                        "tk-dissent",
+                        Some(1),
+                    ),
+                );
+            }
+        }
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        client.write_all(b"L\n").await.unwrap();
+        let expected = b"B\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn l_is_served_on_a_tie_between_dissenters_and_agreeing_nodes() {
+        // A tie (one dissenter, one agreeing node) is NOT a strict
+        // majority, so `L` is still served — "more dissenters than
+        // agreers" is required, not "at least as many".
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "agree-0".to_string(),
+                joined_node_reporting("127.0.0.1:9000", "tk-agree-0", Some(2)),
+            );
+            guard.insert(
+                "dissent-0".to_string(),
+                joined_node_reporting("127.0.0.1:9100", "tk-dissent-0", Some(1)),
+            );
+        }
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        client.write_all(b"L\n").await.unwrap();
+        let expected = b"N 2 2\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
     }
 
     #[test]
@@ -4090,6 +4497,7 @@ mod tests {
             "joining-node",
             "127.0.0.1:9999".to_string(),
             "tk-joining-node".to_string(),
+            1,
         )
         .await;
 
@@ -4133,6 +4541,7 @@ mod tests {
                 &format!("attacker-{i}"),
                 "10.0.0.1:9000".to_string(),
                 format!("tk-attacker-{i}"),
+                (i + 1) as u64,
             )
             .await;
             assert!(result.is_ok(), "registration {i} should have been admitted");
@@ -4147,6 +4556,7 @@ mod tests {
             "attacker-overflow",
             "10.0.0.1:9000".to_string(),
             "tk-attacker-overflow".to_string(),
+            100,
         )
         .await;
         let Err(JoinRejection::TooManyWaitingFromSource) = rejected else {
@@ -4164,13 +4574,18 @@ mod tests {
             "legit-node",
             "10.0.0.2:9000".to_string(),
             "tk-legit-node".to_string(),
+            101,
         )
         .await;
         assert!(other_source.is_ok());
 
         // A duplicate `J` (issue #7) for a name the capped source already
         // holds, presenting the same token, reuses that entry rather than
-        // adding a new one, so it must not be blocked by its own cap.
+        // adding a new one, so it must not be blocked by its own cap. Uses
+        // a distinct connection id from the original registration's (`1`)
+        // — a real duplicate `J` always arrives on a new connection — to
+        // also exercise `start_join` overwriting `NodeInfo::
+        // owner_connection_id` on a reused entry (issue #3/#9).
         let retry = start_join(
             &registry,
             &current_join,
@@ -4180,6 +4595,102 @@ mod tests {
             "attacker-0",
             "10.0.0.1:9000".to_string(),
             "tk-attacker-0".to_string(),
+            102,
+        )
+        .await;
+        assert!(retry.is_ok());
+        assert_eq!(
+            lock(&registry)
+                .get("attacker-0")
+                .unwrap()
+                .owner_connection_id,
+            102,
+            "a duplicate J must take over ownership of the reused entry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_join_rejects_a_new_registration_once_the_global_waiting_cap_is_reached() {
+        // Issue: join-queue starvation — `MAX_WAITING_PER_SOURCE_IP` only
+        // bounds one source's own share of the queue; many distinct
+        // sources, each within their own allowance, could still queue the
+        // registry past any sane depth. `MAX_WAITING_TOTAL` caps the
+        // queue's total size regardless of how many distinct sources
+        // contribute to it. Uses distinct source IPs, each staying under
+        // `MAX_WAITING_PER_SOURCE_IP`, so only the global cap is at play.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        let mut connection_id = 0u64;
+        let sources = MAX_WAITING_TOTAL.div_ceil(MAX_WAITING_PER_SOURCE_IP);
+        let mut admitted = 0;
+        'sources: for source in 0..sources {
+            for slot in 0..MAX_WAITING_PER_SOURCE_IP {
+                if admitted >= MAX_WAITING_TOTAL {
+                    break 'sources;
+                }
+                connection_id += 1;
+                let result = start_join(
+                    &registry,
+                    &current_join,
+                    &None,
+                    &None,
+                    2,
+                    &format!("node-{source}-{slot}"),
+                    format!("10.0.{source}.1:9000"),
+                    format!("tk-node-{source}-{slot}"),
+                    connection_id,
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "registration {source}-{slot} should be admitted"
+                );
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, MAX_WAITING_TOTAL);
+
+        // One more, from a source that has never registered before (so
+        // only the global cap, not the per-source one, could be at play).
+        connection_id += 1;
+        let rejected = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "overflow-node",
+            "10.99.0.1:9000".to_string(),
+            "tk-overflow-node".to_string(),
+            connection_id,
+        )
+        .await;
+        let Err(JoinRejection::TooManyWaitingTotal) = rejected else {
+            panic!("expected a TooManyWaitingTotal rejection, got {rejected:?}");
+        };
+        assert!(!lock(&registry).contains_key("overflow-node"));
+
+        // A duplicate J for an already-registered name still succeeds —
+        // reusing an entry must not be blocked by the cap the same way a
+        // genuinely new registration is.
+        connection_id += 1;
+        let retry = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "node-0-0",
+            "10.0.0.1:9000".to_string(),
+            "tk-node-0-0".to_string(),
+            connection_id,
         )
         .await;
         assert!(retry.is_ok());
@@ -4448,6 +4959,14 @@ mod tests {
         // `Notify` across two parked connections; without waking it, the
         // connection that wasn't the one reported ended would hang in
         // `wait_for_promotion` forever.
+        //
+        // Also covers issue #3/#9's amendment: `start_join` hands
+        // ownership of the shared entry to whichever connection most
+        // recently `J`ed (see `NodeInfo::owner_connection_id`), so the
+        // *first* connection ending — now a stale, superseded owner — must
+        // be a no-op, and only the second (current owner) connection
+        // ending actually removes the entry and wakes the (now sole)
+        // surviving parked connection, the first.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
         // A different join already in progress, so node-b's own `J`
@@ -4498,6 +5017,11 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await; // let it park
 
+        // The first connection's own id, captured before the duplicate `J`
+        // below overwrites it — used below to simulate that connection
+        // (now stale) ending.
+        let stale_id = lock(&registry).get("node-b").unwrap().owner_connection_id;
+
         let (mut node_b_second, server_second) = tcp_pair().await;
         tokio::spawn(handle_connection(
             MaybeTls::Plain(server_second),
@@ -4515,15 +5039,56 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await; // let it park too
 
         assert!(lock(&registry).contains_key("node-b"));
+        let owning_id = lock(&registry).get("node-b").unwrap().owner_connection_id;
+        assert_ne!(
+            stale_id, owning_id,
+            "the duplicate J must have taken over ownership of the entry"
+        );
 
-        // Simulate the *first* connection dying, as `run`'s connection-task
-        // wrapper would report it.
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b").await;
+        // Issue #3/#9: the stale, superseded first connection reporting in
+        // — as `run`'s connection-task wrapper eventually would, once it
+        // notices that half-open connection is actually dead — must be a
+        // no-op. The entry, and the still-live second connection, survive.
+        on_node_connection_ended(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "node-b",
+            stale_id,
+        )
+        .await;
+        assert!(
+            lock(&registry).contains_key("node-b"),
+            "a stale, superseded connection's own id must not remove the entry"
+        );
+        let mut probe = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), node_b_second.read(&mut probe))
+                .await
+                .is_err(),
+            "the surviving connection must not have been woken by the stale no-op"
+        );
 
-        // The still-open second connection must observe the registry
-        // entry is gone and close, not hang forever.
+        // Now the connection actually recorded as owning the entry (the
+        // second) ends for real: this must remove the entry and wake every
+        // parked connection sharing its `Notify` — including the first,
+        // which is still open and parked even though it's no longer the
+        // owner (issue #9's original regression).
+        on_node_connection_ended(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            "node-b",
+            owning_id,
+        )
+        .await;
+
         let mut byte = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(5), node_b_second.read(&mut byte))
+        let read = tokio::time::timeout(Duration::from_secs(5), node_b_first.read(&mut byte))
             .await
             .expect("the surviving duplicate connection was stranded");
         assert_eq!(
@@ -4531,6 +5096,7 @@ mod tests {
             0,
             "expected the connection to close, not data"
         );
+        assert!(!lock(&registry).contains_key("node-b"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5323,7 +5889,7 @@ mod tests {
         let (_first_client, first_server) = tcp_pair().await;
         let first_address = first_server.peer_addr().unwrap();
 
-        let first_connection = dispatch_connection(
+        dispatch_connection(
             first_server,
             first_address,
             cluster_state.clone(),
@@ -5339,16 +5905,18 @@ mod tests {
             },
             shutdown_rx.clone(),
             &mut connection_tasks,
-        )
-        .await;
+        );
 
-        assert!(first_connection);
+        // CRITICAL fix: the connection-limit check now runs inside the
+        // spawned task, not inline here — let it run far enough to take
+        // the sole permit and settle into its read loop.
+        tokio::task::yield_now().await;
         assert_eq!(connection_limit.available_permits(), 0);
 
         let (mut second_client, second_server) = tcp_pair().await;
         let second_address = second_server.peer_addr().unwrap();
 
-        let second_connection = dispatch_connection(
+        dispatch_connection(
             second_server,
             second_address,
             cluster_state,
@@ -5364,14 +5932,13 @@ mod tests {
             },
             shutdown_rx,
             &mut connection_tasks,
-        )
-        .await;
+        );
 
-        assert!(!second_connection);
-
-        let mut response = [0u8; 2];
-        second_client.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"B\n");
+        // Reading to EOF drives the over-limit task to completion: it
+        // replies "Busy" and closes without ever acquiring a permit.
+        let mut response = Vec::new();
+        second_client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"B\n");
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -5635,8 +6202,7 @@ mod tests {
                 config,
                 shutdown_rx,
                 &mut connection_tasks,
-            )
-            .await;
+            );
 
             while connection_tasks.join_next().await.is_some() {}
         });
@@ -5685,6 +6251,96 @@ mod tests {
         let connector = TlsConnector::from(Arc::new(client_config));
 
         (acceptor, connector)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_tls_handshake_does_not_block_a_second_connection() {
+        // CRITICAL regression: `dispatch_connection` used to run the
+        // connection-limit check and the TLS handshake inline, awaited
+        // before ever spawning the connection's task. With
+        // `#[tokio::main(flavor = "current_thread")]` (this process's
+        // actual runtime), that meant a client that stalled its
+        // ClientHello blocked `run`'s entire `select!` — accepts,
+        // shutdown detection, task reaping — for up to
+        // `TLS_HANDSHAKE_TIMEOUT`, since nothing else could run until that
+        // `.await` resolved. Both connections below are dispatched
+        // back-to-back with nothing awaited in between (exactly like two
+        // consecutive iterations of `run`'s accept loop would); if the fix
+        // regressed, the connection-limit-and-handshake work would again
+        // run inline in the second `dispatch_connection` call, and it
+        // wouldn't even start until the first connection's stalled
+        // handshake timed out 10s later, blowing the 2s bound below.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (acceptor, connector) = self_signed_tls_pair();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let cluster_state = ClusterState {
+            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            current_join: Arc::new(Mutex::new(None)),
+        };
+        let connection_limit = Arc::new(Semaphore::new(2));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: Some(acceptor),
+            tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+        };
+
+        let mut connection_tasks = JoinSet::new();
+
+        // Connection A: connects but never sends a ClientHello (or
+        // anything else) — its TLS handshake stalls until
+        // `TLS_HANDSHAKE_TIMEOUT`.
+        let _stalled_client = TcpStream::connect(address).await.unwrap();
+        let (stalled_stream, stalled_addr) = listener.accept().await.unwrap();
+        dispatch_connection(
+            stalled_stream,
+            stalled_addr,
+            cluster_state.clone(),
+            Arc::clone(&connection_limit),
+            config.clone(),
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        );
+
+        // Connection B: dispatched immediately after, with nothing
+        // awaited in between — must still be served promptly.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), async {
+            let served_client = TcpStream::connect(address).await.unwrap();
+            let (served_stream, served_addr) = listener.accept().await.unwrap();
+            dispatch_connection(
+                served_stream,
+                served_addr,
+                cluster_state,
+                connection_limit,
+                config,
+                shutdown_rx,
+                &mut connection_tasks,
+            );
+
+            let server_name = ServerName::try_from("localhost").unwrap();
+            let mut tls = connector.connect(server_name, served_client).await.unwrap();
+            tls.write_all(b"L\n").await.unwrap();
+
+            let expected = b"N 0 2\n";
+            let mut response = vec![0_u8; expected.len()];
+            tls.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, expected);
+        })
+        .await;
+
+        outcome
+            .expect("the second connection was never served — a stalled TLS handshake blocked it");
+
+        connection_tasks.abort_all();
+        while connection_tasks.join_next().await.is_some() {}
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5897,8 +6553,11 @@ mod tests {
         // (`report_complete`), never the heartbeat one, so this event
         // says nothing about node A's actual handoff progress — only
         // `sweep_expired`'s size-derived `migration_timeout_for` should
-        // ever reap a ready node that's truly gone (issue #10).
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-a").await;
+        // ever reap a ready node that's truly gone (issue #10). `0` is the
+        // matching connection id for a `NodeInfo` built directly by
+        // `NodeInfo::new` rather than through `start_join` (see
+        // `NodeInfo::owner_connection_id`'s doc comment).
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-a", 0).await;
 
         assert!(
             lock_current_join(&current_join).is_some(),
@@ -5958,10 +6617,98 @@ mod tests {
 
         // Node B (the joining node itself) disconnects before being
         // promoted (ADR-0008 pattern: the joining node dies mid-handoff).
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b").await;
+        // `0` matches the connection id `NodeInfo::new` defaults to for an
+        // entry built directly rather than through `start_join`.
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 0).await;
 
         ready_task.await.unwrap();
 
+        assert!(lock_current_join(&current_join).is_none());
+        assert!(!lock(&registry).contains_key("node-b"));
+
+        let mut expected_cancel = b"X 6 9\n".to_vec();
+        expected_cancel.extend_from_slice(b"tk-node-a");
+        expected_cancel.extend_from_slice(b"node-b");
+        assert_eq!(*received.lock().unwrap(), expected_cancel);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_duplicate_connection_dying_during_joining_does_not_abandon_the_join() {
+        // Regression for issue #3/#9 (MEDIUM): the joining node re-dials
+        // with a duplicate `J` (a supported scenario, issue #7/#9) while
+        // already `Joining` — its handoff in progress — and the newer
+        // connection takes over ownership of the registration (see
+        // `NodeInfo::owner_connection_id`). When the OLDER, now-
+        // superseded connection then finally notices it's dead and its
+        // teardown reports in, that must NOT abandon the still-healthy,
+        // in-progress join: it isn't the connection currently recorded as
+        // owning the entry.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+
+        let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ready_addr = ready_listener.local_addr().unwrap().to_string();
+        let received: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_task = Arc::clone(&received);
+        let ready_task = tokio::spawn(async move {
+            let (mut connection, _) = ready_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            received_task
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(ready_addr, NodeState::Joined, "tk-node-a".to_string()),
+        );
+        // node-b is Joining, currently owned by connection id 2 — as if
+        // it originally registered on connection 1 and then re-dialed
+        // with a duplicate J on connection 2, which `start_join` records
+        // as the new owner.
+        let mut node_b = NodeInfo::new(
+            "127.0.0.1:2".to_string(),
+            NodeState::Joining,
+            "tk-node-b".to_string(),
+        );
+        node_b.owner_connection_id = 2;
+        lock(&registry).insert("node-b".to_string(), node_b);
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        // The OLD connection (id 1, no longer the recorded owner) reports
+        // its own end — this must be a complete no-op.
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 1).await;
+
+        assert!(
+            lock_current_join(&current_join).is_some(),
+            "a stale, superseded connection dying must not abandon the in-progress join"
+        );
+        assert!(
+            lock(&registry).contains_key("node-b"),
+            "the joining node's registry entry must remain"
+        );
+        assert_eq!(
+            lock(&registry).get("node-b").unwrap().owner_connection_id,
+            2,
+            "ownership must still be the newer connection's, untouched by the no-op"
+        );
+
+        // The CURRENT owner (connection id 2) later ending for real still
+        // abandons the join normally — the fix only changes behavior for
+        // a non-owning connection.
+        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 2).await;
+        ready_task.await.unwrap();
         assert!(lock_current_join(&current_join).is_none());
         assert!(!lock(&registry).contains_key("node-b"));
 
