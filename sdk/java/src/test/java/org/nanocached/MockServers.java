@@ -207,16 +207,28 @@ final class MockServers {
 
         @Override
         public void close() throws IOException {
-            dropConnections();
+            // Listener first, then the accepted sockets: in the other
+            // order a connection accepted between the two steps outlives
+            // close() and its serve thread keeps answering from the
+            // (intact) store — seen on GitHub's ubuntu runners as a get
+            // against a "closed" node returning the stored value for
+            // seconds (reconnectCooldown* tests, 2026-08-21).
             server.close();
+            dropConnections();
         }
 
         private void acceptLoop() {
             while (!server.isClosed()) {
                 try {
                     Socket socket = server.accept();
-                    connectionCount.incrementAndGet();
                     sockets.add(socket);
+                    if (server.isClosed()) {
+                        // Raced close(): dropConnections() may already
+                        // have run, so this socket is ours to close.
+                        socket.close();
+                        return;
+                    }
+                    connectionCount.incrementAndGet();
                     Thread worker = new Thread(() -> serve(socket), "mock-node-conn");
                     worker.setDaemon(true);
                     worker.start();

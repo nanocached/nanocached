@@ -64,28 +64,10 @@ class NanocachedClientTest {
                 return failure;
             }
             if (System.nanoTime() > deadline) {
-                throw new AssertionError("timed out waiting for a get to fail against the closed node; "
-                        + "last get returned " + lastResult + "; stats=" + client.stats()
-                        + "; listeners on port " + port + ": " + listeners(port));
+                throw new AssertionError("timed out waiting for a get to fail against the closed node on port "
+                        + port + "; last get returned " + lastResult + "; stats=" + client.stats());
             }
             Thread.sleep(5);
-        }
-    }
-
-    /** Diagnostic only: what (if anything) is listening on {@code port},
-     * per `ss`, for the CI-only failure mode where a get keeps succeeding
-     * against a closed mock node. */
-    private static String listeners(int port) {
-        if (port < 0) return "(port unknown)";
-        try {
-            Process ss = new ProcessBuilder("sh", "-c", "ss -tlnp 2>/dev/null | grep ':" + port + " ' ; "
-                    + "ss -tnp 2>/dev/null | grep ':" + port + " '")
-                    .redirectErrorStream(true).start();
-            String out = new String(ss.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            ss.waitFor();
-            return out.isBlank() ? "(none)" : out.strip();
-        } catch (Exception e) {
-            return "(ss unavailable: " + e + ")";
         }
     }
 
@@ -536,15 +518,16 @@ class NanocachedClientTest {
                 // fast with a connection-refused error and starts the
                 // cooldown window for that address.
                 //
-                // Polled rather than asserted on the very first get: on
-                // GitHub's ubuntu runners this first call intermittently
-                // returned normally (~1 in 3 runs on main, 2026-08-21),
-                // i.e. the connection did not yet observe the closed
-                // node. The exact mechanism was not pinned down (it never
-                // reproduced locally, 25/25 clean on a 1-CPU Linux
-                // container), so the test only requires that the failure
-                // shows up promptly, which is all the cooldown assertions
-                // below depend on.
+                // Polled rather than asserted on the very first get: the
+                // first call after node.close() intermittently returned
+                // normally on GitHub's ubuntu runners (~1 in 3 runs on
+                // main, 2026-08-21) because MockNode.close() used to
+                // close the listener *after* the accepted sockets, leaving
+                // a connection accepted in between alive and answering.
+                // MockNode.close() now closes the listener first; the
+                // poll stays as a belt-and-braces guard, since all the
+                // cooldown assertions below need is that the failure
+                // shows up promptly.
                 NanocachedException.ConnectionFailed firstError = firstConnectionFailure(client, port);
 
                 // A listener now sits on the same port and answers
