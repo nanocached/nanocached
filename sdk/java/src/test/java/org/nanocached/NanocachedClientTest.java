@@ -43,6 +43,34 @@ class NanocachedClientTest {
         }
     }
 
+    /** Calls {@code get} until it fails with a {@link
+     * NanocachedException.ConnectionFailed} (see
+     * reconnectCooldownSkipsARedialToAKnownDeadAddress for why the first
+     * call after a node closes is not asserted on directly), returning
+     * that failure. */
+    private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client)
+            throws InterruptedException {
+        return firstConnectionFailure(client, -1);
+    }
+
+    private static NanocachedException.ConnectionFailed firstConnectionFailure(NanocachedClient client, int port)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        Object lastResult = null;
+        while (true) {
+            try {
+                lastResult = client.get("k");
+            } catch (NanocachedException.ConnectionFailed failure) {
+                return failure;
+            }
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("timed out waiting for a get to fail against the closed node on port "
+                        + port + "; last get returned " + lastResult + "; stats=" + client.stats());
+            }
+            Thread.sleep(5);
+        }
+    }
+
     /** Single-target connect, mirroring the removed connect(host, port) shorthand. */
     private static NanocachedClient connect(String host, int port) {
         return NanocachedClient.connect(single(host, port));
@@ -192,6 +220,14 @@ class NanocachedClientTest {
     }
 
     @Test
+    void reconnectCooldownStillRejectsNullOrNegative() {
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().reconnectCooldown(null));
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().reconnectCooldown(Duration.ofMillis(-1)));
+    }
+
+    @Test
     void pipelinesConcurrentRequestsOnOneConnection() throws Exception {
         // Same shape as the TypeScript SDK's own pipelining test: N
         // concurrent requests on a single connection, each independently
@@ -244,6 +280,24 @@ class NanocachedClientTest {
                     () -> NanocachedClient.connect(
                             single("127.0.0.1", node.port()).authSecret("wrong")));
             assertTrue(wrong.getMessage().contains("authentication failed"));
+        }
+    }
+
+    @Test
+    void emptyAuthSecretIsTreatedAsNoSecret() throws Exception {
+        // An empty authSecret is the same as none, matching the other
+        // SDKs (issue: audit finding): sent literally, an empty string
+        // would reach the wire as an explicit zero-length secret, which
+        // the server rejects (EmptySecret) and closes without replying —
+        // turning what should be "no auth configured" into an opaque
+        // ConnectionFailed instead of a normal connect against a
+        // no-auth-required server.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).authSecret(""))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
         }
     }
 
@@ -328,6 +382,23 @@ class NanocachedClientTest {
                 assertEquals(Optional.of(value), client.get("k"));
                 assertArrayEquals(value.getBytes(StandardCharsets.UTF_8), client.getBytes("k").orElseThrow());
             }
+        }
+    }
+
+    @Test
+    void rejectsANegativeCompressionThresholdAtConnect() throws Exception {
+        // A negative threshold would otherwise silently force every
+        // set() to attempt compression regardless of value size, since
+        // no value's length is ever less than a negative number (issue:
+        // audit finding; mirrors the Go SDK's identical Connect-time
+        // check). Rejected at connect() time, before any socket is
+        // touched, exactly like the empty-addresses-list check.
+        try (MockNode node = new MockNode()) {
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                    () -> NanocachedClient.connect(single("127.0.0.1", node.port())
+                            .compress(true)
+                            .compressionThreshold(-1)));
+            assertTrue(error.getMessage().contains("compressionThreshold"), error.getMessage());
         }
     }
 
@@ -446,8 +517,18 @@ class NanocachedClientTest {
                 // Nothing listens on `port` anymore, so this redial fails
                 // fast with a connection-refused error and starts the
                 // cooldown window for that address.
-                NanocachedException.ConnectionFailed firstError = assertThrows(
-                        NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                //
+                // Polled rather than asserted on the very first get: the
+                // first call after node.close() intermittently returned
+                // normally on GitHub's ubuntu runners (~1 in 3 runs on
+                // main, 2026-08-21) because MockNode.close() used to
+                // close the listener *after* the accepted sockets, leaving
+                // a connection accepted in between alive and answering.
+                // MockNode.close() now closes the listener first; the
+                // poll stays as a belt-and-braces guard, since all the
+                // cooldown assertions below need is that the failure
+                // shows up promptly.
+                NanocachedException.ConnectionFailed firstError = firstConnectionFailure(client, port);
 
                 // A listener now sits on the same port and answers
                 // immediately with bytes the identify handshake rejects
@@ -500,6 +581,107 @@ class NanocachedClientTest {
                             thirdError.getMessage());
                     assertEquals(1, connections.get(),
                             "the address was never redialed after the cooldown elapsed");
+
+                    for (java.net.Socket socket : acceptedSockets) socket.close();
+                }
+            }
+        }
+    }
+
+    @Test
+    void reconnectCooldownZeroMeansDefaultInsteadOfDisablingIt() throws Exception {
+        // Cross-SDK contract (issue: audit finding): Duration.ZERO means
+        // "use the default", matching the Go SDK's zero-value Config
+        // (whose ReconnectCooldown field, left unset, can't distinguish
+        // "not specified" from "explicitly zero") and the Rust SDK's
+        // Options::reconnect_cooldown. Previously, zero fell straight
+        // through to reconnectCooldownNanos, which effectively disabled
+        // the cooldown by accident (the cached entry's deadline was
+        // already in the past the moment it was recorded) rather than by
+        // the explicit opt-out disableReconnectCooldown() now provides.
+        try (MockNode node = new MockNode()) {
+            int port = node.port();
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", port).reconnectCooldown(Duration.ZERO))) {
+                client.set("k", "v");
+                node.close();
+                firstConnectionFailure(client, port);
+
+                java.util.concurrent.atomic.AtomicInteger connections =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                try (java.net.ServerSocket garbage = new java.net.ServerSocket(port)) {
+                    Thread acceptor = new Thread(() -> {
+                        while (!garbage.isClosed()) {
+                            try {
+                                java.net.Socket socket = garbage.accept();
+                                connections.incrementAndGet();
+                                socket.close();
+                            } catch (java.io.IOException stop) {
+                                return;
+                            }
+                        }
+                    }, "garbage-accept-zero-cooldown");
+                    acceptor.setDaemon(true);
+                    acceptor.start();
+
+                    // Immediately after the failure: with the default (not
+                    // disabled) 1s cooldown, this must be rejected from the
+                    // cached failure without a redial at all.
+                    assertThrows(NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                    assertEquals(0, connections.get(),
+                            "Duration.ZERO must select the default cooldown, not disable it");
+                }
+            }
+        }
+    }
+
+    @Test
+    void disableReconnectCooldownNeverCachesADialFailure() throws Exception {
+        // The Go SDK's equivalent of disableReconnectCooldown() is a
+        // negative Config.ReconnectCooldown; both mean every call that
+        // finds a dead connection pays its own full dial attempt,
+        // instead of ever reusing a cached failure the way the (now
+        // default-selecting) Duration.ZERO does.
+        try (MockNode node = new MockNode()) {
+            int port = node.port();
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", port).disableReconnectCooldown())) {
+                client.set("k", "v");
+                node.close();
+                // Timing: the closed node's FIN may not have reached the
+                // client's live connection yet on a loaded CI runner, in
+                // which case one more get can still be answered from the
+                // kernel buffers before the redial path (and its
+                // connection-refused failure) is ever taken — so poll
+                // until the failure shows up instead of asserting on the
+                // very first call.
+                firstConnectionFailure(client, port);
+
+                java.util.Set<java.net.Socket> acceptedSockets =
+                        java.util.concurrent.ConcurrentHashMap.newKeySet();
+                java.util.concurrent.atomic.AtomicInteger connections =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                try (java.net.ServerSocket garbage = new java.net.ServerSocket(port)) {
+                    Thread acceptor = new Thread(() -> {
+                        while (!garbage.isClosed()) {
+                            try {
+                                java.net.Socket socket = garbage.accept();
+                                connections.incrementAndGet();
+                                acceptedSockets.add(socket);
+                                socket.getOutputStream().write("XXX".getBytes(StandardCharsets.US_ASCII));
+                                socket.getOutputStream().flush();
+                            } catch (java.io.IOException stop) {
+                                return;
+                            }
+                        }
+                    }, "garbage-accept-disabled-cooldown");
+                    acceptor.setDaemon(true);
+                    acceptor.start();
+
+                    assertThrows(NanocachedException.class, () -> client.get("k"));
+                    assertThrows(NanocachedException.class, () -> client.get("k"));
+                    waitFor(() -> connections.get() >= 2,
+                            "every call to redial instead of reusing a cached failure");
 
                     for (java.net.Socket socket : acceptedSockets) socket.close();
                 }
@@ -830,6 +1012,24 @@ class NanocachedClientTest {
             NanocachedException error = assertThrows(NanocachedException.class,
                     () -> connect("127.0.0.1", discovery.port()));
             assertTrue(error.getMessage().contains("invalid node address"), error.getMessage());
+        }
+    }
+
+    @Test
+    void rejectsADiscoveryHeaderLineThatNeverTerminates() throws Exception {
+        // Regression (issue: audit finding): Identify.readLine had no cap
+        // at all — unlike Connection.java's own readLine, bounded by
+        // MAX_HEADER_LINE_LENGTH — so a malicious or buggy discovery
+        // server that streams bytes with no '\n' would grow the client's
+        // line buffer without bound (an OOM risk) instead of failing
+        // fast. Now shares Connection.MAX_HEADER_LINE_LENGTH (4096) and
+        // the same connection-lost exception type.
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.rawListResponse = "N " + "9".repeat(8192); // never terminates
+            NanocachedException.ConnectionFailed error = assertThrows(
+                    NanocachedException.ConnectionFailed.class,
+                    () -> connect("127.0.0.1", discovery.port()));
+            assertTrue(error.getMessage().contains("header line too long"), error.getMessage());
         }
     }
 
@@ -1170,6 +1370,65 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void connectFailureSurfacesTheRealFailureInsteadOfHanging() throws Exception {
+        // Part one of the teardown() regression below: force
+        // startKeepAlive() itself to throw (an invalid <= 0 period is
+        // rejected by scheduleAtFixedRate) after openCluster() has
+        // already succeeded and built replicaWriters/
+        // backgroundReplicaWritePermits — connect() must still surface
+        // that failure (not hang, not swallow it).
+        try (Cluster cluster = startCluster(1)) {
+            long defaultInterval = NanocachedClient.keepAliveIntervalMillis;
+            NanocachedClient.keepAliveIntervalMillis = 0;
+            try {
+                assertThrows(IllegalArgumentException.class,
+                        () -> connect("127.0.0.1", cluster.discovery().port()));
+            } finally {
+                NanocachedClient.keepAliveIntervalMillis = defaultInterval;
+            }
+        }
+    }
+
+    @Test
+    void teardownAlsoShutsDownReplicaWritersAndKeepAlive() throws Exception {
+        // Part two: connect()'s catch blocks have no way to hand back a
+        // half-built instance once they've thrown (see the previous
+        // test), so this exercises teardown() itself — the exact method
+        // those catch blocks call — directly on a normally-connected
+        // client. Regression (issue: audit finding): teardown() used to
+        // close only the connections, leaking replicaWriters (its daemon
+        // threads survive until the executor is GC'd) and its
+        // backgroundReplicaWritePermits whenever something after
+        // openCluster() failed, e.g. the startKeepAlive() failure above.
+        try (Cluster cluster = startCluster(1)) {
+            NanocachedClient client = connect("127.0.0.1", cluster.discovery().port());
+            try {
+                java.lang.reflect.Field replicaWritersField =
+                        NanocachedClient.class.getDeclaredField("replicaWriters");
+                replicaWritersField.setAccessible(true);
+                ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
+                assertFalse(replicaWriters.isShutdown());
+
+                java.lang.reflect.Field keepAliveField = NanocachedClient.class.getDeclaredField("keepAlive");
+                keepAliveField.setAccessible(true);
+                ExecutorService keepAlive = (ExecutorService) keepAliveField.get(client);
+                assertFalse(keepAlive.isShutdown());
+
+                java.lang.reflect.Method teardown = NanocachedClient.class.getDeclaredMethod("teardown");
+                teardown.setAccessible(true);
+                teardown.invoke(client);
+
+                assertTrue(replicaWriters.isShutdown(),
+                        "teardown() must shut down replicaWriters too, not just the connections");
+                assertTrue(keepAlive.isShutdown(),
+                        "teardown() must shut down keepAlive too, not just the connections");
+            } finally {
+                client.close();
+            }
+        }
+    }
+
     // ── read repair (doc/adr/0015-*.md) ────────────────────────────
 
     private static NanocachedClient connectWithReadRepair(int port) {
@@ -1214,6 +1473,14 @@ class NanocachedClientTest {
                 // permanently resurrect already-expired data — see
                 // READ_REPAIR_TTL_SECONDS.
                 assertEquals(60, cluster.nodes().get(owners.get(0)).lastSetTtl);
+                // Regression (issue: audit finding): tryReadRepair used to
+                // re-probe the primary too — the one owner already known
+                // to have missed by the normal read path — wasting a
+                // redundant GET on it. The primary must be probed exactly
+                // once: by getBytes()'s own read(), never again by
+                // tryReadRepair.
+                assertEquals(1, cluster.nodes().get(owners.get(0)).getCount.get(),
+                        "read repair must not re-probe the primary that just missed");
             }
         }
     }
@@ -1372,27 +1639,51 @@ class NanocachedClientTest {
         }
     }
 
+    // ── write() の結果優先順位 (issue: audit finding, finally-join) ──
+
+    // ConnectionOp is private, so write() is driven reflectively with a
+    // dynamic-proxy op — the same technique the pre-fix version of this
+    // suite used, kept and shared across the three tests below since
+    // they only differ in what the proxy does on each thread. The
+    // primary leg always runs on the caller's own thread; a replica leg
+    // (this cluster's replication is 2, so there is exactly one) runs on
+    // "nanocached-replica-writer" when it takes the synchronous-fallback
+    // path (fireAndForgetReplicas is off in every test below).
+
+    private static Class<?> connectionOpClass() throws ClassNotFoundException {
+        return Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+    }
+
+    private static java.lang.reflect.Method writeMethod() throws Exception {
+        java.lang.reflect.Method write =
+                NanocachedClient.class.getDeclaredMethod("write", byte[].class, connectionOpClass());
+        write.setAccessible(true);
+        return write;
+    }
+
+    private static boolean onReplicaWriterThread() {
+        return Thread.currentThread().getName().equals("nanocached-replica-writer");
+    }
+
     @Test
-    void aProgrammingErrorInAReplicaLegPropagatesInsteadOfBeingSwallowed() throws Exception {
-        // Regression for the catch narrowing at write()'s replica-leg
-        // swallow site (part of the stats()/ClientStats work): a
-        // programming bug must not be treated the same way as a dead
-        // replica. ConnectionOp is private, so this drives write()
-        // reflectively with a dynamic-proxy op that throws a
-        // ClassCastException specifically on the replica leg (identified
-        // by thread name — the primary leg runs on the caller's thread,
-        // replica legs on "nanocached-replica-writer").
+    void aReplicaLegBugDoesNotFailAWriteWhenThePrimarySucceeds() throws Exception {
+        // Regression: write()'s old `finally { pending.join(); }` let a
+        // replica leg's uncaught bug replace an already-successful
+        // primary result — turning a completed write into a thrown
+        // CompletionException. A genuine bug on a replica leg must never
+        // fail a write whose primary already succeeded; it's recorded
+        // instead (see aReplicaLegBugPropagatesWhenThePrimaryAlsoFails
+        // below for when it does propagate). Mirrors the TypeScript SDK's
+        // writeToOwners / the Python SDK's _write().
         try (Cluster cluster = startCluster(2)) {
             try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
-                byte[] key = "regression-key".getBytes(StandardCharsets.UTF_8);
+                byte[] key = "primary-ok-replica-bug".getBytes(StandardCharsets.UTF_8);
                 byte[] value = "v".getBytes(StandardCharsets.UTF_8);
-
-                Class<?> connectionOpClass = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
                 Object op = java.lang.reflect.Proxy.newProxyInstance(
-                        connectionOpClass.getClassLoader(),
-                        new Class<?>[] {connectionOpClass},
+                        connectionOpClass().getClassLoader(),
+                        new Class<?>[] {connectionOpClass()},
                         (proxy, method, methodArgs) -> {
-                            if (Thread.currentThread().getName().equals("nanocached-replica-writer")) {
+                            if (onReplicaWriterThread()) {
                                 throw new ClassCastException("injected programming bug");
                             }
                             Connection connection = (Connection) methodArgs[0];
@@ -1400,23 +1691,60 @@ class NanocachedClientTest {
                             return null;
                         });
 
-                java.lang.reflect.Method write =
-                        NanocachedClient.class.getDeclaredMethod("write", byte[].class, connectionOpClass);
-                write.setAccessible(true);
+                long before = client.stats().backgroundWriteBugs();
+                writeMethod().invoke(client, key, op); // must not throw
+                assertEquals(before + 1, client.stats().backgroundWriteBugs(),
+                        "the replica leg's bug must still be recorded even though the write succeeded");
+            }
+        }
+    }
+
+    @Test
+    void aReplicaLegBugPropagatesWhenThePrimaryAlsoFails() throws Exception {
+        // The other half of the same fix: when the primary ALSO fails, a
+        // genuine replica-leg bug takes precedence over the primary's own
+        // (expected) failure and propagates raw — as the bug itself
+        // (RuntimeException), never wrapped in a CompletionException, the
+        // one thing every exception this SDK throws must not be.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                byte[] key = "primary-fails-replica-bug".getBytes(StandardCharsets.UTF_8);
+                Object op = java.lang.reflect.Proxy.newProxyInstance(
+                        connectionOpClass().getClassLoader(),
+                        new Class<?>[] {connectionOpClass()},
+                        (proxy, method, methodArgs) -> {
+                            if (onReplicaWriterThread()) {
+                                throw new ClassCastException("injected programming bug");
+                            }
+                            throw new NanocachedException.ConnectionFailed(
+                                    "nanocached: simulated primary failure", null);
+                        });
 
                 java.lang.reflect.InvocationTargetException thrown = assertThrows(
                         java.lang.reflect.InvocationTargetException.class,
-                        () -> write.invoke(client, key, op));
+                        () -> writeMethod().invoke(client, key, op));
+                assertTrue(thrown.getCause() instanceof ClassCastException,
+                        "expected the raw replica-leg bug to propagate directly, got: " + thrown.getCause());
+            }
+        }
+    }
 
-                boolean sawClassCastException = false;
-                for (Throwable cause = thrown.getCause(); cause != null; cause = cause.getCause()) {
-                    if (cause instanceof ClassCastException) {
-                        sawClassCastException = true;
-                        break;
-                    }
-                }
-                assertTrue(sawClassCastException,
-                        "expected the injected ClassCastException to propagate, got: " + thrown.getCause());
+    @Test
+    void primaryErrorPropagatesWhenTheReplicaIsJustDeadNotBuggy() throws Exception {
+        // The primary's own error is still what propagates when nothing
+        // about the replica leg is a bug — a dead replica is an expected
+        // failure, swallowed inside the replica leg itself (counted via
+        // replicaWriteFailures) and never reaches the join-loop's bug
+        // handling at all.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "primary-fails-replica-dead";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                cluster.nodes().get(owners.get(0)).close();
+                cluster.nodes().get(owners.get(1)).close();
+                Thread.sleep(50);
+
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.set(key, "v"));
             }
         }
     }

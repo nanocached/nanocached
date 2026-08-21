@@ -35,6 +35,8 @@ class MockNode:
         self.unterminated_value_bytes_sent = 0
         self._stored_to_get_replies = 0
         self._malformed_status_replies = 0
+        self._missing_tag_replies = 0
+        self._invalid_tag_value_replies = 0
         self._get_delay = 0.0
         self._set_delay = 0.0
         self._silent = False
@@ -90,6 +92,20 @@ class MockNode:
         never LF, as a server that tagged a response on an untagged
         connection (or some other desync) would produce."""
         self._malformed_status_replies += 1
+
+    def answer_missing_tag_once(self) -> None:
+        """Reply to the next G on a *tagged* connection with the untagged
+        fixed form (`N\\n`, no trailing tag field) — a server that forgot
+        to tag its reply, or some other desync, would produce this."""
+        self._missing_tag_replies += 1
+
+    def answer_invalid_tag_value_once(self) -> None:
+        """Reply to the next G on a *tagged* connection with a `V` whose
+        tag field is non-numeric (`V 1 abc\\n1`) — exercises
+        Connection._parse_tag's invalid-value path (issue #47 audit
+        item 5), as opposed to answer_missing_tag_once's missing-field
+        desync above."""
+        self._invalid_tag_value_replies += 1
 
     def delay_next_get(self, seconds: float) -> None:
         """Hold the next G's response, so a test can abandon the request
@@ -203,6 +219,16 @@ class MockNode:
                         except (ConnectionError, OSError):
                             pass
                         return
+                    if self._missing_tag_replies > 0 and tagged:
+                        self._missing_tag_replies -= 1
+                        writer.write(b"N\n")
+                        await writer.drain()
+                        continue
+                    if self._invalid_tag_value_replies > 0 and tagged:
+                        self._invalid_tag_value_replies -= 1
+                        writer.write(b"V 1 abc\n1")
+                        await writer.drain()
+                        continue
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")

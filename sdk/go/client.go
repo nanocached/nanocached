@@ -159,14 +159,27 @@ const DefaultReconnectCooldown = time.Second
 // G1).
 const maxRequestBytes = 1024*1024 - 256
 
-// validateKey rejects an empty key before any network I/O: the server has
-// no way to answer a zero-length key request except by closing the
-// connection outright, silently poisoning every other request already
-// pipelined on that connection. Matches the style of the ttlSeconds < 0
-// check in SetBytes.
+// validateKey rejects an empty key, or one that alone already exceeds
+// maxRequestBytes, before any network I/O: the server has no way to
+// answer either shape except by closing the connection outright, silently
+// poisoning every other request already pipelined on that connection.
+// The size bound matters here specifically because GetBytes and Delete
+// call validateKey directly (they have no value to combine it with, unlike
+// validateKeyAndValue) — without it, an oversized key on GET/DELETE would
+// sail past client-side validation and only be caught by the server
+// slamming the connection shut (issue #47 audit item G1 follow-up; matches
+// protocol.ts's checkKey and client.py's _check_key, which both fold this
+// bound into the key-only validator rather than leaving it to the
+// key+value check alone). Matches the style of the ttlSeconds < 0 check in
+// SetBytes.
 func validateKey(key string) error {
 	if len(key) == 0 {
-		return fmt.Errorf("nanocached: key must not be empty")
+		return invalidArgument("nanocached: key must not be empty")
+	}
+	if len(key) > maxRequestBytes {
+		return invalidArgument(fmt.Sprintf(
+			"nanocached: key exceeds maxRequestBytes (%d bytes), got %d bytes",
+			maxRequestBytes, len(key)))
 	}
 	return nil
 }
@@ -180,9 +193,9 @@ func validateKeyAndValue(key string, valueLen int) error {
 		return err
 	}
 	if len(key)+valueLen > maxRequestBytes {
-		return fmt.Errorf(
+		return invalidArgument(fmt.Sprintf(
 			"nanocached: key (%d bytes) + value (%d bytes) exceeds the %d-byte request limit",
-			len(key), valueLen, maxRequestBytes)
+			len(key), valueLen, maxRequestBytes))
 	}
 	return nil
 }
@@ -642,7 +655,7 @@ func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 		return err
 	}
 	if ttlSeconds < 0 {
-		return fmt.Errorf("nanocached: ttlSeconds must not be negative, got %d", ttlSeconds)
+		return invalidArgument(fmt.Sprintf("nanocached: ttlSeconds must not be negative, got %d", ttlSeconds))
 	}
 	if err := c.beforeOperation(); err != nil {
 		return err
@@ -766,13 +779,20 @@ func (c *Client) ownerNames(key []byte) []string {
 // the failed request poisons the connection, the redial replaces it, and
 // the operation runs again. Safe because Get/Set/Delete are idempotent.
 // slot is "" in single mode.
+//
+// A malformed/unexpected response frame (ErrProtocol) poisons the
+// connection exactly the same way a genuine I/O failure does (see
+// connection.poison and readLoop) — only the error TYPE surfaced to a
+// caller differs between the two, not the "this connection is dead,
+// discard it" mechanics — so it gets the same retry-via-redial treatment
+// here as ErrConnectionLost.
 func (c *Client) applyReconnecting(slot string, op func(*connection) error) error {
 	conn, err := c.slotConnection(slot)
 	if err != nil {
 		return err
 	}
 	if err := op(conn); err != nil {
-		if !errors.Is(err, ErrConnectionLost) {
+		if !errors.Is(err, ErrConnectionLost) && !errors.Is(err, ErrProtocol) {
 			return err
 		}
 		conn, redialErr := c.slotConnection(slot)

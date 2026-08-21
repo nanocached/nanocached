@@ -57,27 +57,68 @@ public sealed class HashRing
     /// <summary>
     /// The key's owners: the <c>replicas</c> highest-scoring nodes,
     /// primary first. Returns fewer when the cluster is smaller.
+    ///
+    /// <para>Top-<c>replicas</c> selection via a bounded insertion of the
+    /// <c>replicas</c> best candidates seen so far (O(n * replicas))
+    /// instead of sorting every node (O(n log n)) — this runs per key
+    /// while the client's routing lock is held
+    /// (<see cref="NanocachedClient"/>'s <c>_stateLock</c>), and
+    /// <c>replicas</c> is typically small (a handful) next to the cluster
+    /// size, so this avoids paying for a full ranking this call only ever
+    /// uses the front of. Mirrors the Go SDK's <c>HashRing.Owners</c>
+    /// (sdk/go/hashring.go) and the Java SDK's PriorityQueue-based
+    /// approach (HashRing.java); produces the identical ordering a full
+    /// sort would (same comparator, <see cref="Less"/>), just without
+    /// sorting the nodes this call discards.</para>
     /// </summary>
     public IReadOnlyList<string> Owners(ReadOnlySpan<byte> key, int replicas)
     {
         ulong keyHash = Fnv1a(key);
+        int limit = Math.Min(replicas, _nodes.Length);
+        if (limit <= 0) return Array.Empty<string>();
 
-        var scored = new (ulong Score, string Node)[_nodes.Length];
+        // `top` holds the `limit` best candidates seen so far, sorted
+        // best-first; a better candidate is inserted in place, evicting
+        // the current worst kept candidate (top[^1]) once `top` is full.
+        var top = new List<(ulong Score, string Node)>(limit);
         for (int i = 0; i < _nodes.Length; i++)
         {
-            scored[i] = (Fmix64(_nodeHashes[i] ^ keyHash), _nodes[i]);
+            var candidate = (Fmix64(_nodeHashes[i] ^ keyHash), _nodes[i]);
+            if (top.Count == limit && !Less(candidate, top[^1]))
+            {
+                continue; // no better than the worst candidate currently kept
+            }
+
+            int pos = top.Count;
+            while (pos > 0 && Less(candidate, top[pos - 1]))
+            {
+                pos--;
+            }
+            if (top.Count < limit)
+            {
+                top.Add(default);
+            }
+            for (int j = top.Count - 1; j > pos; j--)
+            {
+                top[j] = top[j - 1];
+            }
+            top[pos] = candidate;
         }
 
-        // Descending by score; ties toward the lexicographically smaller
-        // name — a total order every implementation agrees on. Ordinal
-        // comparison, matching byte-wise ordering elsewhere.
-        Array.Sort(scored, (a, b) =>
-        {
-            int byScore = b.Score.CompareTo(a.Score);
-            return byScore != 0 ? byScore : string.CompareOrdinal(a.Node, b.Node);
-        });
+        var owners = new string[top.Count];
+        for (int i = 0; i < top.Count; i++) owners[i] = top[i].Node;
+        return owners;
+    }
 
-        return scored.Take(Math.Min(replicas, scored.Length)).Select(pair => pair.Node).ToArray();
+    /// <summary>Whether <paramref name="a"/> ranks strictly ahead of
+    /// <paramref name="b"/> in owner order: higher score wins; ties break
+    /// toward the lexicographically smaller name (ordinal comparison,
+    /// matching byte-wise ordering elsewhere) — a total order every
+    /// nanocached implementation agrees on.</summary>
+    private static bool Less((ulong Score, string Node) a, (ulong Score, string Node) b)
+    {
+        if (a.Score != b.Score) return a.Score > b.Score;
+        return string.CompareOrdinal(a.Node, b.Node) < 0;
     }
 
     /// <summary>The key's primary — <c>Owners(key, 1)[0]</c>.</summary>

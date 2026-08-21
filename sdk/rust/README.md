@@ -141,6 +141,16 @@ can't tell "not specified" apart from "explicitly zero"); call
 request that finds a dead connection pays its own full dial attempt) —
 the Go SDK's equivalent is a negative `Config.ReconnectCooldown`.
 
+Every `get`/`set`/`delete` also carries its own 30-second wall-clock
+timeout, measured from when that request is issued, so a half-open
+server (one that accepts the connection but stops answering) can't hang
+a caller forever. This is a deliberate difference from the Go SDK, whose
+timeout is connection-level and progress-based — it resets whenever any
+response arrives on the connection, not per request. Under deep
+pipelining against a slow-but-healthy server the two SDKs can therefore
+time out differently for the same workload; that's intentional, not a
+bug, in both SDKs.
+
 ## Authentication and TLS
 
 ```rust

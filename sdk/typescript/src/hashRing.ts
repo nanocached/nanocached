@@ -82,6 +82,13 @@ export class HashRing {
 
   /** The key's primary — `owners(key, 1)[0]`. */
   route(key: Uint8Array): string {
+    if (this.nodes.length === 0) {
+      // owners(key, 1) would silently return [] here, and [0] on that is
+      // `undefined` — a caller expecting a string back deserves a clear
+      // failure instead (issue #47 audit: this used to return `undefined`
+      // uncaught).
+      throw new RangeError("nanocached: cannot route on an empty hash ring");
+    }
     return this.owners(key, 1)[0];
   }
 }

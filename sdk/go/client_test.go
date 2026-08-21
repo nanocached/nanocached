@@ -512,11 +512,11 @@ func TestRejectsANegativeTtl(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.Set("k", "v", -1); err == nil {
-		t.Fatal("negative ttl accepted")
+	if err := client.Set("k", "v", -1); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("negative ttl accepted, err = %v, want ErrInvalidArgument", err)
 	}
-	if err := client.SetBytes("k", []byte("v"), -1); err == nil {
-		t.Fatal("negative ttl accepted (SetBytes)")
+	if err := client.SetBytes("k", []byte("v"), -1); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("negative ttl accepted (SetBytes), err = %v, want ErrInvalidArgument", err)
 	}
 	if err := client.Set("k", "v", 60); err != nil {
 		t.Fatal(err)
@@ -540,19 +540,53 @@ func TestRejectsAnEmptyKeyAndOversizedRequestWithoutTouchingTheNetwork(t *testin
 	}
 	defer client.Close()
 
-	if _, _, err := client.GetBytes(""); err == nil {
-		t.Fatal("empty key accepted by GetBytes")
+	if _, _, err := client.GetBytes(""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty key accepted by GetBytes, err = %v, want ErrInvalidArgument", err)
 	}
-	if err := client.SetBytes("", []byte("v"), 0); err == nil {
-		t.Fatal("empty key accepted by SetBytes")
+	if err := client.SetBytes("", []byte("v"), 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty key accepted by SetBytes, err = %v, want ErrInvalidArgument", err)
 	}
-	if _, err := client.Delete(""); err == nil {
-		t.Fatal("empty key accepted by Delete")
+	if _, err := client.Delete(""); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("empty key accepted by Delete, err = %v, want ErrInvalidArgument", err)
 	}
 
 	oversized := make([]byte, 1024*1024)
-	if err := client.SetBytes("k", oversized, 0); err == nil {
-		t.Fatal("oversized key+value accepted by SetBytes")
+	if err := client.SetBytes("k", oversized, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized key+value accepted by SetBytes, err = %v, want ErrInvalidArgument", err)
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (validation must reject before any network I/O)", got)
+	}
+}
+
+// TestRejectsAnOversizedKeyOnGetAndDelete is the GET/DELETE half of the
+// fix for issue #47 audit item G1's follow-up: validateKey previously only
+// rejected an empty key, so an oversized key (with no value to trip
+// validateKeyAndValue's combined check) sailed past client-side validation
+// on GetBytes/Delete, got serialized onto the wire, and only then hit the
+// server's own request cap — which rejects it by silently closing the
+// connection, poisoning every other request pipelined behind it. This must
+// be caught before any network I/O, exactly like the empty-key and
+// oversized-key+value cases above.
+func TestRejectsAnOversizedKeyOnGetAndDelete(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	oversizedKey := string(make([]byte, maxRequestBytes+1))
+
+	if _, _, err := client.GetBytes(oversizedKey); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized key accepted by GetBytes, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, _, err := client.Get(oversizedKey); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized key accepted by Get, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := client.Delete(oversizedKey); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized key accepted by Delete, err = %v, want ErrInvalidArgument", err)
 	}
 
 	if got := node.connectionCount.Load(); got != 1 {
@@ -1231,9 +1265,11 @@ func TestConnectingToASilentServerFailsWithinTheDeadline(t *testing.T) {
 }
 
 func TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently(t *testing.T) {
-	// Regression for issue #8/#12: a garbage V header is
-	// connection-classified, so the built-in redial-and-retry-once makes
-	// the same call succeed, never serving stray bytes.
+	// Regression for issue #8/#12: a garbage V header is protocol-
+	// classified (issue #47 audit item G4 — see ErrProtocol), and
+	// applyReconnecting's redial-and-retry-once treats that the same as a
+	// connection-level failure, so the same call still succeeds, never
+	// serving stray bytes.
 	node := startMockNode(t, nil)
 	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
 	if err != nil {
@@ -1251,6 +1287,64 @@ func TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently(t *tes
 	}
 	if node.connectionCount.Load() != 2 {
 		t.Fatalf("connections = %d", node.connectionCount.Load())
+	}
+}
+
+// TestAMalformedFrameSurfacesAsErrProtocolNotErrConnectionLost is the
+// error-taxonomy half of issue #47 audit item G4: a malformed/unexpected
+// response frame is a protocol violation, not a genuine connection loss
+// (EOF, reset, timeout). Queuing two malformed replies exhausts
+// applyReconnecting's single redial-and-retry (see the transparent-retry
+// test above), so the second failure is what the caller actually sees —
+// it must be classified as ErrProtocol, not ErrConnectionLost, even though
+// internally both poison the connection identically.
+func TestAMalformedFrameSurfacesAsErrProtocolNotErrConnectionLost(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.malformedLeft.Add(2) // one for the original connection, one for the redial
+	_, _, err = client.Get("k")
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("err = %v, want ErrProtocol", err)
+	}
+	if errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("err = %v, must not also be ErrConnectionLost", err)
+	}
+}
+
+// TestAnAbruptCloseSurfacesAsErrConnectionLostNotErrProtocol is the
+// counterpart to the malformed-frame test above: a genuine I/O failure
+// (here, the whole node going away so both the original attempt and the
+// redial fail to even connect) must keep its existing ErrConnectionLost
+// classification, unaffected by the new ErrProtocol taxonomy.
+func TestAnAbruptCloseSurfacesAsErrConnectionLostNotErrProtocol(t *testing.T) {
+	node := startMockNode(t, nil)
+	hostPort := node.address()
+	client, err := Connect(Config{Addresses: []Address{addr(hostPort)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.close()                      // nothing listens on hostPort anymore
+	time.Sleep(50 * time.Millisecond) // let the FIN land and the listener release the port
+
+	_, _, err = client.Get("k")
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("err = %v, want ErrConnectionLost", err)
+	}
+	if errors.Is(err, ErrProtocol) {
+		t.Fatalf("err = %v, must not also be ErrProtocol", err)
 	}
 }
 
@@ -1533,9 +1627,10 @@ func TestAnUnterminatedResponseHeaderFailsInsteadOfGrowingWithoutBound(t *testin
 	defer listener.Close()
 	// Loops accepting connections (mirrors mockNode.acceptLoop): every
 	// connection gets the same treatment, so the client's built-in
-	// redial-and-retry-once on ErrConnectionLost (see
+	// redial-and-retry-once — which also fires on ErrProtocol, not just
+	// ErrConnectionLost (see
 	// TestAMalformedValueLengthPoisonsTheConnectionAndRetriesTransparently)
-	// hits an oversized header again on the retry instead of a dead
+	// — hits an oversized header again on the retry instead of a dead
 	// listener backlog entry, keeping this test fast regardless of that
 	// retry.
 	go func() {
@@ -1581,8 +1676,13 @@ func TestAnUnterminatedResponseHeaderFailsInsteadOfGrowingWithoutBound(t *testin
 	defer client.Close()
 
 	started := time.Now()
-	if _, _, err := client.Get("k"); !errors.Is(err, ErrConnectionLost) {
-		t.Fatalf("Get against a peer streaming an unterminated header = %v, want ErrConnectionLost", err)
+	// An unterminated header is a corrupt/hostile-peer condition, not a
+	// genuine I/O failure — issue #47 audit item G4 classifies it as
+	// ErrProtocol, not ErrConnectionLost (see errors.go's protocolError).
+	if _, _, err := client.Get("k"); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("Get against a peer streaming an unterminated header = %v, want ErrProtocol", err)
+	} else if errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Get against a peer streaming an unterminated header = %v, must not also be ErrConnectionLost", err)
 	}
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("Get took %v, want well under 2s (bounded by maxHeaderLineLength, not requestTimeout)", elapsed)
@@ -1761,7 +1861,11 @@ func TestWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
 	if err := client.Set("some-key", "v", 0); err != nil {
 		t.Fatal(err)
 	}
-	owner := nodes[NewHashRing(testNames).Route([]byte("some-key"))]
+	primary, err := NewHashRing(testNames).Route([]byte("some-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := nodes[primary]
 
 	owner.wrongNodeLeft.Add(1)
 	if value, ok, err := client.Get("some-key"); err != nil || !ok || value != "v" {

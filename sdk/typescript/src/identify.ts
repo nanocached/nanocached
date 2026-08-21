@@ -334,8 +334,23 @@ function isLegacyServerSignal(error: unknown): boolean {
   return code === "ECONNRESET" || code === "EPIPE";
 }
 
+// One shared per-attempt budget across the dial and every handshake read
+// phase that follows it — matching Rust (a single `tokio::time::timeout`
+// around the whole attempt, identify.rs) and Python (a single
+// `asyncio.wait_for` around the whole attempt, _identify.py) — rather
+// than each phase getting its own fresh `deadlineMs`. `connectSocket`
+// already spends up to `deadlineMs` on the dial itself (its own internal
+// timer, left as-is: the dial is phase one of the shared budget), so
+// every read phase after it must draw from what's left of that same
+// budget (issue #47 audit item 3: two independent full-length timers
+// could add up to ~2x the intended per-attempt deadline).
+export function remainingDeadline(budgetMs: number, startedAt: number): number {
+  return Math.max(0, budgetMs - (Date.now() - startedAt));
+}
+
 async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Promise<IdentifyResult> {
   const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
+  const startedAt = Date.now();
   const socket = await connectSocket(options);
 
   const secret = options.authSecret !== undefined ? Buffer.from(options.authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
@@ -344,7 +359,7 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Pro
   let identity: AuthIdentity;
   try {
     socket.write(authFrame);
-    identity = await readFrame(socket, tryParseIdentity, deadlineMs);
+    identity = await readFrame(socket, tryParseIdentity, remainingDeadline(deadlineMs, startedAt));
   } catch (error) {
     socket.destroy();
     throw error;
@@ -369,7 +384,7 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Pro
     const { nodes, replication } = await readFrame(
       socket,
       tryParseNodeList,
-      deadlineMs,
+      remainingDeadline(deadlineMs, startedAt),
       MAX_NODE_LIST_RESPONSE_LENGTH,
     );
     return { kind: "cluster", nodes, replication };

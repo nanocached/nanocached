@@ -332,6 +332,17 @@ class Connection:
             if not future.cancelled():
                 future.set_result((marker, value))
 
+    # _read_one_response and _parse_tag below are the raw wire-frame
+    # parser — the direct analog of the TypeScript SDK's protocol.ts
+    # (tryParseResponse), which raises its own plain NanocachedError
+    # uniformly for every parse violation, never its connection-loss
+    # ConnectionLostError. Every raise in this pair mirrors that split:
+    # a malformed frame is this SDK's own protocol violation
+    # (NanocachedError), not a transport-level failure (builtin
+    # ConnectionError, this SDK's analog of the TypeScript SDK's
+    # ConnectionLostError — see errors.ts's own doc comment on that
+    # parity), even though both are equally poisoning and equally
+    # swallowable by the retry layer (_SWALLOWABLE_ERRORS covers both).
     async def _read_one_response(self) -> tuple[bytes, bytes | None, int | None]:
         marker = await self._reader.readexactly(1)
 
@@ -341,7 +352,7 @@ class Connection:
             header = await self._reader.readuntil(b"\n")
             fields = header[1:-1].split(b" ")
             if len(fields) != (2 if self._tagged else 1):
-                raise ConnectionError("nanocached: invalid value header in response")
+                raise NanocachedError("nanocached: invalid value header in response")
             try:
                 length = int(fields[0])
             except ValueError:
@@ -352,7 +363,7 @@ class Connection:
             # be connection-classified so the retry layer handles it
             # (issue #8).
             if length < 0 or length > _MAX_VALUE_LENGTH:
-                raise ConnectionError("nanocached: invalid value length in response")
+                raise NanocachedError("nanocached: invalid value length in response")
             tag = self._parse_tag(fields[1]) if self._tagged else None
             value = await self._reader.readexactly(length)
             return marker, value, tag
@@ -362,7 +373,7 @@ class Connection:
                 # `<marker> <tag>\n` (ADR-0019).
                 header = await self._reader.readuntil(b"\n")
                 if len(header) < 2 or header[0:1] != b" ":
-                    raise ConnectionError("nanocached: response is missing its tag (connection desynced)")
+                    raise NanocachedError("nanocached: response is missing its tag (connection desynced)")
                 return marker, None, self._parse_tag(header[1:-1])
             trailer = await self._reader.readexactly(1)
             # The untagged form is always exactly `<marker>\n` — a byte
@@ -372,7 +383,7 @@ class Connection:
             # SDK's protocol.ts (tryParseResponse) (issue: audit finding,
             # unverified trailing byte on the untagged fast path).
             if trailer != b"\n":
-                raise ConnectionError(
+                raise NanocachedError(
                     "nanocached: unexpected byte after response marker (connection desynced)"
                 )
             return marker, None, None
@@ -392,5 +403,5 @@ class Connection:
         except ValueError:
             tag = -1
         if tag < 0 or tag > _MAX_TAG:
-            raise ConnectionError("nanocached: invalid response tag")
+            raise NanocachedError("nanocached: invalid response tag")
         return tag

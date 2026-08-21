@@ -287,9 +287,25 @@ final class Identify {
         return new ClusterTarget(nodes, replication);
     }
 
+    /** Reads up to (and consuming) the next '\n', returning what preceded
+     * it. Bounded by {@link Connection#MAX_HEADER_LINE_LENGTH} — the same
+     * cap and rationale as {@link Connection}'s own readLine, shared
+     * rather than duplicated: every real discovery header line (`N
+     * <count> <r>`, a `<nameLen> <addrLen>` entry line) is a handful of
+     * bytes, so a malicious or buggy discovery server that streams bytes
+     * with no '\n' must fail fast — connection-classified, so the
+     * built-in redial/retry layer (and fetchNodeList's per-address
+     * fallback) handles it exactly like any other dead/misbehaving
+     * address — instead of growing this buffer without bound (issue:
+     * audit finding, unbounded readLine in Identify; Connection.java's
+     * own readLine already had this cap). */
     private static String readLine(InputStream in) throws IOException {
         StringBuilder line = new StringBuilder();
         for (int b = read(in); b != '\n'; b = read(in)) {
+            if (line.length() >= Connection.MAX_HEADER_LINE_LENGTH) {
+                throw new NanocachedException.ConnectionFailed(
+                        "nanocached: response header line too long", null);
+            }
             line.append((char) b);
         }
         return line.toString();

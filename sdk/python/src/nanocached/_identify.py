@@ -132,8 +132,6 @@ async def _connect_and_identify(
     try:
         secret = auth_secret if auth_secret is not None else _NO_SECRET_PLACEHOLDER
         tag_field = b" T" if request_tags else b""
-        writer.write(b"A %d%b\n%b" % (len(secret), tag_field, secret))
-        await writer.drain()
 
         # ADR-0019: read 3 bytes first. `byte[2] == '\n'` is the
         # traditional fixed-width ack (`On\n`/`En\n`/`Od\n`/`Ed\n`),
@@ -141,7 +139,21 @@ async def _connect_and_identify(
         # which must be `\n` (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`), tagging
         # enabled. Anything else is a protocol error, same as before this
         # field existed.
+        #
+        # The write is inside this guard too, not just the ack read: a
+        # pre-0019 server can slam the door (RST/broken pipe) as soon as it
+        # sees the extended `A ... T` frame, before ever reading far enough
+        # to reply — the door-slam is a reaction to what we sent, not just
+        # to us waiting for an answer. Rust/Go/TS all classify a write-time
+        # RST/EOF the same way as a read-time one for exactly this reason
+        # (TS's identify.ts wraps its `socket.write(authFrame)` and the
+        # ack read in the same try/catch before classifying). Scoping the
+        # guard to only the read, as before, meant a write-time door-slam
+        # propagated as a raw connection error instead of triggering the
+        # untagged retry.
         try:
+            writer.write(b"A %d%b\n%b" % (len(secret), tag_field, secret))
+            await writer.drain()
             ack = await reader.readexactly(3)
             if ack[0:1] not in (b"O", b"E") or ack[1:2] not in (b"n", b"d"):
                 raise NanocachedError("nanocached: unexpected response to A")

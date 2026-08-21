@@ -189,6 +189,29 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
 const MAX_CONNECTIONS: usize = 1024;
+/// Coarse cap on how many live connections a single source IP may hold at
+/// once, layered under the global `MAX_CONNECTIONS` semaphore (mirrors
+/// `src/server.rs`'s own `MAX_CONNECTIONS_PER_IP`: no per-source-IP
+/// limit on *ordinary* connections meant a single misbehaving or
+/// compromised peer could otherwise claim the entire `MAX_CONNECTIONS`
+/// budget by itself — heartbeats, `L`, everything — starving every other
+/// client and node, without the global semaphore ever reporting anything
+/// unusual). Deliberately coarse, not a tight per-client budget: a
+/// pooled application host — many worker processes or threads sharing
+/// one egress IP, or a fleet behind one NAT — can legitimately hold a
+/// large number of concurrent connections to discovery, and this guard
+/// exists only to stop one source from monopolising the whole process,
+/// not to bound ordinary legitimate concurrency.
+///
+/// Distinct from `MAX_WAITING_PER_SOURCE_IP`: that one bounds a much
+/// narrower thing — concurrent `Waiting`/`Joining` *join registrations*
+/// from one source, a slice of this process's application state — while
+/// this bounds raw TCP connection count regardless of what a connection
+/// ever does with itself (heartbeats, `L`, an idle client that never
+/// sends anything). A source could hold up to `MAX_WAITING_PER_SOURCE_IP`
+/// pending joins and still be well under this cap from its other,
+/// non-joining connections. See `try_acquire_per_ip`.
+const MAX_CONNECTIONS_PER_IP: usize = 256;
 /// Upper bound on distinct registered node names. `J` (Join) holds one
 /// connection open per node, so it's already bounded by `MAX_CONNECTIONS`,
 /// but `P` (Announce) does not hold its connection — a single connection
@@ -360,6 +383,14 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// successfully parsed, this bound stops applying — `IDLE_TIMEOUT` alone
 /// governs from then on, exactly as before this fix.
 const UNIDENTIFIED_CONNECTION_TIMEOUT: Duration = IDLE_TIMEOUT;
+/// Bounds a response write (mirrors `src/server.rs`'s own `WRITE_TIMEOUT`
+/// and `write_response`) — see `write_response` below. Shorter than
+/// `IDLE_TIMEOUT`: that one tolerates a normal gap between a client's
+/// requests, but a peer that has simply stopped draining its receive
+/// buffer is a distinct failure that shouldn't get to hold a
+/// `MAX_CONNECTIONS` permit for as long as an idle-but-otherwise-fine
+/// connection is allowed to sit.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Backoff applied after an `accept()` failure that looks like file-
@@ -2260,7 +2291,7 @@ async fn wait_for_promotion(
                 let state = lock(registry).get(name).map(|info| info.state);
                 match state {
                     Some(NodeState::Joined) => {
-                        stream.write_all(b"R\n").await?;
+                        write_response(stream, b"R\n").await?;
                         return Ok(());
                     }
                     None => {
@@ -2351,6 +2382,7 @@ async fn run(
         current_join: Arc::new(Mutex::new(None)),
     };
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // Issue: `P` (Announce) holds no connection open, so nothing else
@@ -2429,6 +2461,7 @@ async fn run(
                     address,
                     cluster_state.clone(),
                     Arc::clone(&connection_limit),
+                    Arc::clone(&per_ip_connections),
                     connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
@@ -2463,11 +2496,103 @@ async fn run(
     Ok(())
 }
 
+/// Live connection counts per source IP, backing `MAX_CONNECTIONS_PER_IP`
+/// (see that constant). Mirrors `src/server.rs`'s own `PerIpConnections`:
+/// a plain `Mutex<HashMap<..>>` rather than anything fancier, since every
+/// access here is a brief increment/decrement with no I/O under the lock,
+/// and every accepted connection already pays for a `Semaphore`
+/// acquisition on the shared `connection_limit`, so this adds no
+/// bottleneck relative to that existing one.
+type PerIpConnections = Arc<Mutex<HashMap<std::net::IpAddr, usize>>>;
+
+/// Releases one `MAX_CONNECTIONS_PER_IP` slot on drop — the per-IP
+/// counterpart to the `Semaphore` permit `dispatch_connection` already
+/// holds for `MAX_CONNECTIONS` (`_connection_permit`, which frees itself
+/// the same way). Mirrors `src/server.rs`'s own `PerIpConnectionGuard`.
+struct PerIpConnectionGuard {
+    counts: PerIpConnections,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for PerIpConnectionGuard {
+    fn drop(&mut self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(count) = counts.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                // Don't let a long-lived process accumulate one entry
+                // per distinct IP that has ever connected, most of which
+                // will never connect again.
+                counts.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Reserves one of `MAX_CONNECTIONS_PER_IP` slots for `ip`, or `None` if
+/// it's already at the cap — see `MAX_CONNECTIONS_PER_IP`. Mirrors
+/// `src/server.rs`'s own `try_acquire_per_ip`.
+fn try_acquire_per_ip(
+    counts: &PerIpConnections,
+    ip: std::net::IpAddr,
+) -> Option<PerIpConnectionGuard> {
+    let mut guard = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let count = guard.entry(ip).or_insert(0);
+    if *count >= MAX_CONNECTIONS_PER_IP {
+        return None;
+    }
+    *count += 1;
+    drop(guard);
+
+    Some(PerIpConnectionGuard {
+        counts: Arc::clone(counts),
+        ip,
+    })
+}
+
+/// Best-effort "Busy" reply on `stream` before the caller drops it —
+/// shared by every over-limit rejection in `dispatch_connection`
+/// (`MAX_CONNECTIONS` and, per source IP, `MAX_CONNECTIONS_PER_IP`).
+/// Mirrors `src/server.rs`'s own `reject_over_limit`. A TLS-configured
+/// server has no plaintext channel to answer on before the handshake
+/// completes (ADR-0006: no plaintext fallback once TLS is set) — it just
+/// closes. A plaintext server can still reply on the raw stream. Bounded
+/// by `TLS_HANDSHAKE_TIMEOUT` (reused rather than a new constant: a peer
+/// that never reads this reply must not leak the task by leaving the
+/// write pending indefinitely — the same reasoning as the handshake
+/// itself).
+async fn reject_over_limit(
+    mut stream: TcpStream,
+    address: SocketAddr,
+    tls_acceptor: &Option<TlsAcceptor>,
+) {
+    if tls_acceptor.is_none() {
+        match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(b"B\n")).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("WARN failed to send busy response to {address}: {error}");
+            }
+            Err(_) => {
+                eprintln!("WARN sending busy response to {address} timed out");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_connection(
     stream: TcpStream,
     address: SocketAddr,
     cluster_state: ClusterState,
     connection_limit: Arc<Semaphore>,
+    per_ip_connections: PerIpConnections,
     config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
@@ -2499,27 +2624,23 @@ fn dispatch_connection(
         let permit = match connection_limit.try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                // A TLS-configured server has no plaintext channel to
-                // answer "Busy" on before the handshake completes — it
-                // just closes. A plaintext server can still reply on the
-                // raw stream.
-                if config.tls_acceptor.is_none() {
-                    let mut stream = stream;
+                reject_over_limit(stream, address, &config.tls_acceptor).await;
+                return;
+            }
+        };
 
-                    // Bound the write: a peer that never reads must not
-                    // leak this task by leaving the write pending
-                    // indefinitely.
-                    match timeout(TLS_HANDSHAKE_TIMEOUT, stream.write_all(b"B\n")).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => {
-                            eprintln!("WARN failed to send busy response to {address}: {error}");
-                        }
-                        Err(_) => {
-                            eprintln!("WARN sending busy response to {address} timed out");
-                        }
-                    }
-                }
-
+        // No per-source-IP connection limit: without this, a single
+        // source could hold `MAX_CONNECTIONS` connections all by itself
+        // and starve every other client/node, even though the global
+        // semaphore above isn't literally exhausted until the very last
+        // one. Reserved before the TLS handshake for the same reason as
+        // the global permit — see `MAX_CONNECTIONS_PER_IP`. Distinct
+        // from `MAX_WAITING_PER_SOURCE_IP` (see that constant), which
+        // this does not replace.
+        let per_ip_permit = match try_acquire_per_ip(&per_ip_connections, address.ip()) {
+            Some(permit) => permit,
+            None => {
+                reject_over_limit(stream, address, &config.tls_acceptor).await;
                 return;
             }
         };
@@ -2540,6 +2661,7 @@ fn dispatch_connection(
         };
 
         let _connection_permit = permit;
+        let _per_ip_permit = per_ip_permit;
 
         // Written once this connection identifies itself via `J`/`P` (a
         // plain client connection never does, and stays `None`) — read
@@ -2713,6 +2835,27 @@ async fn sweep_expired(
     }
 }
 
+/// Bounds every response write to a client-or-node-facing `stream` in
+/// `handle_connection`/`wait_for_promotion` (mirrors `src/server.rs`'s own
+/// `write_response`): the read side already has `IDLE_TIMEOUT`/
+/// `UNIDENTIFIED_CONNECTION_TIMEOUT`, but an unbounded `write_all` let a
+/// peer that stops reading (without closing the TCP connection — e.g. a
+/// full receive buffer) hold this connection's `MAX_CONNECTIONS` permit
+/// forever. Uses `WRITE_TIMEOUT` rather than reusing `IDLE_TIMEOUT`: the
+/// two are different failure modes (a normal gap between requests vs. a
+/// peer that isn't draining its receive buffer at all), and reusing the
+/// 60s read timeout would let a stuck write hold a permit far longer than
+/// necessary. Distinct from `write_all_timed`, which bounds this node's
+/// own *outbound* dials to a node (`M`/`X`) under `OUTBOUND_IO_TIMEOUT` —
+/// that one is about this process acting as a client of another node;
+/// this one is about this process, as a server, replying to whoever
+/// dialed it.
+async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()> {
+    timeout(WRITE_TIMEOUT, stream.write_all(data))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+}
+
 async fn handle_connection(
     mut stream: ServerStream,
     // The connection's source IP: combined with the port a `J`/`P`
@@ -2752,10 +2895,31 @@ async fn handle_connection(
     let mut identified = false;
     let unidentified_deadline = Instant::now() + UNIDENTIFIED_CONNECTION_TIMEOUT;
 
+    // Slowloris resistance (mirrors `src/server.rs`'s own `deadline`):
+    // anchored to accept-time here, then re-anchored to
+    // `now + config.idle_timeout` below every time `parse` completes a
+    // full command — never on a bare read. An earlier version of this
+    // function instead recomputed `now + config.idle_timeout` on *every*
+    // read once `identified` was true, so a client that sent one command
+    // and then trickled in a single byte just under `idle_timeout` apart
+    // could hold a `MAX_CONNECTIONS` permit open forever without ever
+    // completing another request. While `!identified`, the effective
+    // bound is `deadline.min(unidentified_deadline)` — see the read loop
+    // below — so the tighter pre-first-command bound from
+    // `UNIDENTIFIED_CONNECTION_TIMEOUT` still applies.
+    let mut deadline = Instant::now() + config.idle_timeout;
+
     loop {
         let parsed = parse(&mut received);
+
+        // Only a fully parsed command extends the deadline — an
+        // `Incomplete` result (more bytes needed) leaves it untouched, so
+        // a client that trickles bytes in without ever finishing a
+        // command can't renew its own budget one byte at a time. See
+        // `deadline`'s own doc comment above.
         if parsed.is_ok() {
             identified = true;
+            deadline = Instant::now() + config.idle_timeout;
         }
         match parsed {
             Ok(DiscoveryCommand::Auth { secret, tagging }) => {
@@ -2775,18 +2939,18 @@ async fn handle_connection(
 
                 if accepted {
                     authenticated = true;
-                    stream.write_all(ok).await?;
+                    write_response(&mut stream, ok).await?;
                     continue;
                 }
 
-                stream.write_all(err).await?;
+                write_response(&mut stream, err).await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "invalid auth secret",
                 ));
             }
             Ok(_) if !authenticated => {
-                stream.write_all(b"Ed\n").await?;
+                write_response(&mut stream, b"Ed\n").await?;
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "command sent before authenticating",
@@ -2860,7 +3024,7 @@ async fn handle_connection(
                     );
                 }
 
-                stream.write_all(b"A\n").await?;
+                write_response(&mut stream, b"A\n").await?;
                 continue;
             }
             Ok(DiscoveryCommand::List) => {
@@ -2870,7 +3034,7 @@ async fn handle_connection(
                     // connection-limit rejection: "can't serve you right
                     // now, retry", which the SDK maps to trying its next
                     // discovery seed.
-                    stream.write_all(b"B\n").await?;
+                    write_response(&mut stream, b"B\n").await?;
                     return Ok(());
                 }
 
@@ -2962,14 +3126,14 @@ async fn handle_connection(
                     }
                 }
                 if refuse {
-                    stream.write_all(b"B\n").await?;
+                    write_response(&mut stream, b"B\n").await?;
                     return Ok(());
                 }
                 let mut response = format!("N {} {}\n", nodes.len(), config.replication);
                 for (name, addr) in &nodes {
                     response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
                 }
-                stream.write_all(response.as_bytes()).await?;
+                write_response(&mut stream, response.as_bytes()).await?;
                 continue;
             }
             Ok(DiscoveryCommand::Join { name, port, token }) => {
@@ -3162,7 +3326,7 @@ async fn handle_connection(
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some((name.clone(), connection_id));
 
-                stream.write_all(b"R\n").await?;
+                write_response(&mut stream, b"R\n").await?;
                 continue;
             }
             Ok(DiscoveryCommand::Complete {
@@ -3181,7 +3345,7 @@ async fn handle_connection(
                     &token,
                 )
                 .await;
-                stream.write_all(b"A\n").await?;
+                write_response(&mut stream, b"A\n").await?;
                 continue;
             }
             Err(ParseError::Incomplete) => {}
@@ -3208,14 +3372,15 @@ async fn handle_connection(
 
         // Issue (slowloris): bound this read by whichever of the ordinary
         // per-read idle timeout and the connection's total unidentified
-        // lifetime is tighter. `unidentified_deadline` is a fixed point in
-        // time (unlike `IDLE_TIMEOUT`, which resets every read), so no
-        // amount of trickling small reads in just under it extends the
-        // bound — see `identified`'s doc comment above.
+        // lifetime is tighter. Both `deadline` and `unidentified_deadline`
+        // are fixed points in time (neither resets on a bare read, unlike
+        // an earlier version of `deadline`), so no amount of trickling
+        // small reads in just under either extends the bound — see
+        // `deadline`'s own doc comment above.
         let read_deadline = if identified {
-            Instant::now() + config.idle_timeout
+            deadline
         } else {
-            unidentified_deadline.min(Instant::now() + config.idle_timeout)
+            deadline.min(unidentified_deadline)
         };
 
         let bytes_read = tokio::select! {
@@ -5674,6 +5839,197 @@ mod tests {
         drop(client);
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn handle_connection_times_out_on_trickled_bytes_after_identification() {
+        // Slowloris regression: before this fix, once `identified` flipped
+        // true, every read recomputed the idle deadline as
+        // `now + config.idle_timeout` regardless of whether it completed a
+        // command — so a client that sent one valid command (`L\n`, no
+        // auth required here) and then trickled in a single byte just
+        // under `idle_timeout` apart could hold a `MAX_CONNECTIONS` permit
+        // open forever without ever completing another request. The
+        // deadline must instead stay anchored to the last *completed*
+        // parse, exactly like the pre-identification case already covered
+        // by `handle_connection_is_closed_after_the_unidentified_connection_timeout`.
+        let (mut client, server) = tcp_pair().await;
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        tokio::task::yield_now().await;
+
+        // Complete one command (`L\n`) — `identified` flips true and
+        // `deadline` is anchored to this moment (accept + IDLE_TIMEOUT,
+        // effectively unchanged here since barely any virtual time has
+        // elapsed since accept). Driven forward with explicit
+        // `yield_now`s rather than by awaiting the response directly: on
+        // a paused clock, a real loopback read on the client side doesn't
+        // reliably re-poll the server's spawned task on its own, so
+        // without this the response bytes would only ever arrive once
+        // some later `tokio::time::advance` call happened to drive the
+        // runtime forward.
+        client.write_all(b"L\n").await.unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let expected = b"N 0 2\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        // Trickle in a single byte of an otherwise-incomplete second `L`
+        // command just under the deadline the completed command above
+        // set. A read-resetting deadline would treat this as grounds for
+        // another full IDLE_TIMEOUT.
+        tokio::time::advance(IDLE_TIMEOUT - Duration::from_secs(1)).await;
+        client.write_all(b"L").await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Past the deadline the completed `L` set, but nowhere near what
+        // a read-resetting deadline would have allowed (another ~59s).
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        // Wrapped in a bounded wait, not a bare `.await`: under Tokio's
+        // paused-clock auto-advance, a bare `connection_task.await` would
+        // fast-forward to *whatever* timer the task is actually waiting
+        // on and still report `TimedOut` even if that timer were the
+        // read-resetting deadline's much later ~119s mark, silently
+        // failing to catch the regression this test exists for. Bounding
+        // the wait to a few seconds past the deadline the completed `L`
+        // set forces a real distinction: only the fixed, non-resetting
+        // deadline resolves within it.
+        let result = tokio::time::timeout(Duration::from_secs(5), connection_task)
+            .await
+            .expect(
+                "the connection must close at roughly IDLE_TIMEOUT after the last completed \
+                 command, not be held open by the trickled, never-completing second `L`",
+            )
+            .unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn handle_connection_bounds_a_stalled_response_write_by_write_timeout() {
+        // Issue #4-equivalent: an unbounded `stream.write_all` let a
+        // client that stops draining its receive buffer (without closing
+        // the connection — e.g. a full receive window) hold this
+        // connection's `MAX_CONNECTIONS` permit open forever. Every
+        // response write now routes through `write_response`, which
+        // bounds it by `WRITE_TIMEOUT` (mirrors `src/server.rs`'s own
+        // `write_response`/`WRITE_TIMEOUT`).
+        //
+        // A `L` reply large enough to exceed both this process's own
+        // kernel send buffer and the client's receive window is required
+        // to actually exercise a blocked write here — a handful of bytes
+        // would just sit in the kernel's send buffer and complete
+        // instantly, proving nothing. So the registry is pre-populated
+        // directly (bypassing `P`/`J`, which are rate- and size-limited
+        // for reasons unrelated to this test) with far more `Joined`
+        // entries than any real socket buffer could hold at once.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Sized for Linux, not just macOS: a Linux loopback socket's
+            // send buffer plus the peer's autotuned receive buffer can
+            // absorb several MiB before a write blocks, so a few MiB of
+            // `N` roster (50k short names) completed instantly there and
+            // the connection simply sat in its idle wait instead of
+            // timing out the write. ~120k entries with `MAX_NAME_LENGTH`
+            // names puts the reply near 20 MiB, past any default buffer.
+            for i in 0..120_000 {
+                let name = format!("node-{i:06}-{}", "x".repeat(MAX_NAME_LENGTH - 12));
+                let addr = format!(
+                    "10.{}.{}.{}:9000",
+                    (i / 65536) % 256,
+                    (i / 256) % 256,
+                    i % 256
+                );
+                guard.insert(
+                    name.clone(),
+                    NodeInfo::new(addr, NodeState::Joined, format!("tk-{name}")),
+                );
+            }
+        }
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            registry,
+            current_join,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        tokio::task::yield_now().await;
+
+        // The client never reads anything from here on — driven forward
+        // with explicit `yield_now`s (see the trickled-bytes test above
+        // for why a bare `.await` on the client side doesn't reliably
+        // re-poll the server's spawned task under a paused clock) so the
+        // (huge) `N ...` response actually starts writing and blocks once
+        // the real OS-level send buffer and the client's receive window
+        // both fill.
+        client.write_all(b"L\n").await.unwrap();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Past `WRITE_TIMEOUT`; the client still hasn't read a single
+        // byte, so the write can only have resolved via the timeout, not
+        // by draining.
+        tokio::time::advance(WRITE_TIMEOUT + Duration::from_secs(1)).await;
+
+        // Wrapped in a bounded wait, not a bare `.await` — see the
+        // trickled-bytes test above for why an unbounded wait wouldn't
+        // reliably catch a regression here either.
+        let result = tokio::time::timeout(Duration::from_secs(5), connection_task)
+            .await
+            .expect(
+                "the connection must close at roughly WRITE_TIMEOUT after the stalled write, \
+                 not be held open indefinitely by a client that never reads",
+            )
+            .unwrap();
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+        // Kept alive for the whole test so the socket isn't dropped/reset
+        // before the server side observes the timeout on its own.
+        drop(client);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_rejects_commands_sent_before_authenticating() {
         let (mut client, server) = tcp_pair().await;
@@ -5879,6 +6235,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_connection_when_connection_limit_is_reached() {
         let connection_limit = Arc::new(Semaphore::new(1));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let cluster_state = ClusterState {
             registry: Arc::new(Mutex::new(FxHashMap::default())),
             current_join: Arc::new(Mutex::new(None)),
@@ -5894,6 +6251,7 @@ mod tests {
             first_address,
             cluster_state.clone(),
             Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
@@ -5921,6 +6279,7 @@ mod tests {
             second_address,
             cluster_state,
             connection_limit,
+            per_ip_connections,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 list_ready_at: Instant::now(),
@@ -5939,6 +6298,131 @@ mod tests {
         let mut response = Vec::new();
         second_client.read_to_end(&mut response).await.unwrap();
         assert_eq!(response, b"B\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejects_connection_when_the_per_ip_connection_limit_is_reached() {
+        // Regression: `MAX_CONNECTIONS` alone lets a single source IP
+        // hold every one of the global permits by itself, starving every
+        // other client and node, without the global semaphore ever
+        // reporting anything unusual short of the very last permit.
+        // `MAX_CONNECTIONS_PER_IP` must reject a source once it
+        // individually reaches its own cap, independent of how much
+        // global headroom remains. Mirrors `src/server.rs`'s own
+        // `rejects_connection_when_the_per_ip_connection_limit_is_reached`.
+        let connection_limit = Arc::new(Semaphore::new(10));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let cluster_state = ClusterState {
+            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            current_join: Arc::new(Mutex::new(None)),
+        };
+
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // Stands in for `MAX_CONNECTIONS_PER_IP - 1` other already-live
+        // connections from this IP, without actually dispatching that
+        // many for the test.
+        per_ip_connections
+            .lock()
+            .unwrap()
+            .insert(ip, MAX_CONNECTIONS_PER_IP - 1);
+
+        let (_first_client, first_server) = tcp_pair().await;
+        let first_address = SocketAddr::new(ip, 9000);
+
+        let mut connection_tasks = JoinSet::new();
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        dispatch_connection(
+            first_server,
+            first_address,
+            cluster_state.clone(),
+            Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx.clone(),
+            &mut connection_tasks,
+        );
+
+        // Let the task run far enough to reserve its per-IP slot and
+        // settle into its read loop — this is the connection that fills
+        // the cap exactly.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            per_ip_connections.lock().unwrap().get(&ip).copied(),
+            Some(MAX_CONNECTIONS_PER_IP)
+        );
+
+        let (mut second_client, second_server) = tcp_pair().await;
+        let second_address = SocketAddr::new(ip, 9001);
+
+        dispatch_connection(
+            second_server,
+            second_address,
+            cluster_state,
+            connection_limit,
+            Arc::clone(&per_ip_connections),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            &mut connection_tasks,
+        );
+
+        // Reading to EOF drives the over-limit task to completion: it
+        // replies "Busy" and closes without reserving a per-IP slot.
+        let mut response = Vec::new();
+        second_client.read_to_end(&mut response).await.unwrap();
+
+        assert_eq!(response, b"B\n");
+        assert_eq!(
+            per_ip_connections.lock().unwrap().get(&ip).copied(),
+            Some(MAX_CONNECTIONS_PER_IP),
+            "the rejected connection must not have reserved a slot"
+        );
+
+        connection_tasks.abort_all();
+
+        while connection_tasks.join_next().await.is_some() {}
+    }
+
+    #[test]
+    fn try_acquire_per_ip_denies_once_the_cap_is_reached_and_frees_the_slot_on_drop() {
+        // Mirrors `src/server.rs`'s own
+        // `try_acquire_per_ip_denies_once_the_cap_is_reached_and_frees_the_slot_on_drop`.
+        let counts: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        let mut guards = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_IP {
+            guards.push(try_acquire_per_ip(&counts, ip).expect("under the per-IP cap"));
+        }
+
+        assert!(
+            try_acquire_per_ip(&counts, ip).is_none(),
+            "the per-IP cap must reject a connection once MAX_CONNECTIONS_PER_IP is reached"
+        );
+
+        // A different source IP has its own, independent budget.
+        let other_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        assert!(try_acquire_per_ip(&counts, other_ip).is_some());
+
+        // Dropping one guard frees its slot for the same IP again.
+        guards.pop();
+        assert!(try_acquire_per_ip(&counts, ip).is_some());
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -6178,6 +6662,7 @@ mod tests {
             current_join: Arc::new(Mutex::new(None)),
         };
         let connection_limit = Arc::new(Semaphore::new(1));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let config = ConnectionConfig {
@@ -6199,6 +6684,7 @@ mod tests {
                 peer_addr,
                 cluster_state,
                 connection_limit,
+                per_ip_connections,
                 config,
                 shutdown_rx,
                 &mut connection_tasks,
@@ -6281,6 +6767,7 @@ mod tests {
             current_join: Arc::new(Mutex::new(None)),
         };
         let connection_limit = Arc::new(Semaphore::new(2));
+        let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let config = ConnectionConfig {
@@ -6305,6 +6792,7 @@ mod tests {
             stalled_addr,
             cluster_state.clone(),
             Arc::clone(&connection_limit),
+            Arc::clone(&per_ip_connections),
             config.clone(),
             shutdown_rx.clone(),
             &mut connection_tasks,
@@ -6320,6 +6808,7 @@ mod tests {
                 served_addr,
                 cluster_state,
                 connection_limit,
+                per_ip_connections,
                 config,
                 shutdown_rx,
                 &mut connection_tasks,

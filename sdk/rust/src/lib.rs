@@ -15,6 +15,8 @@ mod open_targets;
 pub use client::KEEPALIVE_INTERVAL_MS;
 #[doc(hidden)]
 pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
+#[doc(hidden)]
+pub use client::NODE_LIST_STALE_AFTER_MS;
 pub use client::{NanocachedClient, Options, Stats};
 #[doc(hidden)]
 pub use connection::REQUEST_TIMEOUT_MS;

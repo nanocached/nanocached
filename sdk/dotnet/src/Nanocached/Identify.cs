@@ -174,6 +174,26 @@ internal static class Identify
         }
     }
 
+    /// <summary>Every read this SDK does past this point — this method's
+    /// own identify-handshake reads (the <c>A</c> ack, a discovery
+    /// server's node list) and, once a node's stream lives on as a
+    /// <see cref="Connection"/>, every header byte <see cref="Connection"/>
+    /// reads too — goes one byte at a time via <c>ReadExactlyAsync</c> on
+    /// a 1-byte buffer (audit finding: unbuffered per-byte reads).
+    /// Wrapping the stream in a <see cref="ReadBufferedStream"/> here, the
+    /// single place a connection's stream is created, turns what would
+    /// otherwise be a syscall per byte into one read filling the buffer,
+    /// which then serves many subsequent 1-byte reads — see that type's
+    /// own doc comment for why it, and not the BCL's own
+    /// <see cref="BufferedStream"/>, is used: this stream is duplex (one
+    /// concurrent reader, one concurrent writer — <see cref="Connection"/>'s
+    /// dedicated reader loop runs for the connection's whole lifetime
+    /// while requests are written concurrently), which
+    /// <see cref="BufferedStream"/>'s shared read/write buffer state does
+    /// not support safely. Safe under TLS: <see cref="SslStream"/> already
+    /// only ever exposes decrypted application data through Read/Write, so
+    /// buffering on top of it behaves exactly like buffering on top of a
+    /// plain <see cref="NetworkStream"/>.</summary>
     private static async Task<Stream> OpenAsync(
         string host, int port, SslClientAuthenticationOptions? tls, CancellationToken cancel)
     {
@@ -186,7 +206,7 @@ internal static class Identify
             network = new NetworkStream(socket, ownsSocket: true);
             if (tls is null)
             {
-                return network;
+                return new ReadBufferedStream(network);
             }
 
             var options = tls;
@@ -197,7 +217,7 @@ internal static class Identify
             }
             ssl = new SslStream(network);
             await ssl.AuthenticateAsClientAsync(options, cancel).ConfigureAwait(false);
-            return ssl;
+            return new ReadBufferedStream(ssl);
         }
         catch
         {

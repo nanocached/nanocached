@@ -53,6 +53,24 @@ function checkKey(key: Uint8Array): void {
   }
 }
 
+// Exported so callers that need to size-check a value *before* it reaches
+// encodeSet can share this exact rule — see NanocachedClient.set, which
+// checks the pre-compression value this way (issue #47 audit item 3:
+// checking only the post-compression frame here let an oversized value
+// that compresses well slip past the cap; Python's client.py has the
+// same two-layer check for the same reason).
+export function checkKeyAndValue(key: Uint8Array, value: Uint8Array): void {
+  checkKey(key);
+  if (key.length + value.length > MAX_REQUEST_BYTES) {
+    // See MAX_REQUEST_BYTES/checkKey above: same server-side rejection, same
+    // poisoned-connection consequence, just measured across key+value
+    // together instead of the key alone.
+    throw new RangeError(
+      `nanocached: key and value together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${key.length + value.length} bytes`,
+    );
+  }
+}
+
 export function encodeGet(key: Uint8Array, tag?: number): Buffer {
   checkKey(key);
   return Buffer.concat([toAscii(`G ${key.length}${tagField(tag)}\n`), key]);
@@ -70,15 +88,7 @@ export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, ta
     // it here, synchronously, before anything is written.
     throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
   }
-  checkKey(key);
-  if (key.length + value.length > MAX_REQUEST_BYTES) {
-    // See MAX_REQUEST_BYTES/checkKey above: same server-side rejection, same
-    // poisoned-connection consequence, just measured across key+value
-    // together instead of the key alone.
-    throw new RangeError(
-      `nanocached: key and value together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${key.length + value.length} bytes`,
-    );
-  }
+  checkKeyAndValue(key, value);
 
   const header =
     ttlSeconds === 0
@@ -136,9 +146,18 @@ const MARKER_VALUE = 0x56; // 'V'
 const MARKER_WRONG_NODE = 0x57; // 'W'
 const LF = 0x0a;
 
+// Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
+// bare `Number(field)` also accepts scientific notation ("1e2"), leading
+// whitespace (" 5"), and a leading sign ("+5"), any of which would parse a
+// desynced/corrupt tag field as if it were a legitimate one.
+const TAG_PATTERN = /^\d+$/;
+
 function parseTag(field: string): number {
+  if (!TAG_PATTERN.test(field)) {
+    throw new NanocachedError("nanocached: invalid response tag");
+  }
   const tag = Number(field);
-  if (!Number.isInteger(tag) || tag < 0 || tag > MAX_TAG) {
+  if (tag > MAX_TAG) {
     throw new NanocachedError("nanocached: invalid response tag");
   }
   return tag;

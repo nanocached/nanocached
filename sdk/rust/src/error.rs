@@ -24,6 +24,14 @@ pub enum Error {
     /// A connection-level failure; the client redials lazily on the next
     /// use, and in cluster mode retries once through a node-list refresh.
     ConnectionLost(String),
+    /// The server rejected the `A` handshake's secret — either the server
+    /// requires one and none was configured, or the configured one is
+    /// wrong. Never transient: retrying with the same configuration
+    /// cannot succeed (issue #47), unlike `ConnectionLost`, which a redial
+    /// may recover from. Distinct from `Protocol`, which is reserved for
+    /// the server sending something the wire protocol doesn't allow at
+    /// all, not a well-formed rejection of credentials.
+    Authentication(String),
     /// The server said something the protocol doesn't allow.
     Protocol(String),
     /// The caller passed something that could never be meant.
@@ -52,7 +60,9 @@ impl fmt::Display for Error {
                 f,
                 "nanocached: the discovery server is warming up after a restart"
             ),
-            Error::ConnectionLost(message) | Error::Protocol(message) => write!(f, "{message}"),
+            Error::ConnectionLost(message)
+            | Error::Protocol(message)
+            | Error::Authentication(message) => write!(f, "{message}"),
             Error::InvalidArgument(message) => write!(f, "{message}"),
             Error::InvalidUtf8(error) => {
                 write!(f, "nanocached: value is not valid UTF-8: {error}")
