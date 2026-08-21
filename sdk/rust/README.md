@@ -208,6 +208,8 @@ rather than bloated.
 
 ## Notes
 
+- Requires Rust 1.85 or newer (`rust-version` in `Cargo.toml`; checked in
+  CI). See [CHANGELOG.md](CHANGELOG.md) for release notes.
 - This SDK speaks the current wire protocol (rendezvous hashing,
   replication-aware `L`/`W`); it requires an up-to-date server.
 - It shares no code with the server (the repository's independence
