@@ -24,7 +24,7 @@ export interface MockNode extends MockServerBase {
   answerWrongNodeOnSetOnce(): void;
   /** Queue a one-off reply for the next G request on a tagged connection
    * that echoes the WRONG tag (the request's tag + 1) — the desync a
-   * pre-ADR-0019 stream misalignment would produce. */
+   * pre-tag stream misalignment would produce. */
   answerWrongTagOnce(): void;
   /** Swallow the next G request entirely (no reply) — the off-by-one
    * stream desync where every later response answers the previous
@@ -57,7 +57,7 @@ export interface MockNode extends MockServerBase {
    * nanocached-node's own idle timeout), leaving the server listening. */
   dropConnections(): void;
   /** Makes every future `S` reply wait `ms` first — for tests proving a
-   * caller isn't blocked on a slow replica leg (doc/adr/0014-*.md). */
+   * caller isn't blocked on a slow replica leg (fire-and-forget replica writes). */
   delaySets(ms: number): void;
   /** Makes this node a half-open server from this point on: it still
    * accepts and completes the `A` handshake, and still reads every
@@ -70,7 +70,7 @@ export interface MockNode extends MockServerBase {
 
 export interface MockDiscovery extends MockServerBase {
   setNodes(nodes: Array<{ name: string; address: string }>): void;
-  /** While true, `L` answers `B\n` and closes — the ADR-0010 startup
+  /** While true, `L` answers `B\n` and closes — the discovery HA startup
    * grace of a freshly restarted discovery server. */
   setWarmingUp(warming: boolean): void;
   /** Queue a one-off `N` reply for the next `L` request whose header is
@@ -131,11 +131,11 @@ function trackAndClose(server: Server): { sockets: Set<Socket>; close: () => Pro
 export async function startMockNode(
   options: {
     requiredSecret?: string;
-    /** Speak ADR-0019: acknowledge `A ... T` with `OnT\n` and echo tags
+    /** Speak echoed response tags: acknowledge `A ... T` with `OnT\n` and echo tags
      * on that connection's replies. Off by default so the bulk of the
      * suite keeps exercising the legacy untagged path. */
     supportTags?: boolean;
-    /** Behave like a pre-ADR-0019 server: an extended `A ... T` is a
+    /** Behave like a legacy pre-tag server: an extended `A ... T` is a
      * parse error — close the connection without replying. */
     closeOnExtendedAuth?: boolean;
   } = {},
@@ -158,7 +158,7 @@ export async function startMockNode(
   const server = createServer((socket) => {
     connections++;
     let buffer = Buffer.alloc(0);
-    // ADR-0019: set when this connection's `A ... T` was acknowledged —
+    // Echoed response tags: set when this connection's `A ... T` was acknowledged —
     // its requests then carry a trailing tag the replies must echo.
     let tagged = false;
 
@@ -404,7 +404,7 @@ export async function startMockDiscovery(
             const secretLength = Number(parts[1]);
             if (buffer.length < bodyStart + secretLength) return;
             buffer = buffer.subarray(bodyStart + secretLength);
-            // ADR-0019: echo the tag capability — clients send the
+            // Echoed response tags: echo the tag capability — clients send the
             // extended A before knowing which kind of server answered.
             socket.write(parts[2] === "T" ? "OdT\n" : "Od\n");
             break;

@@ -289,7 +289,7 @@ describe("NanocachedClient against a single node", () => {
   });
 });
 
-describe("NanocachedClient value compression (doc/adr/0013-*.md)", () => {
+describe("NanocachedClient value compression (value compression)", () => {
   it("does not touch the wire format when compress is off (the default)", async () => {
     const node = await startMockNode();
     try {
@@ -414,7 +414,7 @@ describe("NanocachedClient value compression (doc/adr/0013-*.md)", () => {
       const writer = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         // A legacy/uncompressed writer's value whose first byte happens to
-        // collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+        // collide with the DEFLATE marker (0x01) — value compression's
         // documented hazard of enabling compress against a keyspace other
         // clients still touch without it.
         await writer.set("k", Uint8Array.from([0x01, 2, 3, 4]));
@@ -1279,7 +1279,7 @@ describe("NanocachedClient request timeout (issue #42)", () => {
   });
 });
 
-describe("NanocachedClient replication (ADR-0011, R=2)", () => {
+describe("NanocachedClient replication (client-side replication, R=2)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
   async function startReplicatedCluster() {
@@ -1431,7 +1431,7 @@ describe("NanocachedClient replication (ADR-0011, R=2)", () => {
   });
 });
 
-describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", () => {
+describe("NanocachedClient fire-and-forget replica writes (fire-and-forget replica writes)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
   // A "did it wait for the mock's delay" assertion can't compare the
@@ -1559,7 +1559,7 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
       replica.mock.delaySets(80);
 
       await client.set("k", "v");
-      // The drain contract (ADR-0014 as amended by issue #47 item 3):
+      // The drain contract (fire-and-forget replica writes as amended by issue #47 item 3):
       // close() resolves only after the in-flight replica write finished.
       await client.close();
       assert.ok(replica.mock.store.has("k"), "close() resolved before the background replica write finished");
@@ -1648,7 +1648,7 @@ describe("NanocachedClient fire-and-forget replica writes (doc/adr/0014-*.md)", 
   });
 });
 
-describe("NanocachedClient read repair (doc/adr/0015-*.md)", () => {
+describe("NanocachedClient read repair (read repair)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
   async function startReplicatedCluster() {
@@ -1776,7 +1776,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     }
   });
 
-  it("counts a swallowed replica-write failure when a replica is dead (ADR-0011/0014)", async () => {
+  it("counts a swallowed replica-write failure when a replica is dead (client-side replication / fire-and-forget replica writes)", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
     try {
@@ -1823,7 +1823,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     }
   });
 
-  it("counts a failed repair write-back (ADR-0015, issue #43)", async () => {
+  it("counts a failed repair write-back (read repair, issue #43)", async () => {
     // The write-back leg is what the counter measures — the replica's
     // value is still returned to the caller, but the background repair
     // write to the primary fails and is counted.
@@ -1935,7 +1935,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
   }> {
     const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
     // UUID-shaped names, matching what real nodes register with (see
-    // doc/adr/0009-*.md) — FNV-1a spreads these across the ring, where
+    // Node identity decoupled from address) — FNV-1a spreads these across the ring, where
     // near-identical short names like "node-a"/"node-b" would collapse
     // into one narrow band and route every key to a single node.
     const nodes = [
@@ -2054,7 +2054,7 @@ describe("NanocachedClient against a discovery-fronted cluster", () => {
   });
 });
 
-describe("NanocachedClient response tags (doc/adr/0019-*.md)", () => {
+describe("NanocachedClient response tags (echoed response tags)", () => {
   it("negotiates tags and round-trips pipelined requests", async () => {
     const node = await startMockNode({ supportTags: true });
     try {
@@ -2075,7 +2075,7 @@ describe("NanocachedClient response tags (doc/adr/0019-*.md)", () => {
   });
 
   it("a desynced stream is caught by the tag check before any caller sees wrong data", async () => {
-    // The exact misdelivery ADR-0016 left open: the server (as a stand-in
+    // The exact misdelivery request pipelining left open: the server (as a stand-in
     // for any off-by-one stream corruption) never answers the first GET,
     // so the second GET's response arrives at the first GET's pending
     // slot. Without tags the first caller would receive the second's

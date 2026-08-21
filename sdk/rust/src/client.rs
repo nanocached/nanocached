@@ -1,9 +1,9 @@
 //! The public client. `Options::addresses` may name either a single
 //! nanocached-node or discovery server(s) fronting a cluster —
 //! `connect()` finds out from the server's own handshake response
-//! (doc/adr/0007-*.md), so calling code is identical either way.
+//! (the server type in the auth response), so calling code is identical either way.
 //!
-//! Cluster mode implements ADR-0011 client-side replication: writes fan
+//! Cluster mode implements client-side replication client-side replication: writes fan
 //! out to each key's top-R owners (the primary's result decides; a dead
 //! replica never fails a write), reads ask the primary and fall over to
 //! the next owner only when the holder is unreachable. Dead connections
@@ -46,7 +46,7 @@ pub static NODE_LIST_STALE_AFTER_MS: AtomicU64 = AtomicU64::new(30_000);
 // of whatever key it names — colliding with a real key would silently
 // keep that key artificially "hot" on every keep-alive tick.
 const KEEPALIVE_KEY: &[u8] = b"\x00nanocached-keepalive";
-/// The TTL a read-repair write applies to the primary (doc/adr/0015-*.md).
+/// The TTL a read-repair write applies to the primary (read repair).
 /// `get`'s response carries no TTL, so the key's original expiry is
 /// unrecoverable; repairing with `ttl_seconds` 0 (no expiry) would make
 /// an expiring key immortal, permanently resurrecting data the primary
@@ -60,7 +60,7 @@ const READ_REPAIR_TTL: u64 = 60;
 pub static KEEPALIVE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(30_000);
 
-/// doc/adr/0013-*.md: values shorter than this (bytes) are never
+/// Value compression: values shorter than this (bytes) are never
 /// compressed — the per-value overhead of attempting it outweighs the
 /// savings. Only meaningful when `compress(true)`.
 const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
@@ -73,7 +73,7 @@ const DEFAULT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(1);
 /// request over that limit is rejected by simply closing the connection
 /// without a response (poisoning whatever else is pipelined behind it on
 /// that same connection). This reserves 256 bytes of headroom for the
-/// header itself (marker byte, decimal lengths, an optional TTL, ADR-0019's
+/// header itself (marker byte, decimal lengths, an optional TTL, echoed response tags's
 /// tag field, spaces, the trailing newline — always comfortably under
 /// this even for the largest fields), so a key+value that clears
 /// `MAX_REQUEST_BYTES` is guaranteed to fit under the server's own cap and
@@ -132,7 +132,7 @@ fn validate_key_and_value(key: &[u8], value: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// doc/adr/0014-*.md: bounds how many replica writes a single client may
+/// Fire-and-forget replica writes: bounds how many replica writes a single client may
 /// have running in the background at once when `fire_and_forget_replicas`
 /// is enabled — once the cap is reached, further replica legs fall back
 /// to running synchronously, the same as with the option off. Read once
@@ -142,7 +142,7 @@ fn validate_key_and_value(key: &[u8], value: &[u8]) -> Result<()> {
 pub static MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES: AtomicUsize = AtomicUsize::new(32);
 
 /// Monotonic counters for failures this SDK deliberately swallows
-/// (ADR-0011/0014/0015) — observability for silently degrading
+/// (client-side replication / fire-and-forget replica writes / read repair) — observability for silently degrading
 /// replication or a stuck node-list refresh that would otherwise have no
 /// visible symptom until reads start missing more often than expected.
 /// Returned by [`NanocachedClient::stats`]; never reset.
@@ -228,7 +228,7 @@ impl Options {
 
     /// The connect targets, tried in order for connect and every
     /// refresh: a single-node deployment is a one-element list, a
-    /// cluster's discovery replicas (ADR-0010) a longer one.
+    /// cluster's discovery replicas (discovery HA) a longer one.
     ///
     /// ```no_run
     /// # use nanocached::Options;
@@ -283,13 +283,13 @@ impl Options {
 
     /// Transparently compress values above [`Self::compression_threshold`]
     /// on `set` and decompress them on `get`/`get_bytes`
-    /// (doc/adr/0013-*.md). Off by default. Requires the `compression`
+    /// (value compression). Off by default. Requires the `compression`
     /// feature (a default feature — disable it with `default-features =
     /// false` to opt out); without it, `compress(true)` fails at
     /// `connect()` time instead of failing to compile. **Every client
     /// that reads or writes a given set of keys must agree on this
     /// setting** — it is a per-keyspace format decision, not a
-    /// per-client preference; see the ADR's Consequences before enabling
+    /// per-client preference; take care before enabling
     /// this against an existing keyspace another client may still touch
     /// with `compress` off.
     pub fn compress(mut self, enabled: bool) -> Self {
@@ -307,7 +307,7 @@ impl Options {
 
     /// Let `set`/`delete` return as soon as the primary owner acks,
     /// letting replica legs finish in the background instead of waiting
-    /// for them too (doc/adr/0014-*.md). Off by default. Unlike
+    /// for them too (fire-and-forget replica writes). Off by default. Unlike
     /// [`Self::compress`], this is a pure latency/durability trade for
     /// this client's own writes — it carries no wire format and needs no
     /// agreement with other clients.
@@ -319,7 +319,7 @@ impl Options {
     /// On a clean miss (the key's first-reached owner reports it
     /// missing), probe the remaining owners before accepting that, and
     /// repair the primary in the background if one still has the value
-    /// (doc/adr/0015-*.md). Off by default. Costs extra reads only on
+    /// (read repair). Off by default. Costs extra reads only on
     /// the misses this actually applies to.
     pub fn read_repair(mut self, enabled: bool) -> Self {
         self.read_repair = enabled;
@@ -366,7 +366,7 @@ struct Member {
 }
 
 /// What `write` should replay for a replica leg that ends up running
-/// detached (doc/adr/0014-*.md) — the synchronous path keeps using the
+/// detached (fire-and-forget replica writes) — the synchronous path keeps using the
 /// borrowed `op` closure unchanged; this only exists to let a background
 /// `tokio::spawn` task own its own copy of the data, since `op` typically
 /// borrows from the caller's stack frame (see `set`/`delete`).
@@ -439,7 +439,7 @@ struct Inner {
     compress: bool,
     compression_threshold: usize,
     fire_and_forget_replicas: bool,
-    /// doc/adr/0014-*.md: bounds in-flight background replica writes.
+    /// Fire-and-forget replica writes: bounds in-flight background replica writes.
     /// Also close()'s drain primitive — acquiring every permit blocks
     /// until every currently in-flight background write has released
     /// its own, i.e. finished.
@@ -491,7 +491,7 @@ impl NanocachedClient {
         let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
 
         // Walk the addresses until one yields a working target; an
-        // address that is unreachable, warming up (`B`, ADR-0010), or
+        // address that is unreachable, warming up (`B`, discovery HA), or
         // knows no live nodes is skipped — the next replica may do
         // better.
         let mut last_error: Option<Error> = None;
@@ -677,7 +677,7 @@ impl NanocachedClient {
         Ok(Self { inner, keepalive })
     }
 
-    /// How many nodes hold each key (ADR-0011) — 1 against a single node.
+    /// How many nodes hold each key (client-side replication) — 1 against a single node.
     pub async fn replication(&self) -> usize {
         match &self.inner.state.lock().await.target {
             Target::Single { .. } => 1,
@@ -690,7 +690,7 @@ impl NanocachedClient {
     }
 
     /// A snapshot of counters for failures this SDK swallows by design
-    /// (ADR-0011/0014/0015) — lets operators detect silently degrading
+    /// (client-side replication / fire-and-forget replica writes / read repair) — lets operators detect silently degrading
     /// replication or a stuck node-list refresh.
     pub fn stats(&self) -> Stats {
         Stats {
@@ -712,7 +712,7 @@ impl NanocachedClient {
     /// a sign the caller lost track of this instance's lifecycle.
     ///
     /// Returns only after every in-flight background replica write has
-    /// finished and the connections are torn down (doc/adr/0014-*.md as
+    /// finished and the connections are torn down (fire-and-forget replica writes as
     /// amended by issue #47 item 3 — the drain contract every SDK now
     /// shares); async since then, which is what lets it actually await
     /// that drain instead of handing teardown to a detached task.
@@ -754,8 +754,8 @@ impl NanocachedClient {
     }
 
     /// Transparently decompresses when `compress` is enabled
-    /// (doc/adr/0013-*.md). With `read_repair`, a clean miss probes the
-    /// remaining owners before being accepted as final (doc/adr/0015-*.md).
+    /// (value compression). With `read_repair`, a clean miss probes the
+    /// remaining owners before being accepted as final (read repair).
     pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
         validate_key(key)?;
@@ -779,7 +779,7 @@ impl NanocachedClient {
         }
     }
 
-    /// doc/adr/0015-*.md: probes the remaining owners of `key` — every
+    /// Read repair: probes the remaining owners of `key` — every
     /// owner but the primary, which the normal read path already probed
     /// and got a clean miss from — in rank order, for a value. The first
     /// one that has it wins: its value is returned, and — detached, not
@@ -807,7 +807,7 @@ impl NanocachedClient {
                 // `close()`'s drain waits for it and no more than
                 // `background_replica_cap` run at once. Past the cap the
                 // repair for this miss is simply skipped — it's opportunistic
-                // (ADR-0015), so a later miss repairs the key instead, and it
+                // (read repair), so a later miss repairs the key instead, and it
                 // must never add latency or unbounded task growth to the read
                 // path it rides on. The `closed` re-check after acquiring the
                 // permit closes the same teardown race the replica path guards
@@ -849,7 +849,7 @@ impl NanocachedClient {
 
     /// `ttl_seconds == 0` means no expiry. Transparently compresses
     /// values at or above `compression_threshold` when `compress` is
-    /// enabled (doc/adr/0013-*.md).
+    /// enabled (value compression).
     pub async fn set(
         &self,
         key: impl AsRef<[u8]>,
@@ -995,11 +995,11 @@ impl NanocachedClient {
 
         // Fan out to the replicas concurrently with the primary write. The
         // primary's outcome decides; replica failures are swallowed by
-        // design (ADR-0011) — a dead or disagreeing replica leaves the key
+        // design (client-side replication) — a dead or disagreeing replica leaves the key
         // under-replicated until the next node-list refresh, never fails
         // the write. Counted in `stats().replica_write_failures` so
         // operators can spot silently degrading replication.
-        // doc/adr/0014-*.md: with fire_and_forget_replicas, up to
+        // Fire-and-forget replica writes: with fire_and_forget_replicas, up to
         // background_replica_cap legs run detached on their own tokio
         // task instead of being awaited below — past that cap, further
         // legs fall back to the synchronous path exactly as with the
@@ -1347,7 +1347,7 @@ impl NanocachedClient {
         redials.retain(|slot, _| slot.is_empty() || live.contains(slot));
     }
 
-    /// Walks every address (ADR-0010). Returns `None` — keep the
+    /// Walks every address (discovery HA). Returns `None` — keep the
     /// last-known list — when none can provide one: unreachable, still
     /// inside its startup grace (`B`), no longer a discovery server, or
     /// knowing no live nodes. Silent by design: this path's noisy

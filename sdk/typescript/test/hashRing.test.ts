@@ -19,7 +19,7 @@ describe("fnv1a", () => {
 });
 
 describe("cross-language score vectors", () => {
-  // Pinned outputs of the full ADR-0011 score pipeline
+  // Pinned outputs of the full client-side replication score pipeline
   // (fmix64(fnv1a(name) ^ fnv1a(key))) — src/hash_ring.rs asserts these
   // exact values, so the two implementations agree byte-for-byte or one
   // side's test fails.
@@ -85,7 +85,7 @@ describe("HashRing", () => {
   });
 
   it("never reorders existing nodes when a node is added", () => {
-    // The HRW property ADR-0011's handoff and replica-cleanup rules rest
+    // The HRW property client-side replication's handoff and replica-cleanup rules rest
     // on: an added node only inserts into a key's ranking.
     const before = new HashRing(nodes);
     const after = new HashRing([...nodes, "node-d"]);

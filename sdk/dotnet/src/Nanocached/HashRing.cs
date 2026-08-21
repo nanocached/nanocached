@@ -3,8 +3,8 @@ using System.Text;
 namespace Nanocached;
 
 /// <summary>
-/// Rendezvous (highest-random-weight) hashing over a fixed node list (see
-/// doc/adr/0011-*.md in the nanocached repository). This is deliberately a
+/// Rendezvous (highest-random-weight) hashing over a fixed node list (the
+/// client-side replication design). This is deliberately a
 /// byte-for-byte port of the same computation every other nanocached
 /// participant uses (the Rust node, the Go/TypeScript/Python/Java/Rust SDKs)
 /// — not just "a" rendezvous hash, but <em>this specific</em> one: if this
@@ -18,7 +18,7 @@ namespace Nanocached;
 /// order (ties — effectively impossible at 64 bits — break toward the
 /// lexicographically smaller name), and its primary is the top one.
 ///
-/// Built from node <em>names</em>, not addresses (doc/adr/0009-*.md).
+/// Built from node <em>names</em>, not addresses (node identity decoupled from address).
 /// </summary>
 public sealed class HashRing
 {

@@ -21,7 +21,7 @@ import java.util.function.Function;
  * the cache protocol ({@code G}/{@code S}/{@code D} — the {@code A}
  * identify exchange happens in {@link Identify} before a Connection
  * exists). Requests are pipelined onto the socket and matched to
- * responses in send order (doc/adr/0016-*.md): a dedicated reader thread
+ * responses in send order (request pipelining): a dedicated reader thread
  * consumes responses and dispatches each to the oldest still-pending
  * request, since nanocached-node itself only ever answers in the order it
  * received requests. Enqueuing the pending slot and writing the frame
@@ -44,7 +44,7 @@ final class Connection {
     private final InputStream in;
     private final OutputStream out;
     private final Runnable onClose;
-    /** ADR-0019: negotiated during identify — when true, every request
+    /** echoed response tags: negotiated during identify — when true, every request
      * carries a tag the server echoes, and {@link #readLoop} verifies the
      * echo against the oldest pending request before dispatching it. */
     private final boolean tagged;
@@ -187,7 +187,7 @@ final class Connection {
         };
     }
 
-    // ADR-0019: on a tagged-mode connection every request header carries
+    // Echoed response tags: on a tagged-mode connection every request header carries
     // the client's tag as its last field, and the server echoes it in the
     // response — `tag == null` is the untagged (pre-0019) form, which
     // must serialize byte-for-byte as it always has.
@@ -204,7 +204,7 @@ final class Connection {
      * still pending behind this one may already have been resolved with
      * misaligned data by the time this runs — an inherent limitation of
      * matching-by-order pipelining shared with the TypeScript SDK's
-     * Connection (doc/adr/0016-*.md), not something this SDK introduces.
+     * Connection (request pipelining), not something this SDK introduces.
      */
     private NanocachedException mismatch(int marker) {
         NanocachedException error = new NanocachedException.ConnectionFailed(
@@ -260,7 +260,7 @@ final class Connection {
     private record Response(int marker, byte[] value, int tag) {}
 
     /** A pending request's future paired with the tag its response must
-     * echo (ADR-0019) — meaningless (and never compared) on an untagged
+     * echo (echoed response tags) — meaningless (and never compared) on an untagged
      * connection. */
     private record Pending(CompletableFuture<Response> future, int tag) {}
 
@@ -280,9 +280,9 @@ final class Connection {
                 throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
             }
             lastUsedNanos = System.nanoTime();
-            // ADR-0019: the tag is claimed in the same synchronous span
+            // Echoed response tags: the tag is claimed in the same synchronous span
             // that enqueues the pending slot and writes the frame
-            // (doc/adr/0016-*.md's enqueue+write atomicity), so tag order
+            // (request pipelining's enqueue+write atomicity), so tag order
             // can never skew from queue/wire order. Built before
             // enqueueing: a builder that fails (e.g. an invalid TTL) must
             // fail with nothing queued, or the next response would
@@ -316,7 +316,7 @@ final class Connection {
         }
     }
 
-    /** A connection-scoped u32 wrapping counter (ADR-0019), 0-based —
+    /** A connection-scoped u32 wrapping counter (echoed response tags), 0-based —
      * only ever called from within the {@code synchronized (this)} block
      * in {@link #request}, so no separate synchronization is needed here.
      * Encoded/decoded as unsigned decimal text (see {@link #tagSuffix}
@@ -350,7 +350,7 @@ final class Connection {
     /** This connection's only reader, for its whole lifetime — nothing
      * else may read from {@code in}. Consumes responses off the wire and
      * dispatches each to the oldest pending request (FIFO —
-     * doc/adr/0016-*.md). */
+     * Request pipelining). */
     private void readLoop() {
         while (true) {
             Response response;
@@ -400,7 +400,7 @@ final class Connection {
                 return;
             }
 
-            // ADR-0019: verify the echoed tag against the request this
+            // Echoed response tags: verify the echoed tag against the request this
             // response is about to answer — *before* it can reach any
             // caller. A mismatch means the streams are misaligned; unlike
             // the caller-side kind check (mismatch()), catching it here
@@ -425,7 +425,7 @@ final class Connection {
         int marker = readByte();
         switch (marker) {
             case 'V' -> {
-                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (ADR-0019).
+                // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags).
                 String[] fields = readLine().split(" ");
                 if (fields.length != (tagged ? 2 : 1)) {
                     throw new NanocachedException.ConnectionFailed(
@@ -448,7 +448,7 @@ final class Connection {
                 int tag = tagged ? parseTag(fields[1]) : -1;
                 return new Response(marker, readExactly(length), tag);
             }
-            // Busy is always bare (ADR-0019): it's an unsolicited
+            // Busy is always bare (echoed response tags): it's an unsolicited
             // pre-auth response, never an answer to a tagged request.
             case 'B' -> {
                 expectLf(); // the trailing '\n'
@@ -466,7 +466,7 @@ final class Connection {
         }
     }
 
-    /** Parses a tag field (ADR-0019) as unsigned decimal text, matching
+    /** Parses a tag field (echoed response tags) as unsigned decimal text, matching
      * the wire's u32 width — see {@link #claimTag}/{@link #tagSuffix}. A
      * non-numeric or out-of-range field is protocol garbage: the
      * connection is desynced and must be poisoned, connection-classified

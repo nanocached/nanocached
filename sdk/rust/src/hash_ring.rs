@@ -1,5 +1,5 @@
-//! Rendezvous (highest-random-weight) hashing over a fixed node list (see
-//! doc/adr/0011-*.md in the nanocached repository). This is deliberately a
+//! Rendezvous (highest-random-weight) hashing over a fixed node list (the
+//! client-side replication design). This is deliberately a
 //! byte-for-byte port of the same computation every other nanocached
 //! participant uses (the node's own `src/hash_ring.rs`, and the
 //! TypeScript, Python, Java, Go, and .NET SDKs) — not just "a" rendezvous
@@ -12,7 +12,7 @@
 //! score order (ties — effectively impossible at 64 bits — break toward
 //! the lexicographically smaller name), and its primary is the top one.
 //!
-//! Built from node *names*, not addresses (doc/adr/0009-*.md).
+//! Built from node *names*, not addresses (node identity decoupled from address).
 
 use crate::error::{Error, Result};
 
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn matches_the_cross_language_score_vectors() {
-        // Pinned outputs of the full ADR-0011 score pipeline — the node,
+        // Pinned outputs of the full client-side replication score pipeline — the node,
         // TypeScript, Python, and Java implementations assert these too.
         assert_eq!(fmix64(0), 0);
         assert_eq!(fmix64(1), 0xb456bcfc34c2cb2c);

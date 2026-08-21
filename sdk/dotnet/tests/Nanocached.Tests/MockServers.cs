@@ -26,11 +26,11 @@ public sealed class MockNode : IDisposable
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
-    /// <summary>Speak ADR-0019: acknowledge `A ... T` with `OnT\n` and echo
+    /// <summary>Speak echoed response tags: acknowledge `A ... T` with `OnT\n` and echo
     /// tags on that connection's replies. Off by default so the bulk of
     /// the suite keeps exercising the legacy untagged path.</summary>
     private readonly bool _supportTags;
-    /// <summary>Behave like a pre-ADR-0019 server: an extended `A ... T`
+    /// <summary>Behave like a legacy pre-tag server: an extended `A ... T`
     /// is a parse error — close the connection without replying.</summary>
     private readonly bool _closeOnExtendedAuth;
     private int _connectionCount;
@@ -80,7 +80,7 @@ public sealed class MockNode : IDisposable
 
     /// <summary>Queue a one-off reply for the next G request on a tagged
     /// connection that echoes the WRONG tag (the request's tag + 1) — the
-    /// desync a pre-ADR-0019 stream misalignment would produce.</summary>
+    /// desync a pre-tag stream misalignment would produce.</summary>
     public void AnswerWrongTagOnce() => Interlocked.Increment(ref _wrongTagReplies);
 
     /// <summary>Swallow the next G request entirely (no reply) — the
@@ -111,7 +111,7 @@ public sealed class MockNode : IDisposable
 
     /// <summary>Holds every future S reply for <paramref name="millis"/>
     /// first — for tests proving a caller isn't blocked on a slow replica
-    /// leg (doc/adr/0014-*.md).</summary>
+    /// leg (fire-and-forget replica writes).</summary>
     public void DelaySets(int millis) => _setDelayMillis = millis;
 
     /// <summary>Makes this node a half-open server from this point on: it
@@ -166,7 +166,7 @@ public sealed class MockNode : IDisposable
                     checkCertificateRevocation: false);
                 stream = ssl;
             }
-            // ADR-0019: set when this connection's `A ... T` was
+            // Echoed response tags: set when this connection's `A ... T` was
             // acknowledged — its requests then carry a trailing tag the
             // replies must echo.
             bool tagged = false;

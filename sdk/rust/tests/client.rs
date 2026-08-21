@@ -30,7 +30,7 @@ struct NodeState {
     stored_to_get_replies: AtomicUsize,
     get_delay_ms: AtomicUsize,
     /// Holds every future S reply this long — for tests proving a caller
-    /// isn't blocked on a slow replica leg (doc/adr/0014-*.md). Unlike
+    /// isn't blocked on a slow replica leg (fire-and-forget replica writes). Unlike
     /// get_delay_ms, persistent rather than one-shot.
     set_delay_ms: AtomicUsize,
     required_secret: Option<Vec<u8>>,
@@ -41,19 +41,19 @@ struct NodeState {
     /// well-formed) but never answered — a half-open server, for the
     /// request-timeout regression test.
     silent: std::sync::atomic::AtomicBool,
-    /// ADR-0019: acknowledge an extended `A ... T` with `OnT\n` and echo
+    /// Echoed response tags: acknowledge an extended `A ... T` with `OnT\n` and echo
     /// tags on that connection's G/S/D replies. Off by default so the
     /// bulk of the suite keeps exercising the legacy untagged path
     /// (mirrors the TypeScript SDK mock's `supportTags`).
     support_tags: bool,
-    /// ADR-0019: behave like a pre-0019 server — an extended `A ... T` is
+    /// Echoed response tags: behave like a pre-0019 server — an extended `A ... T` is
     /// a parse error, so close the connection without replying.
     close_on_extended_auth: bool,
     /// Swallow the next `G` entirely (no reply) — the off-by-one stream
     /// desync where every later response answers the previous request.
     swallow_get_replies: AtomicUsize,
     /// Answer the next `G` on a tagged connection with the wrong echoed
-    /// tag (the request's tag + 1) — the desync a pre-ADR-0019 stream
+    /// tag (the request's tag + 1) — the desync a pre-tag stream
     /// misalignment would produce.
     wrong_tag_replies: AtomicUsize,
 }
@@ -114,7 +114,7 @@ impl MockNode {
 
 async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
     let mut stream = BufReader::new(socket);
-    // ADR-0019: set once this connection's extended `A ... T` was
+    // Echoed response tags: set once this connection's extended `A ... T` was
     // acknowledged (`support_tags` and the caller asked for `T`) — its
     // G/S/D traffic then carries a trailing tag every reply must echo.
     let mut tagged = false;
@@ -172,8 +172,8 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     continue;
                 }
                 if tagged && take_one(&state.wrong_tag_replies) {
-                    // ADR-0019: echo the wrong tag (request tag + 1) — the
-                    // desync a pre-ADR-0019 stream misalignment would
+                    // Echoed response tags: echo the wrong tag (request tag + 1) — the
+                    // desync a pre-tag stream misalignment would
                     // otherwise produce silently.
                     let requested_tag: u64 = parts[2].parse().unwrap();
                     let reply = format!("N {}\n", requested_tag + 1);
@@ -425,7 +425,7 @@ async fn round_trips_set_get_delete() {
     node.stop();
 }
 
-// ── 値の圧縮 (doc/adr/0013-*.md) ────────────────────────────────────
+// ── 値の圧縮 (value compression) ────────────────────────────────────
 
 #[cfg(feature = "compression")]
 #[tokio::test]
@@ -537,7 +537,7 @@ async fn reading_a_legacy_value_with_compress_enabled_errors_clearly() {
     let node = MockNode::start().await;
 
     // A legacy/uncompressed writer's value whose first byte happens to
-    // collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+    // collide with the DEFLATE marker (0x01) — value compression's
     // documented hazard of enabling compress against a keyspace other
     // clients still touch without it. The remaining bytes are chosen to
     // reliably fail DEFLATE decoding (raw DEFLATE has no checksum, so not
@@ -626,7 +626,7 @@ async fn ttl_zero_means_no_expiry_and_omits_the_ttl_field_on_the_wire() {
 async fn pipelines_concurrent_requests_on_one_connection() {
     // Same shape as the TypeScript SDK's own pipelining test: N
     // concurrent requests on a single connection, each independently
-    // verified to round-trip its own value (doc/adr/0016-*.md) — a bug
+    // verified to round-trip its own value (request pipelining) — a bug
     // in matching responses to the right caller in send order would
     // show up as swapped or wrong values here.
     let node = MockNode::start().await;
@@ -854,7 +854,7 @@ async fn a_mismatched_response_kind_poisons_the_connection() {
 
 #[tokio::test]
 async fn an_abandoned_request_future_does_not_poison_the_connection() {
-    // doc/adr/0016-*.md: pipelining leaves an abandoned request
+    // Request pipelining: pipelining leaves an abandoned request
     // (tokio::time::timeout) in the pending queue rather than removing
     // it — its still-coming response is simply dropped (no receiver
     // listening) once the read task dispatches it, and every request
@@ -1518,7 +1518,7 @@ async fn fans_deletes_out_to_every_owner() {
     }
 }
 
-// ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────────
+// ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────────
 
 fn node_by_name<'a>(nodes: &'a [(String, MockNode)], name: &str) -> &'a MockNode {
     &nodes.iter().find(|(n, _)| n == name).unwrap().1
@@ -1666,7 +1666,7 @@ async fn close_drains_in_flight_background_replica_writes() {
         .unwrap();
 
     client.set("k", "v", 0).await.unwrap();
-    // The drain contract (ADR-0014 as amended by issue #47 item 3):
+    // The drain contract (fire-and-forget replica writes as amended by issue #47 item 3):
     // close() returns only after the in-flight replica write finished.
     client.close().await;
 
@@ -1687,7 +1687,7 @@ async fn close_drains_in_flight_background_replica_writes() {
     }
 }
 
-// ── read repair (doc/adr/0015-*.md) ──────────────────────────────────
+// ── read repair (read repair) ──────────────────────────────────
 
 #[tokio::test]
 async fn by_default_a_clean_miss_on_the_primary_is_not_repaired() {
@@ -1801,7 +1801,7 @@ async fn stays_a_clean_miss_when_no_owner_has_the_value() {
     }
 }
 
-// ── stats() (ADR-0011/0014/0015 swallowed-failure counters) ──────────
+// ── stats() (client-side replication / fire-and-forget replica writes / read repair swallowed-failure counters) ──────────
 
 #[tokio::test]
 async fn a_dead_replica_counts_a_replica_write_failure_in_stats() {
@@ -1885,7 +1885,7 @@ async fn refresh_against_an_unreachable_discovery_seed_counts_a_refresh_failure_
     discovery.stop(); // the only configured address is now unreachable
 
     // A WrongNode reply forces with_cluster_retry to call maybe_refresh(true)
-    // (ADR-0010), which now fails against the unreachable discovery seed.
+    // (discovery HA), which now fails against the unreachable discovery seed.
     let primary = owners_of("k")[0].clone();
     node_by_name(&nodes, &primary)
         .state
@@ -1959,12 +1959,12 @@ async fn concurrent_stale_refreshes_coalesce_into_a_single_discovery_round_trip(
     }
 }
 
-// ── ADR-0019: response tags (doc/adr/0019-*.md) ─────────────────────
+// ── echoed response tags: response tags (echoed response tags) ─────────────────────
 
 #[tokio::test]
 async fn tags_round_trip_pipelined_requests_on_a_tagged_connection() {
     // Same shape as pipelines_concurrent_requests_on_one_connection, but
-    // against a server that negotiated ADR-0019 tags on this connection
+    // against a server that negotiated echoed response tags tags on this connection
     // — proves tagged responses are matched to the right caller in send
     // order exactly like the untagged path.
     let node = MockNode::start_with(NodeState {
@@ -2007,7 +2007,7 @@ async fn tags_round_trip_pipelined_requests_on_a_tagged_connection() {
 
 #[tokio::test]
 async fn tags_catch_an_off_by_one_desync_before_any_caller_sees_wrong_data() {
-    // The exact misdelivery ADR-0016 left open: the server (standing in
+    // The exact misdelivery request pipelining left open: the server (standing in
     // for any off-by-one stream corruption) never answers the first GET,
     // so the second GET's response arrives at the first GET's pending
     // slot. Without tags the first caller could receive the second's
@@ -2059,7 +2059,7 @@ async fn a_response_echoing_the_wrong_tag_poisons_the_connection() {
 
     // The tag check poisons the connection; the client's single
     // transparent redial-and-retry heals it — but never by reusing the
-    // desynced stream (ADR-0019), matching
+    // desynced stream (echoed response tags), matching
     // a_mismatched_response_kind_poisons_the_connection's shape above.
     let value = client.get("k").await.unwrap();
     assert_eq!(value, Some("v".to_string()));

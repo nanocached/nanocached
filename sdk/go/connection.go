@@ -16,7 +16,7 @@ import (
 // nanocached-node, speaking the cache protocol (G/S/D — the A identify
 // exchange happens in identify.go before a connection exists). Requests
 // are pipelined onto the socket and matched to responses in send order
-// (doc/adr/0016-*.md): a dedicated read loop consumes responses and
+// (request pipelining): a dedicated read loop consumes responses and
 // dispatches each to the oldest still-pending request, since
 // nanocached-node itself only ever answers in the order it received
 // requests. mu also serializes the push-onto-pending-queue-and-write
@@ -58,7 +58,7 @@ type roundTripResult struct {
 }
 
 // pendingRequest is one still-outstanding request: the channel its result
-// is delivered on, paired with the tag (doc/adr/0019-*.md) its response
+// is delivered on, paired with the tag (echoed response tags) its response
 // must echo. tag is meaningless when the connection is untagged.
 type pendingRequest struct {
 	ch  chan roundTripResult
@@ -69,7 +69,7 @@ type connection struct {
 	mu     sync.Mutex
 	conn   net.Conn // nil only for the pre-poisoned placeholder
 	reader *bufio.Reader
-	// tagged (doc/adr/0019-*.md): negotiated during identify — when true,
+	// tagged (echoed response tags): negotiated during identify — when true,
 	// every request carries a tag the server echoes, and readLoop verifies
 	// the echo against the oldest pending request before dispatching it.
 	tagged   bool
@@ -100,7 +100,7 @@ func newConnection(conn net.Conn, onClose func(), tagged bool) *connection {
 	return c
 }
 
-// appendTagField appends a request's doc/adr/0019-*.md tag as its
+// appendTagField appends a request's echoed response tags tag as its
 // trailing header field (" <tag>") to buf on a tagged connection, or
 // nothing on an untagged one — the same wire shape a fmt.Sprintf(" %d",
 // tag) would produce, built here with strconv.AppendUint straight into
@@ -257,7 +257,7 @@ func (c *connection) poison(err error) {
 }
 
 // request builds a frame via build and waits for its matched response.
-// build receives this request's doc/adr/0019-*.md tag (claimed here,
+// build receives this request's echoed response tags tag (claimed here,
 // meaningless when the connection is untagged) so it can render the
 // frame's trailing tag field. Claiming the tag, pushing onto the pending
 // queue, and writing the frame all happen under the same lock, so
@@ -311,7 +311,7 @@ func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, error
 
 // readLoop consumes responses off the wire for as long as the connection
 // stays open, dispatching each to the oldest pending request (FIFO —
-// doc/adr/0016-*.md). It is this connection's only reader; nothing else
+// Request pipelining). It is this connection's only reader; nothing else
 // may read from conn.
 func (c *connection) readLoop() {
 	for {
@@ -371,7 +371,7 @@ func (c *connection) readLoop() {
 			return
 		}
 
-		// doc/adr/0019-*.md: on a tagged connection, verify the echoed tag
+		// Echoed response tags: on a tagged connection, verify the echoed tag
 		// against the request this response is about to answer — *before*
 		// it can reach any caller. A mismatch means the streams are
 		// misaligned; unlike the caller-side kind check (mismatch()),
@@ -393,7 +393,7 @@ func (c *connection) readLoop() {
 }
 
 // readOneResponse reads one response frame off the wire. tag is only
-// meaningful (and only present on the wire at all — doc/adr/0019-*.md) for
+// meaningful (and only present on the wire at all — echoed response tags) for
 // non-busy responses on a tagged connection; callers gate on c.tagged the
 // same way readOneResponse itself does.
 func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, err error) {
@@ -408,7 +408,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			return 0, nil, 0, err
 		}
 		// Untagged wire: `V <len>\n`. Tagged: `V <len> <seq>\n`
-		// (doc/adr/0019-*.md). After the marker byte the header still
+		// (echoed response tags). After the marker byte the header still
 		// carries the leading space.
 		fields := strings.Fields(header)
 		wantFields := 1
@@ -437,7 +437,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 		}
 		return marker, value, responseTag, nil
 	case 'B':
-		// Busy is always untagged (doc/adr/0019-*.md) — it's an
+		// Busy is always untagged (echoed response tags) — it's an
 		// unsolicited response sent whether or not this connection
 		// negotiated tags.
 		if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
@@ -451,7 +451,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			}
 			return marker, nil, 0, nil
 		}
-		// Tagged wire: `S <seq>\n` etc. (doc/adr/0019-*.md).
+		// Tagged wire: `S <seq>\n` etc. (echoed response tags).
 		header, err := readLine(c.reader)
 		if err != nil {
 			return 0, nil, 0, err
@@ -471,7 +471,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 	}
 }
 
-// parseTag parses a response's doc/adr/0019-*.md echoed tag — a u32
+// parseTag parses a response's echoed response tags echoed tag — a u32
 // written in decimal — matching protocol.ts's parseTag.
 func parseTag(field string) (uint32, error) {
 	tag, err := strconv.ParseUint(field, 10, 32)

@@ -1,7 +1,7 @@
 import { deflateRawSync, inflateRawSync } from "node:zlib";
 import { NanocachedError } from "./errors.js";
 
-// doc/adr/0013-*.md: the one-byte marker every value carries once
+// Value compression: the one-byte marker every value carries once
 // `compress` is enabled on this client — 0x00 for "stored as-is" (below
 // threshold, or compressing didn't actually shrink it), 0x01 for
 // "raw-DEFLATE-compressed" (RFC 1951, no zlib/gzip wrapper). Never
@@ -18,7 +18,7 @@ const MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024;
 
 /** Thrown by get/getBytes when a value with `compress` enabled can't be
  * interpreted — almost always a `compress` mismatch between clients
- * sharing this key (see doc/adr/0013-*.md's compatibility caveat: every
+ * sharing this key (see value compression's compatibility caveat: every
  * client touching a given keyspace must agree on `compress`), not a
  * transient failure. */
 export class DecompressionError extends NanocachedError {
@@ -28,7 +28,7 @@ export class DecompressionError extends NanocachedError {
   }
 }
 
-/** doc/adr/0013-*.md: below `threshold`, or when compressing doesn't
+/** value compression: below `threshold`, or when compressing doesn't
  * actually shrink the value (incompressible data — already-compressed
  * media, random bytes), the marker byte alone is added and the value is
  * stored unchanged. Always returns a value with the marker byte prefixed,
@@ -48,7 +48,7 @@ export function compressValue(value: Buffer, threshold: number): Buffer {
 }
 
 /** The `get`/`getBytes` counterpart to `compressValue`. Only ever called
- * when `compress` is enabled on this client — see doc/adr/0013-*.md. */
+ * when `compress` is enabled on this client — see value compression. */
 export function decompressValue(value: Buffer): Buffer {
   if (value.length === 0) {
     throw new DecompressionError(
@@ -76,13 +76,13 @@ export function decompressValue(value: Buffer): Buffer {
     } catch (error) {
       throw new DecompressionError(
         `nanocached: failed to decompress a value marked as compressed — did every client ` +
-          `sharing this key enable compress (doc/adr/0013-*.md)? (${(error as Error).message})`,
+          `sharing this key enable compress (value compression)? (${(error as Error).message})`,
       );
     }
   }
 
   throw new DecompressionError(
     `nanocached: unrecognized compression marker byte ${marker} — was this value written by a ` +
-      "client with compress disabled (doc/adr/0013-*.md)?",
+      "client with compress disabled (value compression)?",
   );
 }

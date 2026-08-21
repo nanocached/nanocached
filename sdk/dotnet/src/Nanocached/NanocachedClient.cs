@@ -11,9 +11,9 @@ namespace Nanocached;
 /// The public client. An address list names either a single
 /// nanocached-node or discovery server(s) fronting a cluster —
 /// <see cref="ConnectAsync(Options)"/> finds out from the server's own handshake
-/// response (doc/adr/0007-*.md), so calling code is identical either way.
+/// response (the server type in the auth response), so calling code is identical either way.
 ///
-/// Cluster mode implements ADR-0011 client-side replication: writes fan
+/// Cluster mode implements client-side replication client-side replication: writes fan
 /// out to each key's top-R owners (the primary's result decides; a dead
 /// replica never fails a write), reads ask the primary and fall over to
 /// the next owner only when the holder is unreachable. Dead connections
@@ -32,7 +32,7 @@ public sealed class NanocachedClient : IDisposable
     {
         /// <summary>Targets to try, in order — a one-element list is the
         /// single-target case. Everything is either a single
-        /// nanocached-node or a discovery replica (ADR-0010) fronting a
+        /// nanocached-node or a discovery replica (discovery HA) fronting a
         /// cluster; both the initial connect and every later node-list
         /// refresh walk this list until one yields a working target.</summary>
         public List<(string Host, int Port)> Addresses { get; } = new();
@@ -59,10 +59,10 @@ public sealed class NanocachedClient : IDisposable
 
         /// <summary>Transparently compress values above
         /// <see cref="CompressionThreshold"/> on set and decompress them
-        /// on get/getBytes (doc/adr/0013-*.md). Off by default. <b>Every
+        /// on get/getBytes (value compression). Off by default. <b>Every
         /// client that reads or writes a given set of keys must agree on
         /// this setting</b> — it is a per-keyspace format decision, not a
-        /// per-client preference; see the ADR's Consequences before
+        /// per-client preference; take care before
         /// enabling this against an existing keyspace another client may
         /// still touch with <see cref="Compress"/> off.</summary>
         public bool Compress { get; set; }
@@ -76,7 +76,7 @@ public sealed class NanocachedClient : IDisposable
 
         /// <summary>Let SetAsync/DeleteAsync return as soon as the primary
         /// owner acks, letting replica legs finish in the background
-        /// instead of waiting for them too (doc/adr/0014-*.md). Off by
+        /// instead of waiting for them too (fire-and-forget replica writes). Off by
         /// default. Unlike <see cref="Compress"/>, this is a pure
         /// latency/durability trade for this client's own writes — it
         /// carries no wire format and needs no agreement with other
@@ -86,7 +86,7 @@ public sealed class NanocachedClient : IDisposable
         /// <summary>On a clean miss (the key's first-reached owner reports
         /// it missing), probe the remaining owners before accepting that,
         /// and repair the primary in the background if one still has the
-        /// value (doc/adr/0015-*.md). Off by default. Costs extra reads
+        /// value (read repair). Off by default. Costs extra reads
         /// only on the misses this actually applies to.</summary>
         public bool ReadRepair { get; set; }
 
@@ -125,9 +125,9 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>
     /// Point-in-time snapshot returned by <see cref="Stats"/>: counters
     /// for failures this client swallows by design instead of surfacing
-    /// to the caller — a dead replica leg on a write (doc/adr/0011-*.md,
-    /// doc/adr/0014-*.md), a failed background repair of the primary
-    /// after read-repair found a value on another owner (doc/adr/0015-*.md),
+    /// to the caller — a dead replica leg on a write (client-side replication,
+    /// Fire-and-forget replica writes), a failed background repair of the primary
+    /// after read-repair found a value on another owner (read repair),
     /// and a failed node-list refresh attempt or per-node reconnect
     /// during one. None of these ever fail an operation; this is purely
     /// observability so an operator who only watches for thrown
@@ -162,7 +162,7 @@ public sealed class NanocachedClient : IDisposable
     private static readonly byte[] KeepaliveKey =
         new byte[] { 0x00 }.Concat(Encoding.ASCII.GetBytes("nanocached-keepalive")).ToArray();
 
-    // TTL a read-repair write uses (doc/adr/0015-*.md), in whole seconds —
+    // TTL a read-repair write uses (read repair), in whole seconds —
     // the protocol's TTL unit throughout (see SetAsync's ttlSeconds). The
     // original TTL isn't recoverable from a GET response, and repairing
     // with TTL 0 (no expiry) would permanently resurrect data that was
@@ -224,7 +224,7 @@ public sealed class NanocachedClient : IDisposable
     /// refresh, but the address itself is what's actually unreachable.
     /// Mirrors TypeScript's reconnectCooldowns.</summary>
     private readonly ConcurrentDictionary<string, (DateTime Until, Exception Error)> _reconnectCooldowns = new();
-    // doc/adr/0014-*.md: bounds in-flight background replica writes and
+    // Fire-and-forget replica writes: bounds in-flight background replica writes and
     // lets Close() drain them before tearing down connections.
     private readonly SemaphoreSlim _backgroundReplicaPermits;
     // The permit count _backgroundReplicaPermits was built with, captured
@@ -232,7 +232,7 @@ public sealed class NanocachedClient : IDisposable
     // the static MaxInFlightBackgroundReplicaWrites afterwards.
     private readonly int _backgroundReplicaPermitCount;
     // TryReadRepairAsync's background primary-repair write
-    // (doc/adr/0015-*.md) draws from the same pool — one combined cap,
+    // (read repair) draws from the same pool — one combined cap,
     // like every other SDK — so Close() drains it the same way.
     private readonly CancellationTokenSource _lifetime = new();
 
@@ -366,7 +366,7 @@ public sealed class NanocachedClient : IDisposable
         var client = new NanocachedClient(options);
 
         // Walk the addresses until one yields a working target; an
-        // address that is unreachable, warming up (B, ADR-0010), or knows
+        // address that is unreachable, warming up (B, discovery HA), or knows
         // no live nodes is skipped — the next replica may do better.
         Exception? lastError = null;
         foreach (var (host, port) in client._addresses)
@@ -464,14 +464,14 @@ public sealed class NanocachedClient : IDisposable
 
     // ── 公開 API ──────────────────────────────────────────────────
 
-    /// <summary>How many nodes hold each key (ADR-0011) — 1 against a single node.</summary>
+    /// <summary>How many nodes hold each key (client-side replication) — 1 against a single node.</summary>
     public int Replication => _ring is not null ? _replication : 1;
 
     public bool IsClosed => _closed;
 
     /// <summary>
     /// A snapshot of counters for failures this client swallows by
-    /// design (ADR-0011/0014's replica-leg writes, ADR-0015's
+    /// design (client-side replication / fire-and-forget replica writes's replica-leg writes, read repair's
     /// read-repair, and node-list refresh) — see <see cref="ClientStats"/>
     /// for exactly what each counts. Nothing here ever fails an
     /// operation; this exists purely so an operator can detect
@@ -503,9 +503,9 @@ public sealed class NanocachedClient : IDisposable
 
     /// <summary>Returns the raw value, or <c>null</c> when the key is
     /// missing. Transparently decompresses when <c>Compress</c> is
-    /// enabled (doc/adr/0013-*.md). With <c>ReadRepair</c>, a clean miss
+    /// enabled (value compression). With <c>ReadRepair</c>, a clean miss
     /// probes the remaining owners before being accepted as final
-    /// (doc/adr/0015-*.md).</summary>
+    /// (read repair).</summary>
     public async Task<byte[]?> GetBytesAsync(byte[] key)
     {
         ValidateKey(key);
@@ -519,7 +519,7 @@ public sealed class NanocachedClient : IDisposable
         return value is null || !_compress ? value : Compression.DecompressValue(value);
     }
 
-    /// <summary>doc/adr/0015-*.md: probes the remaining owners of
+    /// <summary>read repair: probes the remaining owners of
     /// <paramref name="key"/> — every owner but the primary, which the
     /// normal read path already probed and got a clean miss from — in
     /// rank order, for a value. The first one that has it wins: its value
@@ -580,7 +580,7 @@ public sealed class NanocachedClient : IDisposable
                         Interlocked.Increment(ref _readRepairFailures);
                     }
                 });
-                // Bounded and tracked (doc/adr/0014-*.md's mechanism,
+                // Bounded and tracked (fire-and-forget replica writes's mechanism,
                 // reused here — the one shared pool, so replica legs and
                 // repairs together never exceed
                 // MaxInFlightBackgroundReplicaWrites): past the cap,
@@ -622,7 +622,7 @@ public sealed class NanocachedClient : IDisposable
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no
     /// expiry. Transparently compresses values at or above
     /// <c>CompressionThreshold</c> when <c>Compress</c> is enabled
-    /// (doc/adr/0013-*.md).</summary>
+    /// (value compression).</summary>
     public async Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0)
     {
         if (ttlSeconds < 0)
@@ -709,7 +709,7 @@ public sealed class NanocachedClient : IDisposable
         }
         _closed = true;
         _lifetime.Cancel();
-        // doc/adr/0014-*.md: give background replica writes a chance to
+        // Fire-and-forget replica writes: give background replica writes a chance to
         // finish before their connections are torn out from under them.
         // Acquiring every permit — rather than snapshotting the task set —
         // closes the registration race: a WriteAsync that passed its
@@ -855,7 +855,7 @@ public sealed class NanocachedClient : IDisposable
 
         // Fan out to the replicas concurrently with the primary write. The
         // primary's outcome decides; replica failures are swallowed by
-        // design (ADR-0011) — a dead or disagreeing replica leaves the key
+        // design (client-side replication) — a dead or disagreeing replica leaves the key
         // under-replicated until the next node-list refresh, never fails
         // the write. Now counted via Stats().ReplicaWriteFailures.
         async Task ReplicaWriteAsync(string name)
@@ -882,7 +882,7 @@ public sealed class NanocachedClient : IDisposable
         var replicaWrites = new List<Task>();
         foreach (string name in names.Skip(1))
         {
-            // doc/adr/0014-*.md: with FireAndForgetReplicas, up to
+            // Fire-and-forget replica writes: with FireAndForgetReplicas, up to
             // MaxInFlightBackgroundReplicaWrites legs run in the
             // background instead of being waited for below — past that
             // cap, further legs fall back to the synchronous path exactly
@@ -1179,7 +1179,7 @@ public sealed class NanocachedClient : IDisposable
                 // Left out of the ring for now; the next refresh retries
                 // it. Silent by design — refresh is opportunistic/
                 // best-effort and must never fail the caller's operation,
-                // consistent with ADR-0011's eventual-consistency model.
+                // consistent with client-side replication's eventual-consistency model.
                 // Counted via Stats().RefreshFailures.
             }
         }
@@ -1191,7 +1191,7 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    /// <summary>Walks every configured address (ADR-0010); <c>null</c>
+    /// <summary>Walks every configured address (discovery HA); <c>null</c>
     /// means keep the last-known list.</summary>
     private async Task<Identify.ClusterTarget?> FetchNodeListAsync()
     {
@@ -1218,7 +1218,7 @@ public sealed class NanocachedClient : IDisposable
                 Interlocked.Increment(ref _refreshFailures);
                 // Silent by design — refresh is opportunistic/best-effort
                 // and must never fail the caller's operation, consistent
-                // with ADR-0011's eventual-consistency model. The next
+                // with client-side replication's eventual-consistency model. The next
                 // refresh retries; counted via Stats().RefreshFailures.
             }
         }
@@ -1232,7 +1232,7 @@ public sealed class NanocachedClient : IDisposable
     // Internal and mutable only so tests can shorten it.
     internal static TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
 
-    // doc/adr/0014-*.md: bounds how many replica writes a single client
+    // Fire-and-forget replica writes: bounds how many replica writes a single client
     // may have running in the background at once when
     // FireAndForgetReplicas is enabled — once the cap is reached, further
     // replica legs fall back to running synchronously, the same as with

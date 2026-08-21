@@ -3,7 +3,7 @@ the cache protocol (``G``/``S``/``D`` — the ``A`` identify exchange happens
 in ``_identify`` before a Connection exists).
 
 Requests are pipelined onto the socket and matched to responses in send
-order (doc/adr/0016-*.md): a dedicated read loop task consumes responses
+order (request pipelining): a dedicated read loop task consumes responses
 and dispatches each to the oldest still-pending request, since
 nanocached-node itself only ever answers in the order it received
 requests. Pushing onto the pending queue and writing the frame happen
@@ -25,7 +25,7 @@ from ._errors import NanocachedError, WrongNodeError
 # malicious frame, never just a legitimately large value.
 _MAX_VALUE_LENGTH = 2 * 1024 * 1024
 
-# A tag is a u32 in decimal (ADR-0019).
+# A tag is a u32 in decimal (echoed response tags).
 _MAX_TAG = 0xFFFFFFFF
 
 # Bounds how long the connection may go without progress while requests
@@ -39,7 +39,7 @@ _MAX_TAG = 0xFFFFFFFF
 _REQUEST_TIMEOUT = 30.0
 
 
-# ADR-0019: on a tagged-mode connection every request header carries the
+# Echoed response tags: on a tagged-mode connection every request header carries the
 # client's tag as its last field, and the server echoes it in the
 # response — `tag is None` is the untagged (pre-0019) form.
 def _tag_field(tag: int | None) -> bytes:
@@ -72,7 +72,7 @@ class Connection:
     ) -> None:
         self._reader = reader
         self._writer = writer
-        # ADR-0019: negotiated during identify — when true, every request
+        # Echoed response tags: negotiated during identify — when true, every request
         # carries a tag the server echoes, and _read_loop verifies the
         # echo against the oldest pending slot before resolving it.
         self._tagged = tagged
@@ -144,7 +144,7 @@ class Connection:
         # Requests still pending behind this one may already have been
         # resolved with misaligned data by the time this runs — an
         # inherent limitation of matching-by-order pipelining shared with
-        # the TypeScript SDK's Connection (doc/adr/0016-*.md), not
+        # the TypeScript SDK's Connection (request pipelining), not
         # something this SDK introduces.
         error = ConnectionError(
             f"nanocached: response {marker!r} does not match the request (connection desynced)"
@@ -213,9 +213,9 @@ class Connection:
             if self.closed:
                 raise ConnectionError("nanocached: connection is closed")
             self._last_used = time.monotonic()
-            # ADR-0019: the tag is claimed in the same locked span that
+            # Echoed response tags: the tag is claimed in the same locked span that
             # enqueues the pending slot and writes the frame, so tag
-            # order can never skew from queue/wire order (ADR-0016's
+            # order can never skew from queue/wire order (request pipelining's
             # enqueue+write atomicity). build() runs before the pending
             # slot is appended — a builder that raises must fail with
             # nothing queued, or the next response would resolve an
@@ -251,11 +251,11 @@ class Connection:
         # matched to this slot by the read loop, so the future is left
         # in _pending (cancelled(), unretrieved) rather than removed,
         # keeping queue order aligned with wire order for every request
-        # behind it (doc/adr/0016-*.md). The TypeScript SDK's Connection
+        # behind it (request pipelining). The TypeScript SDK's Connection
         # has no cancellation to handle here at all — plain Promises
         # simply can't be cancelled out from under `pending`. This SDK's
         # asyncio Tasks can be, so this is a real improvement rather than
-        # just preserving it (ADR-0016): cancellation is supported, and
+        # just preserving it (request pipelining): cancellation is supported, and
         # kept safe by leaving the cancelled future in place instead of
         # ripping it out from under the read loop.
         return await future
@@ -310,7 +310,7 @@ class Connection:
             else:
                 self._arm_deadline()
 
-            # ADR-0019: on a tagged connection, verify the echoed tag
+            # Echoed response tags: on a tagged connection, verify the echoed tag
             # against the request this response is about to answer —
             # *before* it can reach any caller. A mismatch means the
             # streams are misaligned; unlike the caller-side kind check
@@ -348,7 +348,7 @@ class Connection:
 
         if marker == b"V":
             # Untagged: `V <length>\n<value>`. Tagged: `V <length> <tag>\n<value>`
-            # (ADR-0019).
+            # (echoed response tags).
             header = await self._reader.readuntil(b"\n")
             fields = header[1:-1].split(b" ")
             if len(fields) != (2 if self._tagged else 1):
@@ -370,7 +370,7 @@ class Connection:
 
         if marker in (b"S", b"D", b"N", b"W"):
             if self._tagged:
-                # `<marker> <tag>\n` (ADR-0019).
+                # `<marker> <tag>\n` (echoed response tags).
                 header = await self._reader.readuntil(b"\n")
                 if len(header) < 2 or header[0:1] != b" ":
                     raise NanocachedError("nanocached: response is missing its tag (connection desynced)")

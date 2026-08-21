@@ -64,7 +64,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Base and per-entry components of how long after this node's own
 /// handoff completes it keeps forwarding concurrent writes to the joiner
 /// (issue #3) — sized the same way, and for the same reason, as
-/// discovery's own size-derived migration timeout (doc/adr/0017-*.md):
+/// discovery's own size-derived migration timeout (size-derived migration timeout):
 /// by the time it elapses the join has either completed cluster-wide
 /// (the joiner is in `L`, clients route to it directly) or been
 /// abandoned (an `X` cleared the slot), and a bigger handoff needs more
@@ -72,7 +72,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const FORWARDING_GRACE_BASE: Duration = Duration::from_secs(60);
 const FORWARDING_GRACE_PER_ENTRY: Duration = Duration::from_millis(5);
 
-/// This node's own size-derived forwarding grace (doc/adr/0017-*.md),
+/// This node's own size-derived forwarding grace (size-derived migration timeout),
 /// computed from how many entries `run_migration` actually sent as part
 /// of the handoff `entries_sent` came from — never anything reported by
 /// another ready node. Saturates rather than overflows for a
@@ -81,7 +81,7 @@ fn forwarding_grace(entries_sent: usize) -> Duration {
     FORWARDING_GRACE_BASE
         + FORWARDING_GRACE_PER_ENTRY.saturating_mul(entries_sent.min(u32::MAX as usize) as u32)
 }
-/// How often the ADR-0008 active-deletion sweep runs. See `run_sweep`.
+/// How often the staged node join active-deletion sweep runs. See `run_sweep`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -307,7 +307,7 @@ struct ConnectionConfig {
     /// before speaking the cache protocol; there is no plaintext fallback.
     tls_acceptor: Option<TlsAcceptor>,
     /// Only present when this node is configured to register with a
-    /// discovery server (ADR-0008/0009) — an `M` arriving otherwise has
+    /// discovery server (staged node join / node identity decoupled from address) — an `M` arriving otherwise has
     /// nowhere sensible to report `C` to and is rejected.
     node_context: Option<NodeContext>,
     /// Where `handle_connection` hands off a `run_migration` future for
@@ -318,12 +318,12 @@ struct ConnectionConfig {
     migration_tx: mpsc::Sender<MigrationTask>,
 }
 
-/// What an ADR-0008 migration task (triggered by an incoming `M`) needs
+/// What an staged node join migration task (triggered by an incoming `M`) needs
 /// beyond the cache itself: this node's own identity, and how to reach
 /// the discovery server to report `C` once the handoff is done.
 #[derive(Clone)]
 struct NodeContext {
-    /// This node's own random per-process identity (ADR-0009), needed to
+    /// This node's own random per-process identity (node identity decoupled from address), needed to
     /// identify this node as the sender when it reports `C`.
     name: String,
     /// This node's per-process membership token (issue #34), generated
@@ -335,7 +335,7 @@ struct NodeContext {
     discovery_addr: String,
     /// Set while `run_migration` is active, cleared when it finishes (see
     /// `MigrationGuard`). Serves two purposes: `run_sweep` checks it and
-    /// skips its pass while it's `Some`, per ADR-0008 — a marked-but-not-
+    /// skips its pass while it's `Some`, per staged node join — a marked-but-not-
     /// yet-swept key may still be needed as the authoritative source for
     /// a subsequent hop while a handoff is in flight — and an incoming
     /// `X` (cancel) uses it to find (by `joining_name`) and abort a
@@ -364,18 +364,18 @@ struct NodeContext {
 
 /// Configuration for registering this node with discovery servers (see
 /// `src/bin/nanocached-discovery.rs`). When set, `run` asks to join once
-/// (ADR-0008) using a random per-process name (ADR-0009) and, once
+/// (staged node join) using a random per-process name (node identity decoupled from address) and, once
 /// promoted, sends a heartbeat declaring that name on `interval`, well
 /// under the discovery server's own liveness timeout.
 pub(crate) struct HeartbeatConfig {
-    /// One or more discovery replicas (ADR-0010). The first is the
+    /// One or more discovery replicas (discovery HA). The first is the
     /// primary — the only one this node ever sends `J` (and `C`) to;
     /// the rest learn about this node via `P` announces once the primary
     /// has promoted it. Never empty (main.rs validates).
     pub(crate) discovery_addrs: Vec<String>,
     /// The port this node serves on. `J`/`P` carry only this; the
     /// discovery server derives the full address from the registration
-    /// connection's source IP (ADR-0012), so there is nothing to
+    /// connection's source IP (addresses derived from the registration connection), so there is nothing to
     /// configure in containerized deployments.
     pub(crate) port: u16,
     pub(crate) interval: Duration,
@@ -465,7 +465,7 @@ pub(crate) async fn run(
     let cache_task = tokio::spawn(run_cache(request_rx, max_memory_bytes));
 
     // Shared with `node_context` (when this node has one) so `run_sweep`
-    // can tell whether an ADR-0008 handoff this node is the source for is
+    // can tell whether an staged node join handoff this node is the source for is
     // currently in flight, regardless of discovery configuration — a node
     // running standalone never touches this beyond the initial `None`.
     let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
@@ -481,7 +481,7 @@ pub(crate) async fn run(
     // #30), the same belief `wrong_node` rejects client requests against.
     let known_ring: KnownRing = Arc::new(Mutex::new(None));
 
-    // Generated once and kept for this process's lifetime (ADR-0009): a
+    // Generated once and kept for this process's lifetime (node identity decoupled from address): a
     // restarted node has no data to reclaim its old identity for, so
     // there's nothing a stable name would preserve across a restart that
     // isn't already lost anyway. Only meaningful when this node registers
@@ -492,7 +492,7 @@ pub(crate) async fn run(
         // so it can't double as the credential proving this node is the
         // one behind it (issue #34).
         token: Uuid::new_v4().to_string(),
-        // The primary (ADR-0010) — where `C` completion reports go,
+        // The primary (discovery HA) — where `C` completion reports go,
         // matching where `J` was sent.
         discovery_addr: config.discovery_addrs[0].clone(),
         active_migration: Arc::clone(&active_migration),
@@ -513,7 +513,7 @@ pub(crate) async fn run(
         _ => None,
     };
 
-    // Buffered rather than unbounded: ADR-0008 allows only one migration in
+    // Buffered rather than unbounded: staged node join allows only one migration in
     // flight per node (see `NodeContext::active_migration`), so a handful of
     // slots is already more than a well-behaved cluster would ever need at
     // once.
@@ -730,7 +730,7 @@ fn try_acquire_per_ip(counts: &PerIpConnections, ip: IpAddr) -> Option<PerIpConn
 /// shared by every over-limit rejection in `dispatch_connection`
 /// (`MAX_CONNECTIONS` and, per source IP, `MAX_CONNECTIONS_PER_IP`). A
 /// TLS-configured server has no plaintext channel to answer on before the
-/// handshake completes (ADR-0006: no plaintext fallback once TLS is set)
+/// handshake completes (TLS support: no plaintext fallback once TLS is set)
 /// — it just closes. A plaintext server can still reply on the raw
 /// stream. Bounded by `TLS_HANDSHAKE_TIMEOUT` (reused rather than a new
 /// constant: a peer that never reads this reply must not leak the task by
@@ -864,7 +864,7 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
 }
 
-/// ADR-0019: a `G`/`S`/`D` response on a tagged-mode connection echoes
+/// Echoed response tags: a `G`/`S`/`D` response on a tagged-mode connection echoes
 /// the request's tag; untagged connections keep the original encoding.
 fn encode_response(response: &Response, tag: Option<u32>) -> Vec<u8> {
     match tag {
@@ -892,7 +892,7 @@ async fn handle_connection(
     // specifically, rather than on every byte read.
     let mut deadline = Instant::now() + config.idle_timeout;
 
-    // ADR-0019: set once an `A ... T` is accepted. From then on every
+    // Echoed response tags: set once an `A ... T` is accepted. From then on every
     // request must carry a trailing tag (`parse_tagged`) and every
     // `G`/`S`/`D` response echoes it, so the client's read loop can
     // verify request/response alignment before dispatching.
@@ -922,7 +922,7 @@ async fn handle_connection(
                 };
 
                 // The identity reply echoes the tag capability only to a
-                // client that asked for it (ADR-0019) — a plain `A` keeps
+                // client that asked for it (echoed response tags) — a plain `A` keeps
                 // the exact three-byte reply older SDKs hard-read.
                 let identity = |response: &Response| {
                     if tagging {
@@ -969,13 +969,13 @@ async fn handle_connection(
                     ));
                 };
 
-                // The shared secret proves only "cluster member" (ADR-0005),
+                // The shared secret proves only "cluster member" (shared-secret authentication),
                 // not "the discovery server" — so without this every client
                 // holding it could send `M` and make this node stream its
                 // cache to an attacker-chosen address. Discovery echoes this
                 // node's own membership token (issue #34) on `M`; only a
                 // discovery server this node registered with knows it (no
-                // client does, and it's never sent back out — ADR-0018), so
+                // client does, and it's never sent back out — per-node membership tokens), so
                 // a mismatch means the sender isn't discovery. Reject loudly.
                 if !constant_time_eq(token.as_bytes(), node_context.token.as_bytes()) {
                     eprintln!(
@@ -1024,7 +1024,7 @@ async fn handle_connection(
                     }
                 };
 
-                // doc/adr/0017-*.md: sizes discovery's migration timeout.
+                // Size-derived migration timeout: sizes discovery's migration timeout.
                 // Issue (perf): one `list_keys` snapshot here, reused by
                 // both `entries_to_send_count` (for this count) and
                 // `run_migration` (for the actual transfer) below,
@@ -1169,7 +1169,7 @@ async fn handle_connection(
                 .await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
-                // ADR-0008: this key may be one an in-progress handoff is
+                // Staged node join: this key may be one an in-progress handoff is
                 // moving to a joining node — see `migration_target_for`.
                 if let Some(node_context) = &config.node_context
                     && let Some(target) = migration_target_for(node_context, &key)
@@ -1317,10 +1317,10 @@ async fn run_cache(mut request_rx: mpsc::Receiver<CacheRequest>, max_memory_byte
     }
 }
 
-/// ADR-0008: sent once per connection, before any heartbeat. `name` is
-/// this node's random per-process identity (ADR-0009); `port` is where it
+/// Staged node join: sent once per connection, before any heartbeat. `name` is
+/// this node's random per-process identity (node identity decoupled from address); `port` is where it
 /// serves — the discovery server composes the reachable address from this
-/// connection's own source IP plus that port (ADR-0012). Discovery holds
+/// connection's own source IP plus that port (addresses derived from the registration connection). Discovery holds
 /// this connection open and pushes `R\n` on it once this node is promoted
 /// to `Joined`.
 /// `token` is this node's per-process membership token (issue #34),
@@ -1334,7 +1334,7 @@ fn join_message(name: &str, port: u16, token: &str) -> Vec<u8> {
     message
 }
 
-/// ADR-0010: same shape as `join_message`, but declares an
+/// Discovery HA: same shape as `join_message`, but declares an
 /// already-promoted member — no handoff orchestration on the other end.
 fn announce_message(name: &str, port: u16, token: &str) -> Vec<u8> {
     let mut message = format!("P {} {port} {}\n", name.len(), token.len()).into_bytes();
@@ -1343,7 +1343,7 @@ fn announce_message(name: &str, port: u16, token: &str) -> Vec<u8> {
     message
 }
 
-/// Only valid once this node has been promoted to `Joined` (ADR-0008); the
+/// Only valid once this node has been promoted to `Joined` (staged node join); the
 /// address was already established by `join_message` on this connection,
 /// so a heartbeat only needs to carry `name` to refresh liveness.
 /// `replication` is this node's current belief about the cluster's
@@ -1371,7 +1371,7 @@ fn auth_message(secret: &[u8]) -> Vec<u8> {
 }
 
 /// Connects out to `addr` as a client — either the discovery server (for
-/// heartbeats, ADR-0008's `J`/`C`) or another node (for ADR-0008's
+/// heartbeats, staged node join's `J`/`C`) or another node (for staged node join's
 /// `SET`-based handoff) — upgrading to TLS first if `tls_connector` is
 /// set. There is no plaintext fallback: if TLS is configured and the
 /// handshake fails, the connection attempt fails too.
@@ -1401,7 +1401,7 @@ async fn connect_client_stream(
 }
 
 /// This registration task's relationship to one discovery replica
-/// (ADR-0010). The primary is the only one ever sent `J` — the ADR-0008
+/// (discovery HA). The primary is the only one ever sent `J` — the staged node join
 /// join, with its data handoff — and flips the shared `promoted` flag
 /// once `R` arrives for it. Standbys (and the primary itself, on any
 /// re-registration after that first promotion) send `P` announces, which
@@ -1412,10 +1412,10 @@ enum DiscoveryRole {
 }
 
 /// Registers this node with every configured discovery replica
-/// (ADR-0010): one `register_with_discovery` task per address, sharing a
+/// (discovery HA): one `register_with_discovery` task per address, sharing a
 /// `promoted` watch so standbys hold off announcing until the primary's
-/// ADR-0008 join has actually completed. `name` is this node's own
-/// ADR-0009 identity, generated once by `run` and shared with
+/// Staged node join join has actually completed. `name` is this node's own
+/// Node identity decoupled from address identity, generated once by `run` and shared with
 /// `ConnectionConfig`'s `NodeContext` — not generated here, so a
 /// migration task triggered by an incoming `M` on some other connection
 /// reports `C` under the same name these tasks register as.
@@ -1476,7 +1476,7 @@ async fn register_with_discovery(
     let announce = announce_message(&name, port, &token);
 
     // A standby must not announce a node the primary hasn't promoted yet:
-    // that would make it visible in the standby's `L` before its ADR-0008
+    // that would make it visible in the standby's `L` before its staged node join
     // handoff has run, which is exactly the state `J`'s staging exists to
     // prevent.
     if let DiscoveryRole::Standby(promoted_rx) = &mut role {
@@ -1543,7 +1543,7 @@ async fn register_with_discovery(
                         Ok(Ok(()))
                     );
                 if registration_sent {
-                    // For `J`, ADR-0008: this connection is held open by
+                    // For `J`, staged node join: this connection is held open by
                     // discovery (no idle timeout applies) until this node
                     // is promoted, which may take an unbounded amount of
                     // time if another join is already in progress. For
@@ -1568,7 +1568,7 @@ async fn register_with_discovery(
                         loop {
                             // Rebuilt every tick, not precomputed once:
                             // this node's belief starts unknown and is set
-                            // only once it has sent its own first ADR-0011
+                            // only once it has sent its own first client-side replication
                             // handoff `M` (issue #30) — a stale precomputed
                             // buffer would keep reporting "unknown" forever.
                             let replication = known_ring
@@ -1644,7 +1644,7 @@ fn set_message(key: &[u8], value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     message
 }
 
-/// ADR-0008: propagates a client's `D` for a key an in-progress handoff
+/// Staged node join: propagates a client's `D` for a key an in-progress handoff
 /// is moving to the joining node too (see `forward_delete_to_joining_node`).
 fn delete_message(key: &[u8]) -> Vec<u8> {
     let mut message = format!("D {}\n", key.len()).into_bytes();
@@ -1652,8 +1652,8 @@ fn delete_message(key: &[u8]) -> Vec<u8> {
     message
 }
 
-/// ADR-0008: reports to discovery that this node (identified by `name`,
-/// ADR-0009) has finished handing off its share of the current join.
+/// Staged node join: reports to discovery that this node (identified by `name`,
+/// Node identity decoupled from address) has finished handing off its share of the current join.
 /// `C <name-len> <joining-len> <token-len>\n<name><joining><token>` — the
 /// completion report names both the reporting node and the join it is
 /// for (issue #5): a bare name let a stale report from an abandoned
@@ -1669,7 +1669,7 @@ fn complete_message(name: &str, joining_name: &str, token: &str) -> Vec<u8> {
 }
 
 /// This node's view of cluster membership plus the replication factor it
-/// came with (ADR-0011) — the two always travel together, since "is this
+/// came with (client-side replication) — the two always travel together, since "is this
 /// key mine to serve" is a top-R question and R arrived on the same `M`
 /// that carried the roster.
 struct Membership {
@@ -1693,7 +1693,7 @@ struct ActiveMigration {
     joining_name: String,
     joining_addr: String,
     after_ring: Arc<HashRing>,
-    /// ADR-0011: discovery's replication factor, carried by the `M` that
+    /// Client-side replication: discovery's replication factor, carried by the `M` that
     /// started this handoff — membership in the joining node's copy set
     /// is "in the key's top-R", not "is the key's owner".
     replication: usize,
@@ -1916,7 +1916,7 @@ impl MigrationGuard {
     /// clearing the slot (which would close the write-forwarding window
     /// the moment THIS node finishes — issue #3), it stamps the
     /// completion time and this handoff's own size-derived grace (from
-    /// `entries_sent`, doc/adr/0017-*.md) so `migration_target_for` keeps
+    /// `entries_sent`, size-derived migration timeout) so `migration_target_for` keeps
     /// forwarding until that grace passes or the slot is
     /// replaced/cancelled.
     fn completed(mut self, entries_sent: usize) {
@@ -1969,7 +1969,7 @@ fn migration_rings(
     (HashRing::new(before_members), HashRing::new(after_members))
 }
 
-/// doc/adr/0017-*.md: counts how many of `keys` this node will actually
+/// Size-derived migration timeout: counts how many of `keys` this node will actually
 /// send to the joining node, mirroring the sender/displaced predicate
 /// `run_migration` computes for real (the old primary for a key is the
 /// one designated sender — a key can be affected by the join without
@@ -2008,9 +2008,9 @@ fn entries_to_send_count(
         .count()
 }
 
-/// ADR-0008 (generalized by ADR-0011): triggered by an incoming `M`.
+/// Staged node join (generalized by client-side replication): triggered by an incoming `M`.
 /// Computes, using the same rendezvous-hash algorithm clients use
-/// (`HashRing` here is `src/hash_ring.rs`'s copy, see ADR-0006), how each
+/// (`HashRing` here is `src/hash_ring.rs`'s copy, see TLS support), how each
 /// of this node's own entries' top-R owner set changes when the joining
 /// node is added. Adding exactly one node can only insert it into a key's
 /// ranking, never reorder the existing nodes relative to each other, so
@@ -2019,7 +2019,7 @@ fn entries_to_send_count(
 /// sender — no duplicate transfers), and the node displaced from rank R
 /// to R+1 (if any — there is at most one) marks its now-dead copy for
 /// the post-handoff sweep. This node may hold either role, both (R=1:
-/// sender and displaced coincide, which is exactly the pre-ADR-0011
+/// sender and displaced coincide, which is exactly the pre-replication
 /// behavior), or neither. There's no need to compare more than a pre-join
 /// ring. Transfers each such entry via an ordinary `SET` (reusing the
 /// client protocol, not a new one), marks it migrated, and once done
@@ -2038,7 +2038,7 @@ fn entries_to_send_count(
 /// gives up on the whole migration: it rolls back every mark from this
 /// run (same as the `abort_requested` path below) and returns without
 /// flipping `known_ring` or reporting `C`, leaving discovery's own
-/// size-derived migration timeout (doc/adr/0017-*.md) to reap the
+/// size-derived migration timeout (size-derived migration timeout) to reap the
 /// stalled join rather than have this node claim success over a joining
 /// node that's missing data. A lost discovery connection for the final
 /// `C` is a separate, already-terminal failure (the transfer itself
@@ -2099,7 +2099,7 @@ async fn run_migration(
         }
 
         let old_owners = before_ring.owners(&key, replication);
-        // ADR-0011: the old primary is the one designated sender.
+        // Client-side replication: the old primary is the one designated sender.
         let sends = old_owners.first() == Some(&self_name);
         // The (at most one) node the joiner displaced from rank R: its
         // copy is dead once the join completes — mark it for the sweep,
@@ -2184,7 +2184,7 @@ async fn run_migration(
         sent_count += 1;
 
         // A sender that stays in the key's top-R keeps its copy (it's
-        // still a live replica, ADR-0011); only a displaced copy is dead.
+        // still a live replica, client-side replication); only a displaced copy is dead.
         if displaced {
             mark_migrated(&node_context.request_tx, &key).await;
             marked_this_run.push(key);
@@ -2297,7 +2297,7 @@ async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
     }
 }
 
-/// ADR-0008's active-deletion background task: every `SWEEP_INTERVAL`,
+/// Staged node join's active-deletion background task: every `SWEEP_INTERVAL`,
 /// reclaims migrated-marked and TTL-expired entries. `Cache::sweep`
 /// removes at most `SWEEP_BUDGET` entries per call so it can't stall other
 /// cache commands queued behind it on the single-threaded actor for long
@@ -2682,7 +2682,7 @@ async fn forward_with_retries(
 /// (`migration_target_for`): `known_ring` flips as soon as *this node's*
 /// share of a join is done, but discovery only publishes the joiner in `L`
 /// once *every* ready node has reported `C` — which, with size-derived
-/// timeouts (doc/adr/0017), can be minutes after a small node finishes.
+/// timeouts (size-derived migration timeout), can be minutes after a small node finishes.
 /// In that gap a client's `L` still names this node as the owner and a
 /// refresh-and-retry gets the very same list, so rejecting here would make
 /// the key plainly unavailable (an error, not a miss) for R=1. Serving it
@@ -2696,7 +2696,7 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
         .is_some_and(|membership| {
-            // ADR-0011: this node serves a key when it's anywhere in the
+            // Client-side replication: this node serves a key when it's anywhere in the
             // key's top-R, not only when it's the primary.
             !membership
                 .ring
@@ -2710,7 +2710,7 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
 /// its `after_ring`), returns where to forward it — for `handle_connection`
 /// to also propagate a client's `S`/`D` for that key there, so the
 /// joining node doesn't end up serving a stale value once promoted (see
-/// doc/adr/0008's Consequences).
+/// the staged-join handoff design).
 fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<ForwardTarget> {
     let mut slot = node_context
         .active_migration
@@ -2731,7 +2731,7 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<Forwar
 
     slot.as_ref()
         .filter(|active| {
-            // ADR-0011: the joiner is a destination for `key` whenever it
+            // Client-side replication: the joiner is a destination for `key` whenever it
             // entered the key's top-R, not only as its new primary.
             active
                 .after_ring
@@ -3746,7 +3746,7 @@ mod tests {
             shutdown_rx,
         ));
 
-        // ADR-0019: `A ... T` flips the connection into tagged mode; every
+        // Echoed response tags: `A ... T` flips the connection into tagged mode; every
         // later request carries a trailing tag and every response echoes
         // it — including the four-field tagged SET-with-TTL form.
         client
@@ -3943,7 +3943,7 @@ mod tests {
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
         // Chosen (ready-node / other-node / joiner-0, R=2) so both
-        // ADR-0011 roles land on this node at once:
+        // Client-side replication roles land on this node at once:
         //   "key-0": pre-join top-2 = [ready-node, other-node]; joiner-0
         //            enters and displaces other-node — ready-node is the
         //            designated sender and STAYS an owner, so it must
@@ -4175,7 +4175,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_completed_forwarding_window_expires_after_the_grace() {
         // Issue #3: the lingering entry forwards only within its own
-        // forwarding_grace (doc/adr/0017-*.md); past it,
+        // forwarding_grace (size-derived migration timeout); past it,
         // migration_target_for clears the slot and stops forwarding.
         let (request_tx, _request_rx) = mpsc::channel(1);
         let node_context = NodeContext {
@@ -5327,7 +5327,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_heartbeat_reports_the_replication_factor_once_known_ring_is_set() {
         // Issue #30: the belief starts unknown (`r=0`) and, once this node
-        // has sent its own first ADR-0011 handoff `M`, every heartbeat
+        // has sent its own first client-side replication handoff `M`, every heartbeat
         // after that must carry the real value — not the buffer built at
         // connection time, which would keep reporting "unknown" forever.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5435,7 +5435,7 @@ mod tests {
             let _ = first.read(&mut buffer).await;
             drop(first);
 
-            // Second connection: the re-registration (ADR-0010: must be P,
+            // Second connection: the re-registration (discovery HA: must be P,
             // not another handoff-orchestrating J).
             let (mut second, _) = listener.accept().await.unwrap();
             let bytes_read = second.read(&mut buffer).await.unwrap();
@@ -5532,7 +5532,7 @@ mod tests {
             // Recorded as an event (checked by the test body) rather than
             // asserted here: this task is aborted, never awaited, so a
             // panic in it would be silently swallowed — which is exactly
-            // how a stale pre-ADR-0012 assertion survived here unnoticed.
+            // how a stale pre-registration-derived-address assertion survived here unnoticed.
             standby_events.lock().unwrap().push(format!(
                 "announced:{}",
                 String::from_utf8_lossy(&buffer[..bytes_read])

@@ -53,7 +53,7 @@ The 2026-08 test run used: ECS Fargate tasks (ARM64 images built from
 the repo `Dockerfile`, pushed to ECR) — two `nanocached-discovery`
 tasks started first so their private IPs could be passed to every
 node's `--discovery` (same list, same order) and to `NANOTEST_ADDRESSES`.
-(That run predated ADR-0012 and scraped each task's IP from the ECS
+(That run predated addresses derived from the registration connection and scraped each task's IP from the ECS
 metadata endpoint for `--advertise-addr`; nodes now need no address
 configuration at all.) The rest of the setup:
 cache nodes as standalone `run-task`s (no service, so a stopped task

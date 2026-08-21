@@ -34,7 +34,7 @@ Keys and values are `byte[]`, with `String` convenience overloads
 and return `Optional<String>` (a value that isn't valid UTF-8 throws
 `java.io.UncheckedIOException`); `getBytes`/`getBytes(byte[])` return the
 raw `Optional<byte[]>` without decoding. The client is thread-safe;
-requests are pipelined per connection (doc/adr/0016-*.md) — concurrent
+requests are pipelined per connection (request pipelining) — concurrent
 callers on the same connection each pay only their own network latency,
 not everyone else's ahead of them.
 
@@ -71,7 +71,7 @@ failed attempt forces a node-list refresh and one retry.
 Off by default. `set`/`delete` normally wait for every replica leg to
 finish, same as the primary. Enabling `fireAndForgetReplicas` returns
 as soon as the primary acks, letting replica legs finish in the
-background (doc/adr/0014-*.md):
+background (fire-and-forget replica writes):
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
@@ -93,7 +93,7 @@ connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `readRepair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (doc/adr/0015-*.md):
+background if one still has the value (read repair):
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
@@ -149,7 +149,7 @@ path / `java.io.File` via convenience overloads.
 
 Off by default. When enabled, values at or above `compressionThreshold`
 bytes are transparently DEFLATE-compressed on `set` and decompressed on
-`get`/`getBytes` (doc/adr/0013-\*.md):
+`get`/`getBytes` (value compression):
 
 ```java
 NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()

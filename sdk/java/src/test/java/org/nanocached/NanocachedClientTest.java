@@ -231,7 +231,7 @@ class NanocachedClientTest {
     void pipelinesConcurrentRequestsOnOneConnection() throws Exception {
         // Same shape as the TypeScript SDK's own pipelining test: N
         // concurrent requests on a single connection, each independently
-        // verified to round-trip its own value (doc/adr/0016-*.md) — a
+        // verified to round-trip its own value (request pipelining) — a
         // bug in matching responses to the right caller in send order
         // would show up as swapped or wrong values here.
         try (MockNode node = new MockNode()) {
@@ -352,7 +352,7 @@ class NanocachedClientTest {
         }
     }
 
-    // ── 値の圧縮 (doc/adr/0013-*.md) ────────────────────────────────
+    // ── 値の圧縮 (value compression) ────────────────────────────────
 
     @Test
     void wireFormatIsUntouchedWhenCompressIsOff() throws Exception {
@@ -439,7 +439,7 @@ class NanocachedClientTest {
     void readingALegacyValueWithCompressEnabledThrowsClearly() throws Exception {
         try (MockNode node = new MockNode()) {
             // A legacy/uncompressed writer's value whose first byte happens
-            // to collide with the DEFLATE marker (0x01) — doc/adr/0013-*.md's
+            // to collide with the DEFLATE marker (0x01) — value compression's
             // documented hazard of enabling compress against a keyspace
             // other clients still touch without it.
             try (NanocachedClient writer = connect("127.0.0.1", node.port())) {
@@ -890,7 +890,7 @@ class NanocachedClientTest {
         // timeout, so an address that accepts the TCP connection but
         // never answers `A` hung connect() forever instead of failing
         // over. It must now time out (bounded by CONNECT_TIMEOUT_MS) —
-        // and a timeout must NOT be mistaken for a pre-ADR-0019 server,
+        // and a timeout must NOT be mistaken for a legacy pre-tag server,
         // which would trigger a second, equally doomed untagged dial.
         try (MockNode node = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(
@@ -1179,7 +1179,7 @@ class NanocachedClientTest {
         }
     }
 
-    // ── fire-and-forget レプリカ書き込み (doc/adr/0014-*.md) ──────────
+    // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     private static NanocachedClient connectFireAndForget(int port) {
         return NanocachedClient.connect(NanocachedClient.builder()
@@ -1429,7 +1429,7 @@ class NanocachedClientTest {
         }
     }
 
-    // ── read repair (doc/adr/0015-*.md) ────────────────────────────
+    // ── read repair (read repair) ────────────────────────────
 
     private static NanocachedClient connectWithReadRepair(int port) {
         return NanocachedClient.connect(NanocachedClient.builder()
@@ -1552,7 +1552,7 @@ class NanocachedClientTest {
                 // the socket is closed below (or the issue-#40 identify
                 // read timeout fires, whichever comes first).
                 try (java.net.ServerSocket silent = new java.net.ServerSocket(0)) {
-                    // The dial may connect more than once (the ADR-0019
+                    // The dial may connect more than once (the echoed response tags
                     // legacy fallback redials after the first connection
                     // dies), so accept in a loop and track every socket.
                     List<java.net.Socket> acceptedSockets =
@@ -1749,7 +1749,7 @@ class NanocachedClientTest {
         }
     }
 
-    // ── 応答タグ (doc/adr/0019-*.md) ──────────────────────────────
+    // ── 応答タグ (echoed response tags) ──────────────────────────────
 
     @Test
     void negotiatesTagsAndRoundTripsPipelinedRequests() throws Exception {
@@ -1789,7 +1789,7 @@ class NanocachedClientTest {
 
     @Test
     void aDesyncedStreamIsCaughtByTheTagCheckBeforeAnyCallerSeesWrongData() throws Exception {
-        // The exact misdelivery doc/adr/0016-*.md left open: the server
+        // The exact misdelivery request pipelining left open: the server
         // (as a stand-in for any off-by-one stream corruption) never
         // answers the first GET, so the second GET's response arrives at
         // the first GET's pending slot. Without tags the first caller

@@ -17,11 +17,11 @@ class MockNode:
     ) -> None:
         self.store: dict[bytes, bytes] = {}
         self.required_secret = required_secret
-        # ADR-0019: acknowledge `A ... T` with `OnT\n` and echo tags on
+        # Echoed response tags: acknowledge `A ... T` with `OnT\n` and echo tags on
         # that connection's replies. Off by default so the bulk of the
         # suite keeps exercising the legacy untagged path.
         self.support_tags = support_tags
-        # Behave like a pre-ADR-0019 server: an extended `A ... T` is a
+        # Behave like a legacy pre-tag server: an extended `A ... T` is a
         # parse error — close the connection without replying.
         self.close_on_extended_auth = close_on_extended_auth
         self.connection_count = 0
@@ -62,7 +62,7 @@ class MockNode:
     def answer_wrong_tag_once(self) -> None:
         """Queue a one-off reply for the next G request on a tagged
         connection that echoes the WRONG tag (the request's tag + 1) —
-        the desync a pre-ADR-0019 stream misalignment would produce."""
+        the desync a pre-tag stream misalignment would produce."""
         self._wrong_tag_replies += 1
 
     def swallow_get_once(self) -> None:
@@ -114,7 +114,7 @@ class MockNode:
 
     def delay_sets(self, seconds: float) -> None:
         """Hold every future S's response — for tests proving a caller
-        isn't blocked on a slow replica leg (doc/adr/0014-*.md)."""
+        isn't blocked on a slow replica leg (fire-and-forget replica writes)."""
         self._set_delay = seconds
 
     def go_silent_after_handshake(self) -> None:
@@ -145,7 +145,7 @@ class MockNode:
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.connection_count += 1
         self._sockets.add(writer)
-        # ADR-0019: set when this connection's `A ... T` was acknowledged
+        # Echoed response tags: set when this connection's `A ... T` was acknowledged
         # — its requests then carry a trailing tag the replies must echo.
         tagged = False
         try:
@@ -325,7 +325,7 @@ class MockDiscovery:
 
                 if parts[0] == b"A":
                     await reader.readexactly(int(parts[1]))
-                    # ADR-0019: echo the tag capability — clients send the
+                    # Echoed response tags: echo the tag capability — clients send the
                     # extended A before knowing which kind of server
                     # answered. Discovery's `L` exchange never uses tags
                     # itself, so nothing else here depends on this.

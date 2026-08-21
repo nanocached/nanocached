@@ -20,7 +20,7 @@ var noSecretPlaceholder = []byte{0}
 
 // discoveredNode pairs a node's hash-ring identity (a random per-process
 // UUID) with its network address — two different things since
-// doc/adr/0009-*.md: Name is what routing hashes; Address is only for
+// Node identity decoupled from address: Name is what routing hashes; Address is only for
 // opening a connection. Unexported (issue #47): no public API ever
 // returns or accepts it, so exporting it was dead public surface.
 type discoveredNode struct {
@@ -33,7 +33,7 @@ type identified struct {
 	conn        net.Conn
 	nodes       []discoveredNode
 	replication int
-	// tagged (doc/adr/0019-*.md): the node accepted the extended `A ... T`,
+	// tagged (echoed response tags): the node accepted the extended `A ... T`,
 	// so this connection's G/S/D traffic must carry tags and its
 	// responses echo them; false means an older node answered the plain-`A`
 	// fallback. Meaningless on a cluster result.
@@ -43,16 +43,16 @@ type identified struct {
 // connectAndIdentify dials host:port, authenticates, and figures out from
 // the server's own A response whether it reached a cache node (On) or a
 // discovery server (Od) — the caller never says which it expects
-// (doc/adr/0007-*.md). A node's conn is handed back live; a discovery
+// (the server type in the auth response). A node's conn is handed back live; a discovery
 // connection is used once for L and closed, returning the name/address
-// list and the cluster's replication factor R (doc/adr/0009, 0010, 0011).
+// list and the cluster's replication factor R (node identity, discovery HA, replication).
 // connectDeadline bounds one whole connect attempt — dial, TLS
 // handshake, and the identify exchange share a single 5s budget, the
 // same shape as the other five SDKs (issue #47 item 1: the previous
 // 10s-dial + 5s-handshake staging made Go's worst-case failover ~3x
 // the others'). A server that accepts the TCP connection but never
 // answers (a blackholed address behaves the same way) must not hang
-// the caller. The ADR-0019 legacy fallback's redial gets a fresh
+// the caller. The echoed response tags legacy fallback's redial gets a fresh
 // budget, matching the per-attempt deadlines elsewhere. A variable
 // only so tests can shorten it.
 var connectDeadline = 5 * time.Second
@@ -71,7 +71,7 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 		if !isLegacyServerSignal(err) {
 			return nil, err
 		}
-		// doc/adr/0019-*.md transparent fallback: a pre-0019 server rejects
+		// Echoed response tags transparent fallback: a pre-0019 server rejects
 		// the extended `A ... T` as a parse error and closes without
 		// replying — redial once with the plain form and run the
 		// connection untagged (the pre-0019 behavior, desync window
@@ -96,7 +96,7 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 	return result, nil
 }
 
-// isLegacyServerSignal reports whether err looks like a pre-doc/adr/0019-*.md
+// isLegacyServerSignal reports whether err looks like a pre-tag
 // server slamming the door on the extended `A ... T` — closing, EOF, or
 // resetting the connection before any reply — the only failure worth
 // retrying with the plain form. A timeout is not one: the server kept the
@@ -142,7 +142,7 @@ func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, 
 	return tls.DialWithDialer(&dialer, "tcp", address, config)
 }
 
-// identify runs the `A` handshake on conn. requestTags (doc/adr/0019-*.md)
+// identify runs the `A` handshake on conn. requestTags (echoed response tags)
 // says whether to send the extended form (`A <len> T\n<secret>`), asking
 // the server to echo tags on this connection's G/S/D traffic; the client
 // always tries this first (connectAndIdentify falls back to the plain form
@@ -180,7 +180,7 @@ func identify(conn net.Conn, address string, authSecret []byte, requestTags bool
 		return nil, fmt.Errorf("nanocached: unexpected response to A")
 	}
 
-	// doc/adr/0019-*.md stretches the reply to four bytes by a `T` before
+	// Echoed response tags stretches the reply to four bytes by a `T` before
 	// the LF when the server is echoing the tag capability our extended
 	// `A` asked for (`OnT\n`/`EnT\n`/`OdT\n`/`EdT\n`); a bare `\n` in that
 	// third position is the traditional, untagged reply.
@@ -271,7 +271,7 @@ func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 		return nil, 0, fmt.Errorf("nanocached: unexpected response from discovery server: %s", header)
 	}
 
-	// `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+	// `N <count> <r>\n` (client-side replication) — the replication factor rides along.
 	fields := strings.Split(rest, " ")
 	if len(fields) != 2 {
 		return nil, 0, fmt.Errorf("nanocached: invalid node-list header in discovery response")

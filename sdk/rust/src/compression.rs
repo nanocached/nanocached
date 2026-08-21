@@ -1,4 +1,4 @@
-//! doc/adr/0013-*.md: transparent, opt-in value compression. Values are
+//! Value compression: transparent, opt-in value compression. Values are
 //! prefixed with a one-byte marker once `compress` is enabled on a
 //! client — `0x00` for stored-as-is (below threshold, or compression
 //! didn't shrink it), `0x01` for raw-DEFLATE-compressed (RFC 1951, no
@@ -74,7 +74,7 @@ mod deflate {
 
     /// The `get`/`get_bytes` counterpart to `compress_value`. Only ever
     /// called when `compress` is enabled on this client — see
-    /// doc/adr/0013-*.md.
+    /// Value compression.
     pub(crate) fn decompress_value(value: &[u8]) -> Result<Vec<u8>> {
         let Some((&marker, body)) = value.split_first() else {
             return Err(Error::Decompression(
@@ -95,7 +95,7 @@ mod deflate {
                 limited.read_to_end(&mut out).map_err(|error| {
                     Error::Decompression(format!(
                         "nanocached: failed to decompress a value marked as compressed — did \
-                         every client sharing this key enable compress (doc/adr/0013-*.md)? \
+                         every client sharing this key enable compress (value compression)? \
                          ({error})"
                     ))
                 })?;
@@ -110,7 +110,7 @@ mod deflate {
             }
             other => Err(Error::Decompression(format!(
                 "nanocached: unrecognized compression marker byte {other} — was this value \
-                 written by a client with compress disabled (doc/adr/0013-*.md)?"
+                 written by a client with compress disabled (value compression)?"
             ))),
         }
     }
@@ -147,7 +147,7 @@ pub(crate) fn decompress_value(_value: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    // doc/adr/0013-*.md: one canonical plaintext and its raw-DEFLATE
+    // Value compression: one canonical plaintext and its raw-DEFLATE
     // compressed bytes (produced once via Python's zlib, level 6,
     // wbits=-15), hardcoded identically into every SDK's test suite — the
     // same duplicated-pinned-constant pattern the hash-ring FNV-1a/score

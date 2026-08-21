@@ -3,7 +3,7 @@ using System.IO.Compression;
 namespace Nanocached;
 
 /// <summary>
-/// doc/adr/0013-*.md: transparent, opt-in value compression. Values are
+/// Value compression: transparent, opt-in value compression. Values are
 /// prefixed with a one-byte marker once <c>Compress</c> is enabled on a
 /// client — <c>0x00</c> for stored-as-is (below threshold, or
 /// compression didn't shrink it), <c>0x01</c> for raw-DEFLATE-compressed
@@ -49,7 +49,7 @@ internal static class Compression
 
     /// <summary>The GetAsync/GetBytesAsync counterpart to
     /// <see cref="CompressValue"/>. Only ever called when <c>Compress</c>
-    /// is enabled on this client — see doc/adr/0013-*.md.</summary>
+    /// is enabled on this client — see value compression.</summary>
     internal static byte[] DecompressValue(byte[] value)
     {
         if (value.Length == 0)
@@ -96,14 +96,14 @@ internal static class Compression
             {
                 throw new DecompressionException(
                     "nanocached: failed to decompress a value marked as compressed — did every "
-                    + $"client sharing this key enable compress (doc/adr/0013-*.md)? ({error.Message})",
+                    + $"client sharing this key enable compress (value compression)? ({error.Message})",
                     error);
             }
         }
 
         throw new DecompressionException(
             $"nanocached: unrecognized compression marker byte {marker} — was this value written "
-            + "by a client with compress disabled (doc/adr/0013-*.md)?");
+            + "by a client with compress disabled (value compression)?");
     }
 
     private static byte[] Prefixed(byte marker, byte[] body)

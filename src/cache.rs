@@ -37,7 +37,7 @@ pub struct Cache {
     entries: LruCache<Bytes, Entry, RandomState>,
     used_bytes: usize,
     max_memory_bytes: usize,
-    /// Keys handed off to another node during an ADR-0008 migration this
+    /// Keys handed off to another node during an staged node join migration this
     /// node was the source for, awaiting `sweep`'s next pass.
     migrated: HashSet<Bytes>,
     /// Expired/marked keys queued for removal by `sweep`, in
@@ -175,7 +175,7 @@ impl Cache {
         }
     }
 
-    /// A point-in-time snapshot of every non-expired key. For ADR-0008's
+    /// A point-in-time snapshot of every non-expired key. For staged node join's
     /// migration task: both of its consumers only ever need the key, never
     /// a value or TTL captured here. `entries_to_send_count` (in
     /// `src/server.rs`) filters purely on key membership in the before/
@@ -218,7 +218,7 @@ impl Cache {
 
     /// The current value and remaining TTL for one key, same shape as one
     /// `entries()` row, without disturbing recency (`LruCache::peek`, not
-    /// `get`). For ADR-0008's migration task, to re-check a key's *live*
+    /// `get`). For staged node join's migration task, to re-check a key's *live*
     /// value right before sending it, instead of trusting whatever
     /// `entries()`'s snapshot captured at the start of the handoff — a
     /// concurrent client write between the snapshot and this key's turn
@@ -246,7 +246,7 @@ impl Cache {
         ))
     }
 
-    /// Marks `key` as handed off during an ADR-0008 migration this node
+    /// Marks `key` as handed off during an staged node join migration this node
     /// was the source for. A no-op if the key is already marked or no
     /// longer present; `sweep` reclaims marked entries later. `migrated`
     /// holds its own copy of the key bytes (see its field docs), so a
@@ -270,7 +270,7 @@ impl Cache {
         self.clear_migrated_mark(key);
     }
 
-    /// ADR-0008's active-deletion facility: reclaims entries marked by
+    /// Staged node join's active-deletion facility: reclaims entries marked by
     /// `mark_migrated`, and — since `get_at`/`delete_at` only expire a
     /// TTL'd entry lazily, on access — also proactively removes anything
     /// past its TTL, so an unread expired key doesn't sit in memory

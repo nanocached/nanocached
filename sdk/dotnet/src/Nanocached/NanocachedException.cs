@@ -15,7 +15,7 @@ public sealed class AlreadyClosedException : NanocachedException
 }
 
 /// <summary>
-/// A node answered <c>W</c> (ADR-0008): per its own view of cluster
+/// A node answered <c>W</c> (staged node join): per its own view of cluster
 /// membership it doesn't hold this key — the caller's routing table is
 /// stale. The client catches this internally to refresh the node list and
 /// retry once; it only escapes when that retry also fails, or in
@@ -39,7 +39,7 @@ public sealed class AuthenticationFailedException : NanocachedException
 
 /// <summary>
 /// A discovery server answered <c>L</c> with <c>B</c> — it is inside its
-/// startup grace (ADR-0010), re-learning membership after a restart. Try
+/// startup grace (discovery HA), re-learning membership after a restart. Try
 /// another address, or retry shortly.
 /// </summary>
 public sealed class DiscoveryBusyException : NanocachedException
@@ -59,7 +59,7 @@ public sealed class ConnectionLostException : NanocachedException
 /// <summary>
 /// Raised by GetAsync/GetBytesAsync when a value with <c>Compress</c>
 /// enabled can't be interpreted — almost always a <c>Compress</c>
-/// mismatch between clients sharing this key (doc/adr/0013-*.md's
+/// mismatch between clients sharing this key (value compression's
 /// compatibility caveat: every client touching a given keyspace must
 /// agree on <c>Compress</c>), not a transient failure.
 /// </summary>

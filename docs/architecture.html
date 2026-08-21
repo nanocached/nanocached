@@ -122,20 +122,19 @@ Kubernetes) and two replicas make discovery effectively always
 available.</p>
 
 <h2>Design decisions</h2>
-<p>Every one of these choices is recorded as an ADR in the repository,
-with the alternatives that were rejected and why:</p>
+<p>The main choices, in summary:</p>
 <div class="table-wrap">
 <table>
-  <thead><tr><th>ADR</th><th>Decision</th></tr></thead>
+  <thead><tr><th>Decision</th></tr></thead>
   <tbody>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0002-client-side-consistent-hashing-with-a-lightweight-self-hosted-discovery-server.md">0002</a></td><td>Client-side hashing with a lightweight discovery server</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0005-shared-secret-authentication-via-environment-variable.md">0005</a></td><td>Shared-secret authentication via environment variable</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0006-tls-support-via-rustls-required-once-configured.md">0006</a></td><td>TLS via rustls, required once configured</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0007-encode-server-type-in-the-auth-response-for-a-unified-connect.md">0007</a></td><td>Server type in the auth response → one unified connect</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0008-staged-node-join-with-discovery-orchestrated-data-handoff.md">0008</a></td><td>Staged node join with orchestrated data handoff</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0009-decouple-node-identity-from-network-address.md">0009</a></td><td>Node identity decoupled from network address</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0010-discovery-ha-via-soft-state-replicas-and-member-announce.md">0010</a></td><td>Discovery HA via soft-state replicas and announces</td></tr>
-    <tr><td><a href="https://github.com/nanocached/nanocached/blob/main/doc/adr/0011-client-side-replication-via-rendezvous-hashing.md">0011</a></td><td>Client-side replication via rendezvous hashing</td></tr>
+    <tr><td>Client-side hashing with a lightweight discovery server</td></tr>
+    <tr><td>Shared-secret authentication via environment variable</td></tr>
+    <tr><td>TLS via rustls, required once configured</td></tr>
+    <tr><td>Server type in the auth response → one unified connect</td></tr>
+    <tr><td>Staged node join with orchestrated data handoff</td></tr>
+    <tr><td>Node identity decoupled from network address</td></tr>
+    <tr><td>Discovery HA via soft-state replicas and announces</td></tr>
+    <tr><td>Client-side replication via rendezvous hashing</td></tr>
   </tbody>
 </table>
 </div>
@@ -148,7 +147,6 @@ with the alternatives that were rejected and why:</p>
     <a href="https://github.com/nanocached/nanocached/blob/main/LICENSE">MIT License</a>
     <a href="https://github.com/nanocached/nanocached">GitHub</a>
     <a href="https://github.com/nanocached/nanocached/issues">Issues</a>
-    <a href="https://github.com/nanocached/nanocached/tree/main/doc/adr">Design decisions (ADRs)</a>
   </div>
 </footer>
 

@@ -16,10 +16,10 @@ import javax.net.ssl.SSLSocket;
  * Connect-and-identify: dials {@code host:port}, authenticates, and
  * figures out from the server's own {@code A} response whether it reached
  * a cache node ({@code On}) or a discovery server ({@code Od}) — the
- * caller never says which it expects (doc/adr/0007-*.md). A node's socket
+ * caller never says which it expects (the server type in the auth response). A node's socket
  * is handed back live; a discovery connection is used once for {@code L}
  * and closed, returning the name/address list and the cluster's
- * replication factor R (doc/adr/0009, 0010, 0011).
+ * replication factor R (node identity, discovery HA, replication).
  */
 final class Identify {
     // A server with no secret accepts any non-empty secret; one that
@@ -28,7 +28,7 @@ final class Identify {
 
     sealed interface Result permits NodeTarget, ClusterTarget {}
 
-    // `tagged` (ADR-0019): the node accepted the extended `A ... T`, so
+    // `tagged` (echoed response tags): the node accepted the extended `A ... T`, so
     // this socket's G/S/D traffic must carry tags and its responses echo
     // them; false means an older node answered the plain-`A` fallback.
     record NodeTarget(Socket socket, boolean tagged) implements Result {}
@@ -38,7 +38,7 @@ final class Identify {
     private Identify() {}
 
     /** Thrown only when writing/reading the extended {@code A ... T}
-     * exchange fails in a way that looks like a pre-ADR-0019 server
+     * exchange fails in a way that looks like a legacy pre-tag server
      * slamming the connection shut without replying (close/EOF/RST,
      * never a malformed-but-present reply) — the one case
      * {@link #connectAndIdentify} retries with the plain form. Never
@@ -54,7 +54,7 @@ final class Identify {
         try {
             return identifyOnce(host, port, authSecret, tls, true);
         } catch (LegacyServerSignal signal) {
-            // ADR-0019 transparent fallback: a pre-0019 server treats the
+            // Echoed response tags transparent fallback: a pre-0019 server treats the
             // extended `A ... T` as a parse error and closes/resets
             // without replying — redial once with the plain form and run
             // the connection untagged (the pre-0019 behavior).
@@ -123,9 +123,9 @@ final class Identify {
 
     /** Parses the reply to `A`: {@code On\n}/{@code En\n} from a cache
      * node, {@code Od\n}/{@code Ed\n} from a discovery server (see
-     * doc/adr/0007-*.md), each stretched to four bytes by a {@code T}
+     * The server type in the auth response), each stretched to four bytes by a {@code T}
      * before the LF when the server is echoing the tag capability our
-     * extended {@code A} asked for (doc/adr/0019-*.md). The second byte
+     * extended {@code A} asked for (echoed response tags). The second byte
      * is what identifies which kind of server this is — it isn't an
      * accident of the auth outcome, it's present whether accepted or
      * rejected. */
@@ -222,7 +222,7 @@ final class Identify {
                     "nanocached: unexpected response from discovery server: " + header);
         }
 
-        // `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+        // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
         String[] fields = header.substring(2).split(" ");
         if (fields.length != 2) {
             throw new NanocachedException("nanocached: invalid node-list header in discovery response");

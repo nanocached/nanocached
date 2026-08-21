@@ -7,7 +7,7 @@ namespace Nanocached;
 /// <summary>
 /// A node's hash-ring identity (a random per-process UUID) and its network
 /// address (<c>host:port</c>) — two different things since
-/// doc/adr/0009-*.md: <see cref="Name"/> is what routing hashes;
+/// Node identity decoupled from address: <see cref="Name"/> is what routing hashes;
 /// <see cref="Address"/> is only for opening a connection.
 /// </summary>
 public sealed record DiscoveredNode(string Name, string Address);
@@ -16,10 +16,10 @@ public sealed record DiscoveredNode(string Name, string Address);
 /// Connect-and-identify: dials <c>host:port</c>, authenticates, and
 /// figures out from the server's own <c>A</c> response whether it reached
 /// a cache node (<c>On</c>) or a discovery server (<c>Od</c>) — the caller
-/// never says which it expects (doc/adr/0007-*.md). A node's stream is
+/// never says which it expects (the server type in the auth response). A node's stream is
 /// handed back live; a discovery connection is used once for <c>L</c> and
 /// disposed, returning the name/address list and the cluster's replication
-/// factor R (doc/adr/0009, 0010, 0011).
+/// factor R (node identity, discovery HA, replication).
 /// </summary>
 internal static class Identify
 {
@@ -36,7 +36,7 @@ internal static class Identify
 
     internal abstract record Result;
 
-    // `Tagged` (ADR-0019): the node accepted the extended `A ... T`, so
+    // `Tagged` (echoed response tags): the node accepted the extended `A ... T`, so
     // this stream's `G`/`S`/`D` traffic must carry tags and its responses
     // echo them; false means an older node answered the plain-`A` fallback.
     internal sealed record NodeTarget(Stream Stream, bool Tagged) : Result;
@@ -44,13 +44,13 @@ internal static class Identify
     internal sealed record ClusterTarget(IReadOnlyList<DiscoveredNode> Nodes, int Replication) : Result;
 
     /// <summary>
-    /// Always dials with the extended <c>A ... T</c> first (doc/adr/0019-*.md),
+    /// Always dials with the extended <c>A ... T</c> first (echoed response tags),
     /// so a 0019+ server tags this connection from the start. Only when the
     /// extended form itself signals a pre-0019 server — the connection
     /// closed/EOF/reset before any reply arrived, never a timeout or a
     /// malformed-but-present reply — does this transparently redial once
     /// with the plain <c>A</c> form and run the connection untagged, the
-    /// same as before ADR-0019 existed.
+    /// same as before echoed response tags existed.
     /// </summary>
     internal static async Task<Result> ConnectAndIdentifyAsync(
         string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls)
@@ -115,7 +115,7 @@ internal static class Identify
 
             // Read the reply's first 3 bytes: a pre-0019 shape ends the
             // reply right there (`On\n`/`En\n`/`Od\n`/`Ed\n`, byte[2] ==
-            // '\n', untagged); doc/adr/0019-*.md stretches it to 4 bytes
+            // '\n', untagged); echoed response tags stretches it to 4 bytes
             // with a `T` before the final '\n' when the server echoes the
             // tag capability our extended `A` asked for.
             var ack = new byte[3];
@@ -156,7 +156,7 @@ internal static class Identify
             }
 
             // A discovery server: one-shot L, then this connection is done.
-            // Tags carry no meaning for discovery (ADR-0019) — L is a
+            // Tags carry no meaning for discovery (echoed response tags) — L is a
             // single request/response with nothing to desync — but the
             // `OdT\n` ack still had to be parsed above since the client
             // sends the extended `A` before knowing which kind of server
@@ -297,7 +297,7 @@ internal static class Identify
                 $"nanocached: unexpected response from discovery server: {header}");
         }
 
-        // `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+        // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
         string[] fields = header[2..].Split(' ');
         if (fields.Length != 2
             || !int.TryParse(fields[0], out int count)

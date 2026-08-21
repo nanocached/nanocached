@@ -1,9 +1,9 @@
-//! Retained ADR-0008 verification/demonstration harness — a correctness
+//! Retained staged node join verification/demonstration harness — a correctness
 //! check, not a load-testing tool. Spawns real
 //! `nanocached-discovery`/`nanocached-node` processes as subprocesses and
 //! drives them exactly like a real client would (raw TCP, the same wire
 //! protocol any SDK speaks), to empirically check staged-join behavior
-//! rather than reason about it from the ADR text alone:
+//! rather than reason about it from the design notes alone:
 //!
 //! - Does a newly joined node actually receive the keys it should, and
 //!   does it show up in `L` only once that handoff is done?
@@ -15,7 +15,7 @@
 //!   really wait (serialize) behind the first, rather than both being
 //!   promoted together?
 //!
-//! ADR-0011 (client-side replication via rendezvous hashing) means this
+//! Client-side replication (client-side replication via rendezvous hashing) means this
 //! harness cannot assume single-owner semantics: with the server's
 //! default `--replication-factor 2`, a node rejects `G`/`S` for any key
 //! outside its own top-R with `W` (see `wrong_node` in `src/server.rs`).
@@ -30,12 +30,12 @@
 //! to run one, or omit it to run all three in sequence.
 //!
 //! This binary has no dependency on the node/discovery implementations
-//! (the binaries share no modules by design — see doc/adr/0017-*.md and
+//! (the binaries share no modules by design — see size-derived migration timeout and
 //! `nanocached-discovery.rs`'s module docs): it only spawns the sibling
 //! binaries as subprocesses and
 //! speaks the wire protocol to them, with its own minimal copy of just
 //! the pieces it needs (`A`/`G`/`S` and discovery's `L`). No TLS/auth
-//! support yet — this is for local verification (see ADR-0008's Context);
+//! support yet — this is for local verification (see staged node join's Context);
 //! add it if/when AWS verification needs it.
 
 use bytes::BytesMut;
@@ -70,7 +70,7 @@ const BUCKET_WIDTH: Duration = Duration::from_millis(250);
 /// (e.g. `sdk/rust/src/connection.rs`).
 const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
 /// Upper bound on a discovery `L` entry's declared name/addr length
-/// (`fetch_joined`). ADR-0009 names and `ip:port` addresses are both, in
+/// (`fetch_joined`). Node identity decoupled from address names and `ip:port` addresses are both, in
 /// practice, well under a hundred bytes, and discovery's own inbound
 /// request cap is 4 KiB (`MAX_REQUEST_SIZE`,
 /// `src/bin/nanocached-discovery.rs`) — nothing legitimate can exceed
@@ -395,7 +395,7 @@ fn fmix64(mut hash: u64) -> u64 {
 }
 
 /// A byte-for-byte port of `src/hash_ring.rs`'s HRW ring, independently
-/// implemented the way any other ADR-0011 participant (node, SDK)
+/// implemented the way any other client-side replication participant (node, SDK)
 /// must — see this file's module docs. Only what this harness needs:
 /// computing a key's top-R owners, in score order, from a roster snapshot.
 struct Ring<'a> {
@@ -434,7 +434,7 @@ impl<'a> Ring<'a> {
 }
 
 /// Fetches the current `Joined` node list and replication factor from
-/// discovery, in the ADR-0009 `<name-length> <addr-length>\n<name><addr>`
+/// discovery, in the node identity decoupled from address `<name-length> <addr-length>\n<name><addr>`
 /// shape.
 async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
     let mut stream = TcpStream::connect(discovery_addr).await?;
@@ -442,7 +442,7 @@ async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
 
     let mut buf = BytesMut::new();
     let header = read_line(&mut stream, &mut buf).await?;
-    // `N <count> <r>\n` since ADR-0011: the replication factor rides
+    // `N <count> <r>\n` since client-side replication: the replication factor rides
     // along so every client (this harness included) can route by top-R
     // instead of assuming single ownership.
     let mut header_parts = header
@@ -542,7 +542,7 @@ async fn set(
     Ok(line == "S")
 }
 
-/// A `G` response: a hit, a miss, or `W` — ADR-0011's "your topology view
+/// A `G` response: a hit, a miss, or `W` — client-side replication's "your topology view
 /// is stale" signal, which the workload treats differently from either
 /// (see `workload_get`) rather than lumping it in with a malformed reply.
 enum GetReply {
@@ -750,7 +750,7 @@ impl Stats {
 
 /// One GET, following the SDK's fallback rule: ask the primary; only on a
 /// connection-level failure fall through to the next owner in rank order.
-/// A `W` from the primary is neither of those — ADR-0011 defines it as
+/// A `W` from the primary is neither of those — client-side replication defines it as
 /// "your topology view is stale", so it's handled by refreshing the
 /// roster from discovery and retrying exactly once (`refresh_and_retry`),
 /// not by treating it as a failed operation.
@@ -781,7 +781,7 @@ async fn workload_get(
     (false, last_error)
 }
 
-/// ADR-0011's documented recovery for a `W`: "topology stale → refresh
+/// Client-side replication's documented recovery for a `W`: "topology stale → refresh
 /// and retry once". Fetches the current roster/replication straight from
 /// discovery (bypassing the periodic poller, which may not have caught up
 /// yet) and retries against the freshly computed primary — exactly once,
@@ -986,7 +986,7 @@ async fn run_workload(
 }
 
 /// Seeds `keys` sequential keys, writing each to every one of its
-/// ADR-0011 top-R owners (as the SDK's fan-out would) rather than to a
+/// Client-side replication top-R owners (as the SDK's fan-out would) rather than to a
 /// single fixed node.
 async fn seed_keys(
     roster: &Roster,
@@ -1079,7 +1079,7 @@ async fn verify_handoff(
 /// appears, returning the roster and replication factor at that moment,
 /// the new node's name, and how long the wait took. Used to measure one
 /// join's handoff duration without needing to know the new node's random
-/// ADR-0009 name in advance.
+/// Node identity decoupled from address name in advance.
 async fn wait_for_new_joined_node(
     discovery_addr: &str,
     already_known: &HashSet<String>,
@@ -1226,7 +1226,7 @@ async fn run_waiting_join(
     let join_started_at = test_start.elapsed();
 
     // Two nodes ask to join at nearly the same time; only one may be
-    // `Joining` at once (ADR-0008), so the second should be visibly
+    // `Joining` at once (staged node join), so the second should be visibly
     // delayed behind the first.
     let second = spawn_node(node_bin, log_dir, base_port + 2, &discovery.addr)?;
     let third = spawn_node(node_bin, log_dir, base_port + 3, &discovery.addr)?;
@@ -1423,7 +1423,7 @@ mod tests {
             assert_eq!(&request, b"L\n");
 
             write_list_header(&mut stream, 1, 2).await;
-            // Declares a name_length far beyond anything a real ADR-0009
+            // Declares a name_length far beyond anything a real node identity decoupled from address
             // name is, and never sends a body that large — the bound
             // check must reject based on the entry header alone.
             stream

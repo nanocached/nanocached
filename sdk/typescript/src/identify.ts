@@ -19,7 +19,7 @@ export interface IdentifyOptions {
 
 /** A node's hash-ring identity (a random per-process UUID) and its
  * network address (`host:port`) — two different things since
- * doc/adr/0009-*.md. `name` is what a hash ring must be built from, so
+ * Node identity decoupled from address. `name` is what a hash ring must be built from, so
  * every party (this client, another client, or a node computing a
  * handoff) agrees on cluster membership; `address` is only for opening a
  * connection, and carries no identity meaning of its own. */
@@ -34,15 +34,15 @@ export interface DiscoveredNode {
  * discovery server (`kind: "cluster"` — the socket has already been used
  * for `L` and discarded; `nodes` is the name/address list it returned).
  * Callers never choose which of these to expect: `A`'s response says so
- * (see doc/adr/0007-*.md), which is what lets `NanocachedClient.connect()`
+ * (see the server type in the auth response), which is what lets `NanocachedClient.connect()`
  * take the exact same options for either.
  */
 export type IdentifyResult =
-  // `tagged` (ADR-0019): the node accepted the extended `A ... T`, so
+  // `tagged` (echoed response tags): the node accepted the extended `A ... T`, so
   // this socket's `G`/`S`/`D` traffic must carry tags and its responses
   // echo them; false means an older node answered the plain-`A` fallback.
   | { kind: "node"; socket: Socket | TLSSocket; tagged: boolean }
-  // `replication` (ADR-0011) is discovery's replication factor R — how
+  // `replication` (client-side replication) is discovery's replication factor R — how
   // many nodes hold each key. It rides the `L` response so clients can't
   // skew from the cluster's setting.
   | { kind: "cluster"; nodes: DiscoveredNode[]; replication: number };
@@ -136,14 +136,14 @@ function readFrame<T>(
 interface AuthIdentity {
   accepted: boolean;
   kind: "node" | "cluster";
-  /** ADR-0019: the server echoed the tag capability (`OnT\n`/`OdT\n`). */
+  /** echoed response tags: the server echoed the tag capability (`OnT\n`/`OdT\n`). */
   tagged: boolean;
 }
 
 /** Parses the reply to `A`: `On\n`/`En\n` from a cache node, `Od\n`/`Ed\n`
- * from a discovery server (see doc/adr/0007-*.md), each stretched to four
+ * from a discovery server (see the server type in the auth response), each stretched to four
  * bytes by a `T` before the LF when the server is echoing the tag
- * capability our extended `A` asked for (doc/adr/0019-*.md). The second
+ * capability our extended `A` asked for (echoed response tags). The second
  * byte is what identifies which kind of server this is — it isn't an
  * accident of the auth outcome, it's present whether accepted or
  * rejected. */
@@ -195,7 +195,7 @@ export class AuthenticationError extends NanocachedError {
 }
 
 /** Thrown when a discovery server answers `L` with `B` — it is inside its
- * startup grace (ADR-0010), re-learning cluster membership after a
+ * startup grace (discovery HA), re-learning cluster membership after a
  * restart, and refuses to serve a possibly-partial node list. The caller
  * should try another address, or retry shortly. */
 export class DiscoveryBusyError extends NanocachedError {
@@ -206,7 +206,7 @@ export class DiscoveryBusyError extends NanocachedError {
 }
 
 /** Parses an `N <count>\n` header followed by `count` entries, each
- * `<name-length> <addr-length>\n<name><addr>\n` (doc/adr/0009-*.md) —
+ * `<name-length> <addr-length>\n<name><addr>\n` (node identity decoupled from address) —
  * name and address are simply concatenated, split by their declared
  * lengths, not by a delimiter. Returns `null` while more bytes are still
  * needed. */
@@ -239,7 +239,7 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
     throw new NanocachedError(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
   }
 
-  // `N <count> <r>\n` (ADR-0011) — the replication factor rides along.
+  // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
   const header = buf.subarray(2, headerEnd).toString("ascii").split(" ");
   if (header.length !== 2) {
     throw new NanocachedError("nanocached: invalid node-list header in discovery response");
@@ -321,7 +321,7 @@ export async function connectAndIdentify(options: IdentifyOptions): Promise<Iden
     return await identifyOnce(options, true);
   } catch (error) {
     if (!isLegacyServerSignal(error)) throw error;
-    // ADR-0019 transparent fallback: a pre-0019 server rejects the
+    // Echoed response tags transparent fallback: a pre-0019 server rejects the
     // extended `A ... T` as a parse error and closes without replying —
     // redial once with the plain form and run the connection untagged
     // (the pre-0019 behavior, desync window included).

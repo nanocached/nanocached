@@ -74,7 +74,7 @@ holder is unreachable. `client.replication` exposes the factor in use.
 Off by default. `set`/`delete` normally wait for every replica leg to
 finish, same as the primary. Enabling `fire_and_forget_replicas` returns
 as soon as the primary acks, letting replica legs finish in the
-background (doc/adr/0014-*.md):
+background (fire-and-forget replica writes):
 
 ```python
 client = await NanocachedClient.connect(
@@ -97,7 +97,7 @@ tearing down their connections.
 Off by default. A clean miss (the key's first-reached owner reports it
 missing) is normally accepted as-is. Enabling `read_repair` probes the
 remaining owners before accepting that, and repairs the primary in the
-background if one still has the value (doc/adr/0015-*.md):
+background if one still has the value (read repair):
 
 ```python
 client = await NanocachedClient.connect(
@@ -157,7 +157,7 @@ ignored. An unreadable or unparseable CA file is a connect-time error.
 
 Off by default. When enabled, values at or above `compression_threshold`
 bytes are transparently DEFLATE-compressed on `set` and decompressed on
-`get`/`get_bytes` (doc/adr/0013-\*.md):
+`get`/`get_bytes` (value compression):
 
 ```python
 client = await NanocachedClient.connect(
@@ -183,7 +183,7 @@ media, random bytes) is passed through unchanged rather than bloated.
 
 ## Notes
 
-- Requests are pipelined per connection (doc/adr/0016-*.md), matching
+- Requests are pipelined per connection (request pipelining), matching
   the TypeScript SDK: concurrent callers on the same connection each pay
   only their own network latency, not everyone else's ahead of them.
 - This SDK speaks the current wire protocol (rendezvous hashing,

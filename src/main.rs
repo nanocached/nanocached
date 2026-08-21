@@ -149,7 +149,7 @@ Usage: nanocached-node [options]
                                <addrs>, a comma-separated list (see
                                nanocached-discovery). The first address is
                                the primary, the only one asked to
-                               orchestrate a join (ADR-0010) — every node
+                               orchestrate a join (discovery HA) — every node
                                in a cluster must list the same addresses
                                in the same order. Omit to run standalone
   --tls-cert <path>           PEM certificate chain; requires TLS on every
