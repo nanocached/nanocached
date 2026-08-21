@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -54,6 +55,72 @@ func TestOwnersAreDistinctAndCapped(t *testing.T) {
 	}
 	if got := ring.Owners([]byte("some-key"), 10); len(got) != 3 {
 		t.Errorf("capped Owners = %v", got)
+	}
+}
+
+// TestOwnersMatchesANaiveFullSortReference pins Owners' output
+// byte-identical to the straightforward "sort everything, then
+// truncate" reference it replaced (the bounded top-R selection it now
+// does instead must never change which nodes come back, or their
+// order) across the edge cases in replicas (0, 1, exactly the node
+// count, and over it) plus a run of pseudo-random keys.
+func TestOwnersMatchesANaiveFullSortReference(t *testing.T) {
+	type scored struct {
+		score uint64
+		node  string
+	}
+	naiveOwners := func(ring *HashRing, key []byte, replicas int) []string {
+		keyHash := fnv1a(key)
+		ranked := make([]scored, len(ring.nodes))
+		for i, node := range ring.nodes {
+			ranked[i] = scored{fmix64(ring.nodeHashes[i] ^ keyHash), node}
+		}
+		sort.Slice(ranked, func(a, b int) bool {
+			if ranked[a].score != ranked[b].score {
+				return ranked[a].score > ranked[b].score
+			}
+			return ranked[a].node < ranked[b].node
+		})
+		if replicas > len(ranked) {
+			replicas = len(ranked)
+		}
+		if replicas <= 0 {
+			return []string{}
+		}
+		owners := make([]string, replicas)
+		for i := range owners {
+			owners[i] = ranked[i].node
+		}
+		return owners
+	}
+
+	nodes := make([]string, 37)
+	for i := range nodes {
+		nodes[i] = fmt.Sprintf("node-%d", i)
+	}
+	ring := NewHashRing(nodes)
+
+	// A tiny deterministic PRNG (splitmix64) stands in for a "math/rand"
+	// seeded sequence, keeping this test free of any flakiness tied to
+	// the runtime's default source.
+	state := uint64(0xC0FFEE)
+	next := func() uint64 {
+		state += 0x9E3779B97F4A7C15
+		z := state
+		z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+		z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+		return z ^ (z >> 31)
+	}
+
+	for _, replicas := range []int{0, 1, len(nodes) / 2, len(nodes), len(nodes) + 1, len(nodes) + 10} {
+		for i := 0; i < 200; i++ {
+			key := []byte(fmt.Sprintf("fuzz-key-%d", next()))
+			got := ring.Owners(key, replicas)
+			want := naiveOwners(ring, key, replicas)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("replicas=%d key=%q: Owners = %v, want %v", replicas, key, got, want)
+			}
+		}
 	}
 }
 

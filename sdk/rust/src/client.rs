@@ -149,7 +149,36 @@ pub struct Options {
     compression_threshold: usize,
     fire_and_forget_replicas: bool,
     read_repair: bool,
-    reconnect_cooldown: Duration,
+    reconnect_cooldown: ReconnectCooldown,
+}
+
+/// `Options::reconnect_cooldown`'s intent, kept distinct from the
+/// resolved [`Duration`] until [`ReconnectCooldown::resolve`]: unlike the
+/// Go SDK, whose zero-value `Config` can't tell "not specified" apart
+/// from "explicitly zero", this crate's builder can, so it uses a
+/// three-way choice instead of overloading `Duration` (where zero would
+/// otherwise be ambiguous between "use the default" and "disable it").
+#[derive(Clone, Copy)]
+enum ReconnectCooldown {
+    Default,
+    Explicit(Duration),
+    Disabled,
+}
+
+impl ReconnectCooldown {
+    /// `None` means disabled; `Some` is the cooldown to use.
+    /// [`Duration::ZERO`] resolves to the default, matching the Go SDK's
+    /// zero-value `Config.ReconnectCooldown`.
+    fn resolve(self) -> Option<Duration> {
+        match self {
+            ReconnectCooldown::Default => Some(DEFAULT_RECONNECT_COOLDOWN),
+            ReconnectCooldown::Explicit(duration) if duration.is_zero() => {
+                Some(DEFAULT_RECONNECT_COOLDOWN)
+            }
+            ReconnectCooldown::Explicit(duration) => Some(duration),
+            ReconnectCooldown::Disabled => None,
+        }
+    }
 }
 
 impl Default for Options {
@@ -163,7 +192,7 @@ impl Default for Options {
             compression_threshold: DEFAULT_COMPRESSION_THRESHOLD,
             fire_and_forget_replicas: false,
             read_repair: false,
-            reconnect_cooldown: DEFAULT_RECONNECT_COOLDOWN,
+            reconnect_cooldown: ReconnectCooldown::Default,
         }
     }
 }
@@ -194,9 +223,19 @@ impl Options {
         self
     }
 
-    /// Shared secret matching NANOCACHED_AUTH_SECRET on the server.
+    /// Shared secret matching NANOCACHED_AUTH_SECRET on the server. An
+    /// empty secret is the same as none, matching the other SDKs: sent
+    /// literally, an empty string would reach the wire as an explicit
+    /// zero-length secret, which the server rejects as EmptySecret and
+    /// closes without replying — turning what should be "no auth
+    /// configured" into an opaque `ConnectionLost`.
     pub fn auth_secret(mut self, secret: impl Into<String>) -> Self {
-        self.auth_secret = Some(secret.into());
+        let secret = secret.into();
+        self.auth_secret = if secret.is_empty() {
+            None
+        } else {
+            Some(secret)
+        };
         self
     }
 
@@ -271,11 +310,28 @@ impl Options {
     /// the 30-second node-list refresh interval so a node that genuinely
     /// recovers isn't shut out for long.
     ///
-    /// Pass [`Duration::ZERO`] to disable the cooldown — every request
+    /// [`Duration::ZERO`] means "use the default", not "disable it" —
+    /// this matches the Go SDK, where a zero-value `Config` (the
+    /// `ReconnectCooldown` field simply left unset) can't distinguish
+    /// "not specified" from "explicitly zero", so zero has to mean
+    /// "default" there. To disable the cooldown entirely — every request
     /// that finds the address's connection dead pays its own full dial
-    /// attempt instead of reusing a cached failure.
+    /// attempt instead of reusing a cached failure — call
+    /// [`Self::disable_reconnect_cooldown`] instead (the Go SDK's
+    /// equivalent is a negative `Config.ReconnectCooldown`).
     pub fn reconnect_cooldown(mut self, duration: Duration) -> Self {
-        self.reconnect_cooldown = duration;
+        self.reconnect_cooldown = ReconnectCooldown::Explicit(duration);
+        self
+    }
+
+    /// Disables the per-address reconnect cooldown entirely: every
+    /// request that finds an address's connection dead pays its own full
+    /// dial attempt instead of reusing a cached failure. See
+    /// [`Self::reconnect_cooldown`] for what the cooldown is; the Go
+    /// SDK's equivalent of this method is a negative
+    /// `Config.ReconnectCooldown`.
+    pub fn disable_reconnect_cooldown(mut self) -> Self {
+        self.reconnect_cooldown = ReconnectCooldown::Disabled;
         self
     }
 }
@@ -334,7 +390,9 @@ struct Inner {
     /// name) to a different address, but the address itself is what's
     /// actually unreachable.
     reconnect_cooldowns: Mutex<HashMap<String, (Instant, Error)>>,
-    reconnect_cooldown: Duration,
+    /// Resolved from `Options::reconnect_cooldown`: `None` means
+    /// disabled.
+    reconnect_cooldown: Option<Duration>,
     addresses: Vec<(String, u16)>,
     auth_secret: Option<String>,
     tls: Option<TlsConfig>,
@@ -530,7 +588,7 @@ impl NanocachedClient {
             }),
             redials: Mutex::new(HashMap::new()),
             reconnect_cooldowns: Mutex::new(HashMap::new()),
-            reconnect_cooldown: options.reconnect_cooldown,
+            reconnect_cooldown: options.reconnect_cooldown.resolve(),
             addresses: options.addresses,
             auth_secret: options.auth_secret,
             tls,
@@ -686,9 +744,10 @@ impl NanocachedClient {
         }
     }
 
-    /// doc/adr/0015-*.md: probes every owner of `key`, in rank order, for
-    /// a value the normal read path already reported missing. The first
-    /// owner that has it wins: its value is returned, and — detached, not
+    /// doc/adr/0015-*.md: probes the remaining owners of `key` — every
+    /// owner but the primary, which the normal read path already probed
+    /// and got a clean miss from — in rank order, for a value. The first
+    /// one that has it wins: its value is returned, and — detached, not
     /// awaited, no tracking — that same value repairs the true primary in
     /// the background with `READ_REPAIR_TTL`. Every failure along the way
     /// (connection lost, WrongNode, another miss) is swallowed; nothing
@@ -700,7 +759,7 @@ impl NanocachedClient {
             Self::owner_names(&state, key)
         };
 
-        for name in &owners {
+        for name in owners.iter().skip(1) {
             let probe = |connection: Arc<Connection>| async move { connection.get(key).await };
             let Ok(Some(value)) = self.apply_reconnecting(Some(name), &probe).await else {
                 continue;
@@ -1078,15 +1137,9 @@ impl NanocachedClient {
                 v
             }
             Err(error) => {
-                if self.inner.reconnect_cooldown > Duration::ZERO {
+                if let Some(cooldown) = self.inner.reconnect_cooldown {
                     let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
-                    cooldowns.insert(
-                        address.clone(),
-                        (
-                            Instant::now() + self.inner.reconnect_cooldown,
-                            error.clone(),
-                        ),
-                    );
+                    cooldowns.insert(address.clone(), (Instant::now() + cooldown, error.clone()));
                 }
                 return Err(error);
             }

@@ -60,8 +60,23 @@ impl HashRing {
 
         // Descending by score; ties toward the lexicographically smaller
         // name — a total order every implementation agrees on.
-        scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        scored.truncate(replicas);
+        let cmp = |a: &(u64, &str), b: &(u64, &str)| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1));
+
+        // This runs per key while the client's routing lock is held, so
+        // avoid a full O(n log n) sort of every node when only the top
+        // `replicas` are wanted: `select_nth_unstable_by` partitions the
+        // `replicas` best candidates into the front of the slice (in
+        // unspecified order among themselves) in expected linear time,
+        // and only that small prefix then needs sorting. `nth` must be a
+        // valid index (< len), hence the `r < scored.len()` guard — when
+        // `replicas >= scored.len()` there's nothing to partition away,
+        // every node is kept, and the sort below covers all of them.
+        let r = replicas.min(scored.len());
+        if r < scored.len() {
+            scored.select_nth_unstable_by(r, cmp);
+            scored.truncate(r);
+        }
+        scored.sort_unstable_by(cmp);
         scored.into_iter().map(|(_, node)| node).collect()
     }
 
@@ -107,6 +122,58 @@ mod tests {
         assert_eq!(owners.len(), 2);
         assert_ne!(owners[0], owners[1]);
         assert_eq!(ring.owners(b"some-key", 10).len(), 3);
+    }
+
+    #[test]
+    fn owners_matches_a_naive_full_sort_reference() {
+        // `owners` now partitions out the top `replicas` instead of doing
+        // a full sort of every node; this pins its output byte-identical
+        // to the straightforward "sort everything, then truncate"
+        // reference it replaced, across the edge cases in `replicas`
+        // (0, 1, exactly the node count, and over it) plus a run of
+        // pseudo-random keys. A small deterministic PRNG stands in for a
+        // `rand` dev-dependency, which this is the only thing that would
+        // need it.
+        struct SplitMix64(u64);
+        impl SplitMix64 {
+            fn next(&mut self) -> u64 {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            }
+        }
+
+        fn naive_owners<'a>(ring: &'a HashRing, key: &[u8], replicas: usize) -> Vec<&'a str> {
+            let key_hash = fnv1a(key);
+            let mut scored: Vec<(u64, &str)> = ring
+                .node_hashes
+                .iter()
+                .zip(&ring.nodes)
+                .map(|(node_hash, node)| (fmix64(node_hash ^ key_hash), node.as_str()))
+                .collect();
+            scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+            scored.truncate(replicas);
+            scored.into_iter().map(|(_, node)| node).collect()
+        }
+
+        let node_names: Vec<String> = (0..37).map(|i| format!("node-{i}")).collect();
+        let name_refs: Vec<&str> = node_names.iter().map(String::as_str).collect();
+        let ring = ring(&name_refs);
+        let len = node_names.len();
+
+        let mut rng = SplitMix64(0xC0FFEE);
+        for &replicas in &[0, 1, len / 2, len, len + 1, len + 10] {
+            for _ in 0..200 {
+                let key = format!("fuzz-key-{}", rng.next()).into_bytes();
+                assert_eq!(
+                    ring.owners(&key, replicas),
+                    naive_owners(&ring, &key, replicas),
+                    "mismatch for replicas={replicas}, key={key:?}"
+                );
+            }
+        }
     }
 
     #[test]

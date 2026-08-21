@@ -660,6 +660,22 @@ async fn authenticates() {
 }
 
 #[tokio::test]
+async fn an_empty_auth_secret_is_the_same_as_none() {
+    // Options::auth_secret("") must normalize to None: sent literally, an
+    // empty string reaches the wire as an explicit zero-length secret,
+    // which a no-auth server rejects instead of treating it as "no
+    // secret given".
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port).auth_secret(""))
+        .await
+        .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
 async fn wrong_node_propagates_in_single_mode() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
@@ -1605,6 +1621,13 @@ async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
     );
 
     let primary = node_by_name(&nodes, &owners[0]);
+    assert_eq!(
+        primary.state.gets.load(Ordering::SeqCst),
+        1,
+        "read repair must not re-probe the primary — the normal read path \
+         already got a clean miss from it"
+    );
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while !primary
         .state
@@ -1635,11 +1658,22 @@ async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
 #[tokio::test]
 async fn stays_a_clean_miss_when_no_owner_has_the_value() {
     let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("nowhere");
     let client = NanocachedClient::connect(options(discovery.port).read_repair(true))
         .await
         .unwrap();
 
     assert_eq!(client.get_bytes("nowhere").await.unwrap(), None);
+
+    // Every owner is probed exactly once: the primary by the normal read
+    // path, the rest by read repair — never the primary twice.
+    for name in &owners {
+        assert_eq!(
+            node_by_name(&nodes, name).state.gets.load(Ordering::SeqCst),
+            1,
+            "owner {name} should have received exactly one G"
+        );
+    }
 
     client.close().await;
     discovery.stop();
@@ -1954,7 +1988,11 @@ async fn reconnect_cooldown_skips_a_known_dead_address() {
 }
 
 #[tokio::test]
-async fn a_zero_reconnect_cooldown_redials_immediately() {
+async fn a_zero_reconnect_cooldown_uses_the_default_instead_of_disabling_it() {
+    // Duration::ZERO now means "use the default" (matching the Go SDK's
+    // zero-value Config), not "disable the cooldown" — that's
+    // Options::disable_reconnect_cooldown() now (see
+    // disable_reconnect_cooldown_redials_immediately below).
     let node = MockNode::start().await;
     let port = node.port;
     let client = NanocachedClient::connect(options(port).reconnect_cooldown(Duration::ZERO))
@@ -1994,8 +2032,72 @@ async fn a_zero_reconnect_cooldown_redials_immediately() {
         }
     });
 
-    // With the cooldown disabled (Duration::ZERO), this redials
-    // immediately instead of reusing the cached failure.
+    // Still within the *default* (1s) cooldown window: rejected fast,
+    // without dialing the listener at all — proving Duration::ZERO did
+    // not disable the cooldown.
+    let started = Instant::now();
+    let second = client.get("k").await;
+    assert!(
+        matches!(second, Err(Error::ConnectionLost(_))),
+        "{second:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "expected a cooldown-fast rejection, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "Duration::ZERO should use the default cooldown, not disable it"
+    );
+
+    client.close().await;
+}
+
+#[tokio::test]
+async fn disable_reconnect_cooldown_redials_immediately() {
+    let node = MockNode::start().await;
+    let port = node.port;
+    let client = NanocachedClient::connect(options(port).disable_reconnect_cooldown())
+        .await
+        .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let first = client.get("k").await;
+    assert!(matches!(first, Err(Error::ConnectionLost(_))), "{first:?}");
+
+    let listener = {
+        let mut attempt = 0;
+        loop {
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(error) if attempt < 50 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = error;
+                }
+                Err(error) => panic!("could not rebind 127.0.0.1:{port}: {error}"),
+            }
+        }
+    };
+    let connections = Arc::new(AtomicUsize::new(0));
+    let garbage_connections = Arc::clone(&connections);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            garbage_connections.fetch_add(1, Ordering::SeqCst);
+            let _ = socket.write_all(b"XXX").await;
+        }
+    });
+
+    // With the cooldown disabled, this redials immediately instead of
+    // reusing the cached failure.
     let second = client.get("k").await;
     match second {
         Err(Error::Protocol(message)) => {

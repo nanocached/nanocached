@@ -1,7 +1,5 @@
 package nanocached
 
-import "sort"
-
 // HashRing is rendezvous (highest-random-weight) hashing over a fixed
 // node list (see doc/adr/0011-*.md in the nanocached repository). This is
 // deliberately a byte-for-byte port of the same computation every other
@@ -64,26 +62,52 @@ func (r *HashRing) Owners(key []byte, replicas int) []string {
 		score uint64
 		node  string
 	}
-	ranked := make([]scored, len(r.nodes))
-	for i, node := range r.nodes {
-		ranked[i] = scored{fmix64(r.nodeHashes[i] ^ keyHash), node}
+
+	if replicas > len(r.nodes) {
+		replicas = len(r.nodes)
+	}
+	if replicas <= 0 {
+		return []string{}
 	}
 
-	// Descending by score; ties toward the lexicographically smaller
-	// name — a total order every implementation agrees on.
-	sort.Slice(ranked, func(a, b int) bool {
-		if ranked[a].score != ranked[b].score {
-			return ranked[a].score > ranked[b].score
+	// less reports whether a ranks strictly ahead of b in owner order:
+	// higher score wins; ties break toward the lexicographically smaller
+	// name — the same total order every nanocached implementation uses.
+	less := func(a, b scored) bool {
+		if a.score != b.score {
+			return a.score > b.score
 		}
-		return ranked[a].node < ranked[b].node
-	})
-
-	if replicas > len(ranked) {
-		replicas = len(ranked)
+		return a.node < b.node
 	}
-	owners := make([]string, replicas)
-	for i := range owners {
-		owners[i] = ranked[i].node
+
+	// This runs per key while the client's routing lock is held, so
+	// avoid sort.Slice's O(n log n) full sort of every node when only
+	// the top `replicas` are wanted: keep just the best `replicas`
+	// candidates seen so far, in a slice sorted best-first, inserting
+	// (and evicting the current worst kept candidate, if any) as better
+	// candidates turn up. `replicas` is typically small (a handful) next
+	// to the cluster size, so this bounded insertion — O(n * replicas) —
+	// beats sorting everything.
+	top := make([]scored, 0, replicas)
+	for i, node := range r.nodes {
+		cand := scored{fmix64(r.nodeHashes[i] ^ keyHash), node}
+		if len(top) == replicas && !less(cand, top[len(top)-1]) {
+			continue // no better than the worst candidate currently kept
+		}
+		pos := len(top)
+		for pos > 0 && less(cand, top[pos-1]) {
+			pos--
+		}
+		if len(top) < replicas {
+			top = append(top, scored{})
+		}
+		copy(top[pos+1:], top[pos:len(top)-1])
+		top[pos] = cand
+	}
+
+	owners := make([]string, len(top))
+	for i, s := range top {
+		owners[i] = s.node
 	}
 	return owners
 }
