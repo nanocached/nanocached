@@ -610,7 +610,21 @@ class NanocachedClientTest {
                     single("127.0.0.1", port).disableReconnectCooldown())) {
                 client.set("k", "v");
                 node.close();
-                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.get("k"));
+                // Timing: the closed node's FIN may not have reached the
+                // client's live connection yet on a loaded CI runner, in
+                // which case one more get can still be answered from the
+                // kernel buffers before the redial path (and its
+                // connection-refused failure) is ever taken — so poll
+                // until the failure shows up instead of asserting on the
+                // very first call.
+                waitFor(() -> {
+                    try {
+                        client.get("k");
+                        return false;
+                    } catch (NanocachedException.ConnectionFailed expected) {
+                        return true;
+                    }
+                }, "the redial to the closed node to fail with ConnectionFailed");
 
                 java.util.Set<java.net.Socket> acceptedSockets =
                         java.util.concurrent.ConcurrentHashMap.newKeySet();

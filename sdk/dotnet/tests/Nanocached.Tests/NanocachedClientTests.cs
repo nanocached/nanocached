@@ -658,6 +658,14 @@ public class NanocachedClientTests
 
     private static async Task AcceptAndAnswerGarbageAsync(System.Net.Sockets.TcpListener listener, Action onAccepted)
     {
+        // Accepted sockets are held open until the listener is stopped,
+        // not disposed right after answering: closing them immediately
+        // races the client's own `A` frame write, which on Linux then
+        // fails with EPIPE (a ConnectionLostException) before the client
+        // ever reads the garbage — whereas these tests want the
+        // deterministic "unexpected response to A" protocol rejection
+        // (a plain NanocachedException) on every dial.
+        var held = new List<System.Net.Sockets.TcpClient>();
         while (true)
         {
             System.Net.Sockets.TcpClient accepted;
@@ -667,8 +675,10 @@ public class NanocachedClientTests
             }
             catch
             {
+                foreach (var client in held) client.Dispose();
                 return;
             }
+            held.Add(accepted);
             onAccepted();
             try
             {
@@ -677,10 +687,6 @@ public class NanocachedClientTests
             catch
             {
                 // The client may have already given up.
-            }
-            finally
-            {
-                accepted.Dispose();
             }
         }
     }

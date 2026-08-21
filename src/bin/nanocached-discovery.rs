@@ -5950,8 +5950,15 @@ mod tests {
             let mut guard = registry
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for i in 0..50_000 {
-                let name = format!("node-{i:06}");
+            // Sized for Linux, not just macOS: a Linux loopback socket's
+            // send buffer plus the peer's autotuned receive buffer can
+            // absorb several MiB before a write blocks, so a few MiB of
+            // `N` roster (50k short names) completed instantly there and
+            // the connection simply sat in its idle wait instead of
+            // timing out the write. ~120k entries with `MAX_NAME_LENGTH`
+            // names puts the reply near 20 MiB, past any default buffer.
+            for i in 0..120_000 {
+                let name = format!("node-{i:06}-{}", "x".repeat(MAX_NAME_LENGTH - 12));
                 let addr = format!(
                     "10.{}.{}.{}:9000",
                     (i / 65536) % 256,
