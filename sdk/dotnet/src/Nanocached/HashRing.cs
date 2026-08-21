@@ -3,8 +3,8 @@ using System.Text;
 namespace Nanocached;
 
 /// <summary>
-/// Rendezvous (highest-random-weight) hashing over a fixed node list (see
-/// Client-side replication in the nanocached repository). This is deliberately a
+/// Rendezvous (highest-random-weight) hashing over a fixed node list (the
+/// client-side replication design). This is deliberately a
 /// byte-for-byte port of the same computation every other nanocached
 /// participant uses (the Rust node, the Go/TypeScript/Python/Java/Rust SDKs)
 /// — not just "a" rendezvous hash, but <em>this specific</em> one: if this
