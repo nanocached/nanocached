@@ -1494,6 +1494,153 @@ class NanocachedClientTest {
         }
     }
 
+    // ── hedged reads (issue #64) ─────────────────────────────────────
+
+    // A "did it wait/not wait" assertion can't compare measured elapsed
+    // time against a delay exactly (Thread.sleep()'s wakeup is only
+    // approximate); generous so CI (ubuntu) is never flaky.
+    private static final long HEDGE_TIMING_TOLERANCE_MILLIS = 30;
+
+    private static NanocachedClient connectWithReadHedgeAfter(int port, long hedgeAfterMillis) {
+        return NanocachedClient.connect(NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", port)))
+                .readHedgeAfter(Duration.ofMillis(hedgeAfterMillis)));
+    }
+
+    @Test
+    void readHedgeAfterRejectsANonPositiveDuration() {
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().readHedgeAfter(Duration.ZERO));
+        assertThrows(IllegalArgumentException.class,
+                () -> NanocachedClient.builder().readHedgeAfter(Duration.ofMillis(-100)));
+    }
+
+    @Test
+    void aHitFromTheReplicaWinsOverASlowPrimary() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+            String replica = owners.get(1);
+
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+                cluster.nodes().get(primary).delayGets(400);
+
+                long start = System.nanoTime();
+                Optional<String> value = client.get("k");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(Optional.of("v"), value);
+                assertTrue(elapsedMillis < 400 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "expected the replica's fast answer to win, took " + elapsedMillis + "ms");
+                assertTrue(elapsedMillis >= 50 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "expected to wait out the hedge interval first, took " + elapsedMillis + "ms");
+                assertEquals(1, cluster.nodes().get(replica).getCount.get(),
+                        "the replica should have been hedged to");
+
+                // The slow primary's leg was left to finish, not
+                // cancelled, and close() (the try-with-resources below)
+                // blocks until it has.
+            }
+            assertEquals(1, cluster.nodes().get(primary).getCount.get(),
+                    "close() should have drained the slow primary's hedge leg");
+        }
+    }
+
+    @Test
+    void aFastPrimaryIsNeverHedged() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String replica = owners.get(1);
+
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+                for (int i = 0; i < 5; i++) {
+                    assertEquals(Optional.of("v"), client.get("k"));
+                }
+                assertEquals(0, cluster.nodes().get(replica).getCount.get());
+            }
+        }
+    }
+
+    @Test
+    void aReplicaMissWaitsForThePrimary() throws Exception {
+        // Hedging must never turn a hit into a miss: the replica lacks the
+        // copy and answers first, but the primary's answer is what counts.
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+            String replica = owners.get(1);
+
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+                cluster.nodes().get(replica).store.remove(MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)));
+                cluster.nodes().get(primary).delayGets(200);
+
+                long start = System.nanoTime();
+                Optional<String> value = client.get("k");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(Optional.of("v"), value);
+                assertTrue(elapsedMillis >= 200 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "expected to wait for the primary, took " + elapsedMillis + "ms");
+                assertEquals(1, cluster.nodes().get(replica).getCount.get());
+
+                // A key nobody has: the miss is accepted once the primary
+                // has answered it too.
+                assertEquals(Optional.empty(), client.get("absent"));
+            }
+        }
+    }
+
+    @Test
+    void offByDefaultASlowPrimaryBoundsTheRead() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+            String replica = owners.get(1);
+
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                client.set("k", "v");
+                cluster.nodes().get(primary).delayGets(200);
+
+                long start = System.nanoTime();
+                Optional<String> value = client.get("k");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(Optional.of("v"), value);
+                assertTrue(elapsedMillis >= 200 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "expected the slow primary to bound the read, took " + elapsedMillis + "ms");
+                assertEquals(0, cluster.nodes().get(replica).getCount.get());
+            }
+        }
+    }
+
+    @Test
+    void aDeadPrimaryFailsOverImmediately() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+
+            NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 500);
+            try {
+                client.set("k", "v");
+                cluster.nodes().get(primary).close();
+                Thread.sleep(50); // give the FIN a moment to be observable
+
+                long start = System.nanoTime();
+                Optional<String> value = client.get("k");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(Optional.of("v"), value);
+                assertTrue(elapsedMillis < 500 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "expected an immediate failover, took " + elapsedMillis + "ms");
+            } finally {
+                client.close();
+            }
+        }
+    }
+
     // ── stats() — counters for by-design swallows ──────────────────
 
     @Test

@@ -22,11 +22,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -66,6 +69,7 @@ public final class NanocachedClient implements AutoCloseable {
         private boolean readRepair;
         private Duration reconnectCooldown = DEFAULT_RECONNECT_COOLDOWN;
         private boolean reconnectCooldownDisabled;
+        private Duration readHedgeAfter;
 
         /** Discovery replicas (discovery HA), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -217,6 +221,38 @@ public final class NanocachedClient implements AutoCloseable {
             this.reconnectCooldownDisabled = true;
             return this;
         }
+
+        /** Sends the same read to the next owner as well once the primary
+         * has been silent for this long (and so on, one more owner per
+         * interval, until every owner is in flight) — a slow-but-alive
+         * owner (a saturated host, a bad link) no longer bounds every read
+         * that touches it at its full round trip (hedged reads). {@code
+         * null} (the default) is off.
+         *
+         * <p>The first answer decides: a hit from any owner is final; a
+         * miss is final only from the primary — a replica's miss may
+         * simply mean it lacks the copy, so hedging never turns a hit
+         * into a miss. A connection-level (or other SDK) failure hedges
+         * onward immediately; a {@link NanocachedException.WrongNode}
+         * answer propagates exactly as the non-hedged read path's does.
+         * Applies only once a ring is known and the key has at least two
+         * owners — with a single copy there is nobody to hedge to, so
+         * this is simply inert against a single node or {@code
+         * replication == 1}.
+         *
+         * <p>The losing leg of a hedge is never cancelled — interrupting a
+         * request mid-write could desync that connection — but left to
+         * finish on this client's background executor, its result
+         * discarded, and is drained by {@link #close()} exactly like a
+         * {@code fireAndForgetReplicas} write. Writes are unaffected. */
+        public Options readHedgeAfter(Duration interval) {
+            if (interval != null && interval.compareTo(Duration.ZERO) <= 0) {
+                throw new IllegalArgumentException(
+                        "nanocached: readHedgeAfter must be a positive duration, got " + interval);
+            }
+            this.readHedgeAfter = interval;
+            return this;
+        }
     }
 
     /**
@@ -345,6 +381,16 @@ public final class NanocachedClient implements AutoCloseable {
      * own full connect attempt (see {@link Options#reconnectCooldown}'s
      * doc for the Duration.ZERO-means-default rule this complements). */
     private final boolean reconnectCooldownDisabled;
+    /** Hedged reads (issue #64): 0 means off. See {@link Options#readHedgeAfter}. */
+    private final long readHedgeAfterNanos;
+    /** Hedge legs still in flight after a read has already returned (the
+     * losers): finished detached on {@link #replicaWriters}, their result
+     * discarded, drained by {@link #close()} exactly like {@link
+     * #backgroundReplicaWritePermits}'s writes. Unlike that pool, hedge
+     * legs are not permit-gated — a read may only ever have at most
+     * {@code replication} legs in flight at once, so no separate cap is
+     * needed. */
+    private final Set<CompletableFuture<?>> hedgedReads = ConcurrentHashMap.newKeySet();
     /** Per-address reconnect cooldown (see {@link Options#reconnectCooldown}):
      * the address of the most recently failed dial, and how long it stays
      * "down" before another dial to it is attempted. Keyed by address, not
@@ -429,7 +475,8 @@ public final class NanocachedClient implements AutoCloseable {
     private NanocachedClient(
             List<Address> addresses, byte[] authSecret, SSLContext tls,
             boolean compress, int compressionThreshold, boolean fireAndForgetReplicas,
-            boolean readRepair, Duration reconnectCooldown, boolean reconnectCooldownDisabled) {
+            boolean readRepair, Duration reconnectCooldown, boolean reconnectCooldownDisabled,
+            Duration readHedgeAfter) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
@@ -439,6 +486,7 @@ public final class NanocachedClient implements AutoCloseable {
         this.readRepair = readRepair;
         this.reconnectCooldownNanos = reconnectCooldown.toNanos();
         this.reconnectCooldownDisabled = reconnectCooldownDisabled;
+        this.readHedgeAfterNanos = readHedgeAfter != null ? readHedgeAfter.toNanos() : 0;
     }
 
     public static NanocachedClient connect(Options options) {
@@ -460,7 +508,8 @@ public final class NanocachedClient implements AutoCloseable {
         NanocachedClient client = new NanocachedClient(
                 options.addresses, options.authSecret, sslContext,
                 options.compress, options.compressionThreshold, options.fireAndForgetReplicas,
-                options.readRepair, options.reconnectCooldown, options.reconnectCooldownDisabled);
+                options.readRepair, options.reconnectCooldown, options.reconnectCooldownDisabled,
+                options.readHedgeAfter);
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, discovery HA), or knows no live
@@ -876,11 +925,39 @@ public final class NanocachedClient implements AutoCloseable {
         if (backgroundReplicaWritePermits != null) {
             backgroundReplicaWritePermits.acquireUninterruptibly(backgroundReplicaWritePermitCount);
         }
+        // Hedged reads (issue #64): the losing leg of a hedge is never
+        // cancelled (see Options.readHedgeAfter's doc for why), so it's
+        // still running on replicaWriters here — drain it exactly like the
+        // background replica writes just above, before that pool is shut
+        // down.
+        drainHedgedReads();
         if (replicaWriters != null) {
             replicaWriters.shutdown();
             awaitTerminationQuietly(replicaWriters);
         }
         teardown();
+    }
+
+    /** Blocks until every hedge leg still tracked in {@link #hedgedReads}
+     * (the losing legs of reads that already returned via their winning
+     * leg) has finished, its outcome discarded either way. Looped, not a
+     * single pass over one snapshot: a read racing this close() call can
+     * still register a new leg after a snapshot was taken but before this
+     * method returns, so re-checking until the set is genuinely empty
+     * — mirroring the Python SDK's {@code _drain_tasks} — keeps one from
+     * leaking past close() undrained. */
+    private void drainHedgedReads() {
+        while (!hedgedReads.isEmpty()) {
+            for (CompletableFuture<?> future : List.copyOf(hedgedReads)) {
+                try {
+                    future.join();
+                } catch (RuntimeException ignored) {
+                    // A losing leg's own failure (expected or a genuine
+                    // bug) is irrelevant now — the read it belonged to
+                    // already returned via its winning leg.
+                }
+            }
+        }
     }
 
     // Bounds close()'s wait for an already-shutdown executor's worker
@@ -991,6 +1068,11 @@ public final class NanocachedClient implements AutoCloseable {
             return applyReconnecting(this::singleConnection, op);
         }
 
+        List<String> names = ownerNames(key);
+        if (readHedgeAfterNanos > 0 && names.size() > 1) {
+            return readHedged(op, names);
+        }
+
         // Owners in rank order; fall through only on connection-level
         // failure — a replica hedges against a dead holder, not a miss.
         // Narrowed to NanocachedException, matching write()'s replicaWrite
@@ -1001,7 +1083,7 @@ public final class NanocachedClient implements AutoCloseable {
         // and silently retried against the next one (issue: audit finding,
         // overbroad RuntimeException catch).
         RuntimeException lastError = null;
-        for (String name : ownerNames(key)) {
+        for (String name : names) {
             try {
                 return applyReconnecting(() -> memberConnection(name), op);
             } catch (NanocachedException.WrongNode error) {
@@ -1013,6 +1095,177 @@ public final class NanocachedClient implements AutoCloseable {
         throw lastError != null
                 ? lastError
                 : new NanocachedException("nanocached: no owner is reachable for this key");
+    }
+
+    /** One hedge leg's outcome, however it happened — see {@link
+     * #readHedged}. Exactly one of {@code wrongNode}/{@code failure}/
+     * {@code bug} is set for anything but a hit ({@code value} may
+     * legitimately be {@code null} too, for a miss). */
+    private static final class LegOutcome<T> {
+        final T value;
+        final NanocachedException.WrongNode wrongNode;
+        final NanocachedException failure;
+        final RuntimeException bug;
+
+        private LegOutcome(T value, NanocachedException.WrongNode wrongNode,
+                NanocachedException failure, RuntimeException bug) {
+            this.value = value;
+            this.wrongNode = wrongNode;
+            this.failure = failure;
+            this.bug = bug;
+        }
+
+        static <T> LegOutcome<T> hit(T value) {
+            return new LegOutcome<>(value, null, null, null);
+        }
+
+        static <T> LegOutcome<T> wrongNode(NanocachedException.WrongNode error) {
+            return new LegOutcome<>(null, error, null, null);
+        }
+
+        static <T> LegOutcome<T> failure(NanocachedException error) {
+            return new LegOutcome<>(null, null, error, null);
+        }
+
+        static <T> LegOutcome<T> bug(RuntimeException error) {
+            return new LegOutcome<>(null, null, null, error);
+        }
+    }
+
+    /**
+     * Hedged reads (issue #64): one slow — not dead — owner otherwise
+     * bounds every read that touches it at its full round trip, since the
+     * sequential path above only moves on to the next owner when the
+     * current one *fails*. Here the read starts at the primary ({@code
+     * names.get(0)}), and if no answer has arrived within {@code
+     * readHedgeAfterNanos} the same read is also sent to the next owner
+     * (and so on, one more owner per interval, until every owner is in
+     * flight); the first answer decides:
+     *
+     * <ul>
+     * <li>a hit from any owner is final;
+     * <li>a miss is final only from the primary — a replica's miss is
+     * provisional (it may simply lack the copy) and the primary is still
+     * waited for, so hedging never turns a hit into a miss; it is
+     * accepted only once every owner has answered or failed;
+     * <li>a failure ({@link NanocachedException} other than {@link
+     * NanocachedException.WrongNode}, or a connection-level one) hedges
+     * onward immediately — the moment nothing else is still in flight,
+     * not after waiting out another full interval;
+     * <li>{@link NanocachedException.WrongNode} propagates exactly as the
+     * sequential path's does.
+     * </ul>
+     *
+     * A losing leg is never cancelled (interrupting a request mid-write
+     * could desync that connection — see {@link Connection}) but left to
+     * run to completion, detached, on {@link #replicaWriters}; its result
+     * is discarded and {@link #close()} drains it via {@link
+     * #hedgedReads} exactly like a {@code fireAndForgetReplicas} write.
+     */
+    private <T> T readHedged(ConnectionOp<T> op, List<String> names) {
+        BlockingQueue<Integer> completions = new LinkedBlockingQueue<>();
+        Map<Integer, LegOutcome<T>> results = new ConcurrentHashMap<>();
+
+        int nextIndex = 1;
+        startHedgeLeg(0, names.get(0), op, completions, results);
+        int pendingCount = 1;
+
+        RuntimeException lastError = null;
+        boolean replicaMissed = false;
+
+        while (pendingCount > 0) {
+            Integer index;
+            try {
+                index = nextIndex < names.size()
+                        ? completions.poll(readHedgeAfterNanos, TimeUnit.NANOSECONDS)
+                        : completions.take();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new NanocachedException(
+                        "nanocached: interrupted while waiting for a hedged read", interrupted);
+            }
+
+            if (index == null) {
+                // Hedge interval elapsed with no answer: one more owner,
+                // without waiting for any leg already in flight.
+                startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results);
+                pendingCount++;
+                nextIndex++;
+                continue;
+            }
+
+            pendingCount--;
+            LegOutcome<T> outcome = results.remove(index);
+            if (outcome.wrongNode != null) {
+                throw outcome.wrongNode;
+            } else if (outcome.bug != null) {
+                throw outcome.bug;
+            } else if (outcome.failure != null) {
+                lastError = outcome.failure;
+            } else if (outcome.value != null || index == 0) {
+                return outcome.value;
+            } else {
+                replicaMissed = true;
+            }
+
+            if (pendingCount == 0 && nextIndex < names.size()) {
+                // Everything started so far has failed or missed
+                // provisionally: the next owner gets its turn right away,
+                // rather than waiting out another full interval.
+                startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results);
+                pendingCount++;
+                nextIndex++;
+            }
+        }
+
+        if (replicaMissed) return null;
+        throw lastError != null
+                ? lastError
+                : new NanocachedException("nanocached: no owner is reachable for this key");
+    }
+
+    /** Starts one hedge leg against {@code names.get(index)} (via {@code
+     * name}), running it on {@link #replicaWriters} — falling back to
+     * running it inline if that pool was concurrently shut down by {@link
+     * #close()}, mirroring {@link #submitReplicaWrite} — and reporting its
+     * outcome by putting it in {@code results} and offering {@code index}
+     * to {@code completions}, rather than through the {@link
+     * CompletableFuture}'s own result: {@link #readHedged} needs to learn
+     * of a completion the instant it happens, including one that races in
+     * while it's blocked waiting on an earlier leg, which a queue gives
+     * for free and a bare future does not. The future itself exists only
+     * so {@link #hedgedReads}/{@link #drainHedgedReads} can still block
+     * {@link #close()} until this leg — win or lose — actually finishes. */
+    private <T> void startHedgeLeg(int index, String name, ConnectionOp<T> op,
+            BlockingQueue<Integer> completions, Map<Integer, LegOutcome<T>> results) {
+        Runnable task = () -> {
+            LegOutcome<T> outcome;
+            try {
+                T value = applyReconnecting(() -> memberConnection(name), op);
+                outcome = LegOutcome.hit(value);
+            } catch (NanocachedException.WrongNode error) {
+                outcome = LegOutcome.wrongNode(error);
+            } catch (NanocachedException error) {
+                outcome = LegOutcome.failure(error);
+            } catch (RuntimeException error) {
+                outcome = LegOutcome.bug(error);
+            }
+            results.put(index, outcome);
+            completions.add(index);
+        };
+
+        CompletableFuture<Void> started;
+        try {
+            started = CompletableFuture.runAsync(task, replicaWriters);
+        } catch (RejectedExecutionException rejected) {
+            // close() shut replicaWriters down concurrently: run it inline
+            // rather than losing it (mirrors submitReplicaWrite).
+            task.run();
+            started = CompletableFuture.completedFuture(null);
+        }
+        CompletableFuture<Void> future = started;
+        hedgedReads.add(future);
+        future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
     }
 
     private <T> T write(byte[] key, ConnectionOp<T> op) {

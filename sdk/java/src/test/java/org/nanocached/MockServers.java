@@ -55,6 +55,7 @@ final class MockServers {
          * desynced" on a bad trailer). */
         private final AtomicInteger badTrailerReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
+        private volatile long getDelayMillis = 0;
         private volatile boolean failSets = false;
         private volatile boolean silent = false;
         /** The TTL (whole seconds; 0 if omitted on the wire) from the
@@ -175,6 +176,12 @@ final class MockServers {
             setDelayMillis = millis;
         }
 
+        /** Holds every future G reply for {@code millis} first — a
+         * slow-but-alive node, for hedged-read tests (issue #64). */
+        void delayGets(long millis) {
+            getDelayMillis = millis;
+        }
+
         /** Drops the connection (server-side reset) on every S instead of
          * acking it, so a write here fails with a connection error — for
          * tests that need a repair/replica write to deterministically
@@ -273,6 +280,14 @@ final class MockServers {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             getCount.incrementAndGet();
 
+                            if (getDelayMillis > 0) {
+                                try {
+                                    Thread.sleep(getDelayMillis);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
