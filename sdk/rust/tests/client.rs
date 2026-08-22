@@ -29,6 +29,10 @@ struct NodeState {
     malformed_value_replies: AtomicUsize,
     stored_to_get_replies: AtomicUsize,
     get_delay_ms: AtomicUsize,
+    /// Holds every future G reply this long — a slow-but-alive node, for
+    /// hedged-read tests (issue #64). Unlike get_delay_ms, persistent
+    /// rather than one-shot.
+    gets_delay_ms: AtomicUsize,
     /// Holds every future S reply this long — for tests proving a caller
     /// isn't blocked on a slow replica leg (fire-and-forget replica writes). Unlike
     /// get_delay_ms, persistent rather than one-shot.
@@ -164,6 +168,10 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 let delay = state.get_delay_ms.swap(0, Ordering::SeqCst);
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                }
+                let gets_delay = state.gets_delay_ms.load(Ordering::SeqCst);
+                if gets_delay > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(gets_delay as u64)).await;
                 }
                 if take_one(&state.swallow_get_replies) {
                     // The off-by-one stream desync: this request's reply
@@ -1872,6 +1880,208 @@ async fn a_failed_repair_write_counts_a_read_repair_failure_in_stats() {
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
+    }
+}
+
+// ── hedged reads (issue #64) ───────────────────────────────────────
+
+/// Hedged-read tests wait out real delays (the mock's `gets_delay_ms`),
+/// so this needs to be generous enough that CI (ubuntu) scheduling
+/// jitter never flips a boundary assertion — see `TIMING_TOLERANCE`'s own
+/// comment for why an exact-equality-style check would be flaky in
+/// spirit even when technically one-sided.
+const HEDGE_TIMING_TOLERANCE: Duration = Duration::from_millis(30);
+
+#[tokio::test]
+async fn a_hit_from_the_replica_wins_over_a_slow_primary() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary.state.gets_delay_ms.store(400, Ordering::SeqCst);
+
+    let start = tokio::time::Instant::now();
+    let value = client.get("k").await.unwrap();
+    let get_elapsed = start.elapsed();
+
+    assert_eq!(value, Some("v".to_string()));
+    assert!(
+        get_elapsed < Duration::from_millis(400) - HEDGE_TIMING_TOLERANCE,
+        "get() should not have waited for the slow primary: get_elapsed = {get_elapsed:?}"
+    );
+    assert!(
+        get_elapsed >= Duration::from_millis(50) - HEDGE_TIMING_TOLERANCE,
+        "get() should have waited out the hedge interval first: get_elapsed = {get_elapsed:?}"
+    );
+    assert_eq!(
+        replica.state.gets.load(Ordering::SeqCst),
+        1,
+        "the replica should have been hedged to"
+    );
+
+    // The slow primary's leg was left to finish, not cancelled, and
+    // close() drains it — so the *total* time from the original get()
+    // call through close() returning must still cover the primary's full
+    // delay.
+    client.close().await;
+    let total_elapsed = start.elapsed();
+    assert!(
+        total_elapsed >= Duration::from_millis(400) - HEDGE_TIMING_TOLERANCE,
+        "close() should have waited for the slow primary leg to finish: total_elapsed = {total_elapsed:?}"
+    );
+
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_fast_primary_is_never_hedged() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let replica = node_by_name(&nodes, &owners[1]);
+
+    for _ in 0..5 {
+        assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    }
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_replica_miss_waits_for_the_primary() {
+    // Hedging must never turn a hit into a miss: the replica lacks the
+    // copy and answers first, but the primary's answer is what counts.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    replica.state.store.lock().unwrap().remove(b"k".as_slice());
+    primary.state.gets_delay_ms.store(200, Ordering::SeqCst);
+
+    let start = tokio::time::Instant::now();
+    let value = client.get("k").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(value, Some("v".to_string()));
+    assert!(
+        elapsed >= Duration::from_millis(200) - HEDGE_TIMING_TOLERANCE,
+        "elapsed = {elapsed:?}"
+    );
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 1);
+
+    // A key nobody has: the miss is accepted once the primary has
+    // answered it too.
+    assert_eq!(client.get("absent").await.unwrap(), None);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn off_by_default_a_slow_primary_bounds_the_read() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary.state.gets_delay_ms.store(200, Ordering::SeqCst);
+
+    let start = tokio::time::Instant::now();
+    let value = client.get("k").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(value, Some("v".to_string()));
+    assert!(
+        elapsed >= Duration::from_millis(200) - HEDGE_TIMING_TOLERANCE,
+        "elapsed = {elapsed:?}"
+    );
+    assert_eq!(replica.state.gets.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_dead_primary_fails_over_immediately() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(500)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[0]).stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let start = tokio::time::Instant::now();
+    let value = client.get("k").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(value, Some("v".to_string()));
+    assert!(
+        elapsed < Duration::from_millis(500) - HEDGE_TIMING_TOLERANCE,
+        "a dead primary should fail over well under the hedge interval: elapsed = {elapsed:?}"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn read_hedge_after_rejects_a_zero_duration() {
+    let result = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", 1)])
+            .read_hedge_after(Duration::ZERO),
+    )
+    .await;
+    match result {
+        Err(Error::InvalidArgument(_)) => {}
+        Ok(_) => panic!("connect() succeeded, want an InvalidArgument error"),
+        Err(other) => panic!("connect() = {other}, want an InvalidArgument error"),
     }
 }
 

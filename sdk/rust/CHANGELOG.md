@@ -4,6 +4,21 @@ All notable changes to the Rust SDK are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow the `sdk/rust/vX.Y.Z` tags.
 
+## [Unreleased]
+
+### Added
+
+- Hedged reads: `Options::read_hedge_after(Duration)` sends a read to the
+  next owner as well once the primary has gone silent for that long
+  (and, if needed, the owner after it once another interval passes),
+  taking the first answer — a hit from any owner, or a miss once every
+  owner has answered or failed. A replica's miss is only ever provisional
+  (the primary's answer still decides), and a `WrongNode` answer
+  propagates exactly as the existing read path's does. Off by default;
+  needs `R >= 2`. The losing leg of a hedge is never cancelled — it runs
+  to completion detached and is drained by `close()`, the same way a
+  fire-and-forget replica write is (issue #64).
+
 ## [0.2.0] - 2026-08-22
 
 First aligned release of the server and all six SDKs at one version.
