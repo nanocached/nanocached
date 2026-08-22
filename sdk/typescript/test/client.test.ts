@@ -1731,6 +1731,177 @@ describe("NanocachedClient read repair (read repair)", () => {
   });
 });
 
+describe("NanocachedClient hedged reads (issue #64)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  // Generous versus the other suites' TIMING_TOLERANCE_MS (20) so this
+  // stays green on CI (ubuntu), which the task calling for this suite
+  // asked to be treated as noisier than a dev machine.
+  const TIMING_TOLERANCE_MS = 30;
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  async function timed<T>(promise: Promise<T>): Promise<[T, number]> {
+    const start = Date.now();
+    const value = await promise;
+    return [value, Date.now() - start];
+  }
+
+  it("rejects a non-positive readHedgeAfterMs", async () => {
+    for (const bad of [0, -1]) {
+      await assert.rejects(
+        () => NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: 1 }], readHedgeAfterMs: bad }),
+        NanocachedError,
+      );
+    }
+  });
+
+  it("a hit from the replica wins over a slow primary", async () => {
+    const cluster = await startReplicatedCluster();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        readHedgeAfterMs: 50,
+      });
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      primary.mock.delayGets(400);
+
+      const [value, elapsed] = await timed(client.get("k"));
+
+      assert.equal(value, "v");
+      assert.ok(elapsed < 400 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
+      assert.ok(elapsed >= 50 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
+      assert.equal(replica.mock.getCount(), 1, "the replica should have been hedged to");
+
+      // The slow primary's leg was left to finish, not cancelled, and
+      // close() drained it.
+      await client.close();
+      assert.equal((client as any).hedgedReads.size, 0);
+      assert.equal(primary.mock.getCount(), 1);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("a fast primary is never hedged", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 50,
+    });
+    try {
+      await client.set("k", "v");
+      const { replica } = cluster.ownerOf("k");
+      for (let i = 0; i < 5; i++) {
+        assert.equal(await client.get("k"), "v");
+      }
+      assert.equal(replica.mock.getCount(), 0);
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("a replica miss waits for the primary", async () => {
+    // Hedging must never turn a hit into a miss: the replica lacks the
+    // copy and answers first, but the primary's answer is what counts.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 50,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      replica.mock.store.delete("k");
+      primary.mock.delayGets(200);
+
+      const [value, elapsed] = await timed(client.get("k"));
+
+      assert.equal(value, "v");
+      assert.ok(elapsed >= 200 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
+      assert.equal(replica.mock.getCount(), 1);
+
+      // A key nobody has: the miss is accepted once the primary has
+      // answered it too.
+      assert.equal(await client.get("absent"), null);
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("off by default: a slow primary bounds the read", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      primary.mock.delayGets(200);
+
+      const [value, elapsed] = await timed(client.get("k"));
+
+      assert.equal(value, "v");
+      assert.ok(elapsed >= 200 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
+      assert.equal(replica.mock.getCount(), 0);
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("a dead primary fails over immediately", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 500,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary } = cluster.ownerOf("k");
+      await primary.mock.close();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+
+      const [value, elapsed] = await timed(client.get("k"));
+
+      assert.equal(value, "v");
+      assert.ok(elapsed < 500 - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+});
+
 describe("NanocachedClient.stats() (observability for by-design swallows)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 

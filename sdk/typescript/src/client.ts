@@ -126,6 +126,20 @@ export interface NanocachedClientOptions {
    * (read repair). Off by default. Costs extra reads only on the
    * misses this actually applies to. */
   readRepair?: boolean;
+  /** Hedged reads (issue #64): if the primary owner hasn't answered a read
+   * within this many milliseconds, the same read is also sent to the next
+   * owner — and so on, one more owner per interval, until every owner is
+   * in flight. The first answer decides: a hit from any owner is final; a
+   * miss is final only from the primary (a replica's miss is provisional,
+   * since it may simply lack the copy); a failure hedges onward
+   * immediately. Undefined (the default) turns this off — reads then use
+   * the plain sequential path in `readFromOwners`, which only moves past
+   * an owner that has *failed*, so one slow-but-alive owner bounds every
+   * read that touches it at its full round trip. Only applies when the
+   * key has at least 2 owners (`replication >= 2`); with a single copy
+   * there is nobody to hedge to. Must be a positive number when set — a
+   * non-positive value is rejected at `connect()`. */
+  readHedgeAfterMs?: number;
   /** How long, after a reconnect dial to an address fails, that address is
    * treated as still down — a request routed to it during this window
    * fails immediately with the original dial error instead of paying
@@ -306,6 +320,8 @@ export class NanocachedClient {
     private readonly readRepair: boolean,
     /** See `NanocachedClientOptions.reconnectCooldownMs`. */
     private readonly reconnectCooldownMs: number,
+    /** See `NanocachedClientOptions.readHedgeAfterMs`. */
+    private readonly readHedgeAfterMs: number | undefined,
   ) {
     this.nodeUrls = nodeUrls;
     this.startKeepAlive(KEEPALIVE_TUNING.intervalMs);
@@ -316,10 +332,20 @@ export class NanocachedClient {
    * tearing down connections instead of abandoning them. */
   private readonly backgroundReplicaWrites = new Set<Promise<void>>();
 
+  /** Hedged reads (issue #64): legs still in flight after a read has
+   * already returned (the losers) — never cancelled, just left to finish
+   * detached, their outcome retrieved so nothing surfaces as an unhandled
+   * rejection, and drained by close() exactly like
+   * `backgroundReplicaWrites`. See `readHedged`. */
+  private readonly hedgedReads = new Set<Promise<unknown>>();
+
   static async connect(options: NanocachedClientOptions): Promise<NanocachedClient> {
     const addresses = options.addresses ?? [];
     if (addresses.length === 0) {
       throw new NanocachedError("nanocached: connect() needs a non-empty addresses list");
+    }
+    if (options.readHedgeAfterMs !== undefined && !(options.readHedgeAfterMs > 0)) {
+      throw new NanocachedError("nanocached: readHedgeAfterMs must be a positive number of milliseconds");
     }
 
     // ca is meaningful only paired with tls: true; a set ca with tls not
@@ -385,6 +411,7 @@ export class NanocachedClient {
           options.fireAndForgetReplicas === true,
           options.readRepair === true,
           reconnectCooldownMs,
+          options.readHedgeAfterMs,
         );
       }
 
@@ -440,6 +467,7 @@ export class NanocachedClient {
         options.fireAndForgetReplicas === true,
         options.readRepair === true,
         reconnectCooldownMs,
+        options.readHedgeAfterMs,
       );
     }
 
@@ -484,6 +512,13 @@ export class NanocachedClient {
     // item 3 / audit finding, mirroring the Go and Rust SDKs' drain loops).
     while (this.backgroundReplicaWrites.size > 0) {
       await Promise.allSettled([...this.backgroundReplicaWrites]);
+    }
+    // Hedged reads (issue #64): same drain shape as backgroundReplicaWrites
+    // above, for the same reason — a losing leg is left running detached
+    // (readHedged), not cancelled, so close() must still wait for it
+    // instead of abandoning it mid-flight.
+    while (this.hedgedReads.size > 0) {
+      await Promise.allSettled([...this.hedgedReads]);
     }
     this.teardownConnections();
   }
@@ -677,6 +712,14 @@ export class NanocachedClient {
     op: (connection: Connection) => Promise<T>,
   ): Promise<T> {
     const names = this.ownerNames(key);
+
+    // Hedged reads (issue #64): only meaningful with at least 2 owners —
+    // with a single copy there is nobody to hedge to, so the plain
+    // sequential path below runs unchanged.
+    if (this.readHedgeAfterMs !== undefined && names.length > 1) {
+      return this.readHedged(key, op, names);
+    }
+
     let lastError: Error | null = null;
 
     for (const name of names) {
@@ -696,6 +739,117 @@ export class NanocachedClient {
       }
     }
 
+    throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
+  }
+
+  /** Hedged reads (issue #64): one slow — not dead — owner otherwise
+   * bounds every read that touches it at its full round trip, since
+   * `readFromOwners` only moves on to the next owner when the current one
+   * *fails*. Here the read starts at the primary, and if no answer has
+   * arrived within `readHedgeAfterMs` the same read is also sent to the
+   * next owner (and so on, one more owner per interval); the first answer
+   * decides:
+   *
+   * - a hit from any owner is final;
+   * - a miss is final only from the primary — a replica's miss is
+   *   provisional (it may simply lack a copy) and the primary is still
+   *   waited for, so hedging never turns a hit into a miss; a miss is
+   *   accepted only once every owner has answered or failed;
+   * - a failure (anything but `WrongNodeError`) hedges onward
+   *   immediately — the same fall-through condition `readFromOwners`
+   *   uses;
+   * - `WrongNodeError` propagates exactly as in `readFromOwners`.
+   *
+   * The losing legs are never cancelled — there is nothing to cancel a
+   * pending Promise with, and doing so would risk poisoning a connection
+   * mid-request anyway — they are left to finish detached in
+   * `hedgedReads`, their outcome retrieved (so nothing surfaces as an
+   * unhandled rejection), and drained by close(). */
+  private async readHedged<T>(
+    key: string | Uint8Array,
+    op: (connection: Connection) => Promise<T>,
+    names: string[],
+  ): Promise<T> {
+    const hedgeAfterMs = this.readHedgeAfterMs;
+    if (hedgeAfterMs === undefined) {
+      throw new NanocachedError("nanocached: internal error — readHedged called without readHedgeAfterMs");
+    }
+
+    type Outcome = { index: number; ok: true; value: T } | { index: number; ok: false; error: unknown };
+
+    // Wraps a leg so it never rejects (failures become { ok: false }
+    // outcomes instead) — Promise.race below is then safe to use freely,
+    // and a leg that outlives the read (a loser) can't trip Node's
+    // unhandled-rejection detector, since its rejection is handled right
+    // here, synchronously, in the same expression that creates it.
+    const start = (index: number): Promise<Outcome> => {
+      const outcome: Promise<Outcome> = this.memberConnection(names[index])
+        .then((connection) => op(connection))
+        .then(
+          (value): Outcome => ({ index, ok: true, value }),
+          (error): Outcome => ({ index, ok: false, error }),
+        );
+      this.hedgedReads.add(outcome as Promise<unknown>);
+      // Self-removing: once this leg settles — whether it's the winner or
+      // a loser left running past the read's return — it no longer needs
+      // close() to wait on it specifically (a loser still in flight stays
+      // in the set via this same entry until then).
+      outcome.finally(() => this.hedgedReads.delete(outcome as Promise<unknown>));
+      return outcome;
+    };
+
+    let pending: Array<{ promise: Promise<Outcome>; index: number }> = [{ promise: start(0), index: 0 }];
+    let nextIndex = 1;
+    let lastError: unknown = null;
+    let replicaMissed = false;
+
+    while (pending.length > 0) {
+      let timer: NodeJS.Timeout | null = null;
+      const racers: Array<Promise<Outcome | "timeout">> = pending.map((leg) => leg.promise);
+      if (nextIndex < names.length) {
+        racers.push(
+          new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), hedgeAfterMs);
+          }),
+        );
+      }
+
+      const winner = await Promise.race(racers);
+      // Cleared unconditionally, whether the timer itself won the race or
+      // a leg beat it — an uncleared timer would otherwise keep the event
+      // loop alive until it eventually fires, long after this read (and
+      // possibly this whole client) is done with it.
+      if (timer !== null) clearTimeout(timer);
+
+      if (winner === "timeout") {
+        // Hedge interval elapsed with no answer: one more owner, no
+        // change to `pending` for the legs already in flight.
+        pending.push({ promise: start(nextIndex), index: nextIndex });
+        nextIndex++;
+        continue;
+      }
+
+      pending = pending.filter((leg) => leg.index !== winner.index);
+
+      if (!winner.ok) {
+        if (winner.error instanceof WrongNodeError) throw winner.error;
+        lastError = winner.error;
+      } else if (winner.value !== null || winner.index === 0) {
+        return winner.value;
+      } else {
+        // A replica miss is provisional — it may simply lack the copy.
+        replicaMissed = true;
+      }
+
+      if (pending.length === 0 && nextIndex < names.length) {
+        // Everything so far failed or missed provisionally: the next
+        // owner gets its turn right away, no waiting for the interval.
+        pending.push({ promise: start(nextIndex), index: nextIndex });
+        nextIndex++;
+      }
+    }
+
+    if (replicaMissed) return null as T;
     throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
   }
 
