@@ -148,7 +148,7 @@ jobs:
 
       - name: Run tests
         working-directory: sdk/dotnet
-        run: dotnet test tests/Nanocached.Tests -v q
+        run: dotnet test tests/Nanocached.Tests -v q --logger "console;verbosity=normal"
 
   go-sdk:
     runs-on: ubuntu-latest
