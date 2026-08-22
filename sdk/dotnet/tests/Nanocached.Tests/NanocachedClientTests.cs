@@ -1919,3 +1919,180 @@ public class NanocachedClientTests
             $"elapsed {stopwatch.ElapsedMilliseconds}ms should be nowhere near the 500ms hedge interval");
     }
 }
+
+/// <summary>
+/// Issue #67: <see cref="NanocachedClient.ConnectAsync(NanocachedClient.Options)"/>
+/// must tolerate a node that discovery still lists but that can't be
+/// reached (dead, not yet evicted) the same way steady-state requests
+/// already do — installing it as a member with no connection instead of
+/// failing the whole connect — and fail only when no listed node is
+/// reachable.
+/// </summary>
+public class TolerantBootstrapTests
+{
+    private static readonly string[] Names =
+    {
+        "6c9f2a7e-4b1d-4f3a-9e5c-1a2b3c4d5e6f",
+        "2e4d6f81-9a3b-4c5d-8e7f-0a1b2c3d4e5f",
+    };
+
+    private static byte[] Bytes(string text) => Encoding.UTF8.GetBytes(text);
+
+    private static IReadOnlyList<string> OwnersOf(string key) =>
+        new HashRing(Names).Owners(Bytes(key), 2);
+
+    private static string KeyWithPrimary(string name)
+    {
+        for (int i = 0; i < 1000; i++)
+        {
+            string key = $"key-{i}";
+            if (OwnersOf(key)[0] == name) return key;
+        }
+        throw new InvalidOperationException($"no key routes to {name}");
+    }
+
+    private sealed record Cluster(
+        IReadOnlyDictionary<string, MockNode> Nodes, MockDiscovery Discovery) : IDisposable
+    {
+        public void Dispose()
+        {
+            Discovery.Dispose();
+            foreach (MockNode node in Nodes.Values) node.Dispose();
+        }
+    }
+
+    /// <summary>Starts a 2-node cluster (replication 2); every name in
+    /// <paramref name="dead"/> is instead listed by discovery at an
+    /// address nobody listens on.</summary>
+    private static Cluster StartCluster(ISet<string> dead)
+    {
+        var nodes = new Dictionary<string, MockNode>();
+        var entries = new List<(string Name, string Address)>();
+        foreach (string name in Names)
+        {
+            if (dead.Contains(name))
+            {
+                entries.Add((name, $"127.0.0.1:{Wire.UnusedPort()}"));
+            }
+            else
+            {
+                var node = new MockNode();
+                nodes[name] = node;
+                entries.Add((name, node.Address));
+            }
+        }
+        var discovery = new MockDiscovery(entries, replication: 2);
+        return new Cluster(nodes, discovery);
+    }
+
+    // Member and its Connection/Address properties are private/internal —
+    // reached via reflection, the same way ReplaceMemberConnection (above,
+    // in NanocachedClientTests) does for its own regression test.
+    private static object GetMember(NanocachedClient client, string name)
+    {
+        FieldInfo membersField = typeof(NanocachedClient)
+            .GetField("_members", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var members = (System.Collections.IDictionary)membersField.GetValue(client)!;
+        return members[name] ?? throw new InvalidOperationException($"no member named {name}");
+    }
+
+    private static Connection? GetMemberConnection(NanocachedClient client, string name)
+    {
+        object member = GetMember(client, name);
+        PropertyInfo property = member.GetType()
+            .GetProperty("Connection", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Connection?)property.GetValue(member);
+    }
+
+    private static string GetMemberAddress(NanocachedClient client, string name)
+    {
+        object member = GetMember(client, name);
+        PropertyInfo property = member.GetType()
+            .GetProperty("Address", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (string)property.GetValue(member)!;
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition, string what)
+    {
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, $"timed out waiting for {what}");
+            await Task.Delay(5);
+        }
+    }
+
+    [Fact]
+    public async Task ConnectSucceedsWithOneUnreachableNode()
+    {
+        string dead = Names[0], live = Names[1];
+        using Cluster cluster = StartCluster(new HashSet<string> { dead });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReconnectCooldown = TimeSpan.FromSeconds(3),
+        });
+
+        Assert.Equal(2, client.Replication);
+        Assert.Null(GetMemberConnection(client, dead));
+        Assert.NotNull(GetMemberConnection(client, live));
+
+        // A key whose primary is alive: the write lands, the dead
+        // replica leg is swallowed and counted, the read hits.
+        string key = KeyWithPrimary(live);
+        await client.SetAsync(key, "v");
+        Assert.Equal("v", await client.GetAsync(key));
+        Assert.Equal(1, client.Stats().ReplicaWriteFailures);
+
+        // A key whose primary is the dead node: the read fails over to
+        // the live replica right away (cooldown still armed — no dial),
+        // well under the 5s connect/dial timeout.
+        string other = KeyWithPrimary(dead);
+        cluster.Nodes[live].Store[MockNode.KeyOf(Bytes(other))] = Bytes("replica copy");
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Equal("replica copy", await client.GetAsync(other));
+        stopwatch.Stop();
+        Assert.True(stopwatch.ElapsedMilliseconds < 2000,
+            $"expected a fast failover, took {stopwatch.ElapsedMilliseconds}ms");
+    }
+
+    [Fact]
+    public async Task ConnectThrowsAConnectionErrorWhenEveryListedNodeIsUnreachable()
+    {
+        using Cluster cluster = StartCluster(new HashSet<string>(Names));
+
+        await Assert.ThrowsAsync<ConnectionLostException>(
+            () => NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            }));
+    }
+
+    [Fact]
+    public async Task AnUnreachableNodeIsRedialedOnceTheCooldownHasPassed()
+    {
+        string dead = Names[0], live = Names[1];
+        using Cluster cluster = StartCluster(new HashSet<string> { dead });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReconnectCooldown = TimeSpan.FromMilliseconds(50),
+        });
+
+        // Bring the "dead" node up on the exact address discovery listed.
+        string deadAddress = GetMemberAddress(client, dead);
+        int port = int.Parse(deadAddress.Split(':')[1]);
+        using var revived = new MockNode(port: port);
+        await Task.Delay(150); // past the 50ms cooldown
+
+        string key = KeyWithPrimary(dead);
+        await client.SetAsync(key, "v");
+
+        await WaitForAsync(
+            () => revived.Store.ContainsKey(MockNode.KeyOf(Bytes(key))),
+            "the revived node to receive the write");
+        Assert.NotNull(GetMemberConnection(client, dead));
+    }
+}

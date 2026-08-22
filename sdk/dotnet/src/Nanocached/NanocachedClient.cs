@@ -199,14 +199,23 @@ public sealed class NanocachedClient : IDisposable
 
     private sealed class Member
     {
-        internal Member(string address, Connection connection)
+        internal Member(string address, Connection? connection)
         {
             Address = address;
             Connection = connection;
         }
 
         internal string Address { get; set; }
-        internal Connection Connection { get; set; }
+
+        /// <summary>The member's current connection — <c>null</c> for a
+        /// member that discovery listed but that this client could not
+        /// reach when it bootstrapped (issue #67): it stays routable (the
+        /// ring already includes it — membership comes from discovery,
+        /// unchanged), so a request for one of its keys fails over the
+        /// same way it would after a mid-life node death, and the next
+        /// request after the reconnect cooldown redials it (see
+        /// <see cref="SlotConnectionAsync"/>).</summary>
+        internal Connection? Connection { get; set; }
     }
 
     // Process-global: how many open sockets exist right now for a given
@@ -495,13 +504,75 @@ public sealed class NanocachedClient : IDisposable
         return new Connection(stream, tagged, () => DecrementOpenTarget(key));
     }
 
+    /// <summary>Dials every node discovery listed, concurrently. A node
+    /// that can't be reached (issue #67: typically one that just died and
+    /// discovery hasn't evicted yet — its liveness window is seconds long,
+    /// and every key is still served by another owner when R &gt; 1) is
+    /// installed without a connection and with its reconnect cooldown
+    /// armed (<see cref="ArmReconnectCooldown"/>), exactly the state a
+    /// member is in after dying mid-life, so requests for its keys fail
+    /// over per request instead of the whole <see cref="ConnectAsync"/>
+    /// failing. Only a cluster with <em>no</em> reachable node fails,
+    /// with the last such dial error. A listed address that answers but no
+    /// longer identifies as a cache node — or fails for any other reason
+    /// that isn't a connection-level failure — remains a hard error, as
+    /// before this fix: every dial outcome is gathered first (so any
+    /// connections opened for other, reachable nodes are still recorded in
+    /// <see cref="_members"/> and get torn down by
+    /// <see cref="ConnectAsync"/>'s catch-and-<see cref="Teardown"/>,
+    /// rather than leaking), and only then is that non-connection-level
+    /// error re-thrown.</summary>
     private async Task OpenClusterAsync(Identify.ClusterTarget cluster)
     {
-        foreach (DiscoveredNode node in cluster.Nodes)
+        async Task<(DiscoveredNode Node, Connection? Connection, Exception? Error)> DialNodeAsync(
+            DiscoveredNode node)
         {
-            _members[node.Name] = new Member(
-                node.Address, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false));
+            try
+            {
+                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), null);
+            }
+            catch (Exception error)
+            {
+                return (node, null, error);
+            }
         }
+
+        var outcomes = await Task.WhenAll(cluster.Nodes.Select(DialNodeAsync)).ConfigureAwait(false);
+
+        Exception? lastError = null;
+        Exception? fatal = null;
+        int reachable = 0;
+        foreach (var (node, connection, error) in outcomes)
+        {
+            if (connection is not null)
+            {
+                _members[node.Name] = new Member(node.Address, connection);
+                reachable++;
+                continue;
+            }
+
+            if (error is ConnectionLostException)
+            {
+                _members[node.Name] = new Member(node.Address, null);
+                ArmReconnectCooldown(node.Address, error);
+                lastError = error;
+            }
+            else
+            {
+                fatal ??= error;
+            }
+        }
+
+        if (fatal is not null)
+        {
+            ExceptionDispatchInfo.Capture(fatal).Throw();
+        }
+
+        if (reachable == 0)
+        {
+            ExceptionDispatchInfo.Capture(lastError!).Throw();
+        }
+
         _ring = new HashRing(cluster.Nodes.Select(node => node.Name).ToList());
         _replication = cluster.Replication;
     }
@@ -810,7 +881,7 @@ public sealed class NanocachedClient : IDisposable
         lock (_stateLock)
         {
             _single?.Close();
-            foreach (Member member in _members.Values) member.Connection.Close();
+            foreach (Member member in _members.Values) member.Connection?.Close();
         }
     }
 
@@ -1188,8 +1259,11 @@ public sealed class NanocachedClient : IDisposable
 
     private async Task<Connection> SlotConnectionAsync(string? slot)
     {
-        (string slotKey, string address, Connection current) = SnapshotSlot(slot);
-        if (!current.IsClosed) return current;
+        (string slotKey, string address, Connection? current) = SnapshotSlot(slot);
+        // current is null for a member that bootstrapped without a
+        // connection (issue #67) — treated exactly like an already-closed
+        // one below: it just goes straight to dialing.
+        if (current is not null && !current.IsClosed) return current;
 
         // Concurrent requests finding the same dead connection share one
         // dial: the first caller redials, the rest wait then reuse.
@@ -1207,7 +1281,7 @@ public sealed class NanocachedClient : IDisposable
         try
         {
             (_, address, current) = SnapshotSlot(slot);
-            if (!current.IsClosed) return current;
+            if (current is not null && !current.IsClosed) return current;
 
             Connection fresh = await DialWithCooldownAsync(address).ConfigureAwait(false);
             lock (_stateLock)
@@ -1258,24 +1332,38 @@ public sealed class NanocachedClient : IDisposable
         }
         catch (NanocachedException error)
         {
-            // null means Options.DisableReconnectCooldown was set — every
-            // request that finds this address's connection dead pays its
-            // own full dial attempt instead of reusing a cached failure.
-            if (_reconnectCooldown is TimeSpan resolvedCooldown)
-            {
-                _reconnectCooldowns[address] = (DateTime.UtcNow + resolvedCooldown, error);
-            }
+            ArmReconnectCooldown(address, error);
             throw;
         }
     }
 
-    private (string SlotKey, string Address, Connection Connection) SnapshotSlot(string? slot)
+    /// <summary>Arms the per-address reconnect cooldown (see
+    /// <see cref="_reconnectCooldowns"/>) after a dial to
+    /// <paramref name="address"/> failed with <paramref name="error"/> — used
+    /// both by a lazy redial's own failed dial (<see cref="DialWithCooldownAsync"/>)
+    /// and by <see cref="OpenClusterAsync"/> installing an unreachable
+    /// member at bootstrap (issue #67), so a request that reaches it right
+    /// after connect fails immediately with this same cached error instead
+    /// of paying its own dial. A no-op when
+    /// <see cref="Options.DisableReconnectCooldown"/> was set
+    /// (<see cref="_reconnectCooldown"/> is <c>null</c>) — every request
+    /// then pays its own full dial attempt instead of reusing a cached
+    /// failure.</summary>
+    private void ArmReconnectCooldown(string address, Exception error)
+    {
+        if (_reconnectCooldown is TimeSpan resolvedCooldown)
+        {
+            _reconnectCooldowns[address] = (DateTime.UtcNow + resolvedCooldown, error);
+        }
+    }
+
+    private (string SlotKey, string Address, Connection? Connection) SnapshotSlot(string? slot)
     {
         lock (_stateLock)
         {
             if (slot is null)
             {
-                return ("", _singleAddress!, _single!);
+                return ("", _singleAddress!, _single);
             }
             if (!_members.TryGetValue(slot, out Member? member))
             {
@@ -1346,7 +1434,7 @@ public sealed class NanocachedClient : IDisposable
 
             foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
             {
-                _members[name].Connection.Close();
+                _members[name].Connection?.Close();
                 _members.Remove(name);
                 // Node names are per-process UUIDs; a departed node's
                 // redial gate would otherwise leak forever (issue #12).
@@ -1467,7 +1555,11 @@ public sealed class NanocachedClient : IDisposable
                 {
                     connections = _single is not null
                         ? new List<Connection> { _single }
-                        : _members.Values.Select(member => member.Connection).ToList();
+                        // A member with no connection (issue #67: still
+                        // unreachable since bootstrap, or between deaths)
+                        // stays lazy — nothing here to ping, redialed on
+                        // its next real use.
+                        : _members.Values.Select(member => member.Connection).OfType<Connection>().ToList();
                 }
                 foreach (Connection connection in connections)
                 {

@@ -57,13 +57,18 @@ public sealed class MockNode : IDisposable
         string? requiredSecret = null,
         bool supportTags = false,
         bool closeOnExtendedAuth = false,
-        X509Certificate2? serverCertificate = null)
+        X509Certificate2? serverCertificate = null,
+        int port = 0)
     {
         _requiredSecret = requiredSecret is null ? null : Encoding.UTF8.GetBytes(requiredSecret);
         _supportTags = supportTags;
         _closeOnExtendedAuth = closeOnExtendedAuth;
         _serverCertificate = serverCertificate;
-        _listener = new TcpListener(IPAddress.Loopback, 0);
+        // port = 0 (the default) picks any free port, as before; a
+        // caller that needs to revive a node on a specific, previously
+        // advertised address (issue #67's redial-after-cooldown test)
+        // passes the exact port instead.
+        _listener = new TcpListener(IPAddress.Loopback, port);
         _listener.Start();
         _ = AcceptLoopAsync();
     }
