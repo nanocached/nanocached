@@ -155,6 +155,13 @@ the Rust SDK, where `Options::reconnect_cooldown(Duration::ZERO)` also
 means "use the default" and `Options::disable_reconnect_cooldown()` is
 the equivalent of a negative value here.
 
+`Connect` itself tolerates a node that discovery still lists but that
+can't be reached — typically one that just died and hasn't been evicted
+yet (a window of seconds): the node is kept in the ring without a
+connection, requests for its keys fail over per request exactly as they
+would after a mid-life death, and it is redialed after the cooldown.
+Only a cluster with no reachable node at all fails `Connect`.
+
 ## Authentication and TLS
 
 ```go
