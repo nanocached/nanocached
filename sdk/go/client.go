@@ -98,6 +98,23 @@ type Config struct {
 	// (read repair). Off by default. Costs extra reads only on the
 	// misses it actually applies to.
 	ReadRepair bool
+	// ReadHedgeAfter routes a Get/GetBytes around a slow — not dead —
+	// owner (hedged reads): if the primary hasn't answered within this
+	// long, the same read is also sent to the next owner (and so on, one
+	// more owner per interval, until every owner is in flight); the first
+	// answer decides, except that a miss is only final coming from the
+	// primary — a replica's miss is provisional (it may simply lack the
+	// copy), so hedging can never turn a hit into a miss. Zero (the
+	// default) disables hedging: the read then bounds on whichever owner
+	// it happens to touch, exactly as before this option existed. Only
+	// meaningful once a ring is known and the key has at least two owners
+	// (Replication() >= 2); a single-node client, or a key with only one
+	// owner, is unaffected either way. Negative is rejected by Connect.
+	// Losing legs are never cancelled — cancelling mid-write would poison
+	// a shared connection (see connection.request) — they run to
+	// completion detached, tracked so Close() waits for them exactly like
+	// a fire-and-forget replica write.
+	ReadHedgeAfter time.Duration
 	// ReconnectCooldown is how long, after a reconnect dial to an address
 	// fails, that address is treated as still down — a request routed to
 	// it during this window fails immediately with the original dial
@@ -126,9 +143,9 @@ func (c Config) String() string {
 	}
 	return fmt.Sprintf(
 		"Config{Addresses:%v AuthSecret:%s TLS:%v CA:%q Compress:%v CompressionThreshold:%d "+
-			"FireAndForgetReplicas:%v ReadRepair:%v ReconnectCooldown:%v}",
+			"FireAndForgetReplicas:%v ReadRepair:%v ReadHedgeAfter:%v ReconnectCooldown:%v}",
 		c.Addresses, secret, c.TLS, c.CA, c.Compress, c.CompressionThreshold,
-		c.FireAndForgetReplicas, c.ReadRepair, c.ReconnectCooldown)
+		c.FireAndForgetReplicas, c.ReadRepair, c.ReadHedgeAfter, c.ReconnectCooldown)
 }
 
 // GoString implements fmt.GoStringer so %#v also redacts AuthSecret —
@@ -291,6 +308,15 @@ type Client struct {
 
 	readRepair bool
 
+	// readHedgeAfter is Config.ReadHedgeAfter (hedged reads); <= 0 disables
+	// hedging. hedgedReadsWG lets Close() drain hedging's losing legs
+	// before tearing down connections, exactly like backgroundReplicaWG
+	// does for fire-and-forget replica writes — unlike that pool, hedge
+	// legs aren't capped by a semaphore, since at most len(names)-1 of
+	// them can ever be in flight per read.
+	readHedgeAfter time.Duration
+	hedgedReadsWG  sync.WaitGroup
+
 	// targetKey is the address this client's connect() ultimately settled
 	// on — a node's own address in single mode, the winning discovery
 	// server's address in cluster mode. Every socket this client ever
@@ -363,6 +389,10 @@ func Connect(config Config) (*Client, error) {
 		return nil, fmt.Errorf(
 			"nanocached: CompressionThreshold must not be negative, got %d", config.CompressionThreshold)
 	}
+	if config.ReadHedgeAfter < 0 {
+		return nil, fmt.Errorf(
+			"nanocached: ReadHedgeAfter must not be negative, got %v", config.ReadHedgeAfter)
+	}
 
 	tlsConfig, err := buildTLSConfig(config)
 	if err != nil {
@@ -394,6 +424,7 @@ func Connect(config Config) (*Client, error) {
 		fireAndForgetReplicas: config.FireAndForgetReplicas,
 		backgroundReplicaSem:  make(chan struct{}, maxInFlightBackgroundReplicaWrites),
 		readRepair:            config.ReadRepair,
+		readHedgeAfter:        config.ReadHedgeAfter,
 	}
 	if config.AuthSecret != "" {
 		client.authSecret = []byte(config.AuthSecret)
@@ -551,11 +582,11 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	}
 	keyBytes := []byte(key)
 	err = c.withClusterRetry(func() error {
-		return c.read(keyBytes, func(conn *connection) error {
-			var opErr error
-			value, ok, opErr = conn.get(keyBytes)
-			return opErr
+		v, o, readErr := c.read(keyBytes, func(conn *connection) ([]byte, bool, error) {
+			return conn.get(keyBytes)
 		})
+		value, ok = v, o
+		return readErr
 	})
 	if err == nil && !ok && c.readRepair {
 		value, ok = c.tryReadRepair(keyBytes)
@@ -719,6 +750,11 @@ func (c *Client) Close() {
 	// Bounded by maxInFlightBackgroundReplicaWrites, so this is a short
 	// wait in practice.
 	c.backgroundReplicaWG.Wait()
+	// Hedged reads: same drain contract for hedging's losing legs (issue
+	// #64) — left running to completion rather than cancelled (see
+	// readHedged), so Close() waits for them too before tearing down
+	// connections out from under them.
+	c.hedgedReadsWG.Wait()
 	c.teardown()
 }
 
@@ -804,33 +840,187 @@ func (c *Client) applyReconnecting(slot string, op func(*connection) error) erro
 	return nil
 }
 
-// read drives the owner walk and error policy; the op closure delivers
-// its result through variables captured by the caller.
-func (c *Client) read(key []byte, op func(*connection) error) error {
+// read drives the owner walk and error policy; op returns its outcome
+// directly (rather than writing into variables the caller captured) so
+// that readHedged below can run several legs concurrently without racing
+// on shared state.
+func (c *Client) read(key []byte, op func(*connection) ([]byte, bool, error)) (value []byte, ok bool, err error) {
 	c.mu.Lock()
 	single := c.ring == nil
 	c.mu.Unlock()
 	if single {
-		return c.applyReconnecting("", op)
+		return c.readFromOwner("", op)
+	}
+
+	names := c.ownerNames(key)
+	if c.readHedgeAfter > 0 && len(names) > 1 {
+		return c.readHedged(names, op)
 	}
 
 	// Owners in rank order; fall through only on connection-level
 	// failure — a replica hedges against a dead holder, not a miss.
 	var lastError error
-	for _, name := range c.ownerNames(key) {
-		err := c.applyReconnecting(name, op)
+	for _, name := range names {
+		v, o, err := c.readFromOwner(name, op)
 		if err == nil {
-			return nil
+			return v, o, nil
 		}
 		if errors.Is(err, ErrWrongNode) {
-			return err
+			return nil, false, err
 		}
 		lastError = err
 	}
 	if lastError == nil {
 		lastError = connectionLost("no owner is reachable for this key", nil)
 	}
-	return lastError
+	return nil, false, lastError
+}
+
+// readFromOwner runs op against one owner slot via applyReconnecting
+// (reconnecting once on a connection-level failure), returning its
+// outcome directly. Used both by read()'s sequential walk and by each
+// concurrent leg of readHedged, so every caller gets its own private
+// value/ok/err rather than writing into state shared across goroutines.
+func (c *Client) readFromOwner(slot string, op func(*connection) ([]byte, bool, error)) (value []byte, ok bool, err error) {
+	err = c.applyReconnecting(slot, func(conn *connection) error {
+		var opErr error
+		value, ok, opErr = op(conn)
+		return opErr
+	})
+	return value, ok, err
+}
+
+// readHedged implements hedged reads (issue #64): one slow — not dead —
+// owner otherwise bounds every read that touches it at its full RTT,
+// since the sequential walk in read() only moves on to the next owner
+// when the current one *fails*. Here the read starts at the primary
+// (names[0]); if it hasn't answered within readHedgeAfter the same read
+// is also sent to the next owner (and so on, one more owner per
+// interval, until every owner is in flight). The first answer decides:
+//
+//   - a hit (ok==true) from any owner is final;
+//   - the primary's answer (names[0]) is final even when it's a miss —
+//     a replica's miss is merely provisional (it may simply lack the
+//     copy) and does not finalize the read on its own;
+//   - a connection-level failure (or any error other than ErrWrongNode)
+//     hedges onward immediately (no wait for the interval) and is
+//     remembered as the last error;
+//   - ErrWrongNode propagates exactly as read()'s sequential path does.
+//
+// If every owner answers with a miss or fails, but at least one
+// non-primary owner's answer was a clean miss, the read is accepted as a
+// miss overall — mirroring the Python SDK exactly (there is no positive
+// evidence the key exists on any owner that actually answered). Only when
+// no owner ever produced even a provisional miss does the last error
+// propagate.
+//
+// Losing legs are never cancelled — cancelling mid-write would poison a
+// shared connection (see connection.request) — they run to completion
+// detached, their outcome discarded, tracked on hedgedReadsWG so Close()
+// waits for them exactly like a fire-and-forget replica write.
+func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, error)) (value []byte, ok bool, err error) {
+	type legResult struct {
+		index int
+		value []byte
+		ok    bool
+		err   error
+	}
+
+	results := make(chan legResult, len(names))
+	// start registers a leg on hedgedReadsWG and launches it, reporting
+	// whether it actually started. c.closed is rechecked under c.mu
+	// immediately before the Add — Close() flips closed under the same
+	// lock before it ever calls hedgedReadsWG.Wait(), so this guarantees
+	// every Add happens-before that Wait (mirrors the identical guard on
+	// backgroundReplicaWG in write() and tryReadRepair()); without it, a
+	// leg starting exactly as Close() observes the counter at zero could
+	// race sync.WaitGroup's Add/Wait and panic. There is no synchronous
+	// fallback here — a leg that loses this race is simply never started.
+	start := func(index int) bool {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return false
+		}
+		c.hedgedReadsWG.Add(1)
+		c.mu.Unlock()
+		go func() {
+			defer c.hedgedReadsWG.Done()
+			v, o, e := c.readFromOwner(names[index], op)
+			results <- legResult{index: index, value: v, ok: o, err: e}
+		}()
+		return true
+	}
+
+	if !start(0) {
+		return nil, false, ErrClosed
+	}
+	pending := 1
+	nextIndex := 1
+	var lastError error
+	replicaMissed := false
+
+	// tryStartNext starts the next owner, if any remain and the client
+	// isn't closing; a start refused because the client is closing is
+	// treated as having run out of owners, same as reaching len(names).
+	tryStartNext := func() {
+		if nextIndex >= len(names) {
+			return
+		}
+		if start(nextIndex) {
+			pending++
+			nextIndex++
+			return
+		}
+		nextIndex = len(names)
+	}
+
+	for pending > 0 {
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		if nextIndex < len(names) {
+			timer = time.NewTimer(c.readHedgeAfter)
+			timeout = timer.C
+		}
+
+		select {
+		case res := <-results:
+			if timer != nil {
+				timer.Stop()
+			}
+			pending--
+			switch {
+			case res.err != nil:
+				if errors.Is(res.err, ErrWrongNode) {
+					// Remaining legs, if any, are left running: already
+					// registered on hedgedReadsWG, they finish and drain
+					// via Close() like any other detached leg.
+					return nil, false, res.err
+				}
+				lastError = res.err
+			case res.ok || res.index == 0:
+				return res.value, res.ok, nil
+			default:
+				// A non-primary clean miss: provisional only.
+				replicaMissed = true
+			}
+			if pending == 0 {
+				tryStartNext()
+			}
+		case <-timeout:
+			// The hedge interval elapsed with no answer: one more owner,
+			// without waiting for the legs already in flight.
+			tryStartNext()
+		}
+	}
+
+	if replicaMissed {
+		return nil, false, nil
+	}
+	if lastError == nil {
+		lastError = connectionLost("no owner is reachable for this key", nil)
+	}
+	return nil, false, lastError
 }
 
 // write runs op against every owner of the key; op's second argument

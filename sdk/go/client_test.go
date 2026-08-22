@@ -78,6 +78,7 @@ type mockNode struct {
 	swallowLeft      atomic.Int32 // echoed response tags: swallow the next G entirely (no reply)
 	lastSetTTL       atomic.Value // string: the TTL field of the last S, or "none"
 	setDelay         atomic.Int64 // nanoseconds; sleep this long before every S reply
+	getDelay         atomic.Int64 // nanoseconds; sleep this long before every G reply
 	conns            sync.Map     // net.Conn -> struct{}
 	silent           atomic.Bool  // once true, every G/S/D is read but never answered
 }
@@ -101,6 +102,10 @@ type mockNodeOpts struct {
 // tests proving a caller isn't blocked on a slow replica leg
 // (fire-and-forget replica writes).
 func (m *mockNode) delaySets(d time.Duration) { m.setDelay.Store(int64(d)) }
+
+// delayGets makes every future G reply from this node wait d first — a
+// slow-but-alive node, for hedged-read tests (issue #64).
+func (m *mockNode) delayGets(d time.Duration) { m.getDelay.Store(int64(d)) }
 
 // goSilentAfterHandshake makes this node a half-open server from this
 // point on: it still accepts and completes the A handshake, and still
@@ -220,6 +225,9 @@ func (m *mockNode) serve(conn net.Conn) {
 				continue
 			}
 			m.getCount.Add(1)
+			if delay := time.Duration(m.getDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
 			if m.takeOne(&m.swallowLeft) {
 				continue // no reply at all — the off-by-one desync injection
 			}
@@ -2259,6 +2267,205 @@ func TestARefreshAgainstAnUnreachableDiscoverySeedCountsARefreshFailureInStats(t
 
 	if got := client.Stats().RefreshFailures; got == 0 {
 		t.Fatalf("RefreshFailures = %d, want > 0", got)
+	}
+}
+
+// ── Hedged reads (issue #64) ─────────────────────────────────────────
+//
+// ReadHedgeAfter sends a read to the next owner when the primary hasn't
+// answered in time — a slow node no longer bounds every read that
+// touches it. Generous timing tolerances (well over 30ms) keep these
+// tests from flaking under CI's ubuntu runners.
+
+const hedgeTimingTolerance = 30 * time.Millisecond
+
+func TestHedgedReadRejectsANegativeHedge(t *testing.T) {
+	for _, bad := range []time.Duration{-1, -time.Second} {
+		if _, err := Connect(Config{Addresses: []Address{addr(unusedPort(t))}, ReadHedgeAfter: bad}); err == nil {
+			t.Fatalf("ReadHedgeAfter=%v: expected an error", bad)
+		}
+	}
+}
+
+func TestHedgedReadZeroMeansOff(t *testing.T) {
+	// Unlike Python's None-sentinel, Go's zero value can't distinguish
+	// "unset" from "explicitly zero" — so, per Config.ReadHedgeAfter's own
+	// doc comment, zero must mean "off" rather than being rejected like a
+	// negative value.
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, ReadHedgeAfter: 0})
+	if err != nil {
+		t.Fatalf("ReadHedgeAfter=0: expected no error, got %v", err)
+	}
+	client.Close()
+}
+
+func TestAHitFromTheReplicaWinsOverASlowPrimary(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+	nodes[primary].delayGets(400 * time.Millisecond)
+
+	start := time.Now()
+	value, ok, err := client.Get("k")
+	elapsed := time.Since(start)
+
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if elapsed >= 400*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want well under the primary's 400ms delay", elapsed)
+	}
+	if elapsed < 50*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want at least the 50ms hedge interval", elapsed)
+	}
+	if got := nodes[replica].getCount.Load(); got != 1 {
+		t.Fatalf("replica getCount = %d, want 1 (the replica should have been hedged to)", got)
+	}
+
+	client.Close() // idempotent-looking, but proves close() drains the still-running slow leg
+	if got := nodes[primary].getCount.Load(); got != 1 {
+		t.Fatalf("primary getCount = %d, want 1", got)
+	}
+}
+
+func TestAFastPrimaryIsNeverHedged(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	replica := ownersOf("k")[1]
+	for i := 0; i < 5; i++ {
+		value, ok, err := client.Get("k")
+		if err != nil || !ok || value != "v" {
+			t.Fatalf("Get = %q, %v, %v", value, ok, err)
+		}
+	}
+	if got := nodes[replica].getCount.Load(); got != 0 {
+		t.Fatalf("replica getCount = %d, want 0 (a fast primary must never be hedged)", got)
+	}
+}
+
+func TestAReplicaMissWaitsForThePrimary(t *testing.T) {
+	// Hedging must never turn a hit into a miss: the replica lacks the
+	// copy and answers first, but the primary's answer is what counts.
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+	nodes[replica].store.Delete("k")
+	nodes[primary].delayGets(200 * time.Millisecond)
+
+	start := time.Now()
+	value, ok, err := client.Get("k")
+	elapsed := time.Since(start)
+
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if elapsed < 200*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want at least the primary's 200ms delay", elapsed)
+	}
+	if got := nodes[replica].getCount.Load(); got != 1 {
+		t.Fatalf("replica getCount = %d, want 1", got)
+	}
+
+	// A key nobody has: the miss is accepted once the primary has
+	// answered it too.
+	_, ok, err = client.Get("absent")
+	if err != nil || ok {
+		t.Fatalf("Get(absent) = ok=%v err=%v, want a clean miss", ok, err)
+	}
+}
+
+func TestHedgingOffByDefaultASlowPrimaryBoundsTheRead(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	primary, replica := owners[0], owners[1]
+	nodes[primary].delayGets(200 * time.Millisecond)
+
+	start := time.Now()
+	value, ok, err := client.Get("k")
+	elapsed := time.Since(start)
+
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if elapsed < 200*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want at least the primary's 200ms delay (hedging is off)", elapsed)
+	}
+	if got := nodes[replica].getCount.Load(); got != 0 {
+		t.Fatalf("replica getCount = %d, want 0 (hedging is off by default)", got)
+	}
+}
+
+func TestADeadPrimaryFailsOverImmediatelyWhenHedgingIsOn(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	primary := ownersOf("k")[0]
+	nodes[primary].close()
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	value, ok, err := client.Get("k")
+	elapsed := time.Since(start)
+
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if elapsed >= 500*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want well under the 500ms hedge interval (a dead primary fails over immediately)", elapsed)
 	}
 }
 
