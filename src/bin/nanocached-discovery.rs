@@ -36,7 +36,24 @@
 //!                             becomes a strict majority of voting nodes,
 //!                             not merely one — makes this replica refuse
 //!                             `L` until it clears — see below. Response:
-//!                             `A\n`.
+//!                             `A <count> <replication>\n` followed by
+//!                             `count` entries in exactly `L`'s entry
+//!                             format (below) — the roster of currently-
+//!                             `Joined` nodes as this replica sees it, so
+//!                             the node can keep its own membership view
+//!                             (which it otherwise only learns from `M`,
+//!                             i.e. on joins) current across liveness
+//!                             evictions too (issue #61: survivors kept
+//!                             routing keys to an evicted node, answering
+//!                             `W` for them until the next join). The
+//!                             roster is withheld — a bare `A\n`, "no
+//!                             update" — exactly when `L` would answer
+//!                             `B\n`: during the startup grace (the
+//!                             registry is still re-filling and a partial
+//!                             roster would make nodes reject keys they do
+//!                             own) and while a strict majority of voting
+//!                             nodes dispute this replica's replication
+//!                             factor.
 //!
 //!   L\n                       List currently `Joined` nodes. Response:
 //!                             `N <count> <replication>\n` (the replication
@@ -2732,6 +2749,65 @@ fn dispatch_connection(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One consistent read of the registry for `L` and the `H` ack: the
+/// replication-factor vote tally (issue #30) and the served roster, taken
+/// under a single lock acquisition so a concurrent heartbeat/leave can't
+/// slip between "no majority disagrees on replication" and the roster
+/// then served.
+struct RosterSnapshot {
+    agreeing: usize,
+    dissenting: Vec<String>,
+    /// Every currently-`Joined` node as `(name, address)`.
+    nodes: Vec<(String, String)>,
+}
+
+impl RosterSnapshot {
+    /// Issue #30 (amended): a STRICT majority of voting nodes disputing
+    /// this replica's own `--replication-factor` is what makes `L` answer
+    /// `B\n` and the `H` ack withhold its roster. A tie does not refuse.
+    fn refuse(&self) -> bool {
+        self.dissenting.len() > self.agreeing
+    }
+}
+
+fn roster_snapshot(registry: &Registry, replication: usize) -> RosterSnapshot {
+    let guard = lock(registry);
+    let mut agreeing = 0usize;
+    let mut dissenting: Vec<String> = Vec::new();
+    let mut nodes: Vec<(String, String)> = Vec::new();
+    for (name, info) in guard.iter() {
+        if info.state != NodeState::Joined {
+            continue;
+        }
+        match info.reported_replication {
+            Some(r) if r == replication => agreeing += 1,
+            Some(_) => dissenting.push(name.clone()),
+            None => {}
+        }
+        nodes.push((name.clone(), info.address.clone()));
+    }
+    RosterSnapshot {
+        agreeing,
+        dissenting,
+        nodes,
+    }
+}
+
+/// The `H` ack carrying a roster (issue #61): `A <count> <replication>\n`
+/// then one `<name-len> <addr-len>\n<name><addr>\n` per `Joined` node —
+/// the same entry layout `L` uses, so a node parses it the way an SDK
+/// parses `L`.
+fn build_heartbeat_ack(nodes: &[(String, String)], replication: usize) -> Vec<u8> {
+    let mut ack = format!("A {} {}\n", nodes.len(), replication).into_bytes();
+    for (name, addr) in nodes {
+        ack.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
+        ack.extend_from_slice(name.as_bytes());
+        ack.extend_from_slice(addr.as_bytes());
+        ack.push(b'\n');
+    }
+    ack
+}
+
 async fn sweep_expired(
     registry: Registry,
     current_join: CurrentJoin,
@@ -3047,7 +3123,22 @@ async fn handle_connection(
                     );
                 }
 
-                write_response(&mut stream, b"A\n").await?;
+                // Issue #61: carry the current `Joined` roster so the node
+                // can refresh its own membership view on every heartbeat,
+                // not only on the `M` of a join. Withheld (bare `A\n`)
+                // under the same two conditions `L` refuses with `B\n` —
+                // see the module docs' `H` entry and `roster_snapshot`.
+                let ack = if Instant::now() < config.list_ready_at {
+                    b"A\n".to_vec()
+                } else {
+                    let snapshot = roster_snapshot(&registry, config.replication);
+                    if snapshot.refuse() {
+                        b"A\n".to_vec()
+                    } else {
+                        build_heartbeat_ack(&snapshot.nodes, config.replication)
+                    }
+                };
+                write_response(&mut stream, &ack).await?;
                 continue;
             }
             Ok(DiscoveryCommand::List) => {
@@ -3090,27 +3181,11 @@ async fn handle_connection(
                 // then serve, which would otherwise let a `B\n`-worthy
                 // state be served as a valid `N` list (or vice versa) for
                 // one request.
-                let (agreeing, dissenting, nodes) = {
-                    let guard = lock(&registry);
-                    let mut agreeing = 0usize;
-                    let mut dissenting: Vec<String> = Vec::new();
-                    for (name, info) in guard.iter() {
-                        if info.state != NodeState::Joined {
-                            continue;
-                        }
-                        match info.reported_replication {
-                            Some(r) if r == config.replication => agreeing += 1,
-                            Some(_) => dissenting.push(name.clone()),
-                            None => {}
-                        }
-                    }
-                    let nodes: Vec<(String, String)> = guard
-                        .iter()
-                        .filter(|(_, info)| info.state == NodeState::Joined)
-                        .map(|(name, info)| (name.clone(), info.address.clone()))
-                        .collect();
-                    (agreeing, dissenting, nodes)
-                };
+                let RosterSnapshot {
+                    agreeing,
+                    dissenting,
+                    nodes,
+                } = roster_snapshot(&registry, config.replication);
                 // A tie does not refuse: strictly more dissenters than
                 // agreers is required, so e.g. 1-vs-1 (or 0-vs-0, the
                 // common case) is served.
@@ -3945,7 +4020,7 @@ mod tests {
         // may observe them coalesced into a single read, so accumulate
         // until the expected byte count has arrived instead of assuming
         // read boundaries.
-        let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let expected = b"R\nA 1 2\n6 14\nnode-a127.0.0.1:8356\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -4144,7 +4219,8 @@ mod tests {
             .await
             .unwrap();
 
-        let expected_second = b"A\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let expected_second =
+            b"A 1 2\n6 14\nnode-a127.0.0.1:8356\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received_second = Vec::new();
         while received_second.len() < expected_second.len() {
             let bytes_read = second.read(&mut chunk).await.unwrap();
@@ -4368,7 +4444,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = b"R\nA\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let expected = b"R\nA 1 2\n6 14\nnode-a127.0.0.1:8356\nN 1 2\n6 14\nnode-a127.0.0.1:8356\n";
         let mut received = Vec::new();
         let mut chunk = [0u8; 64];
 
@@ -4642,9 +4718,10 @@ mod tests {
         node.write_all(b"P 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-a")
             .await
             .unwrap();
-        let mut responses = [0u8; 4];
+        let expected = b"R\nA 1 2\n6 14\nnode-a127.0.0.1:8356\n";
+        let mut responses = vec![0u8; expected.len()];
         node.read_exact(&mut responses).await.unwrap();
-        assert_eq!(&responses, b"R\nA\n");
+        assert_eq!(responses, expected);
 
         // A later connection presenting a different token is rejected.
         let (mut attacker, server) = tcp_pair().await;
@@ -5013,6 +5090,90 @@ mod tests {
     /// Boots a registry with node-a Joined (bootstrap join) and node-b
     /// parked in `wait_for_promotion` (Joining, expecting node-a's C).
     /// Returns the client sockets plus the shared state.
+    /// Issue #61 helper: one `Joined` node (`node-a`, promoted straight
+    /// away into an empty registry) on a connection that then carries `H`.
+    async fn joined_node_a(list_ready_at: Instant) -> (TcpStream, Registry) {
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, server_a) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_a),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            current_join,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at,
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_a
+            .write_all(b"J 6 9001 9\nnode-atk-node-a")
+            .await
+            .unwrap();
+        let mut promoted = [0u8; 2];
+        node_a.read_exact(&mut promoted).await.unwrap();
+        assert_eq!(&promoted, b"R\n");
+        // Keep the shutdown sender alive for the connection's lifetime.
+        std::mem::forget(_shutdown_tx);
+        (node_a, registry)
+    }
+
+    async fn read_exactly(stream: &mut TcpStream, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await.unwrap();
+        buf
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_ack_carries_the_joined_roster() {
+        // Issue #61: the ack is `A <count> <r>\n` plus `L`-shaped entries.
+        let (mut node_a, _registry) = joined_node_a(Instant::now()).await;
+        node_a.write_all(b"H 6 2 9\nnode-atk-node-a").await.unwrap();
+        let expected = b"A 1 2\n6 14\nnode-a127.0.0.1:9001\n";
+        let ack = read_exactly(&mut node_a, expected.len()).await;
+        assert_eq!(ack, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_ack_withholds_the_roster_during_the_startup_grace() {
+        // A partial, still-re-filling registry must not be pushed to nodes
+        // (they'd reject keys owned by members that haven't re-announced).
+        let (mut node_a, _registry) =
+            joined_node_a(Instant::now() + Duration::from_secs(3600)).await;
+        node_a.write_all(b"H 6 2 9\nnode-atk-node-a").await.unwrap();
+        let ack = read_exactly(&mut node_a, 2).await;
+        assert_eq!(ack, b"A\n");
+        // Nothing else follows: a second heartbeat's ack is the very next
+        // thing on the wire.
+        node_a.write_all(b"H 6 2 9\nnode-atk-node-a").await.unwrap();
+        let ack = read_exactly(&mut node_a, 2).await;
+        assert_eq!(ack, b"A\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_ack_withholds_the_roster_when_a_majority_disputes_replication() {
+        // Issue #30 applies to the `H` ack exactly as to `L`: the only
+        // voter reports r=3 against this replica's 2, so the roster (and
+        // the disputed r it would embed) is withheld.
+        let (mut node_a, _registry) = joined_node_a(Instant::now()).await;
+        node_a.write_all(b"H 6 3 9\nnode-atk-node-a").await.unwrap();
+        let ack = read_exactly(&mut node_a, 2).await;
+        assert_eq!(ack, b"A\n");
+        // Back in agreement: the roster is served again.
+        node_a.write_all(b"H 6 2 9\nnode-atk-node-a").await.unwrap();
+        let expected = b"A 1 2\n6 14\nnode-a127.0.0.1:9001\n";
+        let ack = read_exactly(&mut node_a, expected.len()).await;
+        assert_eq!(ack, expected);
+    }
+
     async fn registry_with_a_joined_and_b_waiting(
         shutdown_rx: watch::Receiver<bool>,
     ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {

@@ -77,6 +77,10 @@ unreachable.</p>
   triggers the same refresh-and-retry — so writes recover as soon as
   discovery drops the dead node (bounded by the liveness timeout,
   seconds).</li>
+  <li>Every heartbeat acknowledgment carries the current member list, so
+  the surviving nodes' own ring view follows that eviction within one
+  heartbeat interval too — a key re-homed from the dead node is served
+  by its new owner rather than answered <code>W</code>.</li>
 </ul>
 <p>Node identity is a random per-process name, decoupled from the
 network address — routing hashes the name, connections use the address —
