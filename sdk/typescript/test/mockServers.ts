@@ -59,6 +59,9 @@ export interface MockNode extends MockServerBase {
   /** Makes every future `S` reply wait `ms` first — for tests proving a
    * caller isn't blocked on a slow replica leg (fire-and-forget replica writes). */
   delaySets(ms: number): void;
+  /** Makes every future `G` reply wait `ms` first — a slow-but-alive node,
+   * for hedged-read tests (issue #64). */
+  delayGets(ms: number): void;
   /** Makes this node a half-open server from this point on: it still
    * accepts and completes the `A` handshake, and still reads every
    * request frame off the wire (so the TCP stream stays well-formed),
@@ -152,6 +155,7 @@ export async function startMockNode(
   let connections = 0;
   let gets = 0;
   let setDelayMs = 0;
+  let getDelayMs = 0;
   let lastSetTtl = 0;
   let silent = false;
 
@@ -206,61 +210,73 @@ export async function startMockNode(
 
             if (silent) break;
 
-            if (swallowedGets > 0) {
-              swallowedGets--;
-              break;
-            }
+            // Factored out so delayGets (hedged reads, issue #64) can hold
+            // the whole reply — including every special-cased one-off
+            // reply below, same as the Python mock's delay_gets — instead
+            // of only the plain store lookup.
+            const sendGetReply = () => {
+              if (swallowedGets > 0) {
+                swallowedGets--;
+                return;
+              }
 
-            if (wrongTagReplies > 0 && tagged) {
-              wrongTagReplies--;
-              socket.write(`N ${Number(parts[2]) + 1}\n`);
-              break;
-            }
+              if (wrongTagReplies > 0 && tagged) {
+                wrongTagReplies--;
+                socket.write(`N ${Number(parts[2]) + 1}\n`);
+                return;
+              }
 
-            if (malformedValueReplies > 0) {
-              malformedValueReplies--;
-              socket.write("V x\n");
-              break;
-            }
+              if (malformedValueReplies > 0) {
+                malformedValueReplies--;
+                socket.write("V x\n");
+                return;
+              }
 
-            if (unterminatedValueReplies > 0) {
-              unterminatedValueReplies--;
-              socket.write("V");
-              // Stream non-newline bytes so the header never terminates,
-              // simulating a malicious/corrupted server withholding the
-              // LF forever. A well-behaved client must detect and close
-              // the connection long before this safety cap (a few
-              // hundred KB) is reached; the interval also stops itself
-              // once the socket is gone.
-              const interval = setInterval(() => {
-                if (socket.destroyed || unterminatedBytesSent > 512 * 1024) {
-                  clearInterval(interval);
-                  return;
-                }
-                const filler = Buffer.alloc(1024, 0x39 /* '9' */);
-                unterminatedBytesSent += filler.length;
-                socket.write(filler);
-              }, 1);
-              break;
-            }
+              if (unterminatedValueReplies > 0) {
+                unterminatedValueReplies--;
+                socket.write("V");
+                // Stream non-newline bytes so the header never terminates,
+                // simulating a malicious/corrupted server withholding the
+                // LF forever. A well-behaved client must detect and close
+                // the connection long before this safety cap (a few
+                // hundred KB) is reached; the interval also stops itself
+                // once the socket is gone.
+                const interval = setInterval(() => {
+                  if (socket.destroyed || unterminatedBytesSent > 512 * 1024) {
+                    clearInterval(interval);
+                    return;
+                  }
+                  const filler = Buffer.alloc(1024, 0x39 /* '9' */);
+                  unterminatedBytesSent += filler.length;
+                  socket.write(filler);
+                }, 1);
+                return;
+              }
 
-            if (storedToGetReplies > 0) {
-              storedToGetReplies--;
-              socket.write(`S${tag}\n`);
-              break;
-            }
+              if (storedToGetReplies > 0) {
+                storedToGetReplies--;
+                socket.write(`S${tag}\n`);
+                return;
+              }
 
-            if (wrongNodeReplies > 0) {
-              wrongNodeReplies--;
-              socket.write(`W${tag}\n`);
-              break;
-            }
+              if (wrongNodeReplies > 0) {
+                wrongNodeReplies--;
+                socket.write(`W${tag}\n`);
+                return;
+              }
 
-            const value = store.get(key);
-            if (value === undefined) {
-              socket.write(`N${tag}\n`);
+              const value = store.get(key);
+              if (value === undefined) {
+                socket.write(`N${tag}\n`);
+              } else {
+                socket.write(Buffer.concat([Buffer.from(`V ${value.length}${tag}\n`), value]));
+              }
+            };
+
+            if (getDelayMs > 0) {
+              setTimeout(sendGetReply, getDelayMs);
             } else {
-              socket.write(Buffer.concat([Buffer.from(`V ${value.length}${tag}\n`), value]));
+              sendGetReply();
             }
             break;
           }
@@ -365,6 +381,9 @@ export async function startMockNode(
     },
     delaySets: (ms) => {
       setDelayMs = ms;
+    },
+    delayGets: (ms) => {
+      getDelayMs = ms;
     },
     goSilentAfterHandshake: () => {
       silent = true;
