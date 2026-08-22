@@ -127,7 +127,10 @@ shared storage:</p>
   keeps handoffs simple.</li>
   <li>A restarted replica answers <code>B</code> (busy) during a startup
   grace while live members re-announce, so clients never bootstrap from
-  a half-recovered list; SDKs skip a busy replica like a dead one.</li>
+  a half-recovered list; SDKs skip a busy replica like a dead one. A
+  join requested during that grace is held until it ends, for the same
+  reason: its handoff must come from every member, not from the few
+  that have re-announced so far.</li>
 </ul>
 <p>Pair this with a supervisor that restarts a dead replica (systemd,
 Kubernetes) and two replicas make discovery effectively always

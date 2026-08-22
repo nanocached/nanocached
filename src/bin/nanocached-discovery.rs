@@ -1397,11 +1397,26 @@ async fn try_begin_next_join(
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     replication: usize,
+    joins_ready_at: Instant,
 ) {
     // Scoped to a block, not just an explicit `drop()`, so `join_guard`
     // (a std::sync::MutexGuard, not Send) is unambiguously out of scope
     // before the awaits below — required for this (and everything that
     // calls it) to remain a Send future, which `tokio::spawn` needs.
+    // Issue #63: not during the startup grace (discovery HA). Right after
+    // a restart the registry is still re-filling from `P` announces, and
+    // a join orchestrated against that partial roster hands off from
+    // only the members that have re-announced so far — every key the
+    // joiner now owns that lives on a later-announcing member is
+    // stranded there (1,706/20,000 observed at R=2; with an empty
+    // registry the joiner is simply promoted with no handoff at all).
+    // `L` is refused for exactly this reason; a `J` is accepted but held
+    // in `Waiting` until the grace has passed, and `sweep_expired` calls
+    // back here to start it then.
+    if Instant::now() < joins_ready_at {
+        return;
+    }
+
     let (name, joining_addr, joined, ready_tokens) = {
         let mut join_guard = lock_current_join(current_join);
 
@@ -1889,6 +1904,7 @@ async fn start_join(
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     replication: usize,
+    joins_ready_at: Instant,
     name: &str,
     address: String,
     token: String,
@@ -2023,6 +2039,7 @@ async fn start_join(
         auth_secret,
         tls_connector,
         replication,
+        joins_ready_at,
     )
     .await;
 
@@ -2039,6 +2056,7 @@ async fn handle_complete(
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     replication: usize,
+    joins_ready_at: Instant,
     reporting_name: &str,
     for_joining_name: &str,
     token: &str,
@@ -2110,6 +2128,7 @@ async fn handle_complete(
         auth_secret,
         tls_connector,
         replication,
+        joins_ready_at,
     )
     .await;
 }
@@ -2150,12 +2169,14 @@ async fn handle_complete(
 /// reaped just for being large; abandoning here too would bypass that
 /// grace entirely and reintroduce the flat-timeout failure mode the
 /// size-derived design replaced.
+#[allow(clippy::too_many_arguments)]
 async fn on_node_connection_ended(
     registry: &Registry,
     current_join: &CurrentJoin,
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     replication: usize,
+    joins_ready_at: Instant,
     name: &str,
     connection_id: u64,
 ) {
@@ -2200,6 +2221,7 @@ async fn on_node_connection_ended(
             auth_secret,
             tls_connector,
             replication,
+            joins_ready_at,
             "joining node disconnected",
         )
         .await;
@@ -2220,6 +2242,7 @@ async fn abandon_current_join(
     auth_secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
     replication: usize,
+    joins_ready_at: Instant,
     reason: &str,
 ) {
     let Some(pending) = lock_current_join(current_join).take() else {
@@ -2294,6 +2317,7 @@ async fn abandon_current_join(
         auth_secret,
         tls_connector,
         replication,
+        joins_ready_at,
     )
     .await;
 }
@@ -2431,9 +2455,12 @@ async fn run(
     // by every connection via `ConnectionConfig`, for the life of the
     // process.
     let announce_limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
+    // Discovery HA startup grace: `L` is refused until then, and — issue
+    // #63 — so is starting a join, see `try_begin_next_join`.
+    let list_ready_at = Instant::now() + startup_grace;
     let connection_config = ConnectionConfig {
         idle_timeout: IDLE_TIMEOUT,
-        list_ready_at: Instant::now() + startup_grace,
+        list_ready_at,
         replication,
         auth_secret: auth_secret.clone(),
         tls_acceptor,
@@ -2452,6 +2479,7 @@ async fn run(
         auth_secret,
         tls_connector,
         replication,
+        list_ready_at,
         liveness_timeout,
         shutdown_rx.clone(),
     ));
@@ -2740,6 +2768,7 @@ fn dispatch_connection(
                 &config.auth_secret,
                 &config.tls_connector,
                 config.replication,
+                config.list_ready_at,
                 &name,
                 connection_id,
             )
@@ -2808,12 +2837,14 @@ fn build_heartbeat_ack(nodes: &[(String, String)], replication: usize) -> Vec<u8
     ack
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sweep_expired(
     registry: Registry,
     current_join: CurrentJoin,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     replication: usize,
+    joins_ready_at: Instant,
     liveness_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -2821,6 +2852,7 @@ async fn sweep_expired(
         .min(Duration::from_secs(1))
         .max(Duration::from_millis(1));
     let mut ticker = interval(sweep_interval);
+    let mut grace_joins_kicked = false;
 
     loop {
         tokio::select! {
@@ -2897,6 +2929,7 @@ async fn sweep_expired(
                         &auth_secret,
                         &tls_connector,
                         replication,
+                        joins_ready_at,
                         "ready member evicted mid-join",
                     )
                     .await;
@@ -2926,7 +2959,27 @@ async fn sweep_expired(
                     });
 
                 if timed_out {
-                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication, "migration timeout").await;
+                    abandon_current_join(&registry, &current_join, &auth_secret, &tls_connector, replication, joins_ready_at, "migration timeout").await;
+                }
+
+                // Issue #63: a `J` accepted during the startup grace was
+                // parked in `Waiting` (see `try_begin_next_join`); nothing
+                // event-driven starts it once the grace ends, so the
+                // first tick past the grace does — once; from then on
+                // joins are started by `J`/`C`/abandon exactly as before.
+                // (No join can have started during the grace, so there's
+                // nothing for this one call to collide with.)
+                if !grace_joins_kicked && Instant::now() >= joins_ready_at {
+                    grace_joins_kicked = true;
+                    try_begin_next_join(
+                        &registry,
+                        &current_join,
+                        &auth_secret,
+                        &tls_connector,
+                        replication,
+                        joins_ready_at,
+                    )
+                    .await;
                 }
             }
             _ = shutdown_rx.changed() => return,
@@ -3243,6 +3296,7 @@ async fn handle_connection(
                     &config.auth_secret,
                     &config.tls_connector,
                     config.replication,
+                    config.list_ready_at,
                     &name,
                     addr,
                     token,
@@ -3438,6 +3492,7 @@ async fn handle_connection(
                     &config.auth_secret,
                     &config.tls_connector,
                     config.replication,
+                    config.list_ready_at,
                     &name,
                     &joining_name,
                     &token,
@@ -4775,6 +4830,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "joining-node",
             "127.0.0.1:9999".to_string(),
             "tk-joining-node".to_string(),
@@ -4819,6 +4875,7 @@ mod tests {
                 &None,
                 &None,
                 2,
+                Instant::now(),
                 &format!("attacker-{i}"),
                 "10.0.0.1:9000".to_string(),
                 format!("tk-attacker-{i}"),
@@ -4834,6 +4891,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "attacker-overflow",
             "10.0.0.1:9000".to_string(),
             "tk-attacker-overflow".to_string(),
@@ -4852,6 +4910,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "legit-node",
             "10.0.0.2:9000".to_string(),
             "tk-legit-node".to_string(),
@@ -4873,6 +4932,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "attacker-0",
             "10.0.0.1:9000".to_string(),
             "tk-attacker-0".to_string(),
@@ -4923,6 +4983,7 @@ mod tests {
                     &None,
                     &None,
                     2,
+                    Instant::now(),
                     &format!("node-{source}-{slot}"),
                     format!("10.0.{source}.1:9000"),
                     format!("tk-node-{source}-{slot}"),
@@ -4947,6 +5008,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "overflow-node",
             "10.99.0.1:9000".to_string(),
             "tk-overflow-node".to_string(),
@@ -4968,6 +5030,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "node-0-0",
             "10.0.0.1:9000".to_string(),
             "tk-node-0-0".to_string(),
@@ -5090,8 +5153,125 @@ mod tests {
     /// Boots a registry with node-a Joined (bootstrap join) and node-b
     /// parked in `wait_for_promotion` (Joining, expecting node-a's C).
     /// Returns the client sockets plus the shared state.
-    /// Issue #61 helper: one `Joined` node (`node-a`, promoted straight
-    /// away into an empty registry) on a connection that then carries `H`.
+    /// Issue #63: spawns a discovery-side connection for `stream` whose
+    /// startup grace ends at `list_ready_at`.
+    fn spawn_grace_connection(
+        server: TcpStream,
+        registry: &Registry,
+        current_join: &CurrentJoin,
+        list_ready_at: Instant,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(registry),
+            Arc::clone(current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at,
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_during_the_startup_grace_waits_for_the_members_to_re_announce() {
+        // Issue #63: after a restart, a `J` must not be orchestrated
+        // against the partial registry. Here the registry is empty when
+        // the `J` arrives — before this fix the joiner was promoted on
+        // the spot with no handoff at all. node-a re-announces during
+        // the grace; once the grace ends the join starts, and it starts
+        // from node-a.
+        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let grace = Duration::from_millis(400);
+        let list_ready_at = Instant::now() + grace;
+
+        let _sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            list_ready_at,
+            Duration::from_secs(1),
+            shutdown_rx.clone(),
+        ));
+
+        let (mut joiner, server) = tcp_pair().await;
+        spawn_grace_connection(
+            server,
+            &registry,
+            &current_join,
+            list_ready_at,
+            shutdown_rx.clone(),
+        );
+        joiner
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
+
+        // Held: no promotion, no join, while the grace is running.
+        let mut promoted = [0u8; 2];
+        assert!(
+            timeout(Duration::from_millis(150), joiner.read_exact(&mut promoted))
+                .await
+                .is_err(),
+            "a J during the grace must not be promoted"
+        );
+        assert!(lock_current_join(&current_join).is_none());
+        assert_eq!(lock(&registry)["node-b"].state, NodeState::Waiting);
+
+        // A member re-announcing during the grace, as after a restart.
+        let (mut member, server) = tcp_pair().await;
+        spawn_grace_connection(
+            server,
+            &registry,
+            &current_join,
+            list_ready_at,
+            shutdown_rx.clone(),
+        );
+        member
+            .write_all(b"P 6 9001 9\nnode-atk-node-a")
+            .await
+            .unwrap();
+        let mut announced = [0u8; 2];
+        member.read_exact(&mut announced).await.unwrap();
+        assert_eq!(&announced, b"R\n");
+
+        // Grace over: the sweep ticker starts the join — from node-a.
+        let mut started = false;
+        for _ in 0..100 {
+            if let Some(pending) = lock_current_join(&current_join).as_ref() {
+                assert_eq!(pending.joining_name, "node-b");
+                assert!(
+                    pending.expected.contains_key("node-a"),
+                    "the handoff must come from the member that re-announced"
+                );
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started, "the join must start once the grace has ended");
+        assert!(
+            Instant::now() >= list_ready_at,
+            "the join must not have started before the grace ended"
+        );
+    }
+
+    /// Issue #61 helper: one `Joined` node (`node-a`, announced with `P`,
+    /// which upserts straight to `Joined` — a `J` would be held back
+    /// during the grace, issue #63) on a connection that then carries
+    /// `H`.
     async fn joined_node_a(list_ready_at: Instant) -> (TcpStream, Registry) {
         let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
@@ -5115,7 +5295,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None)),
         ));
         node_a
-            .write_all(b"J 6 9001 9\nnode-atk-node-a")
+            .write_all(b"P 6 9001 9\nnode-atk-node-a")
             .await
             .unwrap();
         let mut promoted = [0u8; 2];
@@ -5249,7 +5429,16 @@ mod tests {
             tuple
         };
 
-        abandon_current_join(&registry, &current_join, &None, &None, 2, "test").await;
+        abandon_current_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "test",
+        )
+        .await;
 
         // node-b's connection must observe the abandonment promptly.
         let mut byte = [0u8; 1];
@@ -5420,6 +5609,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "node-b",
             stale_id,
         )
@@ -5447,6 +5637,7 @@ mod tests {
             &None,
             &None,
             2,
+            Instant::now(),
             "node-b",
             owning_id,
         )
@@ -5670,6 +5861,7 @@ mod tests {
             None,
             None,
             2,
+            Instant::now(),
             Duration::from_secs(1),
             shutdown_rx,
         ));
@@ -6645,6 +6837,7 @@ mod tests {
             None,
             None,
             2,
+            Instant::now(),
             Duration::from_secs(1),
             shutdown_rx,
         ));
@@ -6687,6 +6880,10 @@ mod tests {
             None,
             None,
             2,
+            // Far in the future: this test is about the bounded wait, not
+            // join orchestration — the post-grace kick (issue #63) would
+            // otherwise promote this lone Waiting entry.
+            Instant::now() + Duration::from_secs(365 * 86_400),
             Duration::from_secs(60),
             shutdown_rx,
         ));
@@ -7246,7 +7443,17 @@ mod tests {
         // matching connection id for a `NodeInfo` built directly by
         // `NodeInfo::new` rather than through `start_join` (see
         // `NodeInfo::owner_connection_id`'s doc comment).
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-a", 0).await;
+        on_node_connection_ended(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-a",
+            0,
+        )
+        .await;
 
         assert!(
             lock_current_join(&current_join).is_some(),
@@ -7308,7 +7515,17 @@ mod tests {
         // promoted (staged node join pattern: the joining node dies mid-handoff).
         // `0` matches the connection id `NodeInfo::new` defaults to for an
         // entry built directly rather than through `start_join`.
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 0).await;
+        on_node_connection_ended(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-b",
+            0,
+        )
+        .await;
 
         ready_task.await.unwrap();
 
@@ -7377,7 +7594,17 @@ mod tests {
 
         // The OLD connection (id 1, no longer the recorded owner) reports
         // its own end — this must be a complete no-op.
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 1).await;
+        on_node_connection_ended(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-b",
+            1,
+        )
+        .await;
 
         assert!(
             lock_current_join(&current_join).is_some(),
@@ -7396,7 +7623,17 @@ mod tests {
         // The CURRENT owner (connection id 2) later ending for real still
         // abandons the join normally — the fix only changes behavior for
         // a non-owning connection.
-        on_node_connection_ended(&registry, &current_join, &None, &None, 2, "node-b", 2).await;
+        on_node_connection_ended(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "node-b",
+            2,
+        )
+        .await;
         ready_task.await.unwrap();
         assert!(lock_current_join(&current_join).is_none());
         assert!(!lock(&registry).contains_key("node-b"));
@@ -7445,6 +7682,7 @@ mod tests {
             None,
             None,
             2,
+            Instant::now(),
             Duration::from_secs(60),
             shutdown_rx,
         ));
@@ -7501,6 +7739,7 @@ mod tests {
             None,
             None,
             2,
+            Instant::now(),
             // Well above the advance below, so node-a's own liveness
             // eviction (and the mid-join-eviction abandon it would now
             // trigger, issue #34) doesn't confound what this test is
