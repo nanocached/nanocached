@@ -1875,6 +1875,104 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
+    """Issue #67: connect() must tolerate a node that discovery still lists
+    but that can't be reached (dead, not yet evicted), the way steady-state
+    requests already do — and fail only when no node is reachable."""
+
+    async def start_cluster(self, dead: set[str]):
+        nodes = {}
+        entries = []
+        for name in NAMES:
+            if name in dead:
+                entries.append((name, f"127.0.0.1:{await unused_port()}"))
+            else:
+                node = await MockNode().start()
+                nodes[name] = node
+                entries.append((name, node.address))
+        discovery = await MockDiscovery(entries, replication=2).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    def key_with_primary(self, name: str) -> str:
+        for i in range(1000):
+            key = f"key-{i}"
+            if self.owners_of(key)[0] == name:
+                return key
+        raise AssertionError("no key routes to " + name)
+
+    async def test_connect_succeeds_with_one_unreachable_node(self):
+        dead, live = NAMES[0], NAMES[1]
+        nodes, discovery = await self.start_cluster({dead})
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=0.05
+            )
+            try:
+                self.assertEqual(client.replication, 2)
+                self.assertIsNone(client._members[dead].connection)
+                self.assertIsNotNone(client._members[live].connection)
+
+                # A key whose primary is alive: the write lands, the dead
+                # replica leg is swallowed and counted, the read hits.
+                key = self.key_with_primary(live)
+                await client.set(key, "v")
+                self.assertEqual(await client.get(key), "v")
+                self.assertEqual(client.stats().replica_write_failures, 1)
+
+                # A key whose primary is the dead node: the read fails over
+                # to the live replica right away (cooldown, no dial).
+                other = self.key_with_primary(dead)
+                nodes[live].store[other.encode()] = b"replica copy"
+                start = asyncio.get_running_loop().time()
+                self.assertEqual(await client.get(other), "replica copy")
+                self.assertLess(asyncio.get_running_loop().time() - start, 0.5)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_connect_fails_only_when_every_node_is_unreachable(self):
+        nodes, discovery = await self.start_cluster(set(NAMES))
+        try:
+            with self.assertRaises((ConnectionError, OSError)):
+                await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_an_unreachable_node_is_redialed_once_the_cooldown_has_passed(self):
+        dead, live = NAMES[0], NAMES[1]
+        nodes, discovery = await self.start_cluster({dead})
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=0.05
+            )
+            try:
+                # Bring the "dead" node up on the address discovery listed.
+                dead_address = client._members[dead].address
+                host, port = dead_address.rsplit(":", 1)
+                revived = await MockNode().start(port=int(port))
+                nodes[dead] = revived
+                await asyncio.sleep(0.1)
+
+                key = self.key_with_primary(dead)
+                await client.set(key, "v")
+                self.assertIn(key.encode(), revived.store)
+                self.assertIsNotNone(client._members[dead].connection)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
 class StatsTests(unittest.IsolatedAsyncioTestCase):
     # stats()/ClientStats: observability for failures swallowed by design
     # (client-side replication / fire-and-forget replica writes / read repair).
