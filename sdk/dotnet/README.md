@@ -154,6 +154,13 @@ healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently (all
 operations are idempotent).
 
+`ConnectAsync` itself tolerates a node that discovery still lists but
+that can't be reached — typically one that just died and hasn't been
+evicted yet (a window of seconds): the node is kept in the ring without a
+connection, requests for its keys fail over per request exactly as they
+would after a mid-life death, and it is redialed after the cooldown. Only
+a cluster with no reachable node at all fails `ConnectAsync`.
+
 An address whose redial just failed is treated as still down for
 `ReconnectCooldown` (default 1 second): requests routed to it during that
 window fail immediately with the original dial error instead of each
