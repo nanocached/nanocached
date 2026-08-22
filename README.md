@@ -71,7 +71,14 @@ cargo run --bin nanocached-node -- --port 8356 --discovery 127.0.0.1:8357
 The node sends a heartbeat every 5 seconds; the discovery server derives
 the node's reachable address from that connection's own source IP plus
 the node's port (addresses derived from the registration connection), so containerized deployments need
-no address configuration. Omit `--discovery` to run standalone.
+no address configuration. Each heartbeat is acknowledged with the
+discovery server's current member list, so a node's own view of the
+ring — what it uses to answer `W` for keys it doesn't own — follows
+evictions within one heartbeat interval, not only joins. (This makes the
+heartbeat acknowledgment longer than the bare `A` that nodes before
+v0.3.0 expect: when upgrading a cluster, upgrade nodes before discovery
+servers — a new node accepts either form, an old node redials on every
+heartbeat when given the new one.) Omit `--discovery` to run standalone.
 (Asymmetric port mapping — e.g. Docker's `-p 9999:8356` — is
 unsupported: it is NAT, which the cluster design already excludes.)
 

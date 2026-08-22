@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
@@ -353,8 +353,11 @@ struct NodeContext {
     /// joining node that may not even be promoted yet. Runs for every
     /// `M`, whether or not any of this node's own keys route to the
     /// joiner, so it stays current with joins elsewhere in the cluster
-    /// too. `None` until this node's first successful handoff — a lone
-    /// or freshly-bootstrapped node has no membership to reject against
+    /// too. Also refreshed from the roster the primary discovery server
+    /// returns with every heartbeat ack (issue #61, `adopt_membership`),
+    /// which is how it follows liveness *evictions* — `M` only ever
+    /// carries joins. `None` until the first of either — a lone or
+    /// freshly-bootstrapped node has no membership to reject against
     /// yet.
     known_ring: KnownRing,
     auth_secret: Option<Bytes>,
@@ -508,6 +511,7 @@ pub(crate) async fn run(
             node_context.name.clone(),
             node_context.token.clone(),
             Arc::clone(&known_ring),
+            Arc::clone(&active_migration),
             shutdown_rx.clone(),
         ))),
         _ => None,
@@ -1424,6 +1428,7 @@ async fn send_heartbeats(
     name: String,
     token: String,
     known_ring: KnownRing,
+    active_migration: Arc<Mutex<Option<ActiveMigration>>>,
     shutdown_rx: watch::Receiver<bool>,
 ) {
     let (promoted_tx, promoted_rx) = watch::channel(false);
@@ -1446,6 +1451,7 @@ async fn send_heartbeats(
             name.clone(),
             token.clone(),
             Arc::clone(&known_ring),
+            Arc::clone(&active_migration),
             role,
             shutdown_rx.clone(),
         ));
@@ -1469,6 +1475,7 @@ async fn register_with_discovery(
     name: String,
     token: String,
     known_ring: KnownRing,
+    active_migration: Arc<Mutex<Option<ActiveMigration>>>,
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -1508,7 +1515,11 @@ async fn register_with_discovery(
         };
 
         match connected {
-            Ok(mut stream) => {
+            Ok(stream) => {
+                // Buffered for the heartbeat ack's line-oriented roster
+                // (issue #61, `read_heartbeat_ack`); writes pass straight
+                // through.
+                let mut stream = tokio::io::BufReader::new(stream);
                 let authenticated = match &auth_secret {
                     Some(secret) => {
                         let auth = auth_message(secret);
@@ -1591,14 +1602,31 @@ async fn register_with_discovery(
                             // socket-open, blackholed route) would hang
                             // this loop forever instead of falling through
                             // to the redial below.
-                            let mut ack = [0u8; 2];
                             let read_ack = tokio::select! {
                                 _ = shutdown_rx.changed() => return,
-                                result = timeout(OUTBOUND_IO_TIMEOUT, stream.read_exact(&mut ack)) => result,
+                                result = timeout(OUTBOUND_IO_TIMEOUT, read_heartbeat_ack(&mut stream)) => result,
                             };
 
-                            if !matches!(read_ack, Ok(Ok(_))) || &ack != b"A\n" {
-                                break;
+                            let roster = match read_ack {
+                                Ok(Ok(roster)) => roster,
+                                _ => break,
+                            };
+
+                            // Issue #61: only the primary's view is
+                            // adopted — replicas never reconcile with each
+                            // other (discovery HA), and flip-flopping
+                            // between two replicas' views would be worse
+                            // than either.
+                            if let Some((members, replication)) = roster
+                                && matches!(role, DiscoveryRole::Primary(_))
+                            {
+                                adopt_membership(
+                                    &known_ring,
+                                    &active_migration,
+                                    &discovery_addr,
+                                    members,
+                                    replication,
+                                );
                             }
 
                             if wait_or_shutdown(interval, &mut shutdown_rx).await {
@@ -1619,6 +1647,154 @@ async fn register_with_discovery(
             return;
         }
     }
+}
+
+/// Upper bounds on what a heartbeat ack's roster (issue #61) may claim,
+/// so a misbehaving discovery server can't make this node allocate
+/// without bound: mirror `nanocached-discovery`'s own `MAX_REGISTRY_SIZE`
+/// and `MAX_REQUEST_SIZE` (the two binaries share no modules by design).
+const MAX_ROSTER_ENTRIES: usize = 1 << 16;
+const MAX_ROSTER_FIELD_LEN: usize = 4096;
+
+/// Reads one heartbeat ack. A bare `A\n` means "no membership update"
+/// (the discovery server is in its startup grace, or its replication
+/// factor is disputed — see the `H` entry in `nanocached-discovery`'s
+/// module docs); `A <count> <replication>\n` is followed by `count`
+/// `<name-len> <addr-len>\n<name><addr>\n` entries — the current `Joined`
+/// roster — returned as `Some((names, replication))`. Anything else is an
+/// error, on which the caller redials. Addresses are parsed but dropped:
+/// this node only needs names to build a ring.
+async fn read_heartbeat_ack<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+) -> io::Result<Option<(Vec<String>, usize)>> {
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed heartbeat ack");
+
+    let mut line = Vec::new();
+    stream.read_until(b'\n', &mut line).await?;
+    if line == b"A\n" {
+        return Ok(None);
+    }
+    let header = line
+        .strip_prefix(b"A ")
+        .and_then(|rest| rest.strip_suffix(b"\n"))
+        .and_then(|rest| std::str::from_utf8(rest).ok())
+        .ok_or_else(malformed)?;
+    let mut fields = header.split(' ');
+    let count: usize = fields
+        .next()
+        .and_then(|raw| raw.parse().ok())
+        .filter(|count| *count <= MAX_ROSTER_ENTRIES)
+        .ok_or_else(malformed)?;
+    let replication: usize = fields
+        .next()
+        .and_then(|raw| raw.parse().ok())
+        .filter(|replication| *replication >= 1)
+        .ok_or_else(malformed)?;
+    if fields.next().is_some() {
+        return Err(malformed());
+    }
+
+    let mut names = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        line.clear();
+        stream.read_until(b'\n', &mut line).await?;
+        let entry = line
+            .strip_suffix(b"\n")
+            .and_then(|rest| std::str::from_utf8(rest).ok())
+            .ok_or_else(malformed)?;
+        let mut lengths = entry.split(' ');
+        let name_len: usize = lengths
+            .next()
+            .and_then(|raw| raw.parse().ok())
+            .filter(|len| *len <= MAX_ROSTER_FIELD_LEN)
+            .ok_or_else(malformed)?;
+        let addr_len: usize = lengths
+            .next()
+            .and_then(|raw| raw.parse().ok())
+            .filter(|len| *len <= MAX_ROSTER_FIELD_LEN)
+            .ok_or_else(malformed)?;
+        if lengths.next().is_some() {
+            return Err(malformed());
+        }
+        // `<name><addr>\n`
+        let mut body = vec![0u8; name_len + addr_len + 1];
+        stream.read_exact(&mut body).await?;
+        if body[name_len + addr_len] != b'\n' {
+            return Err(malformed());
+        }
+        let name = std::str::from_utf8(&body[..name_len]).map_err(|_| malformed())?;
+        names.push(name.to_string());
+    }
+
+    Ok(Some((names, replication)))
+}
+
+/// Issue #61: replaces this node's membership belief with the roster its
+/// primary discovery server just reported, if it differs. Until this, a
+/// node's `known_ring` changed only when it finished a join handoff (`M`),
+/// so after a liveness eviction every survivor kept the dead node in its
+/// ring: keys that had re-homed to a survivor were answered `W` there
+/// (R=1: every client error, permanently, until the next join), and with
+/// R>1 writes quietly ran one copy short.
+///
+/// Skipped while a handoff this node is running is in flight or still
+/// forwarding writes (`migration_target_for`'s window) AND the roster
+/// doesn't list that handoff's joiner yet: discovery's roster is `Joined`
+/// nodes only, so until every source has reported `C` it lacks a joiner
+/// this node's `after_ring` already includes, and reverting to the
+/// pre-join ring for that gap would only flap. Once the roster names the
+/// joiner the join is over from discovery's view and the roster is
+/// authoritative again — the forwarding window outlives the join by
+/// `forwarding_grace` (a minute or more), and an eviction landing inside
+/// it must not be ignored for that long. An abandoned join (`X`) clears
+/// the slot; and if that `X` was lost, the window is bounded regardless.
+fn adopt_membership(
+    known_ring: &KnownRing,
+    active_migration: &Arc<Mutex<Option<ActiveMigration>>>,
+    discovery_addr: &str,
+    mut members: Vec<String>,
+    replication: usize,
+) {
+    let join_still_pending = active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .is_some_and(|active| {
+            let slot_live = active
+                .completed_at
+                .is_none_or(|completed_at| completed_at.elapsed() < active.forwarding_grace);
+            slot_live && !members.contains(&active.joining_name)
+        });
+    if join_still_pending {
+        return;
+    }
+
+    members.sort_unstable();
+    members.dedup();
+
+    let mut guard = known_ring
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let unchanged = guard.as_ref().is_some_and(|current| {
+        current.replication == replication && {
+            let mut known: Vec<&String> = current.ring.nodes().iter().collect();
+            known.sort_unstable();
+            known.len() == members.len() && known.iter().zip(&members).all(|(a, b)| *a == b)
+        }
+    });
+    if unchanged {
+        return;
+    }
+
+    println!(
+        "INFO membership updated from discovery at {discovery_addr}: {} member(s), \
+         replication factor {replication}",
+        members.len()
+    );
+    *guard = Some(Arc::new(Membership {
+        ring: Arc::new(HashRing::new(members)),
+        replication,
+    }));
 }
 
 /// Waits for `duration`, or returns `true` early if shutdown is signaled.
@@ -5259,6 +5435,7 @@ mod tests {
             "test-node".to_string(),
             "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         )
         .await;
@@ -5312,6 +5489,7 @@ mod tests {
             "test-node".to_string(),
             "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -5322,6 +5500,273 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    fn test_active_migration(completed_at: Option<Instant>) -> ActiveMigration {
+        ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "test-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            completed_at,
+            forwarding_grace: forwarding_grace(0),
+            acked_entries: Some(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    fn member_names(known_ring: &KnownRing) -> Option<(Vec<String>, usize)> {
+        known_ring.lock().unwrap().as_ref().map(|membership| {
+            let mut names = membership.ring.nodes().to_vec();
+            names.sort_unstable();
+            (names, membership.replication)
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_heartbeat_ack_parses_a_bare_ack_and_a_roster() {
+        // Issue #61 wire shapes: bare `A\n` = no update; `A <n> <r>\n`
+        // + `L`-shaped entries = the current roster.
+        let bare: &[u8] = b"A\n";
+        let mut stream = tokio::io::BufReader::new(bare);
+        assert!(read_heartbeat_ack(&mut stream).await.unwrap().is_none());
+
+        let roster: &[u8] = b"A 2 3\n6 14\nnode-a127.0.0.1:9001\n6 14\nnode-b127.0.0.1:9002\nA\n";
+        let mut stream = tokio::io::BufReader::new(roster);
+        assert_eq!(
+            read_heartbeat_ack(&mut stream).await.unwrap(),
+            Some((vec!["node-a".to_string(), "node-b".to_string()], 3))
+        );
+        // Consumed exactly the roster: the next ack is still readable.
+        assert!(read_heartbeat_ack(&mut stream).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_heartbeat_ack_rejects_malformed_acks() {
+        for malformed in [
+            &b"B\n"[..],
+            b"A 1\n",
+            b"A 1 0\n6 14\nnode-a127.0.0.1:9001\n",
+            b"A 1 2\n6 14\nnode-a127.0.0.1:9001X",
+            b"A 1 2\n6 14 7\nnode-a127.0.0.1:9001\n",
+            b"A 99999999 2\n",
+            b"A 1 2\n99999 14\n",
+        ] {
+            let mut stream = tokio::io::BufReader::new(malformed);
+            assert!(
+                read_heartbeat_ack(&mut stream).await.is_err(),
+                "{malformed:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn adopt_membership_sets_and_replaces_the_belief_only_when_it_changes() {
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+
+        // First roster: from no belief to one.
+        adopt_membership(
+            &known_ring,
+            &slot,
+            "d",
+            vec!["test-node".to_string(), "node-b".to_string()],
+            2,
+        );
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["node-b".to_string(), "test-node".to_string()], 2))
+        );
+        let first = Arc::clone(known_ring.lock().unwrap().as_ref().unwrap());
+
+        // Same members in another order: no churn (same `Arc`).
+        adopt_membership(
+            &known_ring,
+            &slot,
+            "d",
+            vec!["node-b".to_string(), "test-node".to_string()],
+            2,
+        );
+        assert!(Arc::ptr_eq(
+            &first,
+            known_ring.lock().unwrap().as_ref().unwrap()
+        ));
+
+        // node-b evicted: the belief shrinks — the #61 fix proper.
+        adopt_membership(&known_ring, &slot, "d", vec!["test-node".to_string()], 2);
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["test-node".to_string()], 2))
+        );
+
+        // A different replication factor alone is a change too.
+        adopt_membership(&known_ring, &slot, "d", vec!["test-node".to_string()], 3);
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["test-node".to_string()], 3))
+        );
+    }
+
+    #[test]
+    fn adopt_membership_waits_only_while_the_join_is_still_pending() {
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+
+        // In flight (not completed): skipped.
+        *slot.lock().unwrap() = Some(test_active_migration(None));
+        adopt_membership(&known_ring, &slot, "d", vec!["test-node".to_string()], 2);
+        assert!(known_ring.lock().unwrap().is_none());
+
+        // Completed but still forwarding writes, roster without the
+        // joiner (the join itself hasn't completed): skipped.
+        *slot.lock().unwrap() = Some(test_active_migration(Some(Instant::now())));
+        adopt_membership(&known_ring, &slot, "d", vec!["test-node".to_string()], 2);
+        assert!(known_ring.lock().unwrap().is_none());
+
+        // Still forwarding, but the roster now lists the joiner (the join
+        // completed) and is missing a member (evicted): applied — the
+        // forwarding window must not delay an eviction (issue #61).
+        adopt_membership(
+            &known_ring,
+            &slot,
+            "d",
+            vec!["joiner-0".to_string(), "test-node".to_string()],
+            2,
+        );
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["joiner-0".to_string(), "test-node".to_string()], 2))
+        );
+        *known_ring.lock().unwrap() = None;
+
+        // Forwarding grace elapsed (a stale slot no request has lazily
+        // cleared yet): applied.
+        *slot.lock().unwrap() = Some(test_active_migration(Some(
+            Instant::now() - forwarding_grace(0) - Duration::from_secs(1),
+        )));
+        adopt_membership(&known_ring, &slot, "d", vec!["test-node".to_string()], 2);
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["test-node".to_string()], 2))
+        );
+    }
+
+    /// A fake discovery server that answers the registration with `R\n`
+    /// and every heartbeat with `ack`, returning everything it received.
+    fn fake_discovery_acking_with(
+        listener: TcpListener,
+        ack: &'static [u8],
+    ) -> Arc<std::sync::Mutex<Vec<Vec<u8>>>> {
+        let received: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&received);
+        tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 128];
+            let mut first = true;
+            loop {
+                match connection.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(bytes_read) => {
+                        sink.lock().unwrap().push(buffer[..bytes_read].to_vec());
+                        let reply: &[u8] = if first { b"R\n" } else { ack };
+                        first = false;
+                        if connection.write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        received
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_ack_roster_from_the_primary_updates_known_ring() {
+        // Issue #61 end to end on the node side: the primary's ack names
+        // two members, so this node — which never handed anything off and
+        // so had no belief — adopts them and reports R on its next H.
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap().to_string();
+        let received = fake_discovery_acking_with(
+            primary,
+            b"A 2 3\n9 14\ntest-node127.0.0.1:8356\n6 14\nnode-b127.0.0.1:9002\n",
+        );
+
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![primary_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            "test-node".to_string(),
+            "tk-test-node".to_string(),
+            Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
+            shutdown_rx,
+        ));
+        sleep(Duration::from_millis(150)).await;
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["node-b".to_string(), "test-node".to_string()], 3))
+        );
+        let received = received.lock().unwrap();
+        assert!(
+            received
+                .iter()
+                .any(|message| message.starts_with(b"H 9 3 12\n")),
+            "expected a heartbeat reporting the adopted replication factor, got {received:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_heartbeat_ack_roster_from_a_standby_is_ignored() {
+        // Discovery HA: replicas never reconcile, so only the primary's
+        // view is adopted — a standby reporting a roster changes nothing.
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap().to_string();
+        let _primary_received = fake_discovery_acking_with(primary, b"A\n");
+        let standby = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let standby_addr = standby.local_addr().unwrap().to_string();
+        let standby_received =
+            fake_discovery_acking_with(standby, b"A 1 3\n9 14\ntest-node127.0.0.1:8356\n");
+
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![primary_addr, standby_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            "test-node".to_string(),
+            "tk-test-node".to_string(),
+            Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
+            shutdown_rx,
+        ));
+        sleep(Duration::from_millis(150)).await;
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+
+        assert!(
+            standby_received.lock().unwrap().len() > 1,
+            "the standby should have seen heartbeats"
+        );
+        assert!(known_ring.lock().unwrap().is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5375,6 +5820,7 @@ mod tests {
             "test-node".to_string(),
             "tk-test-node".to_string(),
             Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -5468,6 +5914,7 @@ mod tests {
             },
             "test-node".to_string(),
             "tk-test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -5563,6 +6010,7 @@ mod tests {
             "test-node".to_string(),
             "tk-test-node".to_string(),
             Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
 
@@ -5608,6 +6056,7 @@ mod tests {
             },
             "test-node".to_string(),
             "tk-test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -5668,6 +6117,7 @@ mod tests {
             },
             "test-node".to_string(),
             "tk-test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));
@@ -5829,6 +6279,7 @@ mod tests {
             },
             "test-node".to_string(),
             "tk-test-node".to_string(),
+            Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             shutdown_rx,
         ));

@@ -55,6 +55,11 @@ impl HashRing {
         Self { nodes, node_hashes }
     }
 
+    /// The member names this ring was built from, in construction order.
+    pub fn nodes(&self) -> &[String] {
+        &self.nodes
+    }
+
     /// The key's owners: the `replicas` highest-scoring nodes, primary
     /// first. Returns fewer than `replicas` when the cluster is smaller.
     pub fn owners(&self, key: &[u8], replicas: usize) -> Vec<&str> {
