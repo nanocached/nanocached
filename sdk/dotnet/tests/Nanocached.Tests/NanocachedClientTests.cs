@@ -1750,4 +1750,172 @@ public class NanocachedClientTests
             File.Delete(pemPath);
         }
     }
+
+    // ── ヘッジ読み取り (Hedged reads, issue #64) ─────────────────────
+
+    // Generous versus the FireAndForgetReplicas suite's 20ms — hedging's
+    // own assertions straddle both a hedge interval and a mock delay in
+    // the same test, so CI (ubuntu) gets more slack against scheduling
+    // noise on either side.
+    private const long HedgeTimingToleranceMillis = 40;
+
+    // _hedgedReads is private; reached via reflection the same way
+    // ReplaceMemberConnection above reaches _members — the only way to
+    // assert, from outside, that a losing hedge leg was actually drained.
+    private static ICollection<Task> HedgedReads(NanocachedClient client)
+    {
+        FieldInfo field = typeof(NanocachedClient)
+            .GetField("_hedgedReads", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var dictionary = (System.Collections.IDictionary)field.GetValue(client)!;
+        var tasks = new List<Task>();
+        foreach (System.Collections.DictionaryEntry entry in dictionary) tasks.Add((Task)entry.Key);
+        return tasks;
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-10)]
+    public async Task RejectsANonPositiveReadHedgeAfter(int millis)
+    {
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() =>
+            NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", 1) },
+                ReadHedgeAfter = TimeSpan.FromMilliseconds(millis),
+            }));
+    }
+
+    [Fact]
+    public async Task AHitFromTheReplicaWinsOverASlowPrimary()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        string primary = owners[0], replica = owners[1];
+
+        NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
+        });
+        try
+        {
+            await client.SetAsync("k", "v");
+            cluster.Nodes[primary].DelayGets(400);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            string? value = await client.GetAsync("k");
+            stopwatch.Stop();
+
+            Assert.Equal("v", value);
+            Assert.True(stopwatch.ElapsedMilliseconds < 400 - HedgeTimingToleranceMillis,
+                $"elapsed {stopwatch.ElapsedMilliseconds}ms should be well under the primary's 400ms delay");
+            Assert.True(stopwatch.ElapsedMilliseconds >= 50 - HedgeTimingToleranceMillis,
+                $"elapsed {stopwatch.ElapsedMilliseconds}ms should be at least the 50ms hedge interval");
+            Assert.Equal(1, cluster.Nodes[replica].GetCount);
+        }
+        finally
+        {
+            client.Close();
+        }
+        // The slow primary's leg was left to finish, not cancelled, and
+        // Close() drained it (waiting out its own 400ms delay).
+        Assert.Empty(HedgedReads(client));
+        Assert.Equal(1, cluster.Nodes[primary].GetCount);
+    }
+
+    [Fact]
+    public async Task AFastPrimaryIsNeverHedged()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
+        });
+        await client.SetAsync("k", "v");
+        string replica = OwnersOf("k")[1];
+
+        for (int i = 0; i < 5; i++)
+        {
+            Assert.Equal("v", await client.GetAsync("k"));
+        }
+        Assert.Equal(0, cluster.Nodes[replica].GetCount);
+    }
+
+    [Fact]
+    public async Task AReplicaMissWaitsForThePrimary()
+    {
+        // Hedging must never turn a hit into a miss: the replica lacks the
+        // copy and answers first, but the primary's answer is what counts.
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        string primary = owners[0], replica = owners[1];
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
+        });
+        await client.SetAsync("k", "v");
+        cluster.Nodes[replica].Store.TryRemove(MockNode.KeyOf(Bytes("k")), out _);
+        cluster.Nodes[primary].DelayGets(200);
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        string? value = await client.GetAsync("k");
+        stopwatch.Stop();
+
+        Assert.Equal("v", value);
+        Assert.True(stopwatch.ElapsedMilliseconds >= 200 - HedgeTimingToleranceMillis,
+            $"elapsed {stopwatch.ElapsedMilliseconds}ms should have waited out the primary's 200ms delay");
+        Assert.Equal(1, cluster.Nodes[replica].GetCount);
+
+        // A key nobody has: the miss is accepted once the primary has
+        // answered it too.
+        Assert.Null(await client.GetAsync("absent"));
+    }
+
+    [Fact]
+    public async Task OffByDefaultASlowPrimaryBoundsTheRead()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        IReadOnlyList<string> owners = OwnersOf("k");
+        string primary = owners[0], replica = owners[1];
+
+        await client.SetAsync("k", "v");
+        cluster.Nodes[primary].DelayGets(200);
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        string? value = await client.GetAsync("k");
+        stopwatch.Stop();
+
+        Assert.Equal("v", value);
+        Assert.True(stopwatch.ElapsedMilliseconds >= 200 - HedgeTimingToleranceMillis,
+            $"elapsed {stopwatch.ElapsedMilliseconds}ms should have waited out the primary's 200ms delay");
+        Assert.Equal(0, cluster.Nodes[replica].GetCount);
+    }
+
+    [Fact]
+    public async Task ADeadPrimaryFailsOverImmediately()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(500),
+        });
+        await client.SetAsync("k", "v");
+        string primary = OwnersOf("k")[0];
+        cluster.Nodes[primary].Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        string? value = await client.GetAsync("k");
+        stopwatch.Stop();
+
+        Assert.Equal("v", value);
+        Assert.True(stopwatch.ElapsedMilliseconds < 500 - HedgeTimingToleranceMillis,
+            $"elapsed {stopwatch.ElapsedMilliseconds}ms should be nowhere near the 500ms hedge interval");
+    }
 }

@@ -90,6 +90,32 @@ public sealed class NanocachedClient : IDisposable
         /// only on the misses this actually applies to.</summary>
         public bool ReadRepair { get; set; }
 
+        /// <summary>Send the same read to the next owner as well once the
+        /// current wait has been silent for this long — first the primary,
+        /// then (if still no answer) each further owner in turn, one more
+        /// per interval, until every owner is in flight (Hedged reads). A
+        /// slow-but-alive owner otherwise bounds every read that touches it
+        /// at its full round trip, since the sequential read path only
+        /// moves on to the next owner when the current one *fails*.
+        /// <c>null</c> (the default) is off. Applies only when a ring is
+        /// known and the key has at least 2 owners; with a single copy
+        /// there is nobody to hedge to.
+        ///
+        /// <para>The first answer decides: a hit from any owner is final;
+        /// a miss is final only from the primary — a replica's miss is
+        /// provisional (it may simply lack the copy), so the primary is
+        /// still waited for and hedging never turns a hit into a miss. A
+        /// failure (connection-level, or any SDK exception other than
+        /// <see cref="WrongNodeException"/>) hedges onward immediately,
+        /// with no wait; a <see cref="WrongNodeException"/> from any owner
+        /// propagates exactly as the non-hedged read path's does. The
+        /// losing leg of a hedge is never cancelled — cancelling mid-write
+        /// could desync a connection — but is left to finish detached and
+        /// drained by <see cref="Close"/>, the same as a fire-and-forget
+        /// replica write. Writes are unaffected. Rejected as invalid
+        /// unless positive.</para></summary>
+        public TimeSpan? ReadHedgeAfter { get; set; }
+
         /// <summary>How long, after a reconnect dial to an address fails,
         /// that address is treated as still down — a call routed to it
         /// during this window fails immediately with the original dial
@@ -234,6 +260,17 @@ public sealed class NanocachedClient : IDisposable
     // TryReadRepairAsync's background primary-repair write
     // (read repair) draws from the same pool — one combined cap,
     // like every other SDK — so Close() drains it the same way.
+    private readonly TimeSpan? _readHedgeAfter;
+    // Hedge legs (Hedged reads) still running after a read has already
+    // returned via a different leg (the losers): never cancelled —
+    // cancelling mid-write could desync a connection (see Connection's own
+    // doc comment on why no CancellationToken ever reaches the stream) —
+    // left to finish detached, and drained by Close() exactly like
+    // _backgroundReplicaPermits' pool is. Unlike that pool this one is
+    // unbounded: a hedge leg count is already bounded by a key's own
+    // replication factor, not by how many reads are concurrently in
+    // flight, so there is no cap to enforce here.
+    private readonly ConcurrentDictionary<Task, byte> _hedgedReads = new();
     private readonly CancellationTokenSource _lifetime = new();
 
     // Observability for failures this client swallows by design — see
@@ -276,6 +313,7 @@ public sealed class NanocachedClient : IDisposable
         _backgroundReplicaPermitCount = MaxInFlightBackgroundReplicaWrites;
         _backgroundReplicaPermits = new SemaphoreSlim(_backgroundReplicaPermitCount, _backgroundReplicaPermitCount);
         _readRepair = options.ReadRepair;
+        _readHedgeAfter = options.ReadHedgeAfter;
         _reconnectCooldown = options.DisableReconnectCooldown
             ? null
             : options.ReconnectCooldown == TimeSpan.Zero
@@ -361,6 +399,12 @@ public sealed class NanocachedClient : IDisposable
             throw new ArgumentOutOfRangeException(
                 nameof(options),
                 $"nanocached: CompressionThreshold must not be negative, got {options.CompressionThreshold}");
+        }
+        if (options.ReadHedgeAfter is TimeSpan hedgeAfter && hedgeAfter <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "nanocached: ReadHedgeAfter must be a positive duration");
         }
 
         var client = new NanocachedClient(options);
@@ -724,6 +768,30 @@ public sealed class NanocachedClient : IDisposable
         {
             _backgroundReplicaPermits.Wait();
         }
+        // Hedged reads: every losing leg still running is already tracked
+        // in _hedgedReads (added when started, before any await) — drained
+        // here the same way the background replica writes above are,
+        // before Teardown() below tears out the connections those legs are
+        // still reading from. Each task is removed from the set by this
+        // loop itself, not left to its own completion callback, so a leg
+        // that finishes concurrently with this drain can't be waited on
+        // twice or looked up after it's already gone.
+        while (!_hedgedReads.IsEmpty)
+        {
+            Task leg = _hedgedReads.Keys.First();
+            _hedgedReads.TryRemove(leg, out _);
+            try
+            {
+                leg.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                // Already the caller's or lastError's concern (whichever
+                // read started this leg observed or discarded its outcome
+                // already); Close() only needs to wait it out, not surface
+                // it again.
+            }
+        }
         Teardown();
     }
 
@@ -811,10 +879,16 @@ public sealed class NanocachedClient : IDisposable
             return await ApplyReconnectingAsync(null, op).ConfigureAwait(false);
         }
 
+        IReadOnlyList<string> names = OwnerNames(key);
+        if (_readHedgeAfter is TimeSpan hedgeAfter && names.Count > 1)
+        {
+            return await ReadHedgedAsync(op, names, hedgeAfter).ConfigureAwait(false);
+        }
+
         // Owners in rank order; fall through only on connection-level
         // failure — a replica hedges against a dead holder, not a miss.
         Exception? lastError = null;
-        foreach (string name in OwnerNames(key))
+        foreach (string name in names)
         {
             try
             {
@@ -838,6 +912,142 @@ public sealed class NanocachedClient : IDisposable
         }
         throw lastError
               ?? new ConnectionLostException("nanocached: no owner is reachable for this key");
+    }
+
+    /// <summary>
+    /// Hedged reads (<see cref="Options.ReadHedgeAfter"/>): a slow — not
+    /// dead — owner otherwise bounds every read that touches it at its
+    /// full round trip, since <see cref="ReadAsync{T}"/>'s sequential path
+    /// only moves on to the next owner when the current one *fails*. Here
+    /// the read starts at the primary, and if no answer has arrived within
+    /// <paramref name="hedgeAfter"/> the same read is also sent to the next
+    /// owner (and so on, one more owner per interval, until every owner is
+    /// in flight); the first answer decides:
+    ///
+    /// <list type="bullet">
+    /// <item>a hit from any owner is final;</item>
+    /// <item>a miss is final only from the primary — a replica's miss is
+    /// provisional (it may simply lack the copy) and the primary is still
+    /// waited for, so hedging never turns a hit into a miss; it is
+    /// accepted only once every owner has answered or failed;</item>
+    /// <item>a failure (connection-level, or any
+    /// <see cref="NanocachedException"/> other than
+    /// <see cref="WrongNodeException"/>) hedges onward immediately, with
+    /// no wait;</item>
+    /// <item><see cref="WrongNodeException"/> propagates as in
+    /// <see cref="ReadAsync{T}"/>.</item>
+    /// </list>
+    ///
+    /// The losing legs are never cancelled — cancelling mid-write could
+    /// desync a connection (see <see cref="Connection"/>'s own doc
+    /// comment) — but are left to finish detached in
+    /// <see cref="_hedgedReads"/>, their outcome observed, and drained by
+    /// <see cref="Close"/>.
+    /// </summary>
+    private async Task<T> ReadHedgedAsync<T>(
+        Func<Connection, Task<T>> op, IReadOnlyList<string> names, TimeSpan hedgeAfter)
+    {
+        var legIndex = new Dictionary<Task<T>, int>();
+
+        Task<T> StartLeg(int index)
+        {
+            Task<T> task = ApplyReconnectingAsync(names[index], op);
+            legIndex[task] = index;
+            _hedgedReads[task] = 0;
+            task.ContinueWith(
+                completed =>
+                {
+                    // Retrieves the outcome so a losing leg's exception —
+                    // this method's own caller only ever inspects the leg
+                    // that decided the read — never surfaces as an
+                    // unobserved task exception; then leaves _hedgedReads
+                    // exactly the way it found this leg once it's done,
+                    // whether that happens while this method is still
+                    // running (removed explicitly below instead) or long
+                    // after it has already returned.
+                    _ = completed.Exception;
+                    _hedgedReads.TryRemove(task, out _);
+                },
+                TaskScheduler.Default);
+            return task;
+        }
+
+        var pending = new HashSet<Task<T>> { StartLeg(0) };
+        int nextIndex = 1;
+        Exception? lastError = null;
+        bool replicaMissed = false;
+
+        while (pending.Count > 0)
+        {
+            Task<T> completed;
+            if (nextIndex < names.Count)
+            {
+                using var cts = new CancellationTokenSource();
+                Task timer = Task.Delay(hedgeAfter, cts.Token);
+                var waitable = new List<Task>(pending) { timer };
+                Task winner = await Task.WhenAny(waitable).ConfigureAwait(false);
+                if (winner == timer)
+                {
+                    // Hedge interval elapsed with no answer: one more owner.
+                    pending.Add(StartLeg(nextIndex));
+                    nextIndex++;
+                    continue;
+                }
+                cts.Cancel();
+                completed = (Task<T>)winner;
+            }
+            else
+            {
+                completed = await Task.WhenAny(pending).ConfigureAwait(false);
+            }
+            pending.Remove(completed);
+
+            int index = legIndex[completed];
+            T value;
+            try
+            {
+                value = await completed.ConfigureAwait(false);
+            }
+            catch (WrongNodeException)
+            {
+                // Remaining legs are already tracked in _hedgedReads (added
+                // when started, above) — nothing more to do before this
+                // propagates exactly as ReadAsync's own WrongNodeException
+                // does.
+                throw;
+            }
+            catch (Exception error) when (error is NanocachedException)
+            {
+                lastError = error;
+                if (pending.Count == 0 && nextIndex < names.Count)
+                {
+                    // Everything in flight so far failed: the next owner
+                    // gets its turn right away, not after waiting out the
+                    // rest of the interval.
+                    pending.Add(StartLeg(nextIndex));
+                    nextIndex++;
+                }
+                continue;
+            }
+
+            if (value is not null || index == 0)
+            {
+                return value;
+            }
+
+            // A replica's miss is provisional — it may simply lack the
+            // copy — so hedging never turns a hit into a miss: only the
+            // primary's own miss is accepted as final.
+            replicaMissed = true;
+            if (pending.Count == 0 && nextIndex < names.Count)
+            {
+                pending.Add(StartLeg(nextIndex));
+                nextIndex++;
+            }
+        }
+
+        if (replicaMissed) return default!;
+        throw lastError ?? new ConnectionLostException("nanocached: no owner is reachable for this key");
     }
 
     private async Task<T> WriteAsync<T>(byte[] key, Func<Connection, Task<T>> op)
