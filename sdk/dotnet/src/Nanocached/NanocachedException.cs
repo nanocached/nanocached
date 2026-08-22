@@ -45,7 +45,7 @@ public sealed class AuthenticationFailedException : NanocachedException
 public sealed class DiscoveryBusyException : NanocachedException
 {
     public DiscoveryBusyException()
-        : base("nanocached: the discovery server is warming up after a restart") { }
+        : base("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's") { }
 }
 
 /// <summary>A connection-level failure; the client redials lazily on the next use.</summary>

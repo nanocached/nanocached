@@ -39,4 +39,4 @@ class DiscoveryBusyError(NanocachedError):
     another address, or retry shortly."""
 
     def __init__(self) -> None:
-        super().__init__("nanocached: the discovery server is warming up after a restart")
+        super().__init__("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's")

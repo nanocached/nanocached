@@ -49,7 +49,7 @@ public class NanocachedException extends RuntimeException {
      */
     public static final class DiscoveryBusy extends NanocachedException {
         public DiscoveryBusy() {
-            super("nanocached: the discovery server is warming up after a restart");
+            super("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's");
         }
     }
 

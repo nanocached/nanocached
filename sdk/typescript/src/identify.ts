@@ -200,7 +200,7 @@ export class AuthenticationError extends NanocachedError {
  * should try another address, or retry shortly. */
 export class DiscoveryBusyError extends NanocachedError {
   constructor() {
-    super("nanocached: the discovery server is warming up after a restart");
+    super("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's");
     this.name = "DiscoveryBusyError";
   }
 }

@@ -830,7 +830,7 @@ fn dispatch_connection(
         if let Err(error) =
             handle_connection(stream, address, request_tx, config, shutdown_rx).await
         {
-            eprintln!("WARN connection error from {address}: {error}");
+            log_connection_error(&address, &error);
         }
     });
 }
@@ -852,6 +852,20 @@ async fn execute_command(
     response_rx
         .await
         .map_err(|_| io::Error::other("cache task dropped response"))
+}
+
+/// A peer that closes the TCP connection without a TLS `close_notify` —
+/// which is how every SDK and node ends a connection — is reported by
+/// rustls as an error, and logging that at WARN on every ordinary
+/// disconnect buried real problems (issue #68). Noted at INFO instead;
+/// everything else stays a WARN.
+fn log_connection_error(address: &SocketAddr, error: &io::Error) {
+    let text = error.to_string();
+    if text.contains("close_notify") {
+        println!("INFO connection from {address} closed without TLS close_notify");
+    } else {
+        eprintln!("WARN connection error from {address}: {error}");
+    }
 }
 
 /// Bounds every response write in `handle_connection` (issue #4): the read
@@ -1551,21 +1565,55 @@ async fn register_with_discovery(
                         // Bounded so a discovery server that accepts TCP but
                         // never drains can't wedge this task forever (and,
                         // via `heartbeat_task.await`, hang shutdown).
-                        timeout(OUTBOUND_IO_TIMEOUT, async {
+                        let exchange = timeout(OUTBOUND_IO_TIMEOUT, async {
                             stream.write_all(&auth).await?;
                             let mut ack = [0u8; 3];
                             stream.read_exact(&mut ack).await?;
-                            io::Result::Ok(&ack == b"Od\n")
+                            io::Result::Ok(ack)
                         })
-                        .await
-                        .is_ok_and(|result| result.unwrap_or(false))
+                        .await;
+                        // Only an explicit `Ed` is a rejected secret. A
+                        // dropped connection or garbage instead (issue #68)
+                        // is most often a node speaking plaintext to a
+                        // TLS discovery server — `--tls-ca` missing — and
+                        // saying "rejected the auth secret" for that sent
+                        // operators to the wrong knob.
+                        match exchange {
+                            Ok(Ok(ack)) if &ack == b"Od\n" => true,
+                            Ok(Ok(ack)) if &ack == b"Ed\n" => {
+                                eprintln!(
+                                    "WARN discovery server at {discovery_addr} rejected the auth \
+                                     secret"
+                                );
+                                false
+                            }
+                            Ok(Ok(ack)) => {
+                                eprintln!(
+                                    "WARN discovery server at {discovery_addr} answered the auth \
+                                     handshake with {:?} instead of Od/Ed — if it requires TLS, \
+                                     this node needs --tls-ca",
+                                    String::from_utf8_lossy(&ack)
+                                );
+                                false
+                            }
+                            Ok(Err(error)) => {
+                                eprintln!(
+                                    "WARN auth handshake with discovery server at {discovery_addr} \
+                                     failed: {error} — if it requires TLS, this node needs --tls-ca"
+                                );
+                                false
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "WARN auth handshake with discovery server at {discovery_addr} \
+                                     timed out"
+                                );
+                                false
+                            }
+                        }
                     }
                     None => true,
                 };
-
-                if !authenticated {
-                    eprintln!("WARN discovery server at {discovery_addr} rejected the auth secret");
-                }
 
                 let sending_join = matches!(
                     &role,

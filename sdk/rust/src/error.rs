@@ -58,7 +58,7 @@ impl fmt::Display for Error {
             }
             Error::DiscoveryBusy => write!(
                 f,
-                "nanocached: the discovery server is warming up after a restart"
+                "nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's"
             ),
             Error::ConnectionLost(message)
             | Error::Protocol(message)
