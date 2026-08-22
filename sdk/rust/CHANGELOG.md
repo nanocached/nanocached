@@ -4,7 +4,19 @@ All notable changes to the Rust SDK are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow the `sdk/rust/vX.Y.Z` tags.
 
-## [Unreleased]
+## [0.3.0] - 2026-08-22
+
+Aligned release of the server and all six SDKs. Server-side, this
+release fixes the cluster data-loss and availability bugs found in the
+v0.2.0 end-to-end run (issues #61–#63, #66) and changes the discovery
+heartbeat acknowledgment so nodes learn of evictions: upgrade nodes
+before discovery servers.
+
+### Changed
+
+- `Error::DiscoveryBusy`'s message no longer claims the replica is
+  "warming up after a restart" — `B` is also what a replica whose
+  replication factor disagrees with the cluster's answers (issue #68).
 
 ### Added
 
