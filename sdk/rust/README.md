@@ -108,6 +108,36 @@ unlike fire-and-forget replica writes, is uncapped and not drained on
 `close()`: this only fires on an already-rare clean miss, and losing one
 costs nothing beyond staying in the window for one more read.
 
+## Hedged reads
+
+Off by default. A read goes to the key's primary owner and moves on to
+the next owner only when the primary *fails* — so one slow-but-alive
+node (a saturated host, a bad link) makes every read that touches it
+wait out its full round trip, and with `R` copies on `N` nodes that is
+roughly `R/N` of all reads. Setting `read_hedge_after` (a `Duration`)
+sends the same read to the next owner as well once the primary has been
+silent for that long, and takes the first answer:
+
+```rust
+let options = Options::new()
+    .addresses([("cache.internal", 8357)])
+    .read_hedge_after(Duration::from_millis(10)); // hedge after 10 ms
+```
+
+A hit from any owner is final. A miss is only final from the primary: a
+replica's miss is provisional (it may simply lack the copy), so the
+primary's answer is still waited for and hedging never turns a hit into
+a miss — a genuine miss on a slow primary still pays its round trip. Pick
+a value a few times the healthy p99 so a fast cluster hedges rarely: each
+hedge costs one extra read on another owner. Needs `R >= 2`; with a
+single copy there is nobody to hedge to. Writes are unaffected — every
+copy must be written, so a slow owner bounds writes to it regardless
+(`fire_and_forget_replicas` moves only the replica legs off the caller's
+path). The losing leg of a hedge is never cancelled — dropping a
+request mid-write could leave the connection desynced — so it is left
+to finish and drained by `close()`, the same way a fire-and-forget
+replica write is.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps

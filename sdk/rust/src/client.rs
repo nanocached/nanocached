@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::compression::resolve_compression;
 use crate::connection::Connection;
@@ -174,6 +174,7 @@ pub struct Options {
     fire_and_forget_replicas: bool,
     read_repair: bool,
     reconnect_cooldown: ReconnectCooldown,
+    read_hedge_after: Option<Duration>,
 }
 
 /// `Options::reconnect_cooldown`'s intent, kept distinct from the
@@ -217,6 +218,7 @@ impl Default for Options {
             fire_and_forget_replicas: false,
             read_repair: false,
             reconnect_cooldown: ReconnectCooldown::Default,
+            read_hedge_after: None,
         }
     }
 }
@@ -358,6 +360,45 @@ impl Options {
         self.reconnect_cooldown = ReconnectCooldown::Disabled;
         self
     }
+
+    /// Hedged reads (issue #64). Off by default (`None`). A read normally
+    /// starts at the key's primary owner and only moves on to the next
+    /// owner when the primary *fails* — so one slow-but-alive node (a
+    /// saturated host, a bad link) bounds every read that touches it at
+    /// its own full round trip, and with `R` copies on `N` nodes that is
+    /// roughly `R/N` of all reads. Setting this sends the same read to the
+    /// next owner as well once the primary has gone silent for `duration`
+    /// (and, if that owner is also silent for another `duration`, the one
+    /// after it, and so on), and takes the first answer:
+    ///
+    /// - a hit from any owner is final;
+    /// - a miss is final only from the primary — a replica's miss is
+    ///   provisional (it may simply lack the copy), so the primary is
+    ///   still waited for and hedging never turns a hit into a miss; it
+    ///   is accepted only once every owner has answered or failed;
+    /// - a connection-level failure (or any error but [`Error::WrongNode`])
+    ///   hedges onward immediately, no wait;
+    /// - [`Error::WrongNode`] propagates exactly as the normal read path's
+    ///   does.
+    ///
+    /// Only takes effect once a ring is known and the key has at least two
+    /// owners (`R >= 2`); otherwise the sequential path runs unchanged —
+    /// with a single copy there is nobody to hedge to. Writes are
+    /// unaffected: every copy must still be written, so a slow owner
+    /// bounds writes to it regardless ([`Self::fire_and_forget_replicas`]
+    /// moves only the replica legs off the caller's path). The losing leg
+    /// of a hedge is never cancelled — dropping a request mid-write could
+    /// leave the connection desynced for whatever is queued behind it —
+    /// so it runs to completion detached, and [`NanocachedClient::close`]
+    /// drains it exactly like a fire-and-forget replica write.
+    ///
+    /// `duration` must be positive; a zero duration is rejected at
+    /// [`NanocachedClient::connect`] time, the same as this crate's other
+    /// invalid-argument checks.
+    pub fn read_hedge_after(mut self, duration: Duration) -> Self {
+        self.read_hedge_after = Some(duration);
+        self
+    }
 }
 
 struct Member {
@@ -390,6 +431,15 @@ impl WriteBody<'_> {
 enum OwnedWriteBody {
     Set { value: Vec<u8>, ttl_seconds: u64 },
     Delete,
+}
+
+/// One hedged-read leg's outcome (hedged reads, issue #64): tagged with
+/// `index` — its position in the owners list, 0 being the primary — so
+/// `read_hedged` can tell a provisional replica miss (`index != 0`) apart
+/// from the primary's own, final, miss.
+struct HedgeOutcome {
+    index: usize,
+    result: Result<Option<Vec<u8>>>,
 }
 
 enum Target {
@@ -446,6 +496,14 @@ struct Inner {
     background_replica_permits: Arc<Semaphore>,
     background_replica_cap: usize,
     read_repair: bool,
+    /// See [`Options::read_hedge_after`]. `None` means hedging is off.
+    read_hedge_after: Option<Duration>,
+    /// Hedged reads (issue #64): the losing leg of a hedge is left
+    /// running to completion, detached — tracked here exactly like
+    /// `background_replica_permits` tracks a fire-and-forget replica
+    /// write, so `close()` can drain it the same way before teardown
+    /// instead of leaving it dangling past the client's own lifetime.
+    hedged_reads: Mutex<tokio::task::JoinSet<()>>,
     stats: StatsCounters,
 }
 
@@ -483,6 +541,11 @@ impl NanocachedClient {
         if options.addresses.is_empty() {
             return Err(Error::InvalidArgument(
                 "nanocached: connect() needs a non-empty addresses list".to_string(),
+            ));
+        }
+        if matches!(options.read_hedge_after, Some(duration) if duration.is_zero()) {
+            return Err(Error::InvalidArgument(
+                "nanocached: read_hedge_after must be a positive duration".to_string(),
             ));
         }
 
@@ -635,6 +698,8 @@ impl NanocachedClient {
             background_replica_permits: Arc::new(Semaphore::new(background_replica_cap)),
             background_replica_cap,
             read_repair: options.read_repair,
+            read_hedge_after: options.read_hedge_after,
+            hedged_reads: Mutex::new(tokio::task::JoinSet::new()),
             stats: StatsCounters::default(),
         });
 
@@ -738,6 +803,16 @@ impl NanocachedClient {
                 .await;
         }
 
+        // Hedged reads (issue #64): the losing leg of a hedge is left
+        // running to completion rather than cancelled (see
+        // Options::read_hedge_after), so close() must not return while
+        // one is still in flight — drained here exactly like the
+        // fire-and-forget replica writes above.
+        {
+            let mut hedged = self.inner.hedged_reads.lock().await;
+            while hedged.join_next().await.is_some() {}
+        }
+
         // Close every connection now rather than waiting for the last
         // `NanocachedClient` clone (and so `Inner`) to drop, both to
         // release the sockets promptly and to keep open_targets accurate
@@ -760,11 +835,7 @@ impl NanocachedClient {
         let key = key.as_ref();
         validate_key(key)?;
         self.before_operation().await?;
-        let mut value = self
-            .with_cluster_retry(|| {
-                self.read(key, |connection| async move { connection.get(key).await })
-            })
-            .await?;
+        let mut value = self.with_cluster_retry(|| self.read(key)).await?;
         if value.is_none() && self.inner.read_repair {
             let clustered = matches!(self.inner.state.lock().await.target, Target::Cluster { .. });
             if clustered {
@@ -944,24 +1015,32 @@ impl NanocachedClient {
         }
     }
 
-    async fn read<T, F, Fut>(&self, key: &[u8], op: F) -> Result<T>
-    where
-        F: Fn(Arc<Connection>) -> Fut,
-        Fut: std::future::Future<Output = Result<T>>,
-    {
+    async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let owners = {
             let state = self.inner.state.lock().await;
             if let Target::Single { .. } = state.target {
                 drop(state);
+                let op = |connection: Arc<Connection>| async move { connection.get(key).await };
                 return self.apply_reconnecting(None, &op).await;
             }
             Self::owner_names(&state, key)
         };
 
+        // Hedged reads (issue #64): only once the key actually has a
+        // second owner to hedge to — with a single owner (or in single-node
+        // mode, already handled above) there is nobody to hedge to, so the
+        // sequential path below runs exactly as before.
+        if let Some(hedge_after) = self.inner.read_hedge_after {
+            if owners.len() >= 2 {
+                return self.read_hedged(key, owners, hedge_after).await;
+            }
+        }
+
         // Owners in rank order; fall through only on connection-level
         // failure — a replica hedges against a dead holder, not a miss.
         let mut last_error: Option<Error> = None;
         for name in owners {
+            let op = |connection: Arc<Connection>| async move { connection.get(key).await };
             match self.apply_reconnecting(Some(&name), &op).await {
                 Ok(value) => return Ok(value),
                 Err(Error::WrongNode) => return Err(Error::WrongNode),
@@ -971,6 +1050,145 @@ impl NanocachedClient {
         Err(last_error.unwrap_or_else(|| {
             Error::ConnectionLost("nanocached: no owner is reachable for this key".to_string())
         }))
+    }
+
+    /// Hedged reads (issue #64): the read starts at `owners[0]` (the
+    /// primary); if nothing has answered within `hedge_after`, the same
+    /// read is also sent to `owners[1]`, and so on — one more owner every
+    /// further `hedge_after` — until every owner is in flight or one
+    /// settles the read. The first answer decides:
+    ///
+    /// - a hit (`Ok(Some(_))`) from any owner is final;
+    /// - a miss (`Ok(None)`) is final only from the primary (`index ==
+    ///   0`) — a replica's miss is provisional (it may simply lack the
+    ///   copy) and does not by itself end the read; it is accepted only
+    ///   once every owner has answered or failed (`replica_missed` with no
+    ///   owner left to try);
+    /// - `Error::WrongNode` propagates immediately, exactly as the
+    ///   sequential path's does;
+    /// - any other error hedges onward immediately (the next owner, if
+    ///   any, starts right away rather than waiting out the rest of the
+    ///   interval) and is remembered as `last_error`.
+    ///
+    /// Every leg — including the ones still in flight once this method
+    /// returns — is spawned via `spawn_hedge_leg` onto `hedged_reads`,
+    /// never cancelled, and drained by `close()`.
+    async fn read_hedged(
+        &self,
+        key: &[u8],
+        owners: Vec<String>,
+        hedge_after: Duration,
+    ) -> Result<Option<Vec<u8>>> {
+        let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
+        let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
+
+        self.spawn_hedge_leg(Arc::clone(&owned_key), owners[0].clone(), 0, tx.clone())
+            .await;
+        let mut next_index = 1usize;
+        // How many legs are currently in flight (spawned, no outcome
+        // received yet) — once this hits zero with owners left to try,
+        // the next one starts immediately rather than waiting out the
+        // rest of the current hedge interval.
+        let mut in_flight = 1usize;
+        let mut last_error: Option<Error> = None;
+        let mut replica_missed = false;
+
+        loop {
+            let outcome = if next_index < owners.len() {
+                match tokio::time::timeout(hedge_after, rx.recv()).await {
+                    Ok(Some(outcome)) => outcome,
+                    // Every sender is a leg still counted in `in_flight`;
+                    // this can't happen while any are outstanding. Kept as
+                    // a defensive fallback rather than a panic.
+                    Ok(None) => break,
+                    Err(_elapsed) => {
+                        // The hedge interval elapsed with no answer yet:
+                        // one more owner, right away.
+                        self.spawn_hedge_leg(
+                            Arc::clone(&owned_key),
+                            owners[next_index].clone(),
+                            next_index,
+                            tx.clone(),
+                        )
+                        .await;
+                        next_index += 1;
+                        in_flight += 1;
+                        continue;
+                    }
+                }
+            } else {
+                match rx.recv().await {
+                    Some(outcome) => outcome,
+                    None => break,
+                }
+            };
+            in_flight -= 1;
+
+            match outcome.result {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) if outcome.index == 0 => return Ok(None),
+                Ok(None) => replica_missed = true,
+                Err(Error::WrongNode) => return Err(Error::WrongNode),
+                Err(error) => last_error = Some(error),
+            }
+
+            // Everything currently in flight has now answered or failed
+            // (a provisional replica miss or a swallowed failure): the
+            // next owner, if any is left, gets its turn immediately
+            // instead of waiting out the rest of the interval.
+            if in_flight == 0 {
+                if next_index < owners.len() {
+                    self.spawn_hedge_leg(
+                        Arc::clone(&owned_key),
+                        owners[next_index].clone(),
+                        next_index,
+                        tx.clone(),
+                    )
+                    .await;
+                    next_index += 1;
+                    in_flight += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if replica_missed {
+            return Ok(None);
+        }
+        Err(last_error.unwrap_or_else(|| {
+            Error::ConnectionLost("nanocached: no owner is reachable for this key".to_string())
+        }))
+    }
+
+    /// Starts one hedge leg against `owners[index]`. Spawned onto
+    /// `hedged_reads` rather than a bare `tokio::spawn` so `close()` can
+    /// find and drain it (exactly as it drains a fire-and-forget replica
+    /// write) even if `read_hedged` has already returned by the time this
+    /// leg finishes — the losing leg of a hedge is never cancelled,
+    /// because dropping a request mid-write could desync the connection
+    /// for whatever else is queued behind it (see
+    /// `Connection::request_uncapped`'s `WriteGuard`). Its outcome is
+    /// delivered back over `tx`, tagged with `index`; if the read has
+    /// already decided and dropped its receiver, the send simply fails
+    /// and is ignored — the result is discarded either way.
+    async fn spawn_hedge_leg(
+        &self,
+        key: Arc<[u8]>,
+        name: String,
+        index: usize,
+        tx: mpsc::UnboundedSender<HedgeOutcome>,
+    ) {
+        let client = self.clone();
+        let mut hedged = self.inner.hedged_reads.lock().await;
+        hedged.spawn(async move {
+            let op = move |connection: Arc<Connection>| {
+                let key = Arc::clone(&key);
+                async move { connection.get(&key).await }
+            };
+            let result = client.apply_reconnecting(Some(&name), &op).await;
+            let _ = tx.send(HedgeOutcome { index, result });
+        });
     }
 
     async fn write<T, F, Fut>(&self, key: &[u8], body: WriteBody<'_>, op: F) -> Result<T>
