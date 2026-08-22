@@ -159,6 +159,18 @@ cargo run --bin nanocached-node -- --port 8356 --tls-cert cert.pem --tls-key key
   --tls-ca ca.pem --discovery 127.0.0.1:8357
 ```
 
+In a cluster, certificates must carry each node's **IP address** in
+`subjectAltName`, not (only) a hostname: discovery advertises a node by
+the source IP of its registration connection, so discovery's own
+connections to a node and every SDK's connections verify the certificate
+against that IP — a DNS-only SAN fails with `certificate not valid for
+name "172.21.0.3"` on discovery and an `IP address mismatch` on clients.
+Where node IPs aren't known ahead of time (plain Docker, ECS tasks), give
+nodes static addresses, put every address the subnet can hand out in one
+SAN, or mint a per-node certificate at start-up. Clients verify the
+discovery server against whatever they were given in `addresses`, so a
+hostname SAN is fine there.
+
 For local development, generate a self-signed certificate with OpenSSL.
 The certificate must have `CA:FALSE` in its basic constraints — a
 self-signed cert generated with defaults is often marked as its own CA,
@@ -502,7 +514,10 @@ loud `WARN` if that disagrees with its own configured value.
 ### nanocached-node
 
 - Maximum request size: 1 MiB
-- Maximum concurrent connections: 1,024
+- Maximum concurrent connections: 1,024, and at most 256 from any one
+  source IP — anything that collapses source addresses (Docker Desktop's
+  port publishing, a NAT gateway, a load balancer without proxy protocol)
+  makes 256 the effective limit for everything behind it
 - Maximum cache memory usage: 256 MiB by default, configurable with
   `--max-memory <bytes>` (approximate: sum of stored key and value bytes
   plus a small per-entry accounting overhead), least-recently-used
@@ -515,7 +530,8 @@ loud `WARN` if that disagrees with its own configured value.
 ### nanocached-discovery
 
 - Maximum request size: 4 KiB
-- Maximum concurrent connections: 1,024
+- Maximum concurrent connections: 1,024, and at most 256 from any one
+  source IP (same caveat as for nodes)
 - Idle connection timeout: 60 seconds
 
 ## License

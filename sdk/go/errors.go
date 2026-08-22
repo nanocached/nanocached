@@ -19,7 +19,7 @@ var (
 	// ErrDiscoveryBusy: a discovery server answered `L` with `B` — it is
 	// inside its startup grace (discovery HA), re-learning membership after a
 	// restart. Try another address, or retry shortly.
-	ErrDiscoveryBusy = errors.New("nanocached: the discovery server is warming up after a restart")
+	ErrDiscoveryBusy = errors.New("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's")
 
 	// ErrConnectionLost wraps connection-level failures; the client
 	// redials lazily on the next use, and in cluster mode retries once

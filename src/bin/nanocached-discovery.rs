@@ -2753,7 +2753,14 @@ fn dispatch_connection(
         .await;
 
         if let Err(error) = &result {
-            eprintln!("WARN connection error from {address}: {error}");
+            // Issue #68: a peer closing without a TLS `close_notify` (how
+            // every SDK and node ends a connection) is an error to rustls
+            // but not to us — INFO, not a WARN per disconnect.
+            if error.to_string().contains("close_notify") {
+                println!("INFO connection from {address} closed without TLS close_notify");
+            } else {
+                eprintln!("WARN connection error from {address}: {error}");
+            }
         }
 
         let identity = connection_name
