@@ -82,6 +82,13 @@ unreachable.</p>
   heartbeat interval too — a key re-homed from the dead node is served
   by its new owner rather than answered <code>W</code>.</li>
 </ul>
+<p>Liveness is binary, though: a node that is slow but still answering is
+never evicted, and every request that touches it waits out its round
+trip — with <em>R</em> copies on <em>N</em> nodes, about <em>R/N</em> of
+them. The SDKs' hedged reads (opt-in) send a read to the next owner once
+the primary has been silent for a configured interval and take the first
+answer, so reads route around a slow owner; writes cannot, since every
+copy must be written.</p>
 <p>Node identity is a random per-process name, decoupled from the
 network address — routing hashes the name, connections use the address —
 so a node restarting on the same address is correctly treated as a new

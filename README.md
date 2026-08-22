@@ -98,6 +98,18 @@ and join one after another — each join takes roughly the time its handoff
 needs, and no key is lost to a join that has to be retried (a source keeps
 the copies it handed off until discovery confirms the join).
 
+Liveness is binary: a node is a member until it misses heartbeats for the
+liveness timeout, and a node that is slow but answering — a saturated
+host, a lossy or high-latency link — is never evicted. Every request that
+touches such a node waits out its full round trip, so with `R` copies on
+`N` nodes roughly `R/N` of all requests do, and the cluster's tail latency
+becomes that node's. Reads can route around it: the SDKs' hedged reads
+(`read_hedge_after` in the Python SDK) send a read to the next owner when
+the primary is silent for longer than a configured interval. Writes cannot
+— every copy must be written — so a slow owner bounds writes to it until
+it is fixed or removed; `fire_and_forget_replicas` keeps only the replica
+legs off the caller's path.
+
 ### Authentication
 
 Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared
