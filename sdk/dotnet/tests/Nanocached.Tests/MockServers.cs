@@ -43,6 +43,7 @@ public sealed class MockNode : IDisposable
     private int _wrongNodeOnSetReplies;
     private int _extraByteOnSetReplies;
     private volatile int _setDelayMillis;
+    private volatile int _getDelayMillis;
     private volatile bool _silent;
     private long _lastSetTtl;
     /// <summary>J1/D1: when set, every accepted connection is wrapped in
@@ -113,6 +114,11 @@ public sealed class MockNode : IDisposable
     /// first — for tests proving a caller isn't blocked on a slow replica
     /// leg (fire-and-forget replica writes).</summary>
     public void DelaySets(int millis) => _setDelayMillis = millis;
+
+    /// <summary>Holds every future G reply for <paramref name="millis"/>
+    /// first — for hedged-reads tests proving a caller isn't bounded by a
+    /// slow owner (Hedged reads).</summary>
+    public void DelayGets(int millis) => _getDelayMillis = millis;
 
     /// <summary>Makes this node a half-open server from this point on: it
     /// still accepts and completes the A handshake, and still reads every
@@ -203,6 +209,10 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        if (_getDelayMillis > 0)
+                        {
+                            await Task.Delay(_getDelayMillis);
                         }
                         if (TakeOne(ref _swallowedGets))
                         {
