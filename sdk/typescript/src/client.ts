@@ -210,7 +210,12 @@ interface ClusterMember {
    * the next request that routes here, without waiting for a node-list
    * refresh. */
   address: string;
-  connection: Connection;
+  /** `null` for a member that was listed by discovery but unreachable
+   * when this client bootstrapped (issue #67): it stays routable — a
+   * request for one of its keys fails over the same way it would after a
+   * mid-life node death — and the next request after the reconnect
+   * cooldown redials it (ensureConnected/memberConnection). */
+  connection: Connection | null;
 }
 
 type Target =
@@ -254,6 +259,56 @@ function trackOpenTarget(key: string, sockets: Array<Socket | TLSSocket>): void 
       }
     });
   }
+}
+
+/** Outcome of dialing one node discovery listed, during cluster bootstrap
+ * (issue #67). `"ok"` and `"unreachable"` are both tolerated — see
+ * `NanocachedClient.connect`'s cluster branch; `"hard"` (a listed address
+ * that identifies as something other than a node, or an actual
+ * programming bug surfacing from the dial) aborts connect() outright,
+ * exactly as it always has. */
+type ClusterDialOutcome =
+  | { node: DiscoveredNode; kind: "ok"; socket: Socket | TLSSocket; tagged: boolean }
+  | { node: DiscoveredNode; kind: "unreachable"; error: Error }
+  | { node: DiscoveredNode; kind: "hard"; error: Error };
+
+/** Dials one node from discovery's list. Never rejects — every outcome,
+ * including a hard failure, comes back as a `ClusterDialOutcome` so
+ * `connect()` can run every dial concurrently with a plain `Promise.all`
+ * and still tell "no one home yet" (tolerated) apart from "something is
+ * actually wrong" (isSwallowable — a real programming bug, or a listed
+ * address that isn't a node at all) without losing track of sockets
+ * already opened by other concurrent dials. */
+async function dialClusterNode(
+  node: DiscoveredNode,
+  authSecret: string | undefined,
+  tls: boolean | undefined,
+  ca: Buffer | undefined,
+): Promise<ClusterDialOutcome> {
+  const { host, port } = splitHostPort(node.address);
+
+  let identified;
+  try {
+    identified = await connectAndIdentify({ host, port, authSecret, tls, ca });
+  } catch (error) {
+    if (!isSwallowable(error)) return { node, kind: "hard", error: error as Error };
+    // Connection-level failure (issue #67): typically a node that just
+    // died and discovery hasn't evicted yet — its liveness window is
+    // seconds long, and every key is still served by another owner when
+    // replication >= 2. Tolerated here; installed as a connectionless
+    // member by the caller.
+    return { node, kind: "unreachable", error: error as Error };
+  }
+
+  if (identified.kind !== "node") {
+    return {
+      node,
+      kind: "hard",
+      error: new NanocachedError(`nanocached: discovery server returned a non-node address: ${node.address}`),
+    };
+  }
+
+  return { node, kind: "ok", socket: identified.socket, tagged: identified.tagged };
 }
 
 /**
@@ -420,36 +475,58 @@ export class NanocachedClient {
         continue;
       }
 
-      // Keyed by name (node identity decoupled from address), not address — see `Target`.
-      const sockets = new Map<string, { socket: Socket | TLSSocket; tagged: boolean }>();
+      // Dials every node discovery listed, concurrently (issue #67). A
+      // node that can't be reached — typically one that just died and
+      // discovery hasn't evicted yet — is tolerated: it's installed as a
+      // member with no connection and its reconnect cooldown armed
+      // (exactly the state a member is in after dying mid-life), so it
+      // stays in the ring and requests for its keys fail over per
+      // request instead of the whole connect() failing. A listed address
+      // that identifies as something other than a node (or an actual dial
+      // bug) is still a hard error — another address would hand back the
+      // same node list, so don't try one; another address would hand back
+      // the same node list either way. Only a cluster with *no* reachable
+      // node at all fails connect(), with the last dial error.
+      const outcomes = await Promise.all(
+        identified.nodes.map((node) => dialClusterNode(node, options.authSecret, options.tls, ca)),
+      );
 
-      try {
-        for (const node of identified.nodes) {
-          const { host, port } = splitHostPort(node.address);
-          const nodeIdentified = await connectAndIdentify({ host, port, authSecret: options.authSecret, tls: options.tls, ca });
-
-          if (nodeIdentified.kind !== "node") {
-            throw new NanocachedError(`nanocached: discovery server returned a non-node address: ${node.address}`);
-          }
-
-          sockets.set(node.name, { socket: nodeIdentified.socket, tagged: nodeIdentified.tagged });
+      const hard = outcomes.find((outcome) => outcome.kind === "hard");
+      if (hard) {
+        for (const outcome of outcomes) {
+          if (outcome.kind === "ok") outcome.socket.destroy();
         }
-      } catch (error) {
-        // A node (not the discovery address) is the problem here; another
-        // address would hand back the same node list, so don't try one.
-        for (const { socket } of sockets.values()) socket.destroy();
-        throw error;
+        throw hard.error;
       }
-
-      trackOpenTarget(key, [...sockets.values()].map(({ socket }) => socket));
 
       const members = new Map<string, ClusterMember>();
-      for (const node of identified.nodes) {
-        const { socket, tagged } = sockets.get(node.name)!;
-        members.set(node.name, { address: node.address, connection: new Connection(socket, tagged) });
+      const sockets: Array<Socket | TLSSocket> = [];
+      const cooldowns: Array<[string, { until: number; error: Error }]> = [];
+      let reachable = 0;
+      let lastNodeError: Error | null = null;
+
+      for (const outcome of outcomes) {
+        if (outcome.kind === "ok") {
+          members.set(outcome.node.name, {
+            address: outcome.node.address,
+            connection: new Connection(outcome.socket, outcome.tagged),
+          });
+          sockets.push(outcome.socket);
+          reachable++;
+        } else {
+          members.set(outcome.node.name, { address: outcome.node.address, connection: null });
+          cooldowns.push([outcome.node.address, { until: Date.now() + reconnectCooldownMs, error: outcome.error }]);
+          lastNodeError = outcome.error;
+        }
       }
 
-      return new NanocachedClient(
+      if (reachable === 0) {
+        throw lastNodeError as Error;
+      }
+
+      trackOpenTarget(key, sockets);
+
+      const client = new NanocachedClient(
         {
           kind: "cluster",
           ring: new HashRing(identified.nodes.map((node) => node.name)),
@@ -469,6 +546,16 @@ export class NanocachedClient {
         reconnectCooldownMs,
         options.readHedgeAfterMs,
       );
+      // Armed after construction (reconnectCooldowns is initialized by the
+      // constructor's field declarations before its body runs) — the same
+      // cooldown state a mid-life redial failure would have left behind
+      // (ensureConnected), so the first request for one of these nodes'
+      // keys fails over immediately instead of paying a dial timeout, and
+      // only redials once the cooldown has elapsed.
+      for (const [address, cooldown] of cooldowns) {
+        client.reconnectCooldowns.set(address, cooldown);
+      }
+      return client;
     }
 
     throw lastError ?? new NanocachedError("nanocached: could not connect to any address");
@@ -529,7 +616,7 @@ export class NanocachedClient {
       return;
     }
 
-    for (const member of this.target.members.values()) member.connection.close();
+    for (const member of this.target.members.values()) member.connection?.close();
   }
 
   /** How many nodes hold each key (client-side replication) — discovery's replication
@@ -1035,7 +1122,9 @@ export class NanocachedClient {
 
     for (const [name, member] of currentMembers) {
       if (!nodeByName.has(name)) {
-        member.connection.close();
+        // `null` here just means this member never had a live connection
+        // (issue #67) — nothing to close.
+        member.connection?.close();
         members.delete(name);
       }
     }
@@ -1083,7 +1172,7 @@ export class NanocachedClient {
     if (this.closed) {
       // Same race, caught at commit time: close() already tore down the
       // members it knew about; anything newly opened here must die too.
-      for (const member of members.values()) member.connection.close();
+      for (const member of members.values()) member.connection?.close();
       return;
     }
 
@@ -1170,25 +1259,30 @@ export class NanocachedClient {
       // racing this operation, which the refresh-and-retry layer heals.
       throw new ConnectionLostError(`nanocached: ${name} has no open connection`);
     }
-    if (!member.connection.isClosed()) return member.connection;
+    // `null` (issue #67: this member was listed by discovery but
+    // unreachable at bootstrap, or has since died mid-life) is handled
+    // exactly like a closed connection below — ensureConnected redials,
+    // respecting the reconnect cooldown armed for its address.
+    if (member.connection !== null && !member.connection.isClosed()) return member.connection;
 
     const connection = await this.ensureConnected(name, member.address);
 
     // A node-list refresh may have swapped `target` while we dialed; adopt
-    // the new connection only into a member still holding the dead one,
-    // and defer to the refresh's own connection otherwise so no socket is
-    // left open but untracked.
+    // the new connection only into a member still holding the dead (or
+    // absent) one, and defer to the refresh's own connection otherwise so
+    // no socket is left open but untracked.
     const current = this.target.kind === "cluster" ? this.target.members.get(name) : null;
     if (!current) {
       connection.close();
       throw new NanocachedError(`nanocached: ${name} left the cluster while reconnecting`);
     }
-    if (current.connection.isClosed()) {
+    const currentConnection = current.connection;
+    if (currentConnection === null || currentConnection.isClosed()) {
       current.connection = connection;
       return connection;
     }
-    if (current.connection !== connection) connection.close();
-    return current.connection;
+    if (currentConnection !== connection) connection.close();
+    return currentConnection;
   }
 
   private async ensureConnected(slot: string, address: string): Promise<Connection> {
@@ -1256,7 +1350,11 @@ export class NanocachedClient {
       const connections =
         this.target.kind === "single"
           ? [this.target.connection]
-          : [...this.target.members.values()].map((member) => member.connection);
+          : [...this.target.members.values()]
+              .map((member) => member.connection)
+              // `null` (issue #67): no connection to ping — stays lazy,
+              // dialed on the next request that routes there.
+              .filter((connection): connection is Connection => connection !== null);
 
       for (const connection of connections) {
         if (connection.isClosed()) continue;

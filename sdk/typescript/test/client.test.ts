@@ -2311,3 +2311,121 @@ describe("NanocachedClient response tags (echoed response tags)", () => {
     }
   });
 });
+
+describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
+  // Issue #67: connect() must tolerate a node that discovery still lists
+  // but that can't be reached (dead, not yet evicted), the way steady-state
+  // requests already do — and fail only when no node is reachable.
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  function ownerNames(key: string): string[] {
+    return new HashRing(names).owners(Buffer.from(key), 2);
+  }
+
+  function keyWithPrimary(name: string): string {
+    for (let i = 0; i < 1000; i++) {
+      const key = `key-${i}`;
+      if (ownerNames(key)[0] === name) return key;
+    }
+    throw new Error(`no key routes to ${name}`);
+  }
+
+  async function startCluster(dead: Set<string>) {
+    const nodes = new Map<string, MockNode>();
+    const entries: Array<{ name: string; address: string }> = [];
+    for (const name of names) {
+      if (dead.has(name)) {
+        const port = await unusedPort();
+        entries.push({ name, address: `127.0.0.1:${port}` });
+      } else {
+        const node = await startMockNode();
+        nodes.set(name, node);
+        entries.push({ name, address: node.address });
+      }
+    }
+    const discovery = await startMockDiscovery(entries, { replication: 2 });
+    return {
+      nodes,
+      discovery,
+      close: async () => {
+        await Promise.all([discovery.close(), ...[...nodes.values()].map((node) => node.close())]);
+      },
+    };
+  }
+
+  it("connect() succeeds with one unreachable node", async () => {
+    const [dead, live] = names;
+    const cluster = await startCluster(new Set([dead]));
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        reconnectCooldownMs: 50,
+      });
+      try {
+        assert.equal(client.replication, 2);
+        assert.equal((client as any).target.members.get(dead).connection, null);
+        assert.ok((client as any).target.members.get(live).connection !== null);
+
+        // A key whose primary is alive: the write lands, the dead replica
+        // leg is swallowed and counted, the read hits.
+        const key = keyWithPrimary(live);
+        await client.set(key, "v");
+        assert.equal(await client.get(key), "v");
+        assert.equal(client.stats().replicaWriteFailures, 1);
+
+        // A key whose primary is the dead node: the read fails over to the
+        // live replica right away — well under the 5s dial timeout,
+        // whether or not the reconnect cooldown for the dead address is
+        // still armed (an ECONNREFUSED dial fails fast either way).
+        const other = keyWithPrimary(dead);
+        cluster.nodes.get(live)!.store.set(other, Buffer.from("replica copy"));
+        const start = Date.now();
+        assert.equal(await client.get(other), "replica copy");
+        assert.ok(Date.now() - start < 500, "fallback to the live replica was not fast");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("connect() fails only when every listed node is unreachable", async () => {
+    const cluster = await startCluster(new Set(names));
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] }),
+      );
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("redials an unreachable node once the cooldown has passed", async () => {
+    const [dead, live] = names;
+    const cluster = await startCluster(new Set([dead]));
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        reconnectCooldownMs: 50,
+      });
+      try {
+        // Bring the "dead" node up on the address discovery listed.
+        const deadAddress: string = (client as any).target.members.get(dead).address;
+        const port = Number(deadAddress.split(":")[1]);
+        const revived = await startMockNode({ port });
+        cluster.nodes.set(dead, revived);
+        await delay(100);
+
+        const key = keyWithPrimary(dead);
+        await client.set(key, "v");
+        assert.ok(revived.store.has(key));
+        assert.ok((client as any).target.members.get(dead).connection !== null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+});
