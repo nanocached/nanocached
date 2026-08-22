@@ -140,6 +140,21 @@ func startMockNodeOpts(t *testing.T, requiredSecret []byte, opts mockNodeOpts) *
 	return node
 }
 
+// startMockNodeAt binds to a specific address instead of an ephemeral
+// port — for a node that comes back up on the address discovery already
+// advertised (issue #67's redial-after-cooldown test).
+func startMockNodeAt(t *testing.T, requiredSecret []byte, address string) *mockNode {
+	t.Helper()
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := &mockNode{listener: listener, requiredSecret: requiredSecret}
+	go node.acceptLoop()
+	t.Cleanup(node.close)
+	return node
+}
+
 func (m *mockNode) address() string { return m.listener.Addr().String() }
 
 func (m *mockNode) storeLen() int {
@@ -1995,6 +2010,140 @@ func TestFansDeletesOutToEveryOwner(t *testing.T) {
 		if node.hasKey("gone-everywhere") {
 			t.Errorf("still present on %s", name)
 		}
+	}
+}
+
+// ── issue #67: connect() bootstrap tolerates an unreachable node ──
+
+// keyWithPrimary finds a key whose primary owner is name, against
+// testNames/replication 2 — the same ring startCluster's discovery mocks
+// use.
+func keyWithPrimary(t *testing.T, name string) string {
+	t.Helper()
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		if ownersOf(key)[0] == name {
+			return key
+		}
+	}
+	t.Fatalf("no key routes to %s as primary", name)
+	return ""
+}
+
+// startClusterWithDeadNode is startCluster, except every name in dead is
+// listed by discovery at an address nobody listens on instead of a real
+// mockNode — issue #67's bootstrap-tolerance tests. The returned map only
+// holds mockNodes for the live names; deadAddresses gives back the
+// unreachable address discovery listed for each dead name, so a test can
+// later start a real listener on that same address.
+func startClusterWithDeadNode(t *testing.T, replication int, dead map[string]bool) (
+	nodes map[string]*mockNode, deadAddresses map[string]string, discovery *mockDiscovery,
+) {
+	t.Helper()
+	nodes = map[string]*mockNode{}
+	deadAddresses = map[string]string{}
+	listed := make([]discoveredNode, 0, len(testNames))
+	for _, name := range testNames {
+		if dead[name] {
+			address := unusedPort(t)
+			deadAddresses[name] = address
+			listed = append(listed, discoveredNode{Name: name, Address: address})
+			continue
+		}
+		node := startMockNode(t, nil)
+		nodes[name] = node
+		listed = append(listed, discoveredNode{Name: name, Address: node.address()})
+	}
+	return nodes, deadAddresses, startMockDiscovery(t, listed, replication)
+}
+
+func TestConnectSucceedsWithOneUnreachableNode(t *testing.T) {
+	dead, live := testNames[0], testNames[1]
+	nodes, _, discovery := startClusterWithDeadNode(t, 2, map[string]bool{dead: true})
+
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(discovery.address())},
+		ReconnectCooldown: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Connect with one unreachable node = %v, want success", err)
+	}
+	defer client.Close()
+
+	if got := client.Replication(); got != 2 {
+		t.Fatalf("Replication = %d, want 2", got)
+	}
+	if !client.members[dead].connection.isClosed() {
+		t.Fatal("the unreachable node's member has a live connection, want none")
+	}
+	if client.members[live].connection.isClosed() {
+		t.Fatal("the reachable node's member has no live connection")
+	}
+
+	// A key whose primary is alive: the write lands, the dead replica leg
+	// is swallowed and counted, and the read hits.
+	key := keyWithPrimary(t, live)
+	if err := client.Set(key, "v", 0); err != nil {
+		t.Fatalf("Set on a live primary (dead replica) = %v", err)
+	}
+	if value, ok, err := client.Get(key); err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if got := client.Stats().ReplicaWriteFailures; got != 1 {
+		t.Fatalf("ReplicaWriteFailures = %d, want 1", got)
+	}
+
+	// A key whose primary is the dead node: the read fails over to the
+	// live replica right away (cooldown armed at bootstrap, no dial).
+	other := keyWithPrimary(t, dead)
+	nodes[live].store.Store(other, []byte("replica copy"))
+	start := time.Now()
+	value, ok, err := client.Get(other)
+	elapsed := time.Since(start)
+	if err != nil || !ok || value != "replica copy" {
+		t.Fatalf("Get with a dead primary = %q, %v, %v", value, ok, err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("elapsed = %v, want well under the dial timeout (failover via the armed cooldown)", elapsed)
+	}
+}
+
+func TestConnectFailsOnlyWhenEveryNodeIsUnreachable(t *testing.T) {
+	_, _, discovery := startClusterWithDeadNode(t, 2, map[string]bool{testNames[0]: true, testNames[1]: true})
+
+	_, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Connect with every node unreachable = %v, want ErrConnectionLost", err)
+	}
+}
+
+func TestAnUnreachableNodeIsRedialedOnceTheCooldownHasPassed(t *testing.T) {
+	dead := testNames[0]
+	_, deadAddresses, discovery := startClusterWithDeadNode(t, 2, map[string]bool{dead: true})
+
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(discovery.address())},
+		ReconnectCooldown: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Connect with one unreachable node = %v, want success", err)
+	}
+	defer client.Close()
+
+	// Bring the "dead" node up on the address discovery listed.
+	revived := startMockNodeAt(t, nil, deadAddresses[dead])
+
+	key := keyWithPrimary(t, dead)
+	if !waitUntil(t, 2*time.Second, func() bool {
+		return client.Set(key, "v", 0) == nil
+	}) {
+		t.Fatal("Set never succeeded once the revived node came up")
+	}
+	if !revived.hasKey(key) {
+		t.Fatal("the revived node never received the write")
+	}
+	if client.members[dead].connection.isClosed() {
+		t.Fatal("the revived member has no live connection after a successful write to it")
 	}
 }
 

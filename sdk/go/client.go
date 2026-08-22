@@ -510,16 +510,92 @@ func buildTLSConfig(config Config) (*tls.Config, error) {
 	return &tls.Config{RootCAs: pool}, nil
 }
 
+// clusterDialOutcome is one node's identify result from openCluster's
+// concurrent dial round: exactly one of err/result.conn is set on
+// success, matching connectAndIdentify's own contract.
+type clusterDialOutcome struct {
+	result *identified
+	err    error
+}
+
+// openCluster dials every node discovery listed, concurrently — the
+// per-dial timeout is connectDeadline either way, so doing this
+// concurrently instead of one at a time is purely a latency win once more
+// than one node is unreachable. A node that can't be reached (issue #67:
+// typically one that just died and discovery hasn't evicted yet — its
+// liveness window is seconds long, and every key is still served by
+// another owner when replication > 1) is installed as a member with no
+// live connection — the same deadConnection placeholder a freshly
+// discovered node gets in refreshNodeList — and its reconnect cooldown
+// armed, exactly the state a member is in after dying mid-life: requests
+// for its keys fail over per request instead of the whole Connect
+// failing, and the next request after the cooldown redials it. Only a
+// cluster with *no* reachable node fails Connect, with the last dial
+// error. A listed address that identifies as something other than a node
+// (a discovery misconfiguration, not a transient failure) remains a hard,
+// non-tolerated error, checked before anything is installed so it can't
+// leak a socket successfully opened for a different node in the same
+// dial round.
 func (c *Client) openCluster(result *identified) error {
-	names := make([]string, 0, len(result.nodes))
-	for _, node := range result.nodes {
-		conn, err := c.openNodeConnection(node.Address)
-		if err != nil {
-			return err
-		}
-		c.members[node.Name] = &member{address: node.Address, connection: conn}
-		names = append(names, node.Name)
+	nodes := result.nodes
+	outcomes := make([]clusterDialOutcome, len(nodes))
+	var wg sync.WaitGroup
+	wg.Add(len(nodes))
+	for i, node := range nodes {
+		go func(i int, address string) {
+			defer wg.Done()
+			ident, err := connectAndIdentify(address, c.authSecret, c.tlsConfig)
+			outcomes[i] = clusterDialOutcome{result: ident, err: err}
+		}(i, node.Address)
 	}
+	wg.Wait()
+
+	for i, outcome := range outcomes {
+		if outcome.err == nil && outcome.result.conn == nil {
+			for _, other := range outcomes {
+				if other.err == nil && other.result.conn != nil {
+					_ = other.result.conn.Close()
+				}
+			}
+			return fmt.Errorf(
+				"nanocached: discovery server returned a non-node address: %s", nodes[i].Address)
+		}
+	}
+
+	names := make([]string, 0, len(nodes))
+	reachable := 0
+	var lastError error
+	for i, node := range nodes {
+		names = append(names, node.Name)
+		outcome := outcomes[i]
+
+		if outcome.err != nil {
+			c.members[node.Name] = &member{address: node.Address, connection: deadConnection()}
+			if c.reconnectCooldown > 0 {
+				c.redialCooldownMu.Lock()
+				c.redialCooldowns[node.Address] = redialCooldown{
+					until: time.Now().Add(c.reconnectCooldown), err: outcome.err,
+				}
+				c.redialCooldownMu.Unlock()
+			}
+			lastError = outcome.err
+			continue
+		}
+
+		c.members[node.Name] = &member{
+			address:    node.Address,
+			connection: c.trackedConnection(outcome.result.conn, outcome.result.tagged),
+		}
+		reachable++
+	}
+
+	if reachable == 0 {
+		if lastError == nil {
+			lastError = fmt.Errorf("nanocached: could not connect to any address")
+		}
+		return lastError
+	}
+
 	c.ring = NewHashRing(names)
 	c.replication = result.replication
 	return nil
