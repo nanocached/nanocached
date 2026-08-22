@@ -98,10 +98,18 @@ are orchestrated by discovery in stages:</p>
   <li>When every node reports completion, discovery promotes the joiner
   into the served node list; clients pick it up on their next
   refresh.</li>
+  <li>A source keeps the copies it handed off, marked dead, until
+  discovery confirms the join (the joiner shows up in its heartbeat
+  acknowledgment, or in the roster of the next join's migrate request);
+  an abandoned join restores them instead, so no key is lost to a
+  half-finished handoff.</li>
 </ol>
-<p>Migrated-away entries are swept only after the handoff completes, and
+<p>Migrated-away entries are swept only after the join is confirmed, and
 the forwarding window stays open past completion to cover clients still
-routing with the older node list.</p>
+routing with the older node list. Joins are serialized — one handoff at a
+time, cluster-wide — so a fleet started at once simply queues; a source
+that has finished one handoff accepts the next join's request while it is
+still forwarding for the previous one.</p>
 
 <h2>Discovery without a single point of failure</h2>
 <p>The registry is deliberately soft state: nodes announce themselves and

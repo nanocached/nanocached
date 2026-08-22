@@ -283,10 +283,19 @@ impl Cache {
     /// a client in the meantime) — `< SWEEP_BUDGET` means the backlog is
     /// now fully drained.
     pub fn sweep(&mut self) -> usize {
-        self.sweep_at(Instant::now())
+        self.sweep_at(Instant::now(), true)
     }
 
-    fn sweep_at(&mut self, now: Instant) -> usize {
+    /// `sweep` restricted to TTL expiry: marked entries are left alone.
+    /// Issue #62: a source's dead copies must survive until discovery has
+    /// actually completed the join they were handed off for — an
+    /// abandoned join rolls the marks back instead — so the periodic
+    /// sweep runs in this mode while that's still undecided.
+    pub fn sweep_expired(&mut self) -> usize {
+        self.sweep_at(Instant::now(), false)
+    }
+
+    fn sweep_at(&mut self, now: Instant, include_marked: bool) -> usize {
         if self.pending_removal.is_empty() {
             self.pending_removal.extend(
                 self.entries
@@ -298,7 +307,9 @@ impl Cache {
             // drained here): the queue is only a snapshot of candidates,
             // and a key rewritten after this point clears its mark, which
             // the removability re-check below must still observe.
-            self.pending_removal.extend(self.migrated.iter().cloned());
+            if include_marked {
+                self.pending_removal.extend(self.migrated.iter().cloned());
+            }
         }
 
         let mut removed = 0;
@@ -312,7 +323,7 @@ impl Cache {
             // the key may have been rewritten (mark cleared, or no longer
             // expired) since it was queued, and a fresh value must never
             // be swept on the strength of an old candidate entry.
-            let removable = self.migrated.contains(&key[..])
+            let removable = (include_marked && self.migrated.contains(&key[..]))
                 || self
                     .entries
                     .peek(&key[..])
@@ -805,6 +816,29 @@ mod tests {
     }
 
     #[test]
+    fn sweep_expired_leaves_marked_entries_alone() {
+        // Issue #62: until the join is confirmed, a dead copy must not be
+        // reclaimed — only TTL expiry is swept in this mode.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(Bytes::from_static(b"dead"), Bytes::from_static(b"copy"));
+        cache.mark_migrated(b"dead");
+        cache.set_with_ttl(
+            Bytes::from_static(b"ttl"),
+            Bytes::from_static(b"x"),
+            Duration::from_secs(1),
+        );
+        let later = Instant::now() + Duration::from_secs(2);
+
+        assert_eq!(cache.sweep_at(later, false), 1);
+        assert_eq!(cache.get(b"dead"), Some(Bytes::from_static(b"copy")));
+        assert!(cache.get_at(b"ttl", later).is_none());
+
+        // The mark is still in force once marks are swept again.
+        assert_eq!(cache.sweep_at(later, true), 1);
+        assert!(cache.get(b"dead").is_none());
+    }
+
+    #[test]
     fn sweep_does_not_remove_a_value_rewritten_after_its_mark() {
         // Regression for issue #2: a mark refers to the value that was
         // handed off, not to the key forever — deleting the marked value
@@ -865,7 +899,7 @@ mod tests {
         }
 
         let later = now + Duration::from_secs(60);
-        assert_eq!(cache.sweep_at(later), SWEEP_BUDGET);
+        assert_eq!(cache.sweep_at(later, true), SWEEP_BUDGET);
 
         // Exactly one expired key remains, and it is still queued. Rewrite
         // it with a fresh, unexpiring value before the next sweep round.
@@ -877,7 +911,7 @@ mod tests {
             .expect("one expired entry should remain after the budgeted sweep");
         cache.set(leftover.clone(), Bytes::from_static(b"fresh"));
 
-        cache.sweep_at(later);
+        cache.sweep_at(later, true);
         assert_eq!(
             cache.get_at(&leftover, later),
             Some(Bytes::from_static(b"fresh"))
@@ -950,7 +984,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6));
+        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6), true);
 
         assert_eq!(removed, 1);
     }
@@ -980,7 +1014,7 @@ mod tests {
         );
         cache.mark_migrated(b"name");
 
-        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6));
+        let removed = cache.sweep_at(Instant::now() + Duration::from_secs(6), true);
 
         assert_eq!(removed, 1);
     }
