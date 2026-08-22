@@ -74,8 +74,20 @@ impl MockNode {
     }
 
     async fn start_with(state: NodeState) -> Self {
+        Self::start_on(state, 0).await
+    }
+
+    /// Pins the listener to `port` — for a node that comes back on the
+    /// exact address discovery already advertised (issue #67's redial-
+    /// after-cooldown test): `port` 0 (the common case, via `start`/
+    /// `start_with`) still means "pick any free port".
+    async fn start_on_port(port: u16) -> Self {
+        Self::start_on(NodeState::default(), port).await
+    }
+
+    async fn start_on(state: NodeState, port: u16) -> Self {
         let state = Arc::new(state);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -410,6 +422,14 @@ async fn read_exact(stream: &mut BufReader<TcpStream>, length: usize) -> Vec<u8>
 
 fn options(port: u16) -> Options {
     Options::new().addresses([("127.0.0.1", port)])
+}
+
+/// A port nobody is listening on: bind it, then immediately drop the
+/// listener, freeing it back up — for a discovery entry that names a node
+/// which isn't actually reachable (issue #67 tests).
+async fn unused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 // ── 単一ノード ────────────────────────────────────────────────────
@@ -2518,4 +2538,128 @@ async fn falls_back_to_the_untagged_protocol_against_a_pre_0019_server() {
 
     client.close().await;
     node.stop();
+}
+
+// ── 起動時の到達不能ノード (issue #67) ──────────────────────────────
+//
+// connect() must tolerate a node that discovery still lists but that
+// can't be reached (dead, not yet evicted) the way steady-state requests
+// already do — and fail only when no listed node is reachable. Members
+// aren't reachable from these integration tests, so each assertion below
+// goes through observable behavior (replication(), stats(), timing)
+// instead of inspecting a member's connection state directly.
+
+fn key_with_primary(name: &str) -> String {
+    for i in 0..1000 {
+        let key = format!("key-{i}");
+        if owners_of(&key)[0] == name {
+            return key;
+        }
+    }
+    panic!("no key routes to {name}");
+}
+
+#[tokio::test]
+async fn connect_succeeds_with_one_unreachable_node() {
+    let dead_port = unused_port().await;
+    let live = MockNode::start().await;
+    let listed = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[1].to_string(), live.address()),
+    ];
+    let discovery = MockDiscovery::start(listed, 2).await;
+
+    let client = NanocachedClient::connect(
+        options(discovery.port).reconnect_cooldown(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(client.replication().await, 2);
+
+    // A key whose primary is alive: the write lands, the dead replica leg
+    // is swallowed and counted, the read hits.
+    let key = key_with_primary(NAMES[1]);
+    client.set(&key, "v", 0).await.unwrap();
+    assert_eq!(client.get(&key).await.unwrap(), Some("v".to_string()));
+    assert_eq!(client.stats().replica_write_failures, 1);
+
+    // A key whose primary is the dead node: the read fails over to the
+    // live replica right away (cooldown, not a fresh CONNECT_DEADLINE
+    // dial) — well under the dial timeout.
+    let other = key_with_primary(NAMES[0]);
+    live.state
+        .store
+        .lock()
+        .unwrap()
+        .insert(other.as_bytes().to_vec(), b"replica copy".to_vec());
+    let start = Instant::now();
+    assert_eq!(
+        client.get(&other).await.unwrap(),
+        Some("replica copy".to_string())
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        start.elapsed()
+    );
+
+    client.close().await;
+    discovery.stop();
+    live.stop();
+}
+
+#[tokio::test]
+async fn connect_fails_only_when_every_listed_node_is_unreachable() {
+    let dead_a = unused_port().await;
+    let dead_b = unused_port().await;
+    let listed = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{dead_a}")),
+        (NAMES[1].to_string(), format!("127.0.0.1:{dead_b}")),
+    ];
+    let discovery = MockDiscovery::start(listed, 2).await;
+
+    let result = NanocachedClient::connect(options(discovery.port)).await;
+    match result {
+        Err(Error::ConnectionLost(_)) => {}
+        Err(other) => panic!("connect() = {other}, want a ConnectionLost error"),
+        Ok(_) => panic!("connect() succeeded, want every listed node to be unreachable"),
+    }
+
+    discovery.stop();
+}
+
+#[tokio::test]
+async fn an_unreachable_node_is_redialed_once_the_cooldown_has_passed() {
+    let dead_port = unused_port().await;
+    let live = MockNode::start().await;
+    let listed = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[1].to_string(), live.address()),
+    ];
+    let discovery = MockDiscovery::start(listed, 2).await;
+
+    let client = NanocachedClient::connect(
+        options(discovery.port).reconnect_cooldown(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    // Bring the "dead" node up on the exact address discovery listed.
+    let revived = MockNode::start_on_port(dead_port).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let key = key_with_primary(NAMES[0]);
+    client.set(&key, "v", 0).await.unwrap();
+    assert!(revived
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(key.as_bytes()));
+
+    client.close().await;
+    discovery.stop();
+    live.stop();
+    revived.stop();
 }
