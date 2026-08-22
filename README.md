@@ -461,7 +461,9 @@ client's `addresses`) at the same list of replicas, and losing any one replica
 bootstrap. Only *joins* need the primary up. After a (re)start, a replica
 answers `L` with `B` (busy) for the liveness-timeout window while live
 members re-announce themselves, so a bootstrapping client never sees a
-half-recovered node list.
+half-recovered node list; a node asking to join in that window is held
+until it ends, so its handoff comes from the full member set rather than
+from whoever has re-announced so far.
 
 **Each replica needs its own stable, individually addressable name (or a
 stable IP) — this is an operational requirement the system does not
