@@ -76,11 +76,19 @@ final class MockServers {
         private final List<Thread> threads = new CopyOnWriteArrayList<>();
 
         MockNode() throws IOException {
-            this(null, false, false, null);
+            this(null, false, false, null, 0);
         }
 
         MockNode(byte[] requiredSecret) throws IOException {
-            this(requiredSecret, false, false, null);
+            this(requiredSecret, false, false, null, 0);
+        }
+
+        /** Listens on a caller-chosen port instead of an ephemeral one —
+         * for tests that need a node to come back up on the exact address
+         * discovery already listed (issue #67, redial after a bootstrap
+         * dial failed and the address's cooldown has passed). */
+        static MockNode onPort(int port) throws IOException {
+            return new MockNode(null, false, false, null, port);
         }
 
         /** echoed response tags: a node that negotiates tags — accepts `A ... T`
@@ -107,12 +115,17 @@ final class MockServers {
 
         private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
                 SSLContext serverTls) throws IOException {
+            this(requiredSecret, supportTags, closeOnExtendedAuth, serverTls, 0);
+        }
+
+        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
+                SSLContext serverTls, int port) throws IOException {
             this.requiredSecret = requiredSecret;
             this.supportTags = supportTags;
             this.closeOnExtendedAuth = closeOnExtendedAuth;
             this.server = serverTls == null
-                    ? new ServerSocket(0)
-                    : serverTls.getServerSocketFactory().createServerSocket(0);
+                    ? new ServerSocket(port)
+                    : serverTls.getServerSocketFactory().createServerSocket(port);
             Thread acceptor = new Thread(this::acceptLoop, "mock-node-accept");
             acceptor.setDaemon(true);
             acceptor.start();

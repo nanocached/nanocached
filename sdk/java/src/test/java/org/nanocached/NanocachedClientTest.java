@@ -1896,6 +1896,147 @@ class NanocachedClientTest {
         }
     }
 
+    // ── 寛容なブートストラップ (issue #67) ──────────────────────────
+    // connect() must tolerate a node that discovery still lists but that
+    // can't be reached (dead, not yet evicted) the way steady-state
+    // requests already do, failing only when no listed node is reachable
+    // at all. Mirrors the Python SDK's TolerantBootstrapTests.
+
+    private record TolerantCluster(Map<String, MockNode> liveNodes, MockDiscovery discovery)
+            implements AutoCloseable {
+        @Override
+        public void close() throws Exception {
+            discovery.close();
+            for (MockNode node : liveNodes.values()) node.close();
+        }
+    }
+
+    /** Starts a 2-node (replication 2) discovery-fronted cluster where
+     * every name in {@code deadNames} is listed with an address nobody
+     * listens on, and every other name gets a real {@link MockNode}. */
+    private static TolerantCluster startClusterWithDeadNodes(List<String> deadNames) throws Exception {
+        Map<String, MockNode> liveNodes = new java.util.LinkedHashMap<>();
+        List<DiscoveredNode> entries = new ArrayList<>();
+        for (String name : NAMES) {
+            if (deadNames.contains(name)) {
+                entries.add(new DiscoveredNode(name, "127.0.0.1:" + MockServers.unusedPort()));
+            } else {
+                MockNode node = new MockNode();
+                liveNodes.put(name, node);
+                entries.add(new DiscoveredNode(name, node.address()));
+            }
+        }
+        MockDiscovery discovery = new MockDiscovery(entries, 2);
+        return new TolerantCluster(liveNodes, discovery);
+    }
+
+    private static String keyWithPrimary(String name) {
+        for (int i = 0; i < 1000; i++) {
+            String key = "key-" + i;
+            if (new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(name)) {
+                return key;
+            }
+        }
+        throw new AssertionError("no key routes to " + name);
+    }
+
+    // NanocachedClient.Member is private, so its `connection`/`address`
+    // fields are reached reflectively — the same technique already used
+    // elsewhere in this file (e.g. newTrackedConnectionUntracksAndClosesSocketWhenConstructorFails).
+    private static Object memberOf(NanocachedClient client, String name) throws Exception {
+        java.lang.reflect.Field membersField = NanocachedClient.class.getDeclaredField("members");
+        membersField.setAccessible(true);
+        Map<?, ?> members = (Map<?, ?>) membersField.get(client);
+        Object member = members.get(name);
+        assertTrue(member != null, name + " is missing from the member map");
+        return member;
+    }
+
+    private static Connection memberConnectionOf(NanocachedClient client, String name) throws Exception {
+        java.lang.reflect.Field connectionField = memberOf(client, name).getClass().getDeclaredField("connection");
+        connectionField.setAccessible(true);
+        return (Connection) connectionField.get(memberOf(client, name));
+    }
+
+    private static String memberAddressOf(NanocachedClient client, String name) throws Exception {
+        Object member = memberOf(client, name);
+        java.lang.reflect.Field addressField = member.getClass().getDeclaredField("address");
+        addressField.setAccessible(true);
+        return (String) addressField.get(member);
+    }
+
+    @Test
+    void connectSucceedsWithOneUnreachableNode() throws Exception {
+        String dead = NAMES.get(0);
+        String live = NAMES.get(1);
+        try (TolerantCluster cluster = startClusterWithDeadNodes(List.of(dead))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    // Wide on purpose (see reconnectCooldownSkipsARedialToAKnownDeadAddress):
+                    // this test's writes/reads must land well inside the
+                    // window the bootstrap dial failure armed, not race it.
+                    .reconnectCooldown(Duration.ofSeconds(5)))) {
+                assertEquals(2, client.replication());
+                assertTrue(memberConnectionOf(client, dead) == null,
+                        "a node unreachable at bootstrap must have no connection");
+                assertTrue(memberConnectionOf(client, live) != null);
+
+                // A key whose primary is alive: the write lands, the dead
+                // replica leg is swallowed and counted, the read hits.
+                String key = keyWithPrimary(live);
+                client.set(key, "v");
+                assertEquals(Optional.of("v"), client.get(key));
+                assertEquals(1, client.stats().replicaWriteFailures());
+
+                // A key whose primary is the dead node: the read fails
+                // over to the live replica right away — the cooldown
+                // skips the dial entirely, so this must be fast, not
+                // bounded by Identify's connect timeout.
+                String other = keyWithPrimary(dead);
+                cluster.liveNodes().get(live).store.put(
+                        MockNode.keyOf(other.getBytes(StandardCharsets.UTF_8)),
+                        "replica copy".getBytes(StandardCharsets.UTF_8));
+                long started = System.nanoTime();
+                assertEquals(Optional.of("replica copy"), client.get(other));
+                long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                assertTrue(elapsedMillis < 2000,
+                        "expected a cooldown-fast failover, took " + elapsedMillis + "ms");
+            }
+        }
+    }
+
+    @Test
+    void connectFailsOnlyWhenEveryNodeIsUnreachable() throws Exception {
+        try (TolerantCluster cluster = startClusterWithDeadNodes(NAMES)) {
+            assertThrows(NanocachedException.ConnectionFailed.class,
+                    () -> connect("127.0.0.1", cluster.discovery().port()));
+        }
+    }
+
+    @Test
+    void anUnreachableNodeIsRedialedOnceTheCooldownHasPassed() throws Exception {
+        String dead = NAMES.get(0);
+        try (TolerantCluster cluster = startClusterWithDeadNodes(List.of(dead))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    .reconnectCooldown(Duration.ofMillis(300)))) {
+                String deadAddress = memberAddressOf(client, dead);
+                int port = Integer.parseInt(deadAddress.substring(deadAddress.lastIndexOf(':') + 1));
+
+                // Bring the "dead" node up on the exact address discovery
+                // already listed, then outlast the cooldown.
+                try (MockNode revived = MockNode.onPort(port)) {
+                    Thread.sleep(500);
+
+                    String key = keyWithPrimary(dead);
+                    client.set(key, "v");
+                    assertTrue(revived.store.containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                    assertTrue(memberConnectionOf(client, dead) != null);
+                }
+            }
+        }
+    }
+
     // ── 応答タグ (echoed response tags) ──────────────────────────────
 
     @Test

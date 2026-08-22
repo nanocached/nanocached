@@ -463,7 +463,12 @@ public final class NanocachedClient implements AutoCloseable {
     private static final class Member {
         String address;
         // volatile for the same cross-thread visibility reason as
-        // `single` above — see that field's comment.
+        // `single` above — see that field's comment. null for a member
+        // that discovery listed but that this client couldn't reach when
+        // it bootstrapped (issue #67): it stays routable — a request for
+        // one of its keys fails over the same way it would after a
+        // mid-life node death — and the next request after the reconnect
+        // cooldown redials it (see memberConnection).
         volatile Connection connection;
 
         Member(String address, Connection connection) {
@@ -624,12 +629,167 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    private void openCluster(Identify.ClusterTarget cluster) throws IOException {
-        List<String> names = new ArrayList<>();
-        for (DiscoveredNode node : cluster.nodes()) {
-            members.put(node.name(), new Member(node.address(), openNodeConnection(node.address())));
-            names.add(node.name());
+    /** One bootstrap dial's outcome (issue #67): a live connection, or a
+     * connection-level failure to tolerate — exactly one of {@link
+     * #connection}/{@link #error} is set. A hard failure (an unparseable
+     * address, or an address that identifies as something other than a
+     * cache node) is a distinct, non-tolerated case — see {@link #hard}
+     * and {@link #dialBootstrapNode}. */
+    private static final class DialOutcome {
+        final Connection connection;
+        final RuntimeException error;
+        final boolean hard;
+
+        private DialOutcome(Connection connection, RuntimeException error, boolean hard) {
+            this.connection = connection;
+            this.error = error;
+            this.hard = hard;
         }
+
+        static DialOutcome success(Connection connection) {
+            return new DialOutcome(connection, null, false);
+        }
+
+        static DialOutcome tolerable(RuntimeException error) {
+            return new DialOutcome(null, error, false);
+        }
+
+        static DialOutcome hard(RuntimeException error) {
+            return new DialOutcome(null, error, true);
+        }
+    }
+
+    /**
+     * Dials and identifies one node discovery listed, for {@link
+     * #openCluster}'s concurrent bootstrap (issue #67). Never throws: a
+     * connection-level failure — the dial itself failing, or the
+     * identify exchange failing or being rejected — is tolerated and
+     * comes back as {@link DialOutcome#tolerable}, exactly the class of
+     * failure {@link #dialWithCooldown} already tolerates on a lazy
+     * redial. An unparseable address, or an address that identifies as
+     * something other than a cache node, is a hard error today and stays
+     * one — reported as {@link DialOutcome#hard} rather than thrown
+     * directly, so {@link #openCluster} can close whatever the other
+     * concurrent dials already opened before it aborts the whole
+     * bootstrap.
+     */
+    private DialOutcome dialBootstrapNode(DiscoveredNode node) {
+        String address = node.address();
+        int separator = address.lastIndexOf(':');
+        Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
+        if (separator == -1 || port == null) {
+            return DialOutcome.hard(new NanocachedException(
+                    "nanocached: invalid node address from discovery server: " + address));
+        }
+        String host = address.substring(0, separator);
+
+        Identify.Result identified;
+        try {
+            identified = Identify.connectAndIdentify(host, port, authSecret, tls);
+        } catch (IOException | RuntimeException error) {
+            return DialOutcome.tolerable(error instanceof RuntimeException runtime
+                    ? runtime
+                    : new NanocachedException.ConnectionFailed(
+                            "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
+        }
+
+        if (!(identified instanceof Identify.NodeTarget nodeTarget)) {
+            return DialOutcome.hard(new NanocachedException(
+                    "nanocached: discovery server returned a non-node address: " + address));
+        }
+
+        try {
+            return DialOutcome.success(newTrackedConnection(nodeTarget.socket(), nodeTarget.tagged()));
+        } catch (IOException error) {
+            return DialOutcome.tolerable(new NanocachedException.ConnectionFailed(
+                    "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
+        }
+    }
+
+    /**
+     * Dials every node discovery listed, concurrently, on a short-lived
+     * pool sized to the node count — {@link #replicaWriters} doesn't
+     * exist yet at this point, since building it needs {@link #replication}
+     * from this same cluster response, so bootstrap dialing gets its own
+     * throwaway executor rather than reusing it. Every dial still honors
+     * the same per-dial connect timeout as any other identify exchange
+     * (see {@code Identify.CONNECT_TIMEOUT_MS}).
+     *
+     * <p>A node that can't be reached (issue #67: typically one that just
+     * died and discovery hasn't evicted yet — its liveness window is
+     * seconds long, and every key is still served by another owner once
+     * replication &gt; 1) is installed as a member without a connection
+     * and with its reconnect cooldown armed — exactly the state a member
+     * is in after dying mid-life (see {@link #dialWithCooldown}) — so
+     * requests for its keys fail over per request instead of the whole
+     * {@code connect()} call failing, and the next request after the
+     * cooldown redials it. Only a cluster with <em>no</em> reachable node
+     * fails, with the last dial error.
+     *
+     * <p>A hard failure — an unparseable address, or an address that
+     * identifies as something other than a cache node — aborts the whole
+     * bootstrap regardless of how any other node fared, exactly as a
+     * sequential dial hitting the same condition always has; every
+     * connection another concurrent dial already opened is closed first
+     * so this doesn't leak a socket for a node this client will now never
+     * adopt.
+     */
+    private void openCluster(Identify.ClusterTarget cluster) {
+        List<DiscoveredNode> nodes = cluster.nodes();
+
+        ExecutorService dialers = Executors.newFixedThreadPool(
+                Math.max(1, nodes.size()), runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-bootstrap-dial");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        List<CompletableFuture<DialOutcome>> futures = new ArrayList<>(nodes.size());
+        List<DialOutcome> outcomes = new ArrayList<>(nodes.size());
+        try {
+            for (DiscoveredNode node : nodes) {
+                futures.add(CompletableFuture.supplyAsync(() -> dialBootstrapNode(node), dialers));
+            }
+            for (CompletableFuture<DialOutcome> future : futures) {
+                outcomes.add(future.join());
+            }
+        } finally {
+            dialers.shutdown();
+        }
+
+        RuntimeException hardError = null;
+        for (DialOutcome outcome : outcomes) {
+            if (outcome.hard && hardError == null) hardError = outcome.error;
+        }
+        if (hardError != null) {
+            for (DialOutcome outcome : outcomes) {
+                if (outcome.connection != null) outcome.connection.close();
+            }
+            throw hardError;
+        }
+
+        List<String> names = new ArrayList<>(nodes.size());
+        int reachable = 0;
+        RuntimeException lastError = null;
+        for (int i = 0; i < nodes.size(); i++) {
+            DiscoveredNode node = nodes.get(i);
+            DialOutcome outcome = outcomes.get(i);
+            names.add(node.name());
+            if (outcome.connection != null) {
+                members.put(node.name(), new Member(node.address(), outcome.connection));
+                reachable++;
+            } else {
+                members.put(node.name(), new Member(node.address(), null));
+                armReconnectCooldown(node.address(), outcome.error);
+                lastError = outcome.error;
+            }
+        }
+
+        if (reachable == 0) {
+            throw lastError != null
+                    ? lastError
+                    : new NanocachedException("nanocached: could not reach any node in the cluster");
+        }
+
         ring = new HashRing(names);
         replication = cluster.replication();
         backgroundReplicaWritePermitCount = maxInFlightBackgroundReplicaWrites;
@@ -999,7 +1159,9 @@ public final class NanocachedClient implements AutoCloseable {
     private void teardown() {
         synchronized (stateLock) {
             if (single != null) single.close();
-            for (Member member : members.values()) member.connection.close();
+            for (Member member : members.values()) {
+                if (member.connection != null) member.connection.close();
+            }
         }
         if (keepAlive != null) {
             keepAlive.shutdownNow();
@@ -1441,15 +1603,27 @@ public final class NanocachedClient implements AutoCloseable {
             reconnectCooldowns.remove(address);
             return connection;
         } catch (RuntimeException error) {
-            // disableReconnectCooldown() (Options): never record a
-            // cooldown entry at all, so every dial to this address keeps
-            // paying its own full connect attempt instead of ever
-            // hitting the fast-rejection branch above.
-            if (!reconnectCooldownDisabled) {
-                reconnectCooldowns.put(
-                        address, new CooldownEntry(System.nanoTime() + reconnectCooldownNanos, error));
-            }
+            armReconnectCooldown(address, error);
             throw error;
+        }
+    }
+
+    /** Arms {@code address}'s reconnect cooldown with {@code error}: a
+     * call routed to it during {@link #reconnectCooldownNanos} fails
+     * immediately with this same error instead of paying another full
+     * connect timeout. Shared by {@link #dialWithCooldown}'s own failed
+     * redial and, for issue #67, {@link #openCluster} installing a member
+     * whose bootstrap dial failed — the same mechanism either way, so a
+     * node discovery still lists but that couldn't be reached is treated
+     * identically whether it died before or after this client bootstrapped. */
+    private void armReconnectCooldown(String address, RuntimeException error) {
+        // disableReconnectCooldown() (Options): never record a cooldown
+        // entry at all, so every dial to this address keeps paying its
+        // own full connect attempt instead of ever hitting the
+        // fast-rejection branch in dialWithCooldown.
+        if (!reconnectCooldownDisabled) {
+            reconnectCooldowns.put(
+                    address, new CooldownEntry(System.nanoTime() + reconnectCooldownNanos, error));
         }
     }
 
@@ -1465,7 +1639,11 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException.ConnectionFailed(
                     "nanocached: " + name + " has no open connection", null);
         }
-        if (!member.connection.isClosed()) return member.connection;
+        // member.connection is null for a member listed by discovery but
+        // unreachable when this client bootstrapped (issue #67) — treated
+        // exactly like a closed connection: fall through to redial it,
+        // honoring the same reconnect cooldown a mid-life death would.
+        if (member.connection != null && !member.connection.isClosed()) return member.connection;
 
         // Concurrent requests finding the same dead connection share one
         // dial: the first thread in redials, the rest wait then reuse.
@@ -1478,7 +1656,7 @@ public final class NanocachedClient implements AutoCloseable {
                 }
                 member = current;
             }
-            if (!member.connection.isClosed()) return member.connection;
+            if (member.connection != null && !member.connection.isClosed()) return member.connection;
             Connection connection = dialWithCooldown(member.address);
             member.connection = connection;
             return connection;
@@ -1600,7 +1778,10 @@ public final class NanocachedClient implements AutoCloseable {
 
             members.entrySet().removeIf(entry -> {
                 if (!byName.containsKey(entry.getKey())) {
-                    entry.getValue().connection.close();
+                    // null for a member that was never reached (issue #67)
+                    // — nothing to close in that case.
+                    Connection stale = entry.getValue().connection;
+                    if (stale != null) stale.close();
                     // Node names are per-process UUIDs; a departed node's
                     // redial gate would otherwise leak forever (issue #12).
                     redialLocks.remove(entry.getKey());
@@ -1705,7 +1886,12 @@ public final class NanocachedClient implements AutoCloseable {
             List<Connection> connections = new ArrayList<>();
             synchronized (stateLock) {
                 if (single != null) connections.add(single);
-                for (Member member : members.values()) connections.add(member.connection);
+                for (Member member : members.values()) {
+                    // null for a member never reached (issue #67) — stays
+                    // lazy, exactly like a closed connection, until a
+                    // foreground request redials it.
+                    if (member.connection != null) connections.add(member.connection);
+                }
             }
             for (Connection connection : connections) {
                 if (connection.isClosed()) continue; // dead ones stay lazy
