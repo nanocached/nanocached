@@ -1010,8 +1010,17 @@ async fn handle_connection(
                     joining_addr.clone(),
                     Arc::clone(&after_ring),
                     replication,
+                    &joined,
                 ) {
-                    MigrationOutcome::New(guard) => guard,
+                    MigrationOutcome::New { guard, restore } => {
+                        // Issue #62: before the key snapshot below, so
+                        // the restored copies are listed — and re-sent
+                        // if this joiner owns them.
+                        for key in &restore {
+                            unmark_migrated(&node_context.request_tx, key).await;
+                        }
+                        guard
+                    }
                     // A discovery retry of `M` for the handoff already
                     // running here (its ack was lost in transit) — re-ack
                     // with the same count the original `M` computed
@@ -1118,20 +1127,36 @@ async fn handle_connection(
                 // a different `joining_name` (already finished, or this
                 // cancel arrived late) — `run_migration` alone decides
                 // whether to actually stop.
-                {
+                let restore = {
                     let mut slot = node_context
                         .active_migration
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Some(active) = slot.as_ref()
-                        && active.joining_name == joining_name
-                    {
-                        active.abort_requested.store(true, Ordering::SeqCst);
-                        // A completed entry only lingers to forward writes
-                        // (issue #3); the join being abandoned ends that.
-                        if active.completed_at.is_some() {
-                            *slot = None;
+                    match slot.as_ref() {
+                        Some(active) if active.joining_name == joining_name => {
+                            active.abort_requested.store(true, Ordering::SeqCst);
+                            // A completed entry only lingers to forward
+                            // writes (issue #3) and to hold its dead
+                            // copies' marks (issue #62); the join being
+                            // abandoned ends both — the copies are live
+                            // again.
+                            if active.completed_at.is_some() {
+                                slot.take().map(|active| active.marked_keys)
+                            } else {
+                                None
+                            }
                         }
+                        _ => None,
+                    }
+                };
+                if let Some(restore) = restore {
+                    eprintln!(
+                        "WARN join of {joining_name} abandoned by discovery after this node's \
+                         handoff completed; restoring {} dead copies",
+                        restore.len()
+                    );
+                    for key in &restore {
+                        unmark_migrated(&node_context.request_tx, key).await;
                     }
                 }
 
@@ -1755,16 +1780,30 @@ fn adopt_membership(
     mut members: Vec<String>,
     replication: usize,
 ) {
-    let join_still_pending = active_migration
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .is_some_and(|active| {
-            let slot_live = active
-                .completed_at
-                .is_none_or(|completed_at| completed_at.elapsed() < active.forwarding_grace);
-            slot_live && !members.contains(&active.joining_name)
-        });
+    let join_still_pending = {
+        let mut slot = active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_mut() {
+            Some(active) => {
+                let joiner_listed = members.contains(&active.joining_name);
+                // Issue #62: the roster naming the joiner is discovery's
+                // word that the join completed — this handoff's dead
+                // copies may now be swept (`run_sweep`).
+                if joiner_listed && active.completed_at.is_some() && !active.confirmed {
+                    active.confirmed = true;
+                    println!(
+                        "INFO join of {} confirmed by discovery at {discovery_addr}; {} dead \
+                         copies released to the sweep",
+                        active.joining_name,
+                        active.marked_keys.len()
+                    );
+                }
+                active.forwarding_open() && !joiner_listed
+            }
+            None => false,
+        }
+    };
     if join_still_pending {
         return;
     }
@@ -1897,6 +1936,22 @@ struct ActiveMigration {
     /// `A <entries>` ack again — see `MigrationOutcome::DuplicateAcked`.
     acked_entries: Option<usize>,
     abort_requested: Arc<AtomicBool>,
+    /// Issue #62: the dead copies this handoff marked (`mark_migrated`),
+    /// kept here after completion so they can be rolled back if the join
+    /// is abandoned after this node's own share was done — an `X` on a
+    /// completed slot, or a later `M` whose roster shows the joiner never
+    /// made it. Until `confirmed`, `run_sweep` leaves marked entries
+    /// alone (`Command::Sweep { marked: false }`).
+    marked_keys: Vec<Bytes>,
+    /// Issue #62: discovery has completed this join — the joiner showed
+    /// up in the primary's heartbeat-ack roster (`adopt_membership`) or
+    /// in the `joined` roster of a subsequent `M`. Only then are this
+    /// handoff's `marked_keys` safe to sweep, and only then does the slot
+    /// expire on its own once `forwarding_grace` has passed; an
+    /// unconfirmed completed slot stops forwarding after the grace but
+    /// stays put, holding its marks back from the sweep, until something
+    /// decides the join one way or the other.
+    confirmed: bool,
     /// Persistent connection to the joining node, shared by every
     /// `set_on_joining_node`/`delete_on_joining_node` call this handoff's
     /// concurrent client writes trigger (see `migration_target_for` and
@@ -1918,6 +1973,23 @@ struct ActiveMigration {
     /// node, so it must start with no connection rather than possibly
     /// reusing one dialed to whatever node the previous handoff targeted.
     forward_connection: Arc<AsyncMutex<Option<ClientStream>>>,
+}
+
+impl ActiveMigration {
+    /// Still moving keys, or completed but within `forwarding_grace` —
+    /// the window during which concurrent client writes are forwarded
+    /// to the joiner (`migration_target_for`).
+    fn forwarding_open(&self) -> bool {
+        self.completed_at
+            .is_none_or(|completed_at| completed_at.elapsed() < self.forwarding_grace)
+    }
+
+    /// Nothing left for this slot to do: the join is confirmed (its
+    /// marks can be swept without it) and the forwarding window has
+    /// closed. Cleared lazily by whoever notices.
+    fn expired(&self) -> bool {
+        self.confirmed && !self.forwarding_open()
+    }
 }
 
 /// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
@@ -1944,7 +2016,15 @@ struct MigrationGuard {
 enum MigrationOutcome {
     /// A fresh slot was reserved; the caller should ack with the entry
     /// count it computes, then stamp it via `MigrationGuard::ack`.
-    New(MigrationGuard),
+    New {
+        guard: MigrationGuard,
+        /// Issue #62: dead copies left marked by a previous, completed
+        /// handoff that this `M`'s roster reveals was abandoned (its
+        /// joiner isn't `Joined`); the caller must `unmark_migrated`
+        /// each before listing keys, so they're live again — and re-sent
+        /// if the new joiner owns them.
+        restore: Vec<Bytes>,
+    },
     /// This `M` names the same `joining_name` as the handoff already
     /// occupying the slot, and that handoff has already stamped what it
     /// acked — a discovery retry after a lost ack. The caller should
@@ -1963,7 +2043,7 @@ impl MigrationOutcome {
     /// path, so this saves a `match` at every one of those call sites.
     fn unwrap_new(self) -> MigrationGuard {
         match self {
-            MigrationOutcome::New(guard) => guard,
+            MigrationOutcome::New { guard, .. } => guard,
             MigrationOutcome::DuplicateAcked(entries) => {
                 panic!("expected a new migration guard, got a duplicate ack for {entries} entries")
             }
@@ -2014,18 +2094,15 @@ impl MigrationGuard {
         joining_addr: String,
         after_ring: Arc<HashRing>,
         replication: usize,
+        joined: &[(String, String)],
     ) -> MigrationOutcome {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let expired = guard.as_ref().is_some_and(|active| {
-            active
-                .completed_at
-                .is_some_and(|completed_at| completed_at.elapsed() >= active.forwarding_grace)
-        });
-        if expired {
+        if guard.as_ref().is_some_and(ActiveMigration::expired) {
             *guard = None;
         }
 
+        let mut restore = Vec::new();
         if let Some(existing) = guard.as_ref() {
             if existing.joining_name == joining_name {
                 // Same-name retry: re-ack idempotently once the original
@@ -2037,17 +2114,42 @@ impl MigrationGuard {
                 };
             }
 
-            let conflicting_joining_name = existing.joining_name.clone();
-            // Dropped before logging (unlike the lock this replaced,
-            // which held it across the `eprintln!`) since `slot` is also
-            // locked by `migration_target_for` on every GET/SET — a
-            // backpressured stderr shouldn't stall the hot path.
-            drop(guard);
-            eprintln!(
-                "WARN ignoring M for {joining_name}: a migration to \
-                 {conflicting_joining_name} is already active"
-            );
-            return MigrationOutcome::Conflict;
+            if existing.completed_at.is_none() {
+                let conflicting_joining_name = existing.joining_name.clone();
+                // Dropped before logging (unlike the lock this replaced,
+                // which held it across the `eprintln!`) since `slot` is
+                // also locked by `migration_target_for` on every GET/SET
+                // — a backpressured stderr shouldn't stall the hot path.
+                drop(guard);
+                eprintln!(
+                    "WARN ignoring M for {joining_name}: a migration to \
+                     {conflicting_joining_name} is already active"
+                );
+                return MigrationOutcome::Conflict;
+            }
+
+            // Issue #62: a completed handoff (forwarding or not) doesn't
+            // block the next join. Discovery serializes joins, so a new
+            // `M` for a different joiner means the previous join has been
+            // decided — and `joined` says which way: the previous joiner
+            // listed there completed (its dead copies here are really
+            // dead), otherwise it was abandoned and those copies are
+            // live again. Rejecting here instead is what made discovery
+            // abandon back-to-back joins for a whole forwarding window,
+            // and sweeping those marks regardless is what lost the keys.
+            let previous_confirmed = existing.confirmed
+                || joined
+                    .iter()
+                    .any(|(name, _)| *name == existing.joining_name);
+            if !previous_confirmed {
+                restore = existing.marked_keys.clone();
+                eprintln!(
+                    "WARN previous handoff to {} was abandoned (not in the roster M for \
+                     {joining_name} carries); restoring {} dead copies",
+                    existing.joining_name,
+                    restore.len()
+                );
+            }
         }
 
         let abort_requested = Arc::new(AtomicBool::new(false));
@@ -2061,15 +2163,20 @@ impl MigrationGuard {
             forwarding_grace: Duration::ZERO,
             acked_entries: None,
             abort_requested: Arc::clone(&abort_requested),
+            marked_keys: Vec::new(),
+            confirmed: false,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
 
-        MigrationOutcome::New(Self {
-            slot,
-            abort_requested,
-            completed: false,
-        })
+        MigrationOutcome::New {
+            guard: Self {
+                slot,
+                abort_requested,
+                completed: false,
+            },
+            restore,
+        }
     }
 
     /// Stamps the entry count this handoff acks (`entries_to_send_count`,
@@ -2095,7 +2202,7 @@ impl MigrationGuard {
     /// `entries_sent`, size-derived migration timeout) so `migration_target_for` keeps
     /// forwarding until that grace passes or the slot is
     /// replaced/cancelled.
-    fn completed(mut self, entries_sent: usize) {
+    fn completed(mut self, entries_sent: usize, marked_keys: Vec<Bytes>) {
         if let Some(active) = self
             .slot
             .lock()
@@ -2104,6 +2211,7 @@ impl MigrationGuard {
         {
             active.completed_at = Some(Instant::now());
             active.forwarding_grace = forwarding_grace(entries_sent);
+            active.marked_keys = marked_keys;
         }
         self.completed = true;
     }
@@ -2389,10 +2497,17 @@ async fn run_migration(
 
     println!(
         "INFO migration completed: {joining_name} (sent {sent_count} keys, marked {} dead \
-         copies; forwarding writes for {}s)",
+         copies, kept until discovery confirms the join; forwarding writes for {}s)",
         marked_this_run.len(),
         forwarding_grace(sent_count).as_secs()
     );
+
+    // Keep the write-forwarding window open past this node's own share
+    // (issue #3) — see `MigrationGuard::completed`. Stamped BEFORE `C`
+    // goes out (issue #62): discovery may start the next join the moment
+    // this `C` lands and have its `M` here before this task gets past the
+    // ack read — a slot still reading as in-flight would reject it.
+    migration_guard.completed(sent_count, marked_this_run);
 
     if let Err(error) = report_complete(&node_context, &joining_name).await {
         eprintln!(
@@ -2400,10 +2515,6 @@ async fn run_migration(
             node_context.discovery_addr
         );
     }
-
-    // Keep the write-forwarding window open past this node's own share
-    // (issue #3) — see `MigrationGuard::completed`.
-    migration_guard.completed(sent_count);
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Bytes>> {
@@ -2503,19 +2614,26 @@ async fn run_sweep(
         loop {
             // Pause only while a transfer is actually running: a
             // completed entry lingering for its forwarding grace
-            // (issue #3) must not stall TTL/mark sweeping for a minute.
-            let migration_active = active_migration
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_ref()
-                .is_some_and(|active| active.completed_at.is_none());
+            // (issue #3) must not stall TTL sweeping for a minute. Its
+            // *marks*, though (issue #62), are held back until discovery
+            // has confirmed the join they belong to — see
+            // `ActiveMigration::confirmed`.
+            let (migration_active, marks_held) = {
+                let slot = active_migration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match slot.as_ref() {
+                    Some(active) => (active.completed_at.is_none(), !active.confirmed),
+                    None => (false, false),
+                }
+            };
 
             if migration_active {
                 break;
             }
 
             tokio::select! {
-                result = sweep(&request_tx) => match result {
+                result = sweep(&request_tx, !marks_held) => match result {
                     Some(removed) if removed >= SWEEP_BUDGET => continue,
                     _ => break,
                 },
@@ -2525,12 +2643,12 @@ async fn run_sweep(
     }
 }
 
-async fn sweep(request_tx: &mpsc::Sender<CacheRequest>) -> Option<usize> {
+async fn sweep(request_tx: &mpsc::Sender<CacheRequest>, marked: bool) -> Option<usize> {
     let (response_tx, response_rx) = oneshot::channel();
 
     request_tx
         .send(CacheRequest {
-            command: Command::Sweep,
+            command: Command::Sweep { marked },
             response_tx,
         })
         .await
@@ -2896,16 +3014,15 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<Forwar
     // Issue #3: a completed handoff keeps forwarding until the grace
     // passes (discovery publishes the joiner — or abandons the join —
     // well within it). Expired entries are cleared lazily here.
-    let expired = slot.as_ref().is_some_and(|active| {
-        active
-            .completed_at
-            .is_some_and(|completed_at| completed_at.elapsed() >= active.forwarding_grace)
-    });
-    if expired {
+    if slot.as_ref().is_some_and(ActiveMigration::expired) {
         *slot = None;
     }
 
     slot.as_ref()
+        // Issue #62: an unconfirmed completed slot outlives its grace (it
+        // is still holding its marks back from the sweep), but forwarding
+        // ends with the grace regardless.
+        .filter(|active| active.forwarding_open())
         .filter(|active| {
             // Client-side replication: the joiner is a destination for `key` whenever it
             // entered the key's top-R, not only as its new primary.
@@ -4197,6 +4314,7 @@ mod tests {
             joining_addr.clone(),
             Arc::clone(&after_ring),
             2,
+            &joined,
         )
         .unwrap_new();
 
@@ -4222,7 +4340,7 @@ mod tests {
 
         // The displaced copy — and only it — is reclaimed by the sweep.
         assert_eq!(
-            send_command(&request_tx, Command::Sweep).await,
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
             Response::Swept(1)
         );
         match send_command(
@@ -4282,12 +4400,15 @@ mod tests {
             "the completed handoff should carry its completion stamp"
         );
 
-        // Window closed: now the displaced key is rejected (and the
-        // lingering slot is cleared lazily), the kept one still served.
+        // Window closed and the join confirmed (issue #62: an unconfirmed
+        // slot outlives its grace to hold its marks): now the displaced
+        // key is rejected (and the lingering slot is cleared lazily), the
+        // kept one still served.
         {
             let mut slot = node_context.active_migration.lock().unwrap();
             let active = slot.as_mut().unwrap();
             active.completed_at = Some(Instant::now() - active.forwarding_grace);
+            active.confirmed = true;
         }
         assert!(wrong_node(&node_context, b"key-3"));
         assert!(!wrong_node(&node_context, b"key-0"));
@@ -4377,6 +4498,8 @@ mod tests {
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: true,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
 
@@ -4406,6 +4529,8 @@ mod tests {
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: true,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -4419,10 +4544,11 @@ mod tests {
             "127.0.0.1:10".to_string(),
             after_ring,
             2,
+            &[],
         );
 
         assert!(
-            matches!(outcome, MigrationOutcome::New(_)),
+            matches!(outcome, MigrationOutcome::New { .. }),
             "an expired slot must not block a new join"
         );
         assert_eq!(
@@ -4445,6 +4571,8 @@ mod tests {
             forwarding_grace: Duration::ZERO,
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: false,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -4458,6 +4586,7 @@ mod tests {
             "127.0.0.1:10".to_string(),
             after_ring,
             2,
+            &[],
         );
 
         assert!(
@@ -4850,11 +4979,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn migrate_command_rejects_a_different_joining_node_while_one_is_active() {
-        // A duplicate `M` sharing the active migration's `joining_name` is
-        // re-acked (see `migrate_command_re_acks_a_duplicate_m_for_the_same_joining_node`);
-        // an `M` for a genuinely different `joining_name` while one is
-        // already active must still be rejected with `R\n`.
+    async fn migrate_command_accepts_a_different_joining_node_once_the_handoff_completed() {
+        // Issue #62: a completed handoff (still within its forwarding
+        // window) must not block the next join — discovery serializes
+        // joins, so a second `M` means the first join was decided. (A
+        // genuinely in-flight conflict is still rejected — see
+        // `migration_guard_rejects_a_still_active_conflicting_migration`.)
         let (request_tx, request_rx) = mpsc::channel(1);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
 
@@ -4935,15 +5065,321 @@ mod tests {
         second_migrate_message.extend_from_slice(b"joiner-b");
         second_migrate_message.extend_from_slice(second_joining_addr.as_bytes());
 
+        // Only once the first handoff has reported `C` (its slot is
+        // stamped completed before that report goes out).
+        discovery_task.await.unwrap();
+
         client.write_all(&second_migrate_message).await.unwrap();
-        let mut second_ack = [0u8; 2];
+        let mut second_ack = [0u8; 4];
         client.read_exact(&mut second_ack).await.unwrap();
         assert_eq!(
-            &second_ack, b"R\n",
-            "an M for a different joining node must still be rejected while one is active"
+            &second_ack, b"A 0\n",
+            "an M for the next joining node must be accepted once the previous handoff completed"
         );
 
+        client.shutdown().await.unwrap();
+        let _ = connection_task.await;
+        migration_relay.await.unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    fn completed_forwarding_slot(marked: &[&str]) -> ActiveMigration {
+        ActiveMigration {
+            joining_name: "joiner-0".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ])),
+            replication: 2,
+            completed_at: Some(Instant::now()),
+            forwarding_grace: forwarding_grace(0),
+            acked_entries: Some(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: marked
+                .iter()
+                .map(|key| Bytes::copy_from_slice(key.as_bytes()))
+                .collect(),
+            confirmed: false,
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    fn new_guard_for_joiner_1(
+        slot: &Arc<Mutex<Option<ActiveMigration>>>,
+        joined: &[(String, String)],
+    ) -> MigrationOutcome {
+        MigrationGuard::new(
+            Arc::clone(slot),
+            "joiner-1".to_string(),
+            "127.0.0.1:10".to_string(),
+            Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-1".to_string(),
+            ])),
+            2,
+            joined,
+        )
+    }
+
+    #[test]
+    fn migration_guard_accepts_the_next_join_while_a_completed_handoff_is_still_forwarding() {
+        // Issue #62: back-to-back joins. The previous joiner is in the new
+        // `M`'s roster, so its dead copies stay marked (nothing to
+        // restore) and the slot moves on to the new joiner.
+        let slot = Arc::new(Mutex::new(Some(completed_forwarding_slot(&["dead"]))));
+        let joined = vec![
+            ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+            ("joiner-0".to_string(), "127.0.0.1:9".to_string()),
+        ];
+
+        // Kept alive: dropping an uncompleted guard clears the slot.
+        let _guard = match new_guard_for_joiner_1(&slot, &joined) {
+            MigrationOutcome::New { restore, guard } => {
+                assert!(restore.is_empty());
+                guard
+            }
+            _ => panic!("expected a new guard"),
+        };
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().joining_name,
+            "joiner-1"
+        );
+    }
+
+    #[test]
+    fn migration_guard_restores_dead_copies_of_a_handoff_whose_joiner_never_joined() {
+        // Issue #62: the new `M`'s roster lacks the previous joiner — that
+        // join was abandoned (and this node missed the `X`), so the keys
+        // it marked dead are handed back to be unmarked.
+        let slot = Arc::new(Mutex::new(Some(completed_forwarding_slot(&[
+            "dead-a", "dead-b",
+        ]))));
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+
+        let _guard = match new_guard_for_joiner_1(&slot, &joined) {
+            MigrationOutcome::New { restore, guard } => {
+                assert_eq!(
+                    restore,
+                    vec![Bytes::from_static(b"dead-a"), Bytes::from_static(b"dead-b")]
+                );
+                guard
+            }
+            _ => panic!("expected a new guard"),
+        };
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().joining_name,
+            "joiner-1"
+        );
+    }
+
+    #[test]
+    fn an_unconfirmed_completed_slot_outlives_its_grace_but_stops_forwarding() {
+        // Issue #62: past the grace, forwarding is over, but the slot (and
+        // so its marks) stays until the join is decided.
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:1".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx,
+        };
+        let mut stale = completed_forwarding_slot(&["dead"]);
+        stale.completed_at = Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1));
+        *node_context.active_migration.lock().unwrap() = Some(stale);
+
+        assert!(migration_target_for(&node_context, b"key-0").is_none());
+        assert!(
+            node_context.active_migration.lock().unwrap().is_some(),
+            "an unconfirmed slot must keep holding its marks"
+        );
+
+        // Once confirmed, the same stale slot is cleared lazily as before.
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .confirmed = true;
+        assert!(migration_target_for(&node_context, b"key-0").is_none());
+        assert!(node_context.active_migration.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn adopt_membership_confirms_a_completed_handoff_once_the_roster_lists_its_joiner() {
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<ActiveMigration>>> =
+            Arc::new(Mutex::new(Some(completed_forwarding_slot(&["dead"]))));
+
+        // Roster without the joiner: neither adopted nor confirmed.
+        adopt_membership(&known_ring, &slot, "d", vec!["ready-node".to_string()], 2);
+        assert!(!slot.lock().unwrap().as_ref().unwrap().confirmed);
+        assert!(known_ring.lock().unwrap().is_none());
+
+        // Roster with the joiner: both.
+        adopt_membership(
+            &known_ring,
+            &slot,
+            "d",
+            vec!["joiner-0".to_string(), "ready-node".to_string()],
+            2,
+        );
+        assert!(slot.lock().unwrap().as_ref().unwrap().confirmed);
+        assert!(known_ring.lock().unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancel_after_completion_restores_the_dead_copies() {
+        // Issue #62: this node finished its share (the key is marked dead)
+        // and reported `C`; discovery then abandons the join (another
+        // source couldn't take the `M`) and sends `X`. The copy must come
+        // back — and must not have been swept in the meantime.
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Bytes::from_static(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake joining node that acks the one SET.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"S\n").await.unwrap();
+        });
+
+        // A fake discovery server that acks the `C`, and signals it.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (completed_tx, completed_rx) = oneshot::channel();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+            completed_tx.send(()).unwrap();
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+        let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(NodeContext {
+                    name: "ready-node".to_string(),
+                    token: "tk-ready-node".to_string(),
+                    discovery_addr,
+                    active_migration: Arc::clone(&active_migration),
+                    known_ring: Arc::new(Mutex::new(None)),
+                    auth_secret: None,
+                    tls_connector: None,
+                    request_tx: request_tx.clone(),
+                }),
+                migration_tx,
+            },
+            shutdown_rx.clone(),
+        ));
+
+        // R=1, so the sender is displaced: "name" is marked dead once sent.
+        let joining_name = "joiner-107";
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+        client.write_all(&migrate_message).await.unwrap();
+        let mut ack = [0u8; 4];
+        client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A 1\n");
+
+        completed_rx.await.unwrap();
+        joining_task.await.unwrap();
         discovery_task.await.unwrap();
+        // `completed()` runs right after `C` is acked; wait for the stamp.
+        for _ in 0..200 {
+            if active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|active| active.completed_at.is_some())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let slot = active_migration.lock().unwrap();
+            let active = slot.as_ref().expect("the completed slot must linger");
+            assert!(active.completed_at.is_some());
+            assert!(!active.confirmed);
+            assert_eq!(active.marked_keys, vec![Bytes::from_static(b"name")]);
+        }
+        // What `run_sweep` does while the join is undecided: TTL only.
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep { marked: false }).await,
+            Response::Swept(0)
+        );
+
+        let mut cancel_message = format!("X {} {}\n", joining_name.len(), token.len()).into_bytes();
+        cancel_message.extend_from_slice(token.as_bytes());
+        cancel_message.extend_from_slice(joining_name.as_bytes());
+        client.write_all(&cancel_message).await.unwrap();
+        let mut cancel_ack = [0u8; 2];
+        client.read_exact(&mut cancel_ack).await.unwrap();
+        assert_eq!(&cancel_ack, b"A\n");
+
+        assert!(active_migration.lock().unwrap().is_none());
+        // The mark is gone: a full sweep reclaims nothing and the key is
+        // still served.
+        assert_eq!(
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
+            Response::Swept(0)
+        );
+        assert_eq!(
+            send_command(
+                &request_tx,
+                Command::Get {
+                    key: Bytes::from_static(b"name")
+                }
+            )
+            .await,
+            Response::Value(Bytes::from_static(b"Alice"))
+        );
+
         client.shutdown().await.unwrap();
         let _ = connection_task.await;
         migration_relay.await.unwrap();
@@ -5089,7 +5525,7 @@ mod tests {
             Response::Value(Bytes::from_static(b"Alice"))
         );
         assert_eq!(
-            send_command(&request_tx, Command::Sweep).await,
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
             Response::Swept(0)
         );
 
@@ -5373,7 +5809,7 @@ mod tests {
             Response::Value(Bytes::from_static(b"Alice"))
         );
         assert_eq!(
-            send_command(&request_tx, Command::Sweep).await,
+            send_command(&request_tx, Command::Sweep { marked: true }).await,
             Response::Swept(0)
         );
 
@@ -5515,6 +5951,8 @@ mod tests {
             forwarding_grace: forwarding_grace(0),
             acked_entries: Some(0),
             abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: false,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }

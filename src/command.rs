@@ -50,10 +50,14 @@ pub enum Command {
         key: Bytes,
     },
     /// Internal-only (staged node join): the active-deletion pass, run
-    /// periodically by a background task. Reclaims every marked entry
-    /// and, since TTL expiry is otherwise only checked lazily on access,
-    /// also proactively removes anything already past its TTL.
-    Sweep,
+    /// periodically by a background task. Since TTL expiry is otherwise
+    /// only checked lazily on access, proactively removes anything
+    /// already past its TTL; with `marked` also reclaims every marked
+    /// entry — withheld (issue #62) while the join those marks belong to
+    /// is still undecided, see `run_sweep` in `server.rs`.
+    Sweep {
+        marked: bool,
+    },
     /// Staged node join: sent by discovery to a `Joined` node when a new node is
     /// joining, so this node can compute (via `HashRing`) how each of its
     /// own keys' top-R owner set changes (client-side replication). `joining_name`/
@@ -148,7 +152,8 @@ impl Command {
                 Response::Unmarked
             }
 
-            Self::Sweep => Response::Swept(cache.sweep()),
+            Self::Sweep { marked: true } => Response::Swept(cache.sweep()),
+            Self::Sweep { marked: false } => Response::Swept(cache.sweep_expired()),
         }
     }
 }
@@ -1043,7 +1048,23 @@ mod tests {
         cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
         cache.mark_migrated(b"name");
 
-        assert_eq!(Command::Sweep.execute(&mut cache), Response::Swept(1));
+        assert_eq!(
+            Command::Sweep { marked: true }.execute(&mut cache),
+            Response::Swept(1)
+        );
+    }
+
+    #[test]
+    fn sweep_without_marked_leaves_marked_entries_in_place() {
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(b"name");
+
+        assert_eq!(
+            Command::Sweep { marked: false }.execute(&mut cache),
+            Response::Swept(0)
+        );
+        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]

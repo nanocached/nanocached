@@ -92,6 +92,12 @@ cargo run --bin nanocached-node -- --port 8356 \
   --discovery 127.0.0.1:8357,127.0.0.1:8358
 ```
 
+Joins are serialized: discovery moves one node at a time through its
+staged handoff, so nodes started together (or in quick succession) queue
+and join one after another — each join takes roughly the time its handoff
+needs, and no key is lost to a join that has to be retried (a source keeps
+the copies it handed off until discovery confirms the join).
+
 ### Authentication
 
 Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared
