@@ -3030,7 +3030,16 @@ async fn forward_with_retries(
 /// the key plainly unavailable (an error, not a miss) for R=1. Serving it
 /// locally — and forwarding `S`/`D` to the joiner, which the handlers
 /// already do for exactly this window — is what keeps the join invisible
-/// to clients. Once the window closes the rejection below takes over.
+/// to clients.
+///
+/// Only until discovery has confirmed the join, though (issue #66):
+/// from then on `L` does list the joiner, so a `W` is exactly what a
+/// still-stale client needs — its refresh-and-retry lands on the joiner
+/// — whereas serving locally would hand out this node's dead copy (which
+/// the sweep is about to reclaim, and which writes sent straight to the
+/// joiner no longer update): every read that reached this node in the
+/// rest of the forwarding window missed (`N`) once the sweep had run.
+/// Write forwarding keeps going for the whole window regardless.
 fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
     let displaced = node_context
         .known_ring
@@ -3045,7 +3054,29 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
                 .is_owner(key, &node_context.name, membership.replication)
         });
 
-    displaced && migration_target_for(node_context, key).is_none()
+    displaced && !serving_locally_for_unconfirmed_join(node_context, key)
+}
+
+/// `wrong_node`'s exception: a handoff this node ran is still forwarding
+/// `key` to a joiner discovery hasn't confirmed yet (see
+/// `ActiveMigration::confirmed`), so this node is the only owner a
+/// client's `L` can name and must keep serving the key itself.
+fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &[u8]) -> bool {
+    let mut slot = node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Same lazy expiry as `migration_target_for`.
+    if slot.as_ref().is_some_and(ActiveMigration::expired) {
+        *slot = None;
+    }
+    slot.as_ref().is_some_and(|active| {
+        !active.confirmed
+            && active.forwarding_open()
+            && active
+                .after_ring
+                .is_owner(key, &active.joining_name, active.replication)
+    })
 }
 
 /// If a handoff is currently in flight and `key` is one it's moving (per
@@ -4424,6 +4455,22 @@ mod tests {
         // hasn't published the joiner yet; the kept key is served as ever.
         assert!(!wrong_node(&node_context, b"key-3"));
         assert!(!wrong_node(&node_context, b"key-0"));
+
+        // Join confirmed by discovery, window still open (issue #66): the
+        // displaced key is now rejected — `L` lists the joiner, so a
+        // stale client's refresh-and-retry lands there instead of on
+        // this node's dead copy — while the kept one is still served and
+        // write forwarding (`migration_target_for`) continues.
+        node_context
+            .active_migration
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .confirmed = true;
+        assert!(wrong_node(&node_context, b"key-3"));
+        assert!(!wrong_node(&node_context, b"key-0"));
+        assert!(migration_target_for(&node_context, b"key-3").is_some());
 
         // Issue #3: this node's own share being done must NOT close the
         // write-forwarding window — discovery hasn't published the joiner
