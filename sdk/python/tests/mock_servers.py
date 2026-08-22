@@ -132,8 +132,10 @@ class MockNode:
         of the same name."""
         self._silent = True
 
-    async def start(self) -> "MockNode":
-        self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
+    async def start(self, port: int = 0) -> "MockNode":
+        """``port`` pins the listener — for a node that comes back on the
+        address discovery already advertised (issue #67 tests)."""
+        self._server = await asyncio.start_server(self._serve, "127.0.0.1", port)
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 

@@ -225,9 +225,13 @@ def _has_open_target(key: str) -> bool:
 
 class _Member:
     """One cluster member: its last-known address (for lazy redials) and
-    its current connection."""
+    its current connection — ``None`` for a member that was listed by
+    discovery but unreachable when this client bootstrapped (issue #67):
+    it stays routable, so a request for one of its keys fails over the
+    same way it would after a mid-life node death, and the next request
+    after the reconnect cooldown redials it."""
 
-    def __init__(self, address: str, connection: Connection) -> None:
+    def __init__(self, address: str, connection: Connection | None) -> None:
         self.address = address
         self.connection = connection
 
@@ -413,16 +417,59 @@ class NanocachedClient:
         return Connection(reader, writer, on_close=lambda: _decrement_open_target(key), tagged=tagged)
 
     async def _open_cluster(self, identified: ClusterTarget) -> None:
-        for node in identified.nodes:
+        """Dials every node discovery listed, concurrently. A node that
+        can't be reached (issue #67: typically one that just died and
+        discovery hasn't evicted yet — its liveness window is seconds
+        long, and every key is still served by another owner when R > 1)
+        is installed without a connection and with its reconnect cooldown
+        armed, exactly the state a member is in after dying mid-life, so
+        requests for its keys fail over per request instead of the whole
+        connect() failing. Only a cluster with *no* reachable node fails
+        connect(), with the last dial error."""
+
+        async def dial(node):
             node_host, node_port = split_host_port(node.address)
-            target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
-            if not isinstance(target, NodeTarget):
+            try:
+                target = await connect_and_identify(
+                    node_host, node_port, self._auth_secret, self._ssl_context
+                )
+            except (NanocachedError, OSError) as error:
+                return node, error
+            return node, target
+
+        outcomes = await asyncio.gather(*(dial(node) for node in identified.nodes))
+
+        # A non-node answer is a configuration error, not a liveness one:
+        # checked across every outcome first so the sockets this same
+        # round already opened are closed rather than leaked.
+        for node, outcome in outcomes:
+            if not isinstance(outcome, (Exception, NodeTarget)):
+                for _, other in outcomes:
+                    if not isinstance(other, Exception):
+                        other.writer.close()
                 raise NanocachedError(
                     f"nanocached: discovery server returned a non-node address: {node.address}"
                 )
+
+        reachable = 0
+        last_error: Exception | None = None
+        for node, outcome in outcomes:
+            if isinstance(outcome, Exception):
+                self._members[node.name] = _Member(node.address, None)
+                self._redial_cooldowns[node.address] = (
+                    time.monotonic() + self._reconnect_cooldown,
+                    outcome,
+                )
+                last_error = outcome
+                continue
             self._members[node.name] = _Member(
-                node.address, self._new_connection(target.reader, target.writer, target.tagged)
+                node.address, self._new_connection(outcome.reader, outcome.writer, outcome.tagged)
             )
+            reachable += 1
+
+        if reachable == 0:
+            assert last_error is not None
+            raise last_error
 
         self._ring = HashRing([node.name for node in identified.nodes])
         self._replication = identified.replication
@@ -648,7 +695,8 @@ class NanocachedClient:
         if self._single is not None:
             self._single.close()
         for member in self._members.values():
-            member.connection.close()
+            if member.connection is not None:
+                member.connection.close()
 
     # ── ルーティングと複製 ─────────────────────────────────────────
 
@@ -896,7 +944,7 @@ class NanocachedClient:
             # Connection-classified (issue #8): the usual cause is a
             # refresh racing this operation, which the retry layer heals.
             raise ConnectionError(f"nanocached: {name} has no open connection")
-        if not member.connection.closed:
+        if member.connection is not None and not member.connection.closed:
             return member.connection
         return await self._redial(name, member.address)
 
@@ -963,7 +1011,7 @@ class NanocachedClient:
         if current is None:
             connection.close()
             raise ConnectionError(f"nanocached: {slot} left the cluster while reconnecting")
-        if current.connection.closed:
+        if current.connection is None or current.connection.closed:
             current.connection = connection
             return connection
         if current.connection is not connection:
@@ -1002,7 +1050,9 @@ class NanocachedClient:
 
         for name in list(self._members):
             if name not in by_name:
-                self._members[name].connection.close()
+                stale = self._members[name].connection
+                if stale is not None:
+                    stale.close()
                 del self._members[name]
 
         for node in cluster.nodes:
@@ -1079,7 +1129,11 @@ class NanocachedClient:
                 await asyncio.sleep(interval)
                 connections = (
                     [self._single] if self._single is not None
-                    else [member.connection for member in self._members.values()]
+                    else [
+                        member.connection
+                        for member in self._members.values()
+                        if member.connection is not None
+                    ]
                 )
                 for connection in connections:
                     if connection is None or connection.closed:
