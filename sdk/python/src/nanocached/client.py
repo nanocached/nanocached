@@ -439,6 +439,18 @@ class NanocachedClient:
 
         outcomes = await asyncio.gather(*(dial(node) for node in identified.nodes))
 
+        # A non-node answer is a configuration error, not a liveness one:
+        # checked across every outcome first so the sockets this same
+        # round already opened are closed rather than leaked.
+        for node, outcome in outcomes:
+            if not isinstance(outcome, (Exception, NodeTarget)):
+                for _, other in outcomes:
+                    if not isinstance(other, Exception):
+                        other.writer.close()
+                raise NanocachedError(
+                    f"nanocached: discovery server returned a non-node address: {node.address}"
+                )
+
         reachable = 0
         last_error: Exception | None = None
         for node, outcome in outcomes:
@@ -450,11 +462,6 @@ class NanocachedClient:
                 )
                 last_error = outcome
                 continue
-            if not isinstance(outcome, NodeTarget):
-                outcome.writer.close()
-                raise NanocachedError(
-                    f"nanocached: discovery server returned a non-node address: {node.address}"
-                )
             self._members[node.name] = _Member(
                 node.address, self._new_connection(outcome.reader, outcome.writer, outcome.tagged)
             )
