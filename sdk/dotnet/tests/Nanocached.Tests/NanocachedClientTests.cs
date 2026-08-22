@@ -1875,6 +1875,31 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task DisposeRacingAFinishingHedgeLegDoesNotThrow()
+    {
+        // v0.3.0 regression: Close()'s drain checked _hedgedReads for
+        // emptiness and then looked up First(); a losing leg's completion
+        // callback removing itself in between made First() throw out of
+        // Dispose(). Exercised by disposing right as the slow leg lands.
+        for (int i = 0; i < 20; i++)
+        {
+            using Cluster cluster = StartCluster(replication: 2);
+            IReadOnlyList<string> owners = OwnersOf("k");
+            string primary = owners[0];
+            NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+                ReadHedgeAfter = TimeSpan.FromMilliseconds(5),
+            });
+            await client.SetAsync("k", "v");
+            cluster.Nodes[primary].DelayGets(20);
+            Assert.Equal("v", await client.GetAsync("k"));
+            await Task.Delay(i % 5 * 5);
+            client.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task OffByDefaultASlowPrimaryBoundsTheRead()
     {
         using Cluster cluster = StartCluster(replication: 2);

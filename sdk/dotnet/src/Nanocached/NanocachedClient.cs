@@ -846,10 +846,17 @@ public sealed class NanocachedClient : IDisposable
         // still reading from. Each task is removed from the set by this
         // loop itself, not left to its own completion callback, so a leg
         // that finishes concurrently with this drain can't be waited on
-        // twice or looked up after it's already gone.
-        while (!_hedgedReads.IsEmpty)
+        // twice or looked up after it's already gone. A leg's own
+        // completion callback may also remove it between the emptiness
+        // check and the lookup, so the lookup itself must tolerate an
+        // empty set (First() threw here — v0.3.0 .NET SDK).
+        while (true)
         {
-            Task leg = _hedgedReads.Keys.First();
+            Task? leg = _hedgedReads.Keys.FirstOrDefault();
+            if (leg is null)
+            {
+                break;
+            }
             _hedgedReads.TryRemove(leg, out _);
             try
             {
