@@ -1723,6 +1723,158 @@ class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
+    """Hedged reads (issue #64): read_hedge_after sends a read to the next
+    owner when the primary hasn't answered in time — a slow node no longer
+    bounds every read that touches it."""
+
+    TIMING_TOLERANCE_S = 0.03
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def timed(self, coroutine):
+        start = asyncio.get_running_loop().time()
+        result = await coroutine
+        return result, asyncio.get_running_loop().time() - start
+
+    async def test_rejects_a_non_positive_hedge(self):
+        for bad in (0, -0.1):
+            with self.assertRaises(ValueError):
+                await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=bad)
+
+    async def test_a_hit_from_the_replica_wins_over_a_slow_primary(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.4)
+
+                value, elapsed = await self.timed(client.get("k"))
+
+                self.assertEqual(value, "v")
+                self.assertLess(elapsed, 0.4 - self.TIMING_TOLERANCE_S, elapsed)
+                self.assertGreaterEqual(elapsed, 0.05 - self.TIMING_TOLERANCE_S, elapsed)
+                self.assertEqual(nodes[replica].get_count, 1, "the replica should have been hedged to")
+            finally:
+                await client.close()
+            # The slow primary's leg was left to finish, not cancelled, and
+            # close() drained it.
+            self.assertEqual(client._hedged_reads, set())
+            self.assertEqual(nodes[primary].get_count, 1)
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_fast_primary_is_never_hedged(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                _, replica = self.owners_of("k")
+                for _ in range(5):
+                    self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(nodes[replica].get_count, 0)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_replica_miss_waits_for_the_primary(self):
+        # Hedging must never turn a hit into a miss: the replica lacks the
+        # copy and answers first, but the primary's answer is what counts.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                del nodes[replica].store[b"k"]
+                nodes[primary].delay_gets(0.2)
+
+                value, elapsed = await self.timed(client.get("k"))
+
+                self.assertEqual(value, "v")
+                self.assertGreaterEqual(elapsed, 0.2 - self.TIMING_TOLERANCE_S, elapsed)
+                self.assertEqual(nodes[replica].get_count, 1)
+
+                # A key nobody has: the miss is accepted once the primary
+                # has answered it too.
+                self.assertIsNone(await client.get("absent"))
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_off_by_default_a_slow_primary_bounds_the_read(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.2)
+
+                value, elapsed = await self.timed(client.get("k"))
+
+                self.assertEqual(value, "v")
+                self.assertGreaterEqual(elapsed, 0.2 - self.TIMING_TOLERANCE_S, elapsed)
+                self.assertEqual(nodes[replica].get_count, 0)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_dead_primary_fails_over_immediately(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], read_hedge_after=0.5
+        )
+        try:
+            await client.set("k", "v")
+            primary, _ = self.owners_of("k")
+            await nodes[primary].close()
+            await wait_for(
+                lambda: client._members[primary].connection.closed,
+                "the client to see the FIN",
+            )
+
+            value, elapsed = await self.timed(client.get("k"))
+
+            self.assertEqual(value, "v")
+            self.assertLess(elapsed, 0.5 - self.TIMING_TOLERANCE_S, elapsed)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
 class StatsTests(unittest.IsolatedAsyncioTestCase):
     # stats()/ClientStats: observability for failures swallowed by design
     # (client-side replication / fire-and-forget replica writes / read repair).

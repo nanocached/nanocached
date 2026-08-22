@@ -38,6 +38,7 @@ class MockNode:
         self._missing_tag_replies = 0
         self._invalid_tag_value_replies = 0
         self._get_delay = 0.0
+        self._gets_delay = 0.0
         self._set_delay = 0.0
         self._silent = False
         self.last_set_ttl = 0
@@ -112,6 +113,11 @@ class MockNode:
         mid-flight (asyncio.wait_for) and probe cancellation safety."""
         self._get_delay = seconds
 
+    def delay_gets(self, seconds: float) -> None:
+        """Hold every future G's response — a slow-but-alive node, for
+        hedged-read tests (issue #64)."""
+        self._gets_delay = seconds
+
     def delay_sets(self, seconds: float) -> None:
         """Hold every future S's response — for tests proving a caller
         isn't blocked on a slow replica leg (fire-and-forget replica writes)."""
@@ -184,6 +190,8 @@ class MockNode:
                     if self._get_delay > 0:
                         delay, self._get_delay = self._get_delay, 0.0
                         await asyncio.sleep(delay)
+                    if self._gets_delay > 0:
+                        await asyncio.sleep(self._gets_delay)
                     if self._swallowed_gets > 0:
                         self._swallowed_gets -= 1
                         continue

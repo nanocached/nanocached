@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from typing import Any
 import ssl as ssl_module
 import sys
 import threading
@@ -231,6 +232,33 @@ class _Member:
         self.connection = connection
 
 
+async def _drain_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """close()'s drain of a set of detached tasks — see the comment at its
+    call site for why each task is removed here, by this loop, before it
+    is awaited (issue #65)."""
+    while tasks:
+        task = next(iter(tasks))
+        tasks.discard(task)
+        try:
+            await task
+        except asyncio.CancelledError:
+            # The task's own cancellation is its outcome, retrieved here
+            # like any other; close() itself being cancelled must still
+            # propagate.
+            if not task.cancelled():
+                raise
+        except Exception:
+            pass
+
+
+def _retrieve_outcome(task: asyncio.Task[Any]) -> None:
+    """Done-callback for a detached task nobody will await: retrieves its
+    exception so it never surfaces as an "exception was never retrieved"
+    warning."""
+    if not task.cancelled():
+        task.exception()
+
+
 class NanocachedClient:
     def __init__(self) -> None:  # use `await NanocachedClient.connect(...)`
         self._closed = False
@@ -258,6 +286,12 @@ class NanocachedClient:
         # categories admit up to twice the intended cap combined.
         self._background_replica_writes: set[asyncio.Task[None]] = set()
         self._read_repair: bool = False
+        # Hedged reads (issue #64): None = off. See _read_hedged().
+        self._read_hedge_after: float | None = None
+        # Hedge legs still in flight after a read has already returned
+        # (the losers); finished detached, drained by close() exactly like
+        # _background_replica_writes.
+        self._hedged_reads: set[asyncio.Task[object]] = set()
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -288,9 +322,12 @@ class NanocachedClient:
         fire_and_forget_replicas: bool = False,
         read_repair: bool = False,
         reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN,
+        read_hedge_after: float | None = None,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
+        if read_hedge_after is not None and not read_hedge_after > 0:
+            raise ValueError("nanocached: read_hedge_after must be a positive number of seconds")
 
         client = cls()
         client._addresses = list(addresses)
@@ -301,6 +338,7 @@ class NanocachedClient:
         client._fire_and_forget_replicas = fire_and_forget_replicas
         client._read_repair = read_repair
         client._reconnect_cooldown = reconnect_cooldown
+        client._read_hedge_after = read_hedge_after
 
         # Walk the addresses until one yields a working target; an address
         # that is unreachable, warming up (`B`, discovery HA), or knows no live
@@ -595,19 +633,8 @@ class NanocachedClient:
         # never-shrinking set forever — a synchronous spin that froze the
         # whole event loop (every other coroutine in the process, the
         # request-timeout timers, the read loops), not just close().
-        while self._background_replica_writes:
-            task = next(iter(self._background_replica_writes))
-            self._background_replica_writes.discard(task)
-            try:
-                await task
-            except asyncio.CancelledError:
-                # The task's own cancellation is its outcome, retrieved
-                # here like any other; close() itself being cancelled
-                # must still propagate.
-                if not task.cancelled():
-                    raise
-            except Exception:
-                pass
+        await _drain_tasks(self._background_replica_writes)
+        await _drain_tasks(self._hedged_reads)
 
         self._teardown()
 
@@ -653,10 +680,14 @@ class NanocachedClient:
         if self._ring is None:
             return await op(await self._single_connection())
 
+        names = self._owner_names(key)
+        if self._read_hedge_after is not None and len(names) > 1:
+            return await self._read_hedged(key, op, names)
+
         # Owners in rank order; fall through only on connection-level
         # failure — a replica hedges against a dead holder, not a miss.
         last_error: Exception | None = None
-        for name in self._owner_names(key):
+        for name in names:
             try:
                 connection = await self._member_connection(name)
             except (ConnectionError, OSError, NanocachedError) as error:
@@ -673,6 +704,91 @@ class NanocachedClient:
                 # WrongNode answer (issue #8) — matching the TypeScript
                 # SDK's semantics.
                 last_error = error
+        raise last_error if last_error is not None else ConnectionError(
+            "nanocached: no owner is reachable for this key"
+        )
+
+    async def _read_hedged(self, key: bytes, op, names: list[str]):
+        """Hedged reads (issue #64): one slow — not dead — owner otherwise
+        bounds every read that touches it at its full RTT, since the
+        sequential path in _read() only moves on to the next owner when
+        the current one *fails*. Here the read starts at the primary, and
+        if no answer has arrived within ``read_hedge_after`` the same read
+        is also sent to the next owner (and so on, one more owner per
+        interval); the first answer decides:
+
+        - a hit from any owner is final;
+        - a miss is final only from the primary — a replica's miss is
+          provisional (it may simply lack a copy) and the primary is still
+          waited for, so hedging never turns a hit into a miss; it is
+          accepted only once every owner has answered or failed;
+        - a failure (connection-level or a NanocachedError other than
+          WrongNodeError) just hedges onward immediately;
+        - WrongNodeError propagates as in _read().
+
+        The losing legs are never cancelled — cancelling mid-write poisons
+        a connection (see Connection._request) — but left to finish
+        detached in ``_hedged_reads``, their outcome retrieved, and
+        drained by close()."""
+        hedge_after = self._read_hedge_after
+        assert hedge_after is not None
+        legs: dict[asyncio.Task[object], int] = {}
+
+        def start(index: int) -> asyncio.Task[object]:
+            async def leg() -> object:
+                connection = await self._member_connection(names[index])
+                return await op(connection)
+
+            task = asyncio.ensure_future(leg())
+            task.add_done_callback(_retrieve_outcome)
+            legs[task] = index
+            self._hedged_reads.add(task)
+            return task
+
+        def detach(tasks: set[asyncio.Task[object]]) -> None:
+            # Left in _hedged_reads for close() to drain; removed from it
+            # on completion so the set doesn't grow with finished legs.
+            for task in tasks:
+                task.add_done_callback(self._hedged_reads.discard)
+
+        pending: set[asyncio.Task[object]] = {start(0)}
+        next_index = 1
+        last_error: Exception | None = None
+        replica_missed = False
+
+        while pending:
+            timeout = hedge_after if next_index < len(names) else None
+            done, pending = await asyncio.wait(
+                pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                # Hedge interval elapsed with no answer: one more owner.
+                pending.add(start(next_index))
+                next_index += 1
+                continue
+            for task in done:
+                self._hedged_reads.discard(task)
+                index = legs[task]
+                try:
+                    value = task.result()
+                except WrongNodeError:
+                    detach(pending)
+                    raise
+                except (NanocachedError, ConnectionError, OSError) as error:
+                    last_error = error
+                    continue
+                if value is not None or index == 0:
+                    detach(pending)
+                    return value
+                replica_missed = True
+            if not pending and next_index < len(names):
+                # Everything so far failed or missed provisionally: the
+                # next owner gets its turn right away.
+                pending.add(start(next_index))
+                next_index += 1
+
+        if replica_missed:
+            return None
         raise last_error if last_error is not None else ConnectionError(
             "nanocached: no owner is reachable for this key"
         )
