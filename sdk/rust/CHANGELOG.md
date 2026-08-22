@@ -19,6 +19,18 @@ follow the `sdk/rust/vX.Y.Z` tags.
   to completion detached and is drained by `close()`, the same way a
   fire-and-forget replica write is (issue #64).
 
+### Fixed
+
+- `connect()` no longer fails outright just because one of the nodes
+  discovery lists can't be reached yet — typically one that just died
+  and hasn't been evicted from discovery's liveness window (a few
+  seconds). Every listed node is now dialed concurrently; one that can't
+  be reached is installed as a member without a live connection and with
+  its reconnect cooldown armed, exactly the state a member is in after
+  dying mid-life, so requests for its keys fail over per request instead
+  of failing `connect()`. Only a cluster with no reachable node at all
+  still fails `connect()`, with the last dial error (issue #67).
+
 ## [0.2.0] - 2026-08-22
 
 First aligned release of the server and all six SDKs at one version.

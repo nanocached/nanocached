@@ -171,6 +171,13 @@ can't tell "not specified" apart from "explicitly zero"); call
 request that finds a dead connection pays its own full dial attempt) —
 the Go SDK's equivalent is a negative `Config.ReconnectCooldown`.
 
+`connect()` itself tolerates a node that discovery still lists but that
+can't be reached — typically one that just died and hasn't been evicted
+yet (a window of seconds): the node is kept in the ring without a
+connection, requests for its keys fail over per request exactly as they
+would after a mid-life death, and it is redialed after the cooldown.
+Only a cluster with no reachable node at all fails `connect()`.
+
 Every `get`/`set`/`delete` also carries its own 30-second wall-clock
 timeout, measured from when that request is issued, so a half-open
 server (one that accepts the connection but stops answering) can't hang

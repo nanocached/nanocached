@@ -552,6 +552,7 @@ impl NanocachedClient {
         let tls = resolve_tls(options.tls, options.ca.as_deref()).await?;
         let compress = resolve_compression(options.compress)?;
         let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
+        let reconnect_cooldown = options.reconnect_cooldown.resolve();
 
         // Walk the addresses until one yields a working target; an
         // address that is unreachable, warming up (`B`, discovery HA), or
@@ -560,6 +561,14 @@ impl NanocachedClient {
         let mut last_error: Option<Error> = None;
         let mut target: Option<Target> = None;
         let mut tracking_key = String::new();
+        // Bootstrap tolerance (issue #67): a member installed without a
+        // live connection (see below) gets its reconnect cooldown armed
+        // here, at the same instant it's installed, so a request routed
+        // to it right after connect() returns fails immediately with the
+        // dial error instead of re-paying a doomed `CONNECT_DEADLINE` —
+        // exactly the cooldown a mid-life redial failure would leave
+        // behind. Folded into `Inner::reconnect_cooldowns` once it exists.
+        let mut initial_cooldowns: HashMap<String, (Instant, Error)> = HashMap::new();
 
         for (host, port) in &options.addresses {
             let key = format!("{host}:{port}");
@@ -604,31 +613,32 @@ impl NanocachedClient {
                         continue;
                     }
 
-                    let mut members = HashMap::new();
-                    let mut dial_error = None;
-                    for node in &nodes {
-                        let outcome: Result<_> = async {
-                            let (node_host, node_port) = split_host_port(&node.address)?;
-                            let identified = connect_and_identify(
-                                &node_host,
-                                node_port,
-                                auth_secret,
-                                tls.as_ref(),
-                                CONNECT_DEADLINE,
-                            )
-                            .await?;
-                            match identified {
-                                Identified::Node { stream, tagged } => Ok((stream, tagged)),
-                                Identified::Cluster { .. } => Err(Error::Protocol(format!(
-                                    "nanocached: discovery server returned a non-node address: {}",
-                                    node.address
-                                ))),
-                            }
-                        }
-                        .await;
+                    // Dials every listed node concurrently (issue #67):
+                    // `join_all` polls every dial together instead of one
+                    // after another, so bootstrap's worst-case latency
+                    // stays one `CONNECT_DEADLINE` regardless of cluster
+                    // size, not `nodes.len()` of them in sequence.
+                    let outcomes = futures_util::future::join_all(nodes.iter().map(|node| async {
+                        let (node_host, node_port) = split_host_port(&node.address)?;
+                        connect_and_identify(
+                            &node_host,
+                            node_port,
+                            auth_secret,
+                            tls.as_ref(),
+                            CONNECT_DEADLINE,
+                        )
+                        .await
+                    }))
+                    .await;
 
+                    let mut members = HashMap::new();
+                    let mut reachable = 0usize;
+                    let mut dial_last_error: Option<Error> = None;
+                    let mut hard_error: Option<Error> = None;
+
+                    for (node, outcome) in nodes.iter().zip(outcomes) {
                         match outcome {
-                            Ok((stream, tagged)) => {
+                            Ok(Identified::Node { stream, tagged }) => {
                                 members.insert(
                                     node.name.clone(),
                                     Member {
@@ -640,24 +650,77 @@ impl NanocachedClient {
                                         )),
                                     },
                                 );
+                                reachable += 1;
+                            }
+                            Ok(Identified::Cluster { .. }) => {
+                                // The same wrong answer would come back
+                                // from every replica of this address, so
+                                // there's no point tolerating it or trying
+                                // another discovery address — a hard
+                                // error, same as before issue #67.
+                                hard_error = Some(Error::Protocol(format!(
+                                    "nanocached: discovery server returned a non-node address: {}",
+                                    node.address
+                                )));
+                                break;
                             }
                             Err(error) => {
-                                dial_error = Some(error);
-                                break;
+                                // Issue #67: a node discovery still lists
+                                // but that can't be reached — typically
+                                // one that just died and hasn't been
+                                // evicted yet (a window of seconds) — is
+                                // installed as a member without a live
+                                // connection (the same `Connection::dead()`
+                                // placeholder a newly-discovered node gets
+                                // in `refresh_node_list`) rather than
+                                // failing `connect()` outright. It stays in
+                                // the ring, so a request for one of its
+                                // keys fails over per request exactly as
+                                // it would after a mid-life death, and the
+                                // reconnect cooldown armed here means the
+                                // very first such request doesn't even pay
+                                // for a doomed redial.
+                                if let Some(cooldown) = reconnect_cooldown {
+                                    initial_cooldowns.insert(
+                                        node.address.clone(),
+                                        (Instant::now() + cooldown, error.clone()),
+                                    );
+                                }
+                                members.insert(
+                                    node.name.clone(),
+                                    Member {
+                                        address: node.address.clone(),
+                                        connection: Arc::new(Connection::dead()),
+                                    },
+                                );
+                                dial_last_error = Some(error);
                             }
                         }
                     }
-                    if let Some(error) = dial_error {
-                        // A node (not the discovery address) is the
-                        // problem here; another address would hand back
-                        // the same node list, so don't try one — but
-                        // close whatever members already connected so
-                        // they aren't leaked (and stay counted forever in
-                        // open_targets).
+
+                    if let Some(error) = hard_error {
+                        // Close whatever real connections already opened
+                        // so they aren't leaked (and stay counted forever
+                        // in open_targets); a dead placeholder has none to
+                        // close, but close() on it is a harmless no-op.
                         for member in members.values() {
                             member.connection.close();
                         }
                         return Err(error);
+                    }
+
+                    if reachable == 0 {
+                        // No listed node was reachable at all: nothing to
+                        // route to, so connect() itself fails, with the
+                        // last dial error — matching steady-state
+                        // behavior, where a node that never comes back is
+                        // eventually indistinguishable from one that was
+                        // never there.
+                        return Err(dial_last_error.unwrap_or_else(|| {
+                            Error::ConnectionLost(
+                                "nanocached: could not connect to any address".to_string(),
+                            )
+                        }));
                     }
 
                     target = Some(Target::Cluster {
@@ -685,8 +748,8 @@ impl NanocachedClient {
             }),
             redials: Mutex::new(HashMap::new()),
             refresh_gate: Mutex::new(()),
-            reconnect_cooldowns: Mutex::new(HashMap::new()),
-            reconnect_cooldown: options.reconnect_cooldown.resolve(),
+            reconnect_cooldowns: Mutex::new(initial_cooldowns),
+            reconnect_cooldown,
             addresses: options.addresses,
             auth_secret: options.auth_secret,
             tls,
