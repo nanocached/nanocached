@@ -246,6 +246,13 @@ window fail immediately with the original dial error instead of each
 paying another full 5-second connect timeout. Keep it short — a node that
 genuinely recovers is shut out for at most this long.
 
+`connect()` itself tolerates a node that discovery still lists but that
+can't be reached — typically one that just died and hasn't been evicted
+yet (a window of seconds): the node is kept in the ring without a
+connection, requests for its keys fail over per request exactly as they
+would after a mid-life death, and it is redialed after the cooldown. Only
+a cluster with no reachable node at all fails `connect()`.
+
 ## API
 
 - `NanocachedClient.connect(options)` —

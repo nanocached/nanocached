@@ -95,10 +95,10 @@ export async function unusedPort(): Promise<number> {
   return port;
 }
 
-function listen(server: Server): Promise<number> {
+function listen(server: Server, port = 0): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    server.listen(port, "127.0.0.1", () => {
       const address = server.address();
       if (address === null || typeof address === "string") {
         reject(new Error("mock server bound to a non-TCP address"));
@@ -141,6 +141,10 @@ export async function startMockNode(
     /** Behave like a legacy pre-tag server: an extended `A ... T` is a
      * parse error — close the connection without replying. */
     closeOnExtendedAuth?: boolean;
+    /** Pin the listener to this port instead of an ephemeral one — for a
+     * node that comes back on the address discovery already advertised
+     * (issue #67 tests). */
+    port?: number;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -345,7 +349,7 @@ export async function startMockNode(
   });
 
   const { sockets, close } = trackAndClose(server);
-  const port = await listen(server);
+  const port = await listen(server, options.port ?? 0);
 
   return {
     port,
