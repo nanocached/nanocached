@@ -583,10 +583,31 @@ class NanocachedClient:
         # instead of leaking past close() and surfacing later as an
         # "exception was never retrieved" warning with nothing left to
         # report it to.
+        #
+        # Each task is removed from the set here, by this loop, before it
+        # is awaited — never left to the add_done_callback(discard) hook
+        # (issue #65). That hook runs via call_soon, i.e. only when the
+        # event loop gets control back; but awaiting an already-finished
+        # task (or, on Python 3.12+, a gather() of only finished tasks)
+        # completes synchronously without ever yielding to the loop. So
+        # a "while set: await gather(set)" whose every member had
+        # finished, with their discard hooks still queued, re-checked a
+        # never-shrinking set forever — a synchronous spin that froze the
+        # whole event loop (every other coroutine in the process, the
+        # request-timeout timers, the read loops), not just close().
         while self._background_replica_writes:
-            await asyncio.gather(
-                *list(self._background_replica_writes), return_exceptions=True
-            )
+            task = next(iter(self._background_replica_writes))
+            self._background_replica_writes.discard(task)
+            try:
+                await task
+            except asyncio.CancelledError:
+                # The task's own cancellation is its outcome, retrieved
+                # here like any other; close() itself being cancelled
+                # must still propagate.
+                if not task.cancelled():
+                    raise
+            except Exception:
+                pass
 
         self._teardown()
 

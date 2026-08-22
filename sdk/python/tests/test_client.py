@@ -1409,6 +1409,56 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_close_does_not_spin_when_every_background_write_has_already_finished(self):
+        # Regression (issue #65): close() drained _background_replica_writes
+        # with "while set: await gather(set)" and relied on each task's
+        # add_done_callback(discard) hook to empty the set — but that hook
+        # runs via call_soon, only once the loop gets control back, while
+        # awaiting already-finished tasks completes without ever yielding.
+        # With every member finished and its hook still queued, close()
+        # re-checked the same non-empty set forever, synchronously,
+        # freezing the entire event loop. Reproduced exactly: a finished
+        # task whose discard hook is registered after the fact (so it sits
+        # in the loop's ready queue), then close() called straight away.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+            )
+
+            async def finished_write() -> None:
+                pass
+
+            task = asyncio.ensure_future(finished_write())
+            await task
+            client._background_replica_writes.add(task)
+            # On a finished future this schedules the hook with call_soon
+            # rather than running it — the state the spin needed.
+            task.add_done_callback(client._background_replica_writes.discard)
+
+            # A synchronous spin can't be interrupted by asyncio.wait_for
+            # (the loop never runs again), but Python still delivers
+            # signals between bytecodes — so a SIGALRM turns a hang into a
+            # failure instead of a stuck test run.
+            import signal
+
+            def alarm(_signum, _frame):
+                raise AssertionError("close() spun without yielding to the event loop (issue #65)")
+
+            previous = signal.signal(signal.SIGALRM, alarm)
+            signal.setitimer(signal.ITIMER_REAL, 2.0)
+            try:
+                await client.close()
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+
+            self.assertEqual(client._background_replica_writes, set())
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_a_write_starting_after_close_falls_back_to_synchronous_instead_of_registering(self):
         # Regression (issue #47 audit item 4): the fire_and_forget_replicas
         # admission check in _write() must recheck self._closed immediately
