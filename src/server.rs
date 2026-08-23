@@ -1706,6 +1706,61 @@ async fn register_with_discovery(
 /// and `MAX_REQUEST_SIZE` (the two binaries share no modules by design).
 const MAX_ROSTER_ENTRIES: usize = 1 << 16;
 const MAX_ROSTER_FIELD_LEN: usize = 4096;
+/// Cap on a single heartbeat-ack *line* — the header `A <count> <repl>\n`
+/// and each entry's `<name-len> <addr-len>\n` length prefix (issue #92).
+/// Both are only ever a keyword and/or two decimal integers, so 64 bytes
+/// is generous (a full `A 65536 65536\n` is 14). The read itself is bounded
+/// by this, so a hostile/misconfigured discovery that streams a line
+/// without ever sending `\n` errors out instead of growing this node's
+/// heartbeat task memory until it OOMs. The name/addr *bytes* aren't read
+/// this way — they come via a `read_exact` already sized by the
+/// `MAX_ROSTER_FIELD_LEN`-checked lengths below.
+const MAX_ROSTER_LINE_LEN: usize = 64;
+
+/// Reads one `\n`-terminated line into `line` (cleared first), but errors
+/// with `InvalidData` if it would exceed `limit` bytes before the newline —
+/// the bounded counterpart of `read_until`, which grows without cap (issue
+/// #92). On EOF before a newline, returns what was read (no trailing `\n`);
+/// the caller treats a missing terminator as malformed.
+async fn read_line_capped<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+    limit: usize,
+    line: &mut Vec<u8>,
+) -> io::Result<()> {
+    line.clear();
+    loop {
+        let (consumed, done, too_long) = {
+            let available = stream.fill_buf().await?;
+            if available.is_empty() {
+                (0, true, false) // EOF before newline
+            } else if let Some(pos) = available.iter().position(|&byte| byte == b'\n') {
+                let take = pos + 1; // include the newline
+                if line.len() + take > limit {
+                    (0, true, true)
+                } else {
+                    line.extend_from_slice(&available[..take]);
+                    (take, true, false)
+                }
+            } else if line.len() + available.len() > limit {
+                (0, true, true)
+            } else {
+                let take = available.len();
+                line.extend_from_slice(available);
+                (take, false, false)
+            }
+        };
+        stream.consume(consumed);
+        if too_long {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "heartbeat ack line exceeded its size cap",
+            ));
+        }
+        if done {
+            return Ok(());
+        }
+    }
+}
 
 /// Reads one heartbeat ack. A bare `A\n` means "no membership update"
 /// (the discovery server is in its startup grace, or its replication
@@ -1721,7 +1776,7 @@ async fn read_heartbeat_ack<S: AsyncBufReadExt + Unpin>(
     let malformed = || io::Error::new(io::ErrorKind::InvalidData, "malformed heartbeat ack");
 
     let mut line = Vec::new();
-    stream.read_until(b'\n', &mut line).await?;
+    read_line_capped(stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
     if line == b"A\n" {
         return Ok(None);
     }
@@ -1747,8 +1802,7 @@ async fn read_heartbeat_ack<S: AsyncBufReadExt + Unpin>(
 
     let mut names = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        line.clear();
-        stream.read_until(b'\n', &mut line).await?;
+        read_line_capped(stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
         let entry = line
             .strip_suffix(b"\n")
             .and_then(|rest| std::str::from_utf8(rest).ok())
@@ -6300,6 +6354,34 @@ mod tests {
                 "{malformed:?} should be rejected"
             );
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_heartbeat_ack_caps_an_unterminated_line() {
+        // Issue #92: a hostile/misconfigured/MITM'd discovery that streams a
+        // line without ever sending `\n` must error on the size cap, not
+        // grow this node's heartbeat-task buffer until it OOMs. The size-cap
+        // error (vs the generic "malformed" one an unbounded read reaches
+        // only after buffering the whole flood) is the proof the read itself
+        // was bounded — 10 MiB here stands in for an unbounded stream.
+        let flood = vec![b'x'; 10 * 1024 * 1024];
+
+        // The header line.
+        let mut stream = tokio::io::BufReader::new(&flood[..]);
+        let error = read_heartbeat_ack(&mut stream).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("size cap"),
+            "header: got {error}"
+        );
+
+        // An entry's length-prefix line, after a well-formed header.
+        let mut ack = b"A 1 2\n".to_vec();
+        ack.extend_from_slice(&vec![b'x'; 10 * 1024 * 1024]);
+        let mut stream = tokio::io::BufReader::new(&ack[..]);
+        let error = read_heartbeat_ack(&mut stream).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("size cap"), "entry: got {error}");
     }
 
     #[test]
