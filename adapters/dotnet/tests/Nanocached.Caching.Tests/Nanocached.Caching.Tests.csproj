@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- The adapter targets net8.0 (LTS); tests run on the newest
+         installed runtime, mirroring sdk/dotnet/tests/Nanocached.Tests. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <!-- Framework-level tests drive the adapter through real DI, not just
+         the adapter's own SPI implementation directly (issue #108's
+         shared spec, lesson 1 from issue #107/PR #116). -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Nanocached.Caching/Nanocached.Caching.csproj" />
+  </ItemGroup>
+
+</Project>
