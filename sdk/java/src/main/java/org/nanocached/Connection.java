@@ -237,6 +237,30 @@ final class Connection {
         };
     }
 
+    // CLEAR namespace / flush everything (issue #106): `c`/`F` — unlike
+    // g/s/d, these have no legacy pre-namespace equivalent to fall back to
+    // (they're new in #106), so an empty namespace on `clear` always sends
+    // `c 0` rather than some other frame — that IS how the default
+    // namespace is addressed. Neither is key-addressed (protocol.html: "c
+    // / F — clear a namespace, flush everything"), so a node never answers
+    // either with `W`; only `C`.
+
+    /** Drops every entry in one namespace on this connection's node —
+     * {@code namespace.length == 0} clears the default namespace
+     * ({@code c 0}). */
+    void clear(byte[] namespace) {
+        Response response = request(tag -> frame(
+                "c " + namespace.length + tagSuffix(tag) + "\n", namespace, null));
+        if (response.marker != 'C') throw mismatch(response.marker);
+    }
+
+    /** Drops every namespace on this connection's node, the default one
+     * included. */
+    void clearAll() {
+        Response response = request(tag -> frame("F" + tagSuffix(tag) + "\n"));
+        if (response.marker != 'C') throw mismatch(response.marker);
+    }
+
     // Echoed response tags: on a tagged-mode connection every request header carries
     // the client's tag as its last field, and the server echoes it in the
     // response — `tag == null` is the untagged (pre-0019) form, which
@@ -294,6 +318,13 @@ final class Connection {
             p.future().completeExceptionally(error);
         }
         onClose.run();
+    }
+
+    /** A header-only frame with no key/namespace/value bytes to follow
+     * (issue #106's {@code F}, the only request this connection ever
+     * sends with an empty body). */
+    private static byte[] frame(String header) {
+        return header.getBytes(StandardCharsets.US_ASCII);
     }
 
     private static byte[] frame(String header, byte[] key, byte[] value) {
@@ -524,7 +555,9 @@ final class Connection {
                 expectLf(); // the trailing '\n'
                 return new Response(marker, null, -1);
             }
-            case 'S', 'D', 'N', 'W' -> {
+            // 'C' is CLEAR namespace / flush everything's (issue #106) only
+            // reply — same bare-or-tagged shape as S/D/N/W.
+            case 'S', 'D', 'N', 'W', 'C' -> {
                 if (!tagged) {
                     expectLf(); // the trailing '\n'
                     return new Response(marker, null, -1);

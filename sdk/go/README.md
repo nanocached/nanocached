@@ -137,8 +137,8 @@ rejected by `Connect`.
 ## Namespaces
 
 `Client.Namespace(ns)` returns a lightweight handle scoping
-`Get`/`GetBytes`/`Set`/`SetBytes`/`Delete` to `ns`: the same key name in
-two different namespaces — or in a namespace versus the default,
+`Get`/`GetBytes`/`Set`/`SetBytes`/`Delete`/`Clear` to `ns`: the same key
+name in two different namespaces — or in a namespace versus the default,
 unnamespaced keyspace — names two independent cache entries.
 
 ```go
@@ -170,6 +170,26 @@ hashes exactly as it did before namespaces existed, so an unnamespaced
 key's placement never moves across a rolling upgrade. Namespaced frames
 need a server that understands them (an old server answers `E` and closes
 the connection), so upgrade every node before using namespaces.
+
+### Clearing a namespace, or everything
+
+`Namespace.Clear()` drops every entry in that namespace; `Client.ClearAll()`
+drops every namespace, the default one included:
+
+```go
+err = users.Clear()      // only the "users" namespace
+err = client.ClearAll()  // everything, every namespace
+```
+
+Neither is key-addressed, so unlike `Get`/`Set`/`Delete` there's no single
+owner to route to: the request fans out to every node in the cluster
+concurrently, and each node drops its own share of the namespace. Success
+requires every node to acknowledge; if any node fails, the client
+refreshes its node list once and retries the whole fan-out against the
+refreshed list, raising an error naming the still-failing node(s) only if
+that retry also fails. Both operations are idempotent, so a caller can
+simply retry on error. `client.Namespace("").Clear()` clears the default
+namespace and is never rejected.
 
 ## Reconnect and keep-alive
 

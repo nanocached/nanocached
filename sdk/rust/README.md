@@ -71,8 +71,8 @@ timeout): the failed attempt forces a node-list refresh and one retry.
 A namespace is a flat, opaque byte string that scopes a key: the same
 key name in two namespaces (or with no namespace at all) is a wholly
 independent entry. `client.namespace(ns)` returns a lightweight handle
-with the same `get`/`get_bytes`/`set`/`delete` methods as the client
-itself, just scoped to `ns`:
+with the same `get`/`get_bytes`/`set`/`delete`/`clear` methods as the
+client itself, just scoped to `ns`:
 
 ```rust
 let users = client.namespace("users");
@@ -80,6 +80,10 @@ users.set("alice", "online", 0).await?;
 client.set("alice", "offline", 0).await?; // a different entry — no namespace
 
 assert_eq!(users.get("alice").await?, Some("online".to_string()));
+assert_eq!(client.get("alice").await?, Some("offline".to_string()));
+
+users.clear().await?; // drops every entry in "users" — "alice" (offline) survives
+assert_eq!(users.get("alice").await?, None);
 assert_eq!(client.get("alice").await?, Some("offline".to_string()));
 ```
 
@@ -105,6 +109,29 @@ own beyond the request-size bound this crate already applies to
 key+value, and — like a key — may contain any bytes; there is no
 delimiter, no escaping, no hierarchy. Namespaced frames need a
 namespace-aware server; talking to an older one, don't use them.
+
+### Clearing a namespace, or everything
+
+`namespace.clear()` drops every entry in that one namespace —
+`namespace("").clear()` clears the default namespace, and is not
+rejected. `client.clear_all()` flushes the whole store instead: every
+namespace, the default one included:
+
+```rust
+client.namespace("users").clear().await?; // just "users"
+client.clear_all().await?;                // everything, every namespace
+```
+
+Neither is key-addressed (a namespace's keys are spread over every node
+by rendezvous hashing), so in a cluster both fan out to every node the
+client currently knows about and succeed only once every one of them
+has acked — never a partial clear. If any node fails, the node list is
+refreshed once (the same path a `W` reply already triggers) and the
+whole fan-out is retried against the refreshed list; a node still
+failing after that fails the call with an error naming it. Both are
+idempotent, so a caller can simply retry on error. On the wire these are
+the `c`/`F` commands, a single O(1) sub-map drop on each node rather
+than a scan-and-delete, so neither stalls other requests to that node.
 
 ## Fire-and-forget replica writes
 

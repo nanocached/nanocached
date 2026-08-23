@@ -30,6 +30,15 @@ public sealed class MockNode : IDisposable
     /// namespace length.</summary>
     public int NamespacedRequestCount => _namespacedRequestCount;
 
+    /// <summary>issue #106: how many <c>c</c> (clear-one-namespace)
+    /// requests this server has received — lets a fan-out test assert
+    /// every node in a cluster was actually reached.</summary>
+    public int ClearRequestCount => _clearRequestCount;
+
+    /// <summary>issue #106: how many <c>F</c> (flush-everything)
+    /// requests this server has received.</summary>
+    public int ClearAllRequestCount => _clearAllRequestCount;
+
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
@@ -54,6 +63,9 @@ public sealed class MockNode : IDisposable
     private volatile bool _silent;
     private long _lastSetTtl;
     private int _namespacedRequestCount;
+    private int _clearRequestCount;
+    private int _clearAllRequestCount;
+    private int _failClearReplies;
     /// <summary>J1/D1: when set, every accepted connection is wrapped in
     /// an <see cref="SslStream"/> presenting this certificate before the
     /// A/G/S/D protocol loop runs — everything past the handshake is
@@ -127,6 +139,16 @@ public sealed class MockNode : IDisposable
     /// first — for tests proving a caller isn't blocked on a slow replica
     /// leg (fire-and-forget replica writes).</summary>
     public void DelaySets(int millis) => _setDelayMillis = millis;
+
+    /// <summary>issue #106: makes the next <c>c</c>/<c>F</c> request this
+    /// node receives fail at the connection level — the request is read
+    /// (so the TCP stream stays well-formed) but the connection is then
+    /// closed instead of answered <c>C</c>, giving the client an
+    /// immediate <see cref="ConnectionLostException"/> rather than a
+    /// 30-second request-timeout wait. This is what a client's
+    /// fan-out-and-retry (<see cref="NanocachedClient.ClearAllAsync"/>'s
+    /// doc comment) needs to see a node fail.</summary>
+    public void FailClearOnce() => Interlocked.Increment(ref _failClearReplies);
 
     /// <summary>Holds every future G reply for <paramref name="millis"/>
     /// first — for hedged-reads tests proving a caller isn't bounded by a
@@ -431,6 +453,62 @@ public sealed class MockNode : IDisposable
                                 stream,
                                 Store.TryRemove(KeyOf(namespaceBytes, key), out _) ? $"D{tag}\n" : $"N{tag}\n");
                         }
+                        break;
+                    }
+                    // issue #106: c/F never have a legacy uppercase
+                    // counterpart (they postdate namespaces) and are
+                    // never key-addressed, so — unlike g/s/d above —
+                    // there is no wrong-node injection here; W is never a
+                    // valid reply to either. FailClearOnce() is this
+                    // mock's stand-in for a node that fails a clear at
+                    // the connection level (closing instead of replying),
+                    // for the client's fan-out-and-retry to react to.
+                    case "c":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        Interlocked.Increment(ref _clearRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _failClearReplies))
+                        {
+                            return;
+                        }
+                        // Mirrors KeyOf(byte[], byte[])'s "ns:" store-key
+                        // convention: the empty namespace shares the plain
+                        // (unnamespaced) keyspace, so dropping it here must
+                        // spare every "ns:"-prefixed entry, and dropping a
+                        // named namespace must spare everything else.
+                        string? prefix = namespaceBytes.Length == 0
+                            ? null
+                            : $"ns:{Convert.ToBase64String(namespaceBytes)}:";
+                        foreach (string storeKey in Store.Keys)
+                        {
+                            bool inThisNamespace = prefix is null
+                                ? !storeKey.StartsWith("ns:", StringComparison.Ordinal)
+                                : storeKey.StartsWith(prefix, StringComparison.Ordinal);
+                            if (inThisNamespace)
+                            {
+                                Store.TryRemove(storeKey, out _);
+                            }
+                        }
+                        await Wire.WriteAsync(stream, $"C{tag}\n");
+                        break;
+                    }
+                    case "F":
+                    {
+                        Interlocked.Increment(ref _clearAllRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _failClearReplies))
+                        {
+                            return;
+                        }
+                        Store.Clear();
+                        await Wire.WriteAsync(stream, $"C{tag}\n");
                         break;
                     }
                     default:

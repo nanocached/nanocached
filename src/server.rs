@@ -885,6 +885,86 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
 
 /// Echoed response tags: a `G`/`S`/`D` response on a tagged-mode connection echoes
 /// the request's tag; untagged connections keep the original encoding.
+/// `c`/`F` (issue #106): applied to this node's own store unconditionally
+/// — a clear isn't key-addressed, so there is no wrong-node check; the
+/// client fans it out to every member and each drops its own sub-map —
+/// then replayed on the joiner of an in-flight handoff, if any, so a
+/// clear racing a migration can't resurrect entries there. See
+/// `route_clear` for which path the replay takes.
+async fn handle_clear(
+    stream: &mut ServerStream,
+    request_tx: &mpsc::Sender<CacheRequest>,
+    config: &ConnectionConfig,
+    scope: ClearScope,
+    tag: Option<u32>,
+) -> io::Result<()> {
+    let command = match &scope {
+        ClearScope::Namespace(namespace) => Command::Clear {
+            namespace: namespace.clone(),
+        },
+        ClearScope::All => Command::ClearAll,
+    };
+    let response = execute_command(request_tx, command).await?;
+    write_response(stream, &encode_response(&response, tag)).await?;
+
+    if let Some(node_context) = &config.node_context
+        && let ClearRoute::Forward(target) = route_clear(node_context, &scope)
+    {
+        let _ = config
+            .migration_tx
+            .send(Box::pin(forward_with_retries(
+                node_context.clone(),
+                target,
+                OwnedForwardedWrite::Clear(scope),
+            )))
+            .await;
+    }
+
+    Ok(())
+}
+
+/// Where a clear's replay to an in-flight handoff's joiner goes.
+enum ClearRoute {
+    /// No handoff is forwarding: nothing to replay.
+    None,
+    /// Queued on the slot for the transfer loop to replay in order — see
+    /// `ActiveMigration::pending_clears`.
+    Queued,
+    /// This node's own transfer is done; forward on the shared
+    /// connection like a concurrent `S`/`D`.
+    Forward(ForwardTarget),
+}
+
+fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
+    let mut slot = node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Same lazy expiry as `migration_target_for`.
+    if slot.as_ref().is_some_and(ActiveMigration::expired) {
+        *slot = None;
+    }
+
+    let Some(active) = slot.as_mut() else {
+        return ClearRoute::None;
+    };
+
+    if active.completed_at.is_none() {
+        active.pending_clears.push(scope.clone());
+        return ClearRoute::Queued;
+    }
+
+    if !active.forwarding_open() {
+        return ClearRoute::None;
+    }
+
+    ClearRoute::Forward(ForwardTarget {
+        addr: active.joining_addr.clone(),
+        connection: Arc::clone(&active.forward_connection),
+    })
+}
+
 fn encode_response(response: &Response, tag: Option<u32>) -> Vec<u8> {
     match tag {
         Some(tag) => response.encode_with_tag(tag),
@@ -1241,6 +1321,17 @@ async fn handle_connection(
                         )))
                         .await;
                 }
+
+                continue;
+            }
+            Ok((Command::Clear { namespace }, tag)) => {
+                let scope = ClearScope::Namespace(namespace);
+                handle_clear(&mut stream, &request_tx, &config, scope, tag).await?;
+
+                continue;
+            }
+            Ok((Command::ClearAll, tag)) => {
+                handle_clear(&mut stream, &request_tx, &config, ClearScope::All, tag).await?;
 
                 continue;
             }
@@ -2065,6 +2156,19 @@ struct ActiveMigration {
     /// heartbeat's `adopt_membership` to correct `known_ring`. `None`
     /// until `completed()` stamps it.
     pre_completion_ring: Option<Arc<Membership>>,
+    /// Issue #106: clears (`c`/`F`) that arrived while this node's own
+    /// transfer was still running, waiting for `run_migration` to replay
+    /// them on its transfer stream. A clear can't be forwarded the way a
+    /// concurrent `S`/`D` is (on the shared forwarding connection) while
+    /// keys are still being sent on the transfer connection: the two
+    /// streams have no ordering between them, so a key peeked before the
+    /// clear could land on the joiner *after* the forwarded clear and
+    /// resurrect there. Queued here instead and drained by the transfer
+    /// loop onto its own stream, where the order is real. Only filled
+    /// while `completed_at` is `None` (both under this slot's lock), so
+    /// the final drain after `completed()` is stamped sees everything;
+    /// from then on clears forward like any other write.
+    pending_clears: Vec<ClearScope>,
     /// Persistent connection to the joining node, shared by every
     /// `set_on_joining_node`/`delete_on_joining_node` call this handoff's
     /// concurrent client writes trigger (see `migration_target_for` and
@@ -2279,6 +2383,7 @@ impl MigrationGuard {
             marked_keys: Vec::new(),
             confirmed: false,
             pre_completion_ring: None,
+            pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
@@ -2528,56 +2633,36 @@ async fn run_migration(
         // already forwarded-and-since-removed), there's nothing to send —
         // `handle_connection`'s own delete-forwarding path (or nothing
         // ever existing to send in the first place) already covers it.
+        // Issue #106: a clear that arrived since the last key went out
+        // is replayed on this same stream *before* the next key, so the
+        // joiner applies them in the order this node did. (A clear that
+        // races this key's peek is caught by the next iteration's drain,
+        // which then lands after the stale key and wipes it.)
+        if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
+            for key in marked_this_run {
+                unmark_migrated(&node_context.request_tx, &key).await;
+            }
+
+            return;
+        }
+
         let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
             continue;
         };
 
-        let mut sent = false;
-
-        for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
-            if stream.is_none() {
-                match connect_and_authenticate(&node_context, &joining_addr).await {
-                    Ok(connected) => stream = Some(connected),
-                    Err(error) => {
-                        eprintln!(
-                            "WARN migration to {joining_addr} failed to connect \
-                             (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            let active_stream = match stream.as_mut() {
-                Some(active_stream) => active_stream,
-                None => continue,
-            };
-
-            match send_set(active_stream, &key, &value, ttl).await {
-                Ok(()) => {
-                    sent = true;
-                    break;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "WARN migration to {joining_addr} failed to transfer a key \
-                         (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
-                    );
-                    // The connection's state after a failed write/read is
-                    // unknown (e.g. a partial write) — reconnect rather
-                    // than risk a desynced stream on the next attempt.
-                    stream = None;
-                }
-            }
-        }
+        let sent = transfer_with_retries(
+            &node_context,
+            &joining_addr,
+            &mut stream,
+            ForwardedWrite::Set {
+                key: &key,
+                value: &value,
+                ttl,
+            },
+        )
+        .await;
 
         if !sent {
-            eprintln!(
-                "WARN migration to {joining_addr} permanently failed to transfer a key after \
-                 {KEY_TRANSFER_ATTEMPTS} attempts; abandoning the join for discovery's \
-                 migration-timeout to reap"
-            );
-
             for key in marked_this_run {
                 unmark_migrated(&node_context.request_tx, &key).await;
             }
@@ -2632,7 +2717,30 @@ async fn run_migration(
     // goes out (issue #62): discovery may start the next join the moment
     // this `C` lands and have its `M` here before this task gets past the
     // ack read — a slot still reading as in-flight would reject it.
+    // Issue #106: whatever clears queued up after the last key's drain
+    // go out before the slot flips to "completed" ...
+    if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
+        for key in marked_this_run {
+            unmark_migrated(&node_context.request_tx, &key).await;
+        }
+
+        return;
+    }
+
     migration_guard.completed(sent_count, marked_this_run, pre_completion_ring);
+
+    // ... and one more drain after the stamp catches a clear that slipped
+    // in between: `route_clear` queues only while `completed_at` is
+    // `None`, under the same lock `completed()` stamps it, so anything
+    // not in this drain was forwarded on the shared connection instead.
+    // Too late to abandon the join here (it is already completed on this
+    // node); a permanent failure is logged like a failed forward.
+    if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
+        eprintln!(
+            "WARN migration to {joining_addr} completed but a clear that raced its completion \
+             could not be replayed on the joining node"
+        );
+    }
 
     if let Err(error) = report_complete(&node_context, &joining_name).await {
         eprintln!(
@@ -2640,6 +2748,128 @@ async fn run_migration(
             node_context.discovery_addr
         );
     }
+}
+
+/// `run_migration`'s per-item retry loop, shared by key transfers and
+/// replayed clears (issue #106): up to `KEY_TRANSFER_ATTEMPTS` attempts,
+/// reconnecting `stream` after a failure since its state is then
+/// unknown (e.g. a partial write) — the next attempt must not risk a
+/// desynced stream. Returns whether the item was delivered; on `false`
+/// the caller abandons the join for discovery's migration-timeout to
+/// reap, after rolling back its marks.
+async fn transfer_with_retries(
+    node_context: &NodeContext,
+    joining_addr: &str,
+    stream: &mut Option<ClientStream>,
+    write: ForwardedWrite<'_>,
+) -> bool {
+    let what = match &write {
+        ForwardedWrite::Set { .. } | ForwardedWrite::Delete { .. } => "a key",
+        ForwardedWrite::Clear(_) => "a clear",
+    };
+
+    for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+        if stream.is_none() {
+            match connect_and_authenticate(node_context, joining_addr).await {
+                Ok(connected) => *stream = Some(connected),
+                Err(error) => {
+                    eprintln!(
+                        "WARN migration to {joining_addr} failed to connect \
+                         (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let active_stream = match stream.as_mut() {
+            Some(active_stream) => active_stream,
+            None => continue,
+        };
+
+        let result = match &write {
+            // `send_set` carries its own `OUTBOUND_IO_TIMEOUT`.
+            ForwardedWrite::Set { key, value, ttl } => {
+                send_set(active_stream, key, value, *ttl).await
+            }
+            ForwardedWrite::Delete { key } => timeout(
+                OUTBOUND_IO_TIMEOUT,
+                ForwardedWrite::Delete { key }.send(active_stream),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outbound delete timed out",
+                ))
+            }),
+            ForwardedWrite::Clear(scope) => timeout(
+                OUTBOUND_IO_TIMEOUT,
+                ForwardedWrite::Clear(scope).send(active_stream),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outbound clear timed out",
+                ))
+            }),
+        };
+
+        match result {
+            Ok(()) => return true,
+            Err(error) => {
+                eprintln!(
+                    "WARN migration to {joining_addr} failed to transfer {what} \
+                     (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                );
+                *stream = None;
+            }
+        }
+    }
+
+    eprintln!(
+        "WARN migration to {joining_addr} permanently failed to transfer {what} after \
+         {KEY_TRANSFER_ATTEMPTS} attempts; abandoning the join for discovery's \
+         migration-timeout to reap"
+    );
+
+    false
+}
+
+/// Issue #106: takes every clear queued on the slot since the last call
+/// (`ActiveMigration::pending_clears`) and replays it on the transfer
+/// stream, in arrival order. `false` if one could not be delivered.
+async fn drain_pending_clears(
+    node_context: &NodeContext,
+    joining_addr: &str,
+    stream: &mut Option<ClientStream>,
+) -> bool {
+    let pending = {
+        let mut slot = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_mut() {
+            Some(active) => std::mem::take(&mut active.pending_clears),
+            None => Vec::new(),
+        }
+    };
+
+    for scope in &pending {
+        if !transfer_with_retries(
+            node_context,
+            joining_addr,
+            stream,
+            ForwardedWrite::Clear(scope),
+        )
+        .await
+        {
+            return false;
+        }
+    }
+
+    true
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
@@ -2949,6 +3179,28 @@ enum ForwardedWrite<'a> {
     Delete {
         key: &'a Key,
     },
+    Clear(&'a ClearScope),
+}
+
+/// What a `c`/`F` clears (issue #106): one namespace, or everything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClearScope {
+    Namespace(Bytes),
+    All,
+}
+
+impl ClearScope {
+    /// The `c`/`F` frame that replays this clear on the joining node.
+    fn message(&self) -> Vec<u8> {
+        match self {
+            ClearScope::Namespace(namespace) => {
+                let mut message = format!("c {}\n", namespace.len()).into_bytes();
+                message.extend_from_slice(namespace);
+                message
+            }
+            ClearScope::All => b"F\n".to_vec(),
+        }
+    }
 }
 
 impl ForwardedWrite<'_> {
@@ -2956,6 +3208,7 @@ impl ForwardedWrite<'_> {
         match self {
             ForwardedWrite::Set { .. } => "forwarding the write to the joining node timed out",
             ForwardedWrite::Delete { .. } => "forwarding the delete to the joining node timed out",
+            ForwardedWrite::Clear(_) => "forwarding the clear to the joining node timed out",
         }
     }
 
@@ -2972,6 +3225,20 @@ impl ForwardedWrite<'_> {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "joining node did not acknowledge the forwarded delete",
+                    ));
+                }
+                Ok(())
+            }
+            ForwardedWrite::Clear(scope) => {
+                stream.write_all(&scope.message()).await?;
+
+                let mut ack = [0u8; 2];
+                stream.read_exact(&mut ack).await?;
+
+                if &ack != b"C\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "joining node did not acknowledge the forwarded clear",
                     ));
                 }
                 Ok(())
@@ -2996,6 +3263,7 @@ enum OwnedForwardedWrite {
     Delete {
         key: Key,
     },
+    Clear(ClearScope),
 }
 
 impl OwnedForwardedWrite {
@@ -3011,6 +3279,10 @@ impl OwnedForwardedWrite {
             OwnedForwardedWrite::Delete { key } => {
                 delete_on_joining_node(node_context, target, key).await
             }
+            OwnedForwardedWrite::Clear(scope) => {
+                forward_on_shared_connection(node_context, target, ForwardedWrite::Clear(scope))
+                    .await
+            }
         }
     }
 
@@ -3021,6 +3293,7 @@ impl OwnedForwardedWrite {
         match self {
             OwnedForwardedWrite::Set { .. } => "SET",
             OwnedForwardedWrite::Delete { .. } => "DELETE",
+            OwnedForwardedWrite::Clear(_) => "CLEAR",
         }
     }
 }
@@ -4495,6 +4768,361 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_clears_one_namespace_or_everything() {
+        // Issue #106: `c` drops one namespace (and only it); `F` drops all.
+        let (mut client, server) = tcp_pair().await;
+
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(
+                concat!(
+                    "S 4 5\nnameAlice",
+                    "s 5 4 3\nusersnameBob",
+                    "s 6 4 5\nordersnameCarol",
+                    "c 5\nusers",
+                    "g 5 4\nusersname",
+                    "g 6 4\nordersname",
+                    "G 4\nname",
+                    "c 0\n",
+                    "G 4\nname",
+                    "F\n",
+                    "g 6 4\nordersname",
+                    "c 7\nmissing",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\nS\nS\nC\nN\nV 5\nCarolV 5\nAliceC\nN\nC\nN\nC\n";
+        let mut response = vec![0_u8; expected.len()];
+
+        client.read_exact(&mut response).await.unwrap();
+
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_echoes_the_tag_in_tagged_mode() {
+        let (mut client, server) = tcp_pair().await;
+
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: Some(Bytes::from_static(b"secret")),
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(b"A 6 T\nsecretc 5 7\nusersF 8\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"OnT\nC 7\nC 8\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn clear_scope_messages_are_the_c_and_f_frames() {
+        assert_eq!(
+            ClearScope::Namespace(Bytes::from_static(b"users")).message(),
+            b"c 5\nusers".to_vec()
+        );
+        assert_eq!(ClearScope::All.message(), b"F\n".to_vec());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_clear_queues_during_transfer_then_forwards_then_stops() {
+        // Issue #106: the three phases of a handoff slot.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: "127.0.0.1:9".to_string(),
+                after_ring,
+                replication: 2,
+                completed_at: None,
+                forwarding_grace: Duration::ZERO,
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: Vec::new(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+        };
+        let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
+
+        // Transfer running: queued on the slot, in order.
+        assert!(matches!(
+            route_clear(&node_context, &scope),
+            ClearRoute::Queued
+        ));
+        assert!(matches!(
+            route_clear(&node_context, &ClearScope::All),
+            ClearRoute::Queued
+        ));
+        {
+            let slot = node_context.active_migration.lock().unwrap();
+            assert_eq!(
+                slot.as_ref().unwrap().pending_clears,
+                vec![scope.clone(), ClearScope::All]
+            );
+        }
+
+        // Completed, forwarding window open: forwarded to the joiner.
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let active = slot.as_mut().unwrap();
+            active.completed_at = Some(Instant::now());
+            active.forwarding_grace = Duration::from_secs(60);
+        }
+        match route_clear(&node_context, &scope) {
+            ClearRoute::Forward(target) => assert_eq!(target.addr, "127.0.0.1:9"),
+            _ => panic!("a completed handoff must forward clears"),
+        }
+
+        // Window closed: nothing to replay.
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            slot.as_mut().unwrap().forwarding_grace = Duration::ZERO;
+        }
+        assert!(matches!(
+            route_clear(&node_context, &scope),
+            ClearRoute::None
+        ));
+
+        // No handoff at all.
+        *node_context.active_migration.lock().unwrap() = None;
+        assert!(matches!(
+            route_clear(&node_context, &scope),
+            ClearRoute::None
+        ));
+    }
+
+    type RecordedFrames = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// A fake joining node that records every frame it receives (as
+    /// separate frames, split by the protocol's own length fields) and
+    /// acks each with the reply its command expects.
+    fn spawn_recording_joiner(
+        listener: TcpListener,
+    ) -> (RecordedFrames, tokio::task::JoinHandle<()>) {
+        let frames: RecordedFrames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&frames);
+        let task = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut buffer = BytesMut::new();
+            loop {
+                let Some(header_end) = buffer.iter().position(|byte| *byte == b'\n') else {
+                    let mut chunk = [0u8; 1024];
+                    let bytes_read = connection.read(&mut chunk).await.unwrap();
+                    if bytes_read == 0 {
+                        return;
+                    }
+                    buffer.extend_from_slice(&chunk[..bytes_read]);
+                    continue;
+                };
+                let header = String::from_utf8(buffer[..header_end].to_vec()).unwrap();
+                let fields: Vec<usize> = header
+                    .split(' ')
+                    .skip(1)
+                    .map(|field| field.parse().unwrap())
+                    .collect();
+                let (body_length, ack): (usize, &[u8]) = match header.as_bytes()[0] {
+                    b'S' => (fields[0] + fields[1], b"S\n"),
+                    b's' => (fields[0] + fields[1] + fields[2], b"S\n"),
+                    b'c' => (fields[0], b"C\n"),
+                    b'F' => (0, b"C\n"),
+                    other => panic!("unexpected frame {other}"),
+                };
+                let frame_end = header_end + 1 + body_length;
+                if buffer.len() < frame_end {
+                    let mut chunk = [0u8; 1024];
+                    let bytes_read = connection.read(&mut chunk).await.unwrap();
+                    assert!(bytes_read > 0, "frame cut short");
+                    buffer.extend_from_slice(&chunk[..bytes_read]);
+                    continue;
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(buffer.split_to(frame_end).to_vec());
+                connection.write_all(ack).await.unwrap();
+            }
+        });
+        (frames, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clear_queued_during_the_transfer_is_replayed_on_the_joiner_in_order() {
+        // Issue #106: a `c` that arrived while this node was still moving
+        // keys is replayed on the transfer stream before the next key,
+        // so a key this node no longer has can't survive on the joiner —
+        // and keys sent after it arrive after it.
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        // Every key in one namespace, so the joiner cracks some top-2 and
+        // this single-member "cluster" (R=2 over 1 node) sends them all.
+        let users = Bytes::from_static(b"users");
+        for index in 0..20u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: Key::new(users.clone(), Bytes::from(format!("k{index}"))),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let (frames, joining_task) = spawn_recording_joiner(joining_listener);
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr,
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+        };
+
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner-0", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            joining_addr.clone(),
+            Arc::clone(&after_ring),
+            2,
+            &joined,
+        )
+        .unwrap_new();
+
+        let keys = list_keys(&request_tx).await;
+        let expected_keys = keys.as_ref().unwrap().len();
+
+        // The clear lands while the slot is reserved but before the
+        // transfer loop has sent anything: exactly what a client `c`
+        // racing the `M` produces.
+        assert!(matches!(
+            route_clear(
+                &node_context,
+                &ClearScope::Namespace(Bytes::from_static(b"users"))
+            ),
+            ClearRoute::Queued
+        ));
+
+        run_migration(
+            node_context.clone(),
+            "joiner-0".to_string(),
+            joining_addr.clone(),
+            2,
+            before_ring,
+            after_ring,
+            migration_guard,
+            keys,
+        )
+        .await;
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(frames[0], b"c 5\nusers".to_vec(), "the clear goes first");
+        assert_eq!(frames.len(), 1 + expected_keys);
+        assert!(frames[1..].iter().all(|frame| frame.starts_with(b"s 5 ")));
+
+        // Once completed, a clear forwards like a concurrent write.
+        assert!(matches!(
+            route_clear(&node_context, &ClearScope::All),
+            ClearRoute::Forward(_)
+        ));
+        assert!(
+            node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pending_clears
+                .is_empty()
+        );
+
+        discovery_task.await.unwrap();
+        joining_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn migrate_with_replication_marks_displaced_copies_and_keeps_the_senders() {
         let (request_tx, request_rx) = mpsc::channel(1);
         let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
@@ -4735,6 +5363,7 @@ mod tests {
                     .collect(),
                 confirmed: false,
                 pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
+                pending_clears: Vec::new(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
@@ -4927,6 +5556,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: true,
             pre_completion_ring: None,
+            pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
 
@@ -4959,6 +5589,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: true,
             pre_completion_ring: None,
+            pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -5002,6 +5633,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: false,
             pre_completion_ring: None,
+            pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -5532,6 +6164,7 @@ mod tests {
                 .collect(),
             confirmed: false,
             pre_completion_ring: None,
+            pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -6363,6 +6996,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: false,
             pre_completion_ring: None,
+            pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }

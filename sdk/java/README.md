@@ -99,6 +99,23 @@ before namespaces are used. The un-namespaced API is unchanged and
 remains the default — every existing key keeps its placement across the
 upgrade.
 
+`tenant.clear()` drops every entry in that one namespace — an O(1)
+sub-map drop on each node, not a key-by-key scan — and
+`client.clearAll()` drops every namespace, the default one included.
+Neither is key-addressed, so in a cluster the client sends the command
+to *every* node rather than ranking owners for a key; success requires
+every node to ack, and a node that failed gets one node-list refresh and
+one retry (the same recovery a stale-routing `W` gets) before the call
+raises, naming any node still failing. Both are idempotent, so a caller
+that sees either throw can simply call it again. `tenant.clear()` on a
+handle from `client.namespace("")` clears just the default namespace
+(`c 0`), not every namespace — use `clearAll()` for that.
+
+```java
+tenant.clear();      // just "tenant-a"
+client.clearAll();   // every namespace, including the default one
+```
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

@@ -1127,6 +1127,35 @@ class NamespaceEncodingTests(unittest.TestCase):
         self.assertEqual(_encode_get(b"beta", namespace=b"\xff\x00"), b"g 2 4\n\xff\x00beta")
 
 
+class ClearEncodingTests(unittest.TestCase):
+    # Clear / flush (issue #106): docs/protocol.html "c / F" is the
+    # authoritative wire spec these pin. Unlike g/s/d, c/F have no legacy
+    # uppercase form — the default namespace is just namespace-length 0.
+
+    def test_encodes_untagged_clear_and_clear_all(self):
+        from nanocached._connection import _encode_clear, _encode_clear_all
+
+        self.assertEqual(_encode_clear(b"users"), b"c 5\nusers")
+        self.assertEqual(_encode_clear_all(), b"F\n")
+
+    def test_empty_namespace_clears_the_default_namespace(self):
+        from nanocached._connection import _encode_clear
+
+        self.assertEqual(_encode_clear(b""), b"c 0\n")
+        self.assertEqual(_encode_clear(), b"c 0\n")
+
+    def test_tagged_clear_and_clear_all_keep_the_tag_as_the_last_header_field(self):
+        from nanocached._connection import _encode_clear, _encode_clear_all
+
+        self.assertEqual(_encode_clear(b"users", tag=7), b"c 5 7\nusers")
+        self.assertEqual(_encode_clear_all(tag=7), b"F 7\n")
+
+    def test_namespace_may_contain_arbitrary_bytes(self):
+        from nanocached._connection import _encode_clear
+
+        self.assertEqual(_encode_clear(b"\xff\x00"), b"c 2\n\xff\x00")
+
+
 class ClusterTests(unittest.IsolatedAsyncioTestCase):
     async def start_cluster(self, replication: int = 1):
         node_a = await MockNode().start()
@@ -2545,6 +2574,201 @@ class NamespaceClusterTests(unittest.IsolatedAsyncioTestCase):
 
             await tenant.set(key, "v")
             self.assertEqual(await tenant.get(key), "v")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+
+class ClearTests(unittest.IsolatedAsyncioTestCase):
+    # Clear / flush (issue #106): single-node coverage. See
+    # ClearClusterTests below for the fan-out and refresh-once-and-retry
+    # path, which needs an actual cluster.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_clear_drops_only_its_own_namespace(self):
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            orders = client.namespace("orders")
+            await client.set("k", "default-value")
+            await users.set("k", "users-value")
+            await orders.set("k", "orders-value")
+
+            await users.clear()
+
+            self.assertIsNone(await users.get("k"))
+            self.assertEqual(await client.get("k"), "default-value")
+            self.assertEqual(await orders.get("k"), "orders-value")
+            self.assertEqual(self.node.clear_count, 1)
+        finally:
+            await client.close()
+
+    async def test_clear_on_the_empty_namespace_handle_clears_the_default_namespace(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            await client.namespace("").clear()
+            self.assertIsNone(await client.get("k"))
+            self.assertEqual(self.node.clear_count, 1)
+        finally:
+            await client.close()
+
+    async def test_clear_all_empties_every_namespace_including_the_default(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "default-value")
+            await client.namespace("users").set("k", "users-value")
+            await client.namespace("orders").set("k", "orders-value")
+
+            await client.clear_all()
+
+            self.assertIsNone(await client.get("k"))
+            self.assertIsNone(await client.namespace("users").get("k"))
+            self.assertIsNone(await client.namespace("orders").get("k"))
+            self.assertEqual(self.node.flush_count, 1)
+        finally:
+            await client.close()
+
+    async def test_clear_is_idempotent_on_an_already_empty_namespace(self):
+        client = await self.connect()
+        try:
+            await client.namespace("empty").clear()  # must not raise
+        finally:
+            await client.close()
+
+    async def test_after_close_both_raise_already_closed(self):
+        client = await self.connect()
+        users = client.namespace("users")
+        await client.close()
+        with self.assertRaises(AlreadyClosedError):
+            await users.clear()
+        with self.assertRaises(AlreadyClosedError):
+            await client.clear_all()
+
+    async def test_clear_participates_in_tagged_mode(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                users = client.namespace("users")
+                await users.set("k", "v")
+                await users.clear()
+                self.assertIsNone(await users.get("k"))
+                await client.clear_all()
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+
+class ClearClusterTests(unittest.IsolatedAsyncioTestCase):
+    # Clear / flush (issue #106) is not routed by HRW like get/set/delete —
+    # a namespace's keys are spread over every node, so a clear fans out to
+    # every currently-known node instead (client.py's _fan_out_clear) —
+    # these need an actual cluster, unlike ClearTests above.
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    async def test_fans_a_namespace_clear_out_to_every_node(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                tenant = client.namespace("tenant-a")
+                for i in range(20):
+                    await tenant.set(f"k{i}", "v")
+
+                await tenant.clear()
+
+                for name, node in nodes.items():
+                    self.assertEqual(node.clear_count, 1, f"{name} was not sent the clear")
+                    self.assertEqual(
+                        [k for (ns, k) in node.ns_store if ns == b"tenant-a"], [], name
+                    )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_clear_all_fans_out_and_flushes_every_node(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                for i in range(20):
+                    await client.set(f"k{i}", "v")
+                    await client.namespace("tenant-a").set(f"k{i}", "v")
+
+                await client.clear_all()
+
+                for name, node in nodes.items():
+                    self.assertEqual(node.flush_count, 1, f"{name} was not sent the flush")
+                    self.assertEqual(node.store, {}, name)
+                    self.assertEqual(node.ns_store, {}, name)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_node_failing_once_is_healed_by_the_refresh_and_retry(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            failing = NAMES[0]
+            nodes[failing].fail_next_clear_once()
+
+            await client.clear_all()  # must not raise: the retry after the refresh acks
+
+            # Every node is retried on the refreshed list, not just the one
+            # that failed (the operation is idempotent) — so the healthy
+            # node also sees two flushes, and the failing one is healed by
+            # its second (post-refresh) attempt.
+            self.assertEqual(nodes[failing].flush_count, 2)
+            self.assertEqual(nodes[NAMES[1]].flush_count, 2)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+    async def test_a_persistently_failing_node_raises_naming_it(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            failing = NAMES[0]
+            nodes[failing].fail_next_clear_once()
+            nodes[failing].fail_next_clear_once()  # also fails the post-refresh retry
+
+            with self.assertRaises(NanocachedError) as ctx:
+                await client.clear_all()
+            self.assertIn(failing, str(ctx.exception))
         finally:
             await client.close()
             await discovery.close()

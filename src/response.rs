@@ -46,6 +46,9 @@ pub enum Response {
     /// re-fetch `L` from discovery and recompute where the key belongs,
     /// not trust this node to know or proxy the request.
     WrongNode,
+    /// In answer to `c`/`F` (issue #106): how many entries were dropped
+    /// — informational, the wire form is a bare `C`.
+    Cleared(usize),
     /// Internal-only (staged node join), in answer to `Command::PeekEntry` — zero
     /// or one entry, each with its remaining TTL. Never encoded for a wire
     /// client, see `encode`.
@@ -77,6 +80,7 @@ impl Response {
             Self::MigrationRejected => b"R\n".to_vec(),
             Self::MigrationCancelled => b"A\n".to_vec(),
             Self::WrongNode => b"W\n".to_vec(),
+            Self::Cleared(_) => b"C\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -111,6 +115,7 @@ impl Response {
             Self::Deleted => format!("D {tag}\n").into_bytes(),
             Self::NotFound => format!("N {tag}\n").into_bytes(),
             Self::WrongNode => format!("W {tag}\n").into_bytes(),
+            Self::Cleared(_) => format!("C {tag}\n").into_bytes(),
 
             Self::Value(value) => {
                 let header = format!("V {} {tag}\n", value.len());
@@ -144,6 +149,12 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleared_encodes_as_a_bare_c_with_an_optional_tag() {
+        assert_eq!(Response::Cleared(3).encode(), b"C\n".to_vec());
+        assert_eq!(Response::Cleared(0).encode_with_tag(9), b"C 9\n".to_vec());
+    }
 
     #[test]
     fn encodes_stored_response() {

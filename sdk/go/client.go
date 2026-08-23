@@ -35,7 +35,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -840,19 +842,115 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 	return existed, err
 }
 
+// clearNS drops every entry in namespace across every node — the same
+// internal entry point a *Namespace handle's Clear forwards to (issue
+// #106). A nil/empty namespace clears the default namespace; it is never
+// rejected, matching getBytesNS/setBytesNS/deleteNS's own namespace("")
+// rule.
+func (c *Client) clearNS(namespace []byte) error {
+	if err := c.beforeOperation(); err != nil {
+		return err
+	}
+	return c.clearFanout(func(conn *connection) error {
+		return conn.clear(namespace)
+	})
+}
+
+// ClearAll drops every namespace across every node, the default one
+// included (issue #106's `F`). Unlike Get/Set/Delete this touches the
+// whole keyspace at once, so there is no Namespace-scoped equivalent
+// beyond Namespace.Clear (one namespace) — see clearFanout for the
+// fan-out and failure semantics both share.
+func (c *Client) ClearAll() error {
+	if err := c.beforeOperation(); err != nil {
+		return err
+	}
+	return c.clearFanout(func(conn *connection) error {
+		return conn.clearAll()
+	})
+}
+
+// clearFanout runs op (a `c`/`F` request already bound to its namespace
+// or lack thereof) against every node the client currently knows about.
+// Unlike Get/Set/Delete a clear isn't key-addressed — there's no HRW
+// owner ranking to pick a primary/replica split from, no `W` ever
+// answers, and a namespace's keys are spread over every member node by
+// rendezvous hashing — so it fans out to the whole membership rather
+// than a per-key owner list (docs/protocol.html's "c / F"). In single
+// mode there is only ever the one node to send it to.
+//
+// Success requires every node to ack `C`. On any failure (connection
+// error, no/invalid ack, timeout) the node list is refreshed once — the
+// same refresh path W / a dead primary uses elsewhere — and every node
+// of the *refreshed* list (which may differ: a node can have joined or
+// left) is retried once more. Because clear is idempotent, replaying it
+// against nodes that already succeeded in the first round is harmless. A
+// second round of failures raises ErrConnectionLost naming the
+// still-failing node(s) — this must never silently succeed on a partial
+// clear, so unlike replica writes there is no swallowing here.
+func (c *Client) clearFanout(op func(conn *connection) error) error {
+	c.mu.Lock()
+	single := c.ring == nil
+	c.mu.Unlock()
+	if single {
+		return c.applyReconnecting("", op)
+	}
+
+	if failed := c.clearRound(op); len(failed) > 0 {
+		c.maybeRefresh(true)
+		if failed := c.clearRound(op); len(failed) > 0 {
+			sort.Strings(failed)
+			return connectionLost(
+				fmt.Sprintf("clear failed on node(s): %s", strings.Join(failed, ", ")), nil)
+		}
+	}
+	return nil
+}
+
+// clearRound sends op to every currently known member concurrently (each
+// leg gets applyReconnecting's own one-shot redial-and-retry, exactly
+// like a replica write leg), returning the names of the ones that still
+// failed after that — nil on full success.
+func (c *Client) clearRound(op func(conn *connection) error) []string {
+	c.mu.Lock()
+	names := make([]string, 0, len(c.members))
+	for name := range c.members {
+		names = append(names, name)
+	}
+	c.mu.Unlock()
+
+	var mu sync.Mutex
+	var failed []string
+	var wg sync.WaitGroup
+	wg.Add(len(names))
+	for _, name := range names {
+		go func(name string) {
+			defer wg.Done()
+			if err := c.applyReconnecting(name, op); err != nil {
+				mu.Lock()
+				failed = append(failed, name)
+				mu.Unlock()
+			}
+		}(name)
+	}
+	wg.Wait()
+	return failed
+}
+
 // ── namespaces (issue #105) ──────────────────────────────────────────
 
 // Namespace is a lightweight handle scoping Get/GetBytes/Set/SetBytes/
-// Delete to one namespace: the same key name in two different namespaces
-// — or in a namespace versus the default, unnamespaced keyspace — names
-// two independent cache entries (docs/protocol.html's "g / s / d —
-// namespaced get, set, delete"). Obtained from Client.Namespace.
+// Delete/Clear to one namespace: the same key name in two different
+// namespaces — or in a namespace versus the default, unnamespaced
+// keyspace — names two independent cache entries (docs/protocol.html's
+// "g / s / d — namespaced get, set, delete" and "c / F — clear a
+// namespace, flush everything"). Obtained from Client.Namespace.
 //
 // A Namespace does no networking of its own and holds no connections: it
 // is cheap to create, shares the Client's connections, and every method
 // simply forwards to the Client's own internal (namespace, key) entry
-// points (getBytesNS/setBytesNS/deleteNS) — routing (HRW over (ns,key),
-// see hashring.go), replication fan-out, hedged reads, W
+// points (getBytesNS/setBytesNS/deleteNS/clearNS) — routing (HRW over
+// (ns,key), see hashring.go), replication fan-out, hedged reads, W
 // refresh-and-retry, response tags, and value compression all apply
 // exactly as they do to the Client's own namespace-less methods. It
 // becomes invalid — every method returns ErrClosed — the moment the
@@ -912,6 +1010,14 @@ func (n *Namespace) SetBytes(key string, value []byte, ttlSeconds int64) error {
 // before this call. See Client.Delete.
 func (n *Namespace) Delete(key string) (existed bool, err error) {
 	return n.client.deleteNS(n.namespace, key)
+}
+
+// Clear drops every entry in this namespace across every node (issue
+// #106) — see Client.ClearAll to flush every namespace at once, default
+// included. namespace("")'s Clear clears the default namespace; it is
+// never rejected.
+func (n *Namespace) Clear() error {
+	return n.client.clearNS(n.namespace)
 }
 
 // Close is idempotent; later Get/Set/Delete return ErrClosed. Calling

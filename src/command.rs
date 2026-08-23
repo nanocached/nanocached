@@ -1,7 +1,7 @@
 use crate::cache::Cache;
 use crate::key::Key;
 use crate::response::Response;
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -23,6 +23,17 @@ pub enum Command {
     Delete {
         key: Key,
     },
+    /// `c <namespace-length> [tag]\n<namespace>` (issue #106): drops one
+    /// namespace's every entry. A zero-length namespace clears the
+    /// default one. Not key-addressed, so no wrong-node check applies:
+    /// clients fan it out to every member and each node drops its own
+    /// sub-map.
+    Clear {
+        namespace: Bytes,
+    },
+    /// `F [tag]\n` (issue #106): the whole-store flush — every
+    /// namespace, the default one included.
+    ClearAll,
     /// Every cache command addresses a `Key` — namespace plus name (issue
     /// #105). The legacy `G`/`S`/`D` frames address the default (empty)
     /// namespace; their lowercase `g`/`s`/`d` counterparts carry an
@@ -140,6 +151,9 @@ impl Command {
                     Response::NotFound
                 }
             }
+
+            Self::Clear { namespace } => Response::Cleared(cache.clear(&namespace)),
+            Self::ClearAll => Response::Cleared(cache.clear_all()),
 
             Self::ListEntries => Response::Keys(cache.keys()),
 
@@ -335,6 +349,43 @@ fn parse_with_mode(
                 },
                 tag,
             ))
+        }
+
+        b"c" => {
+            let namespace_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let namespace_length = parse_length(namespace_length)?;
+
+            let namespace_start = header_end + 1;
+            let namespace_end = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < namespace_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(namespace_end).freeze();
+            let namespace = frame.slice(namespace_start..namespace_end);
+
+            Ok((Command::Clear { namespace }, tag))
+        }
+
+        b"F" => {
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            input.advance(header_end + 1);
+
+            Ok((Command::ClearAll, tag))
         }
 
         b"S" | b"s" => {
@@ -1479,6 +1530,84 @@ mod tests {
             Command::Get { key: key(b"name") }.execute(&mut cache),
             Response::NotFound
         );
+    }
+
+    #[test]
+    fn parses_clear_and_clear_all() {
+        // Issue #106.
+        let mut input = buf(b"c 5\nusers");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Clear {
+                namespace: Bytes::from_static(b"users"),
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"c 0\n");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Clear {
+                namespace: Bytes::new(),
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"F\nG 1\nk");
+        assert_eq!(parse(&mut input), Ok(Command::ClearAll));
+        assert_eq!(&input[..], b"G 1\nk");
+    }
+
+    #[test]
+    fn clear_and_clear_all_carry_the_tag_last_in_tagged_mode() {
+        let mut input = buf(b"c 5 7\nusers");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Clear {
+                    namespace: Bytes::from_static(b"users"),
+                },
+                Some(7),
+            ))
+        );
+
+        let mut input = buf(b"F 8\n");
+        assert_eq!(parse_tagged(&mut input), Ok((Command::ClearAll, Some(8))));
+
+        let mut input = buf(b"F\n");
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn clear_rejects_extra_fields_and_stays_untouched_when_incomplete() {
+        let mut input = buf(b"F 1 2\n");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+
+        let original = b"c 5\nuse".to_vec();
+        let mut input = buf(&original);
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn clear_executes_against_one_namespace_and_clear_all_against_every_one() {
+        let mut cache = Cache::new(usize::MAX);
+        cache.set(key(b"a"), Bytes::from_static(b"1"));
+        cache.set(namespaced(b"users", b"a"), Bytes::from_static(b"2"));
+        cache.set(namespaced(b"users", b"b"), Bytes::from_static(b"3"));
+
+        assert_eq!(
+            Command::Clear {
+                namespace: Bytes::from_static(b"users"),
+            }
+            .execute(&mut cache),
+            Response::Cleared(2)
+        );
+        assert_eq!(cache.get(&namespaced(b"users", b"a")), None);
+        assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
+
+        assert_eq!(Command::ClearAll.execute(&mut cache), Response::Cleared(1));
+        assert_eq!(cache.get(&key(b"a")), None);
     }
 
     #[test]

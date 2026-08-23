@@ -4,7 +4,8 @@
  * is handled separately in `identify.ts` — by the time a `Connection` uses
  * these encoders/parser, identification is already done and the socket
  * only ever carries `G`/`S`/`D` (and their namespaced `g`/`s`/`d`
- * counterparts) requests and their responses.
+ * counterparts), `c`/`F` (clear a namespace / flush everything, issue
+ * #106) requests, and their responses.
  */
 
 import { NanocachedError } from "./errors.js";
@@ -137,8 +138,32 @@ export function encodeDelete(key: Uint8Array, tag?: number, namespace: Uint8Arra
   return Buffer.concat([toAscii(`d ${namespace.length} ${key.length}${tagField(tag)}\n`), namespace, key]);
 }
 
+// Clear a namespace / flush everything (issue #106). Neither is
+// key-addressed — a namespace's keys are spread over every node by HRW —
+// so, unlike G/S/D, there's no separate uppercase/lowercase pair keyed on
+// whether the namespace is empty: `c` (lowercase) always encodes the
+// clear, with namespace-length 0 addressing the default namespace, and
+// there's no dedicated uppercase clear command at all (the obvious letter,
+// `C`, is already the response marker below). NanocachedClient is what
+// turns a namespace-scoped `c`/an `F` into a cluster-wide operation, by
+// fanning either out to every node — see its `fanoutClear`.
+export function encodeClear(namespace: Uint8Array = EMPTY_NAMESPACE, tag?: number): Buffer {
+  // No key here, but a namespace alone can still push a frame past the
+  // server's per-request cap — same no-reply, poisoned-connection
+  // rejection as an oversized key/value (see checkKey above), so this
+  // guards for it too before anything is written.
+  if (namespace.length > MAX_REQUEST_BYTES) {
+    throw new RangeError(`nanocached: namespace exceeds MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length} bytes`);
+  }
+  return Buffer.concat([toAscii(`c ${namespace.length}${tagField(tag)}\n`), namespace]);
+}
+
+export function encodeClearAll(tag?: number): Buffer {
+  return toAscii(`F${tagField(tag)}\n`);
+}
+
 export interface ParsedResponse {
-  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode";
+  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode" | "cleared";
   value?: Buffer;
   /** echoed response tags: the echoed request tag, present on every response parsed
    * in tagged mode except the unsolicited `busy`. */
@@ -179,6 +204,7 @@ const MARKER_NOT_FOUND = 0x4e; // 'N'
 const MARKER_BUSY = 0x42; // 'B'
 const MARKER_VALUE = 0x56; // 'V'
 const MARKER_WRONG_NODE = 0x57; // 'W'
+const MARKER_CLEARED = 0x43; // 'C' — answers both `c` and `F` (issue #106)
 const LF = 0x0a;
 
 // Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
@@ -210,9 +236,18 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
     case MARKER_STORED:
     case MARKER_DELETED:
     case MARKER_NOT_FOUND:
-    case MARKER_WRONG_NODE: {
+    case MARKER_WRONG_NODE:
+    case MARKER_CLEARED: {
       const kind =
-        buf[0] === MARKER_STORED ? "stored" : buf[0] === MARKER_DELETED ? "deleted" : buf[0] === MARKER_NOT_FOUND ? "notFound" : "wrongNode";
+        buf[0] === MARKER_STORED
+          ? "stored"
+          : buf[0] === MARKER_DELETED
+            ? "deleted"
+            : buf[0] === MARKER_NOT_FOUND
+              ? "notFound"
+              : buf[0] === MARKER_WRONG_NODE
+                ? "wrongNode"
+                : "cleared";
 
       if (!tagged) {
         if (buf.length < 2) return null;

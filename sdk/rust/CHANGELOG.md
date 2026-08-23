@@ -38,6 +38,24 @@ follow the `sdk/rust/vX.Y.Z` tags.
   `route(namespace, key)`); pass `b""` to route an un-namespaced key
   exactly as before.
 
+- Namespace clear / flush-everything (issue #106): `Namespace::clear()`
+  drops every entry in that one namespace (`namespace("").clear()`
+  clears the default namespace and is not rejected); the new
+  `NanocachedClient::clear_all()` flushes every namespace, the default
+  one included. Neither is key-addressed (a namespace's keys are spread
+  over every node by rendezvous hashing), so both fan out to every node
+  the client currently knows about and succeed only once every node has
+  acked `C` — never a partial clear. If any node fails, the node list is
+  refreshed once (the same path a `W` reply already triggers) and the
+  whole fan-out is retried against the refreshed list; a node still
+  failing after that fails the call with `Error::ConnectionLost` naming
+  it. Both operations are idempotent, so a caller can simply retry.
+  Raises `Error::AlreadyClosed` after `close()`, like every other
+  operation. On the wire these are the new `c <namespace-length>[
+  <tag>]\n<namespace>` / `F[ <tag>]\n` commands, acked `C[ <tag>]\n`;
+  talking to a pre-#106 server, both fail with `Error::Protocol` (an
+  unrecognized command answered `E`).
+
 ## [0.3.0] - 2026-08-22
 
 Aligned release of the server and all six SDKs. Server-side, this

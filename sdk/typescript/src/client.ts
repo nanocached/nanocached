@@ -322,6 +322,7 @@ interface NamespaceOps {
   getBytes(key: string | Uint8Array): Promise<Buffer | null>;
   set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void>;
   delete(key: string | Uint8Array): Promise<boolean>;
+  clear(): Promise<void>;
 }
 
 /**
@@ -365,6 +366,14 @@ export class NanocachedNamespace {
   /** See `NanocachedClient.delete`. */
   delete(key: string | Uint8Array): Promise<boolean> {
     return this.ops.delete(key);
+  }
+
+  /** Clears this namespace (issue #106) — every entry in it, on every
+   * node. See `NanocachedClient.clearAll` to flush every namespace
+   * instead, and `NanocachedClient`'s `fanoutClear` for the underlying
+   * fan-out/retry mechanics this forwards to. */
+  clear(): Promise<void> {
+    return this.ops.clear();
   }
 }
 
@@ -853,6 +862,21 @@ export class NanocachedClient {
     );
   }
 
+  /** Clears one namespace (issue #106): every entry in it, on every node.
+   * `namespace` defaults to the default (empty) namespace — see `clearAll`
+   * for the client's own `clear_all`-style flush of every namespace at
+   * once. See `fanoutClear` for the shared fan-out/retry mechanics. */
+  private clearInNamespace(namespace: Uint8Array): Promise<void> {
+    return this.fanoutClear((connection) => connection.clear(namespace));
+  }
+
+  /** Flushes every namespace, the default one included (issue #106) —
+   * the client-level counterpart to a namespace handle's `clear()`. See
+   * `fanoutClear`. */
+  async clearAll(): Promise<void> {
+    return this.fanoutClear((connection) => connection.clearAll());
+  }
+
   /** Returns a lightweight handle scoped to `ns` (first-class namespaces,
    * issue #105) — see `NanocachedNamespace`. `ns` accepts the same
    * key-ish types this client accepts for keys: a `string` is UTF-8
@@ -873,6 +897,7 @@ export class NanocachedClient {
       getBytes: (key) => this.getBytesInNamespace(namespaceBytes, key),
       set: (key, value, ttlSeconds) => this.setInNamespace(namespaceBytes, key, value, ttlSeconds),
       delete: (key) => this.deleteInNamespace(namespaceBytes, key),
+      clear: () => this.clearInNamespace(namespaceBytes),
     });
   }
 
@@ -1146,6 +1171,61 @@ export class NanocachedClient {
 
     const replicaBug = replicaResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
     throw replicaBug ? replicaBug.reason : primary.error;
+  }
+
+  /** Shared fan-out for `clearAll()`/a namespace handle's `clear()`
+   * (issue #106). Unlike get/set/delete, a clear isn't key-addressed —
+   * a namespace's keys are spread across every node by HRW, so there's
+   * no single owner (or owner set) to route to the way `ownerNames`
+   * finds for a key. `send` is issued against every node in single
+   * mode, just the one connection.
+   *
+   * In cluster mode: `send` goes out to every current member
+   * concurrently (clearFanoutAttempt). Success requires every member to
+   * have acked; if any failed — a dead connection, a timeout, anything
+   * — the node list is refreshed once, the same refresh path a `W`/dead
+   * primary retry uses (withWrongNodeRetry), and the clear is retried
+   * against every member of the *refreshed* list (clearFanoutAttempt
+   * reads `this.target.members` fresh each call, so this falls out
+   * naturally once the refresh has swapped `target` in). A member that
+   * still fails after that raises the SDK's normal error type, naming
+   * it — never a silent partial clear, since a caller has no way to
+   * tell which entries actually survived. The operation is idempotent,
+   * so a caller that gets this error can simply retry it. refreshNodeList's
+   * own failures are already counted in stats().refreshFailures, so
+   * nothing new needs tracking here (per issue #106: reuse an existing
+   * counter that fits rather than adding one). */
+  private async fanoutClear(send: (connection: Connection) => Promise<void>): Promise<void> {
+    if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
+
+    if (this.target.kind === "single") {
+      const connection = await this.singleConnection();
+      await send(connection);
+      return;
+    }
+
+    let failedNodes = await this.clearFanoutAttempt(send);
+    if (failedNodes.length === 0) return;
+
+    await this.maybeRefreshNodeList({ force: true });
+    failedNodes = await this.clearFanoutAttempt(send);
+    if (failedNodes.length === 0) return;
+
+    throw new NanocachedError(`nanocached: clear failed on node(s): ${failedNodes.join(", ")}`);
+  }
+
+  /** One pass of the clear fan-out: `send` against every node currently
+   * in the cluster's member list, concurrently — returning the names of
+   * whichever ones failed (see fanoutClear). Always reads
+   * `this.target.members` fresh, so a second call after a node-list
+   * refresh naturally targets the refreshed list, not the one this
+   * fan-out started with. */
+  private async clearFanoutAttempt(send: (connection: Connection) => Promise<void>): Promise<string[]> {
+    if (this.target.kind !== "cluster") return [];
+    const names = [...this.target.members.keys()];
+    const results = await Promise.allSettled(names.map((name) => this.memberConnection(name).then(send)));
+    return names.filter((_, index) => results[index].status === "rejected");
   }
 
   /** Runs `operation`; if a routed-to node answers `W` (staged node join: it

@@ -6,10 +6,11 @@ namespace Nanocached;
 
 /// <summary>
 /// One already-identified connection to a single nanocached-node, speaking
-/// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c>, and their namespaced
-/// counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — the <c>A</c>
-/// identify exchange happens in <see cref="Identify"/> before a Connection
-/// exists).
+/// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c>, their namespaced
+/// counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — and the
+/// namespace-clear/flush-everything commands <c>c</c>/<c>F</c> — issue
+/// #106 — the <c>A</c> identify exchange happens in <see cref="Identify"/>
+/// before a Connection exists).
 /// Requests are pipelined onto the socket and matched to responses in send
 /// order (request pipelining): a dedicated read loop, started in the
 /// constructor, consumes responses and dispatches each to the oldest
@@ -274,6 +275,37 @@ internal sealed class Connection
         };
     }
 
+    /// <summary>issue #106: drops every entry in one namespace on this
+    /// node — <paramref name="namespaceBytes"/> empty clears the default
+    /// namespace (<c>c 0\n</c>, not rejected). Unlike
+    /// <see cref="GetAsync(byte[], byte[])"/>/Set/Delete, there is no
+    /// legacy uppercase counterpart to fall back to for the empty
+    /// namespace: <c>c</c>/<c>F</c> are new in #106 and always sent
+    /// lowercase, whatever the namespace. Never answered <c>W</c> (not
+    /// key-addressed, docs/protocol.html's "c / F" section) — the
+    /// fan-out-and-refresh-once-and-retry logic for a node that fails
+    /// this lives in <see cref="NanocachedClient"/>, not here; this
+    /// method only speaks for the one node this connection is dialed
+    /// to.</summary>
+    internal async Task ClearAsync(byte[] namespaceBytes)
+    {
+        var (marker, _) = await RequestAsync(tag =>
+            Frame(ClearHeader(namespaceBytes, tag), namespaceBytes, EmptyNamespace, null))
+            .ConfigureAwait(false);
+        if (marker != (byte)'C') throw Mismatch(marker);
+    }
+
+    /// <summary>issue #106: drops every namespace on this node, the
+    /// default one included (<c>F\n</c>). See <see cref="ClearAsync(byte[])"/>'s
+    /// doc comment for the shared <c>C</c>-ack/no-<c>W</c> rules.</summary>
+    internal async Task ClearAllAsync()
+    {
+        var (marker, _) = await RequestAsync(tag =>
+            Encoding.ASCII.GetBytes($"F{TagField(tag)}\n"))
+            .ConfigureAwait(false);
+        if (marker != (byte)'C') throw Mismatch(marker);
+    }
+
     /// <summary>issue #105: <c>g &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
     /// when namespaced, or the untouched legacy <c>G &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
     /// otherwise.</summary>
@@ -301,6 +333,13 @@ internal sealed class Connection
         IsNamespaced(namespaceBytes)
             ? $"d {namespaceBytes.Length} {keyLength}{TagField(tag)}\n"
             : $"D {keyLength}{TagField(tag)}\n";
+
+    /// <summary>issue #106: <c>c &lt;ns-len&gt;[ &lt;tag&gt;]\n</c> — always
+    /// lowercase, even for the empty (default) namespace, since <c>c</c>
+    /// has no legacy uppercase form to fall back to (it postdates
+    /// namespaces).</summary>
+    private static string ClearHeader(byte[] namespaceBytes, uint? tag) =>
+        $"c {namespaceBytes.Length}{TagField(tag)}\n";
 
     /// <summary>issue #105: <paramref name="namespaceBytes"/> leads the
     /// body, ahead of the key (and, for a Set, the value) — empty for
@@ -585,6 +624,7 @@ internal sealed class Connection
             case (byte)'D':
             case (byte)'N':
             case (byte)'W':
+            case (byte)'C': // issue #106: same fixed shape as S/D/N/W.
             {
                 if (!_tagged)
                 {

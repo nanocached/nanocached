@@ -79,6 +79,25 @@ server pin the same test vectors for it. A pre-namespace `nanocached-node`
 answers a namespaced request with `E` and closes the connection, so every
 node in a cluster must be upgraded before clients start using namespaces.
 
+`handle.clear()` drops every entry in that namespace, and
+`client.clearAll()` drops every namespace at once, the default one
+included:
+
+```ts
+await users.clear(); // just "users" is gone
+await client.clearAll(); // every namespace, including the default one, is gone
+```
+
+Neither is key-addressed, so — unlike `get`/`set`/`delete` — a clear can't
+be routed to a single owner: it's sent to *every* node in the cluster
+concurrently. It only resolves once every node has acknowledged; if any
+node failed, the node list is refreshed once and the clear is retried
+against the refreshed list, exactly like a `W`/dead-primary retry. A node
+that still fails after that raises the usual `NanocachedError`, naming it
+— a clear never silently succeeds on only part of the cluster, and since
+it's idempotent, the caller can just retry it. In standalone (single-node)
+mode it's simply sent to that one node.
+
 ## Authentication
 
 If the server was started with `NANOCACHED_AUTH_SECRET`, pass the same
@@ -303,8 +322,13 @@ a cluster with no reachable node at all fails `connect()`.
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
 - `client.namespace(ns)` — returns a `NanocachedNamespace` handle scoped to
   `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/`set`/
-  `delete` with the same signatures and semantics as above; `handle.namespace`
-  exposes the raw namespace bytes
+  `delete`/`clear` with the same signatures and semantics as above;
+  `handle.namespace` exposes the raw namespace bytes
+- `handle.clear()` — resolves (`Promise<void>`) once every node in the
+  cluster (or the single node in standalone mode) has cleared that
+  namespace; see [Namespaces](#namespaces)
+- `client.clearAll()` — resolves (`Promise<void>`) once every namespace,
+  the default one included, has been flushed on every node
 - `client.close()` — resolves (`Promise<void>`) after any in-flight
   background replica writes finish and all connections are closed; later
   calls reject with `AlreadyClosedError`; a second `close()` warns but

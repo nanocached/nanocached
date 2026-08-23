@@ -858,6 +858,122 @@ public sealed class NanocachedClient : IDisposable
             .ConfigureAwait(false);
     }
 
+    /// <summary>issue #106: drops every entry in <paramref name="namespaceBytes"/>
+    /// (empty clears the default namespace — not rejected, see
+    /// <see cref="NanocachedNamespace"/>'s doc comment on
+    /// <c>Namespace("")</c>). The internal method
+    /// <see cref="NanocachedNamespace.ClearAsync()"/> forwards to.</summary>
+    internal async Task ClearAsync(byte[] namespaceBytes)
+    {
+        await BeforeOperationAsync().ConfigureAwait(false);
+        await ClearFanOutWithRetryAsync(connection => connection.ClearAsync(namespaceBytes))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>issue #106: drops every namespace, the default one
+    /// included — the client-side equivalent of the server's <c>F</c>.
+    /// Per the issue, deliberately not named "flush" to keep the public
+    /// API's vocabulary to get/set/delete/clear.</summary>
+    public async Task ClearAllAsync()
+    {
+        await BeforeOperationAsync().ConfigureAwait(false);
+        await ClearFanOutWithRetryAsync(connection => connection.ClearAllAsync())
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// issue #106: a clear/flush is never key-addressed (docs/protocol.html's
+    /// "c / F" section — no <c>W</c> ever, so <see cref="WithClusterRetryAsync{T}"/>'s
+    /// single-key retry doesn't apply), so it fans out to <em>every</em>
+    /// node in the client's current node list concurrently, the same way
+    /// <see cref="WriteAsync{T}"/> fans a replicated write out to a key's
+    /// owners. Success requires every node to have acked <c>C</c>: on any
+    /// failure the node list is refreshed once (the same refresh path
+    /// <see cref="WithClusterRetryAsync{T}"/> uses for a stale ring) and
+    /// the clear is retried against every node of the <em>refreshed</em>
+    /// list — not just the ones that failed, since a refresh can also
+    /// reassign which node owns which share. A node still failing after
+    /// that retry fails the whole call — a clear must never silently
+    /// leave a namespace partially cleared — but the operation is
+    /// idempotent, so a caller can simply retry it.
+    ///
+    /// <para>Single/standalone mode (<see cref="_ring"/> is <c>null</c>)
+    /// has only the one connected node, so there is nothing to fan out to
+    /// or refresh: <paramref name="op"/> just runs against it directly,
+    /// through the same lazy-reconnect path every other operation
+    /// uses.</para>
+    /// </summary>
+    private async Task ClearFanOutWithRetryAsync(Func<Connection, Task> op)
+    {
+        if (_ring is null)
+        {
+            await ApplyReconnectingAsync<object?>(null, async connection =>
+            {
+                await op(connection).ConfigureAwait(false);
+                return null;
+            }).ConfigureAwait(false);
+            return;
+        }
+
+        List<string> names;
+        lock (_stateLock) { names = _members.Keys.ToList(); }
+
+        IReadOnlyList<(string Name, Exception Error)> failures =
+            await ClearFanOutAsync(names, op).ConfigureAwait(false);
+        if (failures.Count == 0) return;
+
+        await MaybeRefreshAsync(force: true).ConfigureAwait(false);
+        lock (_stateLock) { names = _members.Keys.ToList(); }
+
+        failures = await ClearFanOutAsync(names, op).ConfigureAwait(false);
+        if (failures.Count > 0)
+        {
+            string detail = string.Join(
+                ", ", failures.Select(failure => $"{failure.Name} ({failure.Error.Message})"));
+            throw new ConnectionLostException($"nanocached: clear failed on node(s): {detail}");
+        }
+    }
+
+    /// <summary>Runs <paramref name="op"/> against every node in
+    /// <paramref name="names"/> concurrently (fan-out — see
+    /// <see cref="ClearFanOutWithRetryAsync"/>), through the same
+    /// lazy-reconnect path a replica write uses. Returns the nodes that
+    /// failed, paired with why, instead of throwing — the caller decides
+    /// whether a first-pass failure warrants a refresh-and-retry or, on a
+    /// second pass, is fatal.</summary>
+    private async Task<IReadOnlyList<(string Name, Exception Error)>> ClearFanOutAsync(
+        IReadOnlyList<string> names, Func<Connection, Task> op)
+    {
+        async Task<(string Name, Exception Error)?> RunAsync(string name)
+        {
+            try
+            {
+                await ApplyReconnectingAsync<object?>(name, async connection =>
+                {
+                    await op(connection).ConfigureAwait(false);
+                    return null;
+                }).ConfigureAwait(false);
+                return null;
+            }
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException)
+            {
+                // Narrowed the same way ReplicaWriteAsync's swallow site is
+                // (client-side replication): a dead/unreachable node here
+                // is exactly the case this fan-out's refresh-and-retry
+                // exists for, not a programming bug — that still
+                // propagates. OperationCanceledException (Close() racing
+                // this) is deliberately not caught either, matching the
+                // other swallow sites.
+                return (name, error);
+            }
+        }
+
+        (string Name, Exception Error)?[] outcomes =
+            await Task.WhenAll(names.Select(RunAsync)).ConfigureAwait(false);
+        return outcomes.Where(outcome => outcome is not null).Select(outcome => outcome!.Value).ToList();
+    }
+
     /// <summary>Rejects an empty key, or a (namespace, key) pair so large
     /// that a bare <c>"g "</c>/<c>"G "</c>/<c>"d "</c>/<c>"D "</c> header
     /// plus the namespace and key alone would already risk tripping the

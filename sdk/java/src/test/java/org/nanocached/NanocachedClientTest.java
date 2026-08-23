@@ -2430,6 +2430,7 @@ class NanocachedClientTest {
             assertThrows(NanocachedException.AlreadyClosed.class, () -> ns.get("k"));
             assertThrows(NanocachedException.AlreadyClosed.class, () -> ns.set("k", "v"));
             assertThrows(NanocachedException.AlreadyClosed.class, () -> ns.delete("k"));
+            assertThrows(NanocachedException.AlreadyClosed.class, ns::clear);
         }
     }
 
@@ -2513,6 +2514,194 @@ class NanocachedClientTest {
                 assertArrayEquals(value, connection.get(new byte[0], key));
             } finally {
                 connection.close();
+            }
+        }
+    }
+
+    // ── CLEAR namespace / flush everything (issue #106) ─────────────
+
+    @Test
+    void connectionEncodesClearAndClearAllFramesIncludingTaggedForm() throws Exception {
+        // Exercised directly against Connection, mirroring
+        // connectionEncodesNamespacedFramesIncludingTaggedAndBinaryForms:
+        // the exact frame shape (the `c <ns-len> <tag>` form, the bare
+        // `F <tag>` form with no body at all, and a binary namespace) is
+        // proven, not just the higher-level round trip. A returning
+        // clear()/clearAll() call with no exception is itself proof the
+        // `C` response parses correctly.
+        try (MockNode node = MockNode.withTagSupport()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            assertTrue(target.tagged());
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                byte[] namespace = {(byte) 0xff, 0x00, 0x01}; // binary, not valid UTF-8
+                connection.clear(namespace); // c <len> <tag>\n<namespace>
+                connection.clear(new byte[0]); // c 0 <tag>\n — the default namespace, not rejected
+                connection.clearAll(); // F <tag>\n — no body at all
+                assertEquals(2, node.clearCount.get());
+                assertEquals(1, node.clearAllCount.get());
+            } finally {
+                connection.close();
+            }
+        }
+
+        // Untagged connection: the legacy bare `c <len>\n<ns>` / `F\n` forms.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.namespace("ns").clear();
+                client.clearAll();
+                assertEquals(1, node.clearCount.get());
+                assertEquals(1, node.clearAllCount.get());
+            }
+        }
+    }
+
+    @Test
+    void namespaceClearDropsOnlyThatNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("default-key", "default-value");
+                NanocachedClient.Namespace ns1 = client.namespace("ns1");
+                NanocachedClient.Namespace ns2 = client.namespace("ns2");
+                ns1.set("k", "ns1-value");
+                ns2.set("k", "ns2-value");
+
+                ns1.clear();
+
+                assertEquals(Optional.empty(), ns1.get("k"));
+                assertEquals(Optional.of("ns2-value"), ns2.get("k")); // a different namespace survives
+                assertEquals(Optional.of("default-value"), client.get("default-key")); // the default survives
+            }
+        }
+    }
+
+    @Test
+    void clearOnAnEmptyNamespaceHandleClearsOnlyTheDefaultNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("default-key", "v");
+                NanocachedClient.Namespace ns = client.namespace("ns");
+                ns.set("k", "ns-value");
+
+                client.namespace("").clear(); // `c 0` — the default namespace only, not `F`
+
+                assertEquals(Optional.empty(), client.get("default-key"));
+                assertEquals(Optional.of("ns-value"), ns.get("k")); // untouched — this is not clearAll()
+            }
+        }
+    }
+
+    @Test
+    void clearAllEmptiesEveryNamespaceIncludingTheDefault() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("default-key", "v");
+                NanocachedClient.Namespace ns1 = client.namespace("ns1");
+                NanocachedClient.Namespace ns2 = client.namespace("ns2");
+                ns1.set("k", "v1");
+                ns2.set("k", "v2");
+
+                client.clearAll();
+
+                assertEquals(Optional.empty(), client.get("default-key"));
+                assertEquals(Optional.empty(), ns1.get("k"));
+                assertEquals(Optional.empty(), ns2.get("k"));
+                assertTrue(node.store.isEmpty());
+                assertTrue(node.namespacedStores.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void clearAllThrowsAfterClose() throws Exception {
+        try (MockNode node = new MockNode()) {
+            NanocachedClient client = connect("127.0.0.1", node.port());
+            client.close();
+            assertThrows(NanocachedException.AlreadyClosed.class, client::clearAll);
+        }
+    }
+
+    @Test
+    void clearAllFansOutToEveryNodeInTheCluster() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                for (int i = 0; i < 20; i++) {
+                    client.set("key-" + i, "v"); // scattered across both nodes by HRW
+                }
+                assertTrue(cluster.nodes().values().stream().anyMatch(n -> !n.store.isEmpty()));
+
+                client.clearAll();
+
+                for (MockNode node : cluster.nodes().values()) {
+                    assertEquals(1, node.clearAllCount.get(), "every node must receive the F frame");
+                    assertTrue(node.store.isEmpty());
+                }
+            }
+        }
+    }
+
+    @Test
+    void namespaceClearFansOutToEveryNodeInTheCluster() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                NanocachedClient.Namespace ns = client.namespace("tenant");
+                for (int i = 0; i < 20; i++) {
+                    ns.set("key-" + i, "v"); // scattered across both nodes by HRW
+                }
+
+                ns.clear();
+
+                for (MockNode node : cluster.nodes().values()) {
+                    assertEquals(1, node.clearCount.get(), "every node must receive the c frame");
+                    assertEquals(Map.of(), node.namespacedStores.getOrDefault("tenant", Map.of()));
+                }
+            }
+        }
+    }
+
+    @Test
+    void clearAllRetriesOnceAfterANodeFailsThenSucceedsOnTheRefreshedList() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode owner = cluster.nodes().get(NAMES.get(0));
+                MockNode survivor = cluster.nodes().get(NAMES.get(1));
+                // Two credits: applyReconnecting's own single redial-retry
+                // (Connection-level healing, beneath the client's
+                // refresh-and-retry) already absorbs one dropped
+                // connection per fan-out pass, so both attempts in the
+                // first pass must fail for the node to still be down by
+                // the time fanOutClear checks — the third attempt, in the
+                // retried pass, then acks normally.
+                owner.failClearOnce();
+                owner.failClearOnce();
+
+                client.clearAll(); // must not throw — the retried pass succeeds
+
+                // The retry resends F to *every* node of the refreshed
+                // list, not just the one that failed (the spec's own
+                // wording) — so the survivor sees it twice (once per
+                // pass) and the owner three times (two dropped, one acked).
+                assertEquals(3, owner.clearAllCount.get());
+                assertEquals(2, survivor.clearAllCount.get());
+                for (MockNode node : cluster.nodes().values()) {
+                    assertTrue(node.store.isEmpty());
+                }
+            }
+        }
+    }
+
+    @Test
+    void clearAllRaisesNamingTheNodeWhenItIsStillDownAfterTheRetry() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String deadName = NAMES.get(0);
+                cluster.nodes().get(deadName).close();
+                Thread.sleep(50);
+
+                NanocachedException error = assertThrows(NanocachedException.class, client::clearAll);
+                assertTrue(error.getMessage().contains(deadName),
+                        "error should name the failing node: " + error.getMessage());
             }
         }
     }

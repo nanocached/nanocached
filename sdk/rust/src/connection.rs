@@ -147,6 +147,11 @@ pub(crate) enum ResponseKind {
     NotFound,
     Stored,
     Deleted,
+    /// `C` — issue #106's `clear`/`clear_all` ack. Neither `c` nor `F` is
+    /// key-addressed, so this is the only outcome besides an error; there
+    /// is no `NotFound`/`W` counterpart to distinguish (clearing an
+    /// already-empty namespace still acks `C`).
+    Cleared,
 }
 
 /// RAII guard around the write half of a round trip: if the enclosing
@@ -300,6 +305,29 @@ impl Connection {
         }
     }
 
+    /// Drops every entry in `namespace` on this one node (issue #106's
+    /// `c`) — `namespace` empty clears the default namespace. Not
+    /// key-addressed (a namespace's keys are spread over every node by
+    /// HRW), so unlike `get`/`set`/`delete` this alone never sees a `W`;
+    /// fanning the call out to every node and aggregating the result is
+    /// [`crate::client::NanocachedClient`]'s job, not this connection's.
+    pub(crate) async fn clear(&self, namespace: &[u8]) -> Result<()> {
+        match self.request(|tag| encode_clear(namespace, tag)).await? {
+            ResponseKind::Cleared => Ok(()),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Drops every namespace on this one node, the default one included
+    /// (issue #106's `F`). See `clear`'s doc comment for the
+    /// not-key-addressed / fan-out note, which applies here too.
+    pub(crate) async fn clear_all(&self) -> Result<()> {
+        match self.request(encode_clear_all).await? {
+            ResponseKind::Cleared => Ok(()),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
     /// Wraps `request_uncapped` in `REQUEST_TIMEOUT_MS`: if the whole
     /// round trip hasn't completed by then, the server is presumed dead
     /// (a half-open server that accepts but never answers looks
@@ -417,6 +445,7 @@ impl Connection {
             ResponseKind::NotFound => "not-found",
             ResponseKind::Stored => "stored",
             ResponseKind::Deleted => "deleted",
+            ResponseKind::Cleared => "cleared",
         };
         self.close();
         Error::ConnectionLost(format!(
@@ -523,6 +552,31 @@ fn encode_delete(namespace: &[u8], key: &[u8], tag: Option<u32>) -> Vec<u8> {
     frame
 }
 
+/// Builds a `c` frame (issue #106): `c <namespace-length>[ <tag>]\n<namespace>`.
+/// Unlike `encode_get`/`encode_set`/`encode_delete`, there is no legacy
+/// uppercase form to preserve here — `clear` is new as of #106, so even
+/// the default (empty) namespace goes out as `c 0[ <tag>]\n` rather than
+/// switching frames.
+fn encode_clear(namespace: &[u8], tag: Option<u32>) -> Vec<u8> {
+    let mut frame = match tag {
+        Some(tag) => format!("c {} {tag}\n", namespace.len()),
+        None => format!("c {}\n", namespace.len()),
+    }
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame
+}
+
+/// Builds an `F` frame (issue #106): `F[ <tag>]\n` — no body at all, since
+/// flushing every namespace names nothing.
+fn encode_clear_all(tag: Option<u32>) -> Vec<u8> {
+    match tag {
+        Some(tag) => format!("F {tag}\n"),
+        None => "F\n".to_string(),
+    }
+    .into_bytes()
+}
+
 /// This connection's only reader, for its whole lifetime — nothing else
 /// may read from `read_half`. Consumes responses off the wire and
 /// dispatches each to the oldest pending request (FIFO —
@@ -615,7 +669,7 @@ async fn read_loop(
         // plain `Protocol` error would leave the connection open and
         // permanently off by one — poison it here instead, the same way
         // as a tag mismatch (mirrors Go's `default: mismatch`).
-        if !matches!(marker, b'V' | b'N' | b'S' | b'D' | b'W') {
+        if !matches!(marker, b'V' | b'N' | b'S' | b'D' | b'W' | b'C') {
             let message = format!(
                 "nanocached: unexpected response from server: {} (connection desynced)",
                 marker as char
@@ -719,9 +773,10 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
             read_half.read_u8().await?; // the trailing '\n'
             Ok((marker, None, None))
         }
-        b'S' | b'D' | b'N' | b'W' => {
+        b'S' | b'D' | b'N' | b'W' | b'C' => {
             if tagged {
-                // `S <tag>\n` / `D <tag>\n` / `N <tag>\n` / `W <tag>\n`.
+                // `S <tag>\n` / `D <tag>\n` / `N <tag>\n` / `W <tag>\n` /
+                // `C <tag>\n` (issue #106).
                 let line = read_line(read_half).await?;
                 Ok((marker, None, Some(parse_tag(line.trim())?)))
             } else {
@@ -755,6 +810,7 @@ impl TryFrom<RawResponse> for ResponseKind {
             b'N' => Ok(ResponseKind::NotFound),
             b'S' => Ok(ResponseKind::Stored),
             b'D' => Ok(ResponseKind::Deleted),
+            b'C' => Ok(ResponseKind::Cleared),
             b'W' => Err(Error::WrongNode),
             other => Err(Error::Protocol(format!(
                 "nanocached: unexpected response from server: {}",
@@ -873,5 +929,52 @@ mod tests {
             encode_delete(b"users", b"alpha", Some(3)),
             [b"d 5 5 3\n".as_slice(), b"users", b"alpha"].concat()
         );
+    }
+
+    #[test]
+    fn encode_clear_untagged_default_namespace() {
+        // Unlike get/set/delete, clear has no legacy uppercase frame to
+        // preserve — even the empty (default) namespace goes out as `c 0`
+        // rather than switching command letters (issue #106).
+        assert_eq!(encode_clear(b"", None), b"c 0\n".to_vec());
+    }
+
+    #[test]
+    fn encode_clear_tagged_default_namespace() {
+        assert_eq!(encode_clear(b"", Some(5)), b"c 0 5\n".to_vec());
+    }
+
+    #[test]
+    fn encode_clear_untagged_named_namespace() {
+        assert_eq!(
+            encode_clear(b"users", None),
+            [b"c 5\n".as_slice(), b"users"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_clear_tagged_named_namespace() {
+        assert_eq!(
+            encode_clear(b"users", Some(3)),
+            [b"c 5 3\n".as_slice(), b"users"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_clear_all_untagged() {
+        assert_eq!(encode_clear_all(None), b"F\n".to_vec());
+    }
+
+    #[test]
+    fn encode_clear_all_tagged() {
+        assert_eq!(encode_clear_all(Some(9)), b"F 9\n".to_vec());
+    }
+
+    #[test]
+    fn cleared_response_converts_from_the_c_marker() {
+        assert!(matches!(
+            ResponseKind::try_from((b'C', None)),
+            Ok(ResponseKind::Cleared)
+        ));
     }
 }

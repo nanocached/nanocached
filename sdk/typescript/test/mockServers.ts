@@ -58,6 +58,18 @@ export interface MockNode extends MockServerBase {
   connectionCount(): number;
   /** How many `G` requests this server has ever received. */
   getCount(): number;
+  /** How many `c`/`F` (clear/flush, issue #106) requests this server has
+   * ever received — lets a test assert a clear fanned out to every node,
+   * even one holding no keys in the cleared namespace. */
+  clearCount(): number;
+  /** Queue a one-off failure for the next `c`/`F` request: instead of
+   * acking with `C`, the connection is destroyed — the "some node
+   * failed" half of the clear fan-out's refresh-once-and-retry path
+   * (issue #106), the same connection-level failure shape
+   * `answerWrongNodeOnce` et al. simulate for get/set/delete via a
+   * different mechanism (an explicit `W`) rather than a real drop, since
+   * a clear is never key-addressed and so never gets a `W` at all. */
+  failClearOnce(): void;
   /** The raw command letter (`"G"`/`"S"`/`"D"`/`"g"`/`"s"`/`"d"`) of the
    * most recent cache-op request this server received — lets a test
    * assert the SDK rule that the default namespace sends the legacy
@@ -190,6 +202,8 @@ export async function startMockNode(
   let storedToGetReplies = 0;
   let connections = 0;
   let gets = 0;
+  let clears = 0;
+  let failClearReplies = 0;
   let setDelayMs = 0;
   let getDelayMs = 0;
   let lastSetTtl = 0;
@@ -403,6 +417,52 @@ export async function startMockNode(
             break;
           }
 
+          case "c": {
+            // Clear one namespace (issue #106): `c <namespace-length>
+            // [tag]\n<namespace>` — namespace-length 0 clears the default
+            // namespace (`store` itself, same sub-map `storeFor("")`
+            // resolves to).
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            if (buffer.length < bodyStart + namespaceLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            buffer = buffer.subarray(bodyStart + namespaceLength);
+            clears++;
+
+            if (silent) break;
+
+            if (failClearReplies > 0) {
+              failClearReplies--;
+              socket.destroy();
+              return;
+            }
+
+            storeFor(namespace).clear();
+            socket.write(`C${tag}\n`);
+            break;
+          }
+
+          case "F": {
+            // Flush everything (issue #106): `F [tag]\n`, no body — drops
+            // the default namespace and every named one.
+            lastCommand = parts[0];
+            buffer = buffer.subarray(bodyStart);
+            clears++;
+
+            if (silent) break;
+
+            if (failClearReplies > 0) {
+              failClearReplies--;
+              socket.destroy();
+              return;
+            }
+
+            store.clear();
+            namespaceStores.clear();
+            socket.write(`C${tag}\n`);
+            break;
+          }
+
           default:
             socket.destroy();
             return;
@@ -443,6 +503,10 @@ export async function startMockNode(
     },
     connectionCount: () => connections,
     getCount: () => gets,
+    clearCount: () => clears,
+    failClearOnce: () => {
+      failClearReplies++;
+    },
     lastCommand: () => lastCommand,
     lastSetTtl: () => lastSetTtl,
     dropConnections: () => {

@@ -1228,6 +1228,180 @@ public class NanocachedClientTests
         await Assert.ThrowsAsync<WrongNodeException>(() => ns.GetAsync("some-key"));
     }
 
+    // ── clear / clearAll (issue #106) ────────────────────────────
+
+    [Fact]
+    public async Task NamespacedClearRemovesOnlyThatNamespaceLeavingOthersAndTheDefaultIntact()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace users = client.Namespace("users");
+        NanocachedNamespace orders = client.Namespace("orders");
+        await users.SetAsync("k", "from users");
+        await orders.SetAsync("k", "from orders");
+        await client.SetAsync("k", "from default");
+
+        await users.ClearAsync();
+
+        Assert.Null(await users.GetAsync("k"));
+        Assert.Equal("from orders", await orders.GetAsync("k"));
+        Assert.Equal("from default", await client.GetAsync("k"));
+        Assert.Equal(1, node.ClearRequestCount);
+    }
+
+    [Fact]
+    public async Task ClearOnTheEmptyNamespaceHandleClearsTheDefaultNamespaceAndIsNotRejected()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace root = client.Namespace("");
+        await client.SetAsync("k", "v");
+
+        // Namespace("").ClearAsync() must not be rejected — it sends
+        // `c 0\n` (docs/protocol.html's "c / F" section), clearing the
+        // default namespace exactly as client.ClearAsync() itself would.
+        await root.ClearAsync();
+
+        Assert.Null(await client.GetAsync("k"));
+        Assert.Equal(1, node.ClearRequestCount);
+    }
+
+    [Fact]
+    public async Task ClearAllEmptiesEveryNamespaceIncludingTheDefaultOne()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace users = client.Namespace("users");
+        await users.SetAsync("k", "from users");
+        await client.SetAsync("k", "from default");
+
+        await client.ClearAllAsync();
+
+        Assert.Null(await users.GetAsync("k"));
+        Assert.Null(await client.GetAsync("k"));
+        Assert.Equal(1, node.ClearAllRequestCount);
+        Assert.Empty(node.Store);
+    }
+
+    [Fact]
+    public async Task ClearAndClearAllRoundTripOnATaggedConnection()
+    {
+        // Exercises the tagged forms "c <ns-len> <tag>\n<ns>" and
+        // "F <tag>\n" — the response parser must learn C's tagged shape
+        // (same as S/D/N/W) alongside the untagged tests above.
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("k", "v");
+        await ns.ClearAsync();
+        Assert.Null(await ns.GetAsync("k"));
+
+        await client.SetAsync("k", "v");
+        await client.ClearAllAsync();
+        Assert.Null(await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task ClearAllFansOutToEveryNodeRegardlessOfReplicationFactor()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        // Replication 1: each key lands on exactly one of the two nodes —
+        // clear is never key-addressed, so it must still reach both.
+        for (int i = 0; i < 20; i++) await client.SetAsync($"key-{i}", "v");
+
+        await client.ClearAllAsync();
+
+        foreach (MockNode node in cluster.Nodes.Values)
+        {
+            Assert.Equal(1, node.ClearAllRequestCount);
+            Assert.Empty(node.Store);
+        }
+    }
+
+    [Fact]
+    public async Task NamespacedClearFansOutToEveryNode()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        NanocachedNamespace users = client.Namespace("users");
+        for (int i = 0; i < 20; i++) await users.SetAsync($"key-{i}", "v");
+
+        await users.ClearAsync();
+
+        foreach (MockNode node in cluster.Nodes.Values)
+        {
+            Assert.Equal(1, node.ClearRequestCount);
+        }
+        for (int i = 0; i < 20; i++)
+        {
+            Assert.Null(await users.GetAsync($"key-{i}"));
+        }
+    }
+
+    [Fact]
+    public async Task AClearThatFailsOnOneNodeIsRefreshedAndRetriedOnceThenSucceeds()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        MockNode flaky = cluster.Nodes[Names[0]];
+        // Two queued failures: the first absorbs the fan-out's own
+        // attempt, the second absorbs the lazy reconnect-on-use retry
+        // ApplyReconnectingAsync already does at the connection level
+        // (SlotConnectionAsync) — only once *both* are exhausted does the
+        // failure reach the outer fan-out, which then refreshes the node
+        // list once and retries against *every* node of the refreshed
+        // list (not just the one that failed), succeeding once the mock
+        // has nothing left queued.
+        flaky.FailClearOnce();
+        flaky.FailClearOnce();
+
+        await client.ClearAllAsync(); // must not throw
+
+        Assert.Equal(3, flaky.ClearAllRequestCount); // 2 failures + the retry pass
+        Assert.Equal(2, cluster.Nodes[Names[1]].ClearAllRequestCount); // first pass + retry pass
+    }
+
+    [Fact]
+    public async Task AClearThatKeepsFailingRaisesAnErrorNamingTheNode()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        string deadName = Names[0];
+        // Dies but discovery hasn't evicted it yet — its own membership
+        // list is unchanged, so refresh still finds it and the retry
+        // reaches the same dead node again.
+        cluster.Nodes[deadName].Dispose();
+
+        ConnectionLostException error = await Assert.ThrowsAsync<ConnectionLostException>(
+            () => client.ClearAllAsync());
+        Assert.Contains(deadName, error.Message);
+    }
+
+    [Fact]
+    public async Task ClearAndClearAllThrowAfterClose()
+    {
+        using var node = new MockNode();
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        NanocachedNamespace ns = client.Namespace("users");
+        client.Close();
+
+        await Assert.ThrowsAsync<AlreadyClosedException>(() => ns.ClearAsync());
+        await Assert.ThrowsAsync<AlreadyClosedException>(() => client.ClearAllAsync());
+    }
+
     // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     // A "did it wait for the mock's delay" assertion can't compare the

@@ -60,6 +60,24 @@ struct NodeState {
     /// tag (the request's tag + 1) — the desync a pre-tag stream
     /// misalignment would produce.
     wrong_tag_replies: AtomicUsize,
+    /// Namespace clear (issue #106): maps each stored entry's composite
+    /// `store_key` to the namespace it was written under, so `c`'s
+    /// handler can find which entries belong to a given namespace without
+    /// trying to reverse-engineer that from the composite key's bytes
+    /// (namespaces are opaque and delimiter-free, so that's not always
+    /// possible unambiguously — see `store_key`'s own doc comment).
+    store_namespaces: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    /// How many `c`/`F` requests this node has ever received — for the
+    /// fan-out-reaches-every-node regression (issue #106).
+    clears: AtomicUsize,
+    /// Fail the next N `c`/`F` requests by closing the connection without
+    /// replying, instead of acking — simulates the "connection error"
+    /// case `clear`/`clear_all`'s partial-failure/refresh-and-retry path
+    /// must handle (issue #106). Unlike `wrong_node_replies`, there is no
+    /// `W` counterpart for clear (never key-addressed, so the real
+    /// protocol never sends one) — a dropped connection is the only
+    /// failure shape worth simulating here.
+    fail_clear_replies: AtomicUsize,
 }
 
 struct MockNode {
@@ -265,13 +283,61 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 let reply = if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
                     format!("W{tag_suffix}\n")
                 } else {
+                    let composite = store_key(&namespace, &key);
+                    state.store.lock().unwrap().insert(composite.clone(), value);
+                    // Namespace clear (issue #106): tracked alongside the
+                    // store itself so `c`'s handler can find this entry by
+                    // namespace later without decoding it back out of the
+                    // composite key.
                     state
-                        .store
+                        .store_namespaces
                         .lock()
                         .unwrap()
-                        .insert(store_key(&namespace, &key), value);
+                        .insert(composite, namespace);
                     format!("S{tag_suffix}\n")
                 };
+                if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            "c" | "F" => {
+                // Namespace clear / flush-everything (issue #106): `c`
+                // carries a namespace-length header field and namespace
+                // body, exactly like `g`/`s`/`d`'s namespace field; `F`
+                // has neither.
+                let namespace = if parts[0] == "c" {
+                    read_exact(&mut stream, parts[1].parse().unwrap()).await
+                } else {
+                    Vec::new()
+                };
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                state.clears.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.fail_clear_replies) {
+                    // Simulates a connection-level failure on this one
+                    // clear — closing without a reply, exactly like a dead
+                    // node, so the caller's partial-failure /
+                    // refresh-and-retry path has something to exercise.
+                    return;
+                }
+                if parts[0] == "c" {
+                    let mut namespaces = state.store_namespaces.lock().unwrap();
+                    let mut store = state.store.lock().unwrap();
+                    let doomed: Vec<Vec<u8>> = namespaces
+                        .iter()
+                        .filter(|(_, entry_ns)| **entry_ns == namespace)
+                        .map(|(composite, _)| composite.clone())
+                        .collect();
+                    for composite in doomed {
+                        store.remove(&composite);
+                        namespaces.remove(&composite);
+                    }
+                } else {
+                    state.store.lock().unwrap().clear();
+                    state.store_namespaces.lock().unwrap().clear();
+                }
+                let reply = format!("C{tag_suffix}\n");
                 if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                     return;
                 }
@@ -631,6 +697,88 @@ async fn a_namespace_handle_errors_after_the_client_is_closed() {
         Err(Error::AlreadyClosed)
     ));
     assert!(matches!(ns.delete("k").await, Err(Error::AlreadyClosed)));
+
+    node.stop();
+}
+
+// ── ネームスペースクリア / clear_all (issue #106) ─────────────────────
+
+#[tokio::test]
+async fn clear_removes_only_its_own_namespace() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let tenant1 = client.namespace("tenant1");
+    let tenant2 = client.namespace("tenant2");
+
+    tenant1.set("k", "v1", 0).await.unwrap();
+    tenant2.set("k", "v2", 0).await.unwrap();
+    client.set("k", "default", 0).await.unwrap();
+
+    tenant1.clear().await.unwrap();
+
+    assert_eq!(tenant1.get("k").await.unwrap(), None);
+    assert_eq!(tenant2.get("k").await.unwrap(), Some("v2".to_string()));
+    assert_eq!(client.get("k").await.unwrap(), Some("default".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn namespace_empty_string_clear_clears_the_default_namespace() {
+    // `namespace("").clear()` — a `c 0` frame — must not be rejected, and
+    // must not disturb any other namespace (issue #106's "do not reject
+    // it" callout).
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let tenant = client.namespace("tenant");
+
+    client.set("k", "default", 0).await.unwrap();
+    tenant.set("k", "v", 0).await.unwrap();
+
+    client.namespace("").clear().await.unwrap();
+
+    assert_eq!(client.get("k").await.unwrap(), None);
+    assert_eq!(tenant.get("k").await.unwrap(), Some("v".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn clear_all_empties_every_namespace_including_the_default_one() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let tenant1 = client.namespace("tenant1");
+    let tenant2 = client.namespace("tenant2");
+
+    client.set("k", "default", 0).await.unwrap();
+    tenant1.set("k", "v1", 0).await.unwrap();
+    tenant2.set("k", "v2", 0).await.unwrap();
+
+    client.clear_all().await.unwrap();
+
+    assert_eq!(client.get("k").await.unwrap(), None);
+    assert_eq!(tenant1.get("k").await.unwrap(), None);
+    assert_eq!(tenant2.get("k").await.unwrap(), None);
+    assert!(node.state.store.lock().unwrap().is_empty());
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn clear_and_clear_all_error_after_close() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("tenant");
+    client.close().await;
+
+    assert!(matches!(ns.clear().await, Err(Error::AlreadyClosed)));
+    assert!(matches!(
+        client.clear_all().await,
+        Err(Error::AlreadyClosed)
+    ));
 
     node.stop();
 }
@@ -1761,6 +1909,123 @@ async fn fans_deletes_out_to_every_owner() {
             .lock()
             .unwrap()
             .contains_key(&b"gone-everywhere".to_vec()));
+    }
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── クラスタでのクリア fan-out (issue #106) ───────────────────────────
+
+#[tokio::test]
+async fn clear_reaches_every_node_regardless_of_replication() {
+    // Replication 1, so a normal write only ever reaches one owner — but
+    // `clear`/`clear_all` are never key-addressed (a namespace's keys are
+    // spread over every node by HRW), so this must still reach both
+    // nodes, not just the key's single owner (issue #106's fan-out rule).
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    client.namespace("tenant").set("k", "v", 0).await.unwrap();
+    client.namespace("tenant").clear().await.unwrap();
+
+    for (name, node) in &nodes {
+        assert_eq!(
+            node.state.clears.load(Ordering::SeqCst),
+            1,
+            "{name} did not receive the clear"
+        );
+    }
+
+    client.clear_all().await.unwrap();
+    for (name, node) in &nodes {
+        assert_eq!(
+            node.state.clears.load(Ordering::SeqCst),
+            2,
+            "{name} did not receive the second (clear_all) request"
+        );
+    }
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_node_failing_is_retried_after_a_node_list_refresh_and_succeeds() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    // 2, not 1: a lone connection-level failure is already absorbed by
+    // `apply_reconnecting`'s own one-shot redial-and-retry (see
+    // connection.rs), so this fan-out-level refresh-and-retry only gets
+    // exercised once that transparent retry has also failed.
+    node_by_name(&nodes, NAMES[0])
+        .state
+        .fail_clear_replies
+        .store(2, Ordering::SeqCst);
+
+    client.clear_all().await.unwrap();
+
+    // The failing node saw 2 attempts on the fan-out's first pass (both
+    // swallowed by `apply_reconnecting`'s internal retry, which is what
+    // finally reports the node as failed to `clear_fanout`) plus 1 more
+    // on the retry pass after the forced refresh, where it succeeds. The
+    // healthy node saw 1 request per pass — the retry re-sends to every
+    // node of the refreshed list, not just the one that failed.
+    assert_eq!(
+        node_by_name(&nodes, NAMES[0])
+            .state
+            .clears
+            .load(Ordering::SeqCst),
+        3
+    );
+    assert_eq!(
+        node_by_name(&nodes, NAMES[1])
+            .state
+            .clears
+            .load(Ordering::SeqCst),
+        2
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_persistently_failing_node_raises_an_error_naming_it() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    // Large enough to still be failing on the post-refresh retry too.
+    node_by_name(&nodes, NAMES[0])
+        .state
+        .fail_clear_replies
+        .store(100, Ordering::SeqCst);
+
+    let error = client
+        .clear_all()
+        .await
+        .expect_err("a node that never acks must fail the whole clear");
+    match error {
+        Error::ConnectionLost(message) => {
+            assert!(message.contains(NAMES[0]), "{message:?}");
+        }
+        other => panic!("expected ConnectionLost, got {other:?}"),
     }
 
     client.close().await;

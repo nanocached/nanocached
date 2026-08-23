@@ -46,6 +46,13 @@ final class MockServers {
          * really does send the legacy frame, not `g 0 ...`/etc (issue
          * #105's SDK rule). */
         final AtomicInteger namespacedCommandCount = new AtomicInteger();
+        /** Counts every `c` (clear one namespace) frame received (issue
+         * #106) — lets a test prove a clear/clearAll fanned out reaches
+         * every node. */
+        final AtomicInteger clearCount = new AtomicInteger();
+        /** Counts every `F` (flush everything) frame received (issue
+         * #106). */
+        final AtomicInteger clearAllCount = new AtomicInteger();
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
         /** echoed response tags: queued one-off replies that echo the WRONG tag (the
          * request's tag + 1) — the desync a pre-tag stream
@@ -70,6 +77,13 @@ final class MockServers {
         private volatile long setDelayMillis = 0;
         private volatile long getDelayMillis = 0;
         private volatile boolean failSets = false;
+        /** One-off connection resets queued for the next `c`/`F` frame(s)
+         * (issue #106), mirroring {@link #wrongNodeReplies}/{@link
+         * #takeWrongNode()} rather than {@link #failSets}'s permanent
+         * switch — a test needs to arm exactly N failures (e.g. 2, to
+         * outlast a single fan-out pass's own applyReconnecting redial)
+         * and then let a later attempt succeed. */
+        private final AtomicInteger clearFailures = new AtomicInteger();
         private volatile boolean silent = false;
         /** The TTL (whole seconds; 0 if omitted on the wire) from the
          * most recent S request this server received. */
@@ -215,6 +229,23 @@ final class MockServers {
          * node can still miss the initial lookup that triggers the repair. */
         void failSets() {
             failSets = true;
+        }
+
+        /** Queue one connection reset (server-side, no reply) for the
+         * next `c`/`F` frame instead of acking it — for tests of
+         * clear()/clearAll()'s partial-failure and refresh-and-retry
+         * paths (issue #106). Call it twice to outlast a single fan-out
+         * pass's own {@code applyReconnecting} redial-retry. */
+        void failClearOnce() {
+            clearFailures.incrementAndGet();
+        }
+
+        private boolean takeClearFailure() {
+            while (true) {
+                int pending = clearFailures.get();
+                if (pending == 0) return false;
+                if (clearFailures.compareAndSet(pending, pending - 1)) return true;
+            }
         }
 
         /** Makes this node a half-open server from this point on: it
@@ -509,6 +540,41 @@ final class MockServers {
                                         ? "D" + tagSuffix + "\n" : "N" + tagSuffix + "\n")
                                         .getBytes(StandardCharsets.US_ASCII));
                             }
+                            out.flush();
+                        }
+                        // CLEAR namespace / flush everything (issue #106):
+                        // an O(1) sub-map drop, never key-addressed, so
+                        // unlike G/S/D/g/s/d there is no W to answer with —
+                        // only C (or, via failClearOnce(), a dropped
+                        // connection).
+                        case "c" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            clearCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeClearFailure()) {
+                                return; // server-side reset instead of acking
+                            }
+                            if (ns.isEmpty()) {
+                                store.clear();
+                            } else {
+                                namespacedStores.remove(ns);
+                            }
+                            out.write(("C" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            out.flush();
+                        }
+                        case "F" -> {
+                            clearAllCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeClearFailure()) {
+                                return; // server-side reset instead of acking
+                            }
+                            store.clear();
+                            namespacedStores.clear();
+                            out.write(("C" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             out.flush();
                         }
                         default -> {
