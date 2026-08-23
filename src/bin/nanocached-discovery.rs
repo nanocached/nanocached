@@ -579,9 +579,64 @@ fn next_connection_id() -> u64 {
     NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Keyed by name (node identity decoupled from address's random per-process node identity), not
-/// address — see `NodeInfo::address`.
-type Registry = Arc<Mutex<FxHashMap<String, NodeInfo>>>;
+/// The node registry (`nodes`, keyed by name — node identity decoupled
+/// from address's random per-process node identity, not address; see
+/// `NodeInfo::address`) plus a `generation` counter (issue #95) bumped
+/// on every change that would alter the heartbeat-ack roster — a node
+/// joining/leaving, an address change, or a `reported_replication`
+/// update. `build_heartbeat_ack` re-serializes the whole `Joined` roster,
+/// and with #61 every `H` from every node carries it; caching the
+/// serialized ack and rebuilding it only when `generation` moves turns
+/// what was O(nodes²) CPU per liveness cycle (a full scan + re-serialize
+/// per heartbeat) into O(nodes) work per actual membership change. Bump
+/// via `bump_roster` while holding `nodes`, so the counter and map stay
+/// consistent for the rebuild path.
+struct RegistryState {
+    nodes: Mutex<FxHashMap<String, NodeInfo>>,
+    generation: AtomicU64,
+    /// The heartbeat-ack roster, cached and rebuilt only when `generation`
+    /// moves (issue #95). Co-located with the map and counter it derives
+    /// from, so it travels wherever the registry does — no plumbing
+    /// through `ConnectionConfig`/`handle_connection`.
+    heartbeat_ack: Mutex<Option<CachedAck>>,
+}
+
+impl Default for RegistryState {
+    fn default() -> Self {
+        RegistryState {
+            nodes: Mutex::new(FxHashMap::default()),
+            generation: AtomicU64::new(0),
+            heartbeat_ack: Mutex::new(None),
+        }
+    }
+}
+
+type Registry = Arc<RegistryState>;
+
+/// Records a change that affects the heartbeat-ack roster so the cached
+/// serialization (`cached_heartbeat_ack`) is rebuilt on the next `H`.
+/// Called at every registry mutation that could change the `Joined` set,
+/// a node's address, or a `reported_replication` vote — generously (an
+/// unnecessary bump only costs one extra rebuild; a *missing* one would
+/// serve a stale roster, the #61 bug). `Relaxed` is enough: the value is
+/// only ever compared for equality against a previously-read snapshot,
+/// and each bump happens under the `nodes` lock the rebuild also takes.
+fn bump_roster(registry: &Registry) {
+    registry.generation.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The cached heartbeat-ack serialization and the `generation` it was
+/// built at (issue #95). Held in `RegistryState::heartbeat_ack`, one per
+/// discovery process; the `refuse` decision is folded into `ack` (the
+/// `list_ready_at` startup grace is not — it's time-gated and handled by
+/// the caller), so a cache hit needs only a generation comparison.
+/// `Arc<[u8]>` so a hit hands out the shared buffer without recopying it
+/// per heartbeat.
+struct CachedAck {
+    generation: u64,
+    replication: usize,
+    ack: Arc<[u8]>,
+}
 
 /// Tracks the single in-progress join (staged node join: only one node moves
 /// through `Waiting` -> `Joining` at a time). `expected` snapshots, at
@@ -890,13 +945,15 @@ fn announce_insert_allowed(limiter: &AnnounceLimiter, peer_ip: std::net::IpAddr)
 /// comment for why this is split out: admitting a genuinely new name also
 /// needs `announce_insert_allowed`'s rate-limit decision, which must run
 /// with the registry lock *not* held).
+/// `Ok(true)` means the entry's address changed (the caller must bump the
+/// roster generation, issue #95); `Ok(false)` a same-address refresh.
 fn apply_announce_to_existing(
     guard: &mut FxHashMap<String, NodeInfo>,
     name: &str,
     addr: &str,
     token: &str,
     peer_ip: std::net::IpAddr,
-) -> Option<Result<(), &'static str>> {
+) -> Option<Result<bool, &'static str>> {
     match guard.get_mut(name) {
         // Issue #34: an announce for a registered name is only the node
         // itself re-declaring if it can present the token its
@@ -923,9 +980,10 @@ fn apply_announce_to_existing(
             Some(Err("announce for a node that is mid-join"))
         }
         Some(info) => {
+            let address_changed = info.address != addr;
             info.address = addr.to_string();
             info.last_heartbeat = Instant::now();
-            Some(Ok(()))
+            Some(Ok(address_changed))
         }
         None => None,
     }
@@ -1374,6 +1432,7 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
     registry
+        .nodes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -1847,6 +1906,8 @@ fn promote_to_joined(registry: &Registry, name: &str) {
     };
 
     if let Some(promoted) = promoted {
+        // A new `Joined` node changes the heartbeat-ack roster (issue #95).
+        bump_roster(registry);
         println!("INFO join promoted: {name} (members now {members})");
         // Wake every currently-parked `J` connection (a duplicate `J`
         // under the same name shares this Notify — issue #7) AND store a
@@ -2442,7 +2503,7 @@ async fn run(
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let cluster_state = ClusterState {
-        registry: Arc::new(Mutex::new(FxHashMap::default())),
+        registry: Arc::new(RegistryState::default()),
         current_join: Arc::new(Mutex::new(None)),
     };
     let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -2807,7 +2868,16 @@ impl RosterSnapshot {
 }
 
 fn roster_snapshot(registry: &Registry, replication: usize) -> RosterSnapshot {
-    let guard = lock(registry);
+    roster_snapshot_locked(&lock(registry), replication)
+}
+
+/// The scan half of `roster_snapshot`, taking an already-held registry
+/// guard — lets `cached_heartbeat_ack` read the generation and build the
+/// snapshot under one lock acquisition (issue #95).
+fn roster_snapshot_locked(
+    guard: &FxHashMap<String, NodeInfo>,
+    replication: usize,
+) -> RosterSnapshot {
     let mut agreeing = 0usize;
     let mut dissenting: Vec<String> = Vec::new();
     let mut nodes: Vec<(String, String)> = Vec::new();
@@ -2840,6 +2910,72 @@ fn build_heartbeat_ack(nodes: &[(String, String)], replication: usize) -> Vec<u8
         ack.extend_from_slice(name.as_bytes());
         ack.extend_from_slice(addr.as_bytes());
         ack.push(b'\n');
+    }
+    ack
+}
+
+/// The heartbeat-ack roster, cached and rebuilt only when the registry's
+/// `generation` has moved since the last build (issue #95). With #61
+/// every `H` from every `Joined` node carries the full roster; rebuilding
+/// it per heartbeat is O(nodes) scan + serialize under the registry lock,
+/// O(nodes²) per liveness cycle. Membership changes far less often than
+/// nodes heartbeat, so on the common path this returns the shared cached
+/// buffer after one atomic load and an equality check — no registry lock,
+/// no re-serialization.
+///
+/// The withheld-roster cases (`refuse`, a bare `A\n`) are baked into the
+/// cached bytes; the startup-grace `A\n` is handled by the caller before
+/// this is reached (it's time- not membership-gated, so it must not be
+/// cached). Whether the ack was built at exactly the latest generation
+/// doesn't matter for correctness — the roster is a convergence aid the
+/// next heartbeat refreshes — so the fast-path generation read need not
+/// be taken under the registry lock.
+fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
+    let generation = registry.generation.load(Ordering::Relaxed);
+    {
+        let cached = registry
+            .heartbeat_ack
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = cached.as_ref()
+            && current.generation == generation
+            && current.replication == replication
+        {
+            return Arc::clone(&current.ack);
+        }
+    }
+
+    // Rebuild: read the generation under the registry lock so it matches
+    // the roster this snapshot serializes (a concurrent bump lands either
+    // fully before or fully after this critical section).
+    let snapshot;
+    let built_generation;
+    {
+        let guard = lock(registry);
+        built_generation = registry.generation.load(Ordering::Relaxed);
+        snapshot = roster_snapshot_locked(&guard, replication);
+    }
+    let ack: Arc<[u8]> = if snapshot.refuse() {
+        Arc::from(b"A\n".as_slice())
+    } else {
+        Arc::from(build_heartbeat_ack(&snapshot.nodes, replication).as_slice())
+    };
+
+    let mut cached = registry
+        .heartbeat_ack
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Only advance the cache — a concurrent rebuild that already stored a
+    // newer generation for this same replication must not be overwritten
+    // with this older one.
+    if cached.as_ref().is_none_or(|current| {
+        current.replication != replication || current.generation <= built_generation
+    }) {
+        *cached = Some(CachedAck {
+            generation: built_generation,
+            replication,
+            ack: Arc::clone(&ack),
+        });
     }
     ack
 }
@@ -2899,6 +3035,11 @@ async fn sweep_expired(
                     }
                     keep
                 });
+                // Evicting a `Joined` node changes the heartbeat-ack roster
+                // (issue #95); Waiting evictions don't (they're never in it).
+                if !heartbeat_evicted.is_empty() {
+                    bump_roster(&registry);
+                }
                 for name in &heartbeat_evicted {
                     eprintln!(
                         "WARN node evicted: {name} (no heartbeat within {}s)",
@@ -3134,11 +3275,19 @@ async fn handle_connection(
                                 && constant_time_eq(info.token.as_bytes(), token.as_bytes()) =>
                         {
                             info.last_heartbeat = Instant::now();
-                            // Stored unconditionally (`Some` or `None`)
-                            // every heartbeat, not just on a mismatch —
+                            // Stored (`Some` or `None`) every heartbeat —
                             // see `NodeInfo::reported_replication` and the
-                            // `L` handler, which reads this back.
-                            info.reported_replication = replication;
+                            // `L` handler, which reads this back. Only an
+                            // actual *change* bumps the roster generation
+                            // (issue #95): last_heartbeat moves every tick
+                            // but doesn't affect the ack roster, and the
+                            // vote is the same value almost every time, so
+                            // bumping unconditionally would defeat the
+                            // heartbeat-ack cache.
+                            if info.reported_replication != replication {
+                                info.reported_replication = replication;
+                                bump_roster(&registry);
+                            }
                             true
                         }
                         _ => false,
@@ -3188,17 +3337,14 @@ async fn handle_connection(
                 // not only on the `M` of a join. Withheld (bare `A\n`)
                 // under the same two conditions `L` refuses with `B\n` —
                 // see the module docs' `H` entry and `roster_snapshot`.
-                let ack = if Instant::now() < config.list_ready_at {
-                    b"A\n".to_vec()
+                if Instant::now() < config.list_ready_at {
+                    // Startup grace is time-gated, not membership-gated, so
+                    // it is handled here rather than folded into the cache.
+                    write_response(&mut stream, b"A\n").await?;
                 } else {
-                    let snapshot = roster_snapshot(&registry, config.replication);
-                    if snapshot.refuse() {
-                        b"A\n".to_vec()
-                    } else {
-                        build_heartbeat_ack(&snapshot.nodes, config.replication)
-                    }
-                };
-                write_response(&mut stream, &ack).await?;
+                    let ack = cached_heartbeat_ack(&registry, config.replication);
+                    write_response(&mut stream, &ack).await?;
+                }
                 continue;
             }
             Ok(DiscoveryCommand::List) => {
@@ -3412,7 +3558,14 @@ async fn handle_connection(
                         apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip)
                     };
                     match existing {
-                        Some(Ok(())) => break 'decide None,
+                        Some(Ok(address_changed)) => {
+                            // Existing entry refreshed — bump only if its
+                            // address actually moved (issue #95).
+                            if address_changed {
+                                bump_roster(&registry);
+                            }
+                            break 'decide None;
+                        }
                         Some(Err(reason)) => break 'decide Some(reason),
                         None => {}
                     }
@@ -3452,10 +3605,17 @@ async fn handle_connection(
                     // this exact name, or filled the registry, while the
                     // lock above was released for the limiter call.
                     let mut guard = lock(&registry);
-                    if let Some(outcome) =
-                        apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip)
-                    {
-                        break 'decide outcome.err();
+                    match apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip) {
+                        Some(Ok(address_changed)) => {
+                            // A refreshed existing entry — bump only if its
+                            // address actually moved (issue #95).
+                            if address_changed {
+                                bump_roster(&registry);
+                            }
+                            break 'decide None;
+                        }
+                        Some(Err(reason)) => break 'decide Some(reason),
+                        None => {}
                     }
                     if guard.len() >= MAX_REGISTRY_SIZE {
                         break 'decide Some("registry is full");
@@ -3463,6 +3623,8 @@ async fn handle_connection(
 
                     println!("INFO node announced: {name} at {addr} (re-registered)");
                     guard.insert(name.clone(), NodeInfo::new(addr, NodeState::Joined, token));
+                    // A newly (re-)admitted `Joined` node changes the roster.
+                    bump_roster(&registry);
                     None
                 };
 
@@ -4042,7 +4204,7 @@ mod tests {
     async fn join_then_heartbeat_then_list_reports_the_registered_node() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4106,7 +4268,7 @@ mod tests {
         // `a_mismatched_heartbeat_replication_factor_makes_l_refuse`.)
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4164,7 +4326,7 @@ mod tests {
         // rather than hand it out.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4223,7 +4385,7 @@ mod tests {
         // the startup-grace refusal — see
         // `list_answers_busy_during_the_startup_grace_while_announce_still_works`),
         // sharing one registry.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4302,6 +4464,80 @@ mod tests {
         info
     }
 
+    #[test]
+    fn cached_heartbeat_ack_reuses_the_buffer_until_the_generation_moves() {
+        // Issue #95: rebuilding the roster ack on every heartbeat is the
+        // O(nodes²)-per-cycle cost. The cache must hand back the very same
+        // buffer while membership is unchanged, and rebuild only once the
+        // generation has moved.
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "node-a".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk-a", Some(2)),
+            );
+            guard.insert(
+                "node-b".to_string(),
+                joined_node_reporting("127.0.0.1:9002", "tk-b", Some(2)),
+            );
+        }
+
+        let first = cached_heartbeat_ack(&registry, 2);
+        let second = cached_heartbeat_ack(&registry, 2);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged membership must reuse the cached buffer, not rebuild it"
+        );
+        // The cached bytes match a fresh serialization of the roster.
+        assert_eq!(
+            &*first,
+            build_heartbeat_ack(&roster_snapshot(&registry, 2).nodes, 2).as_slice()
+        );
+        assert!(first.starts_with(b"A 2 2\n"));
+
+        // A membership change (a new Joined node) plus its generation bump
+        // forces a rebuild: a different buffer reflecting the new roster.
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "node-c".to_string(),
+                joined_node_reporting("127.0.0.1:9003", "tk-c", Some(2)),
+            );
+        }
+        bump_roster(&registry);
+        let third = cached_heartbeat_ack(&registry, 2);
+        assert!(
+            !Arc::ptr_eq(&second, &third),
+            "a membership change must invalidate the cache"
+        );
+        assert!(third.starts_with(b"A 3 2\n"));
+    }
+
+    #[test]
+    fn cached_heartbeat_ack_folds_in_the_refuse_decision() {
+        // The withheld-roster case (a strict dissenting majority → bare
+        // `A\n`, issue #30) is baked into the cached bytes, so a cache hit
+        // never has to recompute it.
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "agree".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk", Some(2)),
+            );
+            guard.insert(
+                "dissent-0".to_string(),
+                joined_node_reporting("127.0.0.1:9002", "tk", Some(1)),
+            );
+            guard.insert(
+                "dissent-1".to_string(),
+                joined_node_reporting("127.0.0.1:9003", "tk", Some(1)),
+            );
+        }
+        assert_eq!(&*cached_heartbeat_ack(&registry, 2), b"A\n");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn l_is_served_despite_a_single_dissenter_among_a_majority() {
         // HIGH-severity amendment to issue #30: one Joined node reporting
@@ -4309,7 +4545,7 @@ mod tests {
         // the whole cluster by itself. Three nodes agree with this
         // replica's R=2; one dissents (reports R=1) — not a strict
         // majority, so `L` is still served.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         {
             let mut guard = lock(&registry);
             for i in 0..3 {
@@ -4357,7 +4593,7 @@ mod tests {
         // Companion to the test above: two dissenting nodes (R=1) against
         // only one agreeing node (R=2) IS a strict majority, so `L` must
         // refuse exactly as the pre-amendment "any dissenter" rule did.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         {
             let mut guard = lock(&registry);
             guard.insert(
@@ -4409,7 +4645,7 @@ mod tests {
         // A tie (one dissenter, one agreeing node) is NOT a strict
         // majority, so `L` is still served — "more dissenters than
         // agreers" is required, not "at least as many".
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         {
             let mut guard = lock(&registry);
             guard.insert(
@@ -4469,7 +4705,7 @@ mod tests {
     async fn announce_upserts_a_joined_node_without_any_join_orchestration() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4525,7 +4761,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn announce_updates_the_address_of_an_already_joined_node() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4577,7 +4813,7 @@ mod tests {
         // (public — `L` lists it) must not be enough to redirect its
         // traffic; the announce must also present the token the name was
         // registered with.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4697,7 +4933,7 @@ mod tests {
         // reported replication belief of) an entry it can't present the
         // token for — otherwise anyone could keep a dead node's entry
         // alive past `sweep_expired`.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4750,7 +4986,7 @@ mod tests {
         // or an amnesiac restart) is trusted on first use — its announce
         // both registers it and binds the presented token, which
         // everything after must match.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -4816,7 +5052,7 @@ mod tests {
         // deliberately long names/addresses so a modest node count
         // (rather than tens of thousands, as a real cluster hitting this
         // would have) is enough to cross the cap in a fast unit test.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
 
         let long_name_prefix = "x".repeat(10_000);
@@ -4861,7 +5097,7 @@ mod tests {
         // each held open forever by `wait_for_promotion` — up to
         // `MAX_CONNECTIONS`. `MAX_WAITING_PER_SOURCE_IP` caps how many
         // concurrent Waiting/Joining registrations one source may hold.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         // A join already in progress cluster-wide (for some unrelated
         // node) means every `start_join` call below only registers as
         // Waiting — it never takes the bootstrap "no Joined nodes yet"
@@ -4966,7 +5202,7 @@ mod tests {
         // queue's total size regardless of how many distinct sources
         // contribute to it. Uses distinct source IPs, each staying under
         // `MAX_WAITING_PER_SOURCE_IP`, so only the global cap is at play.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "unrelated-joiner".to_string(),
             expected: HashMap::new(),
@@ -5049,7 +5285,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn announce_for_a_name_mid_join_is_rejected() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -5097,7 +5333,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn list_answers_busy_during_the_startup_grace_while_announce_still_works() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -5196,7 +5432,7 @@ mod tests {
         // the spot with no handoff at all. node-a re-announces during
         // the grace; once the grace ends the join starts, and it starts
         // from node-a.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let grace = Duration::from_millis(400);
@@ -5280,7 +5516,7 @@ mod tests {
     /// during the grace, issue #63) on a connection that then carries
     /// `H`.
     async fn joined_node_a(list_ready_at: Instant) -> (TcpStream, Registry) {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let (mut node_a, server_a) = tcp_pair().await;
@@ -5364,7 +5600,7 @@ mod tests {
     async fn registry_with_a_joined_and_b_waiting(
         shutdown_rx: watch::Receiver<bool>,
     ) -> (TcpStream, TcpStream, Registry, CurrentJoin) {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
 
         let config = || ConnectionConfig {
@@ -5529,7 +5765,7 @@ mod tests {
         // ending actually removes the entry and wakes the (now sole)
         // surviving parked connection, the first.
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         // A different join already in progress, so node-b's own `J`
         // leaves it parked at `Waiting` rather than immediately becoming
         // the current join's own joining node (which `abandon_current_join`
@@ -5833,7 +6069,7 @@ mod tests {
         // otherwise the join either hangs until `migration_timeout_for`,
         // or leaves a window for the forged-report attack the sibling
         // test exercises directly.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         lock(&registry).insert(
             "node-a".to_string(),
             NodeInfo::new(
@@ -5964,7 +6200,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_second_node_joining_waits_for_a_completion_report_before_being_promoted() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6069,7 +6305,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_ready_node_receives_m_when_a_second_node_joins() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6193,7 +6429,7 @@ mod tests {
         // new, tighter bound specifically, not the ordinary idle timeout
         // it already had.
         let (client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6251,7 +6487,7 @@ mod tests {
         // parse, exactly like the pre-identification case already covered
         // by `handle_connection_is_closed_after_the_unidentified_connection_timeout`.
         let (mut client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6344,11 +6580,9 @@ mod tests {
         // directly (bypassing `P`/`J`, which are rate- and size-limited
         // for reasons unrelated to this test) with far more `Joined`
         // entries than any real socket buffer could hold at once.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         {
-            let mut guard = registry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = lock(&registry);
             // Sized for Linux, not just macOS: a Linux loopback socket's
             // send buffer plus the peer's autotuned receive buffer can
             // absorb several MiB before a write blocks, so a few MiB of
@@ -6432,7 +6666,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_rejects_commands_sent_before_authenticating() {
         let (mut client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6467,7 +6701,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_rejects_an_incorrect_auth_secret() {
         let (mut client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6502,7 +6736,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_accepts_commands_after_correct_auth() {
         let (mut client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6544,7 +6778,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_treats_auth_as_a_no_op_when_no_secret_is_configured() {
         let (mut client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6580,7 +6814,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn handle_connection_echoes_the_tag_capability_in_the_auth_reply() {
         let (mut client, server) = tcp_pair().await;
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -6636,7 +6870,7 @@ mod tests {
         let connection_limit = Arc::new(Semaphore::new(1));
         let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let cluster_state = ClusterState {
-            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            registry: Arc::new(RegistryState::default()),
             current_join: Arc::new(Mutex::new(None)),
         };
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -6712,7 +6946,7 @@ mod tests {
         let connection_limit = Arc::new(Semaphore::new(10));
         let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
         let cluster_state = ClusterState {
-            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            registry: Arc::new(RegistryState::default()),
             current_join: Arc::new(Mutex::new(None)),
         };
 
@@ -6826,7 +7060,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sweep_expired_drops_nodes_past_the_liveness_timeout() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         lock(&registry).insert(
             "some-name".to_string(),
             NodeInfo::new(
@@ -6869,7 +7103,7 @@ mod tests {
         // it. A `Waiting` node must eventually be reaped even if no join
         // ever reaches it, and — like an abandoned join (issue #4) — the
         // connection parked on its `Notify` must be woken, not stranded.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let info = NodeInfo::with_queue_position(
             "10.0.0.1:9000".to_string(),
             NodeState::Waiting,
@@ -6935,7 +7169,7 @@ mod tests {
         // cooldown must reject a second *new* name from the same source
         // shortly after the first, while never gating a refresh of an
         // already-known name, and never affecting a different source.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(None));
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let announce_limiter: AnnounceLimiter = Arc::new(Mutex::new(FxHashMap::default()));
@@ -7062,7 +7296,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
 
         let cluster_state = ClusterState {
-            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            registry: Arc::new(RegistryState::default()),
             current_join: Arc::new(Mutex::new(None)),
         };
         let connection_limit = Arc::new(Semaphore::new(1));
@@ -7167,7 +7401,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
 
         let cluster_state = ClusterState {
-            registry: Arc::new(Mutex::new(FxHashMap::default())),
+            registry: Arc::new(RegistryState::default()),
             current_join: Arc::new(Mutex::new(None)),
         };
         let connection_limit = Arc::new(Semaphore::new(2));
@@ -7409,7 +7643,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_ready_nodes_connection_dying_mid_join_does_not_abandon_the_join() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
 
         lock(&registry).insert(
             "node-a".to_string(),
@@ -7478,7 +7712,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_joining_nodes_connection_dying_abandons_its_own_join_and_cancels_ready_nodes() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
 
         let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ready_addr = ready_listener.local_addr().unwrap().to_string();
@@ -7556,7 +7790,7 @@ mod tests {
         // teardown reports in, that must NOT abandon the still-healthy,
         // in-progress join: it isn't the connection currently recorded as
         // owning the entry.
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
 
         let ready_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ready_addr = ready_listener.local_addr().unwrap().to_string();
@@ -7653,7 +7887,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_join_that_never_completes_is_abandoned_after_the_migration_timeout() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
 
         lock(&registry).insert(
             "node-a".to_string(),
@@ -7710,7 +7944,7 @@ mod tests {
     // longer than the old flat default would have allowed.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_join_with_many_entries_is_not_abandoned_at_the_base_timeout() {
-        let registry: Registry = Arc::new(Mutex::new(FxHashMap::default()));
+        let registry: Registry = Arc::new(RegistryState::default());
 
         lock(&registry).insert(
             "node-a".to_string(),
