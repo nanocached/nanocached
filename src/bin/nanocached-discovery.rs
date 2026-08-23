@@ -1476,7 +1476,16 @@ async fn try_begin_next_join(
         return;
     }
 
-    let (name, joining_addr, joined, ready_tokens) = {
+    // A loop, not a single pass (issue #113): the bootstrap branch below
+    // promotes a node with no handoff and therefore no `C` to chain the
+    // next join off of — so when several nodes are parked in `Waiting`
+    // (all registered during the startup grace, see issue #63, which
+    // kicks this exactly once after the grace), a single pass promoted
+    // the first and left every other one waiting forever. Go around
+    // again after each bootstrap promotion; the next candidate then
+    // finds a `Joined` member and starts a real staged join, after which
+    // `C`/abandon chain the rest as usual.
+    let (name, joining_addr, joined, ready_tokens) = loop {
         let mut join_guard = lock_current_join(current_join);
 
         if join_guard.is_some() {
@@ -1539,7 +1548,7 @@ async fn try_begin_next_join(
         if joined.is_empty() {
             drop(join_guard);
             promote_to_joined(registry, &name);
-            return;
+            continue;
         }
 
         // Issue #34 forged-completion fix (see `PendingJoin::expected`'s
@@ -1557,7 +1566,7 @@ async fn try_begin_next_join(
             max_entries: 0,
         });
 
-        (name, joining_addr, joined, ready_tokens)
+        break (name, joining_addr, joined, ready_tokens);
     };
 
     println!(
@@ -5508,6 +5517,95 @@ mod tests {
         assert!(
             Instant::now() >= list_ready_at,
             "the join must not have started before the grace ended"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_node_parked_during_the_grace_is_served_after_it() {
+        // Issue #113: a fresh cluster whose nodes all register during the
+        // startup grace. The post-grace kick (issue #63) runs
+        // `try_begin_next_join` once; its bootstrap branch promoted the
+        // first waiting node with no handoff — and no `C` to chain the
+        // next join off of — so the second stayed `Waiting` forever.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let grace = Duration::from_millis(400);
+        let list_ready_at = Instant::now() + grace;
+
+        let _sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            list_ready_at,
+            Duration::from_secs(1),
+            shutdown_rx.clone(),
+        ));
+
+        let mut joiners = Vec::new();
+        for frame in [
+            &b"J 6 9002 9\nnode-btk-node-b"[..],
+            &b"J 6 9003 9\nnode-ctk-node-c"[..],
+        ] {
+            let (mut joiner, server) = tcp_pair().await;
+            spawn_grace_connection(
+                server,
+                &registry,
+                &current_join,
+                list_ready_at,
+                shutdown_rx.clone(),
+            );
+            joiner.write_all(frame).await.unwrap();
+            joiners.push(joiner);
+        }
+
+        // Both held while the grace runs.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        {
+            let reg = lock(&registry);
+            assert_eq!(reg["node-b"].state, NodeState::Waiting);
+            assert_eq!(reg["node-c"].state, NodeState::Waiting);
+        }
+
+        // Grace over: one node is promoted by bootstrap (nobody to hand
+        // off from), and the other must be started as a real staged join
+        // against it — not left in `Waiting`.
+        // Snapshot under the locks, decide outside them (clippy's
+        // `await_holding_lock`).
+        let observe = || {
+            let reg = lock(&registry);
+            let joined: Vec<String> = reg
+                .iter()
+                .filter(|(_, info)| info.state == NodeState::Joined)
+                .map(|(name, _)| name.clone())
+                .collect();
+            let joining = reg.iter().any(|(_, info)| info.state == NodeState::Joining);
+            drop(reg);
+            let hands_off_from_joined = lock_current_join(&current_join).as_ref().map(|pending| {
+                joined
+                    .iter()
+                    .all(|name| pending.expected.contains_key(name))
+            });
+            (joined.len(), joining, hands_off_from_joined)
+        };
+
+        let mut served = false;
+        for _ in 0..200 {
+            if let (1, true, Some(from_joined)) = observe() {
+                assert!(
+                    from_joined,
+                    "the second join must hand off from the bootstrapped member"
+                );
+                served = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            served,
+            "the second node parked during the grace must be started after it"
         );
     }
 
