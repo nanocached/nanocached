@@ -1964,6 +1964,53 @@ async fn a_hit_from_the_replica_wins_over_a_slow_primary() {
 }
 
 #[tokio::test]
+async fn a_hedge_escalation_racing_close_is_refused_not_spawned() {
+    // Issue #91: a hedge leg registered after close() began must be refused
+    // rather than spawned against a connection teardown is closing.
+    // Reproduced deterministically via the escalation path: the primary is
+    // slow, so the read is still waiting when the hedge interval elapses and
+    // it goes to spawn a leg for the next owner — but by then close() has set
+    // `closed`. spawn_hedge_leg must re-check `closed` (under the lock the
+    // drain holds) and refuse, so the read fails AlreadyClosed instead of
+    // silently spawning a leg the drain has already passed. Without the fix
+    // the escalation leg is spawned and the read returns the replica's value.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    // Slow enough that the read is still on leg0 (the primary) when the
+    // 50ms hedge interval elapses and it tries to escalate — and that
+    // close()'s own drain of that leg outlasts the escalation attempt.
+    primary.state.gets_delay_ms.store(400, Ordering::SeqCst);
+
+    let get_client = client.clone();
+    let get_task = tokio::spawn(async move { get_client.get("k").await });
+
+    // Let the read start (pass its own closed-check, register leg0) but not
+    // yet reach the 50ms escalation, then close() concurrently: its `closed`
+    // is set well before the escalation fires.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    client.close().await;
+
+    let result = get_task.await.unwrap();
+    assert!(
+        matches!(result, Err(Error::AlreadyClosed)),
+        "a hedge escalation racing close() must be refused (AlreadyClosed), got {result:?}"
+    );
+
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
 async fn a_fast_primary_is_never_hedged() {
     let (nodes, discovery) = start_cluster(2).await;
     let client = NanocachedClient::connect(

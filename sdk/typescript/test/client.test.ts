@@ -1810,6 +1810,39 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
     }
   });
 
+  it("a hedge leg racing close() is refused, not registered (#91)", async () => {
+    const cluster = await startReplicatedCluster();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        readHedgeAfterMs: 50,
+      });
+      await client.set("k", "v");
+
+      // Simulate close() having begun: the flag is set and the drain has
+      // already run. A read that only now reaches leg registration must not
+      // slip a leg in — start() must reject instead of dialing against a
+      // connection teardown is closing (issue #91). Setting `closed`
+      // directly reproduces exactly the state start() sees at that point.
+      (client as any).closed = true;
+      const op = async () => {
+        throw new Error("the leg must never be dialed after close() began");
+      };
+      await assert.rejects(
+        (client as any).readHedged("k", op, ["a", "b"]),
+        AlreadyClosedError,
+      );
+      assert.equal((client as any).hedgedReads.size, 0, "no hedge leg may be registered after close() began");
+
+      // Restore so close() runs its real teardown rather than the
+      // already-closed warning-and-return path.
+      (client as any).closed = false;
+      await client.close();
+    } finally {
+      await cluster.close();
+    }
+  });
+
   it("a fast primary is never hedged", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({

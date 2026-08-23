@@ -1146,7 +1146,7 @@ impl NanocachedClient {
         let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
 
         self.spawn_hedge_leg(Arc::clone(&owned_key), owners[0].clone(), 0, tx.clone())
-            .await;
+            .await?;
         let mut next_index = 1usize;
         // How many legs are currently in flight (spawned, no outcome
         // received yet) — once this hits zero with owners left to try,
@@ -1173,7 +1173,7 @@ impl NanocachedClient {
                             next_index,
                             tx.clone(),
                         )
-                        .await;
+                        .await?;
                         next_index += 1;
                         in_flight += 1;
                         continue;
@@ -1207,7 +1207,7 @@ impl NanocachedClient {
                         next_index,
                         tx.clone(),
                     )
-                    .await;
+                    .await?;
                     next_index += 1;
                     in_flight += 1;
                 } else {
@@ -1241,9 +1241,21 @@ impl NanocachedClient {
         name: String,
         index: usize,
         tx: mpsc::UnboundedSender<HedgeOutcome>,
-    ) {
+    ) -> Result<()> {
         let client = self.clone();
         let mut hedged = self.inner.hedged_reads.lock().await;
+        // Re-check `closed` *after* taking the lock `close()` drains the
+        // JoinSet under (issue #91): `close()` sets `closed` before it
+        // acquires this lock (see `close()`), so a leg that gets the lock
+        // while closed must not spawn — it would run against connections
+        // teardown is about to close and never be awaited by the drain that
+        // has already run (or is about to). Mirrors the background-replica
+        // recheck. If `closed` is still false here, `close()` hasn't taken
+        // this lock yet, so the task added below is in the JoinSet before
+        // that drain and is awaited by it.
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return Err(Error::AlreadyClosed);
+        }
         hedged.spawn(async move {
             let op = move |connection: Arc<Connection>| {
                 let key = Arc::clone(&key);
@@ -1252,6 +1264,7 @@ impl NanocachedClient {
             let result = client.apply_reconnecting(Some(&name), &op).await;
             let _ = tx.send(HedgeOutcome { index, result });
         });
+        Ok(())
     }
 
     async fn write<T, F, Fut>(&self, key: &[u8], body: WriteBody<'_>, op: F) -> Result<T>

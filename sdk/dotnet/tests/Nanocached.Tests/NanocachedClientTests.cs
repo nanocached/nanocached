@@ -1824,6 +1824,56 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task HedgeLegRacingCloseIsRefusedNotRegistered()
+    {
+        // Issue #91: a read that passed its own _closed check can reach
+        // hedge-leg registration only after Close() set _closed and drained
+        // _hedgedReads. StartLeg must recheck _closed under _hedgedReadsLock
+        // so it never registers — and dials against a connection Teardown()
+        // is closing — a leg the drain already passed. Setting _closed
+        // directly (reflection) reproduces exactly that state; ReadHedgedAsync
+        // is private, so the whole path is driven reflectively.
+        using Cluster cluster = StartCluster(replication: 2);
+        NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
+        });
+        try
+        {
+            await client.SetAsync("k", "v");
+
+            FieldInfo closedField = typeof(NanocachedClient)
+                .GetField("_closed", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            MethodInfo readHedged = typeof(NanocachedClient)
+                .GetMethod("ReadHedgedAsync", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .MakeGenericMethod(typeof(string));
+
+            Func<Connection, Task<string>> op = _ =>
+                throw new InvalidOperationException("the leg must never be dialed after Close() began");
+
+            closedField.SetValue(client, true);
+            try
+            {
+                var task = (Task<string>)readHedged.Invoke(
+                    client,
+                    new object[] { op, new List<string> { "a", "b" }, TimeSpan.FromMilliseconds(50) })!;
+                await Assert.ThrowsAsync<AlreadyClosedException>(async () => await task);
+                Assert.Empty(HedgedReads(client));
+            }
+            finally
+            {
+                // Restore so Close() runs its real teardown.
+                closedField.SetValue(client, false);
+            }
+        }
+        finally
+        {
+            client.Close();
+        }
+    }
+
+    [Fact]
     public async Task AFastPrimaryIsNeverHedged()
     {
         using Cluster cluster = StartCluster(replication: 2);

@@ -870,6 +870,15 @@ export class NanocachedClient {
     // unhandled-rejection detector, since its rejection is handled right
     // here, synchronously, in the same expression that creates it.
     const start = (index: number): Promise<Outcome> => {
+      // Recheck this.closed immediately before registering, exactly as the
+      // fire-and-forget replica path does (see registerBackgroundReplicaWrite),
+      // so a read racing close() can't add a leg the drain has already passed
+      // (issue #91): close() sets this.closed before draining hedgedReads, and
+      // this check-and-add runs synchronously (Node is single-threaded), so
+      // once this.closed is set no further leg is ever added and the drain
+      // sees a set that only shrinks. A read that lost this race fails the
+      // same way its own closed-check would have.
+      if (this.closed) throw new AlreadyClosedError();
       const outcome: Promise<Outcome> = this.memberConnection(names[index])
         .then((connection) => op(connection))
         .then(

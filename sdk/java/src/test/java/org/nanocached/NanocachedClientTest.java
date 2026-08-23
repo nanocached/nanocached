@@ -9,6 +9,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -16,6 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -1683,6 +1688,53 @@ class NanocachedClientTest {
                         "expected an immediate failover, took " + elapsedMillis + "ms");
             } finally {
                 client.close();
+            }
+        }
+    }
+
+    @Test
+    void aHedgeLegRacingCloseIsRefusedNotRegistered() throws Exception {
+        // Issue #91: a read that passed its own closed-check can reach
+        // hedge-leg registration only after close() set `closed` and drained
+        // hedgedReads. startHedgeLeg must recheck `closed` under
+        // hedgedReadsLock so it never registers — and dials against a
+        // connection teardown is closing — a leg the drain already passed.
+        // Setting `closed` directly (reflection) reproduces exactly the
+        // state startHedgeLeg sees at that point; readHedged/ConnectionOp are
+        // private, so the whole path is driven reflectively.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+
+                Field closedField = NanocachedClient.class.getDeclaredField("closed");
+                closedField.setAccessible(true);
+                Field hedgedReadsField = NanocachedClient.class.getDeclaredField("hedgedReads");
+                hedgedReadsField.setAccessible(true);
+
+                Class<?> opInterface = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                Object op = Proxy.newProxyInstance(
+                        opInterface.getClassLoader(), new Class<?>[] {opInterface},
+                        (proxy, method, args) -> {
+                            throw new AssertionError("the leg must never be dialed after close() began");
+                        });
+                Method readHedged =
+                        NanocachedClient.class.getDeclaredMethod("readHedged", opInterface, List.class);
+                readHedged.setAccessible(true);
+
+                closedField.setBoolean(client, true);
+                try {
+                    InvocationTargetException thrown = assertThrows(
+                            InvocationTargetException.class,
+                            () -> readHedged.invoke(client, op, List.of("a", "b")));
+                    assertTrue(thrown.getCause() instanceof NanocachedException.AlreadyClosed,
+                            "expected AlreadyClosed, got " + thrown.getCause());
+                    Set<?> hedgedReads = (Set<?>) hedgedReadsField.get(client);
+                    assertTrue(hedgedReads.isEmpty(),
+                            "no hedge leg may be registered after close() began");
+                } finally {
+                    // Restore so close() runs its real teardown.
+                    closedField.setBoolean(client, false);
+                }
             }
         }
     }
