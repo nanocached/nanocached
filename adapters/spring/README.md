@@ -23,6 +23,36 @@ friends run against a nanocached cluster.
 
 ## Usage
 
+Declare the manager, then cache with the standard annotations —
+`@Cacheable`, `@CachePut`, `@CacheEvict` work as on any other Spring
+`CacheManager`:
+
+```java
+@EnableCaching
+@Configuration
+class CacheConfig { /* the cacheManager() bean below */ }
+
+@Service
+class UserService {
+    @Cacheable("users")
+    User findUser(String name) { /* hits the DB only on a cache miss */ }
+
+    @CachePut(cacheNames = "users", key = "#user.name")
+    User saveUser(User user) { /* refreshes the cached entry */ }
+
+    @CacheEvict("users")
+    void deleteUser(String name) {}
+
+    @CacheEvict(cacheNames = "users", allEntries = true)
+    void deleteEveryUser() {}   // one CLEAR on every node, not N deletes
+}
+```
+
+`sync = true` routes through the adapter's `get(key, valueLoader)`
+(per-JVM herding, see below). SpEL keys that name method parameters
+(`key = "#user.name"`) need the `-parameters` compiler flag, as usual
+with Spring.
+
 ```java
 NanocachedClient client = NanocachedClient.connect(new NanocachedClient.Options()
         .addresses(List.of(new NanocachedClient.Address("10.0.0.1", 8357))));

@@ -57,6 +57,13 @@ dependencies {
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
+// The integration tests reference method parameters by name in SpEL
+// (`key = "#user.name"`), which needs parameter names in the class files —
+// the same flag Spring Boot's own build conventions apply.
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += '-parameters'
+}
+
 test {
     useJUnitPlatform()
     testLogging {
