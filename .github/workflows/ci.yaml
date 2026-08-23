@@ -174,3 +174,35 @@ jobs:
       - name: Run tests
         working-directory: sdk/go
         run: go test ./...
+
+  e2e-scripts:
+    # Lints the manual E2E scenario scripts under tests/e2e — it never runs
+    # them (they need Docker, minutes-to-an-hour, netem). Just keeps them
+    # syntactically valid and shellcheck-clean so they stay runnable by hand.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Shell syntax and shellcheck
+        working-directory: tests/e2e
+        run: |
+          for f in *.sh; do bash -n "$f"; done
+          # Excluded warnings are all intentional in these throwaway-cluster
+          # scenario scripts: SC1091 (cl.sh sourced at runtime), SC2086 /
+          # SC2046 (deliberate word-splitting of docker arg lists and
+          # `$(docker ps -aq ...)` id lists), SC2155 (local x=$(...) in
+          # one-liner helpers). Real errors (missing shebang, bad redirect
+          # order, undefined-var typos) are still caught.
+          shellcheck -e SC1091,SC2086,SC2046,SC2155 *.sh
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax
+        working-directory: tests/e2e
+        run: python -m py_compile *.py
