@@ -148,6 +148,25 @@ shared storage:</p>
 Kubernetes) and two replicas make discovery effectively always
 available.</p>
 
+<h2>The proxy tier (optional)</h2>
+<p>Proxyless client-side sharding holds one connection per node per
+client process — a node-side connection count that grows with fleet
+size, capped by each node's connection limit. For large fleets,
+<code>nanocached-proxy</code> terminates many client connections and
+routes on their behalf: it fetches the roster from discovery, performs
+the same rendezvous-hash routing the SDKs do (namespaced keys included),
+fans writes out to all R owners, retries a stale-view <code>W</code>
+after a roster refresh, and fans <code>c</code>/<code>F</code> to every
+member. To a client it looks like a single node that owns every key, so
+any SDK pointed at one address — and any bare protocol client — works
+against it unchanged, with no ring view or discovery client of its own.
+Proxies are stateless and scale horizontally behind one address; clients
+that prefer cluster-direct connections keep working as before. Backend
+connection sharing (many clients multiplexed onto few tagged, pipelined
+connections per node — what collapses the node-side count from fleet
+size to proxy count) is the next step, designed in the proxy's module
+docs.</p>
+
 <h2>Design decisions</h2>
 <p>The main choices, in summary:</p>
 <div class="table-wrap">
