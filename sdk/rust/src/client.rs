@@ -69,67 +69,105 @@ const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
 const DEFAULT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// The server's own request cap (src/server.rs's `MAX_REQUEST_SIZE`) is 1
-/// MiB for the *entire* frame — header line plus key plus value; a
-/// request over that limit is rejected by simply closing the connection
-/// without a response (poisoning whatever else is pipelined behind it on
-/// that same connection). This reserves 256 bytes of headroom for the
-/// header itself (marker byte, decimal lengths, an optional TTL, echoed response tags's
-/// tag field, spaces, the trailing newline — always comfortably under
-/// this even for the largest fields), so a key+value that clears
+/// MiB for the *entire* frame — header line plus namespace plus key plus
+/// value; a request over that limit is rejected by simply closing the
+/// connection without a response (poisoning whatever else is pipelined
+/// behind it on that same connection). This reserves 256 bytes of
+/// headroom for the header itself (marker byte, decimal lengths —
+/// including a namespaced frame's extra `<namespace-length>` field
+/// (Namespaces, issue #105) — an optional TTL, echoed response tags's tag
+/// field, spaces, the trailing newline — always comfortably under this
+/// even for the largest fields), so a namespace+key+value that clears
 /// `MAX_REQUEST_BYTES` is guaranteed to fit under the server's own cap and
 /// never trips that connection-poisoning rejection (issue #47 audit item
 /// R1; see README's "Errors" section).
 const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
 
-/// Rejects an empty key, or one that alone already exceeds
+/// The default namespace — always the empty byte string. Every
+/// namespace-less `get`/`set`/`delete` call on this client passes this,
+/// which is what keeps them on the legacy `G`/`S`/`D` wire forms
+/// byte-for-byte (Namespaces, issue #105's SDK rule): an unchanged client
+/// talking to a pre-namespace server keeps working.
+const DEFAULT_NAMESPACE: &[u8] = b"";
+
+/// Rejects an empty key, or a namespace+key that alone already exceeds
 /// `MAX_REQUEST_BYTES`, before any network I/O: the server's protocol has
 /// no way to represent a zero-length key request that doesn't collide
-/// with other framing, and a key past the server's own 1 MiB request cap
-/// can never be stored either way — both cases get exactly one reply from
-/// the server: closing the connection outright, silently poisoning every
-/// other request already pipelined on that connection (see
-/// src/command.rs's `rejects_empty_key_for_get` et al., and this module's
-/// `MAX_REQUEST_BYTES` doc comment). `get`/`delete` call this directly (no
-/// value to bound), so without the size check here an oversized key on
-/// either of those paths would sail straight past client-side validation
-/// and only be caught by the server slamming the connection shut (issue
-/// #47 audit item R1 follow-up). Catching both cases here client-side, as
-/// `Error::InvalidArgument`, gives the caller a clear synchronous error
-/// and avoids that blast radius entirely.
-fn validate_key(key: &[u8]) -> Result<()> {
+/// with other framing, and a namespace+key past the server's own 1 MiB
+/// request cap can never be stored either way — both cases get exactly
+/// one reply from the server: closing the connection outright, silently
+/// poisoning every other request already pipelined on that connection
+/// (see src/command.rs's `rejects_empty_key_for_get` et al., and this
+/// module's `MAX_REQUEST_BYTES` doc comment). `get`/`delete` call this
+/// directly (no value to bound), so without the size check here an
+/// oversized namespace/key on either of those paths would sail straight
+/// past client-side validation and only be caught by the server slamming
+/// the connection shut (issue #47 audit item R1 follow-up). Catching both
+/// cases here client-side, as `Error::InvalidArgument`, gives the caller
+/// a clear synchronous error and avoids that blast radius entirely. The
+/// namespace itself has no length limit of its own (Namespaces, issue
+/// #105) beyond this shared request-size bound.
+fn validate_key(namespace: &[u8], key: &[u8]) -> Result<()> {
     if key.is_empty() {
         return Err(Error::InvalidArgument(
             "nanocached: key must not be empty".to_string(),
         ));
     }
-    if key.len() > MAX_REQUEST_BYTES {
-        return Err(Error::InvalidArgument(format!(
-            "nanocached: key exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES} bytes), got {} bytes",
-            key.len()
-        )));
+    if namespace.len() + key.len() > MAX_REQUEST_BYTES {
+        return Err(Error::InvalidArgument(if namespace.is_empty() {
+            // Keeps the pre-namespace message unchanged for the common,
+            // namespace-less case.
+            format!(
+                "nanocached: key exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES} bytes), got {} bytes",
+                key.len()
+            )
+        } else {
+            format!(
+                "nanocached: namespace ({} bytes) + key ({} bytes) exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES} bytes)",
+                namespace.len(),
+                key.len()
+            )
+        }));
     }
     Ok(())
 }
 
-/// `validate_key` plus a `MAX_REQUEST_BYTES` bound on `key.len() +
-/// value.len()` — anything past it can never fit the server's own 1 MiB
-/// request cap, so failing fast here is strictly better than sending a
-/// frame the server can only reject by silently closing the connection.
-/// The combined check below is redundant whenever `validate_key` alone
-/// already rejects an oversized key, but stays as its own check since a
-/// key comfortably under the bound can still push the combined total over
-/// it once `value` is added.
-fn validate_key_and_value(key: &[u8], value: &[u8]) -> Result<()> {
-    validate_key(key)?;
-    if key.len() + value.len() > MAX_REQUEST_BYTES {
-        return Err(Error::InvalidArgument(format!(
-            "nanocached: key ({} bytes) + value ({} bytes) exceeds MAX_REQUEST_BYTES ({} bytes)",
-            key.len(),
-            value.len(),
-            MAX_REQUEST_BYTES
-        )));
+/// `validate_key` plus a `MAX_REQUEST_BYTES` bound on `namespace.len() +
+/// key.len() + value.len()` — anything past it can never fit the
+/// server's own 1 MiB request cap, so failing fast here is strictly
+/// better than sending a frame the server can only reject by silently
+/// closing the connection. The combined check below is redundant
+/// whenever `validate_key` alone already rejects an oversized
+/// namespace+key, but stays as its own check since a namespace+key
+/// comfortably under the bound can still push the combined total over it
+/// once `value` is added.
+fn validate_key_and_value(namespace: &[u8], key: &[u8], value: &[u8]) -> Result<()> {
+    validate_key(namespace, key)?;
+    if namespace.len() + key.len() + value.len() > MAX_REQUEST_BYTES {
+        return Err(Error::InvalidArgument(if namespace.is_empty() {
+            format!(
+                "nanocached: key ({} bytes) + value ({} bytes) exceeds MAX_REQUEST_BYTES ({} bytes)",
+                key.len(),
+                value.len(),
+                MAX_REQUEST_BYTES
+            )
+        } else {
+            format!(
+                "nanocached: namespace ({} bytes) + key ({} bytes) + value ({} bytes) exceeds MAX_REQUEST_BYTES ({} bytes)",
+                namespace.len(),
+                key.len(),
+                value.len(),
+                MAX_REQUEST_BYTES
+            )
+        }));
     }
     Ok(())
+}
+
+/// `get`'s strict UTF-8 decode — shared by [`NanocachedClient::get`] and
+/// [`Namespace::get`] so the two stay identical instead of drifting.
+fn decode_utf8_value(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes).map_err(Error::InvalidUtf8)
 }
 
 /// Fire-and-forget replica writes: bounds how many replica writes a single client may
@@ -796,7 +834,9 @@ impl NanocachedClient {
                         }
                         // Any parseable reply proves liveness — `N`, or `W`
                         // from a non-owner — and resets the idle timer.
-                        let _ = connection.get(KEEPALIVE_KEY).await;
+                        // Always the default namespace: the keep-alive key
+                        // is reserved wire-wide, not per-namespace.
+                        let _ = connection.get(DEFAULT_NAMESPACE, KEEPALIVE_KEY).await;
                     }
                 }
             }))
@@ -886,7 +926,7 @@ impl NanocachedClient {
 
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {
         match self.get_bytes(key).await? {
-            Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(Error::InvalidUtf8)?)),
+            Some(bytes) => Ok(Some(decode_utf8_value(bytes)?)),
             None => Ok(None),
         }
     }
@@ -895,14 +935,28 @@ impl NanocachedClient {
     /// (value compression). With `read_repair`, a clean miss probes the
     /// remaining owners before being accepted as final (read repair).
     pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        self.get_bytes_in(DEFAULT_NAMESPACE, key).await
+    }
+
+    /// The shared implementation behind [`Self::get_bytes`] and
+    /// [`Namespace::get_bytes`] (Namespaces, issue #105) — the latter is
+    /// nothing but this, called with its own namespace instead of
+    /// [`DEFAULT_NAMESPACE`]; no networking is duplicated between them.
+    async fn get_bytes_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
-        validate_key(key)?;
+        validate_key(namespace, key)?;
         self.before_operation().await?;
-        let mut value = self.with_cluster_retry(|| self.read(key)).await?;
+        let mut value = self
+            .with_cluster_retry(|| self.read(namespace, key))
+            .await?;
         if value.is_none() && self.inner.read_repair {
             let clustered = matches!(self.inner.state.lock().await.target, Target::Cluster { .. });
             if clustered {
-                value = self.try_read_repair(key).await;
+                value = self.try_read_repair(namespace, key).await;
             }
         }
         match value {
@@ -913,23 +967,24 @@ impl NanocachedClient {
         }
     }
 
-    /// Read repair: probes the remaining owners of `key` — every
-    /// owner but the primary, which the normal read path already probed
-    /// and got a clean miss from — in rank order, for a value. The first
-    /// one that has it wins: its value is returned, and — detached, not
-    /// awaited, no tracking — that same value repairs the true primary in
-    /// the background with `READ_REPAIR_TTL`. Every failure along the way
-    /// (connection lost, WrongNode, another miss) is swallowed; nothing
-    /// here may turn an already-accepted miss into an error. A failed
-    /// repair write is counted in `stats().read_repair_failures`.
-    async fn try_read_repair(&self, key: &[u8]) -> Option<Vec<u8>> {
+    /// Read repair: probes the remaining owners of `(namespace, key)` —
+    /// every owner but the primary, which the normal read path already
+    /// probed and got a clean miss from — in rank order, for a value. The
+    /// first one that has it wins: its value is returned, and — detached,
+    /// not awaited, no tracking — that same value repairs the true primary
+    /// in the background with `READ_REPAIR_TTL`. Every failure along the
+    /// way (connection lost, WrongNode, another miss) is swallowed;
+    /// nothing here may turn an already-accepted miss into an error. A
+    /// failed repair write is counted in `stats().read_repair_failures`.
+    async fn try_read_repair(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
         let owners = {
             let state = self.inner.state.lock().await;
-            Self::owner_names(&state, key)
+            Self::owner_names(&state, namespace, key)
         };
 
         for name in owners.iter().skip(1) {
-            let probe = |connection: Arc<Connection>| async move { connection.get(key).await };
+            let probe =
+                |connection: Arc<Connection>| async move { connection.get(namespace, key).await };
             let Ok(Some(value)) = self.apply_reconnecting(Some(name), &probe).await else {
                 continue;
             };
@@ -952,14 +1007,20 @@ impl NanocachedClient {
                     if !self.inner.closed.load(Ordering::SeqCst) {
                         let client = self.clone();
                         let primary = primary.clone();
+                        let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
                         let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
                         let owned_value: Arc<[u8]> = Arc::from(value.clone());
                         tokio::spawn(async move {
                             let _permit = permit; // held until this task finishes
                             let op = move |connection: Arc<Connection>| {
+                                let namespace = Arc::clone(&owned_namespace);
                                 let key = Arc::clone(&owned_key);
                                 let value = Arc::clone(&owned_value);
-                                async move { connection.set(&key, &value, READ_REPAIR_TTL).await }
+                                async move {
+                                    connection
+                                        .set(&namespace, &key, &value, READ_REPAIR_TTL)
+                                        .await
+                                }
                             };
                             if client
                                 .apply_reconnecting(Some(&primary), &op)
@@ -990,8 +1051,20 @@ impl NanocachedClient {
         value: impl AsRef<[u8]>,
         ttl_seconds: u64,
     ) -> Result<()> {
+        self.set_in(DEFAULT_NAMESPACE, key, value, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::set`] and
+    /// [`Namespace::set`] (Namespaces, issue #105).
+    async fn set_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
         let key = key.as_ref();
-        validate_key(key)?;
         let owned_compressed;
         let value: &[u8] = if self.inner.compress {
             owned_compressed = crate::compression::compress_value(
@@ -1005,13 +1078,16 @@ impl NanocachedClient {
         // Sized against what actually goes on the wire — the compressed
         // form when compression is on — like the other SDKs, so a large
         // but compressible value isn't refused for its raw size.
-        validate_key_and_value(key, value)?;
+        validate_key_and_value(namespace, key, value)?;
         self.before_operation().await?;
         self.with_cluster_retry(|| {
             self.write(
+                namespace,
                 key,
                 WriteBody::Set { value, ttl_seconds },
-                move |connection| async move { connection.set(key, value, ttl_seconds).await },
+                move |connection| async move {
+                    connection.set(namespace, key, value, ttl_seconds).await
+                },
             )
         })
         .await
@@ -1019,15 +1095,45 @@ impl NanocachedClient {
 
     /// Returns whether the key existed before this call.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
+        self.delete_in(DEFAULT_NAMESPACE, key).await
+    }
+
+    /// The shared implementation behind [`Self::delete`] and
+    /// [`Namespace::delete`] (Namespaces, issue #105).
+    async fn delete_in(&self, namespace: &[u8], key: impl AsRef<[u8]>) -> Result<bool> {
         let key = key.as_ref();
-        validate_key(key)?;
+        validate_key(namespace, key)?;
         self.before_operation().await?;
         self.with_cluster_retry(|| {
-            self.write(key, WriteBody::Delete, |connection| async move {
-                connection.delete(key).await
+            self.write(namespace, key, WriteBody::Delete, |connection| async move {
+                connection.delete(namespace, key).await
             })
         })
         .await
+    }
+
+    /// A namespaced view onto this client (Namespaces, issue #105):
+    /// `get`/`get_bytes`/`set`/`delete` on the returned [`Namespace`]
+    /// behave exactly like this client's own, except every key is scoped
+    /// to `ns` — the same key name under two different namespaces (or
+    /// under no namespace at all) names two, or three, wholly independent
+    /// entries. `ns` accepts the same key-ish types this crate accepts
+    /// for keys; a `&str` is UTF-8 encoded. There is no length limit on
+    /// `ns` beyond the request-size rules this crate already applies to
+    /// key+value.
+    ///
+    /// `namespace("")` returns a handle equivalent to this client itself
+    /// — the empty namespace is the default one every namespace-less call
+    /// already uses, so it is not rejected. The handle is cheap (it
+    /// shares this client's connections and routing, and opens no sockets
+    /// of its own) and stays valid only as long as this client does:
+    /// using it after [`Self::close`] fails with [`Error::AlreadyClosed`],
+    /// exactly like calling this client's own methods after close.
+    pub fn namespace(&self, ns: impl AsRef<[u8]>) -> Namespace {
+        Namespace {
+            client: self.clone(),
+            namespace: Arc::from(ns.as_ref()),
+        }
     }
 
     async fn before_operation(&self) -> Result<()> {
@@ -1065,28 +1171,30 @@ impl NanocachedClient {
         }
     }
 
-    fn owner_names(state: &State, key: &[u8]) -> Vec<String> {
+    fn owner_names(state: &State, namespace: &[u8], key: &[u8]) -> Vec<String> {
         match &state.target {
             Target::Single { .. } => Vec::new(),
             Target::Cluster {
                 ring, replication, ..
             } => ring
-                .owners(key, *replication)
+                .owners(namespace, key, *replication)
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
         }
     }
 
-    async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    async fn read(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         let owners = {
             let state = self.inner.state.lock().await;
             if let Target::Single { .. } = state.target {
                 drop(state);
-                let op = |connection: Arc<Connection>| async move { connection.get(key).await };
+                let op = |connection: Arc<Connection>| async move {
+                    connection.get(namespace, key).await
+                };
                 return self.apply_reconnecting(None, &op).await;
             }
-            Self::owner_names(&state, key)
+            Self::owner_names(&state, namespace, key)
         };
 
         // Hedged reads (issue #64): only once the key actually has a
@@ -1095,7 +1203,7 @@ impl NanocachedClient {
         // sequential path below runs exactly as before.
         if let Some(hedge_after) = self.inner.read_hedge_after {
             if owners.len() >= 2 {
-                return self.read_hedged(key, owners, hedge_after).await;
+                return self.read_hedged(namespace, key, owners, hedge_after).await;
             }
         }
 
@@ -1103,7 +1211,8 @@ impl NanocachedClient {
         // failure — a replica hedges against a dead holder, not a miss.
         let mut last_error: Option<Error> = None;
         for name in owners {
-            let op = |connection: Arc<Connection>| async move { connection.get(key).await };
+            let op =
+                |connection: Arc<Connection>| async move { connection.get(namespace, key).await };
             match self.apply_reconnecting(Some(&name), &op).await {
                 Ok(value) => return Ok(value),
                 Err(Error::WrongNode) => return Err(Error::WrongNode),
@@ -1138,15 +1247,23 @@ impl NanocachedClient {
     /// never cancelled, and drained by `close()`.
     async fn read_hedged(
         &self,
+        namespace: &[u8],
         key: &[u8],
         owners: Vec<String>,
         hedge_after: Duration,
     ) -> Result<Option<Vec<u8>>> {
+        let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
         let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
         let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
 
-        self.spawn_hedge_leg(Arc::clone(&owned_key), owners[0].clone(), 0, tx.clone())
-            .await?;
+        self.spawn_hedge_leg(
+            Arc::clone(&owned_namespace),
+            Arc::clone(&owned_key),
+            owners[0].clone(),
+            0,
+            tx.clone(),
+        )
+        .await?;
         let mut next_index = 1usize;
         // How many legs are currently in flight (spawned, no outcome
         // received yet) — once this hits zero with owners left to try,
@@ -1168,6 +1285,7 @@ impl NanocachedClient {
                         // The hedge interval elapsed with no answer yet:
                         // one more owner, right away.
                         self.spawn_hedge_leg(
+                            Arc::clone(&owned_namespace),
                             Arc::clone(&owned_key),
                             owners[next_index].clone(),
                             next_index,
@@ -1202,6 +1320,7 @@ impl NanocachedClient {
             if in_flight == 0 {
                 if next_index < owners.len() {
                     self.spawn_hedge_leg(
+                        Arc::clone(&owned_namespace),
                         Arc::clone(&owned_key),
                         owners[next_index].clone(),
                         next_index,
@@ -1237,6 +1356,7 @@ impl NanocachedClient {
     /// and is ignored — the result is discarded either way.
     async fn spawn_hedge_leg(
         &self,
+        namespace: Arc<[u8]>,
         key: Arc<[u8]>,
         name: String,
         index: usize,
@@ -1258,8 +1378,9 @@ impl NanocachedClient {
         }
         hedged.spawn(async move {
             let op = move |connection: Arc<Connection>| {
+                let namespace = Arc::clone(&namespace);
                 let key = Arc::clone(&key);
-                async move { connection.get(&key).await }
+                async move { connection.get(&namespace, &key).await }
             };
             let result = client.apply_reconnecting(Some(&name), &op).await;
             let _ = tx.send(HedgeOutcome { index, result });
@@ -1267,7 +1388,13 @@ impl NanocachedClient {
         Ok(())
     }
 
-    async fn write<T, F, Fut>(&self, key: &[u8], body: WriteBody<'_>, op: F) -> Result<T>
+    async fn write<T, F, Fut>(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        body: WriteBody<'_>,
+        op: F,
+    ) -> Result<T>
     where
         F: Fn(Arc<Connection>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -1278,7 +1405,7 @@ impl NanocachedClient {
                 drop(state);
                 return self.apply_reconnecting(None, &op).await;
             }
-            Self::owner_names(&state, key)
+            Self::owner_names(&state, namespace, key)
         };
 
         let Some((primary, replicas)) = owners.split_first() else {
@@ -1320,6 +1447,7 @@ impl NanocachedClient {
                         } else {
                             let client = self.clone();
                             let name = name.clone();
+                            let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
                             let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
                             let owned_body = body.to_owned();
                             tokio::spawn(async move {
@@ -1328,18 +1456,22 @@ impl NanocachedClient {
                                     OwnedWriteBody::Set { value, ttl_seconds } => {
                                         let value: Arc<[u8]> = Arc::from(value);
                                         let op = move |connection: Arc<Connection>| {
+                                            let namespace = Arc::clone(&owned_namespace);
                                             let key = Arc::clone(&owned_key);
                                             let value = Arc::clone(&value);
                                             async move {
-                                                connection.set(&key, &value, ttl_seconds).await
+                                                connection
+                                                    .set(&namespace, &key, &value, ttl_seconds)
+                                                    .await
                                             }
                                         };
                                         client.apply_reconnecting(Some(&name), &op).await.is_err()
                                     }
                                     OwnedWriteBody::Delete => {
                                         let op = move |connection: Arc<Connection>| {
+                                            let namespace = Arc::clone(&owned_namespace);
                                             let key = Arc::clone(&owned_key);
-                                            async move { connection.delete(&key).await }
+                                            async move { connection.delete(&namespace, &key).await }
                                         };
                                         client.apply_reconnecting(Some(&name), &op).await.is_err()
                                     }
@@ -1681,6 +1813,67 @@ impl NanocachedClient {
     }
 }
 
+/// A namespaced view onto a [`NanocachedClient`] (Namespaces, issue #105):
+/// the same key name under a different namespace — or under no namespace
+/// at all — is a wholly independent entry. A namespace is a flat, opaque
+/// byte string: there is no delimiter, no escaping, no hierarchy, and it
+/// may contain any bytes.
+///
+/// Returned by [`NanocachedClient::namespace`]; cheap to create and cheap
+/// to clone — it shares the client's connections, routing, and every
+/// other option (compression, replication, hedging, ...), and opens no
+/// sockets of its own. Every method here does nothing but forward to the
+/// same internal `NanocachedClient` methods that `get`/`set`/`delete`
+/// themselves call, just with this handle's namespace instead of the
+/// default (empty) one — this crate's own networking is never
+/// duplicated. A handle is invalid once its client is closed: using it
+/// afterward fails with [`Error::AlreadyClosed`], exactly like calling
+/// the client's own methods after close.
+#[derive(Clone)]
+pub struct Namespace {
+    client: NanocachedClient,
+    namespace: Arc<[u8]>,
+}
+
+impl Namespace {
+    /// This handle's namespace, exactly as given to
+    /// [`NanocachedClient::namespace`] — e.g. for a framework adapter
+    /// built on this crate that needs to report or compare it.
+    pub fn name(&self) -> &[u8] {
+        &self.namespace
+    }
+
+    /// See [`NanocachedClient::get`]; scoped to this namespace.
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {
+        match self.get_bytes(key).await? {
+            Some(bytes) => Ok(Some(decode_utf8_value(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// See [`NanocachedClient::get_bytes`]; scoped to this namespace.
+    pub async fn get_bytes(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        self.client.get_bytes_in(&self.namespace, key).await
+    }
+
+    /// See [`NanocachedClient::set`]; scoped to this namespace.
+    pub async fn set(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
+        self.client
+            .set_in(&self.namespace, key, value, ttl_seconds)
+            .await
+    }
+
+    /// See [`NanocachedClient::delete`]; scoped to this namespace.
+    pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
+        self.client.delete_in(&self.namespace, key).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1694,7 +1887,7 @@ mod tests {
         // audit item R1 follow-up).
         let oversized = vec![0u8; MAX_REQUEST_BYTES + 1];
         assert!(matches!(
-            validate_key(&oversized),
+            validate_key(DEFAULT_NAMESPACE, &oversized),
             Err(Error::InvalidArgument(_))
         ));
     }
@@ -1702,11 +1895,36 @@ mod tests {
     #[test]
     fn validate_key_accepts_a_key_right_at_max_request_bytes() {
         let boundary = vec![0u8; MAX_REQUEST_BYTES];
-        assert!(validate_key(&boundary).is_ok());
+        assert!(validate_key(DEFAULT_NAMESPACE, &boundary).is_ok());
     }
 
     #[test]
     fn validate_key_rejects_an_empty_key() {
-        assert!(matches!(validate_key(b""), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            validate_key(DEFAULT_NAMESPACE, b""),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn validate_key_rejects_an_empty_key_even_with_a_namespace() {
+        assert!(matches!(
+            validate_key(b"users", b""),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+
+    #[test]
+    fn validate_key_sums_namespace_and_key_against_max_request_bytes() {
+        // Neither alone exceeds the bound, but their sum does — the
+        // namespace must count toward the same request-size limit as the
+        // key (Namespaces, issue #105).
+        let namespace = vec![0u8; MAX_REQUEST_BYTES / 2];
+        let key = vec![0u8; MAX_REQUEST_BYTES / 2 + 1];
+        assert!(validate_key(&namespace, &namespace[..1]).is_ok());
+        assert!(matches!(
+            validate_key(&namespace, &key),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 }

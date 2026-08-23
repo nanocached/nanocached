@@ -7,22 +7,62 @@
 //! node's own copy, the two would disagree about which nodes hold a key.
 //! Cross-language test vectors pin the pipeline.
 //!
-//! For each (node, key) pair, `score = fmix64(fnv1a(name) ^ fnv1a(key))`;
+//! For each (node, key) pair, `score = fmix64(fnv1a(name) ^ key_hash)`;
 //! a key's owners are the `replicas` highest-scoring nodes in descending
 //! score order (ties — effectively impossible at 64 bits — break toward
 //! the lexicographically smaller name), and its primary is the top one.
 //!
 //! Built from node *names*, not addresses (node identity decoupled from address).
+//!
+//! Namespaces (issue #105) enter `key_hash`, and this is consensus-critical
+//! across the server, the six SDKs, and `verify-staged-join`:
+//!
+//! - default (empty) namespace: `fnv1a(key)` — byte-identical to the
+//!   pre-namespace form, so an un-namespaced key's placement never moves
+//!   (no cluster-wide hit-rate cliff on a rolling upgrade, and
+//!   mixed-version clients still agree on placement);
+//! - non-empty namespace: `fnv1a(be32(len(ns)) || ns || key)` — the
+//!   namespace length as a 4-byte big-endian integer, then the namespace
+//!   bytes, then the key bytes, hashed as one stream. Length-prefixed so
+//!   `("ab", "c")` and `("a", "bc")` never share an input; including the
+//!   namespace at all is what keeps placement balanced — hashing the key
+//!   alone would pile every namespace's common singleton keys (e.g.
+//!   `config`) onto the same nodes.
 
 use crate::error::{Error, Result};
 
 pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    fnv1a_continue(0xcbf29ce484222325, bytes)
+}
+
+/// Feeds `bytes` into an in-progress FNV-1a state, so a multi-part input
+/// (namespace length, namespace, key) hashes exactly as its
+/// concatenation would, with no allocation to actually build that
+/// concatenation.
+fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// The canonical key-side hash — see the module docs for the two forms.
+/// `namespace` is bounded by the request-size limit (1 MiB) by the time
+/// any caller in this crate reaches here (`client::validate_key`), so its
+/// length always fits `u32`; the cast is the canonical encoding width
+/// every nanocached implementation uses, never a truncation that could
+/// actually occur.
+fn key_hash(namespace: &[u8], key: &[u8]) -> u64 {
+    if namespace.is_empty() {
+        return fnv1a(key);
+    }
+    let namespace_length = u32::try_from(namespace.len())
+        .expect("nanocached: namespace exceeds the request-size limit")
+        .to_be_bytes();
+    let hash = fnv1a(&namespace_length);
+    let hash = fnv1a_continue(hash, namespace);
+    fnv1a_continue(hash, key)
 }
 
 /// MurmurHash3's 64-bit finalizer: the full-avalanche mix FNV-1a lacks.
@@ -49,9 +89,11 @@ impl HashRing {
     }
 
     /// The key's owners: the `replicas` highest-scoring nodes, primary
-    /// first. Returns fewer when the cluster is smaller.
-    pub fn owners(&self, key: &[u8], replicas: usize) -> Vec<&str> {
-        let key_hash = fnv1a(key);
+    /// first. Returns fewer when the cluster is smaller. `namespace` empty
+    /// means the default namespace (see the module docs' `key_hash`
+    /// split) — pass `b""` for an un-namespaced key.
+    pub fn owners(&self, namespace: &[u8], key: &[u8], replicas: usize) -> Vec<&str> {
+        let key_hash = key_hash(namespace, key);
 
         let mut scored: Vec<(u64, &str)> = self
             .node_hashes
@@ -82,17 +124,20 @@ impl HashRing {
         scored.into_iter().map(|(_, node)| node).collect()
     }
 
-    /// The key's primary — `owners(key, 1)[0]`. Returns
+    /// The key's primary — `owners(namespace, key, 1)[0]`. Returns
     /// `Err(Error::InvalidArgument)` on an empty ring instead of panicking
     /// (there is no node to name as primary), matching how every other
     /// public entry point in this crate reports "the caller passed
     /// something that could never be meant" rather than aborting.
-    pub fn route(&self, key: &[u8]) -> Result<&str> {
-        self.owners(key, 1).into_iter().next().ok_or_else(|| {
-            Error::InvalidArgument(
-                "nanocached: HashRing::route called on an empty ring".to_string(),
-            )
-        })
+    pub fn route(&self, namespace: &[u8], key: &[u8]) -> Result<&str> {
+        self.owners(namespace, key, 1)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                Error::InvalidArgument(
+                    "nanocached: HashRing::route called on an empty ring".to_string(),
+                )
+            })
     }
 }
 
@@ -120,18 +165,82 @@ mod tests {
         assert_eq!(fmix64(0xcbf29ce484222325), 0xefd01f60ba992926);
 
         let ring = ring(&["node-a", "node-b", "node-c"]);
-        assert_eq!(ring.owners(b"alpha", 3), vec!["node-c", "node-b", "node-a"]);
-        assert_eq!(ring.owners(b"beta", 3), vec!["node-a", "node-c", "node-b"]);
-        assert_eq!(ring.owners(b"", 3), vec!["node-a", "node-b", "node-c"]);
+        assert_eq!(
+            ring.owners(b"", b"alpha", 3),
+            vec!["node-c", "node-b", "node-a"]
+        );
+        assert_eq!(
+            ring.owners(b"", b"beta", 3),
+            vec!["node-a", "node-c", "node-b"]
+        );
+        assert_eq!(ring.owners(b"", b"", 3), vec!["node-a", "node-b", "node-c"]);
+    }
+
+    #[test]
+    fn matches_the_cross_language_namespaced_vectors() {
+        // Namespaces (issue #105): `key_hash(ns, key) =
+        // fnv1a(be32(len(ns)) || ns || key)`. The server and every other
+        // SDK pin these same vectors — ring over node-a/node-b/node-c, R=3.
+        let ring = ring(&["node-a", "node-b", "node-c"]);
+
+        assert_eq!(key_hash(b"users", b"alpha"), 0xfd4ab55027c21df6);
+        assert_eq!(
+            ring.owners(b"users", b"alpha", 3),
+            vec!["node-a", "node-c", "node-b"]
+        );
+
+        // Hash-only vector: the wire itself rejects a zero-length key, but
+        // key_hash has no such restriction on its own.
+        assert_eq!(key_hash(b"users", b""), 0xa9e9bbca44bb502e);
+        assert_eq!(
+            ring.owners(b"users", b"", 3),
+            vec!["node-b", "node-c", "node-a"]
+        );
+
+        assert_eq!(key_hash(b"\xff\x00", b"beta"), 0x8f7c097eccb8e792);
+        assert_eq!(
+            ring.owners(b"\xff\x00", b"beta", 3),
+            vec!["node-b", "node-a", "node-c"]
+        );
+
+        // Rolling-upgrade invariant: the default namespace routes exactly
+        // like the pre-namespace form.
+        assert_eq!(
+            ring.owners(b"", b"alpha", 3),
+            vec!["node-c", "node-b", "node-a"]
+        );
+    }
+
+    #[test]
+    fn namespace_and_key_boundaries_are_unambiguous() {
+        // The length prefix keeps `("ab", "c")` and `("a", "bc")` apart,
+        // and a namespaced key never collides with the un-namespaced
+        // concatenation.
+        assert_ne!(key_hash(b"ab", b"c"), key_hash(b"a", b"bc"));
+        assert_ne!(key_hash(b"ab", b"c"), key_hash(b"", b"abc"));
+    }
+
+    #[test]
+    fn namespaces_spread_a_shared_singleton_key_over_different_nodes() {
+        // The reason the namespace is part of the hash input at all — see
+        // the module docs.
+        let ring = ring(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let primaries: std::collections::HashSet<&str> = (0..64)
+            .map(|i| {
+                ring.route(format!("cache-{i}").as_bytes(), b"config")
+                    .unwrap()
+            })
+            .collect();
+        assert!(primaries.len() > 1);
     }
 
     #[test]
     fn owners_are_distinct_and_capped() {
         let ring = ring(&["node-a", "node-b", "node-c"]);
-        let owners = ring.owners(b"some-key", 2);
+        let owners = ring.owners(b"", b"some-key", 2);
         assert_eq!(owners.len(), 2);
         assert_ne!(owners[0], owners[1]);
-        assert_eq!(ring.owners(b"some-key", 10).len(), 3);
+        assert_eq!(ring.owners(b"", b"some-key", 10).len(), 3);
     }
 
     #[test]
@@ -156,7 +265,7 @@ mod tests {
         }
 
         fn naive_owners<'a>(ring: &'a HashRing, key: &[u8], replicas: usize) -> Vec<&'a str> {
-            let key_hash = fnv1a(key);
+            let key_hash = key_hash(b"", key);
             let mut scored: Vec<(u64, &str)> = ring
                 .node_hashes
                 .iter()
@@ -178,7 +287,7 @@ mod tests {
             for _ in 0..200 {
                 let key = format!("fuzz-key-{}", rng.next()).into_bytes();
                 assert_eq!(
-                    ring.owners(&key, replicas),
+                    ring.owners(b"", &key, replicas),
                     naive_owners(&ring, &key, replicas),
                     "mismatch for replicas={replicas}, key={key:?}"
                 );
@@ -189,13 +298,19 @@ mod tests {
     #[test]
     fn route_on_an_empty_ring_returns_invalid_argument_instead_of_panicking() {
         let empty = HashRing::new(vec![]);
-        assert!(matches!(empty.route(b"k"), Err(Error::InvalidArgument(_))));
+        assert!(matches!(
+            empty.route(b"", b"k"),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
     fn route_on_a_non_empty_ring_returns_the_primary() {
         let ring = ring(&["node-a", "node-b", "node-c"]);
-        assert_eq!(ring.route(b"alpha").unwrap(), ring.owners(b"alpha", 1)[0]);
+        assert_eq!(
+            ring.route(b"", b"alpha").unwrap(),
+            ring.owners(b"", b"alpha", 1)[0]
+        );
     }
 
     #[test]
@@ -205,11 +320,11 @@ mod tests {
         for i in 0..500 {
             let key = format!("key-{i}");
             let new_order: Vec<&str> = after
-                .owners(key.as_bytes(), 4)
+                .owners(b"", key.as_bytes(), 4)
                 .into_iter()
                 .filter(|node| *node != "node-d")
                 .collect();
-            assert_eq!(before.owners(key.as_bytes(), 3), new_order);
+            assert_eq!(before.owners(b"", key.as_bytes(), 3), new_order);
         }
     }
 }

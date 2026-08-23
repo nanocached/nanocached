@@ -1,6 +1,7 @@
 use crate::cache::{Cache, SWEEP_BUDGET};
 use crate::command::{Command, MigrateProgress, ParseError, parse_resumable};
 use crate::hash_ring::HashRing;
+use crate::key::Key;
 use crate::response::Response;
 use bytes::{Bytes, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -1924,8 +1925,23 @@ async fn wait_or_shutdown(duration: Duration, shutdown_rx: &mut watch::Receiver<
     }
 }
 
-fn set_message(key: &[u8], value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
-    let mut header = format!("S {} {}", key.len(), value.len());
+/// The `S`/`s` frame that transfers or forwards `key` to a joining node.
+/// A key in the default namespace goes out as the legacy `S` frame —
+/// byte-identical to what pre-namespace nodes sent — so a rolling
+/// upgrade's mixed-version handoff keeps working for legacy traffic;
+/// only a namespaced key needs the `s` form (issue #105), which every
+/// node must understand before namespaces are put to use.
+fn set_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
+    let mut header = if key.is_namespaced() {
+        format!(
+            "s {} {} {}",
+            key.namespace.len(),
+            key.name.len(),
+            value.len()
+        )
+    } else {
+        format!("S {} {}", key.name.len(), value.len())
+    };
 
     if let Some(ttl) = ttl {
         header.push_str(&format!(" {}", ttl.as_secs()));
@@ -1934,16 +1950,23 @@ fn set_message(key: &[u8], value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     header.push('\n');
 
     let mut message = header.into_bytes();
-    message.extend_from_slice(key);
+    message.extend_from_slice(&key.namespace);
+    message.extend_from_slice(&key.name);
     message.extend_from_slice(value);
     message
 }
 
 /// Staged node join: propagates a client's `D` for a key an in-progress handoff
 /// is moving to the joining node too (see `forward_delete_to_joining_node`).
-fn delete_message(key: &[u8]) -> Vec<u8> {
-    let mut message = format!("D {}\n", key.len()).into_bytes();
-    message.extend_from_slice(key);
+/// Same legacy-vs-namespaced frame choice as `set_message`.
+fn delete_message(key: &Key) -> Vec<u8> {
+    let mut message = if key.is_namespaced() {
+        format!("d {} {}\n", key.namespace.len(), key.name.len()).into_bytes()
+    } else {
+        format!("D {}\n", key.name.len()).into_bytes()
+    };
+    message.extend_from_slice(&key.namespace);
+    message.extend_from_slice(&key.name);
     message
 }
 
@@ -2022,7 +2045,7 @@ struct ActiveMigration {
     /// completed slot, or a later `M` whose roster shows the joiner never
     /// made it. Until `confirmed`, `run_sweep` leaves marked entries
     /// alone (`Command::Sweep { marked: false }`).
-    marked_keys: Vec<Bytes>,
+    marked_keys: Vec<Key>,
     /// Issue #62: discovery has completed this join — the joiner showed
     /// up in the primary's heartbeat-ack roster (`adopt_membership`) or
     /// in the `joined` roster of a subsequent `M`. Only then are this
@@ -2113,7 +2136,7 @@ enum MigrationOutcome {
         /// joiner isn't `Joined`); the caller must `unmark_migrated`
         /// each before listing keys, so they're live again — and re-sent
         /// if the new joiner owns them.
-        restore: Vec<Bytes>,
+        restore: Vec<Key>,
     },
     /// This `M` names the same `joining_name` as the handoff already
     /// occupying the slot, and that handoff has already stamped what it
@@ -2296,7 +2319,7 @@ impl MigrationGuard {
     fn completed(
         mut self,
         entries_sent: usize,
-        marked_keys: Vec<Bytes>,
+        marked_keys: Vec<Key>,
         pre_completion_ring: Option<Arc<Membership>>,
     ) {
         if let Some(active) = self
@@ -2374,7 +2397,7 @@ fn migration_rings(
 /// migration protocol to support resuming a partial listing — a larger
 /// change than this bug fix warrants.
 fn entries_to_send_count(
-    keys: &[Bytes],
+    keys: &[Key],
     before_ring: &HashRing,
     after_ring: &HashRing,
     self_name: &str,
@@ -2450,7 +2473,7 @@ async fn run_migration(
     before_ring: HashRing,
     after_ring: Arc<HashRing>,
     migration_guard: MigrationGuard,
-    keys: Option<Vec<Bytes>>,
+    keys: Option<Vec<Key>>,
 ) {
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 
@@ -2619,7 +2642,7 @@ async fn run_migration(
     }
 }
 
-async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Bytes>> {
+async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
     let (response_tx, response_rx) = oneshot::channel();
 
     request_tx
@@ -2638,8 +2661,8 @@ async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Bytes>
 
 async fn peek_entry(
     request_tx: &mpsc::Sender<CacheRequest>,
-    key: &Bytes,
-) -> Option<(Bytes, Bytes, Option<Duration>)> {
+    key: &Key,
+) -> Option<(Key, Bytes, Option<Duration>)> {
     let (response_tx, response_rx) = oneshot::channel();
 
     request_tx
@@ -2656,7 +2679,7 @@ async fn peek_entry(
     }
 }
 
-async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
+async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
     let (response_tx, response_rx) = oneshot::channel();
 
     if request_tx
@@ -2671,7 +2694,7 @@ async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
     }
 }
 
-async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
+async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
     let (response_tx, response_rx) = oneshot::channel();
 
     if request_tx
@@ -2702,7 +2725,7 @@ async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
 /// roster once the grace lapsed) is never clobbered. Returns the dead
 /// copies to restore (their async `unmark_migrated` is left to the
 /// caller); `None` when there was nothing completed to abandon.
-fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> Option<Vec<Bytes>> {
+fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> Option<Vec<Key>> {
     let taken = {
         let mut slot = node_context
             .active_migration
@@ -2852,7 +2875,7 @@ async fn connect_and_authenticate(
 
 async fn send_set(
     stream: &mut ClientStream,
-    key: &[u8],
+    key: &Key,
     value: &[u8],
     ttl: Option<Duration>,
 ) -> io::Result<()> {
@@ -2902,7 +2925,7 @@ struct ForwardTarget {
 async fn set_on_joining_node(
     node_context: &NodeContext,
     target: &ForwardTarget,
-    key: &[u8],
+    key: &Key,
     value: &[u8],
     ttl: Option<Duration>,
 ) -> io::Result<()> {
@@ -2919,12 +2942,12 @@ async fn set_on_joining_node(
 /// put on the shared connection.
 enum ForwardedWrite<'a> {
     Set {
-        key: &'a [u8],
+        key: &'a Key,
         value: &'a [u8],
         ttl: Option<Duration>,
     },
     Delete {
-        key: &'a [u8],
+        key: &'a Key,
     },
 }
 
@@ -2966,12 +2989,12 @@ impl ForwardedWrite<'_> {
 /// the way the single-shot `ForwardedWrite` does.
 enum OwnedForwardedWrite {
     Set {
-        key: Bytes,
+        key: Key,
         value: Bytes,
         ttl: Option<Duration>,
     },
     Delete {
-        key: Bytes,
+        key: Key,
     },
 }
 
@@ -3148,7 +3171,7 @@ async fn forward_with_retries(
 /// joiner no longer update): every read that reached this node in the
 /// rest of the forwarding window missed (`N`) once the sweep had run.
 /// Write forwarding keeps going for the whole window regardless.
-fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
+fn wrong_node(node_context: &NodeContext, key: &Key) -> bool {
     let displaced = node_context
         .known_ring
         .lock()
@@ -3169,7 +3192,7 @@ fn wrong_node(node_context: &NodeContext, key: &[u8]) -> bool {
 /// `key` to a joiner discovery hasn't confirmed yet (see
 /// `ActiveMigration::confirmed`), so this node is the only owner a
 /// client's `L` can name and must keep serving the key itself.
-fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &[u8]) -> bool {
+fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &Key) -> bool {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -3192,7 +3215,7 @@ fn serving_locally_for_unconfirmed_join(node_context: &NodeContext, key: &[u8]) 
 /// to also propagate a client's `S`/`D` for that key there, so the
 /// joining node doesn't end up serving a stale value once promoted (see
 /// the staged-join handoff design).
-fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<ForwardTarget> {
+fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarget> {
     let mut slot = node_context
         .active_migration
         .lock()
@@ -3233,7 +3256,7 @@ fn migration_target_for(node_context: &NodeContext, key: &[u8]) -> Option<Forwar
 async fn delete_on_joining_node(
     node_context: &NodeContext,
     target: &ForwardTarget,
-    key: &[u8],
+    key: &Key,
 ) -> io::Result<()> {
     forward_on_shared_connection(node_context, target, ForwardedWrite::Delete { key }).await
 }
@@ -3292,6 +3315,10 @@ async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(name: &[u8]) -> Key {
+        Key::unnamespaced(Bytes::copy_from_slice(name))
+    }
     use bytes::Bytes;
 
     /// A stand-in peer address for `handle_connection` in tests — only the
@@ -3309,7 +3336,7 @@ mod tests {
         let set_response = send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -3318,13 +3345,7 @@ mod tests {
 
         assert_eq!(set_response, Response::Stored);
 
-        let get_response = send_command(
-            &request_tx,
-            Command::Get {
-                key: Bytes::from_static(b"name"),
-            },
-        )
-        .await;
+        let get_response = send_command(&request_tx, Command::Get { key: key(b"name") }).await;
 
         assert_eq!(get_response, Response::Value(Bytes::from_static(b"Alice")));
 
@@ -3362,6 +3383,65 @@ mod tests {
         client.shutdown().await.unwrap();
 
         let expected = b"S\nV 5\nAlice";
+        let mut response = vec![0_u8; expected.len()];
+
+        client.read_exact(&mut response).await.unwrap();
+
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_keeps_namespaces_apart() {
+        // Issue #105: the same key name in two namespaces and in the
+        // default namespace are three independent entries, and `g 0` is
+        // the default namespace.
+        let (mut client, server) = tcp_pair().await;
+
+        let (request_tx, request_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(
+                concat!(
+                    "S 4 5\nnameAlice",
+                    "s 5 4 3\nusersnameBob",
+                    "s 6 4 5\nordersnameCarol",
+                    "g 5 4\nusersname",
+                    "g 6 4\nordersname",
+                    "g 0 4\nname",
+                    "G 4\nname",
+                    "d 5 4\nusersname",
+                    "g 5 4\nusersname",
+                    "G 4\nname",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\nS\nS\nV 3\nBobV 5\nCarolV 5\nAliceV 5\nAliceD\nN\nV 5\nAlice";
         let mut response = vec![0_u8; expected.len()];
 
         client.read_exact(&mut response).await.unwrap();
@@ -3536,7 +3616,7 @@ mod tests {
         };
 
         let forward_task = tokio::spawn(async move {
-            set_on_joining_node(&node_context, &target, b"name", b"Alice", None).await
+            set_on_joining_node(&node_context, &target, &key(b"name"), b"Alice", None).await
         });
 
         tokio::task::yield_now().await;
@@ -3620,13 +3700,13 @@ mod tests {
             connection: Arc::new(AsyncMutex::new(None)),
         };
 
-        set_on_joining_node(&node_context, &target, b"name", b"Alice", None)
+        set_on_joining_node(&node_context, &target, &key(b"name"), b"Alice", None)
             .await
             .unwrap();
-        set_on_joining_node(&node_context, &target, b"age", b"30", None)
+        set_on_joining_node(&node_context, &target, &key(b"age"), b"30", None)
             .await
             .unwrap();
-        delete_on_joining_node(&node_context, &target, b"name")
+        delete_on_joining_node(&node_context, &target, &key(b"name"))
             .await
             .unwrap();
 
@@ -3693,7 +3773,9 @@ mod tests {
         let first_forward = tokio::spawn({
             let node_context = Arc::clone(&node_context);
             let target = Arc::clone(&target);
-            async move { set_on_joining_node(&node_context, &target, b"name", b"Alice", None).await }
+            async move {
+                set_on_joining_node(&node_context, &target, &key(b"name"), b"Alice", None).await
+            }
         });
         frame_received_rx.await.unwrap();
         tokio::time::pause();
@@ -3705,7 +3787,7 @@ mod tests {
             "a timed-out forward must not leave its connection in the shared slot"
         );
 
-        set_on_joining_node(&node_context, &target, b"age", b"30", None)
+        set_on_joining_node(&node_context, &target, &key(b"age"), b"30", None)
             .await
             .unwrap();
 
@@ -3765,7 +3847,7 @@ mod tests {
             node_context,
             target,
             OwnedForwardedWrite::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -4083,12 +4165,7 @@ mod tests {
 
         let request = request_rx.recv().await.unwrap();
 
-        assert_eq!(
-            request.command,
-            Command::Get {
-                key: Bytes::from_static(b"name"),
-            },
-        );
+        assert_eq!(request.command, Command::Get { key: key(b"name") },);
 
         shutdown_tx.send_replace(true);
 
@@ -4435,7 +4512,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"key-0"),
+                key: key(b"key-0"),
                 value: Bytes::from_static(b"primary-copy"),
                 ttl: None,
             },
@@ -4444,7 +4521,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"key-3"),
+                key: key(b"key-3"),
                 value: Bytes::from_static(b"replica-copy"),
                 ttl: None,
             },
@@ -4522,7 +4599,7 @@ mod tests {
         // The joiner got exactly the sender's key, nothing else.
         assert_eq!(
             *joining_received.lock().unwrap(),
-            set_message(b"key-0", b"primary-copy", None)
+            set_message(&key(b"key-0"), b"primary-copy", None)
         );
 
         // The displaced copy — and only it — is reclaimed by the sweep.
@@ -4530,27 +4607,13 @@ mod tests {
             send_command(&request_tx, Command::Sweep { marked: true }).await,
             Response::Swept(1)
         );
-        match send_command(
-            &request_tx,
-            Command::PeekEntry {
-                key: Bytes::from_static(b"key-0"),
-            },
-        )
-        .await
-        {
+        match send_command(&request_tx, Command::PeekEntry { key: key(b"key-0") }).await {
             Response::Entries(entries) => {
                 assert_eq!(entries.len(), 1, "the sender must keep its copy")
             }
             other => panic!("unexpected response: {other:?}"),
         }
-        match send_command(
-            &request_tx,
-            Command::PeekEntry {
-                key: Bytes::from_static(b"key-3"),
-            },
-        )
-        .await
-        {
+        match send_command(&request_tx, Command::PeekEntry { key: key(b"key-3") }).await {
             Response::Entries(entries) => {
                 assert!(entries.is_empty(), "the displaced copy must be swept")
             }
@@ -4561,8 +4624,8 @@ mod tests {
         // node's — but it keeps being served (and forwarded) for as long
         // as the handoff's forwarding window is open, since discovery
         // hasn't published the joiner yet; the kept key is served as ever.
-        assert!(!wrong_node(&node_context, b"key-3"));
-        assert!(!wrong_node(&node_context, b"key-0"));
+        assert!(!wrong_node(&node_context, &key(b"key-3")));
+        assert!(!wrong_node(&node_context, &key(b"key-0")));
 
         // Join confirmed by discovery, window still open (issue #66): the
         // displaced key is now rejected — `L` lists the joiner, so a
@@ -4576,9 +4639,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .confirmed = true;
-        assert!(wrong_node(&node_context, b"key-3"));
-        assert!(!wrong_node(&node_context, b"key-0"));
-        assert!(migration_target_for(&node_context, b"key-3").is_some());
+        assert!(wrong_node(&node_context, &key(b"key-3")));
+        assert!(!wrong_node(&node_context, &key(b"key-0")));
+        assert!(migration_target_for(&node_context, &key(b"key-3")).is_some());
 
         // Issue #3: this node's own share being done must NOT close the
         // write-forwarding window — discovery hasn't published the joiner
@@ -4586,7 +4649,7 @@ mod tests {
         // concurrent client write for a key in the joiner's top-R still
         // needs forwarding.
         assert_eq!(
-            migration_target_for(&node_context, b"key-0").map(|target| target.addr),
+            migration_target_for(&node_context, &key(b"key-0")).map(|target| target.addr),
             Some(joining_addr.clone()),
         );
         // ...but sweeping must no longer be paused by the lingering entry
@@ -4613,8 +4676,8 @@ mod tests {
             active.completed_at = Some(Instant::now() - active.forwarding_grace);
             active.confirmed = true;
         }
-        assert!(wrong_node(&node_context, b"key-3"));
-        assert!(!wrong_node(&node_context, b"key-0"));
+        assert!(wrong_node(&node_context, &key(b"key-3")));
+        assert!(!wrong_node(&node_context, &key(b"key-0")));
         assert!(node_context.active_migration.lock().unwrap().is_none());
 
         joining_task.await.unwrap();
@@ -4668,7 +4731,7 @@ mod tests {
                 abort_requested: Arc::new(AtomicBool::new(false)),
                 marked_keys: marked
                     .iter()
-                    .map(|key| Bytes::copy_from_slice(key.as_bytes()))
+                    .map(|key| Key::from(Bytes::copy_from_slice(key.as_bytes())))
                     .collect(),
                 confirmed: false,
                 pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
@@ -4692,11 +4755,11 @@ mod tests {
 
         // While forwarding (unconfirmed), the displaced key is still served
         // locally — the join isn't visible to clients yet.
-        assert!(!wrong_node(&node_context, b"key-3"));
+        assert!(!wrong_node(&node_context, &key(b"key-3")));
 
         let restored = abandon_migration(&node_context, "joiner-0")
             .expect("a completed handoff must hand back its dead copies to restore");
-        assert_eq!(restored, vec![Bytes::from_static(b"key-3")]);
+        assert_eq!(restored, vec![key(b"key-3")]);
 
         // The slot is gone and known_ring is back to the pre-join snapshot.
         assert!(node_context.active_migration.lock().unwrap().is_none());
@@ -4709,8 +4772,8 @@ mod tests {
         // the abandoned post-join ring and the slot would be gone, so
         // wrong_node would answer W for this node's own live key until the
         // next heartbeat. With the revert it's served immediately.
-        assert!(!wrong_node(&node_context, b"key-3"));
-        assert!(!wrong_node(&node_context, b"key-0"));
+        assert!(!wrong_node(&node_context, &key(b"key-3")));
+        assert!(!wrong_node(&node_context, &key(b"key-0")));
     }
 
     #[test]
@@ -4731,7 +4794,7 @@ mod tests {
         *node_context.known_ring.lock().unwrap() = Some(Arc::clone(&newer));
 
         let restored = abandon_migration(&node_context, "joiner-0").unwrap();
-        assert_eq!(restored, vec![Bytes::from_static(b"key-3")]);
+        assert_eq!(restored, vec![key(b"key-3")]);
         assert!(
             Arc::ptr_eq(
                 node_context.known_ring.lock().unwrap().as_ref().unwrap(),
@@ -4797,7 +4860,7 @@ mod tests {
     #[test]
     fn set_message_without_a_ttl_omits_the_third_header_field() {
         assert_eq!(
-            set_message(b"name", b"Alice", None),
+            set_message(&key(b"name"), b"Alice", None),
             b"S 4 5\nnameAlice".to_vec()
         );
     }
@@ -4805,9 +4868,23 @@ mod tests {
     #[test]
     fn set_message_with_a_ttl_rounds_down_to_whole_seconds() {
         assert_eq!(
-            set_message(b"name", b"Alice", Some(Duration::from_millis(4900))),
+            set_message(&key(b"name"), b"Alice", Some(Duration::from_millis(4900))),
             b"S 4 5 4\nnameAlice".to_vec()
         );
+    }
+
+    #[test]
+    fn set_message_for_a_namespaced_key_uses_the_lowercase_frame() {
+        // Issue #105: namespace length leads, namespace bytes lead the body.
+        let namespaced = Key::new(Bytes::from_static(b"users"), Bytes::from_static(b"name"));
+        assert_eq!(
+            set_message(&namespaced, b"Alice", Some(Duration::from_secs(4))),
+            b"s 5 4 5 4\nusersnameAlice".to_vec()
+        );
+        assert_eq!(delete_message(&namespaced), b"d 5 4\nusersname".to_vec());
+        // The default namespace keeps the legacy frames byte-for-byte, so a
+        // mixed-version handoff still works for un-namespaced traffic.
+        assert_eq!(delete_message(&key(b"name")), b"D 4\nname".to_vec());
     }
 
     #[test]
@@ -4853,7 +4930,7 @@ mod tests {
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
 
-        assert!(migration_target_for(&node_context, b"key-0").is_none());
+        assert!(migration_target_for(&node_context, &key(b"key-0")).is_none());
         assert!(
             node_context.active_migration.lock().unwrap().is_none(),
             "an expired forwarding entry should be cleared lazily"
@@ -4960,7 +5037,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -5070,7 +5147,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let expected_set = set_message(b"name", b"Alice", None);
+        let expected_set = set_message(&key(b"name"), b"Alice", None);
         assert_eq!(*joining_received.lock().unwrap(), expected_set);
         assert_eq!(
             *discovery_received.lock().unwrap(),
@@ -5106,7 +5183,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -5207,7 +5284,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -5316,7 +5393,7 @@ mod tests {
         );
 
         joining_task.await.unwrap();
-        let expected_set = set_message(b"name", b"Alice", None);
+        let expected_set = set_message(&key(b"name"), b"Alice", None);
         assert_eq!(
             *joining_received.lock().unwrap(),
             expected_set,
@@ -5451,7 +5528,7 @@ mod tests {
             abort_requested: Arc::new(AtomicBool::new(false)),
             marked_keys: marked
                 .iter()
-                .map(|key| Bytes::copy_from_slice(key.as_bytes()))
+                .map(|key| Key::from(Bytes::copy_from_slice(key.as_bytes())))
                 .collect(),
             confirmed: false,
             pre_completion_ring: None,
@@ -5513,10 +5590,7 @@ mod tests {
 
         let _guard = match new_guard_for_joiner_1(&slot, &joined) {
             MigrationOutcome::New { restore, guard } => {
-                assert_eq!(
-                    restore,
-                    vec![Bytes::from_static(b"dead-a"), Bytes::from_static(b"dead-b")]
-                );
+                assert_eq!(restore, vec![key(b"dead-a"), key(b"dead-b")]);
                 guard
             }
             _ => panic!("expected a new guard"),
@@ -5546,7 +5620,7 @@ mod tests {
         stale.completed_at = Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1));
         *node_context.active_migration.lock().unwrap() = Some(stale);
 
-        assert!(migration_target_for(&node_context, b"key-0").is_none());
+        assert!(migration_target_for(&node_context, &key(b"key-0")).is_none());
         assert!(
             node_context.active_migration.lock().unwrap().is_some(),
             "an unconfirmed slot must keep holding its marks"
@@ -5560,7 +5634,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .confirmed = true;
-        assert!(migration_target_for(&node_context, b"key-0").is_none());
+        assert!(migration_target_for(&node_context, &key(b"key-0")).is_none());
         assert!(node_context.active_migration.lock().unwrap().is_none());
     }
 
@@ -5599,7 +5673,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -5699,7 +5773,7 @@ mod tests {
             let active = slot.as_ref().expect("the completed slot must linger");
             assert!(active.completed_at.is_some());
             assert!(!active.confirmed);
-            assert_eq!(active.marked_keys, vec![Bytes::from_static(b"name")]);
+            assert_eq!(active.marked_keys, vec![key(b"name")]);
         }
         // What `run_sweep` does while the join is undecided: TTL only.
         assert_eq!(
@@ -5723,13 +5797,7 @@ mod tests {
             Response::Swept(0)
         );
         assert_eq!(
-            send_command(
-                &request_tx,
-                Command::Get {
-                    key: Bytes::from_static(b"name")
-                }
-            )
-            .await,
+            send_command(&request_tx, Command::Get { key: key(b"name") }).await,
             Response::Value(Bytes::from_static(b"Alice"))
         );
 
@@ -5748,7 +5816,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -5868,13 +5936,7 @@ mod tests {
         );
 
         assert_eq!(
-            send_command(
-                &request_tx,
-                Command::Get {
-                    key: Bytes::from_static(b"name")
-                }
-            )
-            .await,
+            send_command(&request_tx, Command::Get { key: key(b"name") }).await,
             Response::Value(Bytes::from_static(b"Alice"))
         );
         assert_eq!(
@@ -5897,7 +5959,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -5906,7 +5968,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"age"),
+                key: key(b"age"),
                 value: Bytes::from_static(b"30"),
                 ttl: None,
             },
@@ -6026,8 +6088,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let expected_name = set_message(b"name", b"Alice", None);
-        let expected_age = set_message(b"age", b"30", None);
+        let expected_name = set_message(&key(b"name"), b"Alice", None);
+        let expected_age = set_message(&key(b"age"), b"30", None);
         let received = joining_received.lock().unwrap().clone();
         assert!(
             received
@@ -6063,7 +6125,7 @@ mod tests {
         send_command(
             &request_tx,
             Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             },
@@ -6152,13 +6214,7 @@ mod tests {
         );
 
         assert_eq!(
-            send_command(
-                &request_tx,
-                Command::Get {
-                    key: Bytes::from_static(b"name")
-                }
-            )
-            .await,
+            send_command(&request_tx, Command::Get { key: key(b"name") }).await,
             Response::Value(Bytes::from_static(b"Alice"))
         );
         assert_eq!(

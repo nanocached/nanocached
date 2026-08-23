@@ -19,6 +19,13 @@
 // connection (request pipelining): concurrent callers on the same
 // connection each pay only their own network latency, not everyone
 // else's ahead of them.
+//
+// Client.Namespace(ns) returns a lightweight *Namespace handle scoping
+// Get/Set/Delete to ns — the same key name in different namespaces (or
+// in a namespace versus no namespace at all) names independent entries
+// (issue #105: first-class namespaces). The namespace-less methods on
+// Client remain the default and are unaffected; namespace("") is
+// equivalent to using Client directly.
 package nanocached
 
 import (
@@ -650,6 +657,17 @@ func (c *Client) Get(key string) (value string, ok bool, err error) {
 // remaining owners before being accepted as final, repairing the gap in
 // the background if one still holds the value (read repair).
 func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
+	return c.getBytesNS(nil, key)
+}
+
+// getBytesNS is GetBytes scoped to namespace (issue #105: first-class
+// namespaces) — the internal (namespace, key) entry point every
+// namespace-aware operation funnels through, including a *Namespace
+// handle's own GetBytes, so routing, replication, hedging, tagging,
+// compression and read repair all stay in exactly one place regardless
+// of which namespace a caller is in. A nil/empty namespace is the
+// default namespace, byte-identical on the wire to a pre-#105 client.
+func (c *Client) getBytesNS(namespace []byte, key string) (value []byte, ok bool, err error) {
 	if err := validateKey(key); err != nil {
 		return nil, false, err
 	}
@@ -658,14 +676,14 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 	}
 	keyBytes := []byte(key)
 	err = c.withClusterRetry(func() error {
-		v, o, readErr := c.read(keyBytes, func(conn *connection) ([]byte, bool, error) {
-			return conn.get(keyBytes)
+		v, o, readErr := c.read(namespace, keyBytes, func(conn *connection) ([]byte, bool, error) {
+			return conn.getNS(namespace, keyBytes)
 		})
 		value, ok = v, o
 		return readErr
 	})
 	if err == nil && !ok && c.readRepair {
-		value, ok = c.tryReadRepair(keyBytes)
+		value, ok = c.tryReadRepair(namespace, keyBytes)
 	}
 	if err != nil || !ok || !c.compress {
 		return value, ok, err
@@ -689,13 +707,13 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 // (connection lost, WrongNode, another miss) is swallowed; nothing here may
 // turn an already-accepted miss into an error. A failed repair write is
 // counted in Stats().ReadRepairFailures.
-func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
-	names := c.ownerNames(key)
+func (c *Client) tryReadRepair(namespace, key []byte) (value []byte, ok bool) {
+	names := c.ownerNames(namespace, key)
 	if len(names) == 0 {
 		return nil, false
 	}
 	for _, name := range names[1:] {
-		v, found, err := c.get(name, key)
+		v, found, err := c.get(name, namespace, key)
 		if err != nil || !found {
 			continue
 		}
@@ -703,7 +721,7 @@ func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 			primary := names[0]
 			repair := func() {
 				if err := c.applyReconnecting(primary, func(conn *connection) error {
-					return conn.set(key, v, readRepairTTL)
+					return conn.setNS(namespace, key, v, readRepairTTL)
 				}); err != nil {
 					c.stats.readRepairFailures.Add(1)
 				}
@@ -738,10 +756,10 @@ func (c *Client) tryReadRepair(key []byte) (value []byte, ok bool) {
 	return nil, false
 }
 
-func (c *Client) get(slot string, key []byte) (value []byte, ok bool, err error) {
+func (c *Client) get(slot string, namespace, key []byte) (value []byte, ok bool, err error) {
 	err = c.applyReconnecting(slot, func(conn *connection) error {
 		var opErr error
-		value, ok, opErr = conn.get(key)
+		value, ok, opErr = conn.getNS(namespace, key)
 		return opErr
 	})
 	return value, ok, err
@@ -758,6 +776,13 @@ func (c *Client) Set(key, value string, ttlSeconds int64) error {
 // Transparently compresses values at or above Config.CompressionThreshold
 // when Config.Compress is enabled (value compression).
 func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
+	return c.setBytesNS(nil, key, value, ttlSeconds)
+}
+
+// setBytesNS is SetBytes scoped to namespace — see getBytesNS's doc
+// comment; the same internal (namespace, key) entry point a *Namespace
+// handle's SetBytes forwards to.
+func (c *Client) setBytesNS(namespace []byte, key string, value []byte, ttlSeconds int64) error {
 	if err := validateKeyAndValue(key, len(value)); err != nil {
 		return err
 	}
@@ -777,14 +802,21 @@ func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 	}
 	keyBytes := []byte(key)
 	return c.withClusterRetry(func() error {
-		return c.write(keyBytes, func(conn *connection, _ bool) error {
-			return conn.set(keyBytes, outgoing, wireTTL)
+		return c.write(namespace, keyBytes, func(conn *connection, _ bool) error {
+			return conn.setNS(namespace, keyBytes, outgoing, wireTTL)
 		})
 	})
 }
 
 // Delete removes the key, reporting whether it existed before this call.
 func (c *Client) Delete(key string) (existed bool, err error) {
+	return c.deleteNS(nil, key)
+}
+
+// deleteNS is Delete scoped to namespace — see getBytesNS's doc comment;
+// the same internal (namespace, key) entry point a *Namespace handle's
+// Delete forwards to.
+func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error) {
 	if err := validateKey(key); err != nil {
 		return false, err
 	}
@@ -793,8 +825,8 @@ func (c *Client) Delete(key string) (existed bool, err error) {
 	}
 	keyBytes := []byte(key)
 	err = c.withClusterRetry(func() error {
-		return c.write(keyBytes, func(conn *connection, primary bool) error {
-			e, opErr := conn.delete(keyBytes)
+		return c.write(namespace, keyBytes, func(conn *connection, primary bool) error {
+			e, opErr := conn.deleteNS(namespace, keyBytes)
 			// Only the primary's answer decides (client-side replication) — and only the
 			// primary leg may touch `existed`: the replica legs run on
 			// other goroutines, so writing it there would both race and
@@ -806,6 +838,80 @@ func (c *Client) Delete(key string) (existed bool, err error) {
 		})
 	})
 	return existed, err
+}
+
+// ── namespaces (issue #105) ──────────────────────────────────────────
+
+// Namespace is a lightweight handle scoping Get/GetBytes/Set/SetBytes/
+// Delete to one namespace: the same key name in two different namespaces
+// — or in a namespace versus the default, unnamespaced keyspace — names
+// two independent cache entries (docs/protocol.html's "g / s / d —
+// namespaced get, set, delete"). Obtained from Client.Namespace.
+//
+// A Namespace does no networking of its own and holds no connections: it
+// is cheap to create, shares the Client's connections, and every method
+// simply forwards to the Client's own internal (namespace, key) entry
+// points (getBytesNS/setBytesNS/deleteNS) — routing (HRW over (ns,key),
+// see hashring.go), replication fan-out, hedged reads, W
+// refresh-and-retry, response tags, and value compression all apply
+// exactly as they do to the Client's own namespace-less methods. It
+// becomes invalid — every method returns ErrClosed — the moment the
+// underlying Client is closed; a Namespace has no Close of its own to
+// call. Safe for concurrent use, like Client itself.
+type Namespace struct {
+	client    *Client
+	namespace []byte
+	name      string
+}
+
+// Namespace returns a handle scoping every operation to ns (issue #105).
+// ns is UTF-8 encoded. ns == "" returns a handle equivalent to the
+// Client itself — legacy G/S/D frames, the same key placement as before
+// namespaces existed — so namespace("") is never rejected; it exists so
+// callers that generically pick a namespace at runtime don't need a
+// special case for "no namespace".
+func (c *Client) Namespace(ns string) *Namespace {
+	return &Namespace{client: c, namespace: []byte(ns), name: ns}
+}
+
+// Name returns the namespace this handle scopes operations to (empty
+// for the default namespace) — surfaced for the framework adapters
+// layered on top of namespaces (issues #107/#108), which need to know
+// which namespace a handle they were given addresses.
+func (n *Namespace) Name() string { return n.name }
+
+// Get returns key's value, within this namespace, as a string; ok is
+// false when the key is missing. See Client.Get.
+func (n *Namespace) Get(key string) (value string, ok bool, err error) {
+	raw, ok, err := n.GetBytes(key)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	return string(raw), true, nil
+}
+
+// GetBytes returns key's raw value within this namespace; ok is false
+// when the key is missing. See Client.GetBytes.
+func (n *Namespace) GetBytes(key string) (value []byte, ok bool, err error) {
+	return n.client.getBytesNS(n.namespace, key)
+}
+
+// Set stores the string value under key within this namespace. See
+// Client.Set.
+func (n *Namespace) Set(key, value string, ttlSeconds int64) error {
+	return n.SetBytes(key, []byte(value), ttlSeconds)
+}
+
+// SetBytes stores the raw value under key within this namespace. See
+// Client.SetBytes.
+func (n *Namespace) SetBytes(key string, value []byte, ttlSeconds int64) error {
+	return n.client.setBytesNS(n.namespace, key, value, ttlSeconds)
+}
+
+// Delete removes key within this namespace, reporting whether it existed
+// before this call. See Client.Delete.
+func (n *Namespace) Delete(key string) (existed bool, err error) {
+	return n.client.deleteNS(n.namespace, key)
 }
 
 // Close is idempotent; later Get/Set/Delete return ErrClosed. Calling
@@ -876,13 +982,17 @@ func (c *Client) withClusterRetry(operation func() error) error {
 	return operation()
 }
 
-func (c *Client) ownerNames(key []byte) []string {
+// ownerNames returns (namespace, key)'s owners in rank order (issue
+// #105: HRW routing takes the namespace into account — see
+// HashRing.OwnersNS). A nil/empty namespace routes exactly as before
+// namespaces existed.
+func (c *Client) ownerNames(namespace, key []byte) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.ring == nil {
 		return nil
 	}
-	return c.ring.Owners(key, c.replication)
+	return c.ring.OwnersNS(namespace, key, c.replication)
 }
 
 // applyReconnecting runs op against the slot's connection, retrying once
@@ -920,7 +1030,7 @@ func (c *Client) applyReconnecting(slot string, op func(*connection) error) erro
 // directly (rather than writing into variables the caller captured) so
 // that readHedged below can run several legs concurrently without racing
 // on shared state.
-func (c *Client) read(key []byte, op func(*connection) ([]byte, bool, error)) (value []byte, ok bool, err error) {
+func (c *Client) read(namespace, key []byte, op func(*connection) ([]byte, bool, error)) (value []byte, ok bool, err error) {
 	c.mu.Lock()
 	single := c.ring == nil
 	c.mu.Unlock()
@@ -928,7 +1038,7 @@ func (c *Client) read(key []byte, op func(*connection) ([]byte, bool, error)) (v
 		return c.readFromOwner("", op)
 	}
 
-	names := c.ownerNames(key)
+	names := c.ownerNames(namespace, key)
 	if c.readHedgeAfter > 0 && len(names) > 1 {
 		return c.readHedged(names, op)
 	}
@@ -1103,7 +1213,7 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 // reports whether this leg is the primary, whose outcome alone decides
 // the operation's result — replica legs run on their own goroutines, so
 // an op that captures outer variables must only write them when primary.
-func (c *Client) write(key []byte, op func(conn *connection, primary bool) error) error {
+func (c *Client) write(namespace, key []byte, op func(conn *connection, primary bool) error) error {
 	c.mu.Lock()
 	single := c.ring == nil
 	c.mu.Unlock()
@@ -1112,7 +1222,7 @@ func (c *Client) write(key []byte, op func(conn *connection, primary bool) error
 		return c.applyReconnecting("", primaryOp)
 	}
 
-	names := c.ownerNames(key)
+	names := c.ownerNames(namespace, key)
 	if len(names) == 0 {
 		return connectionLost("no owner is reachable for this key", nil)
 	}

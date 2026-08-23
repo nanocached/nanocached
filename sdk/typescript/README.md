@@ -43,6 +43,42 @@ isn't valid UTF-8 — never a silent replacement character. Use `getBytes()`
 to read a value's raw bytes instead, e.g. for values this client didn't
 itself write as a UTF-8 string.
 
+## Namespaces
+
+A *namespace* scopes a key: the same key name in two namespaces is two
+independent entries, and the un-namespaced API above always addresses the
+*default* namespace (the empty one). `client.namespace(ns)` returns a
+lightweight handle scoped to `ns`, exposing the same operations with
+identical semantics — routing, replication fan-out, hedged reads, `W`
+refresh-and-retry, response tags, compression, error types:
+
+```ts
+const users = client.namespace("users");
+
+await users.set("alice", "hello");
+await client.set("alice", "goodbye"); // a different entry — the default namespace
+
+console.log(await users.get("alice")); // "hello"
+console.log(await client.get("alice")); // "goodbye"
+```
+
+`ns` accepts the same key-ish types as a key: a `string` is UTF-8 encoded, a
+`Uint8Array` is used as-is. Namespaces are opaque bytes — no delimiter, no
+escaping, no hierarchy — so any bytes are valid, including ones that would
+look like a path separator. `namespace("")` is not an error; it returns a
+handle that behaves exactly like `client` itself, since it addresses the
+very same default namespace. A handle is cheap to create, shares the
+client's connections, and — like every client method — throws
+`AlreadyClosedError` once the client is closed. `handle.namespace` exposes
+the raw namespace bytes back.
+
+On a cluster, namespace participates in routing: `(namespace, key)` hashes
+together, so the same key name in different namespaces can land on
+different owners — this is consensus-critical, and every SDK and the
+server pin the same test vectors for it. A pre-namespace `nanocached-node`
+answers a namespaced request with `E` and closes the connection, so every
+node in a cluster must be upgraded before clients start using namespaces.
+
 ## Authentication
 
 If the server was started with `NANOCACHED_AUTH_SECRET`, pass the same
@@ -265,6 +301,10 @@ a cluster with no reachable node at all fails `connect()`.
 - `client.set(key, value, ttlSeconds = 0)` — `ttlSeconds` must be a
   non-negative integer; 0 (the default) means no expiry
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
+- `client.namespace(ns)` — returns a `NanocachedNamespace` handle scoped to
+  `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/`set`/
+  `delete` with the same signatures and semantics as above; `handle.namespace`
+  exposes the raw namespace bytes
 - `client.close()` — resolves (`Promise<void>`) after any in-flight
   background replica writes finish and all connections are closed; later
   calls reject with `AlreadyClosedError`; a second `close()` warns but

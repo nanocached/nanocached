@@ -187,6 +187,56 @@ final class Connection {
         };
     }
 
+    // Namespaces (issue #105): `g`/`s`/`d` are the namespaced counterparts
+    // of `G`/`S`/`D` — one extra leading `<namespace-length>` header field,
+    // namespace bytes leading the body, everything else (including the
+    // response markers) identical. SDK rule: the default (empty) namespace
+    // must keep sending the legacy `G`/`S`/`D` frames byte-for-byte, so an
+    // unchanged client talking to an old server keeps working — delegating
+    // to the untagged-namespace overload above rather than reimplementing
+    // it guarantees that byte-for-byte equivalence rather than merely
+    // aiming for it.
+
+    byte[] get(byte[] namespace, byte[] key) {
+        if (namespace.length == 0) return get(key);
+        Response response = request(tag -> frame(
+                "g " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
+        return switch (response.marker) {
+            case 'V' -> response.value;
+            case 'N' -> null;
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
+    void set(byte[] namespace, byte[] key, byte[] value, Long ttlSeconds) {
+        if (namespace.length == 0) {
+            set(key, value, ttlSeconds);
+            return;
+        }
+        Response response = request(tag -> {
+            String header = ttlSeconds == null
+                    ? "s " + namespace.length + " " + key.length + " " + value.length + tagSuffix(tag) + "\n"
+                    : "s " + namespace.length + " " + key.length + " " + value.length + " " + ttlSeconds
+                            + tagSuffix(tag) + "\n";
+            return frame(header, namespace, key, value);
+        });
+        if (response.marker == 'W') throw new NanocachedException.WrongNode();
+        if (response.marker != 'S') throw mismatch(response.marker);
+    }
+
+    boolean delete(byte[] namespace, byte[] key) {
+        if (namespace.length == 0) return delete(key);
+        Response response = request(tag -> frame(
+                "d " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
+        return switch (response.marker) {
+            case 'D' -> true;
+            case 'N' -> false;
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
     // Echoed response tags: on a tagged-mode connection every request header carries
     // the client's tag as its last field, and the server echoes it in the
     // response — `tag == null` is the untagged (pre-0019) form, which
@@ -253,6 +303,26 @@ final class Connection {
         System.arraycopy(key, 0, frame, headerBytes.length, key.length);
         if (value != null) {
             System.arraycopy(value, 0, frame, headerBytes.length + key.length, value.length);
+        }
+        return frame;
+    }
+
+    /** As {@link #frame(String, byte[], byte[])}, with the namespace bytes
+     * leading the body ({@code <namespace><key>[<value>]}) — the `g`/`s`/`d`
+     * frame shape (namespaces, issue #105). */
+    private static byte[] frame(String header, byte[] namespace, byte[] key, byte[] value) {
+        byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
+        int valueLength = value == null ? 0 : value.length;
+        byte[] frame = new byte[headerBytes.length + namespace.length + key.length + valueLength];
+        int offset = 0;
+        System.arraycopy(headerBytes, 0, frame, offset, headerBytes.length);
+        offset += headerBytes.length;
+        System.arraycopy(namespace, 0, frame, offset, namespace.length);
+        offset += namespace.length;
+        System.arraycopy(key, 0, frame, offset, key.length);
+        offset += key.length;
+        if (value != null) {
+            System.arraycopy(value, 0, frame, offset, value.length);
         }
         return frame;
     }

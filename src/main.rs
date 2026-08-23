@@ -1,6 +1,7 @@
 mod cache;
 mod command;
 mod hash_ring;
+mod key;
 mod response;
 mod server;
 

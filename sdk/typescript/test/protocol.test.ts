@@ -2,6 +2,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { encodeDelete, encodeGet, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
 
+const NS = Buffer.from("users");
+
 describe("encodeGet", () => {
   it("frames the key with its byte length", () => {
     assert.deepEqual(encodeGet(Buffer.from("key")), Buffer.from("G 3\nkey"));
@@ -231,5 +233,86 @@ describe("tagged frames (echoed response tags)", () => {
       response: { kind: "busy" },
       consumed: 2,
     });
+  });
+});
+
+describe("namespaced encoders (first-class namespaces, issue #105)", () => {
+  it("an empty (default) namespace emits the exact legacy G/S/D frame, byte-for-byte", () => {
+    // The SDK rule from ns-spec.md's SDK-port spec: an unchanged client
+    // talking to an old server must keep working, so the default
+    // namespace never touches the lowercase g/s/d path.
+    assert.deepEqual(encodeGet(Buffer.from("key"), undefined, Buffer.alloc(0)), encodeGet(Buffer.from("key")));
+    assert.deepEqual(
+      encodeSet(Buffer.from("k"), Buffer.from("v"), 60, undefined, Buffer.alloc(0)),
+      encodeSet(Buffer.from("k"), Buffer.from("v"), 60),
+    );
+    assert.deepEqual(encodeDelete(Buffer.from("key"), undefined, Buffer.alloc(0)), encodeDelete(Buffer.from("key")));
+  });
+
+  it("encodeGet frames the namespace length ahead of the key length", () => {
+    assert.deepEqual(encodeGet(Buffer.from("alpha"), undefined, NS), Buffer.concat([Buffer.from("g 5 5\n"), NS, Buffer.from("alpha")]));
+  });
+
+  it("encodeDelete frames the namespace length ahead of the key length", () => {
+    assert.deepEqual(encodeDelete(Buffer.from("alpha"), undefined, NS), Buffer.concat([Buffer.from("d 5 5\n"), NS, Buffer.from("alpha")]));
+  });
+
+  it("encodeSet frames the namespace length first, with no TTL by default", () => {
+    assert.deepEqual(
+      encodeSet(Buffer.from("k"), Buffer.from("v"), 0, undefined, NS),
+      Buffer.concat([Buffer.from("s 5 1 1\n"), NS, Buffer.from("kv")]),
+    );
+  });
+
+  it("encodeSet appends the TTL after the three lengths when given", () => {
+    assert.deepEqual(
+      encodeSet(Buffer.from("k"), Buffer.from("v"), 60, undefined, NS),
+      Buffer.concat([Buffer.from("s 5 1 1 60\n"), NS, Buffer.from("kv")]),
+    );
+  });
+
+  it("keeps the tag as the last header field, with and without a TTL", () => {
+    assert.deepEqual(encodeGet(Buffer.from("alpha"), 7, NS), Buffer.concat([Buffer.from("g 5 5 7\n"), NS, Buffer.from("alpha")]));
+    assert.deepEqual(encodeDelete(Buffer.from("alpha"), 8, NS), Buffer.concat([Buffer.from("d 5 5 8\n"), NS, Buffer.from("alpha")]));
+    assert.deepEqual(
+      encodeSet(Buffer.from("k"), Buffer.from("v"), 0, 9, NS),
+      Buffer.concat([Buffer.from("s 5 1 1 9\n"), NS, Buffer.from("kv")]),
+    );
+    assert.deepEqual(
+      encodeSet(Buffer.from("k"), Buffer.from("v"), 60, 9, NS),
+      Buffer.concat([Buffer.from("s 5 1 1 60 9\n"), NS, Buffer.from("kv")]),
+    );
+  });
+
+  it("a namespace may contain arbitrary bytes — no delimiter, no escaping", () => {
+    const binaryNs = Buffer.from([0xff, 0x00]);
+    assert.deepEqual(
+      encodeGet(Buffer.from("beta"), undefined, binaryNs),
+      Buffer.concat([Buffer.from("g 2 4\n"), binaryNs, Buffer.from("beta")]),
+    );
+  });
+
+  it("a namespace-length of 0 (explicitly passed as an empty buffer) is the same request as the legacy form", () => {
+    assert.deepEqual(encodeGet(Buffer.from("name"), undefined, Buffer.alloc(0)), Buffer.from("G 4\nname"));
+  });
+
+  it("still rejects an empty key when namespaced", () => {
+    assert.throws(() => encodeGet(Buffer.alloc(0), undefined, NS), RangeError);
+    assert.throws(() => encodeSet(Buffer.alloc(0), Buffer.from("v"), 0, undefined, NS), RangeError);
+    assert.throws(() => encodeDelete(Buffer.alloc(0), undefined, NS), RangeError);
+  });
+
+  it("counts the namespace toward MAX_REQUEST_BYTES alongside the key", () => {
+    // ns-spec.md: "no limit on ns beyond the request size rules the SDK
+    // already applies to key+value" — so namespace+key (encodeGet/
+    // encodeDelete) and namespace+key+value (encodeSet) share the same
+    // budget the unnamespaced forms already enforce.
+    const namespace = Buffer.alloc(MAX_REQUEST_BYTES - 2, "n");
+    assert.doesNotThrow(() => encodeGet(Buffer.from("ab"), undefined, namespace));
+    assert.throws(() => encodeGet(Buffer.from("abc"), undefined, namespace), RangeError);
+
+    const smallNamespace = Buffer.alloc(MAX_REQUEST_BYTES - 2, "n");
+    assert.doesNotThrow(() => encodeSet(Buffer.from("a"), Buffer.from("b"), 0, undefined, smallNamespace));
+    assert.throws(() => encodeSet(Buffer.from("a"), Buffer.from("bc"), 0, undefined, smallNamespace), RangeError);
   });
 });

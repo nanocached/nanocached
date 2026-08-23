@@ -171,8 +171,11 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     return;
                 }
             }
-            "G" => {
-                let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+            "G" | "g" => {
+                // Namespaces (issue #105): the lowercase `g` carries one
+                // extra leading `<namespace-length>` header field and the
+                // namespace bytes lead the body; `G` has neither.
+                let (namespace, key) = read_ns_and_key(&mut stream, &parts, parts[0] == "g").await;
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
@@ -194,8 +197,9 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if tagged && take_one(&state.wrong_tag_replies) {
                     // Echoed response tags: echo the wrong tag (request tag + 1) — the
                     // desync a pre-tag stream misalignment would
-                    // otherwise produce silently.
-                    let requested_tag: u64 = parts[2].parse().unwrap();
+                    // otherwise produce silently. The tag is always the
+                    // header's last field, `G`/`g` alike.
+                    let requested_tag: u64 = parts[parts.len() - 1].parse().unwrap();
                     let reply = format!("N {}\n", requested_tag + 1);
                     if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                         return;
@@ -218,7 +222,12 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 let reply = if take_wrong_node(&state) {
                     format!("W{tag_suffix}\n").into_bytes()
                 } else {
-                    match state.store.lock().unwrap().get(&key) {
+                    match state
+                        .store
+                        .lock()
+                        .unwrap()
+                        .get(&store_key(&namespace, &key))
+                    {
                         Some(value) => {
                             let mut frame = format!("V {}{tag_suffix}\n", value.len()).into_bytes();
                             frame.extend_from_slice(value);
@@ -231,9 +240,20 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     return;
                 }
             }
-            "S" => {
-                let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
-                let value = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+            "S" | "s" => {
+                let namespaced = parts[0] == "s";
+                let (ns_len_idx, key_len_idx, value_len_idx) = if namespaced {
+                    (1, 2, 3)
+                } else {
+                    (usize::MAX, 1, 2)
+                };
+                let namespace = if namespaced {
+                    read_exact(&mut stream, parts[ns_len_idx].parse().unwrap()).await
+                } else {
+                    Vec::new()
+                };
+                let key = read_exact(&mut stream, parts[key_len_idx].parse().unwrap()).await;
+                let value = read_exact(&mut stream, parts[value_len_idx].parse().unwrap()).await;
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
@@ -245,21 +265,31 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 let reply = if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
                     format!("W{tag_suffix}\n")
                 } else {
-                    state.store.lock().unwrap().insert(key, value);
+                    state
+                        .store
+                        .lock()
+                        .unwrap()
+                        .insert(store_key(&namespace, &key), value);
                     format!("S{tag_suffix}\n")
                 };
                 if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
                     return;
                 }
             }
-            "D" => {
-                let key = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+            "D" | "d" => {
+                let (namespace, key) = read_ns_and_key(&mut stream, &parts, parts[0] == "d").await;
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
                 let reply = if take_wrong_node(&state) {
                     format!("W{tag_suffix}\n")
-                } else if state.store.lock().unwrap().remove(&key).is_some() {
+                } else if state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .remove(&store_key(&namespace, &key))
+                    .is_some()
+                {
                     format!("D{tag_suffix}\n")
                 } else {
                     format!("N{tag_suffix}\n")
@@ -283,6 +313,43 @@ fn take_one(counter: &AtomicUsize) -> bool {
             (pending > 0).then(|| pending - 1)
         })
         .is_ok()
+}
+
+/// Reads a namespace+key pair off the wire for `G`/`D` and their
+/// namespaced `g`/`d` counterparts (issue #105 mock support): the
+/// lowercase forms carry one extra leading `<namespace-length>` header
+/// field and the namespace bytes lead the body; the uppercase legacy
+/// forms have neither, so `namespace` comes back empty for them.
+async fn read_ns_and_key(
+    stream: &mut BufReader<TcpStream>,
+    parts: &[&str],
+    namespaced: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    if namespaced {
+        let namespace = read_exact(stream, parts[1].parse().unwrap()).await;
+        let key = read_exact(stream, parts[2].parse().unwrap()).await;
+        (namespace, key)
+    } else {
+        let key = read_exact(stream, parts[1].parse().unwrap()).await;
+        (Vec::new(), key)
+    }
+}
+
+/// The mock store's map key for `(namespace, key)`: the default (empty)
+/// namespace maps to the bare key bytes — unchanged from every
+/// pre-namespace test's direct `store.get(b"...")` lookups — while a
+/// non-empty namespace gets a length-prefixed composite so it can never
+/// collide with an unnamespaced entry of the same key bytes (mirrors the
+/// real server/SDK hash input's own delimiter-free framing; see
+/// src/hash_ring.rs's `key_hash`).
+fn store_key(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+    if namespace.is_empty() {
+        return key.to_vec();
+    }
+    let mut composite = (namespace.len() as u32).to_be_bytes().to_vec();
+    composite.extend_from_slice(namespace);
+    composite.extend_from_slice(key);
+    composite
 }
 
 // ── モック discovery ──────────────────────────────────────────────
@@ -450,6 +517,121 @@ async fn round_trips_set_get_delete() {
     assert_eq!(client.replication().await, 1);
 
     client.close().await;
+    node.stop();
+}
+
+// ── namespaces (issue #105) ─────────────────────────────────────────
+
+#[tokio::test]
+async fn namespaced_set_get_delete_round_trips() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("users");
+
+    assert_eq!(ns.name(), b"users");
+    ns.set("greeting", "hello", 0).await.unwrap();
+    assert_eq!(ns.get("greeting").await.unwrap(), Some("hello".to_string()));
+    assert_eq!(
+        ns.get_bytes("greeting").await.unwrap(),
+        Some(b"hello".to_vec())
+    );
+    assert!(ns.delete("greeting").await.unwrap());
+    assert_eq!(ns.get("greeting").await.unwrap(), None);
+    assert!(!ns.delete("greeting").await.unwrap());
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn namespaces_isolate_the_same_key_name_from_each_other_and_the_default() {
+    // Same key name written under two namespaces plus the default
+    // namespace: three wholly independent entries, per issue #105's spec.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let a = client.namespace("tenant-a");
+    let b = client.namespace("tenant-b");
+
+    client.set("shared", "default-value", 0).await.unwrap();
+    a.set("shared", "a-value", 0).await.unwrap();
+    b.set("shared", "b-value", 0).await.unwrap();
+
+    assert_eq!(
+        client.get("shared").await.unwrap(),
+        Some("default-value".to_string())
+    );
+    assert_eq!(a.get("shared").await.unwrap(), Some("a-value".to_string()));
+    assert_eq!(b.get("shared").await.unwrap(), Some("b-value".to_string()));
+    assert_eq!(node.state.store.lock().unwrap().len(), 3);
+
+    // Deleting one namespace's copy doesn't touch the others.
+    assert!(a.delete("shared").await.unwrap());
+    assert_eq!(a.get("shared").await.unwrap(), None);
+    assert_eq!(
+        client.get("shared").await.unwrap(),
+        Some("default-value".to_string())
+    );
+    assert_eq!(b.get("shared").await.unwrap(), Some("b-value".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn namespace_empty_string_uses_the_legacy_wire_frames() {
+    // namespace("") must behave exactly like the client itself: legacy
+    // `S`, not `s` (the SDK rule that keeps an unchanged client talking to
+    // a pre-namespace server working).
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let default = client.namespace("");
+    assert_eq!(default.name(), b"");
+
+    default.set("k", "v", 0).await.unwrap();
+    let header = node.state.last_set_header.lock().unwrap().clone().unwrap();
+    assert!(
+        header.starts_with("S "),
+        "namespace(\"\") must send the legacy S frame, got {header:?}"
+    );
+    assert_eq!(default.get("k").await.unwrap(), Some("v".to_string()));
+    // And it reads back through the plain client too — same entry.
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_namespaced_set_uses_the_lowercase_frame_with_a_namespace_length_field() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.namespace("ns").set("k", "v", 0).await.unwrap();
+    let header = node.state.last_set_header.lock().unwrap().clone().unwrap();
+    assert!(
+        header.starts_with("s 2 1 1"),
+        "expected a namespaced s frame, got {header:?}"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_namespace_handle_errors_after_the_client_is_closed() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("users");
+    client.close().await;
+
+    assert!(matches!(ns.get("k").await, Err(Error::AlreadyClosed)));
+    assert!(matches!(ns.get_bytes("k").await, Err(Error::AlreadyClosed)));
+    assert!(matches!(
+        ns.set("k", "v", 0).await,
+        Err(Error::AlreadyClosed)
+    ));
+    assert!(matches!(ns.delete("k").await, Err(Error::AlreadyClosed)));
+
     node.stop();
 }
 
@@ -1259,8 +1441,15 @@ async fn start_cluster(replication: usize) -> (Vec<(String, MockNode)>, MockDisc
 }
 
 fn owners_of(key: &str) -> Vec<String> {
+    owners_of_namespaced(b"", key)
+}
+
+/// Like `owners_of`, but for a namespaced key — routing must rank owners
+/// on `(namespace, key)` together, not on `key` alone (Namespaces, issue
+/// #105).
+fn owners_of_namespaced(namespace: &[u8], key: &str) -> Vec<String> {
     HashRing::new(NAMES.iter().map(|name| name.to_string()).collect())
-        .owners(key.as_bytes(), 2)
+        .owners(namespace, key.as_bytes(), 2)
         .into_iter()
         .map(str::to_string)
         .collect()
@@ -1324,6 +1513,41 @@ async fn wrong_node_triggers_refresh_and_one_retry() {
         client.get("some-key").await,
         Err(Error::WrongNode)
     ));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn wrong_node_on_a_namespaced_key_triggers_refresh_and_one_retry() {
+    // Mirrors wrong_node_triggers_refresh_and_one_retry, but through a
+    // Namespace handle — proves routing (and the W-triggered refresh and
+    // retry) keys off (namespace, key) together, not off `key` alone
+    // (Namespaces, issue #105).
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let ns = client.namespace("tenant");
+
+    ns.set("some-key", "v", 0).await.unwrap();
+    let primary = owners_of_namespaced(b"tenant", "some-key")[0].clone();
+    let owner = &nodes.iter().find(|(name, _)| *name == primary).unwrap().1;
+
+    owner
+        .state
+        .wrong_node_replies
+        .fetch_add(1, Ordering::SeqCst);
+    assert_eq!(ns.get("some-key").await.unwrap(), Some("v".to_string()));
+
+    owner
+        .state
+        .wrong_node_replies
+        .fetch_add(2, Ordering::SeqCst);
+    assert!(matches!(ns.get("some-key").await, Err(Error::WrongNode)));
 
     client.close().await;
     discovery.stop();

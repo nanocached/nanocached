@@ -23,6 +23,13 @@ public sealed class MockNode : IDisposable
     /// the most recent S request this server received.</summary>
     public long LastSetTtl => _lastSetTtl;
 
+    /// <summary>issue #105 — first-class namespaces: how many lowercase
+    /// g/s/d (namespaced) requests this server has received — lets a test
+    /// prove that <c>Namespace("")</c> sends the legacy G/S/D frames,
+    /// byte-for-byte, rather than the namespaced form with an empty
+    /// namespace length.</summary>
+    public int NamespacedRequestCount => _namespacedRequestCount;
+
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
@@ -46,6 +53,7 @@ public sealed class MockNode : IDisposable
     private volatile int _getDelayMillis;
     private volatile bool _silent;
     private long _lastSetTtl;
+    private int _namespacedRequestCount;
     /// <summary>J1/D1: when set, every accepted connection is wrapped in
     /// an <see cref="SslStream"/> presenting this certificate before the
     /// A/G/S/D protocol loop runs — everything past the handshake is
@@ -146,6 +154,20 @@ public sealed class MockNode : IDisposable
     }
 
     internal static string KeyOf(byte[] key) => Convert.ToBase64String(key);
+
+    /// <summary>issue #105 — first-class namespaces: the store key for a
+    /// namespaced entry, distinct from every unnamespaced <see cref="KeyOf(byte[])"/>
+    /// key (the "ns:" prefix can never collide with a bare base64 key,
+    /// which contains only base64 alphabet characters) and from every
+    /// other namespace's entries — the same key name in two namespaces
+    /// (plus the default namespace) is three independent store entries.
+    /// The empty namespace maps to the same store key as
+    /// <see cref="KeyOf(byte[])"/>, matching the wire rule that an empty
+    /// namespace addresses the default namespace.</summary>
+    internal static string KeyOf(byte[] namespaceBytes, byte[] key) =>
+        namespaceBytes.Length == 0
+            ? KeyOf(key)
+            : $"ns:{Convert.ToBase64String(namespaceBytes)}:{Convert.ToBase64String(key)}";
 
     private async Task AcceptLoopAsync()
     {
@@ -301,6 +323,113 @@ public sealed class MockNode : IDisposable
                         else
                         {
                             await Wire.WriteAsync(stream, Store.TryRemove(KeyOf(key), out _) ? $"D{tag}\n" : $"N{tag}\n");
+                        }
+                        break;
+                    }
+                    // issue #105 — first-class namespaces: the lowercase
+                    // g/s/d frames gain one leading <namespace-length>
+                    // header field, and the namespace bytes lead the body
+                    // ahead of the key (and, for s, the value). Otherwise
+                    // identical to G/S/D above, including every injected
+                    // failure mode this mock supports — a namespaced
+                    // client test can reuse the same hooks.
+                    case "g":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        Interlocked.Increment(ref _getCount);
+                        Interlocked.Increment(ref _namespacedRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (_getDelayMillis > 0)
+                        {
+                            await Task.Delay(_getDelayMillis);
+                        }
+                        if (TakeOne(ref _swallowedGets))
+                        {
+                            break;
+                        }
+                        if (tagged && TakeOne(ref _wrongTagReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"N {int.Parse(parts[^1]) + 1}\n");
+                            break;
+                        }
+                        if (TakeMalformedValue())
+                        {
+                            await Wire.WriteAsync(stream, "V x\n");
+                            break;
+                        }
+                        if (TakeOne(ref _storedToGetReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"S{tag}\n");
+                            break;
+                        }
+                        if (TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                        }
+                        else if (Store.TryGetValue(KeyOf(namespaceBytes, key), out byte[]? value))
+                        {
+                            await Wire.WriteAsync(stream, $"V {value.Length}{tag}\n");
+                            await stream.WriteAsync(value);
+                        }
+                        else
+                        {
+                            await Wire.WriteAsync(stream, $"N{tag}\n");
+                        }
+                        break;
+                    }
+                    case "s":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        byte[] value = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3]));
+                        Interlocked.Increment(ref _namespacedRequestCount);
+                        // Field layout: "s <ns-len> <key-len> <val-len>
+                        // [<ttl>] [<tag>]" — one more leading field than
+                        // legacy S, so the baseline field counts (no ttl)
+                        // are 4/5 instead of 3/4.
+                        int ttlFieldCount = parts.Length - (tagged ? 5 : 4);
+                        _lastSetTtl = ttlFieldCount > 0 ? long.Parse(parts[4]) : 0;
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (_setDelayMillis > 0)
+                        {
+                            await Task.Delay(_setDelayMillis);
+                        }
+                        if (TakeOne(ref _wrongNodeOnSetReplies) || TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                        }
+                        else
+                        {
+                            Store[KeyOf(namespaceBytes, key)] = value;
+                            await Wire.WriteAsync(stream, $"S{tag}\n");
+                        }
+                        break;
+                    }
+                    case "d":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        Interlocked.Increment(ref _namespacedRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                        }
+                        else
+                        {
+                            await Wire.WriteAsync(
+                                stream,
+                                Store.TryRemove(KeyOf(namespaceBytes, key), out _) ? $"D{tag}\n" : $"N{tag}\n");
                         }
                         break;
                     }

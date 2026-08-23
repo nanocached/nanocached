@@ -3,10 +3,22 @@
  * and `src/command.rs` on the Rust side). The `A` (auth/identify) exchange
  * is handled separately in `identify.ts` — by the time a `Connection` uses
  * these encoders/parser, identification is already done and the socket
- * only ever carries `G`/`S`/`D` requests and their responses.
+ * only ever carries `G`/`S`/`D` (and their namespaced `g`/`s`/`d`
+ * counterparts) requests and their responses.
  */
 
 import { NanocachedError } from "./errors.js";
+
+/** The default namespace — what the un-namespaced `G`/`S`/`D` commands
+ * always address (first-class namespaces, issue #105). Every encoder below
+ * takes an optional trailing `namespace`, defaulting to this: an empty
+ * namespace emits the exact legacy `G`/`S`/`D` frame, byte-for-byte, so a
+ * caller that never touches namespaces (or a client that predates this
+ * feature) keeps working unchanged — see `src/key.rs`'s doc comment on the
+ * Rust side for the same design. Only a non-empty namespace switches to the
+ * lowercase `g`/`s`/`d` frame with its extra leading
+ * `<namespace-length>` header field. */
+export const EMPTY_NAMESPACE: Uint8Array = new Uint8Array(0);
 
 function toAscii(text: string): Buffer {
   return Buffer.from(text, "ascii");
@@ -44,12 +56,21 @@ export const MAX_REQUEST_BYTES = 1024 * 1024 - MAX_REQUEST_HEADER_LENGTH;
 // closing the shared, pipelined connection and taking every other
 // in-flight request on it down with it. Reject it here, synchronously,
 // before anything is written, for every command that carries a key.
-function checkKey(key: Uint8Array): void {
+// Namespaces (issue #105) share the key+value size budget rather than
+// getting one of their own: the server's own MAX_REQUEST_SIZE check
+// (src/server.rs) is over the whole frame — header, namespace, key, and
+// value together — so a namespace that pushed the total past
+// MAX_REQUEST_BYTES would hit exactly the same no-reply, poisoned-
+// connection rejection as an oversized key or value. There is no separate
+// per-namespace limit beyond that shared budget (ns-spec.md's SDK-port
+// spec, "no limit on ns beyond the request size rules the SDK already
+// applies to key+value").
+function checkKey(key: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): void {
   if (key.length === 0) {
     throw new RangeError("nanocached: key must not be empty");
   }
-  if (key.length > MAX_REQUEST_BYTES) {
-    throw new RangeError(`nanocached: key exceeds MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${key.length} bytes`);
+  if (namespace.length + key.length > MAX_REQUEST_BYTES) {
+    throw new RangeError(`nanocached: namespace and key together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length + key.length} bytes`);
   }
 }
 
@@ -59,28 +80,31 @@ function checkKey(key: Uint8Array): void {
 // checking only the post-compression frame here let an oversized value
 // that compresses well slip past the cap; Python's client.py has the
 // same two-layer check for the same reason).
-export function checkKeyAndValue(key: Uint8Array, value: Uint8Array): void {
-  checkKey(key);
-  if (key.length + value.length > MAX_REQUEST_BYTES) {
+export function checkKeyAndValue(key: Uint8Array, value: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): void {
+  checkKey(key, namespace);
+  if (namespace.length + key.length + value.length > MAX_REQUEST_BYTES) {
     // See MAX_REQUEST_BYTES/checkKey above: same server-side rejection, same
-    // poisoned-connection consequence, just measured across key+value
-    // together instead of the key alone.
+    // poisoned-connection consequence, just measured across namespace+key+
+    // value together instead of namespace+key alone.
     throw new RangeError(
-      `nanocached: key and value together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${key.length + value.length} bytes`,
+      `nanocached: namespace, key and value together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length + key.length + value.length} bytes`,
     );
   }
 }
 
-export function encodeGet(key: Uint8Array, tag?: number): Buffer {
-  checkKey(key);
-  return Buffer.concat([toAscii(`G ${key.length}${tagField(tag)}\n`), key]);
+export function encodeGet(key: Uint8Array, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+  checkKey(key, namespace);
+  if (namespace.length === 0) {
+    return Buffer.concat([toAscii(`G ${key.length}${tagField(tag)}\n`), key]);
+  }
+  return Buffer.concat([toAscii(`g ${namespace.length} ${key.length}${tagField(tag)}\n`), namespace, key]);
 }
 
 // 0 means no expiry (the default) and is sent on the wire by omitting the
 // TTL field entirely — exactly what an absent/undefined TTL meant before
 // this field existed; the server has no separate "explicit no-op TTL"
 // concept, so any other encoding would be a distinct thing.
-export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, tag?: number): Buffer {
+export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
   if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
     // A non-integer/negative TTL (3.5, -1, NaN, Infinity) would serialize to a
     // frame the server rejects with no reply, closing the shared, pipelined
@@ -88,18 +112,29 @@ export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, ta
     // it here, synchronously, before anything is written.
     throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
   }
-  checkKeyAndValue(key, value);
+  checkKeyAndValue(key, value, namespace);
+
+  if (namespace.length === 0) {
+    const header =
+      ttlSeconds === 0
+        ? `S ${key.length} ${value.length}${tagField(tag)}\n`
+        : `S ${key.length} ${value.length} ${ttlSeconds}${tagField(tag)}\n`;
+    return Buffer.concat([toAscii(header), key, value]);
+  }
 
   const header =
     ttlSeconds === 0
-      ? `S ${key.length} ${value.length}${tagField(tag)}\n`
-      : `S ${key.length} ${value.length} ${ttlSeconds}${tagField(tag)}\n`;
-  return Buffer.concat([toAscii(header), key, value]);
+      ? `s ${namespace.length} ${key.length} ${value.length}${tagField(tag)}\n`
+      : `s ${namespace.length} ${key.length} ${value.length} ${ttlSeconds}${tagField(tag)}\n`;
+  return Buffer.concat([toAscii(header), namespace, key, value]);
 }
 
-export function encodeDelete(key: Uint8Array, tag?: number): Buffer {
-  checkKey(key);
-  return Buffer.concat([toAscii(`D ${key.length}${tagField(tag)}\n`), key]);
+export function encodeDelete(key: Uint8Array, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+  checkKey(key, namespace);
+  if (namespace.length === 0) {
+    return Buffer.concat([toAscii(`D ${key.length}${tagField(tag)}\n`), key]);
+  }
+  return Buffer.concat([toAscii(`d ${namespace.length} ${key.length}${tagField(tag)}\n`), namespace, key]);
 }
 
 export interface ParsedResponse {

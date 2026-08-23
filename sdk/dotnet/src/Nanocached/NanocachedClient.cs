@@ -188,6 +188,14 @@ public sealed class NanocachedClient : IDisposable
     private static readonly byte[] KeepaliveKey =
         new byte[] { 0x00 }.Concat(Encoding.ASCII.GetBytes("nanocached-keepalive")).ToArray();
 
+    // issue #105 — first-class namespaces: the default namespace every
+    // GetAsync/SetAsync/DeleteAsync overload without an explicit namespace
+    // routes through. Never reaches the wire as an explicit zero-length
+    // namespace — Connection maps this back to the legacy G/S/D frames,
+    // byte-for-byte (see Connection's GetAsync(byte[], byte[]) doc
+    // comment) — so every pre-#105 call site keeps working unchanged.
+    private static readonly byte[] EmptyNamespace = Array.Empty<byte>();
+
     // TTL a read-repair write uses (read repair), in whole seconds —
     // the protocol's TTL unit throughout (see SetAsync's ttlSeconds). The
     // original TTL isn't recoverable from a GET response, and repairing
@@ -605,38 +613,87 @@ public sealed class NanocachedClient : IDisposable
         Interlocked.Read(ref _readRepairFailures),
         Interlocked.Read(ref _refreshFailures));
 
+    /// <summary>
+    /// issue #105 — first-class namespaces: a lightweight handle scoping
+    /// every get/set/delete to <paramref name="namespaceBytes"/> — the same
+    /// key name in two namespaces is two independent entries (namespaces).
+    /// Cheap: shares this client's connections, and nothing is dialed or
+    /// allocated beyond the small wrapper itself. Forwards every call to
+    /// this client's own internal (namespace, key) methods rather than
+    /// duplicating any networking, so routing (HRW over (ns, key)),
+    /// replication fan-out, hedged reads, <c>W</c> refresh-and-retry,
+    /// response tags, and compression all behave exactly as calling this
+    /// client directly does.
+    ///
+    /// <para><see cref="Namespace(string)"/> called with <c>""</c> (the
+    /// empty namespace) returns a handle equivalent to this client itself
+    /// — it sends the legacy <c>G</c>/<c>S</c>/<c>D</c> frames,
+    /// byte-for-byte, and hashes exactly as an un-namespaced key always
+    /// has. The handle is invalid once this client is closed: every method
+    /// then throws the same <see cref="AlreadyClosedException"/> this
+    /// client's own methods raise.</para>
+    /// </summary>
+    public NanocachedNamespace Namespace(byte[] namespaceBytes) => new(this, namespaceBytes);
+
+    /// <summary>As <see cref="Namespace(byte[])"/>, with
+    /// <paramref name="namespaceName"/> UTF-8 encoded.</summary>
+    public NanocachedNamespace Namespace(string namespaceName) => Namespace(Encoding.UTF8.GetBytes(namespaceName));
+
     // Strict — never silently replaces a malformed byte with U+FFFD; a
     // non-UTF-8 value raises DecoderFallbackException instead.
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
-    public Task<string?> GetAsync(string key) => GetAsync(Encoding.UTF8.GetBytes(key));
+    public Task<string?> GetAsync(string key) => GetAsync(EmptyNamespace, key);
 
     /// <summary>Returns the value decoded as UTF-8, or <c>null</c> when
     /// the key is missing. A value that is not valid UTF-8 raises
     /// <see cref="System.Text.DecoderFallbackException"/> — use
     /// <see cref="GetBytesAsync(byte[])"/> for the raw bytes instead.</summary>
-    public async Task<string?> GetAsync(byte[] key)
+    public Task<string?> GetAsync(byte[] key) => GetAsync(EmptyNamespace, key);
+
+    /// <summary>issue #105: as <see cref="GetAsync(string)"/>, scoped to
+    /// <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to, rather than
+    /// duplicating this client's networking.</summary>
+    internal Task<string?> GetAsync(byte[] namespaceBytes, string key) =>
+        GetAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+
+    /// <summary>issue #105: as <see cref="GetAsync(byte[])"/>, scoped to
+    /// <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<string?> GetAsync(byte[] namespaceBytes, byte[] key)
     {
-        byte[]? value = await GetBytesAsync(key).ConfigureAwait(false);
+        byte[]? value = await GetBytesAsync(namespaceBytes, key).ConfigureAwait(false);
         return value is null ? null : StrictUtf8.GetString(value);
     }
 
-    public Task<byte[]?> GetBytesAsync(string key) => GetBytesAsync(Encoding.UTF8.GetBytes(key));
+    public Task<byte[]?> GetBytesAsync(string key) => GetBytesAsync(EmptyNamespace, key);
 
     /// <summary>Returns the raw value, or <c>null</c> when the key is
     /// missing. Transparently decompresses when <c>Compress</c> is
     /// enabled (value compression). With <c>ReadRepair</c>, a clean miss
     /// probes the remaining owners before being accepted as final
     /// (read repair).</summary>
-    public async Task<byte[]?> GetBytesAsync(byte[] key)
+    public Task<byte[]?> GetBytesAsync(byte[] key) => GetBytesAsync(EmptyNamespace, key);
+
+    /// <summary>issue #105: as <see cref="GetBytesAsync(string)"/>, scoped
+    /// to <paramref name="namespaceBytes"/>.</summary>
+    internal Task<byte[]?> GetBytesAsync(byte[] namespaceBytes, string key) =>
+        GetBytesAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+
+    /// <summary>issue #105: as <see cref="GetBytesAsync(byte[])"/>, scoped
+    /// to <paramref name="namespaceBytes"/> — this is the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to, rather than
+    /// duplicating this client's networking.</summary>
+    internal async Task<byte[]?> GetBytesAsync(byte[] namespaceBytes, byte[] key)
     {
-        ValidateKey(key);
+        ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
         byte[]? value = await WithClusterRetryAsync(
-            () => ReadAsync(key, connection => connection.GetAsync(key))).ConfigureAwait(false);
+            () => ReadAsync(namespaceBytes, key, connection => connection.GetAsync(namespaceBytes, key)))
+            .ConfigureAwait(false);
         if (value is null && _readRepair && _ring is not null)
         {
-            value = await TryReadRepairAsync(key).ConfigureAwait(false);
+            value = await TryReadRepairAsync(namespaceBytes, key).ConfigureAwait(false);
         }
         return value is null || !_compress ? value : Compression.DecompressValue(value);
     }
@@ -656,16 +713,16 @@ public sealed class NanocachedClient : IDisposable
     /// an already-accepted miss into an error. A failure repairing the
     /// primary specifically is counted via <see cref="Stats"/>'s
     /// <c>ReadRepairFailures</c>.</summary>
-    private async Task<byte[]?> TryReadRepairAsync(byte[] key)
+    private async Task<byte[]?> TryReadRepairAsync(byte[] namespaceBytes, byte[] key)
     {
-        IReadOnlyList<string> names = OwnerNames(key);
+        IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
         if (names.Count == 0) return null;
         foreach (string name in names.Skip(1))
         {
             byte[]? value;
             try
             {
-                value = await ApplyReconnectingAsync(name, connection => connection.GetAsync(key))
+                value = await ApplyReconnectingAsync(name, connection => connection.GetAsync(namespaceBytes, key))
                     .ConfigureAwait(false);
             }
             catch (Exception)
@@ -684,7 +741,8 @@ public sealed class NanocachedClient : IDisposable
                     {
                         await ApplyReconnectingAsync<object?>(primary, async connection =>
                         {
-                            await connection.SetAsync(key, repairValue, ReadRepairTtlSeconds).ConfigureAwait(false);
+                            await connection.SetAsync(namespaceBytes, key, repairValue, ReadRepairTtlSeconds)
+                                .ConfigureAwait(false);
                             return null;
                         }).ConfigureAwait(false);
                     }
@@ -739,83 +797,119 @@ public sealed class NanocachedClient : IDisposable
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
     public Task SetAsync(string key, string value, long ttlSeconds = 0) =>
-        SetAsync(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+        SetAsync(EmptyNamespace, key, value, ttlSeconds);
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no
     /// expiry. Transparently compresses values at or above
     /// <c>CompressionThreshold</c> when <c>Compress</c> is enabled
     /// (value compression).</summary>
-    public async Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0)
+    public Task SetAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
+        SetAsync(EmptyNamespace, key, value, ttlSeconds);
+
+    /// <summary>issue #105: as <see cref="SetAsync(string, string, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task SetAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
+        SetAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+
+    /// <summary>issue #105: as <see cref="SetAsync(byte[], byte[], long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task SetAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds = 0)
     {
         if (ttlSeconds < 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(ttlSeconds), $"nanocached: ttlSeconds must be non-negative, got {ttlSeconds}");
         }
-        ValidateKeyAndValue(key, value);
+        ValidateKeyAndValue(namespaceBytes, key, value);
         byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
         await BeforeOperationAsync().ConfigureAwait(false);
         await WithClusterRetryAsync<object?>(async () =>
         {
-            await WriteAsync<object?>(key, async connection =>
+            await WriteAsync<object?>(namespaceBytes, key, async connection =>
             {
-                await connection.SetAsync(key, outgoing, ttlSeconds).ConfigureAwait(false);
+                await connection.SetAsync(namespaceBytes, key, outgoing, ttlSeconds).ConfigureAwait(false);
                 return null;
             }).ConfigureAwait(false);
             return null;
         }).ConfigureAwait(false);
     }
 
-    public Task<bool> DeleteAsync(string key) => DeleteAsync(Encoding.UTF8.GetBytes(key));
+    public Task<bool> DeleteAsync(string key) => DeleteAsync(EmptyNamespace, key);
 
     /// <summary>Returns whether the key existed before this call.</summary>
-    public async Task<bool> DeleteAsync(byte[] key)
+    public Task<bool> DeleteAsync(byte[] key) => DeleteAsync(EmptyNamespace, key);
+
+    /// <summary>issue #105: as <see cref="DeleteAsync(string)"/>, scoped to
+    /// <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<bool> DeleteAsync(byte[] namespaceBytes, string key) =>
+        DeleteAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+
+    /// <summary>issue #105: as <see cref="DeleteAsync(byte[])"/>, scoped to
+    /// <paramref name="namespaceBytes"/>. Returns whether the key existed
+    /// before this call.</summary>
+    internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
     {
-        ValidateKey(key);
+        ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
-            () => WriteAsync(key, connection => connection.DeleteAsync(key))).ConfigureAwait(false);
+            () => WriteAsync(namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key)))
+            .ConfigureAwait(false);
     }
 
-    /// <summary>Rejects an empty key, or one so large that a bare
-    /// <c>"G "</c>/<c>"D "</c> header plus the key alone would already risk
-    /// tripping the server's MAX_REQUEST_SIZE (audit finding D2) — checked
+    /// <summary>Rejects an empty key, or a (namespace, key) pair so large
+    /// that a bare <c>"g "</c>/<c>"G "</c>/<c>"d "</c>/<c>"D "</c> header
+    /// plus the namespace and key alone would already risk tripping the
+    /// server's MAX_REQUEST_SIZE (audit finding D2) — checked
     /// synchronously, before any connection is touched, mirroring
-    /// <see cref="SetAsync(byte[], byte[], long)"/>'s ttlSeconds
-    /// check.</summary>
-    private static void ValidateKey(byte[] key)
+    /// <see cref="SetAsync(byte[], byte[], long)"/>'s ttlSeconds check.
+    /// issue #105: the namespace counts toward the same budget as the key
+    /// — the wire imposes no separate limit on it, so neither does this
+    /// (the empty namespace contributes 0 bytes, so this is
+    /// byte-identical to the pre-namespace check).</summary>
+    private static void ValidateKey(byte[] namespaceBytes, byte[] key)
     {
         if (key.Length == 0)
         {
             throw new ArgumentException("nanocached: key must not be empty", nameof(key));
         }
-        if (key.Length > MaxRequestBytes)
+        long total = (long)namespaceBytes.Length + key.Length;
+        if (total > MaxRequestBytes)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(key),
-                $"nanocached: key is {key.Length} bytes, which exceeds the {MaxRequestBytes}-byte "
-                + "request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+                namespaceBytes.Length == 0
+                    ? $"nanocached: key is {key.Length} bytes, which exceeds the {MaxRequestBytes}-byte "
+                      + "request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)"
+                    : $"nanocached: namespace ({namespaceBytes.Length} bytes) + key ({key.Length} bytes) = "
+                      + $"{total} bytes, which exceeds the {MaxRequestBytes}-byte request limit (server "
+                      + "MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
         }
     }
 
-    /// <summary>As <see cref="ValidateKey"/>, plus rejects a key+value pair
-    /// too large for a single <c>S</c> request to have any chance of
-    /// fitting under the server's MAX_REQUEST_SIZE (audit finding D2).
-    /// Checked against the caller-supplied value, before compression —
-    /// compression only ever shrinks what actually goes on the wire, so
-    /// this is the conservative (never falsely permissive) side to
-    /// check.</summary>
-    private static void ValidateKeyAndValue(byte[] key, byte[] value)
+    /// <summary>As <see cref="ValidateKey(byte[], byte[])"/>, plus rejects a
+    /// namespace+key+value combination too large for a single
+    /// <c>s</c>/<c>S</c> request to have any chance of fitting under the
+    /// server's MAX_REQUEST_SIZE (audit finding D2). Checked against the
+    /// caller-supplied value, before compression — compression only ever
+    /// shrinks what actually goes on the wire, so this is the conservative
+    /// (never falsely permissive) side to check.</summary>
+    private static void ValidateKeyAndValue(byte[] namespaceBytes, byte[] key, byte[] value)
     {
-        ValidateKey(key);
-        long total = (long)key.Length + value.Length;
+        ValidateKey(namespaceBytes, key);
+        long total = (long)namespaceBytes.Length + key.Length + value.Length;
         if (total > MaxRequestBytes)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(value),
-                $"nanocached: key ({key.Length} bytes) + value ({value.Length} bytes) = {total} bytes, "
-                + $"which exceeds the {MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, "
-                + "src/server.rs, is 1 MiB)");
+                namespaceBytes.Length == 0
+                    ? $"nanocached: key ({key.Length} bytes) + value ({value.Length} bytes) = {total} bytes, "
+                      + $"which exceeds the {MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, "
+                      + "src/server.rs, is 1 MiB)"
+                    : $"nanocached: namespace ({namespaceBytes.Length} bytes) + key ({key.Length} bytes) + "
+                      + $"value ({value.Length} bytes) = {total} bytes, which exceeds the "
+                      + $"{MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
         }
     }
 
@@ -940,11 +1034,15 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    private IReadOnlyList<string> OwnerNames(byte[] key)
+    /// <summary>issue #105: (namespace, key) routes to owners via
+    /// <see cref="HashRing.Owners(ReadOnlySpan{byte}, ReadOnlySpan{byte}, int)"/>
+    /// — the empty namespace routes identically to the pre-namespace
+    /// single-key form.</summary>
+    private IReadOnlyList<string> OwnerNames(byte[] namespaceBytes, byte[] key)
     {
         lock (_stateLock)
         {
-            return _ring!.Owners(key, _replication);
+            return _ring!.Owners(namespaceBytes, key, _replication);
         }
     }
 
@@ -968,14 +1066,14 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
-    private async Task<T> ReadAsync<T>(byte[] key, Func<Connection, Task<T>> op)
+    private async Task<T> ReadAsync<T>(byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op)
     {
         if (_ring is null)
         {
             return await ApplyReconnectingAsync(null, op).ConfigureAwait(false);
         }
 
-        IReadOnlyList<string> names = OwnerNames(key);
+        IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
         if (_readHedgeAfter is TimeSpan hedgeAfter && names.Count > 1)
         {
             return await ReadHedgedAsync(op, names, hedgeAfter).ConfigureAwait(false);
@@ -1158,14 +1256,14 @@ public sealed class NanocachedClient : IDisposable
         throw lastError ?? new ConnectionLostException("nanocached: no owner is reachable for this key");
     }
 
-    private async Task<T> WriteAsync<T>(byte[] key, Func<Connection, Task<T>> op)
+    private async Task<T> WriteAsync<T>(byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op)
     {
         if (_ring is null)
         {
             return await ApplyReconnectingAsync(null, op).ConfigureAwait(false);
         }
 
-        IReadOnlyList<string> names = OwnerNames(key);
+        IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
         if (names.Count == 0)
         {
             throw new ConnectionLostException("nanocached: no owner is reachable for this key");

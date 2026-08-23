@@ -66,6 +66,39 @@ factor in use. A write whose primary just died recovers automatically
 once discovery drops the node (bounded by its liveness timeout): the
 failed attempt forces a node-list refresh and one retry.
 
+## Namespaces
+
+`client.namespace(ns)` returns a lightweight, namespace-scoped handle
+with the same `get`/`getBytes`/`set`/`delete` surface as the client
+itself — the same key name in two namespaces (or the default,
+un-namespaced keyspace) is three independent entries, since the
+namespace enters routing (HRW over `(namespace, key)`) alongside the
+key. `ns` accepts a `String` (UTF-8 encoded) or raw `byte[]` — a
+namespace is an opaque, binary-safe byte string with no delimiter, no
+escaping, and no hierarchy, just like a key.
+
+```java
+NanocachedClient.Namespace tenant = client.namespace("tenant-a");
+tenant.set("greeting", "hello", 60);
+Optional<String> value = tenant.get("greeting");   // "hello" — isolated from client.get("greeting")
+```
+
+A handle is cheap (holds only the namespace bytes and shares the
+client's connections), forwards every call to the client's own
+networking rather than duplicating it, and is invalid once `close()`
+has run (the same `AlreadyClosed` a direct call raises).
+`client.namespace("")` returns a handle equivalent to the client itself
+— same routing, same wire frames — rather than being rejected.
+`namespace.namespace()` returns the handle's namespace bytes, useful
+when passing a handle around generically.
+
+Talking to a namespace uses the `g`/`s`/`d` wire commands, additive to
+the pre-namespace protocol; a pre-namespace server answers `E` and
+closes the connection, so every node in the cluster must be upgraded
+before namespaces are used. The un-namespaced API is unchanged and
+remains the default — every existing key keeps its placement across the
+upgrade.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

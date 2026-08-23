@@ -63,11 +63,21 @@ func captureStderr(t *testing.T, fn func()) string {
 
 // ── モックノード ──────────────────────────────────────────────────
 
+// storeKey is a mock node's storage key: (namespace, key) pairs are
+// stored separately from each other and from an unnamespaced key of the
+// same name (issue #105: first-class namespaces) — ns == "" is the
+// default namespace, exactly the entry a legacy G/S/D frame (or a `g`/
+// `s`/`d` frame with a zero-length namespace) addresses.
+type storeKey struct {
+	ns  string
+	key string
+}
+
 type mockNode struct {
 	listener         net.Listener
 	requiredSecret   []byte
 	opts             mockNodeOpts
-	store            sync.Map // string -> []byte
+	store            sync.Map // storeKey -> []byte
 	connectionCount  atomic.Int32
 	getCount         atomic.Int32
 	wrongNodeLeft    atomic.Int32
@@ -164,7 +174,12 @@ func (m *mockNode) storeLen() int {
 }
 
 func (m *mockNode) hasKey(key string) bool {
-	_, ok := m.store.Load(key)
+	return m.hasNSKey("", key)
+}
+
+// hasNSKey is hasKey scoped to namespace ns (issue #105).
+func (m *mockNode) hasNSKey(ns, key string) bool {
+	_, ok := m.store.Load(storeKey{ns, key})
 	return ok
 }
 
@@ -273,13 +288,66 @@ func (m *mockNode) serve(conn net.Conn) {
 			var reply []byte
 			if m.takeWrongNode() {
 				reply = []byte("W" + tagSuffix + "\n")
-			} else if value, ok := m.store.Load(key); ok {
+			} else if value, ok := m.store.Load(storeKey{"", key}); ok {
 				stored := value.([]byte)
 				reply = append([]byte(fmt.Sprintf("V %d%s\n", len(stored), tagSuffix)), stored...)
 			} else {
 				reply = []byte("N" + tagSuffix + "\n")
 			}
 			if _, err := conn.Write(reply); err != nil {
+				return
+			}
+		// Namespaced get (issue #105): `g <ns-len> <key-len>
+		// [<tag>]\n<ns><key>` — the same body-field order as G, with the
+		// namespace leading the key and one extra ns-len header field.
+		// Everything past reading the namespace bytes mirrors G exactly,
+		// including the fault-injection knobs (shared with G's tests,
+		// which exercise the same store and counters through either
+		// command).
+		case "g":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			if m.silent.Load() {
+				continue
+			}
+			m.getCount.Add(1)
+			if delay := time.Duration(m.getDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
+			if m.takeOne(&m.swallowLeft) {
+				continue
+			}
+			if tagged && m.takeOne(&m.wrongTagLeft) {
+				requestTag := atoiOrPanic(parts[len(parts)-1])
+				if _, err := conn.Write([]byte(fmt.Sprintf("N %d\n", requestTag+1))); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeOne(&m.malformedLeft) {
+				if _, err := conn.Write([]byte("V x\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeOne(&m.storedToGetLeft) {
+				if _, err := conn.Write([]byte("S" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			var nsReply []byte
+			if m.takeWrongNode() {
+				nsReply = []byte("W" + tagSuffix + "\n")
+			} else if value, ok := m.store.Load(storeKey{namespace, key}); ok {
+				stored := value.([]byte)
+				nsReply = append([]byte(fmt.Sprintf("V %d%s\n", len(stored), tagSuffix)), stored...)
+			} else {
+				nsReply = []byte("N" + tagSuffix + "\n")
+			}
+			if _, err := conn.Write(nsReply); err != nil {
 				return
 			}
 		case "S":
@@ -307,7 +375,43 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
 			} else {
-				m.store.Store(key, value)
+				m.store.Store(storeKey{"", key}, value)
+			}
+			if _, err := conn.Write([]byte(reply)); err != nil {
+				return
+			}
+		// Namespaced set (issue #105): `s <ns-len> <key-len> <val-len>
+		// [<ttl>] [<tag>]\n<ns><key><value>` — the ttl+tag `s` form from
+		// the issue #105 SDK port spec. ns-len shifts every later
+		// length field by one position versus S, so the TTL-presence
+		// arithmetic below is S's own shifted by that same one field.
+		case "s":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			valLen := atoiOrPanic(parts[3])
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			value := mustRead(reader, valLen)
+			if m.silent.Load() {
+				continue
+			}
+			ttlBase := 4
+			if tagged {
+				ttlBase = 5
+			}
+			if len(parts) > ttlBase {
+				m.lastSetTTL.Store(parts[4])
+			} else {
+				m.lastSetTTL.Store("none")
+			}
+			if delay := time.Duration(m.setDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
+			reply := "S" + tagSuffix + "\n"
+			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
+				reply = "W" + tagSuffix + "\n"
+			} else {
+				m.store.Store(storeKey{namespace, key}, value)
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
 				return
@@ -320,7 +424,27 @@ func (m *mockNode) serve(conn net.Conn) {
 			reply := "N" + tagSuffix + "\n"
 			if m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
-			} else if _, existed := m.store.LoadAndDelete(key); existed {
+			} else if _, existed := m.store.LoadAndDelete(storeKey{"", key}); existed {
+				reply = "D" + tagSuffix + "\n"
+			}
+			if _, err := conn.Write([]byte(reply)); err != nil {
+				return
+			}
+		// Namespaced delete (issue #105): `d <ns-len> <key-len>
+		// [<tag>]\n<ns><key>` — mirrors D exactly past the extra ns-len
+		// field and namespace bytes.
+		case "d":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			if m.silent.Load() {
+				continue
+			}
+			reply := "N" + tagSuffix + "\n"
+			if m.takeWrongNode() {
+				reply = "W" + tagSuffix + "\n"
+			} else if _, existed := m.store.LoadAndDelete(storeKey{namespace, key}); existed {
 				reply = "D" + tagSuffix + "\n"
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
@@ -1076,7 +1200,7 @@ func TestWireFormatIsUntouchedWhenCompressIsOff(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stored, ok := node.store.Load("k")
+	stored, ok := node.store.Load(storeKey{"", "k"})
 	if !ok || !bytes.Equal(stored.([]byte), []byte(value)) {
 		t.Fatalf("stored = %v, %v", stored, ok)
 	}
@@ -1115,7 +1239,7 @@ func TestCompressesAtOrAboveTheThresholdAndDecompressesBack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	storedAny, ok := node.store.Load("k")
+	storedAny, ok := node.store.Load(storeKey{"", "k"})
 	if !ok {
 		t.Fatal("value not stored")
 	}
@@ -1152,7 +1276,7 @@ func TestBelowThresholdValueIsPrefixedButNotCompressed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	storedAny, ok := node.store.Load("k")
+	storedAny, ok := node.store.Load(storeKey{"", "k"})
 	if !ok {
 		t.Fatal("value not stored")
 	}
@@ -1187,7 +1311,7 @@ func TestIncompressibleDataPassesThroughUnbloatedIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	storedAny, ok := node.store.Load("k")
+	storedAny, ok := node.store.Load(storeKey{"", "k"})
 	if !ok {
 		t.Fatal("value not stored")
 	}
@@ -1212,7 +1336,7 @@ func TestReadingALegacyValueWithCompressEnabledErrorsClearly(t *testing.T) {
 	// reliably fail DEFLATE decoding (raw DEFLATE has no checksum, so not
 	// every garbage body does — see compression_test.go's own pinned
 	// test).
-	node.store.Store("k", []byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF})
+	node.store.Store(storeKey{"", "k"}, []byte{compressionMarkerDeflate, 0xFF, 0xFF, 0xFF, 0xFF})
 
 	reader, err := Connect(Config{Addresses: []Address{addr(node.address())}, Compress: true})
 	if err != nil {
@@ -2096,7 +2220,7 @@ func TestConnectSucceedsWithOneUnreachableNode(t *testing.T) {
 	// A key whose primary is the dead node: the read fails over to the
 	// live replica right away (cooldown armed at bootstrap, no dial).
 	other := keyWithPrimary(t, dead)
-	nodes[live].store.Store(other, []byte("replica copy"))
+	nodes[live].store.Store(storeKey{"", other}, []byte("replica copy"))
 	start := time.Now()
 	value, ok, err := client.Get(other)
 	elapsed := time.Since(start)
@@ -2329,7 +2453,7 @@ func TestByDefaultACleanMissOnThePrimaryIsNotRepaired(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
 	const key = "k"
 	owners := ownersOf(key)
-	nodes[owners[1]].store.Store(key, []byte("from-replica"))
+	nodes[owners[1]].store.Store(storeKey{"", key}, []byte("from-replica"))
 
 	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
 	if err != nil {
@@ -2350,7 +2474,7 @@ func TestReadRepairFindsAValueOnAReplicaAndRepairsThePrimary(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
 	const key = "k"
 	owners := ownersOf(key)
-	nodes[owners[1]].store.Store(key, []byte("from-replica"))
+	nodes[owners[1]].store.Store(storeKey{"", key}, []byte("from-replica"))
 
 	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
 	if err != nil {
@@ -2425,7 +2549,7 @@ func TestAFailedRepairWriteCountsAReadRepairFailureInStats(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
 	const key = "k"
 	owners := ownersOf(key)
-	nodes[owners[1]].store.Store(key, []byte("from-replica"))
+	nodes[owners[1]].store.Store(storeKey{"", key}, []byte("from-replica"))
 	// The repair write back to the primary fails; setWrongNodeLeft only
 	// affects S, so the G probes leading up to it are unaffected.
 	nodes[owners[0]].setWrongNodeLeft.Add(1)
@@ -2574,7 +2698,7 @@ func TestAReplicaMissWaitsForThePrimary(t *testing.T) {
 	}
 	owners := ownersOf("k")
 	primary, replica := owners[0], owners[1]
-	nodes[replica].store.Delete("k")
+	nodes[replica].store.Delete(storeKey{"", "k"})
 	nodes[primary].delayGets(200 * time.Millisecond)
 
 	start := time.Now()
@@ -2669,4 +2793,279 @@ func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) bool 
 		time.Sleep(5 * time.Millisecond)
 	}
 	return condition()
+}
+
+// ── namespaces (issue #105) ──────────────────────────────────────────
+
+// ── encoder tests: appendGetFrame/appendSetFrame/appendDeleteFrame ────
+
+func TestAppendGetFrameEmitsTheLegacyFormForTheDefaultNamespace(t *testing.T) {
+	// The SDK rule: the default (empty) namespace must keep sending the
+	// legacy G frame byte-for-byte, both nil and "" alike, so an
+	// unmodified server keeps working.
+	for _, ns := range [][]byte{nil, []byte("")} {
+		if got, want := string(appendGetFrame(ns, []byte("key"), false, 0)), "G 3\nkey"; got != want {
+			t.Fatalf("appendGetFrame(%v, ...) = %q, want %q", ns, got, want)
+		}
+	}
+}
+
+func TestAppendGetFrameEmitsTheLowercaseFormForANonEmptyNamespace(t *testing.T) {
+	if got, want := string(appendGetFrame([]byte("ns"), []byte("key"), false, 0)), "g 2 3\nnskey"; got != want {
+		t.Fatalf("appendGetFrame = %q, want %q", got, want)
+	}
+}
+
+func TestAppendGetFrameCarriesTheTagFieldLast(t *testing.T) {
+	if got, want := string(appendGetFrame([]byte("ns"), []byte("key"), true, 7)), "g 2 3 7\nnskey"; got != want {
+		t.Fatalf("appendGetFrame (tagged) = %q, want %q", got, want)
+	}
+	// Legacy form stays tagged the same way G always has.
+	if got, want := string(appendGetFrame(nil, []byte("key"), true, 7)), "G 3 7\nkey"; got != want {
+		t.Fatalf("appendGetFrame (legacy, tagged) = %q, want %q", got, want)
+	}
+}
+
+func TestAppendSetFrameLegacyAndNamespacedForms(t *testing.T) {
+	if got, want := string(appendSetFrame(nil, []byte("k"), []byte("v"), -1, false, 0)), "S 1 1\nkv"; got != want {
+		t.Fatalf("legacy S, no ttl = %q, want %q", got, want)
+	}
+	if got, want := string(appendSetFrame(nil, []byte("k"), []byte("v"), 60, false, 0)), "S 1 1 60\nkv"; got != want {
+		t.Fatalf("legacy S, ttl = %q, want %q", got, want)
+	}
+	if got, want := string(appendSetFrame([]byte("ns"), []byte("k"), []byte("v"), -1, false, 0)),
+		"s 2 1 1\nnskv"; got != want {
+		t.Fatalf("namespaced s, no ttl = %q, want %q", got, want)
+	}
+	if got, want := string(appendSetFrame([]byte("ns"), []byte("k"), []byte("v"), -1, true, 9)),
+		"s 2 1 1 9\nnskv"; got != want {
+		t.Fatalf("namespaced s, tag only = %q, want %q", got, want)
+	}
+	// The ttl+tag `s` form from the issue #105 spec: TTL, then tag, both
+	// trailing the three length fields — `s <ns-len> <key-len> <val-len>
+	// [<ttl>] [<tag>]`.
+	if got, want := string(appendSetFrame([]byte("ns"), []byte("k"), []byte("v"), 60, true, 9)),
+		"s 2 1 1 60 9\nnskv"; got != want {
+		t.Fatalf("namespaced s, ttl+tag = %q, want %q", got, want)
+	}
+}
+
+func TestAppendDeleteFrameLegacyAndNamespacedForms(t *testing.T) {
+	if got, want := string(appendDeleteFrame(nil, []byte("k"), false, 0)), "D 1\nk"; got != want {
+		t.Fatalf("legacy D = %q, want %q", got, want)
+	}
+	if got, want := string(appendDeleteFrame([]byte("ns"), []byte("k"), true, 3)), "d 2 1 3\nnsk"; got != want {
+		t.Fatalf("namespaced d = %q, want %q", got, want)
+	}
+}
+
+// TestAppendFramesAcceptBinaryNamespaces exercises a namespace that
+// isn't valid UTF-8 (issue #105: a namespace is a flat, opaque byte
+// string — no delimiter, no escaping, may contain any bytes).
+func TestAppendFramesAcceptBinaryNamespaces(t *testing.T) {
+	ns := []byte{0xff, 0x00}
+	key := []byte("beta")
+
+	got := appendGetFrame(ns, key, false, 0)
+	want := append([]byte("g 2 4\n"), append(append([]byte{}, ns...), key...)...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("appendGetFrame with binary namespace = %v, want %v", got, want)
+	}
+
+	gotD := appendDeleteFrame(ns, key, false, 0)
+	wantD := append([]byte("d 2 4\n"), append(append([]byte{}, ns...), key...)...)
+	if !bytes.Equal(gotD, wantD) {
+		t.Fatalf("appendDeleteFrame with binary namespace = %v, want %v", gotD, wantD)
+	}
+
+	value := []byte("v")
+	gotS := appendSetFrame(ns, key, value, -1, false, 0)
+	wantS := append([]byte("s 2 4 1\n"), append(append(append([]byte{}, ns...), key...), value...)...)
+	if !bytes.Equal(gotS, wantS) {
+		t.Fatalf("appendSetFrame with binary namespace = %v, want %v", gotS, wantS)
+	}
+}
+
+// ── single-node round trip and isolation ──────────────────────────────
+
+func TestNamespaceRoundTripsAndIsolatesFromTheDefaultNamespaceAndOtherNamespaces(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	users := client.Namespace("users")
+	orders := client.Namespace("orders")
+	if got := users.Name(); got != "users" {
+		t.Fatalf("Name() = %q, want %q", got, "users")
+	}
+	if got := orders.Name(); got != "orders" {
+		t.Fatalf("Name() = %q, want %q", got, "orders")
+	}
+
+	// Same key name in the default namespace and two others: three
+	// independent entries (issue #105 spec item 4).
+	if err := client.Set("shared-key", "default", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.Set("shared-key", "in-users", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := orders.Set("shared-key", "in-orders", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if value, ok, err := client.Get("shared-key"); err != nil || !ok || value != "default" {
+		t.Fatalf("default Get = %q, %v, %v", value, ok, err)
+	}
+	if value, ok, err := users.Get("shared-key"); err != nil || !ok || value != "in-users" {
+		t.Fatalf("users Get = %q, %v, %v", value, ok, err)
+	}
+	if value, ok, err := orders.Get("shared-key"); err != nil || !ok || value != "in-orders" {
+		t.Fatalf("orders Get = %q, %v, %v", value, ok, err)
+	}
+	if got := node.storeLen(); got != 3 {
+		t.Fatalf("storeLen = %d, want 3 (isolation)", got)
+	}
+
+	if raw, ok, err := users.GetBytes("shared-key"); err != nil || !ok || string(raw) != "in-users" {
+		t.Fatalf("users GetBytes = %q, %v, %v", raw, ok, err)
+	}
+	if err := users.SetBytes("shared-key", []byte{0x00, 0xff}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok, err := users.GetBytes("shared-key"); err != nil || !ok || !bytes.Equal(raw, []byte{0x00, 0xff}) {
+		t.Fatalf("users GetBytes after SetBytes = %v, %v, %v", raw, ok, err)
+	}
+
+	if existed, err := users.Delete("shared-key"); err != nil || !existed {
+		t.Fatalf("users Delete = %v, %v", existed, err)
+	}
+	if _, ok, err := users.Get("shared-key"); err != nil || ok {
+		t.Fatalf("users Get after delete: ok=%v err=%v", ok, err)
+	}
+	// Deleting from one namespace must not touch the others.
+	if value, ok, err := client.Get("shared-key"); err != nil || !ok || value != "default" {
+		t.Fatalf("default Get after users delete = %q, %v, %v", value, ok, err)
+	}
+	if value, ok, err := orders.Get("shared-key"); err != nil || !ok || value != "in-orders" {
+		t.Fatalf("orders Get after users delete = %q, %v, %v", value, ok, err)
+	}
+}
+
+func TestNamespaceEmptyStringUsesLegacyFramesAndTheDefaultNamespace(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	root := client.Namespace("")
+	if got := root.Name(); got != "" {
+		t.Fatalf("Name() = %q, want \"\"", got)
+	}
+	if err := root.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	// namespace("") must be indistinguishable on the wire from the
+	// client's own namespace-less methods (issue #105's SDK rule): the
+	// mock node stores it as the unnamespaced entry, so the plain client
+	// reads it straight back.
+	if value, ok, err := client.Get("k"); err != nil || !ok || value != "v" {
+		t.Fatalf("client.Get after root.Set = %q, %v, %v", value, ok, err)
+	}
+	if !node.hasKey("k") {
+		t.Fatal("expected the legacy (unnamespaced) store entry")
+	}
+
+	if err := client.Set("k2", "v2", 0); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok, err := root.Get("k2"); err != nil || !ok || value != "v2" {
+		t.Fatalf("root.Get after client.Set = %q, %v, %v", value, ok, err)
+	}
+}
+
+func TestNamespaceMethodsErrorAfterClientClose(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := client.Namespace("users")
+	client.Close()
+
+	if _, _, err := ns.Get("k"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Get err = %v, want ErrClosed", err)
+	}
+	if _, _, err := ns.GetBytes("k"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("GetBytes err = %v, want ErrClosed", err)
+	}
+	if err := ns.Set("k", "v", 0); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Set err = %v, want ErrClosed", err)
+	}
+	if _, err := ns.Delete("k"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Delete err = %v, want ErrClosed", err)
+	}
+}
+
+// ── cluster mode: routing and W refresh-and-retry by (ns, key) ────────
+
+func TestNamespacedWrongNodeTriggersRefreshAndOneRetry(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ns := client.Namespace("users")
+	if err := ns.Set("some-key", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	primary, err := NewHashRing(testNames).RouteNS([]byte("users"), []byte("some-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := nodes[primary]
+
+	owner.wrongNodeLeft.Add(1)
+	if value, ok, err := ns.Get("some-key"); err != nil || !ok || value != "v" {
+		t.Fatalf("Get after one W = %q, %v, %v", value, ok, err)
+	}
+
+	owner.wrongNodeLeft.Add(2)
+	if _, _, err := ns.Get("some-key"); !errors.Is(err, ErrWrongNode) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestNamespacedRoutingCanDifferFromTheDefaultNamespace proves the
+// namespace actually enters routing (issue #105) rather than every
+// namespace simply reusing the default keyspace's placement: for a fixed
+// key, at least one of a handful of namespaces routes to a different
+// primary than the default namespace does.
+func TestNamespacedRoutingCanDifferFromTheDefaultNamespace(t *testing.T) {
+	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	defaultPrimary, err := ring.Route([]byte("some-key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	differed := false
+	for _, ns := range []string{"users", "orders", "sessions", "carts", "invoices"} {
+		primary, err := ring.RouteNS([]byte(ns), []byte("some-key"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if primary != defaultPrimary {
+			differed = true
+			break
+		}
+	}
+	if !differed {
+		t.Fatal("every namespace routed the same key to the same primary as the default namespace")
+	}
 }

@@ -2494,3 +2494,200 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
     }
   });
 });
+
+describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () => {
+  it("round-trips get/getBytes/set/delete through a namespace handle", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const users = client.namespace("users");
+        await users.set("alice", "hello", 60);
+        assert.equal(await users.get("alice"), "hello");
+        assert.deepEqual(await users.getBytes("alice"), Buffer.from("hello"));
+        assert.equal(node.lastSetTtl(), 60);
+
+        assert.equal(await users.delete("alice"), true);
+        assert.equal(await users.get("alice"), null);
+        assert.equal(await users.delete("alice"), false);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("isolates the same key name across the default namespace and two named ones", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const users = client.namespace("users");
+        const orders = client.namespace("orders");
+
+        await client.set("k", "default value");
+        await users.set("k", "users value");
+        await orders.set("k", "orders value");
+
+        assert.equal(await client.get("k"), "default value");
+        assert.equal(await users.get("k"), "users value");
+        assert.equal(await orders.get("k"), "orders value");
+
+        // Three genuinely independent entries on the wire, not one key
+        // getting overwritten three times.
+        assert.equal(node.store.get("k")?.toString("utf8"), "default value");
+        assert.equal(node.namespacedStore("users").get("k")?.toString("utf8"), "users value");
+        assert.equal(node.namespacedStore("orders").get("k")?.toString("utf8"), "orders value");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("namespace(\"\") is not rejected and behaves exactly like the root client, using legacy frames", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const root = client.namespace("");
+        assert.deepEqual(root.namespace, Buffer.alloc(0));
+
+        await root.set("k", "v");
+        assert.equal(node.lastCommand(), "S", "the empty namespace must send the legacy S frame, not s");
+        assert.equal(await client.get("k"), "v", "namespace(\"\") shares storage with the root client");
+
+        assert.equal(await root.get("k"), "v");
+        assert.equal(node.lastCommand(), "G", "the empty namespace must send the legacy G frame, not g");
+
+        assert.equal(await root.delete("k"), true);
+        assert.equal(node.lastCommand(), "D", "the empty namespace must send the legacy D frame, not d");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a non-empty namespace sends the lowercase g/s/d frames", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const users = client.namespace("users");
+
+        await users.set("k", "v");
+        assert.equal(node.lastCommand(), "s");
+
+        await users.get("k");
+        assert.equal(node.lastCommand(), "g");
+
+        await users.delete("k");
+        assert.equal(node.lastCommand(), "d");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("accepts a raw-bytes namespace, not just a string, and encodes a string namespace as UTF-8", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const byString = client.namespace("日本");
+        await byString.set("k", "v");
+
+        const byBytes = client.namespace(Buffer.from("日本", "utf8"));
+        assert.equal(await byBytes.get("k"), "v", "a string namespace and its UTF-8 encoding must address the same namespace");
+        assert.deepEqual(byBytes.namespace, Buffer.from("日本", "utf8"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a namespace handle is invalid once the client is closed, exactly like the client itself", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      const users = client.namespace("users");
+      client.close();
+
+      await assert.rejects(users.get("k"), AlreadyClosedError);
+      await assert.rejects(users.getBytes("k"), AlreadyClosedError);
+      await assert.rejects(users.set("k", "v"), AlreadyClosedError);
+      await assert.rejects(users.delete("k"), AlreadyClosedError);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("routes a namespaced key by (namespace, key), agreeing with the shared hash ring", async () => {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(nodes.map(({ name, mock }) => ({ name, address: mock.address })));
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        const users = client.namespace("users");
+        const ring = new HashRing(names);
+        const key = "alpha";
+
+        await users.set(key, "v");
+
+        // Discovery's default replication is 1 (mockServers.ts), so
+        // exactly one of the two nodes should hold the write — whichever
+        // one the ring picks as the (namespace, key) primary.
+        const namespacedOwner = ring.route(Buffer.from(key), Buffer.from("users"));
+        const other = nodes.find(({ name }) => name !== namespacedOwner)!;
+        const owner = nodes.find(({ name }) => name === namespacedOwner)!;
+        assert.ok(owner.mock.namespacedStore("users").has(key), `${key} did not land on ${namespacedOwner} in namespace "users"`);
+        assert.ok(!other.mock.namespacedStore("users").has(key), `${key} unexpectedly landed on the non-owner ${other.name}`);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+
+  it("W refresh-and-retry on a namespaced key routes by (namespace, key)", async () => {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(nodes.map(({ name, mock }) => ({ name, address: mock.address })));
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        const users = client.namespace("users");
+        const key = "alpha";
+        const ring = new HashRing(names);
+        const owner = nodes.find(({ name }) => name === ring.route(Buffer.from(key), Buffer.from("users")))!;
+
+        await users.set(key, "v");
+
+        owner.mock.answerWrongNodeOnce();
+        assert.equal(await users.get(key), "v");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+});

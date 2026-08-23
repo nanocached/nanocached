@@ -54,6 +54,51 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
     });
 ```
 
+## Namespaces
+
+A namespace is a flat, opaque byte string that scopes a key: the same key
+name in two namespaces is two independent entries — useful for sharing one
+cluster across tenants or subsystems without key-prefixing conventions.
+`client.Namespace(...)` returns a lightweight `NanocachedNamespace` handle
+exposing the same operations as the client:
+
+```csharp
+NanocachedNamespace users = client.Namespace("users");
+
+await users.SetAsync("42", "alice", ttlSeconds: 60);
+string? name = await users.GetAsync("42");   // "alice"
+bool existed = await users.DeleteAsync("42");
+
+// A different namespace, or the client itself, never sees "42" above —
+// same key name, independent entries.
+await client.SetAsync("42", "not alice");
+```
+
+The handle is cheap (it shares the client's connections and dials
+nothing of its own) and forwards every call to the client, so it gets
+identical routing, replication fan-out, hedged reads, `W`
+refresh-and-retry, response tags, and compression — nothing about
+namespaces duplicates the client's networking. It becomes invalid once
+the owning client is closed, raising the same `AlreadyClosedException`
+the client's own methods do.
+
+`client.Namespace("")` (the empty namespace) is equivalent to the client
+itself: it sends the legacy `G`/`S`/`D` frames, byte-for-byte, and hashes
+exactly as an un-namespaced key always has — so existing code that never
+touches namespaces is completely unaffected, and an unnamespaced
+deployment reached through `Namespace("")` is wire-indistinguishable
+from calling the client directly. `Namespace(byte[])` accepts a raw,
+binary-safe namespace too — there's no delimiter, no escaping, and no
+hierarchy, so a namespace may contain any bytes.
+
+Namespaces also enter cluster routing: a key's owners are computed from
+`(namespace, key)` together, not the key alone, so the same key name in
+different namespaces can land on different owners — this is what keeps a
+common key (e.g. a per-tenant `config`) from piling every namespace's
+copy onto the same few nodes. Namespaced frames need a server that
+understands them; talking `g`/`s`/`d` to a pre-namespace node gets `E\n`
+and a closed connection, so upgrade every node before using namespaces.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so

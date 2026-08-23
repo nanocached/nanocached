@@ -139,12 +139,22 @@ func (c *connection) idle() time.Duration {
 	return time.Since(c.lastUsed)
 }
 
+// get sends the default-namespace `G` frame — equivalent to
+// getNS(nil, key), kept as its own method purely so the many call sites
+// that predate namespaces (issue #105) don't have to pass one.
 func (c *connection) get(key []byte) ([]byte, bool, error) {
+	return c.getNS(nil, key)
+}
+
+// getNS is get scoped to namespace: a `g` frame when namespace is
+// non-empty, the byte-for-byte legacy `G` frame otherwise (see
+// appendGetFrame — the SDK rule that the default namespace must never
+// change the wire format at all, so an unmodified server keeps working).
+// The response markers (V/N/W) are identical either way — namespaced
+// commands answer exactly like their uppercase counterparts.
+func (c *connection) getNS(namespace, key []byte) ([]byte, bool, error) {
 	marker, value, err := c.request(func(tag uint32) []byte {
-		frame := append([]byte("G "), strconv.AppendInt(nil, int64(len(key)), 10)...)
-		frame = appendTagField(frame, c.tagged, tag)
-		frame = append(frame, '\n')
-		return append(frame, key...)
+		return appendGetFrame(namespace, key, c.tagged, tag)
 	})
 	if err != nil {
 		return nil, false, err
@@ -161,19 +171,37 @@ func (c *connection) get(key []byte) ([]byte, bool, error) {
 	}
 }
 
-func (c *connection) set(key, value []byte, ttlSeconds int64) error {
-	marker, _, err := c.request(func(tag uint32) []byte {
-		frame := append([]byte("S "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+// appendGetFrame builds a G/g request frame. An empty namespace emits
+// `G <key-len>[ <tag>]\n<key>` — byte-for-byte what a pre-namespace
+// client sends, so the default namespace never depends on the server
+// having learned about namespaces at all. A non-empty namespace emits
+// `g <ns-len> <key-len>[ <tag>]\n<ns><key>` (docs/protocol.html's
+// "g / s / d — namespaced get, set, delete").
+func appendGetFrame(namespace, key []byte, tagged bool, tag uint32) []byte {
+	var frame []byte
+	if len(namespace) == 0 {
+		frame = append([]byte("G "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+	} else {
+		frame = append([]byte("g "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
 		frame = append(frame, ' ')
-		frame = strconv.AppendInt(frame, int64(len(value)), 10)
-		if ttlSeconds >= 0 {
-			frame = append(frame, ' ')
-			frame = strconv.AppendInt(frame, ttlSeconds, 10)
-		}
-		frame = appendTagField(frame, c.tagged, tag)
-		frame = append(frame, '\n')
-		frame = append(frame, key...)
-		return append(frame, value...)
+		frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	return append(frame, key...)
+}
+
+// set sends the default-namespace `S` frame — equivalent to
+// setNS(nil, key, value, ttlSeconds).
+func (c *connection) set(key, value []byte, ttlSeconds int64) error {
+	return c.setNS(nil, key, value, ttlSeconds)
+}
+
+// setNS is set scoped to namespace (issue #105) — see getNS.
+func (c *connection) setNS(namespace, key, value []byte, ttlSeconds int64) error {
+	marker, _, err := c.request(func(tag uint32) []byte {
+		return appendSetFrame(namespace, key, value, ttlSeconds, c.tagged, tag)
 	})
 	if err != nil {
 		return err
@@ -188,12 +216,41 @@ func (c *connection) set(key, value []byte, ttlSeconds int64) error {
 	}
 }
 
+// appendSetFrame builds an S/s request frame; see appendGetFrame for the
+// legacy-vs-namespaced split. The optional TTL field sits ahead of the
+// tag in both forms — `s <ns-len> <key-len> <val-len> [<ttl>] [<tag>]`.
+func appendSetFrame(namespace, key, value []byte, ttlSeconds int64, tagged bool, tag uint32) []byte {
+	var frame []byte
+	if len(namespace) == 0 {
+		frame = append([]byte("S "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+	} else {
+		frame = append([]byte("s "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	}
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(value)), 10)
+	if ttlSeconds >= 0 {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, ttlSeconds, 10)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	frame = append(frame, key...)
+	return append(frame, value...)
+}
+
+// delete sends the default-namespace `D` frame — equivalent to
+// deleteNS(nil, key).
 func (c *connection) delete(key []byte) (bool, error) {
+	return c.deleteNS(nil, key)
+}
+
+// deleteNS is delete scoped to namespace (issue #105) — see getNS.
+func (c *connection) deleteNS(namespace, key []byte) (bool, error) {
 	marker, _, err := c.request(func(tag uint32) []byte {
-		frame := append([]byte("D "), strconv.AppendInt(nil, int64(len(key)), 10)...)
-		frame = appendTagField(frame, c.tagged, tag)
-		frame = append(frame, '\n')
-		return append(frame, key...)
+		return appendDeleteFrame(namespace, key, c.tagged, tag)
 	})
 	if err != nil {
 		return false, err
@@ -208,6 +265,22 @@ func (c *connection) delete(key []byte) (bool, error) {
 	default:
 		return false, c.mismatch(marker)
 	}
+}
+
+// appendDeleteFrame builds a D/d request frame; see appendGetFrame.
+func appendDeleteFrame(namespace, key []byte, tagged bool, tag uint32) []byte {
+	var frame []byte
+	if len(namespace) == 0 {
+		frame = append([]byte("D "), strconv.AppendInt(nil, int64(len(key)), 10)...)
+	} else {
+		frame = append([]byte("d "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	return append(frame, key...)
 }
 
 // mismatch handles a well-formed response of the wrong kind (a `S`

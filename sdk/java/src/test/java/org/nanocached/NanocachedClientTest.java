@@ -3,6 +3,8 @@ package org.nanocached;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -1900,8 +1902,11 @@ class NanocachedClientTest {
     }
 
     private static java.lang.reflect.Method writeMethod() throws Exception {
-        java.lang.reflect.Method write =
-                NanocachedClient.class.getDeclaredMethod("write", byte[].class, connectionOpClass());
+        // Namespaces (issue #105): write() gained a leading namespace
+        // parameter — EMPTY_NAMESPACE (via the empty byte[] literal below)
+        // exercises exactly the un-namespaced path these tests target.
+        java.lang.reflect.Method write = NanocachedClient.class.getDeclaredMethod(
+                "write", byte[].class, byte[].class, connectionOpClass());
         write.setAccessible(true);
         return write;
     }
@@ -1937,7 +1942,7 @@ class NanocachedClientTest {
                         });
 
                 long before = client.stats().backgroundWriteBugs();
-                writeMethod().invoke(client, key, op); // must not throw
+                writeMethod().invoke(client, new byte[0], key, op); // must not throw
                 assertEquals(before + 1, client.stats().backgroundWriteBugs(),
                         "the replica leg's bug must still be recorded even though the write succeeded");
             }
@@ -1967,7 +1972,7 @@ class NanocachedClientTest {
 
                 java.lang.reflect.InvocationTargetException thrown = assertThrows(
                         java.lang.reflect.InvocationTargetException.class,
-                        () -> writeMethod().invoke(client, key, op));
+                        () -> writeMethod().invoke(client, new byte[0], key, op));
                 assertTrue(thrown.getCause() instanceof ClassCastException,
                         "expected the raw replica-leg bug to propagate directly, got: " + thrown.getCause());
             }
@@ -2344,6 +2349,170 @@ class NanocachedClientTest {
                     .ca(cert.pemCert()))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
+            }
+        }
+    }
+
+    // ── 名前空間 (namespaces, issue #105) ──────────────────────────
+
+    @Test
+    void namespacedSetGetDeleteRoundTrips() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace ns = client.namespace("tenant-a");
+                assertArrayEquals("tenant-a".getBytes(StandardCharsets.UTF_8), ns.namespace());
+
+                ns.set("greeting", "hello", 60);
+                assertEquals(Optional.of("hello"), ns.get("greeting"));
+                assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8),
+                        ns.getBytes("greeting").orElseThrow());
+                assertTrue(ns.delete("greeting"));
+                assertEquals(Optional.empty(), ns.get("greeting"));
+                assertFalse(ns.delete("greeting"));
+            }
+        }
+    }
+
+    @Test
+    void namespaceIsolatesTheSameKeyNameFromTheDefaultAndOtherNamespaces() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace ns1 = client.namespace("ns1");
+                NanocachedClient.Namespace ns2 = client.namespace("ns2");
+
+                client.set("shared", "default-value");
+                ns1.set("shared", "ns1-value");
+                ns2.set("shared", "ns2-value");
+
+                assertEquals(Optional.of("default-value"), client.get("shared"));
+                assertEquals(Optional.of("ns1-value"), ns1.get("shared"));
+                assertEquals(Optional.of("ns2-value"), ns2.get("shared"));
+
+                // Three genuinely independent entries: the default
+                // keyspace and each namespace's own store hold exactly
+                // one each, not one shared entry the last write clobbered.
+                assertEquals(1, node.store.size());
+                assertEquals(2, node.namespacedStores.size());
+                assertEquals(1, node.namespacedStores.get("ns1").size());
+                assertEquals(1, node.namespacedStores.get("ns2").size());
+            }
+        }
+    }
+
+    @Test
+    void namespaceEmptyUsesLegacyFramesAndIsEquivalentToTheRootClient() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace root = client.namespace("");
+                assertArrayEquals(new byte[0], root.namespace());
+
+                root.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k")); // same keyspace as the client itself
+                assertEquals(Optional.of("v"), root.get("k"));
+                assertTrue(root.delete("k"));
+                assertEquals(Optional.empty(), client.get("k"));
+
+                // Every request above went out as a legacy G/S/D frame,
+                // never g/s/d — MockNode.namespacedCommandCount only
+                // counts the latter (the SDK rule: the default namespace
+                // must keep sending legacy frames byte-for-byte).
+                assertEquals(0, node.namespacedCommandCount.get());
+            }
+        }
+    }
+
+    @Test
+    void namespacedHandleIsInvalidAfterClose() throws Exception {
+        try (MockNode node = new MockNode()) {
+            NanocachedClient client = connect("127.0.0.1", node.port());
+            NanocachedClient.Namespace ns = client.namespace("ns");
+            client.close();
+            assertThrows(NanocachedException.AlreadyClosed.class, () -> ns.get("k"));
+            assertThrows(NanocachedException.AlreadyClosed.class, () -> ns.set("k", "v"));
+            assertThrows(NanocachedException.AlreadyClosed.class, () -> ns.delete("k"));
+        }
+    }
+
+    @Test
+    void rejectsOversizeNamespacePlusKeyBeforeTouchingTheConnection() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("warm", "up");
+                int connectionsBeforeRejections = node.connectionCount.get();
+
+                byte[] oversizeNamespace = new byte[1024 * 1024];
+                NanocachedClient.Namespace ns = client.namespace(oversizeNamespace);
+                byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+                byte[] value = "v".getBytes(StandardCharsets.UTF_8);
+                assertThrows(IllegalArgumentException.class, () -> ns.get(key));
+                assertThrows(IllegalArgumentException.class, () -> ns.delete(key));
+                assertThrows(IllegalArgumentException.class, () -> ns.set(key, value));
+
+                assertEquals(connectionsBeforeRejections, node.connectionCount.get());
+                assertEquals(Optional.of("up"), client.get("warm"));
+            }
+        }
+    }
+
+    @Test
+    void wrongNodeOnANamespacedKeyTriggersRefreshAndRoutesByNamespaceAndKey() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "key-0";
+                byte[] namespace = "ns".getBytes(StandardCharsets.UTF_8);
+                NanocachedClient.Namespace ns = client.namespace(namespace);
+
+                // Routing must key off (namespace, key), not the key
+                // alone — this pair was picked because its plain-key
+                // owner and its namespaced owner are different nodes in
+                // this 2-node ring, so the test fails if namespace were
+                // silently dropped from routing.
+                List<String> plainOwner = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 1);
+                List<String> nsOwner =
+                        new HashRing(NAMES).owners(namespace, key.getBytes(StandardCharsets.UTF_8), 1);
+                assertNotEquals(plainOwner, nsOwner);
+
+                ns.set(key, "v");
+                MockNode owner = cluster.nodes().get(nsOwner.get(0));
+
+                owner.answerWrongNodeOnce();
+                assertEquals(Optional.of("v"), ns.get(key));
+
+                owner.answerWrongNodeOnce();
+                owner.answerWrongNodeOnce();
+                assertThrows(NanocachedException.WrongNode.class, () -> ns.get(key));
+            }
+        }
+    }
+
+    @Test
+    void connectionEncodesNamespacedFramesIncludingTaggedAndBinaryForms() throws Exception {
+        // Exercised directly against Connection (as the tagged-mode tests
+        // above do) so the exact frame shape — the ttl+tag `s` form
+        // (<ns-len> <key-len> <val-len> <ttl> <tag>), a binary (non-UTF-8)
+        // namespace, and the tagged connection's `g`/`d` forms — is
+        // proven, not just the higher-level round trip.
+        try (MockNode node = MockNode.withTagSupport()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            assertTrue(target.tagged());
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                byte[] namespace = {(byte) 0xff, 0x00, 0x01}; // binary, not valid UTF-8
+                byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+                byte[] value = "v".getBytes(StandardCharsets.UTF_8);
+
+                connection.set(namespace, key, value, 60L); // the ttl+tag `s` form
+                assertArrayEquals(value, connection.get(namespace, key));
+                assertTrue(connection.delete(namespace, key));
+                assertNull(connection.get(namespace, key));
+
+                // The default namespace on a tagged connection still uses
+                // the legacy tagged G/S/D form (no namespace-length field).
+                connection.set(new byte[0], key, value, null);
+                assertArrayEquals(value, connection.get(new byte[0], key));
+            } finally {
+                connection.close();
             }
         }
     }

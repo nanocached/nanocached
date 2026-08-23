@@ -258,23 +258,10 @@ impl Connection {
             .saturating_sub(Duration::from_millis(last))
     }
 
-    pub(crate) async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self
-            .request(|tag| {
-                // Echoed response tags: a tagged connection's request header carries
-                // the claimed tag as its last field; `tag` is `None` on an
-                // untagged connection, in which case the frame is exactly
-                // the pre-0019 bytes.
-                let mut frame = match tag {
-                    Some(tag) => format!("G {} {tag}\n", key.len()),
-                    None => format!("G {}\n", key.len()),
-                }
-                .into_bytes();
-                frame.extend_from_slice(key);
-                frame
-            })
-            .await?
-        {
+    /// `namespace` empty means the default namespace — see `encode_get`
+    /// for the legacy/namespaced wire split (issue #105).
+    pub(crate) async fn get(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.request(|tag| encode_get(namespace, key, tag)).await? {
             ResponseKind::Value(value) => Ok(Some(value)),
             ResponseKind::NotFound => Ok(None),
             other => Err(self.mismatch(&other)),
@@ -282,23 +269,17 @@ impl Connection {
     }
 
     /// `ttl_seconds == 0` means no expiry — mapped to the wire exactly as
-    /// the absent-TTL frame always was.
-    pub(crate) async fn set(&self, key: &[u8], value: &[u8], ttl_seconds: u64) -> Result<()> {
+    /// the absent-TTL frame always was. `namespace` empty means the
+    /// default namespace — see `encode_set` (issue #105).
+    pub(crate) async fn set(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+        ttl_seconds: u64,
+    ) -> Result<()> {
         match self
-            .request(|tag| {
-                // Echoed response tags: the tag, when present, is always the last
-                // header field — after the TTL when there is one.
-                let header = match (ttl_seconds, tag) {
-                    (0, None) => format!("S {} {}\n", key.len(), value.len()),
-                    (0, Some(tag)) => format!("S {} {} {tag}\n", key.len(), value.len()),
-                    (ttl, None) => format!("S {} {} {ttl}\n", key.len(), value.len()),
-                    (ttl, Some(tag)) => format!("S {} {} {ttl} {tag}\n", key.len(), value.len()),
-                };
-                let mut frame = header.into_bytes();
-                frame.extend_from_slice(key);
-                frame.extend_from_slice(value);
-                frame
-            })
+            .request(|tag| encode_set(namespace, key, value, ttl_seconds, tag))
             .await?
         {
             ResponseKind::Stored => Ok(()),
@@ -306,17 +287,11 @@ impl Connection {
         }
     }
 
-    pub(crate) async fn delete(&self, key: &[u8]) -> Result<bool> {
+    /// `namespace` empty means the default namespace — see `encode_delete`
+    /// (issue #105).
+    pub(crate) async fn delete(&self, namespace: &[u8], key: &[u8]) -> Result<bool> {
         match self
-            .request(|tag| {
-                let mut frame = match tag {
-                    Some(tag) => format!("D {} {tag}\n", key.len()),
-                    None => format!("D {}\n", key.len()),
-                }
-                .into_bytes();
-                frame.extend_from_slice(key);
-                frame
-            })
+            .request(|tag| encode_delete(namespace, key, tag))
             .await?
         {
             ResponseKind::Deleted => Ok(true),
@@ -448,6 +423,104 @@ impl Connection {
             "nanocached: response \"{name}\" does not match the request (connection desynced)"
         ))
     }
+}
+
+/// Builds a `G`/`g` frame (Namespaces, issue #105): the default (empty)
+/// namespace always produces the legacy `G <key-len>[ <tag>]\n<key>`
+/// bytes untouched — the SDK rule that keeps an unchanged client talking
+/// to a pre-namespace server working — and only a non-empty namespace
+/// switches to `g <ns-len> <key-len>[ <tag>]\n<namespace><key>`. The
+/// namespace is never interpreted (no delimiter, no escaping): it is
+/// simply sliced by its declared length like every other body field, so
+/// it may contain any bytes.
+fn encode_get(namespace: &[u8], key: &[u8], tag: Option<u32>) -> Vec<u8> {
+    let mut frame = if namespace.is_empty() {
+        match tag {
+            Some(tag) => format!("G {} {tag}\n", key.len()),
+            None => format!("G {}\n", key.len()),
+        }
+    } else {
+        match tag {
+            Some(tag) => format!("g {} {} {tag}\n", namespace.len(), key.len()),
+            None => format!("g {} {}\n", namespace.len(), key.len()),
+        }
+    }
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
+/// Builds an `S`/`s` frame — see `encode_get` for the legacy/namespaced
+/// split. The tag, when present, is always the header's last field,
+/// after the TTL when there is one, on both the uppercase and lowercase
+/// forms alike.
+fn encode_set(
+    namespace: &[u8],
+    key: &[u8],
+    value: &[u8],
+    ttl_seconds: u64,
+    tag: Option<u32>,
+) -> Vec<u8> {
+    let header = if namespace.is_empty() {
+        match (ttl_seconds, tag) {
+            (0, None) => format!("S {} {}\n", key.len(), value.len()),
+            (0, Some(tag)) => format!("S {} {} {tag}\n", key.len(), value.len()),
+            (ttl, None) => format!("S {} {} {ttl}\n", key.len(), value.len()),
+            (ttl, Some(tag)) => format!("S {} {} {ttl} {tag}\n", key.len(), value.len()),
+        }
+    } else {
+        match (ttl_seconds, tag) {
+            (0, None) => format!("s {} {} {}\n", namespace.len(), key.len(), value.len()),
+            (0, Some(tag)) => {
+                format!(
+                    "s {} {} {} {tag}\n",
+                    namespace.len(),
+                    key.len(),
+                    value.len()
+                )
+            }
+            (ttl, None) => {
+                format!(
+                    "s {} {} {} {ttl}\n",
+                    namespace.len(),
+                    key.len(),
+                    value.len()
+                )
+            }
+            (ttl, Some(tag)) => format!(
+                "s {} {} {} {ttl} {tag}\n",
+                namespace.len(),
+                key.len(),
+                value.len()
+            ),
+        }
+    };
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame.extend_from_slice(value);
+    frame
+}
+
+/// Builds a `D`/`d` frame — see `encode_get` for the legacy/namespaced
+/// split.
+fn encode_delete(namespace: &[u8], key: &[u8], tag: Option<u32>) -> Vec<u8> {
+    let mut frame = if namespace.is_empty() {
+        match tag {
+            Some(tag) => format!("D {} {tag}\n", key.len()),
+            None => format!("D {}\n", key.len()),
+        }
+    } else {
+        match tag {
+            Some(tag) => format!("d {} {} {tag}\n", namespace.len(), key.len()),
+            None => format!("d {} {}\n", namespace.len(), key.len()),
+        }
+    }
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
 }
 
 /// This connection's only reader, for its whole lifetime — nothing else
@@ -705,5 +778,100 @@ pub(crate) async fn read_line<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -
                 "nanocached: response header line exceeds {MAX_HEADER_LINE_LENGTH} bytes without a terminator"
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_get_emits_the_legacy_frame_for_the_default_namespace() {
+        assert_eq!(encode_get(b"", b"name", None), b"G 4\nname".to_vec());
+    }
+
+    #[test]
+    fn encode_get_emits_the_tagged_legacy_frame() {
+        assert_eq!(encode_get(b"", b"name", Some(7)), b"G 4 7\nname".to_vec());
+    }
+
+    #[test]
+    fn encode_get_emits_the_namespaced_frame() {
+        assert_eq!(
+            encode_get(b"users", b"alpha", None),
+            [b"g 5 5\n".as_slice(), b"users", b"alpha"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_get_emits_the_tagged_namespaced_frame() {
+        assert_eq!(
+            encode_get(b"users", b"alpha", Some(3)),
+            [b"g 5 5 3\n".as_slice(), b"users", b"alpha"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_get_accepts_a_binary_namespace() {
+        // No delimiter, no escaping — a namespace may contain any bytes,
+        // including ones that would be ambiguous in text (0xff, 0x00).
+        assert_eq!(
+            encode_get(b"\xff\x00", b"beta", None),
+            [b"g 2 4\n".as_slice(), b"\xff\x00", b"beta"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_set_omits_the_ttl_field_when_zero_for_the_default_namespace() {
+        assert_eq!(
+            encode_set(b"", b"k", b"v", 0, None),
+            [b"S 1 1\n".as_slice(), b"k", b"v"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_set_includes_ttl_for_the_default_namespace() {
+        assert_eq!(
+            encode_set(b"", b"k", b"v", 60, None),
+            [b"S 1 1 60\n".as_slice(), b"k", b"v"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_set_namespaced_without_ttl_or_tag() {
+        assert_eq!(
+            encode_set(b"ns", b"k", b"v", 0, None),
+            [b"s 2 1 1\n".as_slice(), b"ns", b"k", b"v"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_set_namespaced_with_ttl_and_tag() {
+        // The spec's own callout: the ttl+tag `s` form.
+        assert_eq!(
+            encode_set(b"ns", b"k", b"v", 60, Some(9)),
+            [b"s 2 1 1 60 9\n".as_slice(), b"ns", b"k", b"v"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_set_namespaced_with_tag_but_no_ttl() {
+        assert_eq!(
+            encode_set(b"ns", b"k", b"v", 0, Some(9)),
+            [b"s 2 1 1 9\n".as_slice(), b"ns", b"k", b"v"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_delete_emits_the_legacy_frame_for_the_default_namespace() {
+        assert_eq!(encode_delete(b"", b"name", None), b"D 4\nname".to_vec());
+    }
+
+    #[test]
+    fn encode_delete_emits_the_tagged_namespaced_frame() {
+        assert_eq!(
+            encode_delete(b"users", b"alpha", Some(3)),
+            [b"d 5 5 3\n".as_slice(), b"users", b"alpha"].concat()
+        );
     }
 }

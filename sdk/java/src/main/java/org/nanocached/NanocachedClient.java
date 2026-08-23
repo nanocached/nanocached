@@ -321,6 +321,14 @@ public final class NanocachedClient implements AutoCloseable {
         return key;
     }
 
+    // Namespaces (issue #105): the default namespace, shared by every
+    // un-namespaced get/set/delete overload below — routing, the wire
+    // encoding (Connection.get/set/delete), and the hash ring (HashRing)
+    // all treat a zero-length namespace as "no namespace at all", so
+    // threading this through those call sites instead of duplicating them
+    // costs nothing on the un-namespaced path.
+    private static final byte[] EMPTY_NAMESPACE = new byte[0];
+
     // TTL a read-repair write uses (read repair), in whole seconds —
     // the protocol's TTL unit throughout (see set()'s ttlSeconds). The
     // original TTL isn't recoverable from a GET response, and repairing
@@ -828,6 +836,114 @@ public final class NanocachedClient implements AutoCloseable {
         return closed;
     }
 
+    /** A namespace-scoped handle (namespaces, issue #105) — see {@link
+     * Namespace}. {@code namespace} is UTF-8 encoded, matching every other
+     * key-ish {@code String} overload in this class. */
+    public Namespace namespace(String namespace) {
+        return namespace(namespace.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** As {@link #namespace(String)}. An empty {@code namespace} is not
+     * rejected — it returns a handle equivalent to this client itself
+     * (the same legacy wire frames and routing, per the namespaces spec). */
+    public Namespace namespace(byte[] namespace) {
+        return new Namespace(namespace);
+    }
+
+    /**
+     * A lightweight, namespace-scoped view of this client (namespaces,
+     * issue #105): the same {@code get}/{@code getBytes}/{@code set}/
+     * {@code delete} surface {@link NanocachedClient} itself exposes,
+     * every key scoped to {@link #namespace()} — the same key name in two
+     * namespaces (or the default, un-namespaced keyspace) is three
+     * independent entries, since the namespace enters the HRW routing
+     * hash alongside the key (see {@link HashRing}) and leads the body of
+     * the {@code g}/{@code s}/{@code d} wire frames (see {@link
+     * Connection}).
+     *
+     * <p>Obtained via {@link #namespace(byte[])}/{@link
+     * #namespace(String)}; cheap (holds only the namespace bytes and this
+     * client's own reference — no networking of its own), shares this
+     * client's connections, and forwards every call to this client's
+     * internal (namespace, key) methods rather than duplicating them —
+     * routing, replication fan-out, hedged reads, {@code W}
+     * refresh-and-retry, response tags, and compression all behave
+     * exactly as they do for the un-namespaced API. Invalid once {@link
+     * #close()} has run, raising the same {@link
+     * NanocachedException.AlreadyClosed} a direct call on this client
+     * would.
+     */
+    public final class Namespace {
+        private final byte[] namespace;
+
+        private Namespace(byte[] namespace) {
+            this.namespace = namespace;
+        }
+
+        /** The namespace this handle scopes every call to. A defensive
+         * copy — unlike a key or value, which this SDK never clones on
+         * the way in or out, this array is reused for every future call
+         * this handle makes, so handing back the live reference would let
+         * a caller who mutates it corrupt this handle's routing from then
+         * on. */
+        public byte[] namespace() {
+            return namespace.clone();
+        }
+
+        /** Returns the value decoded as strict UTF-8, or {@code
+         * Optional.empty()} when the key is missing.
+         * @throws UncheckedIOException if the stored value is not valid UTF-8 */
+        public Optional<String> get(String key) {
+            return get(key.getBytes(StandardCharsets.UTF_8));
+        }
+
+        /** As {@link #get(String)}. */
+        public Optional<String> get(byte[] key) {
+            return getBytes(key).map(NanocachedClient::decodeUtf8Strict);
+        }
+
+        /** Returns the raw value, or {@code Optional.empty()} when the key
+         * is missing. */
+        public Optional<byte[]> getBytes(String key) {
+            return getBytes(key.getBytes(StandardCharsets.UTF_8));
+        }
+
+        /** As {@link #getBytes(String)}. Same semantics as {@link
+         * NanocachedClient#getBytes(byte[])} — compression, read repair,
+         * hedged reads — just scoped to {@link #namespace()}. */
+        public Optional<byte[]> getBytes(byte[] key) {
+            return NanocachedClient.this.getBytes(namespace, key);
+        }
+
+        public void set(String key, String value) {
+            set(key, value, 0L);
+        }
+
+        public void set(String key, String value, long ttlSeconds) {
+            set(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+        }
+
+        public void set(byte[] key, byte[] value) {
+            set(key, value, 0L);
+        }
+
+        /** As {@link NanocachedClient#set(byte[], byte[], long)}, scoped
+         * to {@link #namespace()}. */
+        public void set(byte[] key, byte[] value, long ttlSeconds) {
+            NanocachedClient.this.set(namespace, key, value, ttlSeconds);
+        }
+
+        public boolean delete(String key) {
+            return delete(key.getBytes(StandardCharsets.UTF_8));
+        }
+
+        /** Returns whether the key existed before this call, scoped to
+         * {@link #namespace()}. */
+        public boolean delete(byte[] key) {
+            return NanocachedClient.this.delete(namespace, key);
+        }
+    }
+
     /**
      * A snapshot of counters for failures this client swallows by design
      * (replica-leg writes, read repair, and
@@ -892,11 +1008,20 @@ public final class NanocachedClient implements AutoCloseable {
      * probes the remaining owners before being accepted as final
      * (read repair). */
     public Optional<byte[]> getBytes(byte[] key) {
-        validateKey(key);
+        return getBytes(EMPTY_NAMESPACE, key);
+    }
+
+    /** The namespaced counterpart of every {@code get}/{@code getBytes}
+     * overload above (issue #105) — see {@link #namespace}. {@code
+     * namespace} empty is exactly the un-namespaced form: same routing,
+     * same legacy wire frame. */
+    Optional<byte[]> getBytes(byte[] namespace, byte[] key) {
+        validateKey(namespace, key);
         beforeOperation();
-        byte[] value = withWrongNodeRetry(() -> read(key, connection -> connection.get(key)));
+        byte[] value = withWrongNodeRetry(
+                () -> read(namespace, key, connection -> connection.get(namespace, key)));
         if (value == null && readRepair && ring != null) {
-            value = tryReadRepair(key);
+            value = tryReadRepair(namespace, key);
         }
         if (value == null) return Optional.empty();
         return Optional.of(compress ? Compression.decompressValue(value) : value);
@@ -923,14 +1048,14 @@ public final class NanocachedClient implements AutoCloseable {
      * miss is simply skipped, since read repair is opportunistic and a
      * later miss on the same key repairs it (issue: audit finding,
      * unbounded/undrained read-repair write-backs). */
-    private byte[] tryReadRepair(byte[] key) {
-        List<String> names = ownerNames(key);
+    private byte[] tryReadRepair(byte[] namespace, byte[] key) {
+        List<String> names = ownerNames(namespace, key);
         if (names.isEmpty()) return null;
         String primary = names.get(0);
         for (String name : names.subList(1, names.size())) {
             byte[] value;
             try {
-                value = applyReconnecting(() -> memberConnection(name), connection -> connection.get(key));
+                value = applyReconnecting(() -> memberConnection(name), connection -> connection.get(namespace, key));
             } catch (RuntimeException ignored) {
                 continue;
             }
@@ -941,7 +1066,7 @@ public final class NanocachedClient implements AutoCloseable {
                 Runnable repair = () -> {
                     try {
                         applyReconnecting(() -> memberConnection(primary), connection -> {
-                            connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS);
+                            connection.set(namespace, key, repairValue, READ_REPAIR_TTL_SECONDS);
                             return null;
                         });
                     } catch (NanocachedException ignored) {
@@ -1003,17 +1128,23 @@ public final class NanocachedClient implements AutoCloseable {
      * values at or above {@code compressionThreshold} when {@code
      * compress} is enabled (value compression). */
     public void set(byte[] key, byte[] value, long ttlSeconds) {
+        set(EMPTY_NAMESPACE, key, value, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #set(byte[], byte[], long)}
+     * (issue #105) — see {@link #namespace}. */
+    void set(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
         if (ttlSeconds < 0) {
             throw new IllegalArgumentException(
                     "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
-        validateKeyAndValue(key, value);
+        validateKeyAndValue(namespace, key, value);
         beforeOperation();
         byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
         withWrongNodeRetry(() -> {
-            write(key, connection -> {
-                connection.set(key, outgoing, wireTtlSeconds);
+            write(namespace, key, connection -> {
+                connection.set(namespace, key, outgoing, wireTtlSeconds);
                 return null;
             });
             return null;
@@ -1026,41 +1157,56 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** Returns whether the key existed before this call. */
     public boolean delete(byte[] key) {
-        validateKey(key);
-        beforeOperation();
-        return withWrongNodeRetry(() -> write(key, connection -> connection.delete(key)));
+        return delete(EMPTY_NAMESPACE, key);
     }
 
-    /** Rejects an empty key or one so large that {@code "G "}/{@code "D "}
-     * plus the key alone would already risk tripping the server's
-     * MAX_REQUEST_SIZE (issue: audit finding J2) — checked synchronously,
-     * before any connection is touched, mirroring {@link #set(byte[],
-     * byte[], long)}'s ttlSeconds check. */
-    private static void validateKey(byte[] key) {
+    /** The namespaced counterpart of {@link #delete(byte[])} (issue #105) —
+     * see {@link #namespace}. */
+    boolean delete(byte[] namespace, byte[] key) {
+        validateKey(namespace, key);
+        beforeOperation();
+        return withWrongNodeRetry(
+                () -> write(namespace, key, connection -> connection.delete(namespace, key)));
+    }
+
+    /** Rejects an empty key or a (namespace, key) pair so large that {@code
+     * "G "}/{@code "D "}/{@code "g "}/{@code "d "} plus the namespace and
+     * key alone would already risk tripping the server's MAX_REQUEST_SIZE
+     * (issue: audit finding J2; namespace bytes folded in for issue #105 —
+     * they lead the body exactly like the key does, so they count toward
+     * the same frame-size risk) — checked synchronously, before any
+     * connection is touched, mirroring {@link #set(byte[], byte[],
+     * byte[], long)}'s ttlSeconds check. The namespace itself has no
+     * length limit beyond this shared one (namespaces spec): there is no
+     * separate namespace-only cap. */
+    private static void validateKey(byte[] namespace, byte[] key) {
         if (key.length == 0) {
             throw new IllegalArgumentException("nanocached: key must not be empty");
         }
-        if (key.length > MAX_REQUEST_BYTES) {
+        long total = (long) namespace.length + key.length;
+        if (total > MAX_REQUEST_BYTES) {
             throw new IllegalArgumentException(
-                    "nanocached: key is " + key.length + " bytes, which exceeds the "
-                            + MAX_REQUEST_BYTES + "-byte request limit (server MAX_REQUEST_SIZE, "
-                            + "src/server.rs, is 1 MiB)");
+                    "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
+                            + " bytes) = " + total + " bytes, which exceeds the " + MAX_REQUEST_BYTES
+                            + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
         }
     }
 
-    /** As {@link #validateKey}, plus rejects a key+value pair too large
-     * for a single {@code S} request to have any chance of fitting under
-     * the server's MAX_REQUEST_SIZE (issue: audit finding J2). Checked
-     * against the caller-supplied value, before compression — compression
-     * only ever shrinks what actually goes on the wire, so this is the
-     * conservative (never falsely permissive) side to check. */
-    private static void validateKeyAndValue(byte[] key, byte[] value) {
-        validateKey(key);
-        long total = (long) key.length + value.length;
+    /** As {@link #validateKey}, plus rejects a namespace+key+value triple
+     * too large for a single {@code S}/{@code s} request to have any
+     * chance of fitting under the server's MAX_REQUEST_SIZE (issue: audit
+     * finding J2; namespace folded in for issue #105). Checked against the
+     * caller-supplied value, before compression — compression only ever
+     * shrinks what actually goes on the wire, so this is the conservative
+     * (never falsely permissive) side to check. */
+    private static void validateKeyAndValue(byte[] namespace, byte[] key, byte[] value) {
+        validateKey(namespace, key);
+        long total = (long) namespace.length + key.length + value.length;
         if (total > MAX_REQUEST_BYTES) {
             throw new IllegalArgumentException(
-                    "nanocached: key (" + key.length + " bytes) + value (" + value.length
-                            + " bytes) = " + total + " bytes, which exceeds the " + MAX_REQUEST_BYTES
+                    "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
+                            + " bytes) + value (" + value.length + " bytes) = " + total
+                            + " bytes, which exceeds the " + MAX_REQUEST_BYTES
                             + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
         }
     }
@@ -1253,9 +1399,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    private List<String> ownerNames(byte[] key) {
+    /** {@code namespace} empty is exactly the un-namespaced form — {@link
+     * HashRing#owners(byte[], byte[], int)} treats it identically to
+     * {@link HashRing#owners(byte[], int)} (namespaces, issue #105). */
+    private List<String> ownerNames(byte[] namespace, byte[] key) {
         synchronized (stateLock) {
-            return ring.owners(key, replication);
+            return ring.owners(namespace, key, replication);
         }
     }
 
@@ -1277,12 +1426,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    private <T> T read(byte[] key, ConnectionOp<T> op) {
+    private <T> T read(byte[] namespace, byte[] key, ConnectionOp<T> op) {
         if (ring == null) {
             return applyReconnecting(this::singleConnection, op);
         }
 
-        List<String> names = ownerNames(key);
+        List<String> names = ownerNames(namespace, key);
         if (readHedgeAfterNanos > 0 && names.size() > 1) {
             return readHedged(op, names);
         }
@@ -1495,12 +1644,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    private <T> T write(byte[] key, ConnectionOp<T> op) {
+    private <T> T write(byte[] namespace, byte[] key, ConnectionOp<T> op) {
         if (ring == null) {
             return applyReconnecting(this::singleConnection, op);
         }
 
-        List<String> names = ownerNames(key);
+        List<String> names = ownerNames(namespace, key);
         if (names.isEmpty()) {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }

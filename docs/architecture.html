@@ -53,7 +53,12 @@ replication factor R) and then talks to nodes directly.</p>
 <p>For each key, every node gets a score —
 <code>fmix64(fnv1a(node-name) XOR fnv1a(key))</code> — and the nodes
 ranked by descending score are the key's owner list. The top-R nodes
-hold the key.</p>
+hold the key. A <a href="protocol.html#namespaces">namespaced</a> key
+hashes <code>be32(namespace-length) || namespace || key</code> in place
+of the bare key, so one namespace's entries still spread over every node
+and two namespaces' identical key names land on different ones; the
+default namespace keeps the bare form so existing placements survive an
+upgrade.</p>
 <p>Rendezvous (highest-random-weight) hashing has a property that
 matters here: adding or removing a node never reorders the surviving
 nodes in any key's ranking. A new node takes exactly its share of keys

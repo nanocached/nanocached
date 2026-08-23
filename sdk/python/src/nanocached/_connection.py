@@ -1,5 +1,6 @@
 """One already-identified connection to a single nanocached-node, speaking
-the cache protocol (``G``/``S``/``D`` — the ``A`` identify exchange happens
+the cache protocol (``G``/``S``/``D``, and their namespaced counterparts
+``g``/``s``/``d`` — issue #105 — the ``A`` identify exchange happens
 in ``_identify`` before a Connection exists).
 
 Requests are pipelined onto the socket and matched to responses in send
@@ -46,19 +47,43 @@ def _tag_field(tag: int | None) -> bytes:
     return b"" if tag is None else b" %d" % tag
 
 
-def _encode_get(key: bytes, tag: int | None = None) -> bytes:
+# Namespaces (issue #105): the SDK rule (docs/protocol.html "g / s / d")
+# is that the *default* (empty) namespace must keep sending the legacy
+# uppercase frames byte-for-byte, so an unchanged client talking to an
+# old, pre-namespace server keeps working — only a non-empty namespace
+# switches to the lowercase g/s/d frames, which gain one leading
+# <namespace-length> header field and namespace bytes leading the body.
+# Every encoder below takes namespace last, defaulting to b"", so an
+# un-namespaced call site reads exactly as it did before this feature.
+
+
+def _encode_get(key: bytes, tag: int | None = None, namespace: bytes = b"") -> bytes:
+    if namespace:
+        return b"g %d %d%b\n%b%b" % (len(namespace), len(key), _tag_field(tag), namespace, key)
     return b"G %d%b\n%b" % (len(key), _tag_field(tag), key)
 
 
-def _encode_set(key: bytes, value: bytes, ttl_seconds: int, tag: int | None = None) -> bytes:
+def _encode_set(
+    key: bytes, value: bytes, ttl_seconds: int, tag: int | None = None, namespace: bytes = b""
+) -> bytes:
     # 0 means no expiry — omitted from the wire exactly as the old
     # None/absent TTL was.
+    if namespace:
+        if ttl_seconds == 0:
+            return b"s %d %d %d%b\n%b%b%b" % (
+                len(namespace), len(key), len(value), _tag_field(tag), namespace, key, value
+            )
+        return b"s %d %d %d %d%b\n%b%b%b" % (
+            len(namespace), len(key), len(value), ttl_seconds, _tag_field(tag), namespace, key, value
+        )
     if ttl_seconds == 0:
         return b"S %d %d%b\n%b%b" % (len(key), len(value), _tag_field(tag), key, value)
     return b"S %d %d %d%b\n%b%b" % (len(key), len(value), ttl_seconds, _tag_field(tag), key, value)
 
 
-def _encode_delete(key: bytes, tag: int | None = None) -> bytes:
+def _encode_delete(key: bytes, tag: int | None = None, namespace: bytes = b"") -> bytes:
+    if namespace:
+        return b"d %d %d%b\n%b%b" % (len(namespace), len(key), _tag_field(tag), namespace, key)
     return b"D %d%b\n%b" % (len(key), _tag_field(tag), key)
 
 
@@ -108,8 +133,8 @@ class Connection:
     def close(self) -> None:
         self._poison(ConnectionError("nanocached: connection closed"))
 
-    async def get(self, key: bytes) -> bytes | None:
-        marker, value = await self._request(lambda tag: _encode_get(key, tag))
+    async def get(self, key: bytes, namespace: bytes = b"") -> bytes | None:
+        marker, value = await self._request(lambda tag: _encode_get(key, tag, namespace))
         if marker == b"V":
             return value
         if marker == b"N":
@@ -118,15 +143,15 @@ class Connection:
             raise WrongNodeError()
         raise self._mismatch(marker)
 
-    async def set(self, key: bytes, value: bytes, ttl_seconds: int) -> None:
-        marker, _ = await self._request(lambda tag: _encode_set(key, value, ttl_seconds, tag))
+    async def set(self, key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b"") -> None:
+        marker, _ = await self._request(lambda tag: _encode_set(key, value, ttl_seconds, tag, namespace))
         if marker == b"W":
             raise WrongNodeError()
         if marker != b"S":
             raise self._mismatch(marker)
 
-    async def delete(self, key: bytes) -> bool:
-        marker, _ = await self._request(lambda tag: _encode_delete(key, tag))
+    async def delete(self, key: bytes, namespace: bytes = b"") -> bool:
+        marker, _ = await self._request(lambda tag: _encode_delete(key, tag, namespace))
         if marker == b"D":
             return True
         if marker == b"N":

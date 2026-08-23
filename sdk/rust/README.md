@@ -66,6 +66,46 @@ exposes the factor in use. A write whose primary just died recovers
 automatically once discovery drops the node (bounded by its liveness
 timeout): the failed attempt forces a node-list refresh and one retry.
 
+## Namespaces
+
+A namespace is a flat, opaque byte string that scopes a key: the same
+key name in two namespaces (or with no namespace at all) is a wholly
+independent entry. `client.namespace(ns)` returns a lightweight handle
+with the same `get`/`get_bytes`/`set`/`delete` methods as the client
+itself, just scoped to `ns`:
+
+```rust
+let users = client.namespace("users");
+users.set("alice", "online", 0).await?;
+client.set("alice", "offline", 0).await?; // a different entry — no namespace
+
+assert_eq!(users.get("alice").await?, Some("online".to_string()));
+assert_eq!(client.get("alice").await?, Some("offline".to_string()));
+```
+
+The handle is cheap — it shares the client's connections and routing,
+and opens no sockets of its own — and forwards to the same internal
+methods `get`/`set`/`delete` themselves use, so it gets identical
+semantics: routing, replication fan-out, hedged reads, `W`
+refresh-and-retry, response tags, and compression all key off `(ns,
+key)` together. `client.namespace("")` returns a handle equivalent to
+the client itself (the empty namespace is the default one every
+namespace-less call already uses); `ns.name()` returns the namespace
+back. A handle outlives neither the client's connections nor its own
+lifetime — using one after `close()` raises the same `AlreadyClosed`
+error the client's own methods do.
+
+On the wire, a non-empty namespace switches `get`/`set`/`delete` from
+the `G`/`S`/`D` frames to their lowercase `g`/`s`/`d` counterparts,
+which carry the namespace's length and bytes alongside the key's; the
+default (empty) namespace always sends the exact legacy `G`/`S`/`D`
+bytes, so code that never touches namespaces is unaffected and keeps
+working against an older server. A namespace has no length limit of its
+own beyond the request-size bound this crate already applies to
+key+value, and — like a key — may contain any bytes; there is no
+delimiter, no escaping, no hierarchy. Namespaced frames need a
+namespace-aware server; talking to an older one, don't use them.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

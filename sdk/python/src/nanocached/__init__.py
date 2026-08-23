@@ -13,7 +13,7 @@ from ._errors import (
 )
 from ._hashring import HashRing
 from ._identify import DiscoveredNode
-from .client import ClientStats, NanocachedClient
+from .client import ClientStats, NanocachedClient, Namespace
 
 __all__ = [
     "AlreadyClosedError",
@@ -23,6 +23,7 @@ __all__ = [
     "DiscoveredNode",
     "DiscoveryBusyError",
     "HashRing",
+    "Namespace",
     "NanocachedClient",
     "NanocachedError",
     "WrongNodeError",

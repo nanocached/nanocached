@@ -1,4 +1,5 @@
 use crate::cache::Cache;
+use crate::key::Key;
 use crate::response::Response;
 use bytes::{Bytes, BytesMut};
 use std::time::Duration;
@@ -12,16 +13,20 @@ pub enum Command {
         tagging: bool,
     },
     Get {
-        key: Bytes,
+        key: Key,
     },
     Set {
-        key: Bytes,
+        key: Key,
         value: Bytes,
         ttl: Option<Duration>,
     },
     Delete {
-        key: Bytes,
+        key: Key,
     },
+    /// Every cache command addresses a `Key` — namespace plus name (issue
+    /// #105). The legacy `G`/`S`/`D` frames address the default (empty)
+    /// namespace; their lowercase `g`/`s`/`d` counterparts carry an
+    /// explicit, length-prefixed namespace field first.
     /// Internal-only (staged node join): never produced by `parse()`, constructed
     /// directly by the migration task to snapshot every key this node
     /// currently holds, to compute which ones a newly joining node now
@@ -35,19 +40,19 @@ pub enum Command {
     /// holding zero or one entry — reusing its shape rather than adding a
     /// new one for what's otherwise the exact same data.
     PeekEntry {
-        key: Bytes,
+        key: Key,
     },
     /// Internal-only (staged node join): marks a key as handed off to another
     /// node during a migration this node was the source for. `Sweep`
     /// reclaims marked entries later.
     MarkMigrated {
-        key: Bytes,
+        key: Key,
     },
     /// Internal-only (staged node join): reverses `MarkMigrated` for a key whose
     /// migration was cancelled (see `Command::CancelMigration`), so
     /// `Sweep` doesn't reclaim it after all.
     UnmarkMigrated {
-        key: Bytes,
+        key: Key,
     },
     /// Internal-only (staged node join): the active-deletion pass, run
     /// periodically by a background task. Since TTL expiry is otherwise
@@ -278,7 +283,17 @@ fn parse_with_mode(
             Ok((Command::Auth { secret, tagging }, None))
         }
 
-        b"G" | b"D" => {
+        // Namespaced variants (issue #105): the lowercase letter carries
+        // one extra leading `<namespace-length>` field and the namespace
+        // bytes lead the body. A length of 0 addresses the default
+        // namespace, same as the uppercase form.
+        b"G" | b"D" | b"g" | b"d" => {
+            let namespaced = command == b"g" || command == b"d";
+            let namespace_length = if namespaced {
+                parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?
+            } else {
+                0
+            };
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let tag = parse_trailing_tag(&mut parts, tagged)?;
 
@@ -292,7 +307,10 @@ fn parse_with_mode(
                 return Err(ParseError::EmptyKey);
             }
 
-            let key_start = header_end + 1;
+            let namespace_start = header_end + 1;
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
             let key_end = key_start
                 .checked_add(key_length)
                 .ok_or(ParseError::InvalidLength)?;
@@ -301,10 +319,13 @@ fn parse_with_mode(
                 return Err(ParseError::Incomplete);
             }
 
-            let is_get = command == b"G";
+            let is_get = command == b"G" || command == b"g";
 
             let frame = input.split_to(key_end).freeze();
-            let key = frame.slice(key_start..key_end);
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
 
             Ok((
                 if is_get {
@@ -316,7 +337,12 @@ fn parse_with_mode(
             ))
         }
 
-        b"S" => {
+        b"S" | b"s" => {
+            let namespace_length = if command == b"s" {
+                parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?
+            } else {
+                0
+            };
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
             // In tagged mode the tag is the *last* field, so with both
@@ -355,7 +381,11 @@ fn parse_with_mode(
                 None => None,
             };
 
-            let key_start = header_end + 1;
+            let namespace_start = header_end + 1;
+
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
 
             let key_end = key_start
                 .checked_add(key_length)
@@ -370,7 +400,10 @@ fn parse_with_mode(
             }
 
             let frame = input.split_to(value_end).freeze();
-            let key = frame.slice(key_start..key_end);
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
             let value = frame.slice(key_end..value_end);
 
             Ok((Command::Set { key, value, ttl }, tag))
@@ -678,6 +711,17 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
 mod tests {
     use super::*;
 
+    fn key(name: &[u8]) -> Key {
+        Key::unnamespaced(Bytes::copy_from_slice(name))
+    }
+
+    fn namespaced(namespace: &[u8], name: &[u8]) -> Key {
+        Key::new(
+            Bytes::copy_from_slice(namespace),
+            Bytes::copy_from_slice(name),
+        )
+    }
+
     fn buf(bytes: &[u8]) -> BytesMut {
         BytesMut::from(bytes)
     }
@@ -736,12 +780,7 @@ mod tests {
     fn parses_get_command() {
         let mut input = buf(b"G 4\nname");
 
-        assert_eq!(
-            parse(&mut input),
-            Ok(Command::Get {
-                key: Bytes::from_static(b"name"),
-            })
-        );
+        assert_eq!(parse(&mut input), Ok(Command::Get { key: key(b"name") }));
         assert!(input.is_empty());
     }
 
@@ -752,7 +791,7 @@ mod tests {
         assert_eq!(
             parse(&mut input),
             Ok(Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
             })
@@ -767,7 +806,7 @@ mod tests {
         assert_eq!(
             parse(&mut input),
             Ok(Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: Some(Duration::from_secs(10)),
             })
@@ -779,12 +818,7 @@ mod tests {
     fn parses_delete_command() {
         let mut input = buf(b"D 4\nname");
 
-        assert_eq!(
-            parse(&mut input),
-            Ok(Command::Delete {
-                key: Bytes::from_static(b"name"),
-            })
-        );
+        assert_eq!(parse(&mut input), Ok(Command::Delete { key: key(b"name") }));
         assert!(input.is_empty());
     }
 
@@ -854,7 +888,7 @@ mod tests {
         assert_eq!(
             parse(&mut input),
             Ok(Command::Set {
-                key: Bytes::from_static(b"name"),
+                key: key(b"name"),
                 value: Bytes::new(),
                 ttl: None,
             })
@@ -891,7 +925,7 @@ mod tests {
         assert_eq!(
             parse(&mut input),
             Ok(Command::Get {
-                key: Bytes::from(vec![0xff, 0x00, b'a']),
+                key: Key::from(Bytes::from(vec![0xff, 0x00, b'a'])),
             })
         );
     }
@@ -899,11 +933,9 @@ mod tests {
     #[test]
     fn get_returns_value_for_existing_key() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
 
-        let command = Command::Get {
-            key: Bytes::from_static(b"name"),
-        };
+        let command = Command::Get { key: key(b"name") };
 
         assert_eq!(
             command.execute(&mut cache),
@@ -915,9 +947,7 @@ mod tests {
     fn get_returns_not_found_for_missing_key() {
         let mut cache = Cache::new(usize::MAX);
 
-        let command = Command::Get {
-            key: Bytes::from_static(b"name"),
-        };
+        let command = Command::Get { key: key(b"name") };
 
         assert_eq!(command.execute(&mut cache), Response::NotFound);
     }
@@ -942,13 +972,13 @@ mod tests {
         let mut cache = Cache::new(usize::MAX);
 
         let command = Command::Set {
-            key: Bytes::from_static(b"name"),
+            key: key(b"name"),
             value: Bytes::from_static(b"Alice"),
             ttl: None,
         };
 
         assert_eq!(command.execute(&mut cache), Response::Stored);
-        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]
@@ -956,24 +986,22 @@ mod tests {
         let mut cache = Cache::new(usize::MAX);
 
         let command = Command::Set {
-            key: Bytes::from_static(b"name"),
+            key: key(b"name"),
             value: Bytes::from_static(b"Alice"),
             ttl: Some(Duration::ZERO),
         };
 
         assert_eq!(command.execute(&mut cache), Response::Stored);
 
-        assert_eq!(cache.get(b"name"), None);
+        assert_eq!(cache.get(&key(b"name")), None);
     }
 
     #[test]
     fn delete_returns_deleted_for_existing_key() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
 
-        let command = Command::Delete {
-            key: Bytes::from_static(b"name"),
-        };
+        let command = Command::Delete { key: key(b"name") };
 
         assert_eq!(command.execute(&mut cache), Response::Deleted);
     }
@@ -982,9 +1010,7 @@ mod tests {
     fn delete_returns_not_found_for_missing_key() {
         let mut cache = Cache::new(usize::MAX);
 
-        let command = Command::Delete {
-            key: Bytes::from_static(b"name"),
-        };
+        let command = Command::Delete { key: key(b"name") };
 
         assert_eq!(command.execute(&mut cache), Response::NotFound);
     }
@@ -992,30 +1018,24 @@ mod tests {
     #[test]
     fn list_entries_returns_every_stored_key() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
 
         assert_eq!(
             Command::ListEntries.execute(&mut cache),
-            Response::Keys(vec![Bytes::from_static(b"name")])
+            Response::Keys(vec![key(b"name")])
         );
     }
 
     #[test]
     fn peek_entry_returns_the_matching_entry() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
 
-        let command = Command::PeekEntry {
-            key: Bytes::from_static(b"name"),
-        };
+        let command = Command::PeekEntry { key: key(b"name") };
 
         assert_eq!(
             command.execute(&mut cache),
-            Response::Entries(vec![(
-                Bytes::from_static(b"name"),
-                Bytes::from_static(b"Alice"),
-                None
-            )])
+            Response::Entries(vec![(key(b"name"), Bytes::from_static(b"Alice"), None)])
         );
     }
 
@@ -1024,7 +1044,7 @@ mod tests {
         let mut cache = Cache::new(usize::MAX);
 
         let command = Command::PeekEntry {
-            key: Bytes::from_static(b"missing"),
+            key: key(b"missing"),
         };
 
         assert_eq!(command.execute(&mut cache), Response::Entries(Vec::new()));
@@ -1033,11 +1053,9 @@ mod tests {
     #[test]
     fn mark_migrated_returns_marked() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
 
-        let command = Command::MarkMigrated {
-            key: Bytes::from_static(b"name"),
-        };
+        let command = Command::MarkMigrated { key: key(b"name") };
 
         assert_eq!(command.execute(&mut cache), Response::Marked);
     }
@@ -1045,8 +1063,8 @@ mod tests {
     #[test]
     fn sweep_returns_how_many_entries_it_removed() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
-        cache.mark_migrated(b"name");
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(&key(b"name"));
 
         assert_eq!(
             Command::Sweep { marked: true }.execute(&mut cache),
@@ -1057,14 +1075,14 @@ mod tests {
     #[test]
     fn sweep_without_marked_leaves_marked_entries_in_place() {
         let mut cache = Cache::new(usize::MAX);
-        cache.set(Bytes::from_static(b"name"), Bytes::from_static(b"Alice"));
-        cache.mark_migrated(b"name");
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        cache.mark_migrated(&key(b"name"));
 
         assert_eq!(
             Command::Sweep { marked: false }.execute(&mut cache),
             Response::Swept(0)
         );
-        assert_eq!(cache.get(b"name"), Some(Bytes::from_static(b"Alice")));
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]
@@ -1211,21 +1229,11 @@ mod tests {
 
         assert_eq!(
             parse_tagged(&mut input),
-            Ok((
-                Command::Get {
-                    key: Bytes::from_static(b"name"),
-                },
-                Some(7),
-            ))
+            Ok((Command::Get { key: key(b"name") }, Some(7),))
         );
         assert_eq!(
             parse_tagged(&mut input),
-            Ok((
-                Command::Delete {
-                    key: Bytes::from_static(b"name"),
-                },
-                Some(u32::MAX),
-            ))
+            Ok((Command::Delete { key: key(b"name") }, Some(u32::MAX),))
         );
         assert!(input.is_empty());
     }
@@ -1245,7 +1253,7 @@ mod tests {
             parse_tagged(&mut input),
             Ok((
                 Command::Set {
-                    key: Bytes::from_static(b"name"),
+                    key: key(b"name"),
                     value: Bytes::from_static(b"Alice"),
                     ttl: None,
                 },
@@ -1263,7 +1271,7 @@ mod tests {
             parse_tagged(&mut input),
             Ok((
                 Command::Set {
-                    key: Bytes::from_static(b"name"),
+                    key: key(b"name"),
                     value: Bytes::from_static(b"Alice"),
                     ttl: Some(Duration::from_secs(10)),
                 },
@@ -1293,6 +1301,183 @@ mod tests {
                 },
                 None,
             ))
+        );
+    }
+
+    #[test]
+    fn parses_namespaced_get_set_and_delete() {
+        // Issue #105: `<namespace-length>` leads, namespace bytes lead the body.
+        let mut input = buf(b"g 5 4\nusersname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Get {
+                key: namespaced(b"users", b"name"),
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"s 5 4 5 30\nusersnameAlice");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Set {
+                key: namespaced(b"users", b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: Some(Duration::from_secs(30)),
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"d 5 4\nusersname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Delete {
+                key: namespaced(b"users", b"name"),
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn a_zero_length_namespace_is_the_default_namespace() {
+        let mut input = buf(b"g 0 4\nname");
+        assert_eq!(parse(&mut input), Ok(Command::Get { key: key(b"name") }));
+
+        let mut input = buf(b"s 0 4 5\nnameAlice");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            })
+        );
+    }
+
+    #[test]
+    fn namespaces_are_binary_safe() {
+        let mut input = buf(b"g 2 1\n\xff\x00k");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Get {
+                key: namespaced(b"\xff\x00", b"k"),
+            })
+        );
+    }
+
+    #[test]
+    fn namespaced_commands_carry_the_tag_last_in_tagged_mode() {
+        let mut input = buf(b"g 5 4 7\nusersname");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Get {
+                    key: namespaced(b"users", b"name"),
+                },
+                Some(7),
+            ))
+        );
+
+        let mut input = buf(b"s 5 4 5 30 8\nusersnameAlice");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Set {
+                    key: namespaced(b"users", b"name"),
+                    value: Bytes::from_static(b"Alice"),
+                    ttl: Some(Duration::from_secs(30)),
+                },
+                Some(8),
+            ))
+        );
+
+        let mut input = buf(b"s 5 4 5 9\nusersnameAlice");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Set {
+                    key: namespaced(b"users", b"name"),
+                    value: Bytes::from_static(b"Alice"),
+                    ttl: None,
+                },
+                Some(9),
+            ))
+        );
+
+        let mut input = buf(b"d 5 4 10\nusersname");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Delete {
+                    key: namespaced(b"users", b"name"),
+                },
+                Some(10),
+            ))
+        );
+    }
+
+    #[test]
+    fn namespaced_commands_still_reject_an_empty_key() {
+        let mut input = buf(b"g 5 0\nusers");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+
+        let mut input = buf(b"s 5 0 1\nusersx");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn namespaced_commands_require_the_namespace_length_field() {
+        // `g 4\nname` would be a legacy frame missing its leading field —
+        // the key length alone can't stand in for both.
+        let mut input = buf(b"g 4\nname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+
+        let mut input = buf(b"s 4 5\nnameAlice");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_leaves_a_namespaced_command_untouched_when_incomplete() {
+        let original = b"s 5 4 5\nusersnameAli".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn namespaced_and_unnamespaced_entries_do_not_collide() {
+        let mut cache = Cache::new(usize::MAX);
+
+        Command::Set {
+            key: key(b"usersname"),
+            value: Bytes::from_static(b"flat"),
+            ttl: None,
+        }
+        .execute(&mut cache);
+        Command::Set {
+            key: namespaced(b"users", b"name"),
+            value: Bytes::from_static(b"scoped"),
+            ttl: None,
+        }
+        .execute(&mut cache);
+
+        assert_eq!(
+            Command::Get {
+                key: key(b"usersname"),
+            }
+            .execute(&mut cache),
+            Response::Value(Bytes::from_static(b"flat"))
+        );
+        assert_eq!(
+            Command::Get {
+                key: namespaced(b"users", b"name"),
+            }
+            .execute(&mut cache),
+            Response::Value(Bytes::from_static(b"scoped"))
+        );
+        assert_eq!(
+            Command::Get { key: key(b"name") }.execute(&mut cache),
+            Response::NotFound
         );
     }
 
