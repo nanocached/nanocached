@@ -33,6 +33,60 @@ public class HashRingTests
     }
 
     [Fact]
+    public void NamespacedKeysMatchCrossLanguageVectors()
+    {
+        // issue #105 — first-class namespaces: key_hash for (ns, key),
+        // pinned across the server (src/hash_ring.rs) and every SDK. Ring
+        // over node-a/node-b/node-c, R=3 — same ring as the existing
+        // alpha/beta/"" vectors above.
+        Assert.Equal(0xfd4ab55027c21df6UL, HashRing.KeyHash(Bytes("users"), Bytes("alpha")));
+        Assert.Equal(0xa9e9bbca44bb502eUL, HashRing.KeyHash(Bytes("users"), Bytes("")));
+        byte[] binaryNamespace = { 0xff, 0x00 };
+        Assert.Equal(0x8f7c097eccb8e792UL, HashRing.KeyHash(binaryNamespace, Bytes("beta")));
+
+        var ring = new HashRing(Nodes);
+        Assert.Equal(
+            new[] { "node-a", "node-c", "node-b" },
+            ring.Owners(Bytes("users"), Bytes("alpha"), 3));
+        Assert.Equal(
+            new[] { "node-b", "node-c", "node-a" },
+            ring.Owners(Bytes("users"), Bytes(""), 3));
+        Assert.Equal(
+            new[] { "node-b", "node-a", "node-c" },
+            ring.Owners(binaryNamespace, Bytes("beta"), 3));
+    }
+
+    [Fact]
+    public void DefaultNamespaceRoutesIdenticallyToTheLegacyForm()
+    {
+        // Rolling-upgrade invariant (issue #105): an un-namespaced key's
+        // placement must not move once the server (and this client) learn
+        // about namespaces — the empty namespace hashes and routes exactly
+        // as the pre-namespace single-key form always has.
+        Assert.Equal(HashRing.Fnv1a(Bytes("alpha")), HashRing.KeyHash(ReadOnlySpan<byte>.Empty, Bytes("alpha")));
+        Assert.Equal(HashRing.Fnv1a(Bytes("")), HashRing.KeyHash(ReadOnlySpan<byte>.Empty, Bytes("")));
+
+        var ring = new HashRing(Nodes);
+        Assert.Equal(
+            new[] { "node-c", "node-b", "node-a" },
+            ring.Owners(ReadOnlySpan<byte>.Empty, Bytes("alpha"), 3));
+        Assert.Equal(ring.Owners(Bytes("alpha"), 3), ring.Owners(ReadOnlySpan<byte>.Empty, Bytes("alpha"), 3));
+        Assert.Equal(ring.Route(Bytes("alpha")), ring.Route(ReadOnlySpan<byte>.Empty, Bytes("alpha")));
+    }
+
+    [Fact]
+    public void NamespaceAndKeyBoundariesAreUnambiguous()
+    {
+        // A delimiter-free split: the length prefix keeps ("ab","c") and
+        // ("a","bc") apart, and a namespaced key never collides with the
+        // un-namespaced concatenation (issue #105).
+        Assert.NotEqual(
+            HashRing.KeyHash(Bytes("ab"), Bytes("c")),
+            HashRing.KeyHash(Bytes("a"), Bytes("bc")));
+        Assert.NotEqual(HashRing.KeyHash(Bytes("ab"), Bytes("c")), HashRing.KeyHash(ReadOnlySpan<byte>.Empty, Bytes("abc")));
+    }
+
+    [Fact]
     public void OwnersAreDistinctAndCapped()
     {
         var ring = new HashRing(Nodes);

@@ -1,8 +1,9 @@
 /**
  * In-process stand-ins for nanocached-node and nanocached-discovery,
- * speaking just enough of the wire protocol (`A`, `G`/`S`/`D`, `L`) for
- * the client tests to exercise NanocachedClient end-to-end over real TCP
- * sockets without the Rust binaries.
+ * speaking just enough of the wire protocol (`A`, `G`/`S`/`D` and their
+ * namespaced `g`/`s`/`d` counterparts (issue #105), `L`) for the client
+ * tests to exercise NanocachedClient end-to-end over real TCP sockets
+ * without the Rust binaries.
  */
 
 import { createServer, type Server, type Socket } from "node:net";
@@ -15,6 +16,13 @@ interface MockServerBase {
 
 export interface MockNode extends MockServerBase {
   store: Map<string, Buffer>;
+  /** The default-namespace store, keyed by namespace (issue #105) —
+   * `store` above is exactly `namespacedStore("")`, exposed separately
+   * only because it predates namespaces and plenty of tests already
+   * address it directly. A `namespace` never seen on the wire gets a
+   * fresh, empty map the first time it's asked for (matching the real
+   * server: an unknown namespace simply has no entries yet). */
+  namespacedStore(namespace: string | Uint8Array): Map<string, Buffer>;
   /** Queue a one-off `W` reply for the next G/S/D request. */
   answerWrongNodeOnce(): void;
   /** Queue a one-off `W` reply for the next S specifically (not G/D) —
@@ -50,6 +58,12 @@ export interface MockNode extends MockServerBase {
   connectionCount(): number;
   /** How many `G` requests this server has ever received. */
   getCount(): number;
+  /** The raw command letter (`"G"`/`"S"`/`"D"`/`"g"`/`"s"`/`"d"`) of the
+   * most recent cache-op request this server received — lets a test
+   * assert the SDK rule that the default namespace sends the legacy
+   * uppercase frame, byte-for-byte, never the lowercase `g`/`s`/`d` form
+   * (first-class namespaces, issue #105). */
+  lastCommand(): string;
   /** The TTL (whole seconds; 0 if omitted on the wire) from the most
    * recent `S` request this server received. */
   lastSetTtl(): number;
@@ -148,6 +162,24 @@ export async function startMockNode(
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
+  // Namespaces (issue #105): one sub-map per non-empty namespace, keyed
+  // by its raw bytes (base64, so an arbitrary/binary namespace is a safe
+  // Map key) — mirroring src/key.rs's doc comment on the server side
+  // ("one sub-map per namespace, with legacy traffic in the \"\" one").
+  // The default namespace's entries live in `store` itself, not a
+  // namespaceStores entry, so `store` keeps meaning exactly what it
+  // always did.
+  const namespaceStores = new Map<string, Map<string, Buffer>>();
+  function storeFor(namespace: Buffer): Map<string, Buffer> {
+    if (namespace.length === 0) return store;
+    const key = namespace.toString("base64");
+    let existing = namespaceStores.get(key);
+    if (existing === undefined) {
+      existing = new Map();
+      namespaceStores.set(key, existing);
+    }
+    return existing;
+  }
   let wrongNodeReplies = 0;
   let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
@@ -161,6 +193,7 @@ export async function startMockNode(
   let setDelayMs = 0;
   let getDelayMs = 0;
   let lastSetTtl = 0;
+  let lastCommand = "";
   let silent = false;
 
   const server = createServer((socket) => {
@@ -205,14 +238,24 @@ export async function startMockNode(
             break;
           }
 
-          case "G": {
-            const keyLength = Number(parts[1]);
-            if (buffer.length < bodyStart + keyLength) return;
-            const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
-            buffer = buffer.subarray(bodyStart + keyLength);
+          case "G":
+          case "g": {
+            lastCommand = parts[0];
+            // Namespaced variants (issue #105): `g` carries one extra
+            // leading `<namespace-length>` header field, and the
+            // namespace bytes lead the body — see encodeGet.
+            const namespaced = parts[0] === "g";
+            const namespaceLength = namespaced ? Number(parts[1]) : 0;
+            const keyLength = Number(parts[namespaced ? 2 : 1]);
+            if (buffer.length < bodyStart + namespaceLength + keyLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
             gets++;
 
             if (silent) break;
+
+            const targetStore = storeFor(namespace);
 
             // Factored out so delayGets (hedged reads, issue #64) can hold
             // the whole reply — including every special-cased one-off
@@ -226,7 +269,9 @@ export async function startMockNode(
 
               if (wrongTagReplies > 0 && tagged) {
                 wrongTagReplies--;
-                socket.write(`N ${Number(parts[2]) + 1}\n`);
+                // The tag is always the header's last field on a tagged
+                // connection, namespaced or not.
+                socket.write(`N ${Number(parts[parts.length - 1]) + 1}\n`);
                 return;
               }
 
@@ -269,7 +314,7 @@ export async function startMockNode(
                 return;
               }
 
-              const value = store.get(key);
+              const value = targetStore.get(key);
               if (value === undefined) {
                 socket.write(`N${tag}\n`);
               } else {
@@ -285,19 +330,32 @@ export async function startMockNode(
             break;
           }
 
-          case "S": {
-            const keyLength = Number(parts[1]);
-            const valueLength = Number(parts[2]);
-            if (buffer.length < bodyStart + keyLength + valueLength) return;
-            const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
-            const value = Buffer.from(buffer.subarray(bodyStart + keyLength, bodyStart + keyLength + valueLength));
-            buffer = buffer.subarray(bodyStart + keyLength + valueLength);
-            // The TTL, when present, is the field after the two lengths
-            // (omitted on the wire means "no expiry", i.e. 0 — see
-            // encodeSet's doc comment); on a tagged connection the tag
-            // sits after it as the last field.
-            const ttlFieldCount = parts.length - (tagged ? 4 : 3);
-            lastSetTtl = ttlFieldCount > 0 ? Number(parts[3]) : 0;
+          case "S":
+          case "s": {
+            lastCommand = parts[0];
+            // Namespaced variant (issue #105): `s` carries one extra
+            // leading `<namespace-length>` header field ahead of the key
+            // and value lengths, and the namespace bytes lead the body —
+            // see encodeSet. `offset` shifts every following field index
+            // by one when present.
+            const namespaced = parts[0] === "s";
+            const offset = namespaced ? 1 : 0;
+            const namespaceLength = namespaced ? Number(parts[1]) : 0;
+            const keyLength = Number(parts[1 + offset]);
+            const valueLength = Number(parts[2 + offset]);
+            if (buffer.length < bodyStart + namespaceLength + keyLength + valueLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
+            const value = Buffer.from(
+              buffer.subarray(bodyStart + namespaceLength + keyLength, bodyStart + namespaceLength + keyLength + valueLength),
+            );
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength + valueLength);
+            // The TTL, when present, is the field after the key/value
+            // lengths (omitted on the wire means "no expiry", i.e. 0 —
+            // see encodeSet's doc comment); on a tagged connection the
+            // tag sits after it as the last field.
+            const ttlFieldCount = parts.length - (tagged ? 4 + offset : 3 + offset);
+            lastSetTtl = ttlFieldCount > 0 ? Number(parts[3 + offset]) : 0;
 
             if (silent) break;
 
@@ -313,7 +371,7 @@ export async function startMockNode(
               break;
             }
 
-            store.set(key, value);
+            storeFor(namespace).set(key, value);
             if (setDelayMs > 0) {
               setTimeout(() => socket.write(`S${tag}\n`), setDelayMs);
             } else {
@@ -322,11 +380,16 @@ export async function startMockNode(
             break;
           }
 
-          case "D": {
-            const keyLength = Number(parts[1]);
-            if (buffer.length < bodyStart + keyLength) return;
-            const key = buffer.subarray(bodyStart, bodyStart + keyLength).toString("utf8");
-            buffer = buffer.subarray(bodyStart + keyLength);
+          case "D":
+          case "d": {
+            lastCommand = parts[0];
+            const namespaced = parts[0] === "d";
+            const namespaceLength = namespaced ? Number(parts[1]) : 0;
+            const keyLength = Number(parts[namespaced ? 2 : 1]);
+            if (buffer.length < bodyStart + namespaceLength + keyLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
 
             if (silent) break;
 
@@ -336,7 +399,7 @@ export async function startMockNode(
               break;
             }
 
-            socket.write(store.delete(key) ? `D${tag}\n` : `N${tag}\n`);
+            socket.write(storeFor(namespace).delete(key) ? `D${tag}\n` : `N${tag}\n`);
             break;
           }
 
@@ -355,6 +418,7 @@ export async function startMockNode(
     port,
     address: `127.0.0.1:${port}`,
     store,
+    namespacedStore: (namespace) => storeFor(typeof namespace === "string" ? Buffer.from(namespace, "utf8") : Buffer.from(namespace)),
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
     },
@@ -379,6 +443,7 @@ export async function startMockNode(
     },
     connectionCount: () => connections,
     getCount: () => gets,
+    lastCommand: () => lastCommand,
     lastSetTtl: () => lastSetTtl,
     dropConnections: () => {
       for (const socket of sockets) socket.end();

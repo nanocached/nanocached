@@ -21,14 +21,58 @@
 //! new node is added — who sends the joining node its copy (the old
 //! primary), and whether this node's own copy just became dead (displaced
 //! from rank R, see client-side replication).
+//!
+//! Namespaces (issue #105) enter the key side of the score, and the
+//! canonical hash input is consensus-critical across the server, the six
+//! SDKs and `verify-staged-join`:
+//!
+//! - default (empty) namespace: `fnv1a(key)` — byte-identical to the
+//!   pre-namespace form, so every existing key keeps its placement
+//!   across a rolling upgrade (no cluster-wide hit-rate cliff, and
+//!   mixed-version clients agree on placement);
+//! - non-empty namespace: `fnv1a(be32(len(ns)) || ns || key)` — the
+//!   namespace length as a 4-byte big-endian integer, then the namespace
+//!   bytes, then the key bytes, hashed as one stream. Length-prefixed so
+//!   `("ab", "c")` and `("a", "bc")` never share an input; including the
+//!   namespace at all is what keeps the placement balanced — hashing the
+//!   key alone would pile every namespace's common singleton keys (e.g.
+//!   `config`) onto the same nodes.
+
+use crate::key::Key;
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    fnv1a_continue(FNV_OFFSET_BASIS, bytes)
+}
+
+/// Feeds `bytes` into an in-progress FNV-1a state, so a multi-part
+/// input hashes exactly as its concatenation would, with no allocation.
+fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+/// The canonical key-side hash — see the module docs for the two forms.
+fn key_hash(key: &Key) -> u64 {
+    if !key.is_namespaced() {
+        return fnv1a(&key.name);
+    }
+
+    // Namespaces are bounded by the request-size limit (1 MiB), so the
+    // length always fits; the `u32` cast is the canonical encoding width
+    // every implementation uses, not a truncation that could ever occur.
+    let namespace_length = u32::try_from(key.namespace.len())
+        .expect("a namespace is bounded by the request-size limit")
+        .to_be_bytes();
+
+    let hash = fnv1a(&namespace_length);
+    let hash = fnv1a_continue(hash, &key.namespace);
+    fnv1a_continue(hash, &key.name)
 }
 
 /// MurmurHash3's 64-bit finalizer: a full-avalanche bijective mix, which
@@ -62,8 +106,8 @@ impl HashRing {
 
     /// The key's owners: the `replicas` highest-scoring nodes, primary
     /// first. Returns fewer than `replicas` when the cluster is smaller.
-    pub fn owners(&self, key: &[u8], replicas: usize) -> Vec<&str> {
-        let key_hash = fnv1a(key);
+    pub fn owners(&self, key: &Key, replicas: usize) -> Vec<&str> {
+        let key_hash = key_hash(key);
 
         let mut scored: Vec<(u64, &str)> = self
             .node_hashes
@@ -94,7 +138,7 @@ impl HashRing {
     }
 
     /// Whether `name` is one of the key's `replicas` owners.
-    pub fn is_owner(&self, key: &[u8], name: &str, replicas: usize) -> bool {
+    pub fn is_owner(&self, key: &Key, name: &str, replicas: usize) -> bool {
         if replicas == 0 {
             return false;
         }
@@ -109,7 +153,7 @@ impl HashRing {
         // by, which this can count directly and — unlike building and
         // sorting the whole scored list — give up on as soon as that
         // count is reached, without scoring the rest of the cluster.
-        let key_hash = fnv1a(key);
+        let key_hash = key_hash(key);
         let name_score = fmix64(self.node_hashes[name_index] ^ key_hash);
 
         let mut better_ranked = 0usize;
@@ -137,7 +181,7 @@ impl HashRing {
     /// (`owners`/`is_owner`); this stays for tests and for parity with
     /// the SDKs' primary-routing.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn route(&self, key: &[u8]) -> &str {
+    pub fn route(&self, key: &Key) -> &str {
         self.owners(key, 1)[0]
     }
 }
@@ -146,23 +190,36 @@ impl HashRing {
 mod tests {
     use super::*;
 
+    use bytes::Bytes;
+
     fn ring(names: &[&str]) -> HashRing {
         HashRing::new(names.iter().map(|name| name.to_string()).collect())
+    }
+
+    fn key(name: &[u8]) -> Key {
+        Key::unnamespaced(Bytes::copy_from_slice(name))
+    }
+
+    fn namespaced(namespace: &[u8], name: &[u8]) -> Key {
+        Key::new(
+            Bytes::copy_from_slice(namespace),
+            Bytes::copy_from_slice(name),
+        )
     }
 
     #[test]
     fn routes_a_key_to_one_of_the_given_nodes() {
         let ring = ring(&["a", "b"]);
-        let node = ring.route(b"hello");
+        let node = ring.route(&key(b"hello"));
         assert!(node == "a" || node == "b");
     }
 
     #[test]
     fn routing_is_deterministic() {
         let ring = ring(&["a", "b", "c"]);
-        let first = ring.route(b"some-key").to_string();
+        let first = ring.route(&key(b"some-key")).to_string();
         for _ in 0..100 {
-            assert_eq!(ring.route(b"some-key"), first);
+            assert_eq!(ring.route(&key(b"some-key")), first);
         }
     }
 
@@ -171,16 +228,16 @@ mod tests {
         let nodes = vec!["10.0.0.1:8356".to_string(), "10.0.0.2:8356".to_string()];
         let ring_a = HashRing::new(nodes.clone());
         let ring_b = HashRing::new(nodes);
-        assert_eq!(ring_a.route(b"x"), ring_b.route(b"x"));
+        assert_eq!(ring_a.route(&key(b"x")), ring_b.route(&key(b"x")));
     }
 
     #[test]
     fn owners_are_distinct_and_capped_by_cluster_size() {
         let ring = ring(&["a", "b", "c"]);
-        let owners = ring.owners(b"some-key", 2);
+        let owners = ring.owners(&key(b"some-key"), 2);
         assert_eq!(owners.len(), 2);
         assert_ne!(owners[0], owners[1]);
-        assert_eq!(ring.owners(b"some-key", 10).len(), 3);
+        assert_eq!(ring.owners(&key(b"some-key"), 10).len(), 3);
     }
 
     #[test]
@@ -191,9 +248,9 @@ mod tests {
 
         for i in 0..500 {
             let key = format!("key-{i}");
-            let old: Vec<&str> = before.owners(key.as_bytes(), 3);
+            let old: Vec<&str> = before.owners(&Key::from(Bytes::from(key.clone())), 3);
             let new: Vec<&str> = after
-                .owners(key.as_bytes(), 4)
+                .owners(&Key::from(Bytes::from(key.clone())), 4)
                 .into_iter()
                 .filter(|node| *node != "d")
                 .collect();
@@ -218,8 +275,74 @@ mod tests {
         assert_eq!(fmix64(0xcbf29ce484222325), 0xefd01f60ba992926);
 
         let ring = ring(&["node-a", "node-b", "node-c"]);
-        assert_eq!(ring.owners(b"alpha", 3), vec!["node-c", "node-b", "node-a"]);
-        assert_eq!(ring.owners(b"beta", 3), vec!["node-a", "node-c", "node-b"]);
-        assert_eq!(ring.owners(b"", 3), vec!["node-a", "node-b", "node-c"]);
+        assert_eq!(
+            ring.owners(&key(b"alpha"), 3),
+            vec!["node-c", "node-b", "node-a"]
+        );
+        assert_eq!(
+            ring.owners(&key(b"beta"), 3),
+            vec!["node-a", "node-c", "node-b"]
+        );
+        assert_eq!(
+            ring.owners(&key(b""), 3),
+            vec!["node-a", "node-b", "node-c"]
+        );
+
+        // Namespaced form (issue #105): `fnv1a(be32(len(ns)) || ns || key)`.
+        // Every SDK asserts these same vectors.
+        assert_eq!(key_hash(&namespaced(b"users", b"alpha")), NS_USERS_ALPHA);
+        assert_eq!(key_hash(&namespaced(b"users", b"")), NS_USERS_EMPTY);
+        assert_eq!(key_hash(&namespaced(b"\xff\x00", b"beta")), NS_BINARY_BETA);
+        assert_eq!(
+            ring.owners(&namespaced(b"users", b"alpha"), 3),
+            NS_USERS_ALPHA_OWNERS
+        );
+        assert_eq!(
+            ring.owners(&namespaced(b"users", b""), 3),
+            NS_USERS_EMPTY_OWNERS
+        );
+        assert_eq!(
+            ring.owners(&namespaced(b"\xff\x00", b"beta"), 3),
+            NS_BINARY_BETA_OWNERS
+        );
     }
+
+    #[test]
+    fn the_default_namespace_hashes_exactly_like_the_legacy_form() {
+        // Rolling-upgrade invariant: an un-namespaced key's placement must
+        // not move when the server learns about namespaces.
+        assert_eq!(key_hash(&key(b"alpha")), fnv1a(b"alpha"));
+        assert_eq!(key_hash(&key(b"")), fnv1a(b""));
+    }
+
+    #[test]
+    fn namespace_and_key_boundaries_are_unambiguous() {
+        // A delimiter-free split: the length prefix keeps `("ab","c")`
+        // and `("a","bc")` apart, and a namespaced key never collides
+        // with the un-namespaced concatenation.
+        assert_ne!(
+            key_hash(&namespaced(b"ab", b"c")),
+            key_hash(&namespaced(b"a", b"bc"))
+        );
+        assert_ne!(key_hash(&namespaced(b"ab", b"c")), key_hash(&key(b"abc")));
+    }
+
+    #[test]
+    fn namespaces_spread_a_shared_singleton_key_over_different_nodes() {
+        // The reason the namespace is part of the hash input at all.
+        let ring = ring(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let primaries: std::collections::HashSet<&str> = (0..64)
+            .map(|i| ring.route(&namespaced(format!("cache-{i}").as_bytes(), b"config")))
+            .collect();
+        assert!(primaries.len() > 1);
+    }
+
+    // `key_hash` for (ns, key), computed independently in Python from the
+    // spec's definition, then the top-3 over `node-a`/`node-b`/`node-c`.
+    const NS_USERS_ALPHA: u64 = 0xfd4ab55027c21df6;
+    const NS_USERS_EMPTY: u64 = 0xa9e9bbca44bb502e;
+    const NS_BINARY_BETA: u64 = 0x8f7c097eccb8e792;
+    const NS_USERS_ALPHA_OWNERS: [&str; 3] = ["node-a", "node-c", "node-b"];
+    const NS_USERS_EMPTY_OWNERS: [&str; 3] = ["node-b", "node-c", "node-a"];
+    const NS_BINARY_BETA_OWNERS: [&str; 3] = ["node-b", "node-a", "node-c"];
 }

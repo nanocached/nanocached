@@ -6,8 +6,10 @@ namespace Nanocached;
 
 /// <summary>
 /// One already-identified connection to a single nanocached-node, speaking
-/// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c> — the <c>A</c> identify
-/// exchange happens in <see cref="Identify"/> before a Connection exists).
+/// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c>, and their namespaced
+/// counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — the <c>A</c>
+/// identify exchange happens in <see cref="Identify"/> before a Connection
+/// exists).
 /// Requests are pipelined onto the socket and matched to responses in send
 /// order (request pipelining): a dedicated read loop, started in the
 /// constructor, consumes responses and dispatches each to the oldest
@@ -203,9 +205,29 @@ internal sealed class Connection
         }
     }
 
-    internal async Task<byte[]?> GetAsync(byte[] key)
+    // issue #105 — first-class namespaces. Never sent on the wire as an
+    // explicit zero-length namespace: IsNamespaced treats this the same as
+    // "no namespace at all" everywhere below, so a legacy (unnamespaced)
+    // call still produces the exact G/S/D frame it always has — see the
+    // class doc comment's protocol note and docs/protocol.html's
+    // namespaces section ("<namespace-length> of 0 addresses the default
+    // namespace ... the same one every G/S/D addresses").
+    private static readonly byte[] EmptyNamespace = Array.Empty<byte>();
+
+    private static bool IsNamespaced(byte[] namespaceBytes) => namespaceBytes.Length > 0;
+
+    internal Task<byte[]?> GetAsync(byte[] key) => GetAsync(EmptyNamespace, key);
+
+    /// <summary>issue #105: as the single-argument overload, but scoped to
+    /// <paramref name="namespaceBytes"/> — an empty namespace sends the
+    /// legacy <c>G</c> frame byte-for-byte; a non-empty one sends the
+    /// namespaced <c>g</c> frame, whose header gains a leading
+    /// <c>&lt;namespace-length&gt;</c> field and whose body leads with the
+    /// namespace bytes ahead of the key.</summary>
+    internal async Task<byte[]?> GetAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, value) = await RequestAsync(tag => Frame($"G {key.Length}{TagField(tag)}\n", key, null))
+        var (marker, value) = await RequestAsync(tag =>
+            Frame(GetHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
         {
@@ -218,22 +240,30 @@ internal sealed class Connection
 
     /// <summary><paramref name="ttlSeconds"/> of 0 means no expiry, mapped
     /// on the wire exactly as the old absent-TTL header was.</summary>
-    internal async Task SetAsync(byte[] key, byte[] value, long ttlSeconds)
+    internal Task SetAsync(byte[] key, byte[] value, long ttlSeconds) =>
+        SetAsync(EmptyNamespace, key, value, ttlSeconds);
+
+    /// <summary>issue #105: as the unnamespaced overload, but scoped to
+    /// <paramref name="namespaceBytes"/> — see <see cref="GetAsync(byte[], byte[])"/>'s
+    /// doc comment for the legacy-vs-namespaced frame rule.</summary>
+    internal async Task SetAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds)
     {
         var (marker, _) = await RequestAsync(tag =>
-        {
-            string header = ttlSeconds == 0
-                ? $"S {key.Length} {value.Length}{TagField(tag)}\n"
-                : $"S {key.Length} {value.Length} {ttlSeconds}{TagField(tag)}\n";
-            return Frame(header, key, value);
-        }).ConfigureAwait(false);
+            Frame(SetHeader(namespaceBytes, key.Length, value.Length, ttlSeconds, tag), namespaceBytes, key, value))
+            .ConfigureAwait(false);
         if (marker == (byte)'W') throw new WrongNodeException();
         if (marker != (byte)'S') throw Mismatch(marker);
     }
 
-    internal async Task<bool> DeleteAsync(byte[] key)
+    internal Task<bool> DeleteAsync(byte[] key) => DeleteAsync(EmptyNamespace, key);
+
+    /// <summary>issue #105: as the unnamespaced overload, but scoped to
+    /// <paramref name="namespaceBytes"/> — see <see cref="GetAsync(byte[], byte[])"/>'s
+    /// doc comment for the legacy-vs-namespaced frame rule.</summary>
+    internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, _) = await RequestAsync(tag => Frame($"D {key.Length}{TagField(tag)}\n", key, null))
+        var (marker, _) = await RequestAsync(tag =>
+            Frame(DeleteHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
         {
@@ -244,13 +274,51 @@ internal sealed class Connection
         };
     }
 
-    private static byte[] Frame(string header, byte[] key, byte[]? value)
+    /// <summary>issue #105: <c>g &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+    /// when namespaced, or the untouched legacy <c>G &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+    /// otherwise.</summary>
+    private static string GetHeader(byte[] namespaceBytes, int keyLength, uint? tag) =>
+        IsNamespaced(namespaceBytes)
+            ? $"g {namespaceBytes.Length} {keyLength}{TagField(tag)}\n"
+            : $"G {keyLength}{TagField(tag)}\n";
+
+    /// <summary>issue #105: <c>s &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; [&lt;ttl&gt;][ &lt;tag&gt;]\n</c>
+    /// when namespaced, or the untouched legacy <c>S</c> form otherwise —
+    /// see <see cref="SetAsync(byte[], byte[], long)"/>'s doc comment for
+    /// the TTL-omission rule, unchanged by namespacing.</summary>
+    private static string SetHeader(byte[] namespaceBytes, int keyLength, int valueLength, long ttlSeconds, uint? tag)
+    {
+        string ttlField = ttlSeconds == 0 ? "" : $" {ttlSeconds}";
+        return IsNamespaced(namespaceBytes)
+            ? $"s {namespaceBytes.Length} {keyLength} {valueLength}{ttlField}{TagField(tag)}\n"
+            : $"S {keyLength} {valueLength}{ttlField}{TagField(tag)}\n";
+    }
+
+    /// <summary>issue #105: <c>d &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+    /// when namespaced, or the untouched legacy <c>D &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
+    /// otherwise.</summary>
+    private static string DeleteHeader(byte[] namespaceBytes, int keyLength, uint? tag) =>
+        IsNamespaced(namespaceBytes)
+            ? $"d {namespaceBytes.Length} {keyLength}{TagField(tag)}\n"
+            : $"D {keyLength}{TagField(tag)}\n";
+
+    /// <summary>issue #105: <paramref name="namespaceBytes"/> leads the
+    /// body, ahead of the key (and, for a Set, the value) — empty for
+    /// every legacy (unnamespaced) call, so
+    /// <c>namespaceBytes.CopyTo(...)</c> below is then a no-op and the
+    /// frame is exactly what it always was.</summary>
+    private static byte[] Frame(string header, byte[] namespaceBytes, byte[] key, byte[]? value)
     {
         byte[] headerBytes = Encoding.ASCII.GetBytes(header);
-        var frame = new byte[headerBytes.Length + key.Length + (value?.Length ?? 0)];
-        headerBytes.CopyTo(frame, 0);
-        key.CopyTo(frame, headerBytes.Length);
-        value?.CopyTo(frame, headerBytes.Length + key.Length);
+        var frame = new byte[headerBytes.Length + namespaceBytes.Length + key.Length + (value?.Length ?? 0)];
+        int offset = 0;
+        headerBytes.CopyTo(frame, offset);
+        offset += headerBytes.Length;
+        namespaceBytes.CopyTo(frame, offset);
+        offset += namespaceBytes.Length;
+        key.CopyTo(frame, offset);
+        offset += key.Length;
+        value?.CopyTo(frame, offset);
         return frame;
     }
 

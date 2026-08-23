@@ -17,7 +17,7 @@ pub use client::KEEPALIVE_INTERVAL_MS;
 pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 #[doc(hidden)]
 pub use client::NODE_LIST_STALE_AFTER_MS;
-pub use client::{NanocachedClient, Options, Stats};
+pub use client::{Namespace, NanocachedClient, Options, Stats};
 #[doc(hidden)]
 pub use connection::REQUEST_TIMEOUT_MS;
 pub use error::{Error, Result};

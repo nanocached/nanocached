@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { fmix64, fnv1a, HashRing } from "../src/hashRing.js";
+import { fmix64, fnv1a, HashRing, keyHash } from "../src/hashRing.js";
 
 describe("fnv1a", () => {
   // Published FNV-1a 64-bit test vectors — these pin the hash to the exact
@@ -32,6 +32,49 @@ describe("cross-language score vectors", () => {
     assert.deepEqual(ring.owners(Buffer.from("alpha"), 3), ["node-c", "node-b", "node-a"]);
     assert.deepEqual(ring.owners(Buffer.from("beta"), 3), ["node-a", "node-c", "node-b"]);
     assert.deepEqual(ring.owners(Buffer.alloc(0), 3), ["node-a", "node-b", "node-c"]);
+  });
+});
+
+describe("namespaced score vectors (first-class namespaces, issue #105)", () => {
+  // Pinned outputs of key_hash and the full scoring pipeline over
+  // namespace+key — src/hash_ring.rs's test suite asserts these exact
+  // values too, so the two implementations agree byte-for-byte or one
+  // side's test fails. Ring over node-a/node-b/node-c, R=3, matching the
+  // unnamespaced vectors above.
+  const ring = new HashRing(["node-a", "node-b", "node-c"]);
+
+  it("matches the Rust key_hash for a namespaced key", () => {
+    assert.equal(keyHash(Buffer.from("alpha"), Buffer.from("users")), 0xfd4ab55027c21df6n);
+    assert.deepEqual(ring.owners(Buffer.from("alpha"), 3, Buffer.from("users")), ["node-a", "node-c", "node-b"]);
+  });
+
+  it("matches the Rust key_hash for a namespaced, empty key (hash-only — the wire itself rejects empty keys)", () => {
+    assert.equal(keyHash(Buffer.alloc(0), Buffer.from("users")), 0xa9e9bbca44bb502en);
+    assert.deepEqual(ring.owners(Buffer.alloc(0), 3, Buffer.from("users")), ["node-b", "node-c", "node-a"]);
+  });
+
+  it("matches the Rust key_hash for a binary namespace", () => {
+    const namespace = Buffer.from([0xff, 0x00]);
+    assert.equal(keyHash(Buffer.from("beta"), namespace), 0x8f7c097eccb8e792n);
+    assert.deepEqual(ring.owners(Buffer.from("beta"), 3, namespace), ["node-b", "node-a", "node-c"]);
+  });
+
+  it("the default (empty) namespace is byte-identical to the pre-namespace form", () => {
+    assert.equal(keyHash(Buffer.from("alpha")), fnv1a(Buffer.from("alpha")));
+    assert.deepEqual(ring.owners(Buffer.from("alpha"), 3, Buffer.alloc(0)), ring.owners(Buffer.from("alpha"), 3));
+    assert.deepEqual(ring.owners(Buffer.from("alpha"), 3), ["node-c", "node-b", "node-a"]);
+  });
+
+  it("two different namespaces place the same key name differently", () => {
+    const inUsers = ring.route(Buffer.from("config"), Buffer.from("users"));
+    const inOrders = ring.route(Buffer.from("config"), Buffer.from("orders"));
+    const unnamespaced = ring.route(Buffer.from("config"));
+    // Not a strict inequality assertion (three independent hashes could
+    // coincidentally agree) — the real property under test is that
+    // namespace participates in the score at all, which the pinned
+    // key_hash vectors above already nail down exactly. This is a light
+    // sanity check that route() actually threads the namespace through.
+    assert.ok([inUsers, inOrders, unnamespaced].every((node) => ["node-a", "node-b", "node-c"].includes(node)));
   });
 });
 

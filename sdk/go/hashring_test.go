@@ -48,6 +48,90 @@ func TestMatchesCrossLanguageScoreVectors(t *testing.T) {
 	}
 }
 
+// ── namespaces (issue #105) ──────────────────────────────────────────
+
+// TestNamespacedKeyHashMatchesCrossLanguageVectors pins keyHash's
+// namespaced form (fnv1a(be32(len(ns)) || ns || key)) against the same
+// vectors the server (src/hash_ring.rs) and the other five SDKs assert,
+// next to the existing alpha/beta/"" vectors above.
+func TestNamespacedKeyHashMatchesCrossLanguageVectors(t *testing.T) {
+	cases := []struct {
+		ns, key string
+		want    uint64
+	}{
+		{"users", "alpha", 0xfd4ab55027c21df6},
+		{"users", "", 0xa9e9bbca44bb502e}, // hash-only vector; the wire itself rejects an empty key
+		{"\xff\x00", "beta", 0x8f7c097eccb8e792},
+	}
+	for _, c := range cases {
+		if got := keyHash([]byte(c.ns), []byte(c.key)); got != c.want {
+			t.Errorf("keyHash(%q, %q) = %#x, want %#x", c.ns, c.key, got, c.want)
+		}
+	}
+}
+
+// TestNamespacedOwnersMatchCrossLanguageVectors is the same vectors run
+// through the full HRW pipeline, over the ring/replicas the issue #105
+// spec pins them against.
+func TestNamespacedOwnersMatchCrossLanguageVectors(t *testing.T) {
+	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	cases := []struct {
+		ns, key string
+		want    []string
+	}{
+		{"users", "alpha", []string{"node-a", "node-c", "node-b"}},
+		{"users", "", []string{"node-b", "node-c", "node-a"}},
+		{"\xff\x00", "beta", []string{"node-b", "node-a", "node-c"}},
+	}
+	for _, c := range cases {
+		got := ring.OwnersNS([]byte(c.ns), []byte(c.key), 3)
+		want := c.want
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("OwnersNS(%q, %q) = %v, want %v", c.ns, c.key, got, want)
+		}
+	}
+}
+
+// TestDefaultNamespaceHashesAndRoutesExactlyLikeTheLegacyForm is the
+// rolling-upgrade invariant from hash_ring.rs's module docs: an
+// unnamespaced key's placement must not move when namespaces enter the
+// picture — nil and "" must both behave as "no namespace at all", and
+// OwnersNS(nil, ...)/Owners(...) must agree byte-for-byte with the
+// pre-#105 alpha vector above.
+func TestDefaultNamespaceHashesAndRoutesExactlyLikeTheLegacyForm(t *testing.T) {
+	if got, want := keyHash(nil, []byte("alpha")), fnv1a([]byte("alpha")); got != want {
+		t.Errorf("keyHash(nil, \"alpha\") = %#x, want %#x", got, want)
+	}
+	if got, want := keyHash([]byte(""), []byte("alpha")), fnv1a([]byte("alpha")); got != want {
+		t.Errorf("keyHash(\"\", \"alpha\") = %#x, want %#x", got, want)
+	}
+
+	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
+	want := []string{"node-c", "node-b", "node-a"}
+	if got := ring.OwnersNS(nil, []byte("alpha"), 3); !reflect.DeepEqual(got, want) {
+		t.Errorf("OwnersNS(nil, \"alpha\") = %v, want %v", got, want)
+	}
+	if got := ring.OwnersNS([]byte(""), []byte("alpha"), 3); !reflect.DeepEqual(got, want) {
+		t.Errorf("OwnersNS(\"\", \"alpha\") = %v, want %v", got, want)
+	}
+	if got := ring.Owners([]byte("alpha"), 3); !reflect.DeepEqual(got, want) {
+		t.Errorf("Owners(\"alpha\") = %v, want %v", got, want)
+	}
+}
+
+// TestNamespaceAndKeyBoundariesAreUnambiguous: length-prefixing the
+// namespace is what keeps ("ab","c") and ("a","bc") from colliding, and
+// keeps a namespaced key from ever colliding with the un-namespaced
+// concatenation of the two — mirrors hash_ring.rs's own boundary test.
+func TestNamespaceAndKeyBoundariesAreUnambiguous(t *testing.T) {
+	if got, other := keyHash([]byte("ab"), []byte("c")), keyHash([]byte("a"), []byte("bc")); got == other {
+		t.Errorf("keyHash(\"ab\",\"c\") == keyHash(\"a\",\"bc\") == %#x", got)
+	}
+	if got, legacy := keyHash([]byte("ab"), []byte("c")), keyHash(nil, []byte("abc")); got == legacy {
+		t.Errorf("keyHash(\"ab\",\"c\") == keyHash(nil,\"abc\") == %#x", got)
+	}
+}
+
 func TestOwnersAreDistinctAndCapped(t *testing.T) {
 	ring := NewHashRing([]string{"node-a", "node-b", "node-c"})
 	owners := ring.Owners([]byte("some-key"), 2)

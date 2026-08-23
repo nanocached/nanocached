@@ -1082,6 +1082,51 @@ class TtlEncodingTests(unittest.TestCase):
         self.assertEqual(_encode_set(b"k", b"v", 60), b"S 1 1 60\nkv")
 
 
+class NamespaceEncodingTests(unittest.TestCase):
+    # Namespaces (issue #105): docs/protocol.html "g / s / d" is the
+    # authoritative wire spec these pin.
+
+    def test_default_namespace_still_encodes_the_legacy_uppercase_frames(self):
+        # SDK rule: the default (empty) namespace must keep sending
+        # legacy G/S/D byte-for-byte, so an unchanged client talking to
+        # an old, pre-namespace server keeps working.
+        from nanocached._connection import _encode_delete, _encode_get, _encode_set
+
+        self.assertEqual(_encode_get(b"k"), b"G 1\nk")
+        self.assertEqual(_encode_set(b"k", b"v", 0), b"S 1 1\nkv")
+        self.assertEqual(_encode_delete(b"k"), b"D 1\nk")
+        # Passing namespace=b"" explicitly is identical to omitting it.
+        self.assertEqual(_encode_get(b"k", namespace=b""), b"G 1\nk")
+
+    def test_non_empty_namespace_encodes_the_lowercase_frames(self):
+        from nanocached._connection import _encode_delete, _encode_get, _encode_set
+
+        self.assertEqual(_encode_get(b"k", namespace=b"users"), b"g 5 1\nusersk")
+        self.assertEqual(_encode_delete(b"k", namespace=b"users"), b"d 5 1\nusersk")
+        self.assertEqual(_encode_set(b"k", b"v", 0, namespace=b"users"), b"s 5 1 1\nuserskv")
+        self.assertEqual(_encode_set(b"k", b"v", 60, namespace=b"users"), b"s 5 1 1 60\nuserskv")
+
+    def test_tagged_namespaced_frames_keep_the_tag_as_the_last_header_field(self):
+        from nanocached._connection import _encode_delete, _encode_get, _encode_set
+
+        self.assertEqual(_encode_get(b"k", tag=7, namespace=b"users"), b"g 5 1 7\nusersk")
+        self.assertEqual(_encode_delete(b"k", tag=7, namespace=b"users"), b"d 5 1 7\nusersk")
+        # ttl+tag form: ttl still precedes tag, both after val-len.
+        self.assertEqual(
+            _encode_set(b"k", b"v", 0, tag=7, namespace=b"users"), b"s 5 1 1 7\nuserskv"
+        )
+        self.assertEqual(
+            _encode_set(b"k", b"v", 60, tag=7, namespace=b"users"), b"s 5 1 1 60 7\nuserskv"
+        )
+
+    def test_namespace_may_contain_arbitrary_bytes(self):
+        # No delimiter, no escaping, no hierarchy — sliced by its declared
+        # length like every other body field.
+        from nanocached._connection import _encode_get
+
+        self.assertEqual(_encode_get(b"beta", namespace=b"\xff\x00"), b"g 2 4\n\xff\x00beta")
+
+
 class ClusterTests(unittest.IsolatedAsyncioTestCase):
     async def start_cluster(self, replication: int = 1):
         node_a = await MockNode().start()
@@ -1476,7 +1521,7 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             )
             client._closed = True  # simulate close() having already started
             try:
-                await client._write(b"k", lambda connection: connection.set(b"k", b"v", 0))
+                await client._write(b"", b"k", lambda connection: connection.set(b"k", b"v", 0))
             finally:
                 client._closed = False  # let the real close() below run cleanly
 
@@ -1629,7 +1674,7 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
 
             client._closed = True  # simulate close() having already started
             try:
-                value = await client._try_read_repair(b"k")
+                value = await client._try_read_repair(b"", b"k")
             finally:
                 client._closed = False  # let the real close() below run cleanly
 
@@ -1889,7 +1934,7 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
                 [("127.0.0.1", discovery.port)], read_hedge_after=0.05
             )
             await client.set("k", "v")
-            names = client._owner_names(b"k")
+            names = client._owner_names(b"", b"k")
             self.assertGreater(len(names), 1)
 
             async def op(connection):
@@ -2230,7 +2275,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             # set() must return normally rather than raise.
             replica_connection = client._members[replica].connection
 
-            async def boom(key: bytes, value: bytes, ttl_seconds: int) -> None:
+            async def boom(key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b"") -> None:
                 raise TypeError("injected programming bug")
 
             replica_connection.set = boom
@@ -2287,13 +2332,219 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             # in this SDK's own code.
             replica_connection = client._members[replica].connection
 
-            async def boom(key: bytes, value: bytes, ttl_seconds: int) -> None:
+            async def boom(key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b"") -> None:
                 raise TypeError("injected programming bug")
 
             replica_connection.set = boom
 
             with self.assertRaisesRegex(TypeError, "injected programming bug"):
                 await client.set(key, "v2")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                try:
+                    await node.close()
+                except Exception:
+                    pass
+
+
+class NamespaceTests(unittest.IsolatedAsyncioTestCase):
+    # Namespaces (issue #105): NanocachedClient.namespace() and the
+    # Namespace handle it returns — single-node coverage. See
+    # NamespaceClusterTests below for routing/replication/W
+    # refresh-and-retry, which need an actual cluster.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_namespace_accessor_exposes_the_encoded_bytes(self):
+        client = await self.connect()
+        try:
+            self.assertEqual(client.namespace("users").namespace, b"users")
+            self.assertEqual(client.namespace(b"\xff\x00").namespace, b"\xff\x00")
+            self.assertEqual(client.namespace("").namespace, b"")
+        finally:
+            await client.close()
+
+    async def test_round_trips_set_get_delete_within_a_namespace(self):
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            await users.set("greeting", "hello")
+            self.assertEqual(await users.get("greeting"), "hello")
+            self.assertTrue(await users.delete("greeting"))
+            self.assertIsNone(await users.get("greeting"))
+            self.assertFalse(await users.delete("greeting"))
+        finally:
+            await client.close()
+
+    async def test_get_bytes_never_decodes_and_ttl_is_forwarded(self):
+        client = await self.connect()
+        try:
+            bin_ns = client.namespace("bin")
+            await bin_ns.set(b"k", b"\x00\xff", ttl_seconds=60)
+            self.assertEqual(await bin_ns.get_bytes(b"k"), b"\x00\xff")
+            self.assertEqual(self.node.last_set_ttl, 60)
+        finally:
+            await client.close()
+
+    async def test_binary_namespace_round_trips(self):
+        client = await self.connect()
+        try:
+            ns = client.namespace(b"\xff\x00")
+            await ns.set("k", "v")
+            self.assertEqual(await ns.get("k"), "v")
+        finally:
+            await client.close()
+
+    async def test_a_non_empty_namespace_speaks_the_lowercase_frames_on_the_wire(self):
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            await users.set("k", "v")
+            await users.get("k")
+            await users.delete("k")
+            self.assertEqual(self.node.namespaced_command_count, 3)
+        finally:
+            await client.close()
+
+    async def test_the_default_namespace_still_speaks_the_legacy_frames_on_the_wire(self):
+        # SDK rule (issue #105 spec): the default (empty) namespace must
+        # keep sending legacy G/S/D, never g/s/d, so an unchanged client
+        # talking to an old, pre-namespace server keeps working.
+        client = await self.connect()
+        try:
+            root = client.namespace("")
+            await root.set("k", "v")
+            await root.get("k")
+            await root.delete("k")
+            self.assertEqual(self.node.namespaced_command_count, 0)
+            self.assertEqual(self.node.get_count, 1)
+        finally:
+            await client.close()
+
+    async def test_namespace_isolates_a_shared_key_name(self):
+        # Same key name in two namespaces plus the default namespace: 3
+        # independent entries, none of which observe each other's writes
+        # or deletes.
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            orders = client.namespace("orders")
+            await client.set("shared", "default-value")
+            await users.set("shared", "users-value")
+            await orders.set("shared", "orders-value")
+
+            self.assertEqual(await client.get("shared"), "default-value")
+            self.assertEqual(await users.get("shared"), "users-value")
+            self.assertEqual(await orders.get("shared"), "orders-value")
+            self.assertEqual(self.node.store[b"shared"], b"default-value")
+            self.assertEqual(self.node.ns_store[(b"users", b"shared")], b"users-value")
+            self.assertEqual(self.node.ns_store[(b"orders", b"shared")], b"orders-value")
+
+            self.assertTrue(await users.delete("shared"))
+            self.assertIsNone(await users.get("shared"))
+            # Deleting from one namespace must not touch the others.
+            self.assertEqual(await client.get("shared"), "default-value")
+            self.assertEqual(await orders.get("shared"), "orders-value")
+        finally:
+            await client.close()
+
+    async def test_a_handle_survives_the_client_it_is_bound_to_being_open_but_raises_after_close(self):
+        client = await self.connect()
+        users = client.namespace("users")
+        await users.set("k", "v")  # the handle works fine before close()
+        await client.close()
+        with self.assertRaises(AlreadyClosedError):
+            await users.get("k")
+        with self.assertRaises(AlreadyClosedError):
+            await users.get_bytes("k")
+        with self.assertRaises(AlreadyClosedError):
+            await users.set("k", "v")
+        with self.assertRaises(AlreadyClosedError):
+            await users.delete("k")
+
+    async def test_namespaced_requests_participate_in_tagged_mode(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                users = client.namespace("users")
+                await users.set("k", "v")
+                self.assertEqual(await users.get("k"), "v")
+                self.assertTrue(await users.delete("k"))
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+
+class NamespaceClusterTests(unittest.IsolatedAsyncioTestCase):
+    # Namespaces (issue #105) enter HRW routing (client.py's _owner_names),
+    # so a namespaced key's owners aren't necessarily a key-alone lookup's
+    # owners — these need an actual cluster, unlike NamespaceTests above.
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, namespace: bytes, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2, namespace=namespace)
+
+    async def test_fans_namespaced_writes_out_to_every_owner(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                tenant = client.namespace("tenant-a")
+                await tenant.set("k", "v")
+                for name, node in nodes.items():
+                    self.assertIn((b"tenant-a", b"k"), node.ns_store, f"missing from {name}")
+                    # The default namespace's own store must stay empty —
+                    # this write never touched it.
+                    self.assertNotIn(b"k", node.store)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_w_refresh_and_retry_routes_a_namespaced_key_by_namespace_and_key(self):
+        # Mirrors ReplicationTests.test_writes_route_around_a_dead_
+        # primary_once_discovery_drops_it, but for a namespaced key: the
+        # retry after a forced refresh must re-rank using (namespace,
+        # key) — using the key alone could pick a different, wrong
+        # primary for this namespace.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            namespace = b"tenant-a"
+            tenant = client.namespace(namespace)
+            key = "written-after-primary-death"
+            primary, replica = self.owners_of(namespace, key)
+
+            await nodes[primary].close()
+            discovery.nodes = [(replica, nodes[replica].address)]
+            await wait_for(
+                lambda: client._members[primary].connection.closed,
+                "the client to see the FIN",
+            )
+
+            await tenant.set(key, "v")
+            self.assertEqual(await tenant.get(key), "v")
         finally:
             await client.close()
             await discovery.close()

@@ -134,6 +134,43 @@ path). The losing leg of a hedge is left to finish and is drained by
 `Close()`. Zero (the default) disables hedging; a negative value is
 rejected by `Connect`.
 
+## Namespaces
+
+`Client.Namespace(ns)` returns a lightweight handle scoping
+`Get`/`GetBytes`/`Set`/`SetBytes`/`Delete` to `ns`: the same key name in
+two different namespaces — or in a namespace versus the default,
+unnamespaced keyspace — names two independent cache entries.
+
+```go
+users := client.Namespace("users")
+err = users.Set("42", "alice", 0)
+value, ok, err := users.Get("42")       // "alice", scoped to "users"
+_, ok, err = client.Get("42")           // unrelated: the default namespace
+```
+
+A `Namespace` does no networking of its own: it shares the client's
+connections and every method simply forwards to the client's own
+internal `(namespace, key)` methods, so routing (rendezvous hashing over
+`(namespace, key)` — see below), replication fan-out, hedged reads, `W`
+refresh-and-retry, response tags, and value compression all apply exactly
+as they do to the client's own namespace-less methods. It's cheap to
+create, safe for concurrent use, and becomes invalid — every method
+returns `ErrClosed` — once the client is closed; it has no `Close` of its
+own. `client.Namespace("")` returns a handle equivalent to the client
+itself: legacy, byte-for-byte `G`/`S`/`D` frames and the same key
+placement as before namespaces existed, so it's never rejected. A
+namespace is a flat, opaque byte string — no delimiter, no escaping, no
+hierarchy, and any bytes are allowed — and `Namespace.Name()` returns it
+back.
+
+Namespaces enter routing too: a key's owners are computed from
+`(namespace, key)` rather than `key` alone, so the same key name in
+different namespaces can land on different nodes. The default namespace
+hashes exactly as it did before namespaces existed, so an unnamespaced
+key's placement never moves across a rolling upgrade. Namespaced frames
+need a server that understands them (an old server answers `E` and closes
+the connection), so upgrade every node before using namespaces.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps

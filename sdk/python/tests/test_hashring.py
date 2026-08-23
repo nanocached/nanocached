@@ -69,5 +69,50 @@ class HashRingTests(unittest.TestCase):
             ring.route(b"k")
 
 
+class NamespaceCrossLanguageVectorTests(unittest.TestCase):
+    # Namespaces (issue #105): pinned outputs of key_hash(namespace, key)
+    # and the resulting top-3 owners over node-a/node-b/node-c — the Rust
+    # server (src/hash_ring.rs) and every other SDK assert these exact
+    # same vectors, next to the pre-namespace alpha/beta/"" vectors above.
+    NODES = ["node-a", "node-b", "node-c"]
+
+    def test_matches_the_cross_language_namespace_vectors(self):
+        from nanocached._hashring import key_hash
+
+        self.assertEqual(key_hash(b"users", b"alpha"), 0xFD4AB55027C21DF6)
+        # Hash-only vector: the wire itself rejects an empty key, but the
+        # ring's own hash pipeline has no such restriction.
+        self.assertEqual(key_hash(b"users", b""), 0xA9E9BBCA44BB502E)
+        self.assertEqual(key_hash(b"\xff\x00", b"beta"), 0x8F7C097ECCB8E792)
+
+        ring = HashRing(self.NODES)
+        self.assertEqual(
+            ring.owners(b"alpha", 3, namespace=b"users"), ["node-a", "node-c", "node-b"]
+        )
+        self.assertEqual(
+            ring.owners(b"", 3, namespace=b"users"), ["node-b", "node-c", "node-a"]
+        )
+        self.assertEqual(
+            ring.owners(b"beta", 3, namespace=b"\xff\x00"), ["node-b", "node-a", "node-c"]
+        )
+
+    def test_default_namespace_matches_the_legacy_unnamespaced_form(self):
+        # Rolling-upgrade invariant (issue #105 spec): an un-namespaced
+        # key's placement must not move when namespaces are introduced —
+        # empty ns == the legacy form, byte-for-byte.
+        ring = HashRing(self.NODES)
+        self.assertEqual(ring.owners(b"alpha", 3, namespace=b""), ring.owners(b"alpha", 3))
+        self.assertEqual(ring.owners(b"alpha", 3), ["node-c", "node-b", "node-a"])
+
+    def test_namespace_and_key_boundaries_are_unambiguous(self):
+        # A delimiter-free split: the length prefix keeps ("ab", "c") and
+        # ("a", "bc") apart, and a namespaced key never collides with the
+        # un-namespaced concatenation.
+        from nanocached._hashring import key_hash
+
+        self.assertNotEqual(key_hash(b"ab", b"c"), key_hash(b"a", b"bc"))
+        self.assertNotEqual(key_hash(b"ab", b"c"), key_hash(b"", b"abc"))
+
+
 if __name__ == "__main__":
     unittest.main()

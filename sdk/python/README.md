@@ -69,6 +69,38 @@ key (the primary's result decides; a dead replica never fails a write),
 and `get` asks the primary, falling over to the next owner only when the
 holder is unreachable. `client.replication` exposes the factor in use.
 
+## Namespaces
+
+A namespace is a flat, opaque byte string that scopes a key: the same key
+name in two namespaces (or in a namespace versus the default, un-namespaced
+keyspace) is two independent entries. `client.namespace(ns)` returns a
+lightweight handle with the same `get`/`get_bytes`/`set`/`delete` as the
+client itself, just scoped to `ns`:
+
+```python
+users = client.namespace("users")
+await users.set("alice", "admin")
+await client.set("alice", "not the same entry")  # default namespace
+
+print(await users.get("alice"))   # admin
+print(await client.get("alice"))  # not the same entry
+```
+
+`ns` may be `str` (UTF-8 encoded) or `bytes`, with no length limit beyond
+the same request-size rule keys and values already follow; it is never
+interpreted — no delimiter, no escaping, no hierarchy. The handle is cheap,
+shares the client's connections, and forwards to the same routing,
+replication, hedged reads, response tags and compression the client itself
+uses — a namespaced key's owners are computed from `(namespace, key)`
+together, so two namespaces spread even identical key names across the
+cluster rather than piling them on the same nodes. `client.namespace("")`
+returns a handle equivalent to the client itself: the un-namespaced form is
+the default namespace, and the SDK always speaks the wire protocol's legacy
+frames for it, so an unchanged client talking to an older, pre-namespace
+server keeps working. The handle becomes invalid, raising the same
+`AlreadyClosedError` the client itself would, once the client it came from
+is closed.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

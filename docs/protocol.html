@@ -76,19 +76,58 @@ expires <code>&lt;ttl-seconds&gt;</code> after the write.</p>
 <p>Responds <code>D\n</code> if the key existed, <code>N\n</code>
 otherwise.</p>
 
+<h2 id="namespaces">g / s / d — namespaced get, set, delete</h2>
+<p>A <em>namespace</em> is a flat, opaque byte string that scopes a key:
+the same key name in two namespaces is two independent entries. The
+lowercase command letters are the namespaced counterparts of
+<code>G</code>/<code>S</code>/<code>D</code>: the header gains one
+leading <code>&lt;namespace-length&gt;</code> field and the namespace
+bytes lead the body.</p>
+<pre><code>g &lt;namespace-length&gt; &lt;key-length&gt;\n&lt;namespace&gt;&lt;key&gt;
+s &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
+s &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
+d &lt;namespace-length&gt; &lt;key-length&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+<p>Responses are exactly those of the uppercase commands. A
+<code>&lt;namespace-length&gt;</code> of 0 addresses the <em>default
+namespace</em> — the same one every <code>G</code>/<code>S</code>/<code>D</code>
+addresses, so <code>g 0 4\nname</code> and <code>G 4\nname</code> are
+the same request. <code>&lt;key-length&gt;</code> 0 is rejected as
+always. The namespace is never interpreted: there is no delimiter,
+no escaping, no hierarchy — it is sliced by its declared length like
+every other body field, and may contain any bytes.</p>
+<p>Namespaces also enter routing (clusters only). Each node's score is
+<code>fmix64(fnv1a(node-name) XOR key-hash)</code>, where the key hash
+is</p>
+<ul>
+  <li><code>fnv1a(key)</code> for the default namespace — byte-identical
+  to the pre-namespace form, so existing keys keep their placement across
+  an upgrade; and</li>
+  <li><code>fnv1a(be32(namespace-length) || namespace || key)</code>
+  otherwise: the namespace length as a 4-byte big-endian integer, then
+  the namespace bytes, then the key bytes, hashed as one stream.</li>
+</ul>
+<p>Every SDK and the server pin the same test vectors for both forms.
+Namespaced frames need a server that understands them; a pre-namespace
+node answers <code>E\n</code> and closes the connection, so upgrade
+every node before clients start using namespaces.</p>
+
 <h2 id="tags">Response tags (tagged mode)</h2>
 <p>Pipelined clients match responses to requests by order alone — the
 frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
-<code>G</code>/<code>S</code>/<code>D</code> header must end with a
+<code>G</code>/<code>S</code>/<code>D</code> (and
+<code>g</code>/<code>s</code>/<code>d</code>) header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
 answer.</p>
 <pre><code>G &lt;key-length&gt; &lt;tag&gt;\n&lt;key&gt;
 S &lt;key-length&gt; &lt;value-length&gt; &lt;tag&gt;\n&lt;key&gt;&lt;value&gt;
 S &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt; &lt;tag&gt;\n&lt;key&gt;&lt;value&gt;
-D &lt;key-length&gt; &lt;tag&gt;\n&lt;key&gt;</code></pre>
+D &lt;key-length&gt; &lt;tag&gt;\n&lt;key&gt;
+g &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
+s &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
+d &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
 <p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
 <code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
 <code>N &lt;tag&gt;\n</code>, and <code>W &lt;tag&gt;\n</code>;

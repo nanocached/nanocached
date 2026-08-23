@@ -6,7 +6,7 @@ import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
-import { checkKeyAndValue } from "./protocol.js";
+import { checkKeyAndValue, EMPTY_NAMESPACE } from "./protocol.js";
 
 export { ConnectionLostError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
@@ -309,6 +309,63 @@ async function dialClusterNode(
   }
 
   return { node, kind: "ok", socket: identified.socket, tagged: identified.tagged };
+}
+
+/** The forwarding operations `NanocachedNamespace` delegates to — bound
+ * closures over one `NanocachedClient` instance and one namespace, built by
+ * `NanocachedClient.namespace()`. Kept as a plain object of closures
+ * (rather than handing the handle the client instance itself) so the
+ * handle can only ever reach the client through this narrow, namespace-
+ * scoped surface — never anything else `NanocachedClient` exposes. */
+interface NamespaceOps {
+  get(key: string | Uint8Array): Promise<string | null>;
+  getBytes(key: string | Uint8Array): Promise<Buffer | null>;
+  set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void>;
+  delete(key: string | Uint8Array): Promise<boolean>;
+}
+
+/**
+ * A lightweight handle scoped to one namespace (first-class namespaces,
+ * issue #105), returned by `NanocachedClient.namespace(ns)`. Exposes the
+ * same data operations the client itself does, with identical semantics —
+ * routing (HRW over `(namespace, key)`), replication fan-out, hedged
+ * reads, `W` refresh-and-retry, response tags, compression, error types —
+ * because every method here just forwards to the client's own internal
+ * (namespace, key)-taking machinery instead of duplicating any of its
+ * networking. Cheap to create, shares the client's connections, and — like
+ * every client method — throws `AlreadyClosedError` once the client is
+ * closed.
+ */
+export class NanocachedNamespace {
+  /** The raw namespace bytes this handle addresses (a UTF-8-encoded
+   * string is stored this way too) — useful for the framework adapters
+   * built on top of this (#107/#108), which need to name a namespace back
+   * to its caller. */
+  readonly namespace: Buffer;
+
+  constructor(namespace: Buffer, private readonly ops: NamespaceOps) {
+    this.namespace = namespace;
+  }
+
+  /** See `NanocachedClient.get`. */
+  get(key: string | Uint8Array): Promise<string | null> {
+    return this.ops.get(key);
+  }
+
+  /** See `NanocachedClient.getBytes`. */
+  getBytes(key: string | Uint8Array): Promise<Buffer | null> {
+    return this.ops.getBytes(key);
+  }
+
+  /** See `NanocachedClient.set`. */
+  set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
+    return this.ops.set(key, value, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.delete`. */
+  delete(key: string | Uint8Array): Promise<boolean> {
+    return this.ops.delete(key);
+  }
 }
 
 /**
@@ -642,8 +699,7 @@ export class NanocachedClient {
    * mode), it is never silently replaced. Use `getBytes` for raw bytes,
    * e.g. for values this client didn't itself write as a UTF-8 string. */
   async get(key: string | Uint8Array): Promise<string | null> {
-    const value = await this.getBytes(key);
-    return value === null ? null : UTF8_DECODER.decode(value);
+    return this.getInNamespace(EMPTY_NAMESPACE, key);
   }
 
   /** The raw-bytes companion to `get`: same routing/retry/cluster
@@ -652,15 +708,24 @@ export class NanocachedClient {
    * the remaining owners before being accepted as final
    * (read repair). */
   async getBytes(key: string | Uint8Array): Promise<Buffer | null> {
+    return this.getBytesInNamespace(EMPTY_NAMESPACE, key);
+  }
+
+  private async getInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<string | null> {
+    const value = await this.getBytesInNamespace(namespace, key);
+    return value === null ? null : UTF8_DECODER.decode(value);
+  }
+
+  private async getBytesInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     let value = await this.withWrongNodeRetry(() =>
       this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.get(key))
-        : this.readFromOwners(key, (connection) => connection.get(key)),
+        ? this.singleConnection().then((connection) => connection.get(key, namespace))
+        : this.readFromOwners(key, namespace, (connection) => connection.get(key, namespace)),
     );
     if (value === null && this.readRepair && this.target.kind === "cluster") {
-      value = await this.tryReadRepair(key);
+      value = await this.tryReadRepair(key, namespace);
     }
     if (value === null || !this.compress) return value;
     return decompressValue(value);
@@ -686,8 +751,8 @@ export class NanocachedClient {
    * #43). Nothing here may turn an already-accepted miss into an error —
    * except an actual programming bug (isSwallowable), which still
    * propagates. */
-  private async tryReadRepair(key: string | Uint8Array): Promise<Buffer | null> {
-    const names = this.ownerNames(key);
+  private async tryReadRepair(key: string | Uint8Array, namespace: Uint8Array): Promise<Buffer | null> {
+    const names = this.ownerNames(key, namespace);
     // Every owner but the primary, which the normal read path already
     // probed and got a clean miss from (same as the Rust, Go, Java and
     // .NET SDKs).
@@ -695,7 +760,7 @@ export class NanocachedClient {
       let value: Buffer | null;
       try {
         const connection = await this.memberConnection(name);
-        value = await connection.get(key);
+        value = await connection.get(key, namespace);
       } catch (error) {
         if (!isSwallowable(error)) throw error;
         continue;
@@ -721,7 +786,7 @@ export class NanocachedClient {
       // repairs it.
       if (primaryName !== undefined && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const repaired = this.memberConnection(primaryName)
-          .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS))
+          .then((connection) => connection.set(key, repairValue, READ_REPAIR_TTL_SECONDS, namespace))
           .catch((error) => {
             // Swallowed by design — see the doc comment.
             if (!isSwallowable(error)) throw error;
@@ -749,6 +814,15 @@ export class NanocachedClient {
    * compresses values at or above `compressionThreshold` when `compress`
    * is enabled (value compression). */
   async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
+    return this.setInNamespace(EMPTY_NAMESPACE, key, value, ttlSeconds);
+  }
+
+  /** Returns whether the key existed before this call. */
+  async delete(key: string | Uint8Array): Promise<boolean> {
+    return this.deleteInNamespace(EMPTY_NAMESPACE, key);
+  }
+
+  private async setInNamespace(namespace: Uint8Array, key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
@@ -760,32 +834,54 @@ export class NanocachedClient {
     // too, purely as a defense-in-depth backstop should compressValue
     // ever grow a value instead of shrinking it (encodeSet, reached
     // through connection.set below, does that second check).
-    checkKeyAndValue(keyBytes, valueBytes);
+    checkKeyAndValue(keyBytes, valueBytes, namespace);
     const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
     return this.withWrongNodeRetry(() =>
       this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.set(key, outgoing, ttlSeconds))
-        : this.writeToOwners(key, (connection) => connection.set(key, outgoing, ttlSeconds)),
+        ? this.singleConnection().then((connection) => connection.set(key, outgoing, ttlSeconds, namespace))
+        : this.writeToOwners(key, namespace, (connection) => connection.set(key, outgoing, ttlSeconds, namespace)),
     );
   }
 
-  /** Returns whether the key existed before this call. */
-  async delete(key: string | Uint8Array): Promise<boolean> {
+  private async deleteInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     return this.withWrongNodeRetry(() =>
       this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.delete(key))
-        : this.writeToOwners(key, (connection) => connection.delete(key)),
+        ? this.singleConnection().then((connection) => connection.delete(key, namespace))
+        : this.writeToOwners(key, namespace, (connection) => connection.delete(key, namespace)),
     );
   }
 
-  /** The names of `key`'s top-R owners, primary first (client-side replication). Only
-   * meaningful in cluster mode. */
-  private ownerNames(key: string | Uint8Array): string[] {
+  /** Returns a lightweight handle scoped to `ns` (first-class namespaces,
+   * issue #105) — see `NanocachedNamespace`. `ns` accepts the same
+   * key-ish types this client accepts for keys: a `string` is UTF-8
+   * encoded, a `Uint8Array` is used as-is (namespaces are opaque bytes —
+   * no delimiter, no escaping, no hierarchy, matching `src/key.rs` on the
+   * server). The empty namespace (`""`/an empty `Uint8Array`) is not
+   * rejected: it returns a handle that behaves exactly like this client,
+   * since it addresses the very same default namespace `get`/`set`/
+   * `delete` already do — see `getInNamespace`/`encodeGet` and friends,
+   * which all send the legacy frame for it. The handle shares this
+   * client's connections and forwards every call to this client's own
+   * (namespace, key)-taking methods — it opens nothing of its own and
+   * duplicates none of this client's networking. */
+  namespace(ns: string | Uint8Array): NanocachedNamespace {
+    const namespaceBytes = typeof ns === "string" ? Buffer.from(ns, "utf8") : Buffer.from(ns);
+    return new NanocachedNamespace(namespaceBytes, {
+      get: (key) => this.getInNamespace(namespaceBytes, key),
+      getBytes: (key) => this.getBytesInNamespace(namespaceBytes, key),
+      set: (key, value, ttlSeconds) => this.setInNamespace(namespaceBytes, key, value, ttlSeconds),
+      delete: (key) => this.deleteInNamespace(namespaceBytes, key),
+    });
+  }
+
+  /** The names of `key`'s top-R owners in `namespace`, primary first
+   * (client-side replication). Only meaningful in cluster mode. */
+  private ownerNames(key: string | Uint8Array, namespace: Uint8Array): string[] {
     if (this.target.kind !== "cluster") return [];
     const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
-    return this.target.ring.owners(keyBytes, this.target.replication);
+    return this.target.ring.owners(keyBytes, this.target.replication, namespace);
   }
 
   /** Cluster read (client-side replication): ask the key's owners in rank order,
@@ -796,15 +892,16 @@ export class NanocachedClient {
    * which withWrongNodeRetry fixes with a refresh and one retry. */
   private async readFromOwners<T>(
     key: string | Uint8Array,
+    namespace: Uint8Array,
     op: (connection: Connection) => Promise<T>,
   ): Promise<T> {
-    const names = this.ownerNames(key);
+    const names = this.ownerNames(key, namespace);
 
     // Hedged reads (issue #64): only meaningful with at least 2 owners —
     // with a single copy there is nobody to hedge to, so the plain
     // sequential path below runs unchanged.
     if (this.readHedgeAfterMs !== undefined && names.length > 1) {
-      return this.readHedged(key, op, names);
+      return this.readHedged(op, names);
     }
 
     let lastError: Error | null = null;
@@ -853,7 +950,6 @@ export class NanocachedClient {
    * `hedgedReads`, their outcome retrieved (so nothing surfaces as an
    * unhandled rejection), and drained by close(). */
   private async readHedged<T>(
-    key: string | Uint8Array,
     op: (connection: Connection) => Promise<T>,
     names: string[],
   ): Promise<T> {
@@ -960,9 +1056,10 @@ export class NanocachedClient {
    * everyone.) */
   private async writeToOwners<T>(
     key: string | Uint8Array,
+    namespace: Uint8Array,
     op: (connection: Connection) => Promise<T>,
   ): Promise<T> {
-    const [primaryName, ...replicaNames] = this.ownerNames(key);
+    const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
       throw new ConnectionLostError("nanocached: no owner is reachable for this key");
     }

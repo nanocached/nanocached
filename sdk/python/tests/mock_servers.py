@@ -1,5 +1,6 @@
 """In-process stand-ins for nanocached-node and nanocached-discovery,
-speaking just enough of the wire protocol (``A``, ``G``/``S``/``D``, ``L``)
+speaking just enough of the wire protocol (``A``, ``G``/``S``/``D`` and
+their namespaced ``g``/``s``/``d`` counterparts — issue #105 — and ``L``)
 for the client tests to exercise NanocachedClient end-to-end over real TCP
 sockets without the Rust binaries. Mirrors the TypeScript SDK's mocks."""
 
@@ -16,6 +17,16 @@ class MockNode:
         close_on_extended_auth: bool = False,
     ) -> None:
         self.store: dict[bytes, bytes] = {}
+        # Namespaces (issue #105): entries under a non-empty namespace live
+        # here instead, keyed by (namespace, key) — separate from `store`
+        # so a namespaced key never collides with a same-named default-
+        # namespace one, proving isolation the way the real server's
+        # namespace-scoped storage does. A `g`/`s`/`d` with namespace-
+        # length 0 (the default namespace) still goes to `store` above —
+        # see _store_key/_get_entry/_set_entry/_delete_entry — so existing
+        # tests that poke `node.store[...]` directly keep working
+        # unchanged.
+        self.ns_store: dict[tuple[bytes, bytes], bytes] = {}
         self.required_secret = required_secret
         # Echoed response tags: acknowledge `A ... T` with `OnT\n` and echo tags on
         # that connection's replies. Off by default so the bulk of the
@@ -26,6 +37,11 @@ class MockNode:
         self.close_on_extended_auth = close_on_extended_auth
         self.connection_count = 0
         self.get_count = 0
+        # Namespaces (issue #105): counts every `g`/`s`/`d` frame received,
+        # regardless of outcome — lets a test prove the default (empty)
+        # namespace never leaves this connection as anything but the
+        # legacy `G`/`S`/`D` it must stay byte-for-byte compatible with.
+        self.namespaced_command_count = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
         self._wrong_tag_replies = 0
@@ -150,6 +166,25 @@ class MockNode:
             self._server.close()
             await self._server.wait_closed()
 
+    # Namespaces (issue #105): a namespace-length of 0 (default namespace)
+    # is routed to `store` — the same entries `G`/`S`/`D` see — exactly
+    # like the real server's "g 0 ... == G ..." rule; a non-empty
+    # namespace is routed to `ns_store`, keyed by (namespace, key), so it
+    # never collides with a same-named default-namespace entry.
+    def _get_entry(self, namespace: bytes, key: bytes) -> bytes | None:
+        return self.store.get(key) if not namespace else self.ns_store.get((namespace, key))
+
+    def _set_entry(self, namespace: bytes, key: bytes, value: bytes) -> None:
+        if namespace:
+            self.ns_store[(namespace, key)] = value
+        else:
+            self.store[key] = value
+
+    def _delete_entry(self, namespace: bytes, key: bytes) -> bool:
+        if namespace:
+            return self.ns_store.pop((namespace, key), None) is not None
+        return self.store.pop(key, None) is not None
+
     async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.connection_count += 1
         self._sockets.add(writer)
@@ -163,6 +198,8 @@ class MockNode:
                 except (asyncio.IncompleteReadError, ConnectionError):
                     return
                 parts = header[:-1].split(b" ")
+                if parts[0] in (b"g", b"s", b"d"):
+                    self.namespaced_command_count += 1
                 # On a tagged connection every request's last header field
                 # is its tag, echoed back as each reply's own last field.
                 tag_suffix = b" " + parts[-1] if tagged else b""
@@ -184,8 +221,17 @@ class MockNode:
                     if not accepted:
                         return
 
-                elif parts[0] == b"G":
-                    key = await reader.readexactly(int(parts[1]))
+                elif parts[0] in (b"G", b"g"):
+                    # Namespaces (issue #105): `g` gains one leading
+                    # <namespace-length> header field, with namespace
+                    # bytes leading the body — everything else about the
+                    # request/response is identical to `G`, tag included.
+                    if parts[0] == b"g":
+                        namespace = await reader.readexactly(int(parts[1]))
+                        key = await reader.readexactly(int(parts[2]))
+                    else:
+                        namespace = b""
+                        key = await reader.readexactly(int(parts[1]))
                     self.get_count += 1
                     if self._silent:
                         continue
@@ -242,23 +288,38 @@ class MockNode:
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")
-                    elif key in self.store:
-                        value = self.store[key]
-                        writer.write(b"V %d%b\n%b" % (len(value), tag_suffix, value))
                     else:
-                        writer.write(b"N" + tag_suffix + b"\n")
+                        value = self._get_entry(namespace, key)
+                        if value is not None:
+                            writer.write(b"V %d%b\n%b" % (len(value), tag_suffix, value))
+                        else:
+                            writer.write(b"N" + tag_suffix + b"\n")
                     await writer.drain()
 
-                elif parts[0] == b"S":
-                    key = await reader.readexactly(int(parts[1]))
-                    value = await reader.readexactly(int(parts[2]))
-                    # parts[3], when present (and not the tag itself), is
-                    # the TTL (omitted on the wire means "no expiry", i.e.
-                    # 0 — see _encode_set's doc comment in
-                    # _connection.py). On a tagged connection the tag sits
-                    # after it as the last field.
-                    base_field_count = 4 if tagged else 3
-                    self.last_set_ttl = int(parts[3]) if len(parts) > base_field_count else 0
+                elif parts[0] in (b"S", b"s"):
+                    # Namespaces (issue #105): `s`'s header is `s
+                    # <ns-len> <key-len> <val-len> [<ttl>] [<tag>]` —
+                    # otherwise identical to `S`.
+                    if parts[0] == b"s":
+                        namespace = await reader.readexactly(int(parts[1]))
+                        key = await reader.readexactly(int(parts[2]))
+                        value = await reader.readexactly(int(parts[3]))
+                        # parts[4], when present (and not the tag itself),
+                        # is the TTL — one field later than S's own,
+                        # because of the leading ns-len field above.
+                        base_field_count = 5 if tagged else 4
+                        self.last_set_ttl = int(parts[4]) if len(parts) > base_field_count else 0
+                    else:
+                        namespace = b""
+                        key = await reader.readexactly(int(parts[1]))
+                        value = await reader.readexactly(int(parts[2]))
+                        # parts[3], when present (and not the tag itself),
+                        # is the TTL (omitted on the wire means "no
+                        # expiry", i.e. 0 — see _encode_set's doc comment
+                        # in _connection.py). On a tagged connection the
+                        # tag sits after it as the last field.
+                        base_field_count = 4 if tagged else 3
+                        self.last_set_ttl = int(parts[3]) if len(parts) > base_field_count else 0
                     if self._silent:
                         continue
                     if self._set_delay > 0:
@@ -270,19 +331,24 @@ class MockNode:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")
                     else:
-                        self.store[key] = value
+                        self._set_entry(namespace, key, value)
                         writer.write(b"S" + tag_suffix + b"\n")
                     await writer.drain()
 
-                elif parts[0] == b"D":
-                    key = await reader.readexactly(int(parts[1]))
+                elif parts[0] in (b"D", b"d"):
+                    if parts[0] == b"d":
+                        namespace = await reader.readexactly(int(parts[1]))
+                        key = await reader.readexactly(int(parts[2]))
+                    else:
+                        namespace = b""
+                        key = await reader.readexactly(int(parts[1]))
                     if self._silent:
                         continue
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")
                     else:
-                        deleted = self.store.pop(key, None) is not None
+                        deleted = self._delete_entry(namespace, key)
                         writer.write((b"D" if deleted else b"N") + tag_suffix + b"\n")
                     await writer.drain()
 

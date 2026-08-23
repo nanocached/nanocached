@@ -153,6 +153,14 @@ existed, err := client.Delete("greeting")</code></pre>
   busy or unreachable replicas.</li>
   <li><b>Replication</b> — R rides along with the node list, so there is
   nothing to configure; each client exposes the factor in use.</li>
+  <li><b>Namespaces</b> — <code>client.namespace("users")</code>
+  (<code>Namespace(...)</code> in .NET) returns a handle with the same
+  <code>get</code>/<code>set</code>/<code>delete</code> operations scoped to
+  a flat, opaque namespace: the same key name in two namespaces is two
+  entries. The handle shares the client's connections and routing; the
+  un-namespaced API is unchanged and keeps the legacy wire frames, so it
+  still works against pre-namespace servers. See the
+  <a href="protocol.html#namespaces">protocol</a> for the wire form.</li>
   <li><b>Failure recovery</b> — a stale routing table (a node answers
   <code>W</code>) or a dead primary both trigger one node-list refresh
   and one retry; recovery is bounded by discovery's liveness timeout.</li>

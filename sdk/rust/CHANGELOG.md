@@ -4,6 +4,40 @@ All notable changes to the Rust SDK are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow the `sdk/rust/vX.Y.Z` tags.
 
+## [Unreleased]
+
+### Added
+
+- Namespaces (issue #105): `client.namespace(ns)` returns a lightweight
+  `Namespace` handle scoped to `ns` — a flat, opaque byte string. The
+  same key name under two different namespaces (or under no namespace at
+  all) is a wholly independent entry. The handle exposes the same
+  `get`/`get_bytes`/`set`/`delete` operations as `NanocachedClient`, with
+  identical semantics (routing, replication fan-out, hedged reads, `W`
+  refresh-and-retry, response tags, compression) keyed off `(namespace,
+  key)` together; it shares the client's connections and routing rather
+  than duplicating any networking, and is invalid once the client is
+  closed (`Error::AlreadyClosed`, same as the client's own methods).
+  `namespace("")` returns a handle equivalent to the client itself. The
+  namespace-less API is unchanged and remains the default.
+
+  On the wire, a non-empty namespace switches `get`/`set`/`delete` from
+  the `G`/`S`/`D` frames to their lowercase `g`/`s`/`d` counterparts,
+  which carry the namespace's length and bytes ahead of the key; the
+  default (empty) namespace always sends the legacy `G`/`S`/`D` bytes
+  byte-for-byte, so existing code and connections to a pre-namespace
+  server are unaffected. Routing folds the namespace into the rendezvous
+  hash's key input (`fnv1a(be32(len(ns)) || ns || key)` for a non-empty
+  namespace; the default namespace hashes exactly like the pre-namespace
+  form, so an un-namespaced key's placement never moves) — pinned against
+  the same cross-language test vectors the server and every other SDK
+  assert. Namespaced frames need a namespace-aware server.
+
+  **Breaking: `HashRing::owners` and `HashRing::route` gained a leading
+  `namespace: &[u8]` parameter** (`owners(namespace, key, replicas)` /
+  `route(namespace, key)`); pass `b""` to route an un-namespaced key
+  exactly as before.
+
 ## [0.3.0] - 2026-08-22
 
 Aligned release of the server and all six SDKs. Server-side, this

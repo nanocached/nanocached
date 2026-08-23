@@ -1071,6 +1071,163 @@ public class NanocachedClientTests
         }
     }
 
+    // ── namespaces (issue #105) ──────────────────────────────────
+
+    [Fact]
+    public async Task NamespaceIsolatesEntriesWithTheSameKeyName()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace users = client.Namespace("users");
+        NanocachedNamespace orders = client.Namespace("orders");
+
+        await users.SetAsync("k", "from users");
+        await orders.SetAsync("k", "from orders");
+        await client.SetAsync("k", "from default");
+
+        // Same key name, three independent entries: the default
+        // namespace and each of the two named ones.
+        Assert.Equal("from users", await users.GetAsync("k"));
+        Assert.Equal("from orders", await orders.GetAsync("k"));
+        Assert.Equal("from default", await client.GetAsync("k"));
+        Assert.Equal(3, node.Store.Count);
+
+        Assert.True(await users.DeleteAsync("k"));
+        Assert.Null(await users.GetAsync("k"));
+        // Deleting from "users" must not touch the other two namespaces.
+        Assert.Equal("from orders", await orders.GetAsync("k"));
+        Assert.Equal("from default", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task NamespaceAcceptsRawBytesIncludingNonUtf8()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] binaryNamespace = { 0xff, 0x00, 0x10 };
+        NanocachedNamespace ns = client.Namespace(binaryNamespace);
+        Assert.Equal(binaryNamespace, ns.NamespaceBytes);
+
+        await ns.SetAsync(Bytes("k"), Bytes("v"));
+        Assert.Equal(Bytes("v"), await ns.GetBytesAsync(Bytes("k")));
+        Assert.True(await ns.DeleteAsync(Bytes("k")));
+        Assert.Null(await ns.GetBytesAsync(Bytes("k")));
+    }
+
+    [Fact]
+    public async Task EmptyNamespaceIsEquivalentToTheRootClientAndSendsLegacyFrames()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace root = client.Namespace("");
+        Assert.Equal("", root.Namespace);
+        Assert.Empty(root.NamespaceBytes);
+
+        await root.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k")); // same store entry as the root client
+        Assert.True(await root.DeleteAsync("k"));
+        Assert.Null(await client.GetAsync("k"));
+
+        // Namespace("") never reaches the wire as an explicit
+        // zero-length-namespace g/s/d frame — it is byte-for-byte the
+        // legacy G/S/D form (docs/protocol.html's namespaces section).
+        Assert.Equal(0, node.NamespacedRequestCount);
+    }
+
+    [Fact]
+    public async Task NonEmptyNamespaceUsesTheNamespacedFrames()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("k", "v");
+        Assert.Equal("v", await ns.GetAsync("k"));
+        Assert.True(await ns.DeleteAsync("k"));
+
+        Assert.Equal(3, node.NamespacedRequestCount); // one g/s/d frame apiece
+    }
+
+    [Fact]
+    public async Task NamespacedSetWithTtlRoundTripsOnATaggedConnection()
+    {
+        // Exercises the tagged form of the namespaced s frame with a TTL
+        // present: "s <ns-len> <key-len> <val-len> <ttl> <tag>\n<ns><key><value>".
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("k", "v", ttlSeconds: 60);
+        Assert.Equal(60, node.LastSetTtl);
+        Assert.Equal("v", await ns.GetAsync("k"));
+        Assert.True(await ns.DeleteAsync("k"));
+    }
+
+    [Fact]
+    public async Task NamespaceHandleThrowsAfterTheOwningClientCloses()
+    {
+        using var node = new MockNode();
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        NanocachedNamespace ns = client.Namespace("users");
+        client.Close();
+
+        await Assert.ThrowsAsync<AlreadyClosedException>(() => ns.GetAsync("k"));
+        await Assert.ThrowsAsync<AlreadyClosedException>(() => ns.SetAsync("k", "v"));
+        await Assert.ThrowsAsync<AlreadyClosedException>(() => ns.DeleteAsync("k"));
+    }
+
+    [Fact]
+    public async Task NamespacedKeysRouteByNamespaceAndKeyTogether()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        byte[] namespaceBytes = Bytes("users");
+        NanocachedNamespace users = client.Namespace("users");
+        for (int i = 0; i < 50; i++) await users.SetAsync($"key-{i}", $"value-{i}");
+        for (int i = 0; i < 50; i++)
+        {
+            Assert.Equal($"value-{i}", await users.GetAsync($"key-{i}"));
+        }
+
+        // Routed by HRW over (namespace, key) — the same ring the un-
+        // namespaced tests above pin, but with the namespace mixed into
+        // the key-side hash, so this lands on whichever owner
+        // HashRing.Owners(ns, key, ...) picks, not the un-namespaced key's
+        // owner.
+        var ring = new HashRing(Names);
+        for (int i = 0; i < 50; i++)
+        {
+            byte[] key = Bytes($"key-{i}");
+            string owner = ring.Owners(namespaceBytes, key, 1)[0];
+            Assert.True(cluster.Nodes[owner].Store.ContainsKey(MockNode.KeyOf(namespaceBytes, key)));
+        }
+    }
+
+    [Fact]
+    public async Task NamespacedWrongNodeTriggersRefreshAndOneRetryRoutedByNamespaceAndKey()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        byte[] namespaceBytes = Bytes("users");
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("some-key", "v");
+        MockNode owner = cluster.Nodes[new HashRing(Names).Route(namespaceBytes, Bytes("some-key"))];
+
+        owner.AnswerWrongNodeOnce();
+        Assert.Equal("v", await ns.GetAsync("some-key"));
+
+        owner.AnswerWrongNodeOnce();
+        owner.AnswerWrongNodeOnce();
+        await Assert.ThrowsAsync<WrongNodeException>(() => ns.GetAsync("some-key"));
+    }
+
     // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     // A "did it wait for the mock's delay" assertion can't compare the

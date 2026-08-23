@@ -1,5 +1,7 @@
 package nanocached
 
+import "encoding/binary"
+
 // HashRing is rendezvous (highest-random-weight) hashing over a fixed
 // node list (the client-side replication design). This is
 // deliberately a byte-for-byte port of the same computation every other
@@ -9,7 +11,7 @@ package nanocached
 // would disagree about which nodes hold a key. Cross-language test
 // vectors pin the pipeline.
 //
-// For each (node, key) pair, score = fmix64(fnv1a(name) ^ fnv1a(key)); a
+// For each (node, key) pair, score = fmix64(fnv1a(name) ^ keyHash); a
 // key's owners are the `replicas` highest-scoring nodes in descending
 // score order (ties — effectively impossible at 64 bits — break toward
 // the lexicographically smaller name), and its primary is the top one.
@@ -20,14 +22,59 @@ type HashRing struct {
 	nodeHashes []uint64
 }
 
-// fnv1a is FNV-1a over 64 bits; Go's uint64 arithmetic wraps like Rust's u64.
+// fnv1aOffsetBasis and fnv1aPrime are FNV-1a's 64-bit constants; Go's
+// uint64 arithmetic wraps like Rust's u64.
+const (
+	fnv1aOffsetBasis uint64 = 0xcbf29ce484222325
+	fnv1aPrime       uint64 = 0x100000001b3
+)
+
+// fnv1a is FNV-1a over 64 bits, from the standard offset basis.
 func fnv1a(data []byte) uint64 {
-	var hash uint64 = 0xcbf29ce484222325
+	return fnv1aContinue(fnv1aOffsetBasis, data)
+}
+
+// fnv1aContinue feeds data into an in-progress FNV-1a state, so a
+// multi-part input (issue #105's namespaced key hash: length-prefix,
+// then namespace, then key) can be hashed as one stream without ever
+// materializing the concatenation — mirrors src/hash_ring.rs's
+// fnv1a_continue, which every implementation shares this exact split
+// with.
+func fnv1aContinue(hash uint64, data []byte) uint64 {
 	for _, b := range data {
 		hash ^= uint64(b)
-		hash *= 0x100000001b3
+		hash *= fnv1aPrime
 	}
 	return hash
+}
+
+// keyHash is the canonical key-side hash input the HRW score is built
+// from (issue #105: first-class namespaces) — consensus-critical across
+// the server, this SDK, and the other five:
+//
+//   - default (empty) namespace: fnv1a(key) — byte-identical to the
+//     pre-namespace form, so an existing key's placement never moves
+//     across a rolling upgrade, and mixed-version clients still agree;
+//   - non-empty namespace: fnv1a(be32(len(ns)) || ns || key) — the
+//     namespace length as a 4-byte big-endian integer, then the
+//     namespace bytes, then the key bytes, hashed as one stream.
+//     Length-prefixed so ("ab","c") and ("a","bc") can never collide;
+//     including the namespace at all is what keeps placement balanced —
+//     hashing the key alone would pile every namespace's common
+//     singleton keys (e.g. "config") onto the same nodes.
+func keyHash(namespace, key []byte) uint64 {
+	if len(namespace) == 0 {
+		return fnv1a(key)
+	}
+	// Namespaces are bounded by the request-size limit (1 MiB, see
+	// maxRequestBytes), so this cast never truncates — it's the
+	// canonical encoding width every implementation uses, not a
+	// narrowing that could actually occur.
+	var lengthBytes [4]byte
+	binary.BigEndian.PutUint32(lengthBytes[:], uint32(len(namespace)))
+	hash := fnv1a(lengthBytes[:])
+	hash = fnv1aContinue(hash, namespace)
+	return fnv1aContinue(hash, key)
 }
 
 // fmix64 is MurmurHash3's 64-bit finalizer: the full-avalanche mix FNV-1a lacks.
@@ -53,10 +100,20 @@ func NewHashRing(nodes []string) *HashRing {
 	return ring
 }
 
-// Owners returns the key's owners: the `replicas` highest-scoring nodes,
-// primary first. Returns fewer when the cluster is smaller.
+// Owners returns the key's owners in the default (unnamespaced) keyspace:
+// the `replicas` highest-scoring nodes, primary first. Returns fewer when
+// the cluster is smaller. Equivalent to OwnersNS(nil, key, replicas) —
+// kept as its own method so existing callers (and this package's own
+// pre-#105 tests) don't have to pass a namespace they don't have.
 func (r *HashRing) Owners(key []byte, replicas int) []string {
-	keyHash := fnv1a(key)
+	return r.OwnersNS(nil, key, replicas)
+}
+
+// OwnersNS is Owners scoped to namespace (issue #105: first-class
+// namespaces) — an empty namespace is the same default keyspace Owners
+// itself addresses, byte-identical placement included (see keyHash).
+func (r *HashRing) OwnersNS(namespace, key []byte, replicas int) []string {
+	keyHash := keyHash(namespace, key)
 
 	type scored struct {
 		score uint64
@@ -112,15 +169,21 @@ func (r *HashRing) Owners(key []byte, replicas int) []string {
 	return owners
 }
 
-// Route returns the key's primary — Owners(key, 1)[0]. On an empty ring
-// there is no primary to return, so it reports an error (wrapping
-// ErrInvalidArgument, matching every other client-side validation
-// failure caught before any network I/O) instead of panicking — a public
-// API shouldn't crash its caller's process over a construction-time
-// mistake it can hand back as an ordinary error instead.
+// Route returns the key's primary in the default (unnamespaced) keyspace
+// — Owners(key, 1)[0]. On an empty ring there is no primary to return, so
+// it reports an error (wrapping ErrInvalidArgument, matching every other
+// client-side validation failure caught before any network I/O) instead
+// of panicking — a public API shouldn't crash its caller's process over a
+// construction-time mistake it can hand back as an ordinary error
+// instead.
 func (r *HashRing) Route(key []byte) (string, error) {
+	return r.RouteNS(nil, key)
+}
+
+// RouteNS is Route scoped to namespace (issue #105).
+func (r *HashRing) RouteNS(namespace, key []byte) (string, error) {
 	if len(r.nodes) == 0 {
 		return "", invalidArgument("nanocached: HashRing.Route called on an empty ring")
 	}
-	return r.Owners(key, 1)[0], nil
+	return r.OwnersNS(namespace, key, 1)[0], nil
 }

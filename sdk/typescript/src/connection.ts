@@ -2,6 +2,7 @@ import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { NanocachedError } from "./errors.js";
 import {
+  EMPTY_NAMESPACE,
   encodeDelete,
   encodeGet,
   encodeSet,
@@ -112,23 +113,26 @@ export class Connection {
     this.socket.on("close", () => this.onClose());
   }
 
-  async get(key: string | Uint8Array): Promise<Buffer | null> {
-    const response = await this.send((tag) => encodeGet(toBytes(key), tag));
+  /** `namespace` (first-class namespaces, issue #105) defaults to the
+   * default (empty) namespace, which sends the exact legacy `G` frame —
+   * see `encodeGet`. */
+  async get(key: string | Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<Buffer | null> {
+    const response = await this.send((tag) => encodeGet(toBytes(key), tag, namespace));
     if (response.kind === "value") return response.value ?? Buffer.alloc(0);
     if (response.kind === "notFound") return null;
     if (response.kind === "wrongNode") throw new WrongNodeError();
     throw this.mismatch(response);
   }
 
-  async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<void> {
-    const response = await this.send((tag) => encodeSet(toBytes(key), toBytes(value), ttlSeconds, tag));
+  async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<void> {
+    const response = await this.send((tag) => encodeSet(toBytes(key), toBytes(value), ttlSeconds, tag, namespace));
     if (response.kind === "wrongNode") throw new WrongNodeError();
     if (response.kind !== "stored") throw this.mismatch(response);
   }
 
   /** Returns whether the key existed before this call. */
-  async delete(key: string | Uint8Array): Promise<boolean> {
-    const response = await this.send((tag) => encodeDelete(toBytes(key), tag));
+  async delete(key: string | Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<boolean> {
+    const response = await this.send((tag) => encodeDelete(toBytes(key), tag, namespace));
     if (response.kind === "deleted") return true;
     if (response.kind === "notFound") return false;
     if (response.kind === "wrongNode") throw new WrongNodeError();

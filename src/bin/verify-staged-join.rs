@@ -376,12 +376,46 @@ async fn read_exact_into(
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    fnv1a_continue(0xcbf29ce484222325, bytes)
+}
+
+fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     for &byte in bytes {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+/// The canonical key-side hash (issue #105), matching `src/hash_ring.rs`:
+/// `fnv1a(key)` for the default (empty) namespace, and
+/// `fnv1a(be32(len(ns)) || ns || key)` otherwise.
+fn key_hash(namespace: &[u8], key: &[u8]) -> u64 {
+    if namespace.is_empty() {
+        return fnv1a(key);
+    }
+
+    let length = u32::try_from(namespace.len())
+        .expect("a namespace is bounded by the request-size limit")
+        .to_be_bytes();
+    let hash = fnv1a(&length);
+    let hash = fnv1a_continue(hash, namespace);
+    fnv1a_continue(hash, key)
+}
+
+/// The namespace half of this harness's keys: every other seeded key
+/// lives in a namespace (issue #105), so the handoff is checked for both
+/// wire forms and both HRW forms, not just the legacy one.
+const VERIFY_NAMESPACE: &[u8] = b"verify";
+
+/// The (namespace, key) pair for seeded key `index`.
+fn verify_key(index: usize) -> (&'static [u8], String) {
+    let namespace: &'static [u8] = if index.is_multiple_of(2) {
+        b""
+    } else {
+        VERIFY_NAMESPACE
+    };
+    (namespace, format!("verify-key-{index}"))
 }
 
 /// MurmurHash3's 64-bit finalizer, matching `src/hash_ring.rs` exactly.
@@ -414,8 +448,8 @@ impl<'a> Ring<'a> {
 
     /// The key's owners: the `replicas` highest-scoring nodes, primary
     /// first. Fewer than `replicas` when the roster is smaller.
-    fn owners(&self, key: &[u8], replicas: usize) -> Roster {
-        let key_hash = fnv1a(key);
+    fn owners(&self, namespace: &[u8], key: &[u8], replicas: usize) -> Roster {
+        let key_hash = key_hash(namespace, key);
 
         let mut scored: Vec<(u64, &(String, String))> = self
             .node_hashes
@@ -530,16 +564,39 @@ async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
 async fn set(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
+    namespace: &[u8],
     key: &[u8],
     value: &[u8],
 ) -> io::Result<bool> {
-    let mut message = format!("S {} {}\n", key.len(), value.len()).into_bytes();
+    let mut message = set_header(namespace, key, value.len());
+    message.extend_from_slice(namespace);
     message.extend_from_slice(key);
     message.extend_from_slice(value);
     stream.write_all(&message).await?;
 
     let line = read_line(stream, buf).await?;
     Ok(line == "S")
+}
+
+/// The `S` (default namespace) or `s` (namespaced, issue #105) header.
+fn set_header(namespace: &[u8], key: &[u8], value_length: usize) -> Vec<u8> {
+    if namespace.is_empty() {
+        format!("S {} {}\n", key.len(), value_length).into_bytes()
+    } else {
+        format!("s {} {} {}\n", namespace.len(), key.len(), value_length).into_bytes()
+    }
+}
+
+/// The `G`/`g` frame for `key`.
+fn get_message(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut message = if namespace.is_empty() {
+        format!("G {}\n", key.len()).into_bytes()
+    } else {
+        format!("g {} {}\n", namespace.len(), key.len()).into_bytes()
+    };
+    message.extend_from_slice(namespace);
+    message.extend_from_slice(key);
+    message
 }
 
 /// A `G` response: a hit, a miss, or `W` — client-side replication's "your topology view
@@ -578,10 +635,13 @@ fn parse_value_length(line: &str) -> io::Result<usize> {
     Ok(length)
 }
 
-async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Result<GetReply> {
-    let mut message = format!("G {}\n", key.len()).into_bytes();
-    message.extend_from_slice(key);
-    stream.write_all(&message).await?;
+async fn get(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    namespace: &[u8],
+    key: &[u8],
+) -> io::Result<GetReply> {
+    stream.write_all(&get_message(namespace, key)).await?;
 
     let line = read_line(stream, buf).await?;
 
@@ -602,10 +662,13 @@ async fn get(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Resu
 /// into "the operation succeeded" — the workload only needs the latter,
 /// but `verify_handoff` needs to know whether a key it expects a node to
 /// hold is actually there.
-async fn get_value(stream: &mut TcpStream, buf: &mut BytesMut, key: &[u8]) -> io::Result<bool> {
-    let mut message = format!("G {}\n", key.len()).into_bytes();
-    message.extend_from_slice(key);
-    stream.write_all(&message).await?;
+async fn get_value(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    namespace: &[u8],
+    key: &[u8],
+) -> io::Result<bool> {
+    stream.write_all(&get_message(namespace, key)).await?;
 
     let line = read_line(stream, buf).await?;
 
@@ -758,16 +821,17 @@ async fn workload_get(
     discovery_addr: &str,
     conns: &mut HashMap<String, (TcpStream, BytesMut)>,
     owners: &[(String, String)],
+    namespace: &[u8],
     key: &[u8],
 ) -> (bool, Option<io::Error>) {
     let mut last_error = None;
 
     for (_, addr) in owners {
         match get_or_connect(conns, addr).await {
-            Ok((stream, buf)) => match get(stream, buf, key).await {
+            Ok((stream, buf)) => match get(stream, buf, namespace, key).await {
                 Ok(GetReply::Hit | GetReply::Miss) => return (true, None),
                 Ok(GetReply::WrongNode) => {
-                    return refresh_and_retry_get(discovery_addr, conns, key).await;
+                    return refresh_and_retry_get(discovery_addr, conns, namespace, key).await;
                 }
                 Err(error) => {
                     conns.remove(addr);
@@ -789,6 +853,7 @@ async fn workload_get(
 async fn refresh_and_retry_get(
     discovery_addr: &str,
     conns: &mut HashMap<String, (TcpStream, BytesMut)>,
+    namespace: &[u8],
     key: &[u8],
 ) -> (bool, Option<io::Error>) {
     let (roster, replication) = match fetch_joined(discovery_addr).await {
@@ -796,7 +861,7 @@ async fn refresh_and_retry_get(
         Err(error) => return (false, Some(error)),
     };
 
-    let owners = Ring::new(&roster).owners(key, replication);
+    let owners = Ring::new(&roster).owners(namespace, key, replication);
     let Some((_, addr)) = owners.first() else {
         return (
             false,
@@ -805,7 +870,7 @@ async fn refresh_and_retry_get(
     };
 
     match get_or_connect(conns, addr).await {
-        Ok((stream, buf)) => match get(stream, buf, key).await {
+        Ok((stream, buf)) => match get(stream, buf, namespace, key).await {
             Ok(GetReply::Hit | GetReply::Miss) => (true, None),
             Ok(GetReply::WrongNode) => (
                 false,
@@ -827,6 +892,7 @@ async fn refresh_and_retry_get(
 async fn workload_set(
     conns: &mut HashMap<String, (TcpStream, BytesMut)>,
     owners: &[(String, String)],
+    namespace: &[u8],
     key: &[u8],
     value: &[u8],
 ) -> (bool, Option<io::Error>) {
@@ -835,7 +901,7 @@ async fn workload_set(
 
     for (index, (_, addr)) in owners.iter().enumerate() {
         let result = match get_or_connect(conns, addr).await {
-            Ok((stream, buf)) => set(stream, buf, key, value).await,
+            Ok((stream, buf)) => set(stream, buf, namespace, key, value).await,
             Err(error) => Err(error),
         };
 
@@ -892,14 +958,21 @@ async fn run_worker(
         }
 
         let ring = Ring::new(&roster);
-        let key = format!("verify-key-{}", rng.below(ctx.keys));
+        let (namespace, key) = verify_key(rng.below(ctx.keys));
         let is_get = rng.below(10) < 8;
-        let owners = ring.owners(key.as_bytes(), replication);
+        let owners = ring.owners(namespace, key.as_bytes(), replication);
 
         let (ok, error) = if is_get {
-            workload_get(&ctx.discovery_addr, &mut conns, &owners, key.as_bytes()).await
+            workload_get(
+                &ctx.discovery_addr,
+                &mut conns,
+                &owners,
+                namespace,
+                key.as_bytes(),
+            )
+            .await
         } else {
-            workload_set(&mut conns, &owners, key.as_bytes(), &value).await
+            workload_set(&mut conns, &owners, namespace, key.as_bytes(), &value).await
         };
 
         let elapsed = test_start.elapsed();
@@ -999,11 +1072,11 @@ async fn seed_keys(
     let value = vec![b'x'; value_size];
 
     for index in 0..keys {
-        let key = format!("verify-key-{index}");
+        let (namespace, key) = verify_key(index);
 
-        for (_, addr) in ring.owners(key.as_bytes(), replication) {
+        for (_, addr) in ring.owners(namespace, key.as_bytes(), replication) {
             let (stream, buf) = get_or_connect(&mut conns, &addr).await?;
-            if !set(stream, buf, key.as_bytes(), &value).await? {
+            if !set(stream, buf, namespace, key.as_bytes(), &value).await? {
                 return Err(io::Error::other(format!(
                     "seed SET for {key} to {addr} was not acknowledged"
                 )));
@@ -1046,10 +1119,10 @@ async fn verify_handoff(
     let mut missing = Vec::new();
 
     for index in 0..keys {
-        let key = format!("verify-key-{index}");
+        let (namespace, key) = verify_key(index);
 
         if !ring
-            .owners(key.as_bytes(), replication)
+            .owners(namespace, key.as_bytes(), replication)
             .iter()
             .any(|(name, _)| name == new_node_name)
         {
@@ -1057,7 +1130,7 @@ async fn verify_handoff(
         }
 
         expected += 1;
-        if !get_value(&mut stream, &mut buf, key.as_bytes()).await? {
+        if !get_value(&mut stream, &mut buf, namespace, key.as_bytes()).await? {
             missing.push(key);
         }
     }
@@ -1322,16 +1395,51 @@ mod tests {
             |roster: Roster| -> Vec<String> { roster.into_iter().map(|(name, _)| name).collect() };
 
         assert_eq!(
-            names(ring.owners(b"alpha", 3)),
+            names(ring.owners(b"", b"alpha", 3)),
             vec!["node-c", "node-b", "node-a"]
         );
         assert_eq!(
-            names(ring.owners(b"beta", 3)),
+            names(ring.owners(b"", b"beta", 3)),
             vec!["node-a", "node-c", "node-b"]
         );
         assert_eq!(
-            names(ring.owners(b"", 3)),
+            names(ring.owners(b"", b"", 3)),
             vec!["node-a", "node-b", "node-c"]
+        );
+
+        // Namespaced form (issue #105) — the same vectors `src/hash_ring.rs`
+        // and every SDK pin.
+        assert_eq!(key_hash(b"users", b"alpha"), 0xfd4ab55027c21df6);
+        assert_eq!(key_hash(b"users", b""), 0xa9e9bbca44bb502e);
+        assert_eq!(key_hash(b"\xff\x00", b"beta"), 0x8f7c097eccb8e792);
+        assert_eq!(
+            names(ring.owners(b"users", b"alpha", 3)),
+            vec!["node-a", "node-c", "node-b"]
+        );
+        assert_eq!(
+            names(ring.owners(b"users", b"", 3)),
+            vec!["node-b", "node-c", "node-a"]
+        );
+        assert_eq!(
+            names(ring.owners(b"\xff\x00", b"beta", 3)),
+            vec!["node-b", "node-a", "node-c"]
+        );
+    }
+
+    #[test]
+    fn namespaced_frames_lead_with_the_namespace_length() {
+        assert_eq!(get_message(b"", b"name"), b"G 4\nname".to_vec());
+        assert_eq!(get_message(b"users", b"name"), b"g 5 4\nusersname".to_vec());
+        assert_eq!(set_header(b"", b"name", 5), b"S 4 5\n".to_vec());
+        assert_eq!(set_header(b"users", b"name", 5), b"s 5 4 5\n".to_vec());
+    }
+
+    #[test]
+    fn seeded_keys_alternate_between_the_default_and_a_namespace() {
+        assert_eq!(verify_key(0), (&b""[..], "verify-key-0".to_string()));
+        assert_eq!(
+            verify_key(1),
+            (VERIFY_NAMESPACE, "verify-key-1".to_string())
         );
     }
 
@@ -1342,7 +1450,7 @@ mod tests {
             .map(|name| (name.to_string(), String::new()))
             .collect();
         let ring = Ring::new(&nodes);
-        assert_eq!(ring.owners(b"some-key", 10).len(), 3);
+        assert_eq!(ring.owners(b"", b"some-key", 10).len(), 3);
     }
 
     #[test]

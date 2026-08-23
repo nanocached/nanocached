@@ -9,6 +9,12 @@ fails a write), reads ask the primary and fall over to the next owner only
 when the holder is unreachable. Dead connections are redialed lazily on use
 (issue #1), and an opt-in keep-alive can hold connections open across the
 server's 60s idle timeout.
+
+Namespaces (issue #105): every get/get_bytes/set/delete below implicitly
+addresses the default (empty) namespace, which is byte-for-byte the
+pre-namespace protocol — namespace() returns a Namespace handle for
+addressing any other one, sharing this client's connections and routing
+without duplicating its networking (see namespace()'s docstring).
 """
 
 from __future__ import annotations
@@ -153,30 +159,38 @@ def _to_bytes(value: str | bytes) -> bytes:
     return value.encode("utf-8") if isinstance(value, str) else bytes(value)
 
 
-def _check_key(key_bytes: bytes) -> None:
+def _check_key(key_bytes: bytes, namespace: bytes = b"") -> None:
     """An empty key (``key_length == 0``) hits ``ParseError::EmptyKey`` in
     src/command.rs, which — like a frame that's too large — the server
     rejects with no reply, closing the shared, pipelined connection and
     taking every other in-flight request on it down with it. Raised here,
     synchronously, before anything is written, for every command that
-    carries a key."""
+    carries a key.
+
+    A namespace has no length limit of its own (issue #105 spec) — it is
+    only ever bounded by the same MAX_REQUEST_BYTES the whole frame
+    already has to fit under, so its bytes are folded into this check
+    too rather than validated separately."""
     if len(key_bytes) == 0:
         raise ValueError("nanocached: key must not be empty")
-    if len(key_bytes) > _MAX_REQUEST_BYTES:
+    total = len(namespace) + len(key_bytes)
+    if total > _MAX_REQUEST_BYTES:
         raise ValueError(
-            f"nanocached: key exceeds MAX_REQUEST_BYTES ({_MAX_REQUEST_BYTES} bytes), got {len(key_bytes)} bytes"
+            f"nanocached: namespace and key together exceed MAX_REQUEST_BYTES "
+            f"({_MAX_REQUEST_BYTES} bytes), got {total} bytes"
         )
 
 
-def _check_key_and_value(key_bytes: bytes, value_bytes: bytes) -> None:
+def _check_key_and_value(key_bytes: bytes, value_bytes: bytes, namespace: bytes = b"") -> None:
     """Same server-side rejection and poisoned-connection consequence as
-    _check_key, just measured across key+value together instead of the
-    key alone — see _MAX_REQUEST_BYTES."""
-    _check_key(key_bytes)
-    total = len(key_bytes) + len(value_bytes)
+    _check_key, just measured across namespace+key+value together instead
+    of namespace+key alone — see _MAX_REQUEST_BYTES."""
+    _check_key(key_bytes, namespace)
+    total = len(namespace) + len(key_bytes) + len(value_bytes)
     if total > _MAX_REQUEST_BYTES:
         raise ValueError(
-            f"nanocached: key and value together exceed MAX_REQUEST_BYTES ({_MAX_REQUEST_BYTES} bytes), got {total} bytes"
+            f"nanocached: namespace, key and value together exceed MAX_REQUEST_BYTES "
+            f"({_MAX_REQUEST_BYTES} bytes), got {total} bytes"
         )
 
 
@@ -502,19 +516,28 @@ class NanocachedClient:
         decompresses when ``compress`` is enabled (value compression).
         With ``read_repair``, a clean miss probes the remaining owners
         before being accepted as final (read repair)."""
+        return await self._get_bytes(b"", key)
+
+    async def _get_bytes(self, namespace: bytes, key: str | bytes) -> bytes | None:
+        """The namespace-carrying implementation behind get_bytes() and
+        Namespace.get_bytes() (issue #105) — see namespace()'s docstring:
+        the handle never duplicates this client's networking, it just
+        calls in here with its own namespace instead of b""."""
         key_bytes = _to_bytes(key)
-        _check_key(key_bytes)
+        _check_key(key_bytes, namespace)
         await self._before_operation()
         value = await self._with_wrong_node_retry(
-            lambda: self._read(key_bytes, lambda connection: connection.get(key_bytes))
+            lambda: self._read(
+                namespace, key_bytes, lambda connection: connection.get(key_bytes, namespace)
+            )
         )
         if value is None and self._read_repair and self._ring is not None:
-            value = await self._try_read_repair(key_bytes)
+            value = await self._try_read_repair(namespace, key_bytes)
         if value is None or not self._compress:
             return value
         return decompress_value(value)
 
-    async def _try_read_repair(self, key: bytes) -> bytes | None:
+    async def _try_read_repair(self, namespace: bytes, key: bytes) -> bytes | None:
         """read repair: probes the remaining owners of ``key`` —
         every owner but the primary, which the normal read path already
         probed and got a clean miss from (same as the Rust, Go, Java and
@@ -541,11 +564,11 @@ class NanocachedClient:
         (issue #43). Nothing here may turn an already-accepted miss into
         an error — except a genuine programming error (anything outside
         _SWALLOWABLE_ERRORS), which still propagates."""
-        names = self._owner_names(key)
+        names = self._owner_names(namespace, key)
         for name in names[1:]:
             try:
                 connection = await self._member_connection(name)
-                value = await connection.get(key)
+                value = await connection.get(key, namespace)
             except _SWALLOWABLE_ERRORS:
                 continue
             if value is None:
@@ -557,7 +580,7 @@ class NanocachedClient:
                 async def repair(primary: str = primary, value: bytes = value) -> None:
                     try:
                         connection = await self._member_connection(primary)
-                        await connection.set(key, value, _READ_REPAIR_TTL)
+                        await connection.set(key, value, _READ_REPAIR_TTL, namespace)
                     except _SWALLOWABLE_ERRORS:
                         # Swallowed by design — see the docstring.
                         self._read_repair_failures += 1
@@ -582,7 +605,12 @@ class NanocachedClient:
         """Strict UTF-8 decode of the stored value (bytes.decode()) — a
         value that is not valid UTF-8 raises UnicodeDecodeError rather than
         silently replacing it. Use get_bytes() for the raw bytes."""
-        value = await self.get_bytes(key)
+        return await self._get(b"", key)
+
+    async def _get(self, namespace: bytes, key: str | bytes) -> str | None:
+        """The namespace-carrying implementation behind get() and
+        Namespace.get() (issue #105) — see _get_bytes()."""
+        value = await self._get_bytes(namespace, key)
         return value.decode() if value is not None else None
 
     async def set(
@@ -593,6 +621,13 @@ class NanocachedClient:
         Transparently compresses values at or above
         ``compression_threshold`` when ``compress`` is enabled
         (value compression)."""
+        await self._set(b"", key, value, ttl_seconds=ttl_seconds)
+
+    async def _set(
+        self, namespace: bytes, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
+    ) -> None:
+        """The namespace-carrying implementation behind set() and
+        Namespace.set() (issue #105) — see _get_bytes()."""
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
             raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
@@ -603,25 +638,56 @@ class NanocachedClient:
         # pre-compression value for the same reason). Re-checked after
         # compression too, purely as a defense-in-depth backstop should
         # compress_value ever grow a value instead of shrinking it.
-        _check_key_and_value(key_bytes, value_bytes)
+        _check_key_and_value(key_bytes, value_bytes, namespace)
         if self._compress:
             value_bytes = compress_value(value_bytes, self._compression_threshold)
-            _check_key_and_value(key_bytes, value_bytes)
+            _check_key_and_value(key_bytes, value_bytes, namespace)
         await self._before_operation()
         await self._with_wrong_node_retry(
             lambda: self._write(
-                key_bytes, lambda connection: connection.set(key_bytes, value_bytes, ttl_seconds)
+                namespace,
+                key_bytes,
+                lambda connection: connection.set(key_bytes, value_bytes, ttl_seconds, namespace),
             )
         )
 
     async def delete(self, key: str | bytes) -> bool:
         """Returns whether the key existed before this call."""
+        return await self._delete(b"", key)
+
+    async def _delete(self, namespace: bytes, key: str | bytes) -> bool:
+        """The namespace-carrying implementation behind delete() and
+        Namespace.delete() (issue #105) — see _get_bytes()."""
         key_bytes = _to_bytes(key)
-        _check_key(key_bytes)
+        _check_key(key_bytes, namespace)
         await self._before_operation()
         return await self._with_wrong_node_retry(
-            lambda: self._write(key_bytes, lambda connection: connection.delete(key_bytes))
+            lambda: self._write(
+                namespace, key_bytes, lambda connection: connection.delete(key_bytes, namespace)
+            )
         )
+
+    def namespace(self, ns: str | bytes) -> "Namespace":
+        """A lightweight handle scoped to ``ns`` (issue #105): its
+        get/get_bytes/set/delete are this client's own, just with every
+        key implicitly scoped to ``ns`` — same routing (HRW over
+        (namespace, key)), replication fan-out, hedged reads, ``W``
+        refresh-and-retry, response tags, and compression as calling this
+        client directly. ``ns`` accepts the same key-ish types as a key
+        (a ``str`` is UTF-8 encoded); no length limit beyond the request-
+        size rules already applied to key+value (_check_key).
+
+        ``namespace("")`` returns a handle equivalent to this client
+        itself — it hashes and encodes identically to the un-namespaced
+        form (the SDK-wide rule that the default namespace always speaks
+        the legacy G/S/D frames, never g/s/d), so it is not rejected.
+
+        The handle is cheap (it holds no state of its own beyond the
+        namespace bytes and a reference to this client) and shares this
+        client's connections; it does not become invalid until this
+        client does, at which point its operations raise the same
+        AlreadyClosedError get/set/delete already would."""
+        return Namespace(self, _to_bytes(ns))
 
     async def close(self) -> None:
         """Idempotent; later get/set/delete raise AlreadyClosedError. A
@@ -720,15 +786,19 @@ class NanocachedClient:
             await self._maybe_refresh(force=True)
             return await operation()
 
-    def _owner_names(self, key: bytes) -> list[str]:
+    def _owner_names(self, namespace: bytes, key: bytes) -> list[str]:
+        """HRW routing over (namespace, key) (issue #105) — an empty
+        namespace hashes byte-identically to the pre-namespace form (see
+        _hashring.key_hash), so an un-namespaced call site's routing is
+        unchanged."""
         assert self._ring is not None
-        return self._ring.owners(key, self._replication)
+        return self._ring.owners(key, self._replication, namespace=namespace)
 
-    async def _read(self, key: bytes, op):
+    async def _read(self, namespace: bytes, key: bytes, op):
         if self._ring is None:
             return await op(await self._single_connection())
 
-        names = self._owner_names(key)
+        names = self._owner_names(namespace, key)
         if self._read_hedge_after is not None and len(names) > 1:
             return await self._read_hedged(key, op, names)
 
@@ -853,11 +923,11 @@ class NanocachedClient:
             "nanocached: no owner is reachable for this key"
         )
 
-    async def _write(self, key: bytes, op):
+    async def _write(self, namespace: bytes, key: bytes, op):
         if self._ring is None:
             return await op(await self._single_connection())
 
-        names = self._owner_names(key)
+        names = self._owner_names(namespace, key)
         if not names:
             raise ConnectionError("nanocached: no owner is reachable for this key")
         primary, replicas = names[0], names[1:]
@@ -1182,3 +1252,41 @@ class NanocachedClient:
                         pass
 
         self._keepalive_task = asyncio.ensure_future(ping_loop())
+
+
+class Namespace:
+    """A lightweight, namespace-scoped view of a NanocachedClient (issue
+    #105, SDK parity issue #25) — returned by NanocachedClient.namespace(),
+    see its docstring for the full contract. Holds nothing but the owning
+    client and the namespace's already-encoded bytes; every operation just
+    forwards to that client's own (namespace, key)-taking internals
+    (_get_bytes/_get/_set/_delete), so this never duplicates the client's
+    networking, routing, replication, or retry logic — it only ever
+    supplies a namespace those already know how to carry."""
+
+    def __init__(self, client: NanocachedClient, namespace: bytes) -> None:
+        self._client = client
+        self._namespace = namespace
+
+    @property
+    def namespace(self) -> bytes:
+        """The raw bytes this handle scopes every key to — the same bytes
+        that go on the wire and into HRW routing. Useful for the
+        framework adapters built on top of this handle (#107/#108)."""
+        return self._namespace
+
+    async def get_bytes(self, key: str | bytes) -> bytes | None:
+        """Same as NanocachedClient.get_bytes(), scoped to this namespace."""
+        return await self._client._get_bytes(self._namespace, key)
+
+    async def get(self, key: str | bytes) -> str | None:
+        """Same as NanocachedClient.get(), scoped to this namespace."""
+        return await self._client._get(self._namespace, key)
+
+    async def set(self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0) -> None:
+        """Same as NanocachedClient.set(), scoped to this namespace."""
+        await self._client._set(self._namespace, key, value, ttl_seconds=ttl_seconds)
+
+    async def delete(self, key: str | bytes) -> bool:
+        """Same as NanocachedClient.delete(), scoped to this namespace."""
+        return await self._client._delete(self._namespace, key)

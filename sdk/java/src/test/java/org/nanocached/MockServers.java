@@ -31,8 +31,21 @@ final class MockServers {
 
     static final class MockNode implements AutoCloseable {
         final Map<String, byte[]> store = new ConcurrentHashMap<>();
+        /** Namespaces (issue #105): one store per non-empty namespace,
+         * keyed by the namespace's {@link #keyOf} string form — the
+         * default (empty) namespace keeps using {@link #store} above, so
+         * every pre-existing test that inspects {@code store} directly is
+         * unaffected. Isolation between namespaces (and between a
+         * namespace and the default keyspace) falls out of these simply
+         * being different maps. */
+        final Map<String, Map<String, byte[]>> namespacedStores = new ConcurrentHashMap<>();
         final AtomicInteger connectionCount = new AtomicInteger();
         final AtomicInteger getCount = new AtomicInteger();
+        /** Counts every `g`/`s`/`d` frame received — never incremented by
+         * `G`/`S`/`D`. Lets a test prove the empty (default) namespace
+         * really does send the legacy frame, not `g 0 ...`/etc (issue
+         * #105's SDK rule). */
+        final AtomicInteger namespacedCommandCount = new AtomicInteger();
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
         /** echoed response tags: queued one-off replies that echo the WRONG tag (the
          * request's tag + 1) — the desync a pre-tag stream
@@ -409,6 +422,95 @@ final class MockServers {
                             }
                             out.flush();
                         }
+                        // Namespaces (issue #105): the lowercase counterparts
+                        // of G/S/D — one extra leading <namespace-length>
+                        // header field, namespace bytes leading the body,
+                        // everything else (including the response markers)
+                        // identical. Only the happy path plus takeWrongNode
+                        // is reproduced here — the exotic desync-injection
+                        // hooks above are exercised exclusively via the
+                        // uppercase commands already, and namespaces don't
+                        // change any of that machinery.
+                        case "g" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            getCount.incrementAndGet();
+                            namespacedCommandCount.incrementAndGet();
+
+                            if (getDelayMillis > 0) {
+                                try {
+                                    Thread.sleep(getDelayMillis);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            } else {
+                                byte[] value = namespacedGet(ns, key);
+                                if (value == null) {
+                                    out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                } else {
+                                    out.write(("V " + value.length + tagSuffix + "\n")
+                                            .getBytes(StandardCharsets.US_ASCII));
+                                    out.write(value);
+                                }
+                            }
+                            out.flush();
+                        }
+                        case "s" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            byte[] value = in.readNBytes(Integer.parseInt(parts[3]));
+                            namespacedCommandCount.incrementAndGet();
+                            // As the "S" case above: the TTL, when present,
+                            // is the field after the three lengths; the tag
+                            // (on a tagged connection) sits after that as
+                            // the last field.
+                            int ttlFieldCount = parts.length - (tagged ? 5 : 4);
+                            lastSetTtl = ttlFieldCount > 0 ? Long.parseLong(parts[4]) : 0;
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (failSets) {
+                                return;
+                            }
+                            if (setDelayMillis > 0) {
+                                try {
+                                    Thread.sleep(setDelayMillis);
+                                } catch (InterruptedException interrupted) {
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            } else {
+                                namespacedPut(ns, key, value);
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            }
+                            out.flush();
+                        }
+                        case "d" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            namespacedCommandCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            } else {
+                                out.write((namespacedRemove(ns, key) != null
+                                        ? "D" + tagSuffix + "\n" : "N" + tagSuffix + "\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
+                            }
+                            out.flush();
+                        }
                         default -> {
                             return;
                         }
@@ -435,6 +537,30 @@ final class MockServers {
                 if (pending == 0) return false;
                 if (wrongTagReplies.compareAndSet(pending, pending - 1)) return true;
             }
+        }
+
+        // Namespaces (issue #105): an empty namespace addresses the same
+        // default keyspace `G`/`S`/`D` do (protocol.html) — routed to
+        // `store` directly rather than `namespacedStores.get("")`, so it's
+        // the exact same map a legacy-frame test already asserts against.
+        private byte[] namespacedGet(String ns, String key) {
+            if (ns.isEmpty()) return store.get(key);
+            Map<String, byte[]> nsStore = namespacedStores.get(ns);
+            return nsStore == null ? null : nsStore.get(key);
+        }
+
+        private void namespacedPut(String ns, String key, byte[] value) {
+            if (ns.isEmpty()) {
+                store.put(key, value);
+                return;
+            }
+            namespacedStores.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>()).put(key, value);
+        }
+
+        private byte[] namespacedRemove(String ns, String key) {
+            if (ns.isEmpty()) return store.remove(key);
+            Map<String, byte[]> nsStore = namespacedStores.get(ns);
+            return nsStore == null ? null : nsStore.remove(key);
         }
 
         static String keyOf(byte[] key) {
