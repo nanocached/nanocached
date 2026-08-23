@@ -21,17 +21,80 @@ friends run against a nanocached cluster.
   Spring's own cache implementations; disable with
   `allowNullValues(false)`.
 
+## Setup
+
+Two beans set the adapter up — the SDK client and the manager — plus
+`@EnableCaching`. There is no Spring Boot autoconfiguration (yet, see
+below), so nothing happens by merely adding the dependency or editing
+`application.yaml`: these beans are the setup.
+
+```java
+@Configuration
+@EnableCaching
+class CacheConfig {
+
+    // destroyMethod: the client owns real connections; Spring closes it
+    // with the context. The manager borrows it and needs no closing.
+    @Bean(destroyMethod = "close")
+    NanocachedClient nanocachedClient() {
+        return NanocachedClient.connect(new NanocachedClient.Options()
+                .addresses(List.of(new NanocachedClient.Address("10.0.0.1", 8357))));
+    }
+
+    @Bean
+    CacheManager cacheManager(NanocachedClient client) {
+        return NanocachedCacheManager.builder(client)
+                .defaultTtl(Duration.ofMinutes(10))
+                .ttl("sessions", Duration.ofSeconds(30))
+                // .cacheNames(List.of("users", "sessions"))  // optional: closed set
+                .build();
+    }
+}
+```
+
+In a Spring Boot app the same two beans apply, and you can source the
+values from `application.yaml` yourself the ordinary way — property
+binding is Boot's, nothing adapter-specific:
+
+```yaml
+nanocached:
+  addresses: "10.0.0.1:8357,10.0.0.2:8357"
+  default-ttl: 10m
+```
+
+```java
+@Bean(destroyMethod = "close")
+NanocachedClient nanocachedClient(
+        @Value("${nanocached.addresses}") List<String> addresses) {
+    return NanocachedClient.connect(new NanocachedClient.Options()
+            .addresses(addresses.stream()
+                    .map(a -> a.split(":", 2))
+                    .map(a -> new NanocachedClient.Address(a[0], Integer.parseInt(a[1])))
+                    .toList()));
+}
+
+@Bean
+CacheManager cacheManager(
+        NanocachedClient client,
+        @Value("${nanocached.default-ttl:0s}") Duration defaultTtl) {
+    return NanocachedCacheManager.builder(client).defaultTtl(defaultTtl).build();
+}
+```
+
+Boot's `spring.cache.*` keys (e.g. `spring.cache.type`) do **not** know
+this adapter; they configure Boot's own autoconfigured managers, and your
+explicit `CacheManager` bean takes precedence over those. A
+`nanocached-spring-boot-starter` that binds a `nanocached.*` namespace and
+autoconfigures both beans is a planned follow-up — it will remove the Java
+config above, not change what the adapter does.
+
 ## Usage
 
-Declare the manager, then cache with the standard annotations —
+With the setup in place, cache with the standard annotations —
 `@Cacheable`, `@CachePut`, `@CacheEvict` work as on any other Spring
 `CacheManager`:
 
 ```java
-@EnableCaching
-@Configuration
-class CacheConfig { /* the cacheManager() bean below */ }
-
 @Service
 class UserService {
     @Cacheable("users")
@@ -53,27 +116,10 @@ class UserService {
 (`key = "#user.name"`) need the `-parameters` compiler flag, as usual
 with Spring.
 
-```java
-NanocachedClient client = NanocachedClient.connect(new NanocachedClient.Options()
-        .addresses(List.of(new NanocachedClient.Address("10.0.0.1", 8357))));
-
-@Bean
-public CacheManager cacheManager() {
-    return NanocachedCacheManager.builder(client)
-            .defaultTtl(Duration.ofMinutes(10))
-            .ttl("sessions", Duration.ofSeconds(30))
-            // .cacheNames(List.of("users", "sessions"))  // optional: closed set
-            .build();
-}
-```
-
 By default any cache name works — namespaces need no server-side setup, so
 `getCache("anything")` creates the cache on first use. `cacheNames(...)`
 switches to a closed, eagerly-created set (`getCache` answers `null` for
 unknown names, letting a `CompositeCacheManager` fall through).
-
-The manager borrows the client; closing the client (e.g. a
-`@Bean(destroyMethod = "close")`) is the application's job.
 
 ## Serialization
 
