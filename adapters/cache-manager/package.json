@@ -1,0 +1,59 @@
+{
+  "name": "nanocached-cache-manager",
+  "version": "0.1.0",
+  "description": "cache-manager v5 store adapter for nanocached, a tiny distributed cache with client-side replication",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nanocached/nanocached.git",
+    "directory": "adapters/cache-manager"
+  },
+  "homepage": "https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager#readme",
+  "bugs": {
+    "url": "https://github.com/nanocached/nanocached/issues"
+  },
+  "keywords": [
+    "nanocached",
+    "cache-manager",
+    "cache",
+    "distributed-cache",
+    "store"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "build:sdk": "pnpm --dir ../../sdk/typescript install --frozen-lockfile && pnpm --dir ../../sdk/typescript run build",
+    "build": "pnpm run build:sdk && tsc",
+    "pretypecheck": "pnpm run build:sdk",
+    "typecheck": "tsc --noEmit",
+    "pretest": "pnpm run build:sdk",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "prepublishOnly": "npm run test && npm run build"
+  },
+  "dependencies": {
+    "nanocached": "link:../../sdk/typescript"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "cache-manager": "^5",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "cache-manager": "^5"
+  }
+}

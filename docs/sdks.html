@@ -153,6 +153,15 @@ existed, err := client.Delete("greeting")</code></pre>
 
 <h2 id="behavior">Shared behavior, briefly</h2>
 <ul>
+  <li><b>Framework adapters</b> — separate, ecosystem-specific packages on
+  top of the SDKs (outside the SDK parity policy): Spring
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring">adapters/spring</a>),
+  ASP.NET Core's <code>IDistributedCache</code>
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/dotnet">adapters/dotnet</a>),
+  a Django cache backend
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/django">adapters/django</a>),
+  and a cache-manager store for Node
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager">adapters/cache-manager</a>).</li>
   <li><b>Addresses</b> — one list-shaped option in every SDK; list every
   discovery replica, and connect and refresh try them in order, skipping
   busy or unreachable replicas.</li>
