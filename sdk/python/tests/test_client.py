@@ -1875,6 +1875,44 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_hedge_leg_racing_close_is_refused_not_registered(self):
+        # Issue #91: a read that passed its own closed-check can reach the
+        # hedge-leg registration only after close() has set _closed and
+        # drained _hedged_reads (e.g. it yielded in _maybe_refresh while
+        # close() ran). start() must recheck _closed so it never registers a
+        # leg the drain has already passed — which would then dial against a
+        # connection teardown is closing. Set _closed directly to reproduce
+        # exactly the state start() sees at that point.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            await client.set("k", "v")
+            names = client._owner_names(b"k")
+            self.assertGreater(len(names), 1)
+
+            async def op(connection):
+                raise AssertionError("the leg must never be dialed after close() began")
+
+            client._closed = True
+            with self.assertRaises(AlreadyClosedError):
+                await client._read_hedged(b"k", op, names)
+            self.assertEqual(
+                client._hedged_reads,
+                set(),
+                "no hedge leg may be registered after close() began",
+            )
+
+            # Restore so close() runs its real teardown rather than the
+            # already-closed warning-and-return path.
+            client._closed = False
+            await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
     """Issue #67: connect() must tolerate a node that discovery still lists

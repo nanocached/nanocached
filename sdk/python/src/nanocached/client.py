@@ -783,6 +783,18 @@ class NanocachedClient:
         legs: dict[asyncio.Task[object], int] = {}
 
         def start(index: int) -> asyncio.Task[object]:
+            # Recheck self._closed immediately before registering, exactly
+            # as the fire_and_forget_replicas path does (issue #47 item 4),
+            # so a read racing close() can't add a leg that close()'s drain
+            # has already passed (issue #91): close() sets self._closed
+            # before draining _hedged_reads, and this check-and-add is one
+            # synchronous critical section (asyncio is single-threaded), so
+            # once self._closed is set no further leg is ever added and the
+            # drain sees a set that only shrinks. A read that lost this race
+            # fails the same way _before_operation would have.
+            if self._closed:
+                raise AlreadyClosedError()
+
             async def leg() -> object:
                 connection = await self._member_connection(names[index])
                 return await op(connection)

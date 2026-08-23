@@ -280,6 +280,13 @@ public sealed class NanocachedClient : IDisposable
     // replication factor, not by how many reads are concurrently in
     // flight, so there is no cap to enforce here.
     private readonly ConcurrentDictionary<Task, byte> _hedgedReads = new();
+    // Serializes a hedge leg's "check _closed, then register" (StartLeg)
+    // against Close()'s "observe the set empty, then stop draining" (issue
+    // #91). Without it a leg could be registered — and dialed against a
+    // connection Teardown() is closing — after the drain had already found
+    // the set empty. Held only briefly on both sides (never across a leg's
+    // own await), so it doesn't serialize the reads themselves.
+    private readonly object _hedgedReadsLock = new();
     private readonly CancellationTokenSource _lifetime = new();
 
     // Observability for failures this client swallows by design — see
@@ -850,14 +857,25 @@ public sealed class NanocachedClient : IDisposable
         // completion callback may also remove it between the emptiness
         // check and the lookup, so the lookup itself must tolerate an
         // empty set (First() threw here — v0.3.0 .NET SDK).
+        //
+        // The emptiness check + removal is taken under _hedgedReadsLock
+        // (issue #91): _closed was set above, and StartLeg checks _closed
+        // under the same lock before registering, so once this observes the
+        // set empty while holding the lock no further leg can be added — a
+        // racing StartLeg would see _closed and throw. The blocking await
+        // happens outside the lock so it never blocks a (doomed) StartLeg.
         while (true)
         {
-            Task? leg = _hedgedReads.Keys.FirstOrDefault();
-            if (leg is null)
+            Task? leg;
+            lock (_hedgedReadsLock)
             {
-                break;
+                leg = _hedgedReads.Keys.FirstOrDefault();
+                if (leg is null)
+                {
+                    break;
+                }
+                _hedgedReads.TryRemove(leg, out _);
             }
-            _hedgedReads.TryRemove(leg, out _);
             try
             {
                 leg.GetAwaiter().GetResult();
@@ -1029,10 +1047,21 @@ public sealed class NanocachedClient : IDisposable
 
         Task<T> StartLeg(int index)
         {
-            Task<T> task = ApplyReconnectingAsync(names[index], op);
-            legIndex[task] = index;
-            _hedgedReads[task] = 0;
-            task.ContinueWith(
+            // Check _closed and register under _hedgedReadsLock so this
+            // can't interleave with Close()'s drain observing the set empty
+            // (issue #91): Close() sets _closed before its drain takes this
+            // lock, so a leg that finds _closed here must not start — it
+            // would dial against connections Teardown() is about to close
+            // and never be awaited. A leg that passes the check is in
+            // _hedgedReads before the lock is released, so the drain's next
+            // locked snapshot sees it.
+            lock (_hedgedReadsLock)
+            {
+                if (_closed) throw new AlreadyClosedException();
+                Task<T> task = ApplyReconnectingAsync(names[index], op);
+                legIndex[task] = index;
+                _hedgedReads[task] = 0;
+                task.ContinueWith(
                 completed =>
                 {
                     // Retrieves the outcome so a losing leg's exception —
@@ -1046,8 +1075,9 @@ public sealed class NanocachedClient : IDisposable
                     _ = completed.Exception;
                     _hedgedReads.TryRemove(task, out _);
                 },
-                TaskScheduler.Default);
-            return task;
+                    TaskScheduler.Default);
+                return task;
+            }
         }
 
         var pending = new HashSet<Task<T>> { StartLeg(0) };

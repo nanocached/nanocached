@@ -391,6 +391,14 @@ public final class NanocachedClient implements AutoCloseable {
      * {@code replication} legs in flight at once, so no separate cap is
      * needed. */
     private final Set<CompletableFuture<?>> hedgedReads = ConcurrentHashMap.newKeySet();
+    /** Serializes a hedge leg's "check closed, then register" against
+     * {@link #close()}'s "observe the set empty, then stop draining"
+     * (issue #91). Without it a leg could be registered — and dialed
+     * against a connection {@link #teardown()} is closing — after the drain
+     * had already found the set empty. Held only briefly on both sides
+     * (never across a leg's own {@code join()}), so it doesn't serialize
+     * the reads themselves. */
+    private final Object hedgedReadsLock = new Object();
     /** Per-address reconnect cooldown (see {@link Options#reconnectCooldown}):
      * the address of the most recently failed dial, and how long it stays
      * "down" before another dial to it is attempted. Keyed by address, not
@@ -1126,12 +1134,25 @@ public final class NanocachedClient implements AutoCloseable {
      * leg) has finished, its outcome discarded either way. Looped, not a
      * single pass over one snapshot: a read racing this close() call can
      * still register a new leg after a snapshot was taken but before this
-     * method returns, so re-checking until the set is genuinely empty
-     * — mirroring the Python SDK's {@code _drain_tasks} — keeps one from
-     * leaking past close() undrained. */
+     * method returns, so re-checking until the set is genuinely empty keeps
+     * one from leaking past close() undrained. The emptiness check is taken
+     * under {@link #hedgedReadsLock} (issue #91): {@link #close()} sets
+     * {@code closed} before calling this, and {@link #startHedgeLeg} checks
+     * {@code closed} under the same lock before registering, so once this
+     * observes the set empty while holding the lock no further leg can be
+     * added — {@code startHedgeLeg} would see {@code closed} and throw. The
+     * blocking {@code join()}s happen outside the lock so they never block a
+     * concurrent (doomed) registration. */
     private void drainHedgedReads() {
-        while (!hedgedReads.isEmpty()) {
-            for (CompletableFuture<?> future : List.copyOf(hedgedReads)) {
+        while (true) {
+            List<CompletableFuture<?>> snapshot;
+            synchronized (hedgedReadsLock) {
+                if (hedgedReads.isEmpty()) {
+                    return;
+                }
+                snapshot = List.copyOf(hedgedReads);
+            }
+            for (CompletableFuture<?> future : snapshot) {
                 try {
                     future.join();
                 } catch (RuntimeException ignored) {
@@ -1447,18 +1468,31 @@ public final class NanocachedClient implements AutoCloseable {
             completions.add(index);
         };
 
-        CompletableFuture<Void> started;
-        try {
-            started = CompletableFuture.runAsync(task, replicaWriters);
-        } catch (RejectedExecutionException rejected) {
-            // close() shut replicaWriters down concurrently: run it inline
-            // rather than losing it (mirrors submitReplicaWrite).
-            task.run();
-            started = CompletableFuture.completedFuture(null);
+        // Check closed and register under hedgedReadsLock so this can't
+        // interleave with close()'s drain observing the set empty (issue
+        // #91): close() sets `closed` before its drain takes this lock, so
+        // a leg that finds `closed` here must not start — it would run
+        // against connections teardown is about to close and never be
+        // awaited. A leg that passes the check is added to hedgedReads
+        // before the lock is released, so the drain's next locked snapshot
+        // sees it.
+        synchronized (hedgedReadsLock) {
+            if (closed) {
+                throw new NanocachedException.AlreadyClosed();
+            }
+            CompletableFuture<Void> started;
+            try {
+                started = CompletableFuture.runAsync(task, replicaWriters);
+            } catch (RejectedExecutionException rejected) {
+                // close() shut replicaWriters down concurrently: run it inline
+                // rather than losing it (mirrors submitReplicaWrite).
+                task.run();
+                started = CompletableFuture.completedFuture(null);
+            }
+            CompletableFuture<Void> future = started;
+            hedgedReads.add(future);
+            future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
         }
-        CompletableFuture<Void> future = started;
-        hedgedReads.add(future);
-        future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
     }
 
     private <T> T write(byte[] key, ConnectionOp<T> op) {
