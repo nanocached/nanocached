@@ -1,0 +1,66 @@
+plugins {
+    id 'java-library'
+    id 'com.vanniktech.maven.publish' version '0.34.0'
+}
+
+group = 'org.nanocached'
+version = '0.1.0'
+
+mavenPublishing {
+    publishToMavenCentral(true)
+    signAllPublications()
+    coordinates('org.nanocached', 'nanocached-spring', version.toString())
+    pom {
+        name = 'nanocached-spring'
+        description = 'Spring Cache (CacheManager/Cache) adapter for the nanocached Java SDK'
+        url = 'https://nanocached.org'
+        licenses {
+            license {
+                name = 'MIT License'
+                url = 'https://github.com/nanocached/nanocached/blob/main/LICENSE'
+            }
+        }
+        developers {
+            developer {
+                id = 't0k0sh1'
+                name = 'Takashi Yamashina'
+            }
+        }
+        scm {
+            url = 'https://github.com/nanocached/nanocached'
+            connection = 'scm:git:git://github.com/nanocached/nanocached.git'
+            developerConnection = 'scm:git:ssh://git@github.com/nanocached/nanocached.git'
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // The SDK the adapter is built on. `api`: NanocachedClient appears in
+    // the adapter's public construction API.
+    api 'org.nanocached:nanocached:0.3.0'
+    // Spring's cache SPI. `api` for the same reason: the whole point of
+    // this module is implementing org.springframework.cache types.
+    api 'org.springframework:spring-context:6.2.8'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed'
+        exceptionFormat 'full'
+    }
+}
