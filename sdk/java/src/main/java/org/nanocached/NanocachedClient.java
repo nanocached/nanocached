@@ -1093,9 +1093,32 @@ public final class NanocachedClient implements AutoCloseable {
         drainHedgedReads();
         if (replicaWriters != null) {
             replicaWriters.shutdown();
-            awaitTerminationQuietly(replicaWriters);
+            // A longer bound than keepAlive's: a synchronous (or
+            // replication-factor-exceeded fallback) replica leg is neither
+            // permit-tracked nor interrupted, so — unlike the fire-and-forget
+            // and hedged legs already drained above — it can still be doing
+            // real work here, blocked in Connection.request()'s future.join()
+            // for up to the connection request timeout (issue #97). Wait it
+            // out (plus the thread-teardown margin) rather than proceed into
+            // teardown() and close the connection it's reading from, which
+            // would poison its future and surface a spurious I/O exception on
+            // a leg the caller never saw — contradicting "close() drains
+            // everything". The leg self-bounds at requestTimeoutMillis, so
+            // this is bounded regardless of how unresponsive the node is.
+            awaitTerminationQuietly(replicaWriters, replicaWriterDrainTimeoutMillis());
         }
         teardown();
+    }
+
+    /** How long {@link #close()} waits for {@link #replicaWriters} to
+     * terminate: the connection request timeout (the longest a still-running
+     * synchronous replica leg can be blocked in {@code future.join()}) plus
+     * the same thread-teardown margin keepAlive gets — see the call site and
+     * {@link #EXECUTOR_TERMINATION_TIMEOUT_SECONDS} (issue #97). Reads the
+     * live {@code Connection.requestTimeoutMillis}, so a test that shortens
+     * it shortens this too. */
+    private static long replicaWriterDrainTimeoutMillis() {
+        return Connection.requestTimeoutMillis + executorTerminationTimeoutMillis;
     }
 
     /** Blocks until every hedge leg still tracked in {@link #hedgedReads}
@@ -1120,21 +1143,29 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    // Bounds close()'s wait for an already-shutdown executor's worker
-    // threads to actually finish exiting — without this, close() could
-    // return (and teardown() tear the connections out from under any
-    // still-running task) before every task genuinely stopped running,
-    // even though every permit/future it cared about was already
-    // accounted for above (issue: audit finding, close() not awaiting
-    // termination). A few seconds is generous: by the time shutdown()/
-    // shutdownNow() runs here, every task either already completed (the
-    // permit-drain above) or was already interrupted (keepAlive), so this
-    // is just waiting out thread teardown itself, not real work.
-    private static final long EXECUTOR_TERMINATION_TIMEOUT_SECONDS = 5;
+    // The thread-teardown margin for close()'s executor awaits — how long
+    // to wait for an already-shutdown executor's worker threads to actually
+    // finish exiting once the real work they were doing is accounted for,
+    // without which close() could return (and teardown() tear the
+    // connections out from under a task) before every task genuinely
+    // stopped running (issue: audit finding, close() not awaiting
+    // termination). A few seconds is generous for keepAlive (shutdownNow()
+    // interrupted it) and for replicaWriters' *tracked* work (the
+    // permit-drain above already waited it out). It is NOT enough on its
+    // own for a still-running synchronous replica leg, which is neither
+    // permit-tracked nor interrupted — replicaWriters is awaited for
+    // requestTimeout + this margin instead (see replicaWriterDrainTimeoutMillis,
+    // issue #97). Non-final only so tests can shorten it, mirroring
+    // Connection.requestTimeoutMillis.
+    static volatile long executorTerminationTimeoutMillis = 5_000;
 
     private static void awaitTerminationQuietly(ExecutorService executor) {
+        awaitTerminationQuietly(executor, executorTerminationTimeoutMillis);
+    }
+
+    private static void awaitTerminationQuietly(ExecutorService executor, long timeoutMillis) {
         try {
-            executor.awaitTermination(EXECUTOR_TERMINATION_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            executor.awaitTermination(timeoutMillis, TimeUnit.MILLISECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
