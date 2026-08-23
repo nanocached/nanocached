@@ -83,7 +83,12 @@ CacheManager cacheManager(
 
 Boot's `spring.cache.*` keys (e.g. `spring.cache.type`) do **not** know
 this adapter; they configure Boot's own autoconfigured managers, and your
-explicit `CacheManager` bean takes precedence over those. A
+explicit `CacheManager` bean takes precedence over those — Boot's
+`CacheAutoConfiguration` backs off whenever a `CacheManager` bean exists,
+so with the two beans above nanocached wins even with the Redis starter on
+the classpath and even with a stray `spring.cache.type=redis` left in the
+yaml (`BootAutoConfigurationInteractionTest` pins all of this against real
+Boot autoconfiguration). A
 `nanocached-spring-boot-starter` that binds a `nanocached.*` namespace and
 autoconfigures both beans is a planned follow-up — it will remove the Java
 config above, not change what the adapter does.

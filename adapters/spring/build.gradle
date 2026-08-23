@@ -52,6 +52,13 @@ dependencies {
     // this module is implementing org.springframework.cache types.
     api 'org.springframework:spring-context:6.2.8'
 
+    // The Boot-interaction tests (BootAutoConfigurationInteractionTest)
+    // prove the setup story against real Spring Boot autoconfiguration,
+    // with Redis on the classpath as the competing cache backend.
+    testImplementation platform('org.springframework.boot:spring-boot-dependencies:3.5.3')
+    testImplementation 'org.springframework.boot:spring-boot-starter-cache'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis'
+
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
