@@ -1285,6 +1285,52 @@ class NanocachedClientTest {
     }
 
     @Test
+    void closeWaitsForAnInFlightSynchronousReplicaLeg() throws Exception {
+        // Issue #97: a synchronous (non-fire-and-forget) replica leg runs
+        // on replicaWriters and is awaited by the calling thread. A close()
+        // from ANOTHER thread used to wait only a fixed 5s for that pool,
+        // then proceed into teardown() and close the connection the leg was
+        // still reading from — returning while a leg it claims to have
+        // drained was in flight. close() must instead wait for the leg
+        // (bounded by the request timeout), so this exercises a leg whose
+        // duration is well past the (here shortened) teardown margin the
+        // pre-fix code bounded on.
+        long defaultTimeout = Connection.requestTimeoutMillis;
+        long defaultTeardown = NanocachedClient.executorTerminationTimeoutMillis;
+        Connection.requestTimeoutMillis = 2000;
+        // Shrink the thread-teardown margin so the pre-fix fixed bound
+        // (== this margin) is well under the leg's 800ms; the fix's bound is
+        // requestTimeout + this margin, comfortably above it.
+        NanocachedClient.executorTerminationTimeoutMillis = 200;
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            cluster.nodes().get(replica).delaySets(800);
+
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                Thread writer = new Thread(() -> client.set("k", "v"));
+                writer.start();
+                // Let the synchronous leg get in flight on replicaWriters
+                // before close() runs, without waiting for it to finish.
+                Thread.sleep(100);
+
+                long start = System.nanoTime();
+                client.close();
+                long closeMillis = (System.nanoTime() - start) / 1_000_000;
+                writer.join();
+
+                // close() waited out the remaining ~700ms of the leg, not
+                // just the 200ms teardown margin the pre-fix code bounded on.
+                assertTrue(closeMillis >= 500,
+                        "close() returned in " + closeMillis + "ms — before the in-flight "
+                                + "synchronous replica leg finished");
+            }
+        } finally {
+            Connection.requestTimeoutMillis = defaultTimeout;
+            NanocachedClient.executorTerminationTimeoutMillis = defaultTeardown;
+        }
+    }
+
+    @Test
     void closeRacingConcurrentWritesNeverThrowsARawExecutorException() throws Exception {
         // Issue: audit finding — a set() straggling past close() (which
         // has already shut down replicaWriters) must never let a raw
