@@ -2690,4 +2690,227 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
       await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
     }
   });
+
+  it("clear() empties one namespace, leaving the default namespace and other namespaces untouched", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const users = client.namespace("users");
+        const orders = client.namespace("orders");
+
+        await client.set("k", "default value");
+        await users.set("k", "users value");
+        await orders.set("k", "orders value");
+
+        await users.clear();
+        assert.equal(node.lastCommand(), "c", "clear() must send the lowercase c frame");
+
+        assert.equal(await users.get("k"), null, "the cleared namespace must be empty");
+        assert.equal(await client.get("k"), "default value", "the default namespace must survive");
+        assert.equal(await orders.get("k"), "orders value", "the other namespace must survive");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("namespace(\"\").clear() clears the default namespace (c 0), same as clearAll's default-namespace half", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        await client.namespace("").clear();
+        assert.equal(await client.get("k"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("clearAll() empties every namespace, including the default one", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const users = client.namespace("users");
+        await client.set("k", "default value");
+        await users.set("k", "users value");
+
+        await client.clearAll();
+
+        assert.equal(await client.get("k"), null);
+        assert.equal(await users.get("k"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("clear()/clearAll() raise AlreadyClosedError after close()", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      const users = client.namespace("users");
+      client.close();
+
+      await assert.rejects(users.clear(), AlreadyClosedError);
+      await assert.rejects(client.clearAll(), AlreadyClosedError);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("sends the clear to the single node in standalone mode", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        await client.clearAll();
+        assert.equal(node.clearCount(), 1);
+        assert.equal(await client.get("k"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47", "b2e6a1c4-3f9d-4a7b-8e5c-1d0f6a2b9c3e"];
+
+  async function startCluster() {
+    const mocks = await Promise.all([startMockNode(), startMockNode(), startMockNode()]);
+    const nodes = names.map((name, i) => ({ name, mock: mocks[i] }));
+    const discovery = await startMockDiscovery(nodes.map(({ name, mock }) => ({ name, address: mock.address })));
+    return {
+      nodes,
+      discovery,
+      close: async () => {
+        await Promise.all([discovery.close(), ...mocks.map((m) => m.close())]);
+      },
+    };
+  }
+
+  it("fans a namespaced clear out to every node in the cluster, not just the key's owners", async () => {
+    const cluster = await startCluster();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+      try {
+        await client.namespace("users").clear();
+        for (const { name, mock } of cluster.nodes) {
+          assert.equal(mock.clearCount(), 1, `${name} did not receive the clear`);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("fans clearAll() out to every node in the cluster", async () => {
+    const cluster = await startCluster();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+      try {
+        await client.clearAll();
+        for (const { name, mock } of cluster.nodes) {
+          assert.equal(mock.clearCount(), 1, `${name} did not receive the flush`);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("one node failing the first pass still succeeds once the refresh-and-retry reaches it", async () => {
+    const cluster = await startCluster();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+      try {
+        const flaky = cluster.nodes[0].mock;
+        flaky.failClearOnce();
+
+        await client.clearAll();
+
+        // The first pass failed on `flaky` (connection destroyed instead
+        // of acked); the retry re-sends to *every* node of the refreshed
+        // list (per issue #106's spec), not just the one that failed, so
+        // every node — including the two that already succeeded — ends
+        // up with 2 clear attempts, and the whole call still succeeds.
+        for (const { name, mock } of cluster.nodes) {
+          assert.equal(mock.clearCount(), 2, `${name} did not see both the first pass and the retry`);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("a node that keeps failing raises an error naming it, after the one retry", async () => {
+    const cluster = await startCluster();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+      try {
+        const stubborn = cluster.nodes[0].mock;
+        // Fails both the first pass and the retry after the forced refresh.
+        stubborn.failClearOnce();
+        stubborn.failClearOnce();
+
+        await assert.rejects(client.clearAll(), (error: unknown) => {
+          assert.ok(error instanceof NanocachedError);
+          assert.match((error as Error).message, /clear failed on node\(s\)/);
+          assert.match((error as Error).message, new RegExp(names[0]));
+          return true;
+        });
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("never silently succeeds on a partial clear — the other nodes were cleared but the call still throws", async () => {
+    const cluster = await startCluster();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+      try {
+        await Promise.all(cluster.nodes.map(({ mock }) => mock.namespacedStore("users").set("k", Buffer.from("v"))));
+
+        const stubborn = cluster.nodes[0].mock;
+        stubborn.failClearOnce();
+        stubborn.failClearOnce();
+
+        await assert.rejects(client.namespace("users").clear());
+
+        // The other two nodes' namespace was still genuinely cleared —
+        // the failure is reported, not swallowed, even though most of
+        // the cluster did clear.
+        const healthy = cluster.nodes.slice(1);
+        for (const { mock } of healthy) {
+          assert.equal(mock.namespacedStore("users").has("k"), false);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
 });

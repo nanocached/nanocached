@@ -3,6 +3,8 @@ import type { TLSSocket } from "node:tls";
 import { NanocachedError } from "./errors.js";
 import {
   EMPTY_NAMESPACE,
+  encodeClear,
+  encodeClearAll,
   encodeDelete,
   encodeGet,
   encodeSet,
@@ -137,6 +139,27 @@ export class Connection {
     if (response.kind === "notFound") return false;
     if (response.kind === "wrongNode") throw new WrongNodeError();
     throw this.mismatch(response);
+  }
+
+  /** Clears one namespace on this node (issue #106) — `namespace`
+   * defaults to the default (empty) namespace, matching `get`/`set`/
+   * `delete` above. Unlike those, a clear is never key-addressed, so the
+   * node never answers `W` for it (a `W` here would just be an
+   * unexpected kind, handled below like any other mismatch); it's
+   * `NanocachedClient` that turns this per-connection primitive into a
+   * cluster-wide operation by fanning it out to every node — see its
+   * `fanoutClear`. */
+  async clear(namespace: Uint8Array = EMPTY_NAMESPACE): Promise<void> {
+    const response = await this.send((tag) => encodeClear(namespace, tag));
+    if (response.kind !== "cleared") throw this.mismatch(response);
+  }
+
+  /** Flushes every namespace on this node, default included (issue
+   * #106) — the `F` command's per-connection primitive; see `clear` and
+   * `NanocachedClient.clearAll` for the cluster-wide fan-out. */
+  async clearAll(): Promise<void> {
+    const response = await this.send((tag) => encodeClearAll(tag));
+    if (response.kind !== "cleared") throw this.mismatch(response);
   }
 
   /** A well-formed response of the wrong kind (a `stored` answering a G)

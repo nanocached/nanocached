@@ -15,6 +15,13 @@ addresses the default (empty) namespace, which is byte-for-byte the
 pre-namespace protocol — namespace() returns a Namespace handle for
 addressing any other one, sharing this client's connections and routing
 without duplicating its networking (see namespace()'s docstring).
+
+Clear / flush (issue #106): a namespace's keys are spread over every node
+by HRW, not owned by one primary, so Namespace.clear() and this client's
+own clear_all() fan out to every currently-known node instead of routing
+by key — see _fan_out_clear()'s docstring for the refresh-once-and-retry
+contract that gives it the same all-or-nothing guarantee a keyed write's
+`W` retry has.
 """
 
 from __future__ import annotations
@@ -191,6 +198,18 @@ def _check_key_and_value(key_bytes: bytes, value_bytes: bytes, namespace: bytes 
         raise ValueError(
             f"nanocached: namespace, key and value together exceed MAX_REQUEST_BYTES "
             f"({_MAX_REQUEST_BYTES} bytes), got {total} bytes"
+        )
+
+
+def _check_namespace(namespace: bytes) -> None:
+    """A clear frame (issue #106) carries no key, just the namespace
+    itself — same server-side rejection and poisoned-connection
+    consequence as _check_key if it alone pushed the frame over
+    MAX_REQUEST_BYTES, so it gets the same eager, synchronous check."""
+    if len(namespace) > _MAX_REQUEST_BYTES:
+        raise ValueError(
+            f"nanocached: namespace exceeds MAX_REQUEST_BYTES "
+            f"({_MAX_REQUEST_BYTES} bytes), got {len(namespace)} bytes"
         )
 
 
@@ -667,15 +686,99 @@ class NanocachedClient:
             )
         )
 
+    async def clear_all(self) -> None:
+        """Drops every namespace on every node, the default namespace
+        included (issue #106) — the whole-store flush counterpart to
+        Namespace.clear(), which drops just one. Raises
+        AlreadyClosedError after close(), like get/set/delete. See
+        _fan_out_clear() for the fan-out and failure semantics."""
+        await self._before_operation()
+        await self._fan_out_clear(lambda connection: connection.clear_all())
+
+    async def _clear(self, namespace: bytes) -> None:
+        """The namespace-carrying implementation behind Namespace.clear()
+        (issue #106) — namespace() never duplicates this client's
+        networking, it just calls in here with its own namespace (see
+        namespace()'s docstring). An empty namespace clears the default
+        namespace (`c 0\\n`) rather than being rejected, per the issue
+        #106 spec."""
+        _check_namespace(namespace)
+        await self._before_operation()
+        await self._fan_out_clear(lambda connection: connection.clear(namespace))
+
+    async def _fan_out_clear(self, op) -> None:
+        """Shared by clear_all() and _clear() (issue #106): a clear isn't
+        key-addressed like get/set/delete — a namespace's keys are spread
+        over every node by HRW, so ``op`` (already bound to either
+        Connection.clear(namespace) or Connection.clear_all()) is sent to
+        every currently-known node concurrently, mirroring _write()'s
+        replica fan-out. It only succeeds once every node has acked `C`;
+        a node that fails (connection error, timeout, or any other
+        non-`C` answer — Connection.clear()/clear_all() already turn
+        those into a raised error) triggers exactly one node-list refresh
+        (the same forced-refresh path a `W`/dead primary uses,
+        _maybe_refresh(force=True)) and one retry against every node of
+        the *refreshed* list — mirroring _with_wrong_node_retry's
+        "refresh once, retry once" contract, just fanned out across every
+        node instead of a single owner. A node still failing after that
+        retry is named in the raised error; the whole operation is
+        idempotent (dropping an already-empty namespace is a no-op on the
+        server), so a caller can simply retry it. In standalone (single
+        node, no discovery) mode there is nothing to refresh from, so a
+        failure there — like _with_wrong_node_retry's own single-mode
+        case — just propagates immediately instead of retrying."""
+        failures = await self._clear_round(op)
+        if not failures:
+            return
+
+        if self._ring is None:
+            _, error = failures[0]
+            raise error
+
+        await self._maybe_refresh(force=True)
+        failures = await self._clear_round(op)
+        if not failures:
+            return
+
+        names = ", ".join(name for name, _ in failures)
+        raise NanocachedError(f"nanocached: clear failed on: {names}")
+
+    async def _clear_round(self, op) -> list[tuple[str, BaseException]]:
+        """One fan-out pass for _fan_out_clear(): every node gets ``op``
+        concurrently, with each failure captured here instead of raised
+        immediately — a connection-level exception on one node must not
+        cancel the others still in flight, the same reasoning
+        asyncio.gather(..., return_exceptions=True) applies to a write's
+        replica legs. Standalone (self._ring is None) mode degenerates to
+        the one connection there is."""
+        if self._ring is None:
+            try:
+                await op(await self._single_connection())
+            except _SWALLOWABLE_ERRORS as error:
+                return [(self._single_address or "?", error)]
+            return []
+
+        async def attempt(name: str) -> tuple[str, BaseException | None]:
+            try:
+                await op(await self._member_connection(name))
+            except _SWALLOWABLE_ERRORS as error:
+                return name, error
+            return name, None
+
+        outcomes = await asyncio.gather(*(attempt(name) for name in self._members))
+        return [(name, error) for name, error in outcomes if error is not None]
+
     def namespace(self, ns: str | bytes) -> "Namespace":
         """A lightweight handle scoped to ``ns`` (issue #105): its
         get/get_bytes/set/delete are this client's own, just with every
         key implicitly scoped to ``ns`` — same routing (HRW over
         (namespace, key)), replication fan-out, hedged reads, ``W``
         refresh-and-retry, response tags, and compression as calling this
-        client directly. ``ns`` accepts the same key-ish types as a key
-        (a ``str`` is UTF-8 encoded); no length limit beyond the request-
-        size rules already applied to key+value (_check_key).
+        client directly. Its clear() (issue #106) fans out across every
+        node instead — see _fan_out_clear(). ``ns`` accepts the same
+        key-ish types as a key (a ``str`` is UTF-8 encoded); no length
+        limit beyond the request-size rules already applied to key+value
+        (_check_key).
 
         ``namespace("")`` returns a handle equivalent to this client
         itself — it hashes and encodes identically to the un-namespaced
@@ -1290,3 +1393,12 @@ class Namespace:
     async def delete(self, key: str | bytes) -> bool:
         """Same as NanocachedClient.delete(), scoped to this namespace."""
         return await self._client._delete(self._namespace, key)
+
+    async def clear(self) -> None:
+        """Drops every entry in this namespace, on every node (issue
+        #106) — namespace(""), the handle equivalent to the client
+        itself, clears the default namespace rather than being rejected.
+        See NanocachedClient.clear_all() for the whole-store flush
+        counterpart, and _fan_out_clear() for the fan-out and failure
+        semantics both share."""
+        await self._client._clear(self._namespace)

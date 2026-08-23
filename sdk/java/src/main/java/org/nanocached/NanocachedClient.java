@@ -942,6 +942,15 @@ public final class NanocachedClient implements AutoCloseable {
         public boolean delete(byte[] key) {
             return NanocachedClient.this.delete(namespace, key);
         }
+
+        /** Drops every entry in this namespace (CLEAR, issue #106) — see
+         * {@link NanocachedClient#clearAll()} for the whole-store
+         * counterpart. An empty {@link #namespace()} (this handle's own
+         * {@code namespace("")}) clears the default namespace ({@code c
+         * 0}), never rejected. */
+        public void clear() {
+            NanocachedClient.this.clear(namespace);
+        }
     }
 
     /**
@@ -1169,6 +1178,39 @@ public final class NanocachedClient implements AutoCloseable {
                 () -> write(namespace, key, connection -> connection.delete(namespace, key)));
     }
 
+    /**
+     * CLEAR (issue #106): flushes every namespace, the default one
+     * included, on every node in this client's current node list — a
+     * single sub-map drop per node, not key-addressed (protocol.html: "c
+     * / F — clear a namespace, flush everything"), so there is no owner
+     * ranking to consult and no {@code W} to react to; the same {@code F}
+     * frame goes to every node. Succeeds only once every node has acked
+     * {@code C}: a node that failed (a dead connection, a bad/missing
+     * ack, a timeout) gets one node-list refresh and one retry against
+     * the refreshed list — the same refresh-and-retry path a
+     * {@code W}/dead primary get/set/delete uses (see {@link
+     * #withWrongNodeRetry}) — so this never silently reports success on a
+     * partial clear: a node still failing after that retry fails this
+     * call, naming it. The operation is idempotent, so a caller that sees
+     * this throw can simply call it again.
+     *
+     * <p>Standalone (single-node) mode sends {@code F} to that one node.
+     */
+    public void clearAll() {
+        beforeOperation();
+        fanOutClear(null);
+    }
+
+    /** The namespaced counterpart of {@link #clearAll()} (issue #106) —
+     * see {@link #namespace} and {@link Namespace#clear()}. An empty
+     * {@code namespace} clears the default namespace ({@code c 0}) rather
+     * than every namespace — never rejected. */
+    void clear(byte[] namespace) {
+        validateNamespace(namespace);
+        beforeOperation();
+        fanOutClear(namespace);
+    }
+
     /** Rejects an empty key or a (namespace, key) pair so large that {@code
      * "G "}/{@code "D "}/{@code "g "}/{@code "d "} plus the namespace and
      * key alone would already risk tripping the server's MAX_REQUEST_SIZE
@@ -1207,6 +1249,20 @@ public final class NanocachedClient implements AutoCloseable {
                     "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
                             + " bytes) + value (" + value.length + " bytes) = " + total
                             + " bytes, which exceeds the " + MAX_REQUEST_BYTES
+                            + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+        }
+    }
+
+    /** As {@link #validateKey}, but for {@link #clear(byte[])} (issue
+     * #106): no key is involved — the namespace alone is the entire body
+     * of a {@code c} frame — so only it needs to stay clear of the same
+     * MAX_REQUEST_BYTES headroom. {@link #clearAll()} needs no such
+     * check: an {@code F} frame's body is always empty. */
+    private static void validateNamespace(byte[] namespace) {
+        if (namespace.length > MAX_REQUEST_BYTES) {
+            throw new IllegalArgumentException(
+                    "nanocached: namespace (" + namespace.length + " bytes) exceeds the "
+                            + MAX_REQUEST_BYTES
                             + "-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
         }
     }
@@ -1783,6 +1839,96 @@ public final class NanocachedClient implements AutoCloseable {
             replicaWrite.run();
             return CompletableFuture.completedFuture(null);
         }
+    }
+
+    // ── CLEAR namespace / flush everything (issue #106) ─────────────
+
+    /** Fans a clear out to every node — {@code namespace == null} means
+     * {@code F} ({@link #clearAll()}), otherwise {@code c <namespace>}
+     * ({@link #clear(byte[])}) — shared by both. Single mode sends
+     * straight to the one connection, exactly like {@link #write}'s own
+     * {@code ring == null} branch (no discovery to refresh from, so a
+     * failure here is only ever {@link #applyReconnecting}'s one redial).
+     * Cluster mode sends to every node concurrently (client-side
+     * replication's own {@link #replicaWriters} pool — a clear is exactly
+     * the kind of per-node fan-out that pool already exists for), then —
+     * unlike a replica leg's failure, silently tolerated there — retries
+     * once against a freshly refreshed node list on any failure, exactly
+     * as {@link #withWrongNodeRetry} does for a {@code W}/dead-primary
+     * get/set/delete; a node still failing after that retry fails this
+     * call, naming it, so a clear can never silently report success while
+     * one node's data survives. */
+    private void fanOutClear(byte[] namespace) {
+        if (ring == null) {
+            applyReconnecting(this::singleConnection, connection -> {
+                sendClear(connection, namespace);
+                return null;
+            });
+            return;
+        }
+
+        Set<String> failed = clearFanOutOnce(allMemberNames(), namespace);
+        if (failed.isEmpty()) return;
+
+        maybeRefresh(true);
+        failed = clearFanOutOnce(allMemberNames(), namespace);
+        if (!failed.isEmpty()) {
+            throw new NanocachedException(
+                    "nanocached: clear failed on node(s): " + String.join(", ", failed));
+        }
+    }
+
+    private static void sendClear(Connection connection, byte[] namespace) {
+        if (namespace == null) connection.clearAll();
+        else connection.clear(namespace);
+    }
+
+    /** Every member name in this client's current node list, snapshotted
+     * under {@link #stateLock} (mirrors {@link #refreshNodeList}'s own
+     * {@code new ArrayList<>(members.keySet())}) — {@link #fanOutClear}'s
+     * fan-out target. Distinct from {@link #ownerNames}, which ranks only
+     * a key's few owners by HRW: a clear touches every node regardless of
+     * what it currently owns. */
+    private List<String> allMemberNames() {
+        synchronized (stateLock) {
+            return new ArrayList<>(members.keySet());
+        }
+    }
+
+    /** Sends one clear pass concurrently to every name in {@code names},
+     * on {@link #replicaWriters}, returning the names that failed rather
+     * than throwing — {@link #fanOutClear} decides whether that's grounds
+     * for a refresh-and-retry or a final error. A connection-level
+     * failure counts as a failure here; a genuine programming bug is not
+     * caught and propagates once every leg has been joined, mirroring
+     * {@link #write}'s replicaBug handling via {@link
+     * #unwrapReplicaBug}. */
+    private Set<String> clearFanOutOnce(List<String> names, byte[] namespace) {
+        Set<String> failed = ConcurrentHashMap.newKeySet();
+        List<CompletableFuture<Void>> futures = new ArrayList<>(names.size());
+        for (String name : names) {
+            futures.add(submitReplicaWrite(() -> {
+                try {
+                    applyReconnecting(() -> memberConnection(name), connection -> {
+                        sendClear(connection, namespace);
+                        return null;
+                    });
+                } catch (NanocachedException ignored) {
+                    failed.add(name);
+                }
+            }));
+        }
+
+        RuntimeException bug = null;
+        for (CompletableFuture<Void> future : futures) {
+            try {
+                future.join();
+            } catch (CompletionException wrapped) {
+                bug = unwrapReplicaBug(wrapped);
+            }
+        }
+        if (bug != null) throw bug;
+        return failed;
     }
 
     // ── 遅延再接続 ────────────────────────────────────────────────

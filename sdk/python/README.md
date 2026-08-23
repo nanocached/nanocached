@@ -101,6 +101,25 @@ server keeps working. The handle becomes invalid, raising the same
 `AlreadyClosedError` the client itself would, once the client it came from
 is closed.
 
+A namespace's keys are spread across every node by rendezvous hashing, so
+clearing one isn't addressed to a single owner the way get/set/delete are.
+`await users.clear()` drops every entry in that namespace; `namespace("")`
+clears the default namespace rather than being rejected. `await
+client.clear_all()` drops every namespace at once, the default one
+included:
+
+```python
+await users.clear()       # only "users" is gone
+await client.clear_all()  # every namespace, default included
+```
+
+Both fan a request out to every node the client currently knows about and
+only succeed once each one has acknowledged it; a node that fails is given
+one retry against a freshly refreshed node list before the call raises,
+naming the node that still failed. Both are idempotent, so a caller can
+simply retry a raised error, and both raise `AlreadyClosedError` after
+`close()` like every other operation.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

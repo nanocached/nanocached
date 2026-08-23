@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { encodeDelete, encodeGet, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
+import { encodeClear, encodeClearAll, encodeDelete, encodeGet, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
 
 const NS = Buffer.from("users");
 
@@ -79,6 +79,35 @@ describe("encodeDelete", () => {
   });
 });
 
+describe("encodeClear / encodeClearAll (issue #106)", () => {
+  it("frames the default namespace as namespace-length 0, with no body", () => {
+    assert.deepEqual(encodeClear(), Buffer.from("c 0\n"));
+    assert.deepEqual(encodeClear(Buffer.alloc(0)), Buffer.from("c 0\n"));
+  });
+
+  it("frames a named namespace's length ahead of its bytes", () => {
+    assert.deepEqual(encodeClear(NS), Buffer.concat([Buffer.from("c 5\n"), NS]));
+  });
+
+  it("encodeClearAll is just the bare marker, no body at all", () => {
+    assert.deepEqual(encodeClearAll(), Buffer.from("F\n"));
+  });
+
+  it("appends the tag as the last header field on both", () => {
+    assert.deepEqual(encodeClear(NS, 7), Buffer.concat([Buffer.from("c 5 7\n"), NS]));
+    assert.deepEqual(encodeClear(Buffer.alloc(0), 7), Buffer.from("c 0 7\n"));
+    assert.deepEqual(encodeClearAll(9), Buffer.from("F 9\n"));
+  });
+
+  it("rejects a namespace beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeClear(Buffer.alloc(MAX_REQUEST_BYTES + 1)), RangeError);
+  });
+
+  it("accepts a namespace of exactly MAX_REQUEST_BYTES", () => {
+    assert.doesNotThrow(() => encodeClear(Buffer.alloc(MAX_REQUEST_BYTES, "n")));
+  });
+});
+
 describe("tryParseResponse", () => {
   it("returns null on an empty buffer", () => {
     assert.equal(tryParseResponse(Buffer.alloc(0)), null);
@@ -91,6 +120,7 @@ describe("tryParseResponse", () => {
       ["N\n", "notFound"],
       ["B\n", "busy"],
       ["W\n", "wrongNode"],
+      ["C\n", "cleared"],
     ] as const;
 
     for (const [wire, kind] of cases) {
@@ -107,7 +137,7 @@ describe("tryParseResponse", () => {
     // Issue: audit finding — the untagged form is always exactly
     // `<marker>\n`; a second byte other than LF means the streams are
     // desynced (this used to be accepted silently, with consumed: 2).
-    for (const wire of ["SX", "DX", "NX", "WX"]) {
+    for (const wire of ["SX", "DX", "NX", "WX", "CX"]) {
       assert.throws(() => tryParseResponse(Buffer.from(wire)), /connection desynced/);
     }
   });
@@ -192,6 +222,10 @@ describe("tagged frames (echoed response tags)", () => {
     assert.deepEqual(tryParseResponse(Buffer.from("N 4294967295\n"), true), {
       response: { kind: "notFound", tag: 4294967295 },
       consumed: 13,
+    });
+    assert.deepEqual(tryParseResponse(Buffer.from("C 7\n"), true), {
+      response: { kind: "cleared", tag: 7 },
+      consumed: 4,
     });
   });
 

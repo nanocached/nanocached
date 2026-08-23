@@ -283,6 +283,59 @@ func appendDeleteFrame(namespace, key []byte, tagged bool, tag uint32) []byte {
 	return append(frame, key...)
 }
 
+// clear drops every entry in namespace (issue #106) — an empty namespace
+// clears the default namespace (`c 0\n`), never rejected: see
+// appendClearFrame. Unlike get/set/delete there is no key involved and
+// no `W` ever answers (docs/protocol.html's "c / F — clear a namespace,
+// flush everything": neither command is key-addressed), so the only
+// well-formed reply is `C`; anything else is a mismatch.
+func (c *connection) clear(namespace []byte) error {
+	marker, _, err := c.request(func(tag uint32) []byte {
+		return appendClearFrame(namespace, c.tagged, tag)
+	})
+	if err != nil {
+		return err
+	}
+	if marker != 'C' {
+		return c.mismatch(marker)
+	}
+	return nil
+}
+
+// clearAll drops every namespace, the default one included (issue #106's
+// `F` — see clear).
+func (c *connection) clearAll() error {
+	marker, _, err := c.request(func(tag uint32) []byte {
+		return appendClearAllFrame(c.tagged, tag)
+	})
+	if err != nil {
+		return err
+	}
+	if marker != 'C' {
+		return c.mismatch(marker)
+	}
+	return nil
+}
+
+// appendClearFrame builds a `c` request frame: `c <ns-len>[ <tag>]\n<ns>`.
+// There is no separate legacy/uppercase form the way G/S/D have — clear
+// isn't key-addressed, so it always names its namespace explicitly, even
+// the default one (ns-len 0), and never had a pre-namespace wire shape to
+// preserve.
+func appendClearFrame(namespace []byte, tagged bool, tag uint32) []byte {
+	frame := append([]byte("c "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	return append(frame, namespace...)
+}
+
+// appendClearAllFrame builds an `F` request frame: `F[ <tag>]\n` — no
+// body, since it addresses every namespace at once.
+func appendClearAllFrame(tagged bool, tag uint32) []byte {
+	frame := appendTagField([]byte("F"), tagged, tag)
+	return append(frame, '\n')
+}
+
 // mismatch handles a well-formed response of the wrong kind (a `S`
 // answering a G): the request/response streams are misaligned — every
 // later response would answer the wrong request, silently returning
@@ -517,14 +570,15 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			return 0, nil, 0, err
 		}
 		return marker, nil, 0, nil
-	case 'S', 'D', 'N', 'W':
+	case 'S', 'D', 'N', 'W', 'C':
 		if !c.tagged {
 			if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
 				return 0, nil, 0, err
 			}
 			return marker, nil, 0, nil
 		}
-		// Tagged wire: `S <seq>\n` etc. (echoed response tags).
+		// Tagged wire: `S <seq>\n` etc. (echoed response tags) — `C`
+		// (issue #106's clear/flush ack) included.
 		header, err := readLine(c.reader)
 		if err != nil {
 			return 0, nil, 0, err

@@ -99,6 +99,25 @@ copy onto the same few nodes. Namespaced frames need a server that
 understands them; talking `g`/`s`/`d` to a pre-namespace node gets `E\n`
 and a closed connection, so upgrade every node before using namespaces.
 
+`ClearAsync()` drops every entry in a namespace in one call — an O(1)
+sub-map drop on each node, not a scan-and-delete — including on the
+empty (default) namespace's own handle. `ClearAllAsync()`, on the client
+itself, drops every namespace, the default one included:
+
+```csharp
+await users.ClearAsync();     // only "users" is gone
+await client.ClearAllAsync(); // every namespace, including the default one
+```
+
+Neither is key-addressed, so in a cluster both fan out to every node in
+the client's current node list concurrently (a namespace's keys are
+spread across all of them). Success requires every node to ack; on any
+failure the node list is refreshed once and the clear retried against
+the refreshed list, exactly like a stale-routing retry elsewhere in this
+SDK — a node still failing after that raises a `ConnectionLostException`
+naming it, never a silent partial clear. Both raise
+`AlreadyClosedException` after `Close()`, like every other operation.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so

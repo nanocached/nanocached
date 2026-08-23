@@ -88,4 +88,14 @@ public sealed class NanocachedNamespace
 
     /// <summary>Returns whether the key existed before this call.</summary>
     public Task<bool> DeleteAsync(byte[] key) => _client.DeleteAsync(_namespace, key);
+
+    /// <summary>issue #106: drops every entry in this handle's namespace —
+    /// on the empty namespace (<c>client.Namespace("")</c>), clears the
+    /// default namespace (<c>c 0\n</c>), not rejected. Fanned out to every
+    /// node in the owning client's current node list, with a
+    /// refresh-once-and-retry on any node failure and never a silent
+    /// partial clear — see <see cref="NanocachedClient.ClearAllAsync"/>'s
+    /// doc comment for the shared fan-out/retry logic this and it both
+    /// use.</summary>
+    public Task ClearAsync() => _client.ClearAsync(_namespace);
 }

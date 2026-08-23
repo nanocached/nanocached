@@ -111,13 +111,30 @@ Namespaced frames need a server that understands them; a pre-namespace
 node answers <code>E\n</code> and closes the connection, so upgrade
 every node before clients start using namespaces.</p>
 
+<h2 id="clear">c / F — clear a namespace, flush everything</h2>
+<pre><code>c &lt;namespace-length&gt;\n&lt;namespace&gt;
+F\n</code></pre>
+<p>Both respond <code>C\n</code>. <code>c</code> drops every entry in
+one namespace — a <code>&lt;namespace-length&gt;</code> of 0 clears the
+default namespace — and <code>F</code> drops every namespace, the
+default one included. On the node this is a single sub-map drop (O(1),
+no key scan, memory reclaimed immediately), so neither command stalls
+other requests the way a scan-and-delete would. Neither is
+key-addressed, so <code>W</code> never applies: in a cluster a client
+sends the command to <em>every</em> member node (a namespace's keys are
+spread over all of them by rendezvous hashing) and each node clears its
+own share. A node that is mid-handoff to a joining node replays the
+clear there too, in order with the keys it is still sending, so a clear
+racing a join can't leave stale entries on the joiner.</p>
+
 <h2 id="tags">Response tags (tagged mode)</h2>
 <p>Pipelined clients match responses to requests by order alone — the
 frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
 <code>G</code>/<code>S</code>/<code>D</code> (and
-<code>g</code>/<code>s</code>/<code>d</code>) header must end with a
+<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>)
+header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
 answer.</p>
@@ -127,10 +144,13 @@ S &lt;key-length&gt; &lt;value-length&gt; &lt;ttl-seconds&gt; &lt;tag&gt;\n&lt;k
 D &lt;key-length&gt; &lt;tag&gt;\n&lt;key&gt;
 g &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 s &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
-d &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+d &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
+c &lt;namespace-length&gt; &lt;tag&gt;\n&lt;namespace&gt;
+F &lt;tag&gt;\n</code></pre>
 <p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
 <code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
-<code>N &lt;tag&gt;\n</code>, and <code>W &lt;tag&gt;\n</code>;
+<code>N &lt;tag&gt;\n</code>, <code>W &lt;tag&gt;\n</code>, and
+<code>C &lt;tag&gt;\n</code>;
 <code>B\n</code> stays bare (it is unsolicited, sent before
 authentication). Tagged mode is per connection and entirely opt-in — a
 plain <code>A</code> keeps every frame exactly as documented above. See

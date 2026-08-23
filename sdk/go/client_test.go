@@ -91,6 +91,8 @@ type mockNode struct {
 	getDelay         atomic.Int64 // nanoseconds; sleep this long before every G reply
 	conns            sync.Map     // net.Conn -> struct{}
 	silent           atomic.Bool  // once true, every G/S/D is read but never answered
+	failClearLeft    atomic.Int32 // issue #106: fail the next N c/F requests (read, then drop the connection with no reply)
+	clearCount       atomic.Int32 // issue #106: how many c/F requests this node has received, failed or not
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -133,6 +135,19 @@ func (m *mockNode) answerWrongTagOnce() { m.wrongTagLeft.Add(1) }
 // off-by-one stream desync where every later response answers the
 // previous request.
 func (m *mockNode) swallowGetOnce() { m.swallowLeft.Add(1) }
+
+// failClearTimes makes this node's next n c/F requests fail: the request
+// is still read off the wire (so the stream stays well-formed for
+// whatever request follows on a fresh connection), but answered by
+// dropping the connection instead of replying — a connection-level
+// failure (issue #106's clearFanout retry path), not a `W` or malformed
+// frame, since neither ever applies to a clear.
+func (m *mockNode) failClearTimes(n int32) { m.failClearLeft.Add(n) }
+
+// clearCountReceived reports how many c/F requests this node has
+// received so far (failed attempts counted too) — used to assert a
+// clear actually fanned out to every node (issue #106).
+func (m *mockNode) clearCountReceived() int32 { return m.clearCount.Load() }
 
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
 	return startMockNodeOpts(t, requiredSecret, mockNodeOpts{})
@@ -448,6 +463,41 @@ func (m *mockNode) serve(conn net.Conn) {
 				reply = "D" + tagSuffix + "\n"
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
+				return
+			}
+		// Clear one namespace (issue #106): `c <ns-len>[ <tag>]\n<ns>` —
+		// drops every stored entry whose namespace matches (an empty
+		// namespace is the default one, stored under storeKey{"", ...}
+		// exactly like G/S/D's unnamespaced form). Always acks `C`
+		// unless failClearTimes queued a failure.
+		case "c":
+			nsLen := atoiOrPanic(parts[1])
+			namespace := string(mustRead(reader, nsLen))
+			m.clearCount.Add(1)
+			if m.takeOne(&m.failClearLeft) {
+				return // simulate a connection-level failure: no reply, drop
+			}
+			m.store.Range(func(k, _ any) bool {
+				if k.(storeKey).ns == namespace {
+					m.store.Delete(k)
+				}
+				return true
+			})
+			if _, err := conn.Write([]byte("C" + tagSuffix + "\n")); err != nil {
+				return
+			}
+		// Flush everything (issue #106): `F[ <tag>]\n` — drops every
+		// namespace, default included.
+		case "F":
+			m.clearCount.Add(1)
+			if m.takeOne(&m.failClearLeft) {
+				return
+			}
+			m.store.Range(func(k, _ any) bool {
+				m.store.Delete(k)
+				return true
+			})
+			if _, err := conn.Write([]byte("C" + tagSuffix + "\n")); err != nil {
 				return
 			}
 		default:
@@ -2883,6 +2933,247 @@ func TestAppendFramesAcceptBinaryNamespaces(t *testing.T) {
 	wantS := append([]byte("s 2 4 1\n"), append(append(append([]byte{}, ns...), key...), value...)...)
 	if !bytes.Equal(gotS, wantS) {
 		t.Fatalf("appendSetFrame with binary namespace = %v, want %v", gotS, wantS)
+	}
+}
+
+// ── clear/flush frame encoders (issue #106) ──────────────────────────
+
+func TestAppendClearFrameUntaggedAndTagged(t *testing.T) {
+	if got, want := string(appendClearFrame([]byte("ns"), false, 0)), "c 2\nns"; got != want {
+		t.Fatalf("appendClearFrame = %q, want %q", got, want)
+	}
+	if got, want := string(appendClearFrame([]byte("ns"), true, 7)), "c 2 7\nns"; got != want {
+		t.Fatalf("appendClearFrame (tagged) = %q, want %q", got, want)
+	}
+}
+
+// TestAppendClearFrameEmptyNamespaceClearsTheDefaultNamespace covers both
+// nil and "" the way appendGetFrame's legacy-form test does: the default
+// namespace is `c 0\n`, never rejected.
+func TestAppendClearFrameEmptyNamespaceClearsTheDefaultNamespace(t *testing.T) {
+	for _, ns := range [][]byte{nil, []byte("")} {
+		if got, want := string(appendClearFrame(ns, false, 0)), "c 0\n"; got != want {
+			t.Fatalf("appendClearFrame(%v, ...) = %q, want %q", ns, got, want)
+		}
+	}
+}
+
+func TestAppendClearAllFrameUntaggedAndTagged(t *testing.T) {
+	if got, want := string(appendClearAllFrame(false, 0)), "F\n"; got != want {
+		t.Fatalf("appendClearAllFrame = %q, want %q", got, want)
+	}
+	if got, want := string(appendClearAllFrame(true, 3)), "F 3\n"; got != want {
+		t.Fatalf("appendClearAllFrame (tagged) = %q, want %q", got, want)
+	}
+}
+
+// ── clear/flush client round trips, single node (issue #106) ─────────
+
+// TestNamespaceClearRoundTrip covers the issue #106 spec's namespaced
+// clear scenario directly: set in two namespaces plus the default one,
+// clear a single namespace, and confirm only that namespace emptied.
+func TestNamespaceClearRoundTrip(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	users := client.Namespace("users")
+	orders := client.Namespace("orders")
+	if err := client.Set("k", "default", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.Set("k", "in-users", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := orders.Set("k", "in-orders", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := users.Clear(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok, err := users.Get("k"); err != nil || ok {
+		t.Fatalf("users.Get after Clear: ok=%v err=%v", ok, err)
+	}
+	if value, ok, err := orders.Get("k"); err != nil || !ok || value != "in-orders" {
+		t.Fatalf("orders.Get after users.Clear = %q, %v, %v", value, ok, err)
+	}
+	if value, ok, err := client.Get("k"); err != nil || !ok || value != "default" {
+		t.Fatalf("default Get after users.Clear = %q, %v, %v", value, ok, err)
+	}
+}
+
+// TestNamespaceClearOnTheEmptyStringHandleClearsTheDefaultNamespace
+// covers the spec's "clear() on namespace(\"\") clears the default
+// namespace, never rejected" rule.
+func TestNamespaceClearOnTheEmptyStringHandleClearsTheDefaultNamespace(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Namespace("").Clear(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := client.Get("k"); err != nil || ok {
+		t.Fatalf("Get after namespace(\"\").Clear: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestClearAllEmptiesEveryNamespace covers the spec's "clearAll() empties
+// everything, default included" scenario.
+func TestClearAllEmptiesEveryNamespace(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Namespace("users").Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Namespace("orders").Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.storeLen(); got != 3 {
+		t.Fatalf("storeLen before ClearAll = %d, want 3", got)
+	}
+
+	if err := client.ClearAll(); err != nil {
+		t.Fatal(err)
+	}
+	if got := node.storeLen(); got != 0 {
+		t.Fatalf("storeLen after ClearAll = %d, want 0", got)
+	}
+}
+
+func TestClearMethodsErrorAfterClientClose(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := client.Namespace("users")
+	client.Close()
+
+	if err := ns.Clear(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Clear err = %v, want ErrClosed", err)
+	}
+	if err := client.ClearAll(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("ClearAll err = %v, want ErrClosed", err)
+	}
+}
+
+// ── clear/flush cluster fan-out and failure handling (issue #106) ────
+
+// TestClearFansOutToEveryNode proves a namespaced Clear reaches every
+// member node, not just one owner — clear isn't key-addressed the way
+// Get/Set/Delete are (docs/protocol.html's "c / F").
+func TestClearFansOutToEveryNode(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Namespace("users").Clear(); err != nil {
+		t.Fatal(err)
+	}
+	for name, node := range nodes {
+		if node.clearCountReceived() != 1 {
+			t.Errorf("%s received %d clear requests, want 1", name, node.clearCountReceived())
+		}
+	}
+}
+
+// TestClearAllFansOutToEveryNode is TestClearFansOutToEveryNode for
+// ClearAll's `F`.
+func TestClearAllFansOutToEveryNode(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.ClearAll(); err != nil {
+		t.Fatal(err)
+	}
+	for name, node := range nodes {
+		if node.clearCountReceived() != 1 {
+			t.Errorf("%s received %d clear requests, want 1", name, node.clearCountReceived())
+		}
+	}
+}
+
+// TestAClearThatFailsTwiceIsRetriedAfterARefreshAndSucceeds: a node
+// fails the first two attempts — the request itself, and
+// applyReconnecting's own one-shot redial-retry of it — so the failure
+// surfaces to clearFanout's own refresh-and-retry loop; the node
+// eventually acks on the very next attempt, in the refreshed list's
+// round, and the overall Clear succeeds.
+func TestAClearThatFailsTwiceIsRetriedAfterARefreshAndSucceeds(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var flaky *mockNode
+	for _, node := range nodes {
+		flaky = node
+		break
+	}
+	flaky.failClearTimes(2)
+
+	if err := client.Namespace("users").Clear(); err != nil {
+		t.Fatalf("Clear = %v, want success after refresh-and-retry", err)
+	}
+	if got := client.Stats().RefreshFailures; got != 0 {
+		t.Fatalf("RefreshFailures = %d, want 0 (discovery stayed reachable)", got)
+	}
+}
+
+// TestAPersistentlyFailingNodeFailsClearNamingIt: the failing node never
+// recovers, so both rounds fail on it and Clear raises an error naming
+// it, never silently succeeding on a partial clear.
+func TestAPersistentlyFailingNodeFailsClearNamingIt(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var failingName string
+	var failing *mockNode
+	for name, node := range nodes {
+		failingName, failing = name, node
+		break
+	}
+	failing.failClearTimes(1000)
+
+	err = client.ClearAll()
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("ClearAll err = %v, want ErrConnectionLost", err)
+	}
+	if !strings.Contains(err.Error(), failingName) {
+		t.Fatalf("ClearAll err = %v, want it to name %s", err, failingName)
 	}
 }
 

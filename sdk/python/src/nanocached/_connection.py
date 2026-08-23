@@ -1,6 +1,7 @@
 """One already-identified connection to a single nanocached-node, speaking
 the cache protocol (``G``/``S``/``D``, and their namespaced counterparts
-``g``/``s``/``d`` — issue #105 — the ``A`` identify exchange happens
+``g``/``s``/``d`` — issue #105 — plus ``c``/``F`` to clear a namespace or
+flush every namespace, issue #106 — the ``A`` identify exchange happens
 in ``_identify`` before a Connection exists).
 
 Requests are pipelined onto the socket and matched to responses in send
@@ -87,6 +88,19 @@ def _encode_delete(key: bytes, tag: int | None = None, namespace: bytes = b"") -
     return b"D %d%b\n%b" % (len(key), _tag_field(tag), key)
 
 
+# Clear a namespace / flush everything (issue #106): unlike g/s/d above,
+# c/F have no legacy uppercase equivalent to fall back to for the default
+# namespace — they're new commands, so the default namespace is just
+# <namespace-length> 0 on the wire (docs/protocol.html "c / F"), never a
+# different marker.
+def _encode_clear(namespace: bytes = b"", tag: int | None = None) -> bytes:
+    return b"c %d%b\n%b" % (len(namespace), _tag_field(tag), namespace)
+
+
+def _encode_clear_all(tag: int | None = None) -> bytes:
+    return b"F%b\n" % _tag_field(tag)
+
+
 class Connection:
     def __init__(
         self,
@@ -159,6 +173,24 @@ class Connection:
         if marker == b"W":
             raise WrongNodeError()
         raise self._mismatch(marker)
+
+    async def clear(self, namespace: bytes = b"") -> None:
+        """Drops every entry in ``namespace`` on this node (issue #106) —
+        a namespace-length of 0 clears the default namespace. Never
+        answers ``W``: a clear isn't key-addressed (every node holds a
+        share of every namespace's keys, see docs/protocol.html
+        "c / F"), so any marker other than ``C`` is a desync exactly like
+        get/set/delete's own _mismatch path."""
+        marker, _ = await self._request(lambda tag: _encode_clear(namespace, tag))
+        if marker != b"C":
+            raise self._mismatch(marker)
+
+    async def clear_all(self) -> None:
+        """Drops every namespace on this node, the default one included
+        (issue #106) — see clear()."""
+        marker, _ = await self._request(lambda tag: _encode_clear_all(tag))
+        if marker != b"C":
+            raise self._mismatch(marker)
 
     def _mismatch(self, marker: bytes) -> ConnectionError:
         # A well-formed response of the wrong kind (a `V` answering a set)
@@ -393,7 +425,7 @@ class Connection:
             value = await self._reader.readexactly(length)
             return marker, value, tag
 
-        if marker in (b"S", b"D", b"N", b"W"):
+        if marker in (b"S", b"D", b"N", b"W", b"C"):
             if self._tagged:
                 # `<marker> <tag>\n` (echoed response tags).
                 header = await self._reader.readuntil(b"\n")

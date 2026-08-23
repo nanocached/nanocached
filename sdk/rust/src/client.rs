@@ -170,6 +170,23 @@ fn decode_utf8_value(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes).map_err(Error::InvalidUtf8)
 }
 
+/// `clear`'s own bound (issue #106): a clear frame carries no key or
+/// value, only the namespace, so unlike `validate_key`/
+/// `validate_key_and_value` there is nothing to sum it against — the
+/// namespace alone just needs to fit under the server's own request cap,
+/// same rationale as those two (issue #47 audit item R1 follow-up):
+/// failing fast here, as `Error::InvalidArgument`, beats sending a frame
+/// the server can only reject by closing the connection outright.
+fn validate_namespace_for_clear(namespace: &[u8]) -> Result<()> {
+    if namespace.len() > MAX_REQUEST_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "nanocached: namespace exceeds MAX_REQUEST_BYTES ({MAX_REQUEST_BYTES} bytes), got {} bytes",
+            namespace.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Fire-and-forget replica writes: bounds how many replica writes a single client may
 /// have running in the background at once when `fire_and_forget_replicas`
 /// is enabled — once the cap is reached, further replica legs fall back
@@ -1112,6 +1129,35 @@ impl NanocachedClient {
         .await
     }
 
+    /// Flushes every namespace, the default one included, across every
+    /// node (issue #106's `F`) — the whole store starts empty again.
+    /// Deliberately not named `flush*` (the issue's own naming
+    /// guidance): from the caller's side this is exactly "clear
+    /// everything" the same way [`Namespace::clear`] is "clear this one
+    /// namespace". Fans out to every node and requires all of them to
+    /// ack, refreshing the node list once and retrying if any fail
+    /// (`clear_fanout`, shared with [`Namespace::clear`]) — success here
+    /// never means a partial clear.
+    pub async fn clear_all(&self) -> Result<()> {
+        self.before_operation().await?;
+        self.clear_fanout(|connection: Arc<Connection>| async move { connection.clear_all().await })
+            .await
+    }
+
+    /// The shared implementation behind [`Namespace::clear`] (issue
+    /// #106's `c`) — drops every entry in `namespace` across every node.
+    /// `namespace` empty clears the default namespace; this is
+    /// deliberately not rejected, matching `namespace("")` itself being a
+    /// valid (if trivial) handle.
+    async fn clear_in(&self, namespace: &[u8]) -> Result<()> {
+        validate_namespace_for_clear(namespace)?;
+        self.before_operation().await?;
+        self.clear_fanout(move |connection: Arc<Connection>| async move {
+            connection.clear(namespace).await
+        })
+        .await
+    }
+
     /// A namespaced view onto this client (Namespaces, issue #105):
     /// `get`/`get_bytes`/`set`/`delete` on the returned [`Namespace`]
     /// behave exactly like this client's own, except every key is scoped
@@ -1502,6 +1548,82 @@ impl NanocachedClient {
         primary_result
     }
 
+    /// Namespace clear / flush-everything fan-out (issue #106's `clear`/
+    /// `clear_all`): unlike `write`'s `op`, `op` here (built from
+    /// `Connection::clear`/`Connection::clear_all`) isn't key-addressed —
+    /// a namespace's keys are spread over every node by HRW — so instead
+    /// of picking owners for one key, this sends `op` to every node
+    /// currently known and requires all of them to ack.
+    ///
+    /// In single-node mode there is exactly one node, so this simply
+    /// defers to `apply_reconnecting`'s own transparent redial-and-retry
+    /// — the fan-out/refresh machinery below only makes sense once
+    /// there's a node list to fan out over and refresh.
+    ///
+    /// On a cluster, if any node fails the first pass, the node list is
+    /// refreshed once — the same path a `W`/dead-primary retry already
+    /// uses (`maybe_refresh` counts a failed refresh in
+    /// `stats().refresh_failures` on its own, so nothing extra is needed
+    /// here) — and the whole fan-out is retried once more against every
+    /// node of the *refreshed* list, not just the ones that failed: a
+    /// clear is idempotent, so re-sending it to a node that already
+    /// succeeded is harmless, and the refreshed list may not even be the
+    /// same nodes. A node that still fails after that retry fails the
+    /// whole call — this never returns success on a partial clear; the
+    /// caller can simply retry the whole operation again.
+    async fn clear_fanout<F, Fut>(&self, op: F) -> Result<()>
+    where
+        F: Fn(Arc<Connection>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
+        if single {
+            return self.apply_reconnecting(None, &op).await;
+        }
+
+        if self.clear_fanout_once(&op).await.is_some() {
+            self.maybe_refresh(true).await;
+            if let Some(failed) = self.clear_fanout_once(&op).await {
+                return Err(Error::ConnectionLost(format!(
+                    "nanocached: clear failed on node(s): {} (even after a node-list refresh and retry)",
+                    failed.join(", ")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// One fan-out pass of `op` over every currently known cluster
+    /// member, concurrently — every member is always attempted regardless
+    /// of whether another already failed, so a single pass yields the
+    /// complete failure list rather than just the first node to fail.
+    /// `None` means every member acked; `Some` carries the names of the
+    /// ones that didn't (a connection error, a mismatched reply, or —
+    /// though the real protocol never sends one for `c`/`F` — anything
+    /// else `apply_reconnecting` surfaces as an error).
+    async fn clear_fanout_once<F, Fut>(&self, op: &F) -> Option<Vec<String>>
+    where
+        F: Fn(Arc<Connection>) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let names: Vec<String> = match &self.inner.state.lock().await.target {
+            Target::Single { .. } => return None,
+            Target::Cluster { members, .. } => members.keys().cloned().collect(),
+        };
+
+        let outcomes = futures_util::future::join_all(names.iter().map(|name| async move {
+            (name.as_str(), self.apply_reconnecting(Some(name), op).await)
+        }))
+        .await;
+
+        let failed: Vec<String> = outcomes
+            .into_iter()
+            .filter_map(|(name, result)| result.err().map(|_| name.to_string()))
+            .collect();
+
+        (!failed.is_empty()).then_some(failed)
+    }
+
     /// Runs `op` against the slot's connection, retrying once on a
     /// connection-level failure: a Rust socket only learns of a peer FIN
     /// (e.g. the server's 60s idle timeout) on I/O, so lazy
@@ -1871,6 +1993,20 @@ impl Namespace {
     /// See [`NanocachedClient::delete`]; scoped to this namespace.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.client.delete_in(&self.namespace, key).await
+    }
+
+    /// Drops every entry in this namespace, across every node (issue
+    /// #106's `c`) — other namespaces, and the default one, are
+    /// untouched. On `namespace("")` (the default namespace's own
+    /// handle) this clears the default namespace; see
+    /// [`NanocachedClient::clear_all`] to clear every namespace at once
+    /// instead. Fans out to every node and requires all of them to ack,
+    /// refreshing the node list once and retrying if any fail — see
+    /// [`NanocachedClient::clear_all`]'s own doc comment for the full
+    /// fan-out/refresh-and-retry semantics, which this shares: success
+    /// never means a partial clear.
+    pub async fn clear(&self) -> Result<()> {
+        self.client.clear_in(&self.namespace).await
     }
 }
 

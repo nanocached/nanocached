@@ -1,8 +1,10 @@
 """In-process stand-ins for nanocached-node and nanocached-discovery,
 speaking just enough of the wire protocol (``A``, ``G``/``S``/``D`` and
-their namespaced ``g``/``s``/``d`` counterparts — issue #105 — and ``L``)
-for the client tests to exercise NanocachedClient end-to-end over real TCP
-sockets without the Rust binaries. Mirrors the TypeScript SDK's mocks."""
+their namespaced ``g``/``s``/``d`` counterparts — issue #105 —
+``c``/``F`` to clear a namespace or flush everything — issue #106 — and
+``L``) for the client tests to exercise NanocachedClient end-to-end over
+real TCP sockets without the Rust binaries. Mirrors the TypeScript SDK's
+mocks."""
 
 from __future__ import annotations
 
@@ -42,6 +44,13 @@ class MockNode:
         # namespace never leaves this connection as anything but the
         # legacy `G`/`S`/`D` it must stay byte-for-byte compatible with.
         self.namespaced_command_count = 0
+        # Clear / flush (issue #106): counts every `c`/`F` frame received,
+        # regardless of outcome — mirrors get_count/namespaced_command_count
+        # above, so a test can assert a clear's fan-out actually reached
+        # every mock node.
+        self.clear_count = 0
+        self.flush_count = 0
+        self._fail_clear_replies = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
         self._wrong_tag_replies = 0
@@ -123,6 +132,15 @@ class MockNode:
         item 5), as opposed to answer_missing_tag_once's missing-field
         desync above."""
         self._invalid_tag_value_replies += 1
+
+    def fail_next_clear_once(self) -> None:
+        """Closes the connection instead of acking the next `c`/`F` this
+        node receives (issue #106) — simulates a node that's unreachable
+        when a clear's fan-out reaches it, so a test can exercise the
+        client's refresh-once-and-retry path. Call it more than once
+        (e.g. twice) to also fail the retry, for the persistent-failure
+        path."""
+        self._fail_clear_replies += 1
 
     def delay_next_get(self, seconds: float) -> None:
         """Hold the next G's response, so a test can abandon the request
@@ -350,6 +368,36 @@ class MockNode:
                     else:
                         deleted = self._delete_entry(namespace, key)
                         writer.write((b"D" if deleted else b"N") + tag_suffix + b"\n")
+                    await writer.drain()
+
+                elif parts[0] in (b"c", b"F"):
+                    # Clear / flush (issue #106): `c` always carries a
+                    # namespace-length header field, even 0 for the
+                    # default namespace — unlike g/s/d it has no legacy
+                    # uppercase form to fall back to. `F` carries no key
+                    # or namespace at all, just the optional tag.
+                    if parts[0] == b"c":
+                        namespace = await reader.readexactly(int(parts[1]))
+                        self.clear_count += 1
+                    else:
+                        self.flush_count += 1
+                    if self._silent:
+                        continue
+                    if self._fail_clear_replies > 0:
+                        self._fail_clear_replies -= 1
+                        writer.close()
+                        return
+                    if parts[0] == b"c":
+                        if namespace:
+                            for ns, ns_key in list(self.ns_store):
+                                if ns == namespace:
+                                    del self.ns_store[(ns, ns_key)]
+                        else:
+                            self.store.clear()
+                    else:
+                        self.store.clear()
+                        self.ns_store.clear()
+                    writer.write(b"C" + tag_suffix + b"\n")
                     await writer.drain()
 
                 else:
