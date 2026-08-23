@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 import ssl
+import traceback
 import unittest
 from unittest import mock
 
@@ -1971,6 +1972,68 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             for node in nodes.values():
                 await node.close()
+
+    async def test_refresh_purges_cooldowns_for_departed_addresses(self):
+        # #96: a node that leaves the cluster must not leave its per-address
+        # reconnect-cooldown entry behind — in a churny deployment (fresh
+        # IP:port per restart) those would accumulate unboundedly.
+        dead, live = NAMES[0], NAMES[1]
+        nodes, discovery = await self.start_cluster({dead})
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], reconnect_cooldown=100
+            )
+            try:
+                dead_address = client._members[dead].address
+                # The unreachable node armed its cooldown at bootstrap.
+                self.assertIn(dead_address, client._redial_cooldowns)
+
+                # Discovery now drops the dead node from the roster; the next
+                # refresh reconciles membership and must purge its cooldown.
+                discovery.nodes = [(live, nodes[live].address)]
+                await client._maybe_refresh(force=True)
+
+                self.assertNotIn(dead, client._members)
+                self.assertNotIn(dead_address, client._redial_cooldowns)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_cooldown_reraise_does_not_grow_the_traceback(self):
+        # #96: re-raising the *stored* exception on every cooldown hit
+        # splices a fresh traceback segment onto it each time, growing it
+        # without bound for the life of the cooldown. The fix resets the
+        # traceback before re-raising, so its depth stays flat.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                address = "127.0.0.1:1"
+                stored = ConnectionError("boom")
+                loop = asyncio.get_running_loop()
+                client._redial_cooldowns[address] = (loop.time() + 100, stored)
+
+                # A plain try/except, not assertRaises: assertRaises clears
+                # the caught exception's __traceback__ on exit (to break a
+                # reference cycle), which would also reset the growth this
+                # test is meant to observe.
+                depths = []
+                for _ in range(50):
+                    try:
+                        await client._redial("some-slot", address)
+                    except ConnectionError as error:
+                        self.assertIs(error, stored)
+                        depths.append(len(traceback.extract_tb(error.__traceback__)))
+
+                # Without the fix, each hit adds frames; with it, depth is flat.
+                self.assertLessEqual(max(depths) - min(depths), 1, depths)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
 
 
 class StatsTests(unittest.IsolatedAsyncioTestCase):

@@ -1624,8 +1624,19 @@ impl NanocachedClient {
         // would otherwise accumulate forever (issue #12).
         let live: std::collections::HashSet<String> =
             nodes.iter().map(|node| node.name.clone()).collect();
-        let mut redials = self.inner.redials.lock().await;
-        redials.retain(|slot, _| slot.is_empty() || live.contains(slot));
+        {
+            let mut redials = self.inner.redials.lock().await;
+            redials.retain(|slot, _| slot.is_empty() || live.contains(slot));
+        }
+
+        // Same rationale for the per-address reconnect cooldowns: a departed
+        // node's address would otherwise leave its cooldown entry behind
+        // forever in a churny deployment where nodes get a fresh IP:port on
+        // every restart (issue #96).
+        let live_addresses: std::collections::HashSet<String> =
+            nodes.iter().map(|node| node.address.clone()).collect();
+        let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
+        cooldowns.retain(|address, _| live_addresses.contains(address));
     }
 
     /// Walks every address (discovery HA). Returns `None` — keep the

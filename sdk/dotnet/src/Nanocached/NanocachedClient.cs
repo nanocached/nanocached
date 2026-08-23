@@ -1441,11 +1441,16 @@ public sealed class NanocachedClient : IDisposable
 
             foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
             {
-                _members[name].Connection?.Close();
+                Member departed = _members[name];
+                departed.Connection?.Close();
                 _members.Remove(name);
                 // Node names are per-process UUIDs; a departed node's
                 // redial gate would otherwise leak forever (issue #12).
                 _redialGates.Remove(name);
+                // Same leak, same reason, for the per-address cooldown map:
+                // a departed node's address is never reused, so its cooldown
+                // entry (if any) would otherwise linger forever (issue #96).
+                _reconnectCooldowns.TryRemove(departed.Address, out _);
             }
 
             foreach (DiscoveredNode node in cluster.Nodes)

@@ -1359,6 +1359,22 @@ func (c *Client) refreshNodeList() {
 		}
 	}
 	c.redialMu.Unlock()
+
+	// Same rationale for the per-address reconnect cooldowns: an address
+	// whose owning node has left the cluster would otherwise leave its
+	// cooldown entry behind forever in a churny deployment where nodes get
+	// a fresh IP:port on every restart (issue #96).
+	liveAddresses := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		liveAddresses[node.Address] = struct{}{}
+	}
+	c.redialCooldownMu.Lock()
+	for address := range c.redialCooldowns {
+		if _, live := liveAddresses[address]; !live {
+			delete(c.redialCooldowns, address)
+		}
+	}
+	c.redialCooldownMu.Unlock()
 }
 
 // fetchNodeList walks every configured address (discovery HA); ok=false

@@ -2663,3 +2663,64 @@ async fn an_unreachable_node_is_redialed_once_the_cooldown_has_passed() {
     live.stop();
     revived.stop();
 }
+
+#[tokio::test]
+async fn refresh_purges_cooldowns_for_departed_addresses() {
+    // #96: a node that leaves the cluster must not leave its per-address
+    // reconnect-cooldown entry behind — those would accumulate unboundedly
+    // in a churny deployment. Members aren't inspectable from here, so this
+    // uses an observable proxy: after the dead node departs (which must
+    // purge its cooldown) and later rejoins at the SAME address, a write
+    // routed to it has to redial and land — which a stale, still-armed
+    // cooldown for that address would block for the full 60s window.
+    let default_stale = nanocached::NODE_LIST_STALE_AFTER_MS.load(Ordering::SeqCst);
+    nanocached::NODE_LIST_STALE_AFTER_MS.store(0, Ordering::SeqCst);
+
+    let dead_port = unused_port().await;
+    let live = MockNode::start().await;
+    let listed = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[1].to_string(), live.address()),
+    ];
+    let discovery = MockDiscovery::start(listed, 2).await;
+
+    let client = NanocachedClient::connect(
+        options(discovery.port).reconnect_cooldown(Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
+
+    // Any request pumps a refresh (staleness forced to 0 above); route it
+    // to the live node so it never depends on the dead one.
+    let live_key = key_with_primary(NAMES[1]);
+
+    // Drop the dead node from the roster: the refresh reconciles membership
+    // and must purge its bootstrap-armed cooldown along with it.
+    *discovery.nodes.lock().unwrap() = vec![(NAMES[1].to_string(), live.address())];
+    client.get(&live_key).await.unwrap();
+
+    // Bring the node back up at the same address and re-list it.
+    let revived = MockNode::start_on_port(dead_port).await;
+    *discovery.nodes.lock().unwrap() = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{dead_port}")),
+        (NAMES[1].to_string(), live.address()),
+    ];
+    client.get(&live_key).await.unwrap();
+
+    // A write routed to the rejoined node must redial and land; a lingering
+    // cooldown (no purge) would block the redial and fail this.
+    let dead_key = key_with_primary(NAMES[0]);
+    client.set(&dead_key, "v", 0).await.unwrap();
+    assert!(revived
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(dead_key.as_bytes()));
+
+    nanocached::NODE_LIST_STALE_AFTER_MS.store(default_stale, Ordering::SeqCst);
+    client.close().await;
+    discovery.stop();
+    live.stop();
+    revived.stop();
+}
