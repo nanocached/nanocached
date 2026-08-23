@@ -105,6 +105,11 @@ try (NanocachedClient client = NanocachedClient.connect(
     Optional&lt;String&gt; value = client.get("greeting");     // empty when missing
     boolean existed = client.delete("greeting");
 }</code></pre>
+<p>Spring users: the separate <code>org.nanocached:nanocached-spring</code>
+module implements Spring's <code>CacheManager</code>/<code>Cache</code> on
+this SDK — named caches as namespaces, per-cache TTL, <code>clear()</code>
+as the namespace's <code>CLEAR</code>. See
+<a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring">adapters/spring</a>.</p>
 
 <h2 id="rust">Rust</h2>
 <pre><code>cargo add nanocached</code></pre>

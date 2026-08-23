@@ -1,0 +1,11 @@
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.10.0'
+}
+
+rootProject.name = 'nanocached-spring'
+
+// The adapter builds against the sibling SDK sources (substituted for the
+// published org.nanocached:nanocached coordinates), so a checkout needs no
+// locally-installed artifact and CI always tests adapter + SDK at the same
+// commit.
+includeBuild('../../sdk/java')
