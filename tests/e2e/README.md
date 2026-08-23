@@ -38,8 +38,13 @@ Each `i*.sh` is one scenario; the paired `*.py` is its probe/loader.
 - `disc.py` (query `L`), `verify.py` (seed/check), `load.py` (mixed load,
   `--hedge`), `stats.sh` + `memtrend.py` (RSS sampling + slope).
 
+## Scenario catalogue
+
+[`SCENARIOS.md`](SCENARIOS.md) is the full catalogue — every scenario across
+all rounds (single-node, cluster, long-run, the v0.2.0→v0.3.0 verification
+rounds, and the post-v0.3.0 review reproductions) with its measured result.
+
 ## History
 
 These grew out of the v0.2.0 → v0.3.0 verification effort (issues #61–#68, then
-the post-v0.3.0 review #91–#97). The scenario catalogue with measured results
-lives in the verification notes for those rounds.
+the post-v0.3.0 review #91–#97).
