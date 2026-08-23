@@ -2117,6 +2117,47 @@ func TestConnectFailsOnlyWhenEveryNodeIsUnreachable(t *testing.T) {
 	}
 }
 
+func TestRefreshPurgesCooldownsForDepartedAddresses(t *testing.T) {
+	// #96: a node that leaves the cluster must not leave its per-address
+	// reconnect-cooldown entry behind — in a churny deployment (a fresh
+	// IP:port per restart) those would accumulate unboundedly.
+	dead, live := testNames[0], testNames[1]
+	nodes, deadAddresses, discovery := startClusterWithDeadNode(t, 2, map[string]bool{dead: true})
+
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(discovery.address())},
+		ReconnectCooldown: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	deadAddr := deadAddresses[dead]
+	hasCooldown := func(address string) bool {
+		client.redialCooldownMu.Lock()
+		defer client.redialCooldownMu.Unlock()
+		_, ok := client.redialCooldowns[address]
+		return ok
+	}
+	// The unreachable node armed its cooldown at bootstrap.
+	if !hasCooldown(deadAddr) {
+		t.Fatalf("no cooldown armed for the unreachable node %s", deadAddr)
+	}
+
+	// Discovery drops the dead node from the roster; the next refresh
+	// reconciles membership and must purge its cooldown alongside it.
+	discovery.setNodes([]discoveredNode{{Name: live, Address: nodes[live].address()}})
+	client.maybeRefresh(true)
+
+	if _, ok := client.members[dead]; ok {
+		t.Fatalf("departed node %s still present in members", dead)
+	}
+	if hasCooldown(deadAddr) {
+		t.Fatalf("cooldown for departed address %s was not purged", deadAddr)
+	}
+}
+
 func TestAnUnreachableNodeIsRedialedOnceTheCooldownHasPassed(t *testing.T) {
 	dead := testNames[0]
 	_, deadAddresses, discovery := startClusterWithDeadNode(t, 2, map[string]bool{dead: true})

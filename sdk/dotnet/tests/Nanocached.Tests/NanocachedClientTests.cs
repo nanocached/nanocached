@@ -2037,6 +2037,28 @@ public class TolerantBootstrapTests
         return (string)property.GetValue(member)!;
     }
 
+    private static bool HasMember(NanocachedClient client, string name)
+    {
+        FieldInfo membersField = typeof(NanocachedClient)
+            .GetField("_members", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var members = (System.Collections.IDictionary)membersField.GetValue(client)!;
+        return members.Contains(name);
+    }
+
+    private static System.Collections.IDictionary GetCooldowns(NanocachedClient client)
+    {
+        FieldInfo field = typeof(NanocachedClient)
+            .GetField("_reconnectCooldowns", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (System.Collections.IDictionary)field.GetValue(client)!;
+    }
+
+    private static Task ForceRefreshAsync(NanocachedClient client)
+    {
+        MethodInfo method = typeof(NanocachedClient)
+            .GetMethod("RefreshNodeListAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Task)method.Invoke(client, null)!;
+    }
+
     private static async Task WaitForAsync(Func<bool> condition, string what)
     {
         DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
@@ -2119,5 +2141,34 @@ public class TolerantBootstrapTests
             () => revived.Store.ContainsKey(MockNode.KeyOf(Bytes(key))),
             "the revived node to receive the write");
         Assert.NotNull(GetMemberConnection(client, dead));
+    }
+
+    [Fact]
+    public async Task RefreshPurgesCooldownsForDepartedAddresses()
+    {
+        // #96: a node that leaves the cluster must not leave its per-address
+        // reconnect-cooldown entry behind — in a churny deployment (a fresh
+        // IP:port per restart) those would accumulate unboundedly.
+        string dead = Names[0], live = Names[1];
+        using Cluster cluster = StartCluster(new HashSet<string> { dead });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReconnectCooldown = TimeSpan.FromMinutes(1),
+        });
+
+        string deadAddress = GetMemberAddress(client, dead);
+        System.Collections.IDictionary cooldowns = GetCooldowns(client);
+        // The unreachable node armed its cooldown at bootstrap.
+        Assert.True(cooldowns.Contains(deadAddress), "no cooldown armed for the unreachable node");
+
+        // Discovery drops the dead node from the roster; the refresh
+        // reconciles membership and must purge its cooldown alongside it.
+        cluster.Discovery.SetNodes(new[] { (live, cluster.Nodes[live].Address) });
+        await ForceRefreshAsync(client);
+
+        Assert.False(HasMember(client, dead), "departed node still present in members");
+        Assert.False(cooldowns.Contains(deadAddress), "cooldown for departed address was not purged");
     }
 }

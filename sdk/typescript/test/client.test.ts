@@ -2428,4 +2428,36 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
       await cluster.close();
     }
   });
+
+  it("refresh purges cooldowns for departed addresses (#96)", async () => {
+    // A node that leaves the cluster must not leave its per-address
+    // reconnect-cooldown entry behind — in a churny deployment (a fresh
+    // IP:port per restart) those would accumulate unboundedly.
+    const [dead, live] = names;
+    const cluster = await startCluster(new Set([dead]));
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        reconnectCooldownMs: 60_000,
+      });
+      try {
+        const deadAddress: string = (client as any).target.members.get(dead).address;
+        const cooldowns: Map<string, unknown> = (client as any).reconnectCooldowns;
+        // The unreachable node armed its cooldown at bootstrap.
+        assert.ok(cooldowns.has(deadAddress), "no cooldown armed for the unreachable node");
+
+        // Discovery drops the dead node; the refresh must purge its cooldown
+        // alongside its member entry.
+        cluster.discovery.setNodes([{ name: live, address: cluster.nodes.get(live)!.address }]);
+        await (client as any).refreshNodeList();
+
+        assert.ok(!(client as any).target.members.has(dead), "departed node still in members");
+        assert.ok(!cooldowns.has(deadAddress), "cooldown for departed address was not purged");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await cluster.close();
+    }
+  });
 });

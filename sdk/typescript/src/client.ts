@@ -1126,6 +1126,10 @@ export class NanocachedClient {
         // (issue #67) — nothing to close.
         member.connection?.close();
         members.delete(name);
+        // A departed node's address is never reused (names/addresses are
+        // per-process), so its per-address cooldown entry would otherwise
+        // linger forever in a churny deployment (issue #96).
+        this.reconnectCooldowns.delete(member.address);
       }
     }
 

@@ -975,7 +975,15 @@ class NanocachedClient:
         if cooldown is not None:
             until, error = cooldown
             if time.monotonic() < until:
-                raise error
+                # Reset the traceback before re-raising: re-raising the
+                # *stored* exception instance splices a fresh traceback
+                # segment onto it on every cooldown hit, so a burst of
+                # calls to a down address (or one per keep-alive tick)
+                # would grow it without bound for the life of the
+                # cooldown (#96). with_traceback(None) returns the same
+                # instance, so the caller still sees its original type
+                # and message.
+                raise error.with_traceback(None)
 
         task = asyncio.ensure_future(self._open_and_adopt(slot, address))
         self._redials[slot] = task
@@ -1088,6 +1096,15 @@ class NanocachedClient:
         if self._closed:
             self._teardown()
             return
+
+        # Drop reconnect-cooldown entries for addresses whose owning node
+        # has left the cluster: in a churny deployment (a fresh IP:port on
+        # every restart) they would otherwise accumulate one dead entry
+        # per departed address forever (#96).
+        live_addresses = {node.address for node in cluster.nodes}
+        for cooled_address in list(self._redial_cooldowns):
+            if cooled_address not in live_addresses:
+                del self._redial_cooldowns[cooled_address]
 
         self._ring = HashRing(list(self._members))
         self._replication = cluster.replication
