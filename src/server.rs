@@ -1141,29 +1141,7 @@ async fn handle_connection(
                 // a different `joining_name` (already finished, or this
                 // cancel arrived late) — `run_migration` alone decides
                 // whether to actually stop.
-                let restore = {
-                    let mut slot = node_context
-                        .active_migration
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    match slot.as_ref() {
-                        Some(active) if active.joining_name == joining_name => {
-                            active.abort_requested.store(true, Ordering::SeqCst);
-                            // A completed entry only lingers to forward
-                            // writes (issue #3) and to hold its dead
-                            // copies' marks (issue #62); the join being
-                            // abandoned ends both — the copies are live
-                            // again.
-                            if active.completed_at.is_some() {
-                                slot.take().map(|active| active.marked_keys)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
-                };
-                if let Some(restore) = restore {
+                if let Some(restore) = abandon_migration(&node_context, &joining_name) {
                     eprintln!(
                         "WARN join of {joining_name} abandoned by discovery after this node's \
                          handoff completed; restoring {} dead copies",
@@ -2000,6 +1978,16 @@ struct ActiveMigration {
     /// stays put, holding its marks back from the sweep, until something
     /// decides the join one way or the other.
     confirmed: bool,
+    /// Issue #93: the `known_ring` value this handoff replaced when it
+    /// flipped to the post-join topology on completion (`run_migration`).
+    /// If the join is later abandoned (`X`) after this node's own share
+    /// completed but before discovery confirmed it cluster-wide, the
+    /// post-join ring never became real — the abandon path restores this
+    /// snapshot so `wrong_node` stops answering `W` for the (now live
+    /// again) restored keys immediately, instead of waiting for the next
+    /// heartbeat's `adopt_membership` to correct `known_ring`. `None`
+    /// until `completed()` stamps it.
+    pre_completion_ring: Option<Arc<Membership>>,
     /// Persistent connection to the joining node, shared by every
     /// `set_on_joining_node`/`delete_on_joining_node` call this handoff's
     /// concurrent client writes trigger (see `migration_target_for` and
@@ -2213,6 +2201,7 @@ impl MigrationGuard {
             abort_requested: Arc::clone(&abort_requested),
             marked_keys: Vec::new(),
             confirmed: false,
+            pre_completion_ring: None,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
@@ -2250,7 +2239,12 @@ impl MigrationGuard {
     /// `entries_sent`, size-derived migration timeout) so `migration_target_for` keeps
     /// forwarding until that grace passes or the slot is
     /// replaced/cancelled.
-    fn completed(mut self, entries_sent: usize, marked_keys: Vec<Bytes>) {
+    fn completed(
+        mut self,
+        entries_sent: usize,
+        marked_keys: Vec<Bytes>,
+        pre_completion_ring: Option<Arc<Membership>>,
+    ) {
         if let Some(active) = self
             .slot
             .lock()
@@ -2260,6 +2254,7 @@ impl MigrationGuard {
             active.completed_at = Some(Instant::now());
             active.forwarding_grace = forwarding_grace(entries_sent);
             active.marked_keys = marked_keys;
+            active.pre_completion_ring = pre_completion_ring;
         }
         self.completed = true;
     }
@@ -2534,14 +2529,19 @@ async fn run_migration(
     }
 
     // From here on, this node considers the post-join top-R authoritative
-    // for every key — see `NodeContext::known_ring`.
-    *node_context
-        .known_ring
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(Membership {
-        ring: after_ring,
-        replication,
-    }));
+    // for every key — see `NodeContext::known_ring`. The value it replaces
+    // is snapshotted into the slot (issue #93) so the abandon path can put
+    // it back if this join never becomes real cluster-wide.
+    let pre_completion_ring = {
+        let mut guard = node_context
+            .known_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.replace(Arc::new(Membership {
+            ring: after_ring,
+            replication,
+        }))
+    };
 
     println!(
         "INFO migration completed: {joining_name} (sent {sent_count} keys, marked {} dead \
@@ -2555,7 +2555,7 @@ async fn run_migration(
     // goes out (issue #62): discovery may start the next join the moment
     // this `C` lands and have its `M` here before this task gets past the
     // ack read — a slot still reading as in-flight would reject it.
-    migration_guard.completed(sent_count, marked_this_run);
+    migration_guard.completed(sent_count, marked_this_run, pre_completion_ring);
 
     if let Err(error) = report_complete(&node_context, &joining_name).await {
         eprintln!(
@@ -2630,6 +2630,60 @@ async fn unmark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Bytes) {
     {
         let _ = response_rx.await;
     }
+}
+
+/// Handles an incoming `X` (discovery abandoning a join) against this
+/// node's migration slot. Always requests abort on a matching in-flight
+/// handoff (whether or not it has completed), so a still-running transfer
+/// stops. A safe no-op if there's no active migration, or it's for a
+/// different `joining_name` — a cancel that arrived after this handoff
+/// already finished and cleared its slot, or for some other join.
+///
+/// For a handoff that had already completed this node's own share (so it
+/// only lingered to forward writes, issue #3, and hold its dead copies'
+/// marks, issue #62), the abandon ends both: the slot is taken, and its
+/// `known_ring` flip to the post-join topology is reverted (issue #93) —
+/// but only if `known_ring` still holds *this* handoff's post-join ring,
+/// so a newer membership update (e.g. a heartbeat that adopted a fresh
+/// roster once the grace lapsed) is never clobbered. Returns the dead
+/// copies to restore (their async `unmark_migrated` is left to the
+/// caller); `None` when there was nothing completed to abandon.
+fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> Option<Vec<Bytes>> {
+    let taken = {
+        let mut slot = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.as_ref() {
+            Some(active) if active.joining_name == joining_name => {
+                active.abort_requested.store(true, Ordering::SeqCst);
+                if active.completed_at.is_some() {
+                    slot.take()
+                } else {
+                    // Still transferring: `run_migration` will notice the
+                    // abort and roll back its own marks; it hasn't flipped
+                    // `known_ring` yet, so there is nothing to revert.
+                    None
+                }
+            }
+            _ => None,
+        }
+    }?;
+
+    {
+        let mut guard = node_context
+            .known_ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.ring, &taken.after_ring))
+        {
+            *guard = taken.pre_completion_ring;
+        }
+    }
+
+    Some(taken.marked_keys)
 }
 
 /// Staged node join's active-deletion background task: every `SWEEP_INTERVAL`,
@@ -4516,6 +4570,152 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    // ── issue #93: abandon reverts known_ring ──────────────────────────
+
+    /// A `NodeContext` (named "ready-node") whose `known_ring` currently
+    /// holds the post-join ring a completed handoff flipped it to, with a
+    /// matching completed-but-unconfirmed slot carrying the pre-join
+    /// snapshot. `key-3`'s pre-join top-2 is [other-node, ready-node]
+    /// (this node owns it); joiner-0 enters and displaces ready-node.
+    fn completed_unconfirmed_context(
+        marked: &[&str],
+    ) -> (NodeContext, Arc<HashRing>, Arc<Membership>) {
+        let before_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "other-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let pre_completion_ring = Arc::new(Membership {
+            ring: Arc::clone(&before_ring),
+            replication: 2,
+        });
+        let (request_tx, request_rx) = mpsc::channel(1);
+        // Keep the receiver alive for the context's lifetime — wrong_node /
+        // abandon_migration never touch it, but a dropped rx would make any
+        // stray send fail.
+        Box::leak(Box::new(request_rx));
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:1".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: "127.0.0.1:9".to_string(),
+                after_ring: Arc::clone(&after_ring),
+                replication: 2,
+                completed_at: Some(Instant::now()),
+                forwarding_grace: forwarding_grace(0),
+                acked_entries: Some(0),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: marked
+                    .iter()
+                    .map(|key| Bytes::copy_from_slice(key.as_bytes()))
+                    .collect(),
+                confirmed: false,
+                pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+            }))),
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::clone(&after_ring),
+                replication: 2,
+            })))),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx,
+        };
+        (node_context, after_ring, pre_completion_ring)
+    }
+
+    #[test]
+    fn abandoning_a_completed_join_reverts_known_ring() {
+        let (node_context, _after_ring, pre_completion_ring) =
+            completed_unconfirmed_context(&["key-3"]);
+
+        // While forwarding (unconfirmed), the displaced key is still served
+        // locally — the join isn't visible to clients yet.
+        assert!(!wrong_node(&node_context, b"key-3"));
+
+        let restored = abandon_migration(&node_context, "joiner-0")
+            .expect("a completed handoff must hand back its dead copies to restore");
+        assert_eq!(restored, vec![Bytes::from_static(b"key-3")]);
+
+        // The slot is gone and known_ring is back to the pre-join snapshot.
+        assert!(node_context.active_migration.lock().unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            node_context.known_ring.lock().unwrap().as_ref().unwrap(),
+            &pre_completion_ring,
+        ));
+
+        // The bug (issue #93): without the revert, known_ring would still be
+        // the abandoned post-join ring and the slot would be gone, so
+        // wrong_node would answer W for this node's own live key until the
+        // next heartbeat. With the revert it's served immediately.
+        assert!(!wrong_node(&node_context, b"key-3"));
+        assert!(!wrong_node(&node_context, b"key-0"));
+    }
+
+    #[test]
+    fn abandon_does_not_clobber_a_newer_known_ring() {
+        // If a later membership update already replaced known_ring (e.g. the
+        // grace lapsed and a heartbeat adopted a fresh roster) it must win —
+        // reverting to the stale pre-join snapshot would undo it.
+        let (node_context, _after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        let newer = Arc::new(Membership {
+            ring: Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "other-node".to_string(),
+                "joiner-0".to_string(),
+                "joiner-1".to_string(),
+            ])),
+            replication: 2,
+        });
+        *node_context.known_ring.lock().unwrap() = Some(Arc::clone(&newer));
+
+        let restored = abandon_migration(&node_context, "joiner-0").unwrap();
+        assert_eq!(restored, vec![Bytes::from_static(b"key-3")]);
+        assert!(
+            Arc::ptr_eq(
+                node_context.known_ring.lock().unwrap().as_ref().unwrap(),
+                &newer,
+            ),
+            "a newer known_ring must not be reverted to the pre-join snapshot"
+        );
+    }
+
+    #[test]
+    fn abandoning_an_in_flight_join_only_requests_abort() {
+        // The transfer is still running (not completed): the abandon just
+        // asks it to stop — run_migration rolls back its own marks and never
+        // flipped known_ring, so there's nothing to hand back or revert.
+        let (node_context, after_ring, _pre) = completed_unconfirmed_context(&["key-3"]);
+        {
+            let mut slot = node_context.active_migration.lock().unwrap();
+            slot.as_mut().unwrap().completed_at = None;
+        }
+
+        assert!(abandon_migration(&node_context, "joiner-0").is_none());
+        // The slot survives (run_migration's guard still owns it) with abort
+        // requested, and known_ring is left exactly as it was.
+        let slot = node_context.active_migration.lock().unwrap();
+        let active = slot.as_ref().expect("an in-flight slot must not be taken");
+        assert!(active.abort_requested.load(Ordering::SeqCst));
+        assert!(Arc::ptr_eq(
+            &node_context
+                .known_ring
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ring,
+            &after_ring,
+        ));
+    }
+
     #[test]
     fn heartbeat_message_declares_the_name_length_before_the_name() {
         assert_eq!(
@@ -4595,6 +4795,7 @@ mod tests {
             abort_requested: Arc::new(AtomicBool::new(false)),
             marked_keys: Vec::new(),
             confirmed: true,
+            pre_completion_ring: None,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
 
@@ -4626,6 +4827,7 @@ mod tests {
             abort_requested: Arc::new(AtomicBool::new(false)),
             marked_keys: Vec::new(),
             confirmed: true,
+            pre_completion_ring: None,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -4668,6 +4870,7 @@ mod tests {
             abort_requested: Arc::new(AtomicBool::new(false)),
             marked_keys: Vec::new(),
             confirmed: false,
+            pre_completion_ring: None,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -5197,6 +5400,7 @@ mod tests {
                 .map(|key| Bytes::copy_from_slice(key.as_bytes()))
                 .collect(),
             confirmed: false,
+            pre_completion_ring: None,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -6048,6 +6252,7 @@ mod tests {
             abort_requested: Arc::new(AtomicBool::new(false)),
             marked_keys: Vec::new(),
             confirmed: false,
+            pre_completion_ring: None,
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }
