@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 from typing import Any
 import ssl as ssl_module
 import sys
@@ -42,8 +43,10 @@ from ._errors import AlreadyClosedError, NanocachedError, WrongNodeError
 from ._hashring import HashRing
 from ._identify import (
     ClusterTarget,
+    DiscoveredNode,
     NodeTarget,
     connect_and_identify,
+    connect_and_identify_proxy,
     split_host_port,
 )
 
@@ -329,6 +332,15 @@ class NanocachedClient:
         # (the losers); finished detached, drained by close() exactly like
         # _background_replica_writes.
         self._hedged_reads: set[asyncio.Task[object]] = set()
+        # SDK proxy mode (issue #122): set once, at connect(), when
+        # via_proxy is true — never flips back. Gates the reconnect
+        # fallback in _open_node_connection (retry the same proxy, then
+        # re-fetch Q and pick another) and is otherwise inert: a proxy
+        # connection is this client's ordinary single-connection mode
+        # (self._single/self._single_address), so every other code path
+        # (self._ring is None) already treats it exactly like a lone
+        # node target.
+        self._via_proxy: bool = False
         self._target_key: str | None = None
         self._last_fetch = time.monotonic()
         self._refresh_task: asyncio.Task[None] | None = None
@@ -360,6 +372,7 @@ class NanocachedClient:
         read_repair: bool = False,
         reconnect_cooldown: float = _DEFAULT_RECONNECT_COOLDOWN,
         read_hedge_after: float | None = None,
+        via_proxy: bool = False,
     ) -> "NanocachedClient":
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
@@ -376,6 +389,18 @@ class NanocachedClient:
         client._read_repair = read_repair
         client._reconnect_cooldown = reconnect_cooldown
         client._read_hedge_after = read_hedge_after
+
+        # SDK proxy mode (issue #122): a separate connect path — fetch the
+        # proxy roster (`Q`) from a discovery seed instead of the node
+        # roster (`L`), and land on a single proxy connection instead of a
+        # ring. Kept as its own loop (mirroring the ring-mode one just
+        # below) rather than interleaved with it, since the two share only
+        # the outermost "walk the addresses" shape and diverge in what
+        # they fetch, how a `NodeTarget` answer is treated (a config error
+        # here, a legitimate single-node pin there), and what a successful
+        # answer installs.
+        if via_proxy:
+            return await cls._connect_via_proxy(client)
 
         # Walk the addresses until one yields a working target; an address
         # that is unreachable, warming up (`B`, discovery HA), or knows no live
@@ -424,6 +449,69 @@ class NanocachedClient:
             client._target_key = key
             try:
                 await client._open_cluster(identified)
+            except BaseException:
+                client._teardown()
+                raise
+            client._start_keepalive()
+            return client
+
+        raise last_error if last_error is not None else NanocachedError(
+            "nanocached: could not connect to any address"
+        )
+
+    @classmethod
+    async def _connect_via_proxy(cls, client: "NanocachedClient") -> "NanocachedClient":
+        """SDK proxy mode (issue #122): ``client`` already has every
+        connect()-time option applied — this only walks the discovery
+        seeds for a proxy roster (``Q``) instead of a node roster
+        (``L``), and lands on one proxy instead of a ring. Reuses
+        connect()'s own seed-iteration and `B` handling (an address
+        that's unreachable, warming up, or has an empty roster is
+        skipped, the next seed may do better); once a seed answers with a
+        *non-empty* roster this commits to it exactly the way
+        connect()'s ring-mode path commits to the first discovery
+        server that lists any nodes — if every proxy in that roster then
+        turns out unreachable, connect() fails outright rather than
+        trying yet another discovery seed for a fresh roster."""
+        last_error: Exception | None = None
+        for address_host, address_port in client._addresses:
+            key = f"{address_host}:{address_port}"
+            if len(client._addresses) == 1 and _has_open_target(key):
+                _warn(
+                    f"nanocached: connect() called for {key} while a previous connection to it "
+                    f"is still open — was close() forgotten?"
+                )
+
+            try:
+                identified = await connect_and_identify_proxy(
+                    address_host, address_port, client._auth_secret, client._ssl_context
+                )
+            except (NanocachedError, OSError) as error:
+                last_error = error
+                continue
+
+            if isinstance(identified, NodeTarget):
+                # via_proxy is only meaningful against discovery
+                # addresses (issue #122 spec) — the identify handshake
+                # already tells node and discovery apart, so a node
+                # answer here is a configuration error, not a liveness
+                # one, and fails fast instead of silently falling back
+                # to the next address the way an unreachable one does.
+                identified.writer.close()
+                raise NanocachedError(
+                    f"nanocached: via_proxy requires a discovery server address, but {key} "
+                    f"identifies as a cache node"
+                )
+
+            if not identified:
+                last_error = NanocachedError(
+                    f"nanocached: no proxies registered with discovery server at {key}"
+                )
+                continue
+
+            client._target_key = key
+            try:
+                await client._connect_to_proxy(identified)
             except BaseException:
                 client._teardown()
                 raise
@@ -506,6 +594,111 @@ class NanocachedClient:
 
         self._ring = HashRing([node.name for node in identified.nodes])
         self._replication = identified.replication
+
+    async def _connect_to_proxy(self, proxies: list[DiscoveredNode]) -> None:
+        """SDK proxy mode (issue #122) initial connect: installs the
+        winner of _dial_one_proxy_randomly as this client's single
+        connection — from here on it behaves exactly like a lone
+        explicit node target (the classmethod connect()'s own NodeTarget
+        branch), never a ring: a proxy looks exactly like one node that
+        owns every key (issue #122 spec)."""
+        self._via_proxy = True
+        self._single = await self._dial_one_proxy_randomly(proxies)
+
+    async def _dial_one_proxy_randomly(self, proxies: list[DiscoveredNode]) -> Connection:
+        """Shuffles ``proxies`` and dials each in turn until one answers
+        as a live cache node: "connect to ONE proxy chosen AT RANDOM —
+        spreads a fleet over proxies — ...on connect failure, fail over
+        through the remaining proxies in random order" (issue #122
+        spec). Shared by the initial proxy-mode connect
+        (_connect_to_proxy) and the reconnect-time roster refetch
+        (_reconnect_via_new_proxy) so there is exactly one place this
+        logic lives, per the spec's "reuse the existing reconnect/
+        refresh plumbing... do not build a second reconnect machine".
+        Always updates self._single_address to whichever proxy actually
+        answered — including on a reconnect that lands on a *different*
+        proxy than the one that just died — since that is what the next
+        redial (_single_connection) will target."""
+        order = list(proxies)
+        random.shuffle(order)
+        last_error: Exception | None = None
+        for proxy in order:
+            proxy_host, proxy_port = split_host_port(proxy.address)
+            try:
+                target = await connect_and_identify(
+                    proxy_host, proxy_port, self._auth_secret, self._ssl_context
+                )
+            except (NanocachedError, OSError) as error:
+                last_error = error
+                continue
+            if not isinstance(target, NodeTarget):
+                # A proxy always identifies as a node (issue #122 spec);
+                # anything else means it stopped being a proxy between Q
+                # and this dial (retired, address reused) — treated as
+                # just another unreachable candidate rather than aborting
+                # the whole roster the way _open_cluster's stricter
+                # "discovery returned a non-node address" check does,
+                # since via_proxy's whole point is resilience across a
+                # fleet of proxies.
+                last_error = NanocachedError(
+                    f"nanocached: proxy {proxy.address} no longer identifies as a cache node"
+                )
+                continue
+            if self._closed:
+                target.writer.close()
+                raise AlreadyClosedError()
+            self._single_address = proxy.address
+            return self._new_connection(target.reader, target.writer, target.tagged)
+        raise last_error if last_error is not None else NanocachedError(
+            "nanocached: no proxies registered with discovery"
+        )
+
+    async def _reconnect_via_new_proxy(self) -> Connection:
+        """SDK proxy mode (issue #122) reconnect fallback, invoked by
+        _open_node_connection when a redial to the currently pinned
+        proxy itself fails ("first retry the same proxy... if that
+        fails, re-fetch Q from discovery and pick another", issue #122
+        spec — the "retry the same proxy" half is just the ordinary
+        _redial attempt against self._single_address that got us here).
+        Re-fetches the roster and dials one at random via
+        _dial_one_proxy_randomly, reusing exactly the same fan-out and
+        random-order failover as the initial connect."""
+        proxies = await self._fetch_proxy_list()
+        if not proxies:
+            raise NanocachedError(
+                "nanocached: no proxies registered with discovery (proxy mode reconnect)"
+            )
+        return await self._dial_one_proxy_randomly(proxies)
+
+    async def _fetch_proxy_list(self) -> list[DiscoveredNode]:
+        """Walks every configured discovery address (discovery HA),
+        exactly like _fetch_node_list, returning the first that answers
+        with a (possibly empty) proxy roster. A node-identifying address
+        is skipped (closed) rather than erroring, and every failure is
+        swallowed here: like _fetch_node_list, this reconnect-time fetch
+        must never itself raise something other than "no proxies were
+        found" — the caller (_reconnect_via_new_proxy) turns an empty
+        result into the same clear error an empty initial roster would
+        raise at connect(). Each failed address is counted in
+        stats().refresh_failures — the same counter _fetch_node_list
+        itself uses, since both are "the node/proxy list this client
+        routes with just went stale" (per the spec: reuse the SDK's
+        existing counters rather than adding a proxy-only one)."""
+        for address_host, address_port in self._addresses:
+            try:
+                identified = await connect_and_identify_proxy(
+                    address_host, address_port, self._auth_secret, self._ssl_context
+                )
+            except _SWALLOWABLE_ERRORS:
+                self._refresh_failures += 1
+                continue
+            if isinstance(identified, NodeTarget):
+                identified.writer.close()
+                continue
+            if not identified:
+                continue
+            return identified
+        return []
 
     # ── 公開 API ───────────────────────────────────────────────────
 
@@ -1213,7 +1406,23 @@ class NanocachedClient:
 
     async def _open_node_connection(self, address: str) -> Connection:
         node_host, node_port = split_host_port(address)
-        identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
+        try:
+            identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
+        except (NanocachedError, OSError):
+            # SDK proxy mode (issue #122) reconnect: this is only ever
+            # reached via _redial("", self._single_address) — "first
+            # retry the same proxy (it may have restarted)" — so a dial
+            # failure here specifically means *that* retry just failed;
+            # fall back to re-fetching the roster and picking another,
+            # instead of endlessly retrying a proxy that may be gone for
+            # good. The `address == self._single_address` guard is belt
+            # and braces: in via_proxy mode this method is never called
+            # any other way (there are no cluster members to redial), but
+            # matching only the pinned address keeps that assumption from
+            # silently mattering here.
+            if self._via_proxy and address == self._single_address:
+                return await self._reconnect_via_new_proxy()
+            raise
         if not isinstance(identified, NodeTarget):
             raise NanocachedError(f"nanocached: {address} no longer identifies as a cache node")
         if self._closed:

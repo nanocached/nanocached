@@ -636,6 +636,17 @@ final class MockServers {
 
     static final class MockDiscovery implements AutoCloseable {
         volatile List<DiscoveredNode> nodes;
+        /** SDK proxy mode (issue #122): the roster `Q` answers with —
+         * reuses {@link DiscoveredNode} exactly like a real proxy
+         * announce does on the wire (name/address, no replication field),
+         * even though a proxy's "name" has no routing meaning to a
+         * client. Empty by default; a test sets this directly (mirrors
+         * {@link #warmingUp}/{@link #rawListResponse} below) — including
+         * mid-test, for a "roster changed under a live client" case. A
+         * "proxy" here is nothing more than a {@link MockNode}: that is
+         * literally what a proxy looks like to a client (full G/S/D,
+         * never W). */
+        volatile List<DiscoveredNode> proxies = List.of();
         volatile boolean warmingUp = false;
         final int replication;
         private final ServerSocket server;
@@ -713,6 +724,25 @@ final class MockServers {
                             frame.append(node.name().length()).append(' ')
                                     .append(node.address().length()).append('\n')
                                     .append(node.name()).append(node.address()).append('\n');
+                        }
+                        out.write(frame.toString().getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                    } else if (parts[0].equals("Q")) {
+                        // SDK proxy mode (issue #122): same B-on-startup-grace
+                        // shape as L above; the header carries only the
+                        // count (no replication field — a proxy client
+                        // needs no R).
+                        if (warmingUp) {
+                            out.write("B\n".getBytes(StandardCharsets.US_ASCII));
+                            out.flush();
+                            return;
+                        }
+                        List<DiscoveredNode> snapshot = proxies;
+                        StringBuilder frame = new StringBuilder("N " + snapshot.size() + "\n");
+                        for (DiscoveredNode proxy : snapshot) {
+                            frame.append(proxy.name().length()).append(' ')
+                                    .append(proxy.address().length()).append('\n')
+                                    .append(proxy.name()).append(proxy.address()).append('\n');
                         }
                         out.write(frame.toString().getBytes(StandardCharsets.UTF_8));
                         out.flush();

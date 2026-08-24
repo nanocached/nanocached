@@ -54,6 +54,39 @@ using NanocachedClient client = await NanocachedClient.ConnectAsync(
     });
 ```
 
+## SDK proxy mode
+
+Off by default. Set `ViaProxy` to route through one `nanocached-proxy`
+from the fleet instead of connecting directly to the cluster:
+
+```csharp
+using NanocachedClient client = await NanocachedClient.ConnectAsync(
+    new NanocachedClient.Options
+    {
+        Addresses = { ("discovery.internal", 8357) }, // discovery, not a proxy directly
+        ViaProxy = true,
+    });
+```
+
+`Addresses` must name discovery server(s) — `ConnectAsync` fetches the
+current proxy roster from discovery and connects to one proxy, chosen at
+random (spreading a fleet of clients across the proxy fleet); pointing
+`ViaProxy` at a plain node address fails fast with a clear error instead
+of silently pinning to it. A proxy looks exactly like a single node that
+owns every key (full `Get`/`Set`/`Delete`, never routing-stale), so once
+connected the client is in its ordinary single-connection mode: **no
+ring, no per-node connections, and no hedged reads** — there is nobody
+else to hedge to, so a configured `ReadHedgeAfter` is accepted but inert
+under `ViaProxy`. Namespaces, `ClearAsync`/`ClearAllAsync`, response
+tags, keep-alive, and compression all work unchanged over the one
+connection.
+
+On reconnect, the client first retries the same proxy (it may simply
+have restarted); only if that also fails does it re-fetch the roster
+from discovery and fail over to another proxy chosen at random — reusing
+the same lazy reconnect-on-use plumbing every other mode uses, not a
+second mechanism.
+
 ## Namespaces
 
 A namespace is a flat, opaque byte string that scopes a key: the same key
@@ -207,7 +240,8 @@ single copy there is nobody to hedge to. Writes are unaffected — every
 copy must be written, so a slow owner bounds writes to it regardless
 (`FireAndForgetReplicas` moves only the replica legs off the caller's
 path). The losing leg of a hedge is left to finish and is drained by
-`Close()`.
+`Close()`. Inert under [SDK proxy mode](#sdk-proxy-mode) (`ViaProxy`):
+a proxy connection has no ring and nobody else to hedge to.
 
 ## Reconnect and keep-alive
 

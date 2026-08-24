@@ -2324,6 +2324,189 @@ public class NanocachedClientTests
         Assert.True(stopwatch.ElapsedMilliseconds < 500 - HedgeTimingToleranceMillis,
             $"elapsed {stopwatch.ElapsedMilliseconds}ms should be nowhere near the 500ms hedge interval");
     }
+
+    // ── SDK proxy mode (issue #122) ──────────────────────────────
+
+    private static NanocachedClient.Options ViaProxyAddress(string host, int port) =>
+        new() { Addresses = { (host, port) }, ViaProxy = true };
+
+    // _singleAddress is private; reached via reflection the same way
+    // GetMemberConnection/GetMemberAddress (TolerantBootstrapTests, below)
+    // reach _members' internals — the only way to assert, from outside,
+    // which proxy a client landed on.
+    private static string GetSingleAddress(NanocachedClient client)
+    {
+        FieldInfo field = typeof(NanocachedClient)
+            .GetField("_singleAddress", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (string)field.GetValue(client)!;
+    }
+
+    [Fact]
+    public async Task ViaProxyRoutesEveryOperationThroughTheChosenProxyAndNeverDialsANode()
+    {
+        // discovery lists node in its ordinary L roster (a real discovery
+        // would never mix the two, but this proves ViaProxy never even
+        // tries L/node — see the ConnectionCount assertion below) and
+        // proxy in its Q roster.
+        using var node = new MockNode();
+        using var proxy = new MockNode();
+        using var discovery = new MockDiscovery(new[] { (Names[0], node.Address) });
+        discovery.SetProxies(new[] { ("proxy-1", proxy.Address) });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.True(await client.DeleteAsync("k"));
+        Assert.Null(await client.GetAsync("k"));
+
+        NanocachedNamespace users = client.Namespace("users");
+        await users.SetAsync("42", "alice");
+        Assert.Equal("alice", await users.GetAsync("42"));
+        await users.ClearAsync();
+        Assert.Null(await users.GetAsync("42"));
+
+        // A proxy owns every key: no ring, single connection.
+        Assert.Equal(1, client.Replication);
+        Assert.Equal(1, proxy.ConnectionCount);
+        Assert.Equal(0, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task ViaProxySpreadsFreshClientsAcrossBothProxies()
+    {
+        using var proxyA = new MockNode();
+        using var proxyB = new MockNode();
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-a", proxyA.Address), ("proxy-b", proxyB.Address) });
+
+        var chosen = new HashSet<string>();
+        for (int i = 0; i < 30; i++)
+        {
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(
+                ViaProxyAddress("127.0.0.1", discovery.Port));
+            chosen.Add(GetSingleAddress(client));
+        }
+
+        // Statistical, not flaky in practice: 30 independent 50/50 picks
+        // missing either proxy entirely has probability 2 * 0.5^30.
+        Assert.Contains(proxyA.Address, chosen);
+        Assert.Contains(proxyB.Address, chosen);
+    }
+
+    [Fact]
+    public async Task ViaProxyFailsOverToTheLiveProxyWhenTheRandomlyChosenOneIsDown()
+    {
+        using var live = new MockNode();
+        int dead = Wire.UnusedPort();
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-dead", $"127.0.0.1:{dead}"), ("proxy-live", live.Address) });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal(live.Address, GetSingleAddress(client));
+    }
+
+    [Fact]
+    public async Task ViaProxySkipsAWarmingUpDiscoverySeedAndFetchesQFromTheNext()
+    {
+        using var proxy = new MockNode();
+        using var warming = new MockDiscovery(Array.Empty<(string, string)>());
+        using var healthy = new MockDiscovery(Array.Empty<(string, string)>());
+        warming.WarmingUp = true;
+        healthy.SetProxies(new[] { ("proxy-1", proxy.Address) });
+
+        var options = new NanocachedClient.Options { ViaProxy = true };
+        options.Addresses.Add(("127.0.0.1", warming.Port));
+        options.Addresses.Add(("127.0.0.1", healthy.Port));
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task ViaProxyThrowsAClearErrorWhenTheProxyRosterIsEmpty()
+    {
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+
+        NanocachedException error = await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(ViaProxyAddress("127.0.0.1", discovery.Port)));
+        Assert.Contains("no proxies registered", error.Message);
+    }
+
+    [Fact]
+    public async Task ViaProxyPointedAtANodeAddressFailsFast()
+    {
+        using var node = new MockNode();
+
+        NanocachedException error = await Assert.ThrowsAsync<NanocachedException>(
+            () => NanocachedClient.ConnectAsync(ViaProxyAddress("127.0.0.1", node.Port)));
+        Assert.Contains("ViaProxy requires discovery addresses", error.Message);
+    }
+
+    [Fact]
+    public async Task ViaProxyReconnectsThroughAFreshQFetchWhenTheConnectedProxyDies()
+    {
+        var proxyA = new MockNode();
+        var proxyB = new MockNode();
+        var proxies = new Dictionary<string, MockNode> { ["proxy-a"] = proxyA, ["proxy-b"] = proxyB };
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-a", proxyA.Address), ("proxy-b", proxyB.Address) });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+        await client.SetAsync("k", "v");
+
+        string connectedAddress = GetSingleAddress(client);
+        MockNode connected = proxies.Values.Single(p => p.Address == connectedAddress);
+        MockNode survivor = proxies.Values.Single(p => p.Address != connectedAddress);
+        try
+        {
+            connected.Dispose();
+            await Task.Delay(50); // let the FIN land, as TransparentlyReconnectsAfterAServerFin does
+
+            // The connected proxy's own address is retried first (it may
+            // simply have restarted) and only then does the client
+            // re-fetch Q and fail over — see DialProxyWithFailoverAsync.
+            await client.SetAsync("k2", "v2");
+            Assert.Equal("v2", await client.GetAsync("k2"));
+            Assert.Equal(survivor.Address, GetSingleAddress(client));
+            Assert.True(survivor.Store.ContainsKey(MockNode.KeyOf(Bytes("k2"))));
+        }
+        finally
+        {
+            survivor.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task ViaProxyIgnoresReadHedgeAfterSinceThereIsNoReplicaToHedgeTo()
+    {
+        using var proxy = new MockNode();
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-1", proxy.Address) });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", discovery.Port) },
+            ViaProxy = true,
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(50),
+        });
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal("v", await client.GetAsync("k"));
+
+        // No ring in proxy mode, so ReadAsync never reaches
+        // ReadHedgedAsync at all: exactly one G per GetAsync call, on the
+        // one connection, whatever ReadHedgeAfter says.
+        Assert.Equal(2, proxy.GetCount); // the two GetAsync calls above
+    }
 }
 
 /// <summary>

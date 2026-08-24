@@ -55,6 +55,37 @@ like an unreachable one; if every address is warming up, `connect()`
 returns `Error::DiscoveryBusy` — retry shortly. An empty addresses list
 is rejected eagerly with `Error::InvalidArgument`.
 
+## SDK proxy mode
+
+`Options::via_proxy(true)` connects through a `nanocached-proxy` tier
+instead of joining the cluster directly — useful once a fleet of client
+processes is large enough that one connection per node per process would
+overrun a node's own connection limit. `addresses` must still name
+discovery server(s); `connect()` fetches the *proxy* roster from
+discovery (not the node roster) and lands on one proxy, chosen at
+random so a fleet of clients spreads across the proxy tier:
+
+```rust
+let client = NanocachedClient::connect(
+    Options::new()
+        .addresses([("10.0.0.1", 8357)])
+        .via_proxy(true),
+).await?;
+```
+
+A proxy looks, on the wire, exactly like a single node that owns every
+key, so from here on the client runs in its existing single-connection
+mode: no ring view, no per-node connections, and **`read_hedge_after` is
+inert if also set** — there are no replicas on this one connection to
+hedge a read to. Namespaces, `clear`/`clear_all`, compression, and
+keep-alive all work unchanged. If the proxy connection is lost, the same
+proxy is redialed first (it may simply have restarted); only if that
+also fails does the client re-fetch the roster from discovery and swap
+onto another, randomly chosen, reachable proxy. Pointing `via_proxy` at
+an address that turns out to be a cache node, not a discovery server,
+fails `connect()` fast with `Error::InvalidArgument`; an empty (or
+wholly unreachable) proxy roster is a normal connect error.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so

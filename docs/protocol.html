@@ -182,7 +182,10 @@ for the design.</p>
 and migration frames — <code>L</code> (node list),
 <code>J</code>/<code>H</code>/<code>P</code> (join, heartbeat,
 announce), <code>M</code>/<code>X</code>/<code>C</code> (migrate,
-cancel, complete). These are versioned with the server and not part of
+cancel, complete), and <code>Y</code>/<code>Q</code> (proxy announce and
+proxy list — how <code>nanocached-proxy</code> registers with discovery
+and how SDKs in proxy mode find one). These are versioned with the
+server and not part of
 the public caching API; the server
 source documents them in detail.</p>
 

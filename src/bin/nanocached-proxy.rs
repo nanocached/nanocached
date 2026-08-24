@@ -75,10 +75,12 @@
 //!
 //! # Deployment, TLS, auth, limits
 //!
-//! - Deployment: proxies are stateless and horizontally scalable; run
-//!   several behind one address (DNS/LB/VIP) and point single-address
-//!   clients at it. SDKs in discovery mode keep working cluster-direct —
-//!   the proxy is opt-in per client.
+//! - Deployment: proxies are stateless and horizontally scalable. Each
+//!   announces itself to discovery (`Y`, issue #122) on its refresh
+//!   cadence, so clients can fetch the proxy roster from discovery (`Q`)
+//!   instead of being handed a proxy address out of band — a DNS/LB/VIP
+//!   in front of the proxies keeps working too. SDKs in discovery mode
+//!   keep working cluster-direct; the proxy is opt-in per client.
 //! - Auth: the shared secret (env `NANOCACHED_SECRET`, same as node and
 //!   discovery) is required of clients exactly as a node requires it,
 //!   and presented by the proxy on every backend and discovery
@@ -146,6 +148,23 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// corrupt header must not drive allocations or blocking reads.
 const MAX_ROSTER_ENTRIES: usize = 4096;
 const MAX_NAME_OR_ADDR_LENGTH: usize = 1024;
+
+/// This process's own identity toward discovery (issue #122): a random
+/// per-process name (like a node's) and the token that pins it — see the
+/// discovery side's `ProxyInfo::token`.
+struct ProxyIdentity {
+    name: String,
+    token: String,
+}
+
+impl ProxyIdentity {
+    fn generate() -> Self {
+        Self {
+            name: uuid::Uuid::new_v4().to_string(),
+            token: format!("tk-{}", uuid::Uuid::new_v4()),
+        }
+    }
+}
 
 fn read_auth_secret() -> Option<Bytes> {
     std::env::var("NANOCACHED_SECRET")
@@ -629,6 +648,56 @@ async fn connect_upstream(
     }
 }
 
+/// One `Y` announce to one discovery replica (issue #122): the declared
+/// port composes with this connection's source IP on the discovery side,
+/// exactly like a node's `J`/`P` (same NAT caveat).
+async fn announce_to(
+    addr: &str,
+    secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
+    identity: &ProxyIdentity,
+    port: u16,
+) -> io::Result<()> {
+    timeout(UPSTREAM_IO_TIMEOUT, async {
+        let mut stream = connect_upstream(addr, tls_connector).await?;
+        let mut buf = BytesMut::new();
+
+        if let Some(secret) = secret {
+            let mut auth = format!("A {}\n", secret.len()).into_bytes();
+            auth.extend_from_slice(secret);
+            stream.write_all(&auth).await?;
+            let ack = read_line(&mut stream, &mut buf).await?;
+            if !ack.starts_with("Od") && !ack.starts_with("On") {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("discovery at {addr} rejected authentication: {ack:?}"),
+                ));
+            }
+        }
+
+        let mut frame = format!(
+            "Y {} {port} {}\n",
+            identity.name.len(),
+            identity.token.len()
+        )
+        .into_bytes();
+        frame.extend_from_slice(identity.name.as_bytes());
+        frame.extend_from_slice(identity.token.as_bytes());
+        stream.write_all(&frame).await?;
+
+        let ack = read_line(&mut stream, &mut buf).await?;
+        if ack != "R" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("discovery at {addr} rejected the proxy announce: {ack:?}"),
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy announce timed out"))?
+}
+
 /// The background roster refresher: one fetch at startup, then again
 /// every `REFRESH_INTERVAL` or whenever something sends on `refresh_rx`
 /// (a `W`, a failed fan-out). Failures keep the last good view.
@@ -636,6 +705,7 @@ async fn run_refresher(
     discovery: Vec<String>,
     secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
+    announce: Option<(ProxyIdentity, u16)>,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
     mut refresh_rx: mpsc::Receiver<()>,
 ) {
@@ -646,6 +716,21 @@ async fn run_refresher(
             }
             Err(error) => {
                 eprintln!("WARN roster refresh failed: {error}");
+            }
+        }
+
+        // Issue #122: (re-)announce this proxy on the same cadence, to
+        // every replica — each keeps its own proxy map (they don't
+        // gossip), and re-announcing is what keeps the entry alive past
+        // the liveness timeout. Failures only warn: an unreachable
+        // replica can't take the proxy down, it just won't list it.
+        if let Some((identity, port)) = &announce {
+            for addr in &discovery {
+                if let Err(error) =
+                    announce_to(addr, &secret, &tls_connector, identity, *port).await
+                {
+                    eprintln!("WARN proxy announce to {addr} failed: {error}");
+                }
             }
         }
 
@@ -1810,10 +1895,13 @@ async fn run(
 
     let (ring_tx, ring_rx) = watch::channel(None);
     let (refresh_tx, refresh_rx) = mpsc::channel(16);
+    let identity = ProxyIdentity::generate();
+    println!("INFO proxy identity: {}", identity.name);
     tokio::spawn(run_refresher(
         args.discovery.clone(),
         secret.clone(),
         tls_connector.clone(),
+        Some((identity, args.port)),
         ring_tx,
         refresh_rx,
     ));
@@ -2227,6 +2315,7 @@ mod tests {
         tokio::spawn(run_refresher(
             vec![discovery_addr.to_string()],
             secret.clone(),
+            None,
             None,
             ring_tx,
             refresh_rx,

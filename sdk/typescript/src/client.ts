@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { Connection, ConnectionLostError, isConnectionError, WrongNodeError } from "./connection.js";
-import { connectAndIdentify, type DiscoveredNode } from "./identify.js";
+import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
@@ -84,6 +84,23 @@ export interface NanocachedClientOptions {
    * grace after a restart) is skipped the same way as an unreachable
    * one. */
   addresses: NanocachedAddress[];
+  /** SDK proxy mode (issue #122): connect through one `nanocached-proxy`
+   * instead of routing directly to the cluster. Only meaningful when
+   * every configured address is a discovery server — if the first one
+   * reached identifies as a cache node instead, `connect()` fails fast
+   * with a clear error, since proxy mode has no direct-node fallback.
+   * Once connected, this client is in the same single-connection mode a
+   * lone node address puts it in: no ring view, no per-node connections,
+   * and no hedged reads — `readHedgeAfterMs` is inert here, since a proxy
+   * connection has no replicas to hedge to. Namespaces, clear/clearAll,
+   * tags, keep-alive, and compression all work unchanged over that one
+   * connection. The proxy is chosen at random from discovery's roster
+   * (spreading a fleet of clients across proxies), with random failover
+   * through the rest if the chosen one is unreachable; on a later
+   * connection loss, the same proxy is retried first (it may have simply
+   * restarted) before the roster is re-fetched and another is picked.
+   * Off by default. */
+  viaProxy?: boolean;
   /** Shared secret to authenticate with, matching NANOCACHED_AUTH_SECRET
    * on the server. Omit if the server has no secret configured. */
   authSecret?: string;
@@ -138,7 +155,9 @@ export interface NanocachedClientOptions {
    * read that touches it at its full round trip. Only applies when the
    * key has at least 2 owners (`replication >= 2`); with a single copy
    * there is nobody to hedge to. Must be a positive number when set — a
-   * non-positive value is rejected at `connect()`. */
+   * non-positive value is rejected at `connect()`. Inert under `viaProxy`
+   * (issue #122): a proxy connection is single-connection mode, so there
+   * is never a second owner to hedge to either. */
   readHedgeAfterMs?: number;
   /** How long, after a reconnect dial to an address fails, that address is
    * treated as still down — a request routed to it during this window
@@ -220,6 +239,12 @@ interface ClusterMember {
 
 type Target =
   | { kind: "single"; connection: Connection }
+  // SDK proxy mode (issue #122, `viaProxy`): a single connection to one
+  // `nanocached-proxy`, exactly like `"single"` except `address` is
+  // mutable — a `refreshProxyTarget` can swap it to a different proxy
+  // after a reconnect-time `Q` re-fetch, unlike a plain node target's
+  // fixed `NanocachedClient.url`.
+  | { kind: "proxy"; connection: Connection; address: string }
   // `members` is keyed by node *name* (node identity decoupled from address), matching what
   // `ring.owners()` returns — not by address, which carries no identity
   // meaning and is only used to open connections. `replication` is
@@ -229,6 +254,20 @@ type Target =
 
 function targetKey(options: { host: string; port: number }): string {
   return `${options.host}:${options.port}`;
+}
+
+/** Fisher-Yates over a copy of `items` — never mutates its argument.
+ * Backs SDK proxy mode's random proxy selection (issue #122): spreading a
+ * fleet of fresh clients across a discovery server's proxy roster, and
+ * failing over through the rest in random order (rather than roster
+ * order) when the first pick turns out to be down. */
+function shuffled<T>(items: readonly T[]): T[] {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
 }
 
 // How long a cluster client's node list may go without being re-fetched
@@ -478,6 +517,10 @@ export class NanocachedClient {
     const compressionThreshold = options.compressionThreshold ?? DEFAULT_COMPRESSION_THRESHOLD;
     const reconnectCooldownMs = options.reconnectCooldownMs ?? DEFAULT_RECONNECT_COOLDOWN_MS;
 
+    if (options.viaProxy === true) {
+      return NanocachedClient.connectViaProxy(options, addresses, ca, compress, compressionThreshold, reconnectCooldownMs);
+    }
+
     // Walk the addresses in order until one yields a working target. An
     // address is skipped when it's unreachable, answers `B` (discovery HA
     // startup grace), or knows no live nodes — the next replica may do
@@ -627,6 +670,102 @@ export class NanocachedClient {
     throw lastError ?? new NanocachedError("nanocached: could not connect to any address");
   }
 
+  /** SDK proxy mode (issue #122, `viaProxy`): walks `addresses` — every
+   * one of which must be a discovery server, never a bare node — for a
+   * proxy roster via `Q` (mirroring the plain flow's walk for `L`), then
+   * dials one proxy chosen at random from it, failing over through the
+   * rest in random order if the pick is unreachable. A proxy looks
+   * exactly like a single node that owns every key (full `G`/`S`/`D`,
+   * never `W`), so once connected this client runs the same
+   * single-connection path a lone node target does — `Target.kind ===
+   * "proxy"` just additionally knows how to re-fetch `Q` and pick a new
+   * proxy on reconnect (`refreshProxyTarget`), the way a cluster target
+   * re-fetches `L` (`refreshNodeList`). See via-proxy-spec.md. */
+  private static async connectViaProxy(
+    options: NanocachedClientOptions,
+    addresses: NanocachedAddress[],
+    ca: Buffer | undefined,
+    compress: boolean,
+    compressionThreshold: number,
+    reconnectCooldownMs: number,
+  ): Promise<NanocachedClient> {
+    let lastError: Error | null = null;
+
+    for (const address of addresses) {
+      let result;
+      try {
+        result = await connectAndListProxies({ host: address.host, port: address.port, authSecret: options.authSecret, tls: options.tls, ca });
+      } catch (error) {
+        // Unreachable, still warming up (DiscoveryBusyError), or an
+        // actual programming bug — either way, try the next address the
+        // same way the plain flow does for a discovery seed.
+        lastError = error as Error;
+        continue;
+      }
+
+      if (result.kind === "node") {
+        // A hard config error, not a transient one (issue #122): every
+        // other configured address would identify the same way (either
+        // they're all discovery servers, or the caller pointed viaProxy
+        // at the wrong thing), so there is no point trying the rest —
+        // fail fast with a clear message instead of quietly falling back
+        // to a node the caller never asked this mode to talk to directly.
+        throw new NanocachedError(
+          `nanocached: viaProxy is set, but ${address.host}:${address.port} identifies as a cache node, not a discovery server — proxy mode needs discovery addresses`,
+        );
+      }
+
+      if (result.proxies.length === 0) {
+        lastError = new NanocachedError(`nanocached: no proxies registered with the discovery server at ${address.host}:${address.port}`);
+        continue;
+      }
+
+      // Random spread (issue #122): a fleet of fresh clients spreads
+      // evenly across proxies, and a down first pick fails over through
+      // the rest in that same random order rather than roster order.
+      for (const proxy of shuffled(result.proxies)) {
+        let identified;
+        try {
+          identified = await connectAndIdentify({ ...splitHostPort(proxy.address), authSecret: options.authSecret, tls: options.tls, ca });
+        } catch (error) {
+          lastError = error as Error;
+          continue;
+        }
+
+        if (identified.kind !== "node") {
+          // A listed proxy that no longer identifies as one — treat like
+          // any other bad candidate and keep failing over.
+          lastError = new NanocachedError(`nanocached: ${proxy.address} no longer identifies as a proxy`);
+          continue;
+        }
+
+        const key = targetKey(address);
+        trackOpenTarget(key, [identified.socket]);
+        return new NanocachedClient(
+          { kind: "proxy", connection: new Connection(identified.socket, identified.tagged), address: proxy.address },
+          key,
+          [proxy.address],
+          addresses,
+          options.authSecret,
+          options.tls,
+          ca,
+          compress,
+          compressionThreshold,
+          options.fireAndForgetReplicas === true,
+          options.readRepair === true,
+          reconnectCooldownMs,
+          options.readHedgeAfterMs,
+        );
+      }
+      // Every listed proxy was unreachable: unlike cluster bootstrap
+      // (issue #67), a proxy target needs exactly one live connection to
+      // start with — there is no connectionless-member fallback to install
+      // — so fall through to the next discovery address instead.
+    }
+
+    throw lastError ?? new NanocachedError("nanocached: could not connect to any address");
+  }
+
   /** Whether close() has already been called on this instance. */
   isClosed(): boolean {
     return this.closed;
@@ -677,7 +816,9 @@ export class NanocachedClient {
   }
 
   private teardownConnections(): void {
-    if (this.target.kind === "single") {
+    // Both "single" and "proxy" (issue #122) targets are one bare
+    // `connection` — only "cluster" has a member map to fan out over.
+    if (this.target.kind !== "cluster") {
       this.target.connection.close();
       return;
     }
@@ -729,9 +870,9 @@ export class NanocachedClient {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     let value = await this.withWrongNodeRetry(() =>
-      this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.get(key, namespace))
-        : this.readFromOwners(key, namespace, (connection) => connection.get(key, namespace)),
+      this.target.kind === "cluster"
+        ? this.readFromOwners(key, namespace, (connection) => connection.get(key, namespace))
+        : this.connectionForSingleTarget().then((connection) => connection.get(key, namespace)),
     );
     if (value === null && this.readRepair && this.target.kind === "cluster") {
       value = await this.tryReadRepair(key, namespace);
@@ -846,9 +987,9 @@ export class NanocachedClient {
     checkKeyAndValue(keyBytes, valueBytes, namespace);
     const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
     return this.withWrongNodeRetry(() =>
-      this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.set(key, outgoing, ttlSeconds, namespace))
-        : this.writeToOwners(key, namespace, (connection) => connection.set(key, outgoing, ttlSeconds, namespace)),
+      this.target.kind === "cluster"
+        ? this.writeToOwners(key, namespace, (connection) => connection.set(key, outgoing, ttlSeconds, namespace))
+        : this.connectionForSingleTarget().then((connection) => connection.set(key, outgoing, ttlSeconds, namespace)),
     );
   }
 
@@ -856,9 +997,9 @@ export class NanocachedClient {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     return this.withWrongNodeRetry(() =>
-      this.target.kind === "single"
-        ? this.singleConnection().then((connection) => connection.delete(key, namespace))
-        : this.writeToOwners(key, namespace, (connection) => connection.delete(key, namespace)),
+      this.target.kind === "cluster"
+        ? this.writeToOwners(key, namespace, (connection) => connection.delete(key, namespace))
+        : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
     );
   }
 
@@ -1199,8 +1340,11 @@ export class NanocachedClient {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
 
-    if (this.target.kind === "single") {
-      const connection = await this.singleConnection();
+    // Single connection either way (plain node, or one proxy — issue
+    // #122): no fan-out, no retry-through-refresh — same as get/set/
+    // delete's own non-cluster branch above.
+    if (this.target.kind !== "cluster") {
+      const connection = await this.connectionForSingleTarget();
       await send(connection);
       return;
     }
@@ -1236,7 +1380,13 @@ export class NanocachedClient {
    * routed-to node, and discovery all disagreeing right after resyncing)
    * that retrying further would likely just mask a real problem, so that
    * error propagates. In single mode there's no discovery to refresh
-   * from, so `W` propagates immediately — see `WrongNodeError`. */
+   * from, so `W` propagates immediately — see `WrongNodeError`. Proxy
+   * mode (issue #122) *does* have discovery to fall back on — a
+   * connection-level failure there forces a `Q` re-fetch and a retry
+   * against whichever proxy that lands on, the same shape as the cluster
+   * case (`WrongNodeError` itself can't happen against a proxy, which
+   * never answers `W`, but the shared connection-error branch still
+   * applies). */
   private async withWrongNodeRetry<T>(operation: () => Promise<T>): Promise<T> {
     try {
       return await operation();
@@ -1247,7 +1397,7 @@ export class NanocachedClient {
       // for a dead primary is therefore bounded by discovery's liveness
       // timeout. A second failure after a fresh refresh propagates.
       const retryable = error instanceof WrongNodeError || isConnectionError(error);
-      if (!retryable || this.target.kind !== "cluster") throw error;
+      if (!retryable || this.target.kind === "single") throw error;
       await this.maybeRefreshNodeList({ force: true });
       return await operation();
     }
@@ -1255,23 +1405,32 @@ export class NanocachedClient {
 
   /** No-op in single mode. In cluster mode, re-fetches the node list from
    * discovery if it's older than NODE_LIST_STALE_AFTER_MS, or unconditionally
-   * when `force` is set (see withWrongNodeRetry). Concurrent callers that
-   * both need a refresh share one in-flight refresh (nodeListRefresh is set
-   * synchronously, before the first await, so a second caller arriving
-   * before the first refresh resolves sees it already set) rather than each
-   * starting their own — including a `force` call arriving while an
-   * ordinary staleness-triggered refresh is already in flight, which is
-   * still enough to satisfy it (either way, the node list ends up current). */
+   * when `force` is set (see withWrongNodeRetry). In proxy mode (issue
+   * #122) there's no periodic staleness check — a single proxy connection
+   * doesn't drift the way cluster membership does — so this is a no-op
+   * there too unless `force` is set, which only ever happens after the
+   * connected proxy has already died (`withWrongNodeRetry`). Concurrent
+   * callers that both need a refresh share one in-flight refresh
+   * (nodeListRefresh is set synchronously, before the first await, so a
+   * second caller arriving before the first refresh resolves sees it
+   * already set) rather than each starting their own — including a
+   * `force` call arriving while an ordinary staleness-triggered refresh is
+   * already in flight, which is still enough to satisfy it (either way,
+   * the node/proxy list ends up current). */
   private async maybeRefreshNodeList(options?: { force?: boolean }): Promise<void> {
-    if (this.target.kind !== "cluster") return;
-    if (!options?.force && Date.now() - this.lastNodeListFetch < NODE_LIST_STALE_AFTER_MS) return;
+    if (this.target.kind === "single") return;
+    if (this.target.kind === "proxy") {
+      if (!options?.force) return;
+    } else if (!options?.force && Date.now() - this.lastNodeListFetch < NODE_LIST_STALE_AFTER_MS) {
+      return;
+    }
 
     if (this.nodeListRefresh) {
       await this.nodeListRefresh;
       return;
     }
 
-    this.nodeListRefresh = this.refreshNodeList();
+    this.nodeListRefresh = this.target.kind === "proxy" ? this.refreshProxyTarget() : this.refreshNodeList();
     try {
       await this.nodeListRefresh;
     } finally {
@@ -1415,6 +1574,105 @@ export class NanocachedClient {
     return null;
   }
 
+  /** SDK proxy mode's counterpart to `fetchNodeList` (issue #122): walks
+   * every configured address for a fresh proxy roster via `Q` instead of
+   * `L`. Same "keep the last-known list, never throw" contract —
+   * unreachable, still warming up (`B`), no longer a discovery server, or
+   * registering zero proxies are all just reasons to try the next
+   * address, counted in stats().refreshFailures; an actual programming
+   * bug (isSwallowable) still propagates. */
+  private async fetchProxyList(): Promise<DiscoveredNode[] | null> {
+    for (const address of this.addresses) {
+      let result;
+      try {
+        result = await connectAndListProxies({ host: address.host, port: address.port, authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+      } catch (error) {
+        if (!isSwallowable(error)) throw error;
+        this.refreshFailures++;
+        continue;
+      }
+
+      if (result.kind !== "cluster") {
+        // A configured address stopped identifying as a discovery server
+        // — connect() is what hard-errors on this at bootstrap (issue
+        // #122); here it's just another reason this address can't serve
+        // the refresh, same as an unreachable one.
+        this.refreshFailures++;
+        continue;
+      }
+
+      if (result.proxies.length === 0) {
+        this.refreshFailures++;
+        continue;
+      }
+
+      return result.proxies;
+    }
+
+    return null;
+  }
+
+  /** Proxy mode's reconnect-on-loss (issue #122): only ever reached via a
+   * *forced* `maybeRefreshNodeList`, itself only triggered once
+   * `proxyConnection`'s own same-address redial has already failed (see
+   * `withWrongNodeRetry`) — so this always starts from "the connected
+   * proxy is confirmed unreachable, right now." Re-fetches the roster
+   * (`fetchProxyList`) and dials candidates in random order — the same
+   * random-spread/failover shape `connectViaProxy`'s bootstrap uses —
+   * until one connects, swapping it into `target`.
+   *
+   * Mirrors `refreshNodeList`'s failure contract: never throws to the
+   * caller (an actual programming bug still propagates), and when nothing
+   * reachable turns up, simply leaves `target` holding its already-dead
+   * connection — the retried operation's own `proxyConnection` call then
+   * redials that same (still dead) address once more and surfaces a real
+   * connection error, rather than this method hanging or manufacturing a
+   * misleading success. */
+  private async refreshProxyTarget(): Promise<void> {
+    if (this.target.kind !== "proxy") return;
+
+    const proxies = await this.fetchProxyList();
+    if (proxies === null) {
+      this.lastNodeListFetch = Date.now();
+      return;
+    }
+
+    for (const proxy of shuffled(proxies)) {
+      if (this.closed) return; // close() ran while we were dialing (issue #10-style race)
+
+      let identified;
+      try {
+        identified = await connectAndIdentify({ ...splitHostPort(proxy.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+      } catch (error) {
+        if (!isSwallowable(error)) throw error;
+        this.refreshFailures++;
+        continue;
+      }
+
+      if (identified.kind !== "node") {
+        // A listed proxy that no longer identifies as one — skip it like
+        // any other bad candidate, same as fetchProxyList's own handling
+        // of a stale address.
+        this.refreshFailures++;
+        continue;
+      }
+
+      if (this.closed) {
+        identified.socket.destroy();
+        return;
+      }
+
+      trackOpenTarget(this.url, [identified.socket]);
+      this.target = { kind: "proxy", connection: new Connection(identified.socket, identified.tagged), address: proxy.address };
+      this.nodeUrls = [proxy.address];
+      this.lastNodeListFetch = Date.now();
+      return;
+    }
+
+    // Every candidate was unreachable — see the doc comment above.
+    this.lastNodeListFetch = Date.now();
+  }
+
   /** The "ensure connected" path (issue #1) for a single-node target: if
    * the one connection has died since it was opened — most commonly the
    * server's 60s idle timeout — reconnect to the same node first.
@@ -1432,6 +1690,34 @@ export class NanocachedClient {
       this.target.connection = connection;
     }
     return connection;
+  }
+
+  /** The proxy-mode "ensure connected" path (issue #122): the same shape
+   * as `singleConnection` — redial first before doing anything more
+   * drastic, since the proxy may have simply restarted — except the
+   * address it redials is `target.address` rather than the fixed
+   * `this.url`: a `refreshProxyTarget` can have swapped it to a different
+   * proxy since the connection this call finds dead was opened. */
+  private async proxyConnection(): Promise<Connection> {
+    if (this.target.kind !== "proxy") {
+      throw new NanocachedError("nanocached: internal error — proxyConnection on a non-proxy target");
+    }
+    if (!this.target.connection.isClosed()) return this.target.connection;
+
+    const connection = await this.ensureConnected("", this.target.address);
+    if (this.target.kind === "proxy" && this.target.connection.isClosed()) {
+      this.target.connection = connection;
+    }
+    return connection;
+  }
+
+  /** Dispatches to whichever single-connection path applies —
+   * `singleConnection` for a plain node target, `proxyConnection` for a
+   * proxy one (issue #122) — so get/set/delete/clear's non-cluster branch
+   * doesn't need its own three-way `target.kind` check at every call
+   * site. Never called in cluster mode. */
+  private connectionForSingleTarget(): Promise<Connection> {
+    return this.target.kind === "proxy" ? this.proxyConnection() : this.singleConnection();
   }
 
   /** The cluster-mode "ensure connected" path: the named member's
@@ -1538,7 +1824,8 @@ export class NanocachedClient {
   private startKeepAlive(intervalMs: number): void {
     const timer = setInterval(() => {
       const connections =
-        this.target.kind === "single"
+        // "single" and "proxy" (issue #122) are both one bare connection.
+        this.target.kind !== "cluster"
           ? [this.target.connection]
           : [...this.target.members.values()]
               .map((member) => member.connection)

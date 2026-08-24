@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import ssl as ssl_module
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 from ._errors import AuthenticationError, DiscoveryBusyError, NanocachedError
 
@@ -66,6 +68,17 @@ class ClusterTarget:
     replication: int
 
 
+# Issue #122 (SDK proxy mode): the follow-up command a discovery
+# connection is asked once it has identified itself (`L` for the node
+# roster, `Q` for the proxy roster) parametrizes _connect_and_identify_*
+# below, so both share the handshake/tag-fallback machinery instead of
+# duplicating it.
+_DiscoveryResult = TypeVar("_DiscoveryResult")
+_FetchDiscovery = Callable[
+    [asyncio.StreamReader, asyncio.StreamWriter], Awaitable[_DiscoveryResult]
+]
+
+
 class _LegacyServerSignal(Exception):
     """Internal-only: raised when the extended `A ... T` auth attempt hit a
     connection-closed-shaped failure while reading the identify response —
@@ -93,14 +106,45 @@ async def connect_and_identify(
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
 ) -> NodeTarget | ClusterTarget:
+    return await _connect_and_identify_generic(host, port, auth_secret, ssl_context, _fetch_node_list)
+
+
+async def connect_and_identify_proxy(
+    host: str,
+    port: int,
+    auth_secret: bytes | None,
+    ssl_context: ssl_module.SSLContext | None,
+) -> NodeTarget | list[DiscoveredNode]:
+    """SDK proxy mode (issue #122): the ``Q`` counterpart of
+    connect_and_identify() — everything through the ``A`` handshake is
+    identical (a discovery address may still answer with a node
+    identity, handled by the caller exactly the same way), only the
+    follow-up command and response shape differ: ``Q``'s reply is `L`'s
+    entry shape with no replication field, since a proxy roster carries
+    no replication factor of its own (see nanocached-discovery.rs's
+    ``ListProxies`` handler)."""
+    return await _connect_and_identify_generic(host, port, auth_secret, ssl_context, _fetch_proxy_list)
+
+
+async def _connect_and_identify_generic(
+    host: str,
+    port: int,
+    auth_secret: bytes | None,
+    ssl_context: ssl_module.SSLContext | None,
+    fetch_discovery: _FetchDiscovery[_DiscoveryResult],
+) -> NodeTarget | _DiscoveryResult:
     try:
-        return await _connect_and_identify_with_deadline(host, port, auth_secret, ssl_context, request_tags=True)
+        return await _connect_and_identify_with_deadline(
+            host, port, auth_secret, ssl_context, request_tags=True, fetch_discovery=fetch_discovery
+        )
     except _LegacyServerSignal:
         # Echoed response tags transparent fallback: a pre-0019 server treats the
         # extended `A ... T` as a parse error and closes without replying
         # — redial once with the plain form and run the connection
         # untagged (the pre-0019 behavior, desync window included).
-        return await _connect_and_identify_with_deadline(host, port, auth_secret, ssl_context, request_tags=False)
+        return await _connect_and_identify_with_deadline(
+            host, port, auth_secret, ssl_context, request_tags=False, fetch_discovery=fetch_discovery
+        )
 
 
 async def _connect_and_identify_with_deadline(
@@ -109,10 +153,12 @@ async def _connect_and_identify_with_deadline(
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
     request_tags: bool,
-) -> NodeTarget | ClusterTarget:
+    fetch_discovery: _FetchDiscovery[_DiscoveryResult],
+) -> NodeTarget | _DiscoveryResult:
     try:
         return await asyncio.wait_for(
-            _connect_and_identify(host, port, auth_secret, ssl_context, request_tags), CONNECT_DEADLINE
+            _connect_and_identify(host, port, auth_secret, ssl_context, request_tags, fetch_discovery),
+            CONNECT_DEADLINE,
         )
     except TimeoutError as error:
         raise ConnectionError(
@@ -126,7 +172,8 @@ async def _connect_and_identify(
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
     request_tags: bool,
-) -> NodeTarget | ClusterTarget:
+    fetch_discovery: _FetchDiscovery[_DiscoveryResult],
+) -> NodeTarget | _DiscoveryResult:
     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
 
     try:
@@ -195,18 +242,43 @@ async def _connect_and_identify(
         if ack[1:2] == b"n":
             return NodeTarget(reader=reader, writer=writer, tagged=tagged)
 
-        # A discovery server: one-shot `L`, then this connection is done.
-        writer.write(b"L\n")
-        await writer.drain()
-        cluster = await _read_node_list(reader)
+        # A discovery server: one-shot follow-up command (`L` for a node
+        # roster, `Q` for a proxy roster — issue #122), then this
+        # connection is done.
+        result = await fetch_discovery(reader, writer)
         writer.close()
-        return cluster
+        return result
     except BaseException:
         writer.close()
         raise
 
 
-async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
+async def _fetch_node_list(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> ClusterTarget:
+    writer.write(b"L\n")
+    await writer.drain()
+    return await _read_node_list(reader)
+
+
+async def _fetch_proxy_list(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> list[DiscoveredNode]:
+    """SDK proxy mode (issue #122): the proxy-roster counterpart of
+    _fetch_node_list, sending `Q` instead of `L`."""
+    writer.write(b"Q\n")
+    await writer.drain()
+    return await _read_proxy_list(reader)
+
+
+async def _read_list_header(reader: asyncio.StreamReader, kind: str) -> bytes:
+    """Reads and validates the header line shared by `L`'s node-list
+    response and `Q`'s proxy-list response (issue #122) — both are `N
+    ...\\n`, `B\\n` (discovery HA's startup-grace refusal, handled
+    identically for both commands per the issue #122 spec), or garbage.
+    ``kind`` ("node-list" / "proxy-list") only ever appears in raised
+    error text. Leaves the caller to parse whatever comes after `N `,
+    which differs between the two (`L` carries a trailing replication
+    field, `Q` doesn't — see nanocached-discovery.rs's `ListProxies`
+    handler)."""
     try:
         header = await reader.readuntil(b"\n")
     except asyncio.LimitOverrunError as error:
@@ -218,14 +290,12 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         # silently", "refresh swallows failures") and escape raw to
         # callers instead (mirrors the TimeoutError wrapping above).
         raise NanocachedError(
-            "nanocached: invalid node-list header in discovery response (missing header terminator)"
+            f"nanocached: invalid {kind} header in discovery response (missing header terminator)"
         ) from error
     except asyncio.IncompleteReadError as error:
         # EOF before the terminator — an EOFError, not an OSError, so the
         # same escape hatch applies.
-        raise NanocachedError(
-            "nanocached: truncated node-list header in discovery response"
-        ) from error
+        raise NanocachedError(f"nanocached: truncated {kind} header in discovery response") from error
 
     if header.startswith(b"B"):
         raise DiscoveryBusyError()
@@ -233,6 +303,11 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         raise NanocachedError(
             f"nanocached: unexpected response from discovery server: {header[:-1]!r}"
         )
+    return header
+
+
+async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
+    header = await _read_list_header(reader, "node-list")
 
     # `N <count> <r>\n` (client-side replication) — the replication factor rides along.
     fields = header[2:-1].split(b" ")
@@ -251,28 +326,67 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
     if count < 0 or count > _MAX_NODE_COUNT:
         raise NanocachedError("nanocached: invalid node count in discovery response")
 
-    nodes: list[DiscoveredNode] = []
-    total_bytes = len(header)
+    nodes = await _read_entries(reader, count, len(header), "node")
+    return ClusterTarget(nodes=nodes, replication=replication)
+
+
+async def _read_proxy_list(reader: asyncio.StreamReader) -> list[DiscoveredNode]:
+    """SDK proxy mode (issue #122): `Q`'s response is `N <count>\\n` —
+    `L`'s header shape with no trailing replication field, since a
+    proxy roster carries no replication factor of its own — followed by
+    `count` entries in exactly `L`'s entry shape (see
+    nanocached-discovery.rs's `ListProxies` handler)."""
+    header = await _read_list_header(reader, "proxy-list")
+
+    fields = header[2:-1].split(b" ")
+    if len(fields) != 1:
+        raise NanocachedError("nanocached: invalid proxy-list header in discovery response")
+    try:
+        count = int(fields[0])
+    except ValueError as error:
+        raise NanocachedError("nanocached: invalid proxy-list header in discovery response") from error
+    if count < 0 or count > _MAX_NODE_COUNT:
+        raise NanocachedError("nanocached: invalid proxy count in discovery response")
+
+    return await _read_entries(reader, count, len(header), "proxy")
+
+
+async def _read_entries(
+    reader: asyncio.StreamReader, count: int, total_bytes: int, kind: str
+) -> list[DiscoveredNode]:
+    """The `<name-len> <addr-len>\\n<name><addr>\\n` entry loop shared by
+    `L`'s node-list response and `Q`'s proxy-list response (issue #122)
+    — identical shape either way, just consumed after a different header
+    (see _read_node_list / _read_proxy_list). ``total_bytes`` starts as
+    the header's own length, so the aggregate response-size cap
+    (_MAX_NODE_LIST_RESPONSE_LENGTH) is enforced across the whole
+    response, header included, regardless of which command produced it.
+    ``kind`` ("node" / "proxy") only ever appears in raised error text —
+    the returned DiscoveredNode shape (name, address) is the same for
+    both; a proxy has no replication or ring role of its own, but is
+    otherwise addressed exactly like a node once connected to (see
+    client.py's proxy-mode connect)."""
+    entries: list[DiscoveredNode] = []
     for _ in range(count):
         try:
             entry_header = await reader.readuntil(b"\n")
         except asyncio.LimitOverrunError as error:
             raise NanocachedError(
-                "nanocached: invalid node entry header in discovery response (missing header terminator)"
+                f"nanocached: invalid {kind} entry header in discovery response (missing header terminator)"
             ) from error
         except asyncio.IncompleteReadError as error:
             raise NanocachedError(
-                "nanocached: truncated node entry header in discovery response"
+                f"nanocached: truncated {kind} entry header in discovery response"
             ) from error
         total_bytes += len(entry_header)
         lengths = entry_header[:-1].split(b" ")
         if len(lengths) != 2:
-            raise NanocachedError("nanocached: invalid node entry header in discovery response")
+            raise NanocachedError(f"nanocached: invalid {kind} entry header in discovery response")
         try:
             name_length, addr_length = int(lengths[0]), int(lengths[1])
         except ValueError as error:
             raise NanocachedError(
-                "nanocached: invalid node entry header in discovery response"
+                f"nanocached: invalid {kind} entry header in discovery response"
             ) from error
         if (
             name_length < 0
@@ -280,7 +394,7 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
             or name_length > _MAX_NODE_FIELD_LENGTH
             or addr_length > _MAX_NODE_FIELD_LENGTH
         ):
-            raise NanocachedError("nanocached: invalid node entry lengths in discovery response")
+            raise NanocachedError(f"nanocached: invalid {kind} entry lengths in discovery response")
 
         total_bytes += name_length + addr_length + 1
         if total_bytes > _MAX_NODE_LIST_RESPONSE_LENGTH:
@@ -293,12 +407,12 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
             # IncompleteReadError is an EOFError, not an OSError, so left
             # unwrapped it would escape _SWALLOWABLE_ERRORS.
             raise NanocachedError(
-                "nanocached: truncated node entry in discovery response"
+                f"nanocached: truncated {kind} entry in discovery response"
             ) from error
         if body[-1:] != b"\n":
-            raise NanocachedError("nanocached: malformed node entry in discovery response")
+            raise NanocachedError(f"nanocached: malformed {kind} entry in discovery response")
         try:
-            nodes.append(
+            entries.append(
                 DiscoveredNode(
                     name=body[:name_length].decode("utf-8"),
                     address=body[name_length:-1].decode("utf-8"),
@@ -306,7 +420,7 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
             )
         except UnicodeDecodeError as error:
             raise NanocachedError(
-                "nanocached: malformed node entry in discovery response"
+                f"nanocached: malformed {kind} entry in discovery response"
             ) from error
 
-    return ClusterTarget(nodes=nodes, replication=replication)
+    return entries

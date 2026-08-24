@@ -99,8 +99,10 @@ export interface MockNode extends MockServerBase {
 
 export interface MockDiscovery extends MockServerBase {
   setNodes(nodes: Array<{ name: string; address: string }>): void;
-  /** While true, `L` answers `B\n` and closes — the discovery HA startup
-   * grace of a freshly restarted discovery server. */
+  /** While true, `L` and `Q` both answer `B\n` and close — the discovery
+   * HA startup grace of a freshly restarted discovery server (shared by
+   * both commands on the real server — see nanocached-discovery.rs's
+   * `ListProxies` handler). */
   setWarmingUp(warming: boolean): void;
   /** Queue a one-off `N` reply for the next `L` request whose header is
    * never terminated by an LF — streams chunks of non-newline bytes
@@ -110,6 +112,16 @@ export interface MockDiscovery extends MockServerBase {
   /** Total bytes written so far by the unterminated-list stream queued
    * with answerUnterminatedListOnce. */
   unterminatedListBytesSent(): number;
+  /** SDK proxy mode (issue #122): sets the roster `Q` serves — entirely
+   * separate from `setNodes`' node list, mirroring the real server's
+   * separate `proxies`/`nodes` registries. Callable mid-test to simulate
+   * a roster change (e.g. a proxy dying and being swept). */
+  setProxies(proxies: Array<{ name: string; address: string }>): void;
+  /** How many `L` requests this server has received — lets a test assert
+   * proxy mode never touches the node list at all (issue #122). */
+  listCount(): number;
+  /** How many `Q` requests this server has received (issue #122). */
+  listProxiesCount(): number;
 }
 
 /** A port with nothing listening on it — bound once to reserve a real
@@ -132,6 +144,17 @@ function listen(server: Server, port = 0): Promise<number> {
       }
       resolve(address.port);
     });
+  });
+}
+
+/** Encodes the `<name-length> <addr-length>\n<name><addr>\n` entries
+ * shared, byte-for-byte, by `L`'s node list and `Q`'s proxy roster (issue
+ * #122) — the two responses differ only in their header. */
+function encodeEntries(entries: Array<{ name: string; address: string }>): Buffer[] {
+  return entries.map(({ name, address }) => {
+    const nameBytes = Buffer.from(name, "utf8");
+    const addrBytes = Buffer.from(address, "utf8");
+    return Buffer.concat([Buffer.from(`${nameBytes.length} ${addrBytes.length}\n`), nameBytes, addrBytes, Buffer.from("\n")]);
   });
 }
 
@@ -530,9 +553,15 @@ export async function startMockDiscovery(
   options: { replication?: number } = {},
 ): Promise<MockDiscovery> {
   let nodes = initialNodes;
+  // SDK proxy mode (issue #122): entirely separate from `nodes`, matching
+  // the real server's separate registries — starts empty, since most
+  // existing (non-proxy) test suites never call setProxies.
+  let proxies: Array<{ name: string; address: string }> = [];
   let warmingUp = false;
   let unterminatedListReplies = 0;
   let unterminatedListBytesSent = 0;
+  let listCalls = 0;
+  let listProxiesCalls = 0;
   // Default 1 (no replication) so single-placement assertions in tests
   // stay exact; replication tests opt in explicitly. The real server
   // defaults to 2.
@@ -564,6 +593,7 @@ export async function startMockDiscovery(
 
           case "L": {
             buffer = buffer.subarray(bodyStart);
+            listCalls++;
 
             if (warmingUp) {
               socket.write("B\n");
@@ -589,17 +619,24 @@ export async function startMockDiscovery(
               return;
             }
 
-            const entries = nodes.map(({ name, address }) => {
-              const nameBytes = Buffer.from(name, "utf8");
-              const addrBytes = Buffer.from(address, "utf8");
-              return Buffer.concat([
-                Buffer.from(`${nameBytes.length} ${addrBytes.length}\n`),
-                nameBytes,
-                addrBytes,
-                Buffer.from("\n"),
-              ]);
-            });
-            socket.write(Buffer.concat([Buffer.from(`N ${nodes.length} ${replication}\n`), ...entries]));
+            socket.write(Buffer.concat([Buffer.from(`N ${nodes.length} ${replication}\n`), ...encodeEntries(nodes)]));
+            break;
+          }
+
+          case "Q": {
+            // SDK proxy mode (issue #122): same shape as `L` above, minus
+            // the trailing replication field a proxy client needs no R
+            // for, and served from the separate `proxies` roster.
+            buffer = buffer.subarray(bodyStart);
+            listProxiesCalls++;
+
+            if (warmingUp) {
+              socket.write("B\n");
+              socket.end();
+              return;
+            }
+
+            socket.write(Buffer.concat([Buffer.from(`N ${proxies.length}\n`), ...encodeEntries(proxies)]));
             break;
           }
 
@@ -627,6 +664,11 @@ export async function startMockDiscovery(
       unterminatedListReplies++;
     },
     unterminatedListBytesSent: () => unterminatedListBytesSent,
+    setProxies: (next) => {
+      proxies = next;
+    },
+    listCount: () => listCalls,
+    listProxiesCount: () => listProxiesCalls,
     close,
   };
 }

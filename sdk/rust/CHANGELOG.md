@@ -8,6 +8,28 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Added
 
+- SDK proxy mode (issue #122): `Options::via_proxy(true)` connects
+  through a `nanocached-proxy` tier instead of joining the cluster
+  directly. `addresses` must still name discovery server(s); `connect()`
+  fetches the proxy roster (the new `Q` discovery command — `N <count>\n`
+  then, per proxy, the same `<name-len> <addr-len>\n<name><addr>\n` shape
+  `L` uses, minus the replication field) rather than the node roster, and
+  lands on one proxy chosen at random, spreading a fleet of clients
+  across the proxy tier; on a failed dial it fails over through the rest
+  of the roster in random order. A proxy identifies itself on the wire
+  exactly like a single node that owns every key, so from there the
+  client runs in its existing single-connection mode: no ring, no
+  per-node connections, and `Options::read_hedge_after` is simply inert
+  if also set (there is nothing to hedge a read to). If the proxy
+  connection is lost, the same proxy is redialed first; only if that also
+  fails is the roster re-fetched and another, randomly chosen, reachable
+  proxy dialed — reusing this crate's existing reconnect plumbing and
+  `stats().refresh_failures` counter rather than a second one. Pointing
+  `via_proxy` at an address that identifies as a cache node fails
+  `connect()` fast with `Error::InvalidArgument`; an empty or wholly
+  unreachable proxy roster is a normal connect error. Off by default;
+  `close()` is unchanged.
+
 - Namespaces (issue #105): `client.namespace(ns)` returns a lightweight
   `Namespace` handle scoped to `ns` — a flat, opaque byte string. The
   same key name under two different namespaces (or under no namespace at

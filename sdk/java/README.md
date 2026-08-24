@@ -214,6 +214,47 @@ NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
         .reconnectCooldown(java.time.Duration.ofMillis(1000))); // default
 ```
 
+## SDK proxy mode (`viaProxy`)
+
+Off by default. `addresses` must name discovery server(s); enabling
+`viaProxy` connects through exactly one `nanocached-proxy` instead of
+joining the cluster ring:
+
+```java
+NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+        .addresses(List.of(new Address("discovery.internal", 8358)))
+        .viaProxy(true));
+```
+
+The client fetches the proxy roster from discovery and picks one proxy
+at random — spreading a client fleet across the whole proxy tier instead
+of piling everyone onto the first one — failing over to another proxy at
+random if the chosen one is unreachable. `connect()` fails fast, naming
+the address, if it turns out to be a cache node instead of a discovery
+server: proxy mode has nothing to fetch a roster from in that case. An
+empty roster (no proxy currently registered) is the SDK's normal connect
+error too.
+
+A proxy answers exactly like a single node that owns every key (full
+`get`/`set`/`delete`, namespaces, `clear`/`clearAll`, tags, keep-alive,
+and compression all work unchanged) — so from here on this client is in
+its existing single-connection mode. Two things follow from having only
+one connection and no ring view:
+
+- **No client-side replication.** There is nothing to fan a write out to
+  or read a fallback from — the proxy (and whatever's behind it) owns
+  that.
+- **`readHedgeAfter` is inert.** Hedging needs a second owner to send the
+  same read to; a single connection has none, so a configured hedge
+  interval simply never fires here (it is not rejected — it may still
+  apply to a different, non-proxy client sharing the same `Options`).
+
+On a lost connection, the client first retries the same proxy (it may
+simply have restarted); only if that also fails does it re-fetch the
+roster and pick another at random — reusing the same reconnect cooldown
+and counters as any other single-mode redial, not a second reconnect
+path. `close()` is unchanged.
+
 ## Authentication and TLS
 
 ```java

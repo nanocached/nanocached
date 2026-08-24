@@ -2914,3 +2914,228 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
     }
   });
 });
+
+describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
+  // A proxy is just a MockNode from the wire's point of view (see
+  // via-proxy-spec.md: "A proxy looks exactly like a single node that
+  // owns every key") — registered with the mock discovery's separate
+  // `setProxies` roster instead of `setNodes`.
+  function proxyAddressOf(client: NanocachedClient): string {
+    return (client as any).target.address;
+  }
+
+  it("routes every op to the proxy discovery hands back, and never touches the node list", async () => {
+    const [proxy, node] = await Promise.all([startMockNode(), startMockNode()]);
+    const discovery = await startMockDiscovery([{ name: "some-node", address: node.address }]);
+    discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        assert.equal(proxyAddressOf(client), proxy.address);
+
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+        assert.equal(await client.delete("k"), true);
+        await client.namespace("ns").set("nk", "nv");
+        assert.equal(await client.namespace("ns").get("nk"), "nv");
+        await client.clearAll();
+
+        // Never dialed the node list at all — proxy mode fetches `Q`,
+        // never `L`, and never opens a connection to a "node" address.
+        assert.equal(discovery.listCount(), 0);
+        assert.ok(discovery.listProxiesCount() >= 1);
+        assert.equal(node.connectionCount(), 0);
+        assert.equal(proxy.connectionCount(), 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxy.close(), node.close()]);
+    }
+  });
+
+  it("spreads a fleet of fresh clients across every registered proxy", async () => {
+    const [proxyA, proxyB] = await Promise.all([startMockNode(), startMockNode()]);
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([
+      { name: "proxy-a", address: proxyA.address },
+      { name: "proxy-b", address: proxyB.address },
+    ]);
+    try {
+      const clients = await Promise.all(
+        Array.from({ length: 20 }, () =>
+          NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }], viaProxy: true }),
+        ),
+      );
+      try {
+        assert.ok(proxyA.connectionCount() > 0, "proxy A was never picked");
+        assert.ok(proxyB.connectionCount() > 0, "proxy B was never picked");
+        assert.equal(proxyA.connectionCount() + proxyB.connectionCount(), 20);
+      } finally {
+        for (const client of clients) client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxyA.close(), proxyB.close()]);
+    }
+  });
+
+  it("fails over to the reachable proxy when the other one is down", async () => {
+    const live = await startMockNode();
+    const deadPort = await unusedPort();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([
+      { name: "proxy-dead", address: `127.0.0.1:${deadPort}` },
+      { name: "proxy-live", address: live.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        assert.equal(proxyAddressOf(client), live.address);
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), live.close()]);
+    }
+  });
+
+  it("falls through a discovery seed still in its startup grace to the next seed's Q", async () => {
+    const proxy = await startMockNode();
+    const [warming, healthy] = await Promise.all([startMockDiscovery([]), startMockDiscovery([])]);
+    warming.setWarmingUp(true);
+    healthy.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [
+          { host: "127.0.0.1", port: warming.port },
+          { host: "127.0.0.1", port: healthy.port },
+        ],
+        viaProxy: true,
+      });
+      try {
+        assert.equal(proxyAddressOf(client), proxy.address);
+        assert.equal(await client.get("missing"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([warming.close(), healthy.close(), proxy.close()]);
+    }
+  });
+
+  it("rejects connect with the dial error when every registered proxy is unreachable", async () => {
+    const [deadPortA, deadPortB] = await Promise.all([unusedPort(), unusedPort()]);
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([
+      { name: "proxy-a", address: `127.0.0.1:${deadPortA}` },
+      { name: "proxy-b", address: `127.0.0.1:${deadPortB}` },
+    ]);
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }], viaProxy: true }),
+        (error: unknown) => error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string",
+      );
+    } finally {
+      await discovery.close();
+    }
+  });
+
+  it("rejects connect with a clear error when no proxies are registered", async () => {
+    const discovery = await startMockDiscovery([]);
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }], viaProxy: true }),
+        /no proxies registered/,
+      );
+    } finally {
+      await discovery.close();
+    }
+  });
+
+  it("rejects connect with a clear error when viaProxy is pointed at a cache node", async () => {
+    const node = await startMockNode();
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }], viaProxy: true }),
+        /not a discovery server/,
+      );
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("reconnects by re-fetching Q and landing on the surviving proxy", async () => {
+    const [proxyA, proxyB] = await Promise.all([startMockNode(), startMockNode()]);
+    const byAddress = new Map([
+      [proxyA.address, proxyA],
+      [proxyB.address, proxyB],
+    ]);
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([
+      { name: "proxy-a", address: proxyA.address },
+      { name: "proxy-b", address: proxyB.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        await client.set("k", "v");
+
+        const landedAddress = proxyAddressOf(client);
+        const dead = byAddress.get(landedAddress)!;
+        const survivorAddress = landedAddress === proxyA.address ? proxyB.address : proxyA.address;
+        const survivor = byAddress.get(survivorAddress)!;
+
+        // Fully closing the dead proxy's server (not just dropping its
+        // connections) makes both the same-proxy redial and any stray
+        // dial during the Q-refresh fail fast, instead of hanging on a
+        // half-open TCP handshake.
+        await dead.close();
+        await waitFor(() => singleConnectionClosed(client), "the client to notice the dead proxy");
+
+        assert.equal(await client.get("k"), null);
+        assert.equal(proxyAddressOf(client), survivorAddress);
+        assert.ok(survivor.connectionCount() > 0);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxyA.close().catch(() => {}), proxyB.close().catch(() => {})]);
+    }
+  });
+
+  it("ignores readHedgeAfterMs — a proxy connection has no replicas to hedge to", async () => {
+    const proxy = await startMockNode();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+        readHedgeAfterMs: 10,
+      });
+      try {
+        await client.set("k", "v");
+        proxy.delayGets(50);
+        assert.equal(await client.get("k"), "v");
+        // A hedge would have sent a second G shortly after the first;
+        // exactly one reached the wire.
+        assert.equal(proxy.getCount(), 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxy.close()]);
+    }
+  });
+});

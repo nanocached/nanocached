@@ -146,6 +146,37 @@ public sealed class NanocachedClient : IDisposable
         /// <see cref="ReconnectCooldown"/> for what the cooldown is. Off
         /// by default.</summary>
         public bool DisableReconnectCooldown { get; set; }
+
+        /// <summary>SDK proxy mode (issue #122): route through one
+        /// <c>nanocached-proxy</c> — chosen at random from the fleet
+        /// discovery currently knows about, via its <c>Q</c> roster —
+        /// instead of connecting directly to every owner of a key. A
+        /// proxy looks exactly like a single node that owns every key
+        /// (full <c>G</c>/<c>S</c>/<c>D</c>, never <c>W</c>), so once
+        /// connected this client is in its ordinary single-connection
+        /// mode: no ring, no per-node connections, and no hedged reads —
+        /// there is nobody else to hedge to, so a configured
+        /// <see cref="ReadHedgeAfter"/> is accepted but inert under
+        /// <see cref="ViaProxy"/>. Namespaces, clear/clear-all, tags,
+        /// keep-alive, and compression all work unchanged over the one
+        /// connection.
+        ///
+        /// <para>Only meaningful when every configured
+        /// <see cref="Addresses"/> entry is a discovery server: if the
+        /// first reachable one instead identifies as a cache node — the
+        /// same identify handshake every other mode uses — <see cref="ConnectAsync(Options)"/>
+        /// fails fast with a clear error rather than silently pinning to
+        /// that node as non-proxy single mode would. An empty proxy
+        /// roster, or every listed proxy being unreachable, is the SDK's
+        /// ordinary connect error.</para>
+        ///
+        /// <para>On reconnect, the SDK first retries the same proxy (it
+        /// may simply have restarted); only when that also fails does it
+        /// re-fetch the roster from discovery and fail over to another
+        /// proxy chosen at random — reusing the same lazy
+        /// reconnect-on-use plumbing every other mode uses, not a second
+        /// mechanism. Off by default.</para></summary>
+        public bool ViaProxy { get; set; }
     }
 
     /// <summary>
@@ -252,6 +283,11 @@ public sealed class NanocachedClient : IDisposable
     private readonly int _compressionThreshold;
     private readonly bool _fireAndForgetReplicas;
     private readonly bool _readRepair;
+    // SDK proxy mode (issue #122): true routes _single through
+    // DialProxyWithFailoverAsync instead of the plain DialWithCooldownAsync
+    // every other single-connection client uses — see that method's doc
+    // comment for the retry-then-refetch reconnect flow this gates.
+    private readonly bool _viaProxy;
     // Resolved from Options.ReconnectCooldown/DisableReconnectCooldown:
     // null means disabled (Options.DisableReconnectCooldown was set); a
     // caller-specified TimeSpan.Zero resolves to DefaultReconnectCooldown
@@ -334,6 +370,7 @@ public sealed class NanocachedClient : IDisposable
         _compress = options.Compress;
         _compressionThreshold = options.CompressionThreshold;
         _fireAndForgetReplicas = options.FireAndForgetReplicas;
+        _viaProxy = options.ViaProxy;
         _backgroundReplicaPermitCount = MaxInFlightBackgroundReplicaWrites;
         _backgroundReplicaPermits = new SemaphoreSlim(_backgroundReplicaPermitCount, _backgroundReplicaPermitCount);
         _readRepair = options.ReadRepair;
@@ -455,7 +492,7 @@ public sealed class NanocachedClient : IDisposable
             try
             {
                 identified = await Identify
-                    .ConnectAndIdentifyAsync(host, port, client._authSecret, client._tls)
+                    .ConnectAndIdentifyAsync(host, port, client._authSecret, client._tls, options.ViaProxy)
                     .ConfigureAwait(false);
             }
             catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
@@ -468,6 +505,20 @@ public sealed class NanocachedClient : IDisposable
             {
                 switch (identified)
                 {
+                    // SDK proxy mode (issue #122): a configured address
+                    // that identifies as a plain cache node is a
+                    // configuration error, not a target to pin to the way
+                    // non-proxy mode's NodeTarget case below does — ViaProxy
+                    // only ever makes sense against discovery addresses.
+                    // Fatal (not "try the next address"): every other
+                    // configured address is presumably the same kind of
+                    // mistake.
+                    case Identify.NodeTarget node when options.ViaProxy:
+                        node.Stream.Dispose();
+                        throw new NanocachedException(
+                            $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
+                            + "identifies as a cache node");
+
                     case Identify.NodeTarget node:
                         if (client._addresses.Count > 1)
                         {
@@ -480,6 +531,21 @@ public sealed class NanocachedClient : IDisposable
                         client._targetKey = key;
                         client._single = client.NewConnection(node.Stream, node.Tagged);
                         client._singleAddress = key;
+                        client.StartKeepAlive();
+                        return client;
+
+                    // SDK proxy mode: an empty roster is exactly like an
+                    // empty node list above — try the next discovery
+                    // seed, another discovery replica may know of proxies
+                    // this one hasn't heard announced yet.
+                    case Identify.ProxyListTarget proxies when proxies.Proxies.Count == 0:
+                        lastError = new NanocachedException(
+                            $"nanocached: no proxies registered with discovery at {host}:{port}");
+                        continue;
+
+                    case Identify.ProxyListTarget proxies:
+                        client._targetKey = key;
+                        await client.OpenProxyAsync(proxies.Proxies).ConfigureAwait(false);
                         client.StartKeepAlive();
                         return client;
 
@@ -590,6 +656,68 @@ public sealed class NanocachedClient : IDisposable
 
         _ring = new HashRing(cluster.Nodes.Select(node => node.Name).ToList());
         _replication = cluster.Replication;
+    }
+
+    /// <summary>SDK proxy mode (issue #122): connects to exactly one of
+    /// <paramref name="proxies"/>, picked at random (spreads a fleet of
+    /// clients over the proxy fleet), failing over through the rest in
+    /// random order on a dial failure. Leaves the client in its ordinary
+    /// single-connection mode (<see cref="_ring"/> stays <c>null</c>) —
+    /// a proxy owns every key, so there is no ring to build. Throws the
+    /// last dial error when every proxy in the roster is unreachable,
+    /// exactly like <see cref="OpenClusterAsync"/> does when every node
+    /// is.</summary>
+    private async Task OpenProxyAsync(IReadOnlyList<DiscoveredNode> proxies)
+    {
+        (Connection connection, string address) =
+            await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
+        _single = connection;
+        _singleAddress = address;
+    }
+
+    /// <summary>Shared by the initial SDK proxy mode connect
+    /// (<see cref="OpenProxyAsync"/>) and reconnect failover
+    /// (<see cref="DialProxyWithFailoverAsync"/>) — reusing one
+    /// dial-and-pick routine rather than building it twice. Dials every
+    /// proxy in <paramref name="proxies"/>, in a fresh random order each
+    /// call (<see cref="ShuffleProxies"/>), and returns the first that
+    /// connects — the same <see cref="OpenNodeConnectionAsync"/> a
+    /// cluster node dial uses, since a proxy identifies exactly like one.
+    /// Throws the last dial error when none connect.</summary>
+    private async Task<(Connection Connection, string Address)> ConnectToAnyProxyAsync(
+        IReadOnlyList<DiscoveredNode> proxies)
+    {
+        Exception? lastError = null;
+        foreach (DiscoveredNode proxy in ShuffleProxies(proxies))
+        {
+            try
+            {
+                Connection connection = await OpenNodeConnectionAsync(proxy.Address).ConfigureAwait(false);
+                return (connection, proxy.Address);
+            }
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException)
+            {
+                lastError = error;
+            }
+        }
+        throw lastError ?? new ConnectionLostException("nanocached: no proxy is reachable");
+    }
+
+    /// <summary>Fisher-Yates over a copy of <paramref name="proxies"/> —
+    /// never mutates the roster the caller passed in.
+    /// <see cref="Random.Shared"/> is thread-safe, so this needs no
+    /// synchronization of its own even though several clients (or several
+    /// concurrent redials on this one client) may shuffle at once.</summary>
+    private static List<DiscoveredNode> ShuffleProxies(IReadOnlyList<DiscoveredNode> proxies)
+    {
+        var shuffled = proxies.ToList();
+        for (int i = shuffled.Count - 1; i > 0; i--)
+        {
+            int j = Random.Shared.Next(i + 1);
+            (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+        }
+        return shuffled;
     }
 
     // ── 公開 API ──────────────────────────────────────────────────
@@ -1534,7 +1662,12 @@ public sealed class NanocachedClient : IDisposable
             (_, address, current) = SnapshotSlot(slot);
             if (current is not null && !current.IsClosed) return current;
 
-            Connection fresh = await DialWithCooldownAsync(address).ConfigureAwait(false);
+            // SDK proxy mode (issue #122): the single connection's redial
+            // gets an extra fallback a cluster member's never needs — see
+            // DialProxyWithFailoverAsync's doc comment.
+            Connection fresh = slot is null && _viaProxy
+                ? await DialProxyWithFailoverAsync(address).ConfigureAwait(false)
+                : await DialWithCooldownAsync(address).ConfigureAwait(false);
             lock (_stateLock)
             {
                 if (slot is null)
@@ -1605,6 +1738,44 @@ public sealed class NanocachedClient : IDisposable
         if (_reconnectCooldown is TimeSpan resolvedCooldown)
         {
             _reconnectCooldowns[address] = (DateTime.UtcNow + resolvedCooldown, error);
+        }
+    }
+
+    /// <summary>SDK proxy mode (issue #122) reconnect: first retries
+    /// <paramref name="address"/> — the currently connected proxy, which
+    /// may simply have restarted — through the ordinary
+    /// <see cref="DialWithCooldownAsync"/> (same per-address cooldown as
+    /// every other redial). Only when that also fails does this re-fetch
+    /// the proxy roster from discovery (<see cref="FetchProxyListAsync"/>)
+    /// and fail over to another proxy chosen at random
+    /// (<see cref="ConnectToAnyProxyAsync"/> — the same dial-and-pick
+    /// <see cref="OpenProxyAsync"/>'s initial connect uses, not a second
+    /// mechanism). On success, <see cref="_singleAddress"/> is updated to
+    /// the winner so the *next* redial retries the new proxy first, same
+    /// as this one did. An empty roster is reported with a message naming
+    /// the situation, same wording as <see cref="ConnectAsync(Options)"/>'s
+    /// own empty-roster error; every proxy in a non-empty roster being
+    /// unreachable surfaces as the last dial error, same as any other
+    /// connect failure.</summary>
+    private async Task<Connection> DialProxyWithFailoverAsync(string address)
+    {
+        try
+        {
+            return await DialWithCooldownAsync(address).ConfigureAwait(false);
+        }
+        catch (NanocachedException sameProxyError)
+        {
+            IReadOnlyList<DiscoveredNode> proxies = await FetchProxyListAsync().ConfigureAwait(false);
+            if (proxies.Count == 0)
+            {
+                throw new ConnectionLostException(
+                    "nanocached: no proxies registered with discovery", sameProxyError);
+            }
+
+            (Connection connection, string newAddress) =
+                await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
+            lock (_stateLock) { _singleAddress = newAddress; }
+            return connection;
         }
     }
 
@@ -1777,6 +1948,55 @@ public sealed class NanocachedClient : IDisposable
             }
         }
         return null;
+    }
+
+    /// <summary>SDK proxy mode (issue #122): as <see cref="FetchNodeListAsync"/>,
+    /// but walks <see cref="_addresses"/> for a discovery server willing
+    /// to answer <c>Q</c> instead of <c>L</c>. Used by
+    /// <see cref="DialProxyWithFailoverAsync"/>'s reconnect fallback; the
+    /// initial connect fetches <c>Q</c> directly in
+    /// <see cref="ConnectAsync(Options)"/>'s own loop instead, since that
+    /// first fetch also needs the loop's own per-address bookkeeping
+    /// (<c>_targetKey</c>, the forgotten-close warning). Unlike
+    /// <see cref="FetchNodeListAsync"/>, an address that identifies as a
+    /// plain cache node is not skipped as merely uninteresting: it means
+    /// ViaProxy is pointed at the wrong kind of address, the same
+    /// configuration error <see cref="ConnectAsync(Options)"/> fails fast
+    /// on, so it is thrown here too rather than silently trying the next
+    /// address.</summary>
+    private async Task<IReadOnlyList<DiscoveredNode>> FetchProxyListAsync()
+    {
+        Exception? lastError = null;
+        foreach (var (host, port) in _addresses)
+        {
+            Identify.Result identified;
+            try
+            {
+                identified = await Identify
+                    .ConnectAndIdentifyAsync(host, port, _authSecret, _tls, viaProxy: true)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is NanocachedException or IOException or System.Net.Sockets.SocketException)
+            {
+                Interlocked.Increment(ref _refreshFailures);
+                lastError = error;
+                continue;
+            }
+
+            switch (identified)
+            {
+                case Identify.NodeTarget node:
+                    node.Stream.Dispose();
+                    throw new NanocachedException(
+                        $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
+                        + "identifies as a cache node");
+
+                case Identify.ProxyListTarget proxies:
+                    return proxies.Proxies;
+            }
+        }
+        throw lastError ?? new NanocachedException(
+            "nanocached: could not reach any discovery address for the proxy roster");
     }
 
     // ── keep-alive ────────────────────────────────────────────────

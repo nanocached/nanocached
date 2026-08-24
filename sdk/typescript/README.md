@@ -286,6 +286,42 @@ pairs only discovery serves), and any remaining addresses go unused; when
 several addresses were given, the client warns about this. Direct node
 targets are meant for development or deliberate single-node deployments.
 
+## SDK proxy mode (`viaProxy`)
+
+Instead of routing directly to the cluster, a client can connect through
+one `nanocached-proxy` — useful when the cluster's internal topology
+shouldn't be exposed to every client (a fan-in/fan-out point, or a network
+boundary discovery servers cross but individual nodes don't):
+
+```ts
+const client = await NanocachedClient.connect({
+  addresses: [{ host: "cache.internal", port: 8357 }], // discovery addresses
+  viaProxy: true,
+});
+```
+
+`addresses` must still point at discovery servers — `viaProxy` fetches the
+registered proxy roster from discovery (rather than the node list) and
+connects to one proxy chosen at random, spreading a fleet of clients across
+the available proxies; if the chosen proxy is unreachable, the client fails
+over through the rest of the roster in random order. If the first address
+reached turns out to be a cache node instead of a discovery server,
+`connect()` fails fast with a clear error, since proxy mode has no
+direct-node fallback.
+
+A proxy looks exactly like a single node that owns every key, so once
+connected the client is in the same single-connection mode a direct node
+address puts it in: no ring view, no per-node connections, and **no hedged
+reads** — `readHedgeAfterMs` is inert under `viaProxy`, since a proxy
+connection has no replicas to hedge to. Namespaces, `clear`/`clearAll`,
+tags, keep-alive, and compression all work unchanged over that one
+connection.
+
+On a connection loss, the client first retries the same proxy (it may have
+simply restarted); if that fails, it re-fetches the proxy roster and picks
+another at random, the same reconnect/refresh machinery cluster mode uses
+for the node list.
+
 ## Idle connections, reconnect, and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
@@ -311,9 +347,10 @@ a cluster with no reachable node at all fails `connect()`.
 ## API
 
 - `NanocachedClient.connect(options)` —
-  `options: { addresses, authSecret?, tls?, ca?, compress?, compressionThreshold?, fireAndForgetReplicas?, readRepair?, reconnectCooldownMs? }`
+  `options: { addresses, viaProxy?, authSecret?, tls?, ca?, compress?, compressionThreshold?, fireAndForgetReplicas?, readRepair?, readHedgeAfterMs?, reconnectCooldownMs? }`
   (`addresses` is a required, non-empty `NanocachedAddress[]`, each
-  `{ host, port }`)
+  `{ host, port }`; see [SDK proxy mode](#sdk-proxy-mode-viaproxy) for
+  `viaProxy`)
 - `client.get(key)` — resolves `string | null`, strictly decoded as UTF-8
   (rejects with a `TypeError` if the value isn't valid UTF-8)
 - `client.getBytes(key)` — resolves `Buffer | null`, the raw bytes

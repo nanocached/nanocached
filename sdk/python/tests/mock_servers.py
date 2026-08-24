@@ -1,10 +1,16 @@
 """In-process stand-ins for nanocached-node and nanocached-discovery,
 speaking just enough of the wire protocol (``A``, ``G``/``S``/``D`` and
 their namespaced ``g``/``s``/``d`` counterparts — issue #105 —
-``c``/``F`` to clear a namespace or flush everything — issue #106 — and
-``L``) for the client tests to exercise NanocachedClient end-to-end over
-real TCP sockets without the Rust binaries. Mirrors the TypeScript SDK's
-mocks."""
+``c``/``F`` to clear a namespace or flush everything — issue #106 —
+``L`` and, for SDK proxy mode (issue #122), ``Q``) for the client tests
+to exercise NanocachedClient end-to-end over real TCP sockets without the
+Rust binaries. Mirrors the TypeScript SDK's mocks.
+
+SDK proxy mode (issue #122): a mock "proxy" needs no dedicated class — a
+proxy looks exactly like a single node that owns every key, and that is
+literally what MockNode already is. MockDiscovery just gains a second
+roster (``proxies``, served by ``Q``) alongside its existing node roster
+(``nodes``, served by ``L``)."""
 
 from __future__ import annotations
 
@@ -412,14 +418,31 @@ class MockDiscovery:
         self,
         nodes: list[tuple[str, str]],
         replication: int = 1,
+        proxies: list[tuple[str, str]] | None = None,
     ) -> None:
         self.nodes = nodes
         self.replication = replication
+        # SDK proxy mode (issue #122): the roster `Q` serves, kept
+        # separate from `nodes` — a client in via_proxy mode must never
+        # be routed to (or even ask for) the node roster. `set_proxies`
+        # lets a test update it mid-run (a proxy dying/restarting).
+        self.proxies = list(proxies) if proxies else []
         self.warming_up = False
         self._unterminated_list_replies = 0
         self.unterminated_list_bytes_sent = 0
+        # Counts every `L`/`Q` this discovery receives, regardless of
+        # outcome (even a `B` refusal) — lets a test assert the node
+        # roster was never asked for in via_proxy mode, or vice versa.
+        self.list_count = 0
+        self.list_proxies_count = 0
         self._server: asyncio.Server | None = None
         self.port = 0
+
+    def set_proxies(self, proxies: list[tuple[str, str]]) -> None:
+        """Updates the roster `Q` serves from here on — for reconnect
+        tests that kill one proxy and need discovery to then hand back
+        only the survivor(s)."""
+        self.proxies = list(proxies)
 
     def answer_unterminated_list_once(self) -> None:
         """Reply `N` to the next L, then stream chunks of non-newline
@@ -456,6 +479,7 @@ class MockDiscovery:
                     writer.write(b"OdT\n" if len(parts) > 2 and parts[2] == b"T" else b"Od\n")
                     await writer.drain()
                 elif parts[0] == b"L":
+                    self.list_count += 1
                     if self.warming_up:
                         writer.write(b"B\n")
                         await writer.drain()
@@ -474,6 +498,21 @@ class MockDiscovery:
                         return
                     frame = b"N %d %d\n" % (len(self.nodes), self.replication)
                     for name, address in self.nodes:
+                        name_b, addr_b = name.encode(), address.encode()
+                        frame += b"%d %d\n%b%b\n" % (len(name_b), len(addr_b), name_b, addr_b)
+                    writer.write(frame)
+                    await writer.drain()
+                elif parts[0] == b"Q":
+                    # SDK proxy mode (issue #122): `L`'s entry shape with
+                    # no replication field — same startup-grace `B`
+                    # refusal, served from the separate `proxies` roster.
+                    self.list_proxies_count += 1
+                    if self.warming_up:
+                        writer.write(b"B\n")
+                        await writer.drain()
+                        return
+                    frame = b"N %d\n" % len(self.proxies)
+                    for name, address in self.proxies:
                         name_b, addr_b = name.encode(), address.encode()
                         frame += b"%d %d\n%b%b\n" % (len(name_b), len(addr_b), name_b, addr_b)
                     writer.write(frame)
