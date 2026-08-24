@@ -364,6 +364,49 @@ struct NodeContext {
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     request_tx: mpsc::Sender<CacheRequest>,
+    /// Issue #124: set for the whole decommission (drain-out handoff +
+    /// grace) — `leave_target_for` forwards concurrent writes through
+    /// it, the `M` handler rejects new joins while it is set, and
+    /// `/readyz` reports not-ready.
+    leaving: Arc<Mutex<Option<LeaveState>>>,
+}
+
+/// Issue #124: a decommission in progress. The mirror of
+/// `ActiveMigration`, but self-contained: the leaver computes, from the
+/// roster alone, which single node newly enters each of its keys' top-R
+/// once it is gone (removing a node from an HRW ranking can only
+/// promote the previous rank-R+1 node), and hands that node the entry —
+/// the surviving owners already hold their copies.
+struct LeaveState {
+    /// The roster including this node — what routing looked like when
+    /// the drain began.
+    before_ring: Arc<HashRing>,
+    /// The roster minus this node — where each key lives afterwards.
+    after_ring: Arc<HashRing>,
+    replication: usize,
+    /// name → address for every member, to dial entrants.
+    addresses: HashMap<String, String>,
+    /// One shared forwarding connection per entrant address, reused by
+    /// every concurrent write forwarded during the drain (mirrors
+    /// `ActiveMigration::forward_connection`).
+    connections: Mutex<HashMap<String, Arc<AsyncMutex<Option<ClientStream>>>>>,
+}
+
+impl LeaveState {
+    /// The node that newly enters `key`'s top-R when this node leaves —
+    /// `None` when this node wasn't an owner (nothing moves) or the
+    /// cluster is too small for a replacement (the survivors are all
+    /// owners already).
+    fn entrant_for(&self, key: &Key, self_name: &str) -> Option<String> {
+        if !self.before_ring.is_owner(key, self_name, self.replication) {
+            return None;
+        }
+        self.after_ring
+            .owners(key, self.replication)
+            .into_iter()
+            .find(|owner| !self.before_ring.is_owner(key, owner, self.replication))
+            .map(|owner| owner.to_string())
+    }
 }
 
 /// Configuration for registering this node with discovery servers (see
@@ -458,6 +501,7 @@ pub(crate) async fn run(
     tls_acceptor: Option<TlsAcceptor>,
     max_memory_bytes: usize,
     metrics_address: Option<String>,
+    drain_timeout: Duration,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
@@ -505,6 +549,7 @@ pub(crate) async fn run(
         auth_secret: config.auth_secret.clone(),
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
+        leaving: Arc::new(Mutex::new(None)),
     });
 
     // Issue #124: the operations sidecar — Prometheus-format /metrics
@@ -526,6 +571,18 @@ pub(crate) async fn run(
         None => None,
     };
 
+    // Issue #124: the decommission needs every discovery replica, and
+    // `heartbeat` is consumed by the task below — keep a copy.
+    let discovery_addrs_for_leave = heartbeat
+        .as_ref()
+        .map(|config| config.discovery_addrs.clone());
+
+    // Issue #124: heartbeats get their own stop signal, flipped either
+    // at normal shutdown or the moment a decommission begins — a
+    // heartbeat surviving past the leave would be answered as an
+    // unknown node and re-register, quietly re-joining the cluster the
+    // node just left.
+    let (heartbeat_stop_tx, heartbeat_stop_rx) = watch::channel(false);
     let heartbeat_task = match (heartbeat, &node_context) {
         (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
             config,
@@ -533,7 +590,7 @@ pub(crate) async fn run(
             node_context.token.clone(),
             Arc::clone(&known_ring),
             Arc::clone(&active_migration),
-            shutdown_rx.clone(),
+            heartbeat_stop_rx,
         ))),
         _ => None,
     };
@@ -548,20 +605,61 @@ pub(crate) async fn run(
         idle_timeout: IDLE_TIMEOUT,
         auth_secret,
         tls_acceptor,
-        node_context,
+        node_context: node_context.clone(),
         migration_tx,
     };
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
+    // Issue #124: set once the decommission has been spawned; its
+    // completion signal re-enters the loop below to run the ordinary
+    // shutdown. A second signal while draining falls through to the
+    // immediate path (operator override).
+    let mut decommission_started = false;
+    let (decommission_done_tx, mut decommission_done_rx) = watch::channel(false);
+
     loop {
         tokio::select! {
             biased;
 
-            result = &mut shutdown => {
+            result = &mut shutdown, if !decommission_started => {
                 result?;
+
+                // Issue #124: a clustered node with a drain budget
+                // decommissions first — hand entries to their post-leave
+                // owners, leave membership, then run this same shutdown.
+                // The accept loop keeps running throughout (serving and
+                // write-forwarding during the drain is the point), so
+                // the decommission is spawned and its completion loops
+                // back in via `decommission_done`.
+                if let (Some(node_context), Some(discovery_addrs), false) = (
+                    &node_context,
+                    &discovery_addrs_for_leave,
+                    decommission_started,
+                ) && !drain_timeout.is_zero()
+                {
+                    println!(
+                        "INFO shutdown signal received — decommissioning (budget {}s)",
+                        drain_timeout.as_secs()
+                    );
+                    decommission_started = true;
+                    // Stop heartbeating before anything else: a
+                    // heartbeat landing after the V would re-register
+                    // this node (see heartbeat_stop_tx above).
+                    heartbeat_stop_tx.send_replace(true);
+                    let node_context = node_context.clone();
+                    let discovery_addrs = discovery_addrs.clone();
+                    let done = decommission_done_tx.clone();
+                    tokio::spawn(async move {
+                        run_decommission(node_context, discovery_addrs, drain_timeout).await;
+                        let _ = done.send(true);
+                    });
+                    continue;
+                }
+
                 println!("INFO shutdown signal received");
+                heartbeat_stop_tx.send_replace(true);
                 shutdown_tx.send_replace(true);
 
                 // `run_migration` doesn't watch `shutdown_rx` itself (it's
@@ -582,6 +680,20 @@ pub(crate) async fn run(
                     migration.abort_requested.store(true, Ordering::SeqCst);
                 }
 
+                break;
+            }
+
+            _ = decommission_done_rx.changed(), if decommission_started => {
+                println!("INFO decommission finished — shutting down");
+                heartbeat_stop_tx.send_replace(true);
+                shutdown_tx.send_replace(true);
+                if let Some(migration) = active_migration
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                {
+                    migration.abort_requested.store(true, Ordering::SeqCst);
+                }
                 break;
             }
 
@@ -677,6 +789,10 @@ pub(crate) async fn run(
     // waits on a sender only `run`'s own return would drop, and `run` can't
     // return until `cache_task` resolves.
     drop(connection_config);
+    // Same deadlock, second holder (issue #124): `connection_config` now
+    // only *clones* the context (the decommission path needs its own
+    // copy), so the original binding still holds a `request_tx` here.
+    drop(node_context);
 
     cache_task
         .await
@@ -1344,6 +1460,20 @@ async fn handle_connection(
                     ));
                 };
 
+                // Issue #124: a decommissioning node must not take on a
+                // new join handoff — its own drain-out is moving the
+                // very entries a join would want it to send. Rejecting
+                // lets discovery's retry land once this node has left.
+                if node_context
+                    .leaving
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some()
+                {
+                    write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
+                    continue;
+                }
+
                 // The shared secret proves only "cluster member" (shared-secret authentication),
                 // not "the discovery server" — so without this every client
                 // holding it could send `M` and make this node stream its
@@ -1570,6 +1700,58 @@ async fn handle_connection(
                         .await;
                 }
 
+                // Issue #124: mirror for a decommission in flight — the
+                // key's post-leave entrant must see this write too.
+                if let Some(node_context) = &config.node_context
+                    && let Some(target) = leave_target_for(node_context, &key)
+                {
+                    let _ = config
+                        .migration_tx
+                        .send(Box::pin(forward_with_retries(
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Set {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                            },
+                        )))
+                        .await;
+                }
+
+                continue;
+            }
+            Ok((Command::HandoffSet { key, value, ttl }, tag)) => {
+                // Issue #124: a decommissioning peer handing this node an
+                // entry it is about to own — stored without the
+                // wrong-node check (ownership becomes true when the
+                // post-leave roster publishes, deliberately after this).
+                let response = execute_command(
+                    &request_tx,
+                    Command::HandoffSet {
+                        key: key.clone(),
+                        value: value.clone(),
+                        ttl,
+                    },
+                )
+                .await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                // If this node is itself mid-join-handoff for the key,
+                // propagate like any other write.
+                if let Some(node_context) = &config.node_context
+                    && let Some(target) = migration_target_for(node_context, &key)
+                {
+                    let _ = config
+                        .migration_tx
+                        .send(Box::pin(forward_with_retries(
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Set { key, value, ttl },
+                        )))
+                        .await;
+                }
+
                 continue;
             }
             Ok((Command::Delete { key }, tag)) => {
@@ -1587,6 +1769,20 @@ async fn handle_connection(
 
                 if let Some(node_context) = &config.node_context
                     && let Some(target) = migration_target_for(node_context, &key)
+                {
+                    let _ = config
+                        .migration_tx
+                        .send(Box::pin(forward_with_retries(
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Delete { key: key.clone() },
+                        )))
+                        .await;
+                }
+
+                // Issue #124: see the `S` arm's decommission mirror.
+                if let Some(node_context) = &config.node_context
+                    && let Some(target) = leave_target_for(node_context, &key)
                 {
                     let _ = config
                         .migration_tx
@@ -3148,6 +3344,402 @@ async fn drain_pending_clears(
     true
 }
 
+/// Issue #124: the whole decommission, run on SIGTERM (see `run`'s
+/// signal arm). Self-contained by design: removing one node from an HRW
+/// ranking can only promote the previous rank-R+1 node into each key's
+/// top-R, so the leaver alone can compute every key's single new owner
+/// and hand the entry over — the surviving owners already hold theirs.
+/// Sequence:
+///
+/// 1. Ask any in-flight join handoff to abort (its marks roll back;
+///    discovery retries the join after this node is gone) and wait
+///    briefly for the slot to clear.
+/// 2. Fetch the roster (`L`) — names AND addresses; `known_ring` holds
+///    only names — and install `LeaveState`, which (a) starts
+///    forwarding concurrent writes to each key's entrant and (b) makes
+///    the `M` handler reject new joins.
+/// 3. Transfer: for every held key this node owns, re-peek the live
+///    value and send it to the key's entrant via `U` (the handoff
+///    store: the receiver isn't the owner *yet*, so a plain `S` would
+///    be answered `W`).
+/// 4. Tell every discovery replica this node is leaving (`V`): the
+///    post-leave roster publishes, clients' `W`-refresh routes them to
+///    the entrants — which now hold the data.
+/// 5. A short forwarding grace (bounded by what's left of the drain
+///    budget), then return; the caller runs the ordinary shutdown.
+///
+/// The whole run is budgeted by `--drain-timeout`: if the budget runs
+/// out mid-transfer this logs what was left behind and still sends `V`
+/// (the process is exiting either way; clean membership beats a
+/// liveness-timeout ghost), degrading to today's crash semantics for
+/// the untransferred remainder.
+async fn run_decommission(
+    node_context: NodeContext,
+    discovery_addrs: Vec<String>,
+    drain_budget: Duration,
+) {
+    let deadline = Instant::now() + drain_budget;
+
+    // 1. No new joins (the flag isn't set yet, so flip abort first) and
+    // wind down the active one.
+    if let Some(active) = node_context
+        .active_migration
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        active.abort_requested.store(true, Ordering::SeqCst);
+    }
+    for _ in 0..50 {
+        let busy = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|active| active.completed_at.is_none());
+        if !busy || Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // 2. Roster with addresses.
+    let roster = match fetch_roster_for_leave(&node_context, &discovery_addrs).await {
+        Ok(roster) => roster,
+        Err(error) => {
+            eprintln!(
+                "WARN decommission: fetching the roster failed ({error}); leaving without a \
+                 handoff"
+            );
+            send_leave(&node_context, &discovery_addrs).await;
+            return;
+        }
+    };
+    let (members, replication) = roster;
+    let self_name = node_context.name.clone();
+    if !members.iter().any(|(name, _)| *name == self_name) {
+        // Not a member (already expired, or never joined): nothing to
+        // hand off.
+        send_leave(&node_context, &discovery_addrs).await;
+        return;
+    }
+    let survivors: Vec<(String, String)> = members
+        .iter()
+        .filter(|(name, _)| *name != self_name)
+        .cloned()
+        .collect();
+    if survivors.is_empty() {
+        println!("INFO decommission: last member — nothing to hand off");
+        send_leave(&node_context, &discovery_addrs).await;
+        return;
+    }
+
+    let before_ring = Arc::new(HashRing::new(
+        members.iter().map(|(name, _)| name.clone()).collect(),
+    ));
+    let after_ring = Arc::new(HashRing::new(
+        survivors.iter().map(|(name, _)| name.clone()).collect(),
+    ));
+    let addresses: HashMap<String, String> = members.iter().cloned().collect();
+
+    *node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(LeaveState {
+        before_ring: Arc::clone(&before_ring),
+        after_ring: Arc::clone(&after_ring),
+        replication,
+        addresses: addresses.clone(),
+        connections: Mutex::new(HashMap::new()),
+    });
+
+    // 3. Transfer.
+    let Some(keys) = list_keys(&node_context.request_tx).await else {
+        eprintln!("WARN decommission: cache task unavailable; leaving without a handoff");
+        send_leave(&node_context, &discovery_addrs).await;
+        return;
+    };
+    let mut streams: HashMap<String, ClientStream> = HashMap::new();
+    let mut sent = 0usize;
+    let mut left_behind = 0usize;
+
+    for key in keys {
+        if Instant::now() >= deadline {
+            left_behind += 1;
+            continue;
+        }
+        if !before_ring.is_owner(&key, &self_name, replication) {
+            continue;
+        }
+        let Some(entrant) = after_ring
+            .owners(&key, replication)
+            .into_iter()
+            .find(|owner| !before_ring.is_owner(&key, owner, replication))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(addr) = addresses.get(&entrant) else {
+            continue;
+        };
+
+        // Live re-peek, same reasoning as the join transfer: a client
+        // write racing this key's turn must win.
+        let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
+            continue;
+        };
+
+        let mut delivered = false;
+        for _ in 0..KEY_TRANSFER_ATTEMPTS {
+            if !streams.contains_key(addr) {
+                match connect_and_authenticate(&node_context, addr).await {
+                    Ok(stream) => {
+                        streams.insert(addr.clone(), stream);
+                    }
+                    Err(error) => {
+                        eprintln!("WARN decommission: connecting to {addr} failed: {error}");
+                        continue;
+                    }
+                }
+            }
+            let Some(stream) = streams.get_mut(addr) else {
+                continue;
+            };
+            match send_handoff_set(stream, &key, &value, ttl).await {
+                Ok(()) => {
+                    delivered = true;
+                    break;
+                }
+                Err(error) => {
+                    eprintln!("WARN decommission: transfer to {addr} failed: {error}");
+                    streams.remove(addr);
+                }
+            }
+        }
+        if delivered {
+            sent += 1;
+        } else {
+            left_behind += 1;
+        }
+    }
+
+    if left_behind > 0 {
+        eprintln!(
+            "WARN decommission: {left_behind} entr(ies) could not be handed off within the \
+             drain budget — the surviving replicas (R={replication}) are their only copies now"
+        );
+    }
+    println!("INFO decommission: handed off {sent} entr(ies)");
+
+    // 4. Leave.
+    send_leave(&node_context, &discovery_addrs).await;
+
+    // 5. Grace: keep forwarding concurrent writes while clients refresh
+    // onto the post-leave roster.
+    let grace = forwarding_grace(sent).min(deadline.saturating_duration_since(Instant::now()));
+    println!(
+        "INFO decommission: forwarding window open for {}s",
+        grace.as_secs()
+    );
+    sleep(grace).await;
+}
+
+/// `V <name-len> <token-len>` to every discovery replica — membership
+/// removal is immediate on each replica that hears it (they don't
+/// gossip); one refusing/unreachable replica only means that replica
+/// serves this node until its liveness timeout.
+async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
+    for addr in discovery_addrs {
+        let result = timeout(OUTBOUND_IO_TIMEOUT, async {
+            let mut stream = connect_and_authenticate(node_context, addr).await?;
+            let mut frame = format!(
+                "V {} {}\n",
+                node_context.name.len(),
+                node_context.token.len()
+            )
+            .into_bytes();
+            frame.extend_from_slice(node_context.name.as_bytes());
+            frame.extend_from_slice(node_context.token.as_bytes());
+            stream.write_all(&frame).await?;
+            let mut ack = [0u8; 2];
+            stream.read_exact(&mut ack).await?;
+            if &ack != b"R\n" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "discovery did not acknowledge the leave",
+                ));
+            }
+            io::Result::Ok(())
+        })
+        .await
+        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, "leave timed out")));
+
+        if let Err(error) = result {
+            eprintln!("WARN decommission: leave notification to {addr} failed: {error}");
+        }
+    }
+}
+
+/// The `U` frame (issue #124) — `set_message`'s shape with the handoff
+/// letter and the namespace length always present.
+fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
+    let mut header = format!(
+        "U {} {} {}",
+        key.namespace.len(),
+        key.name.len(),
+        value.len()
+    );
+    if let Some(ttl) = ttl {
+        header.push_str(&format!(" {}", ttl.as_secs()));
+    }
+    header.push('\n');
+    let mut message = header.into_bytes();
+    message.extend_from_slice(&key.namespace);
+    message.extend_from_slice(&key.name);
+    message.extend_from_slice(value);
+    message
+}
+
+async fn send_handoff_set(
+    stream: &mut ClientStream,
+    key: &Key,
+    value: &[u8],
+    ttl: Option<Duration>,
+) -> io::Result<()> {
+    timeout(OUTBOUND_IO_TIMEOUT, async {
+        stream.write_all(&handoff_message(key, value, ttl)).await?;
+        let mut ack = [0u8; 2];
+        stream.read_exact(&mut ack).await?;
+        if &ack != b"S\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "peer did not acknowledge the handed-off entry",
+            ));
+        }
+        io::Result::Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handoff transfer timed out"))?
+}
+
+/// Issue #124: an `L` fetch for the decommission — `known_ring` holds
+/// names only, and the drain needs addresses to dial entrants. Bounded
+/// parse mirroring the SDKs'/harness's.
+async fn fetch_roster_for_leave(
+    node_context: &NodeContext,
+    discovery_addrs: &[String],
+) -> io::Result<(Vec<(String, String)>, usize)> {
+    let mut last_error = io::Error::other("no discovery replicas configured");
+
+    for addr in discovery_addrs {
+        match timeout(OUTBOUND_IO_TIMEOUT, fetch_roster_once(node_context, addr)).await {
+            Ok(Ok(roster)) => return Ok(roster),
+            Ok(Err(error)) => last_error = error,
+            Err(_) => {
+                last_error = io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("L fetch from {addr} timed out"),
+                )
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
+async fn fetch_roster_once(
+    node_context: &NodeContext,
+    addr: &str,
+) -> io::Result<(Vec<(String, String)>, usize)> {
+    const MAX_ROSTER_ENTRIES: usize = 4096;
+    const MAX_NAME_OR_ADDR_LENGTH: usize = 1024;
+
+    let mut stream = connect_and_authenticate(node_context, addr).await?;
+    stream.write_all(b"L\n").await?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let read_line = |buf: &mut Vec<u8>| -> Option<String> {
+        let position = buf.iter().position(|byte| *byte == b'\n')?;
+        let line: Vec<u8> = buf.drain(..=position).collect();
+        Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned())
+    };
+
+    macro_rules! next_line {
+        () => {{
+            loop {
+                if let Some(line) = read_line(&mut buf) {
+                    break line;
+                }
+                let bytes_read = stream.read(&mut chunk).await?;
+                if bytes_read == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "discovery closed mid-response",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..bytes_read]);
+            }
+        }};
+    }
+
+    let header = next_line!();
+    if header == "B" {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "discovery is in its startup grace",
+        ));
+    }
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad L response");
+    let mut parts = header.strip_prefix("N ").ok_or_else(bad)?.split(' ');
+    let count: usize = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(bad)?;
+    let replication: usize = parts
+        .next()
+        .and_then(|part| part.parse().ok())
+        .ok_or_else(bad)?;
+    if count > MAX_ROSTER_ENTRIES || replication == 0 {
+        return Err(bad());
+    }
+
+    let mut members = Vec::with_capacity(count);
+    for _ in 0..count {
+        let entry_header = next_line!();
+        let mut parts = entry_header.split(' ');
+        let name_length: usize = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(bad)?;
+        let addr_length: usize = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(bad)?;
+        if name_length > MAX_NAME_OR_ADDR_LENGTH || addr_length > MAX_NAME_OR_ADDR_LENGTH {
+            return Err(bad());
+        }
+        // Body + trailing newline.
+        while buf.len() < name_length + addr_length + 1 {
+            let bytes_read = stream.read(&mut chunk).await?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "discovery closed mid-entry",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..bytes_read]);
+        }
+        let body: Vec<u8> = buf.drain(..name_length + addr_length + 1).collect();
+        members.push((
+            String::from_utf8_lossy(&body[..name_length]).into_owned(),
+            String::from_utf8_lossy(&body[name_length..name_length + addr_length]).into_owned(),
+        ));
+    }
+
+    Ok((members, replication))
+}
+
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
     let (response_tx, response_rx) = oneshot::channel();
 
@@ -3795,6 +4387,36 @@ fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<Forward
         })
 }
 
+/// Issue #124: if a decommission is in flight and this node owned
+/// `key`, returns the forward target for the node that newly enters the
+/// key's top-R once this node is gone — a concurrent client write must
+/// reach it, or the copy handed over by the drain-out transfer goes
+/// stale the moment discovery publishes the post-leave roster (the
+/// exact mirror of `migration_target_for`'s join-side reasoning).
+fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarget> {
+    let leaving = node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let leave = leaving.as_ref()?;
+    let entrant = leave.entrant_for(key, &node_context.name)?;
+    let addr = leave.addresses.get(&entrant)?.clone();
+
+    let connection = {
+        let mut connections = leave
+            .connections
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            connections
+                .entry(addr.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
+        )
+    };
+
+    Some(ForwardTarget { addr, connection })
+}
+
 /// Forwards a client's `D` for `key` to `target`, mirroring
 /// `set_on_joining_node` but for deletes — see `migration_target_for` and
 /// `ForwardTarget`. Accepts either `D\n` (the key was present there too)
@@ -4038,9 +4660,17 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
 
-        let error = run(&address, None, None, None, MAX_CACHE_MEMORY_BYTES, None)
-            .await
-            .unwrap_err();
+        let error = run(
+            &address,
+            None,
+            None,
+            None,
+            MAX_CACHE_MEMORY_BYTES,
+            None,
+            Duration::from_secs(25),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
     }
@@ -4157,6 +4787,7 @@ mod tests {
             auth_secret: Some(Bytes::from_static(b"shared-secret")),
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
         };
 
         let target = ForwardTarget {
@@ -4239,6 +4870,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
         };
 
         // Exactly what `migration_target_for` would hand every concurrent
@@ -4313,6 +4945,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
         });
         let target = Arc::new(ForwardTarget {
             addr: joining_addr,
@@ -4383,6 +5016,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
         };
 
         let target = ForwardTarget {
@@ -5300,6 +5934,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
         };
         let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
 
@@ -5450,6 +6085,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
         };
 
         let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
@@ -5517,6 +6153,302 @@ mod tests {
         drop(node_context);
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_set_bypasses_the_wrong_node_check() {
+        // Issue #124: a decommissioning peer's `U` must store even though
+        // this node doesn't own the key yet; a plain `S` for the same
+        // key answers `W`.
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        // A membership view where some other node owns everything.
+        let node_context = NodeContext {
+            name: "self".to_string(),
+            token: "tk-self".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::new(HashRing::new(vec!["other".to_string()])),
+                replication: 1,
+            })))),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+        };
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(b"S 4 5\nnameAliceU 0 4 5\nnameAliceG 4\nname")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        // S → W (not owner), U → S (stored anyway), G → W (reads still
+        // follow the routing discipline).
+        let expected = b"W\nS\nW\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn entrant_for_promotes_exactly_the_new_owner() {
+        // Issue #124: removing self from the ranking promotes exactly
+        // the pre-leave rank-R+1 node, for owned keys only.
+        let names = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ];
+        let before = Arc::new(HashRing::new(names.clone()));
+        let after = Arc::new(HashRing::new(
+            names
+                .iter()
+                .filter(|name| *name != "node-a")
+                .cloned()
+                .collect(),
+        ));
+        let leave = LeaveState {
+            before_ring: Arc::clone(&before),
+            after_ring: Arc::clone(&after),
+            replication: 2,
+            addresses: HashMap::new(),
+            connections: Mutex::new(HashMap::new()),
+        };
+
+        let mut promoted = 0;
+        for index in 0..200 {
+            let key = key(format!("key-{index}").as_bytes());
+            let owned = before.is_owner(&key, "node-a", 2);
+            match leave.entrant_for(&key, "node-a") {
+                Some(entrant) => {
+                    promoted += 1;
+                    assert!(owned, "entrant only exists for owned keys");
+                    // The entrant is a new owner and wasn't one before.
+                    assert!(after.is_owner(&key, &entrant, 2));
+                    assert!(!before.is_owner(&key, &entrant, 2));
+                }
+                None => assert!(!owned, "every owned key must have an entrant here"),
+            }
+        }
+        assert!(promoted > 0, "the sample must exercise owned keys");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decommission_hands_off_owned_keys_and_leaves() {
+        // Issue #124 end to end at the unit level: seed keys, run the
+        // decommission against a mock peer + mock discovery, and check
+        // every owned key arrives at the peer as a `U` and the leave
+        // (`V`) reaches discovery.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        for index in 0..20u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        // The peer records every frame (reusing the recording joiner —
+        // `U` is in its grammar below).
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        // Mock discovery: serves L (self + peer), records V.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let left: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let left_record = Arc::clone(&left);
+        let peer_addr_for_l = peer_addr.clone();
+        let discovery_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = discovery_listener.accept().await else {
+                    return;
+                };
+                let left_record = Arc::clone(&left_record);
+                let peer_addr = peer_addr_for_l.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if bytes_read == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..bytes_read]);
+                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
+                            continue;
+                        };
+                        let line: Vec<u8> = buf.drain(..=position).collect();
+                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        if line == "L" {
+                            let entries = [("leaver", "127.0.0.1:1"), ("peer", peer_addr.as_str())];
+                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                            for (name, addr) in entries {
+                                response.extend_from_slice(
+                                    format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
+                                        .as_bytes(),
+                                );
+                            }
+                            let _ = stream.write_all(&response).await;
+                        } else if line.starts_with("V ") {
+                            let lengths: Vec<usize> = line
+                                .split(' ')
+                                .skip(1)
+                                .map(|field| field.parse().unwrap())
+                                .collect();
+                            let need = lengths[0] + lengths[1];
+                            while buf.len() < need {
+                                let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                    return;
+                                };
+                                if bytes_read == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..bytes_read]);
+                            }
+                            let body: Vec<u8> = buf.drain(..need).collect();
+                            left_record
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&body[..lengths[0]]).into_owned());
+                            let _ = stream.write_all(b"R\n").await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+        };
+
+        // R=1 over {leaver, peer}: every key the leaver owns must move
+        // to the peer — the strongest (no-replica) case.
+        let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
+        let expected: usize = (0..20u8)
+            .filter(|index| before.is_owner(&key(format!("key-{index}").as_bytes()), "leaver", 1))
+            .count();
+        assert!(expected > 0, "the sample must give the leaver some keys");
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr.clone()],
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // Every owned key arrived as a `U` frame...
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), expected, "frames: {frames:?}");
+        assert!(frames.iter().all(|frame| frame.starts_with(b"U 0 ")));
+        // ...the leave reached discovery...
+        assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
+        // ...and the leave state is installed for write forwarding.
+        assert!(node_context.leaving.lock().unwrap().is_some());
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #124 helper: a fake surviving peer recording every `U`
+    /// frame it receives and acking `S`.
+    fn spawn_recording_peer(
+        listener: TcpListener,
+    ) -> (RecordedFrames, tokio::task::JoinHandle<()>) {
+        let frames: RecordedFrames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&frames);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut connection, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    loop {
+                        let Some(header_end) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let header = String::from_utf8(buf[..header_end].to_vec()).unwrap();
+                        let fields: Vec<usize> = header
+                            .split(' ')
+                            .skip(1)
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        assert!(header.starts_with("U "), "unexpected frame {header:?}");
+                        let body_length = fields[0] + fields[1] + fields[2];
+                        let frame_end = header_end + 1 + body_length;
+                        while buf.len() < frame_end {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        recorded
+                            .lock()
+                            .unwrap()
+                            .push(buf.split_to(frame_end).to_vec());
+                        let _ = connection.write_all(b"S\n").await;
+                    }
+                });
+            }
+        });
+        (frames, task)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5589,6 +6521,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
         };
 
         let joined = vec![
@@ -5770,6 +6703,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx,
+            leaving: Arc::new(Mutex::new(None)),
         };
         (node_context, after_ring, pre_completion_ring)
     }
@@ -5936,6 +6870,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx,
+            leaving: Arc::new(Mutex::new(None)),
         };
 
         *node_context.active_migration.lock().unwrap() = Some(ActiveMigration {
@@ -6140,6 +7075,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -6257,6 +7193,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -6379,6 +7316,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -6487,6 +7425,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -6645,6 +7584,7 @@ mod tests {
             auth_secret: None,
             tls_connector: None,
             request_tx,
+            leaving: Arc::new(Mutex::new(None)),
         };
         let mut stale = completed_forwarding_slot(&["dead"]);
         stale.completed_at = Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1));
@@ -6759,6 +7699,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -6907,6 +7848,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -7084,6 +8026,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },
@@ -7206,6 +8149,7 @@ mod tests {
                     auth_secret: None,
                     tls_connector: None,
                     request_tx: request_tx.clone(),
+                    leaving: Arc::new(Mutex::new(None)),
                 }),
                 migration_tx,
             },

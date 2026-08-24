@@ -65,6 +65,18 @@ pub enum Command {
     UnmarkMigrated {
         key: Key,
     },
+    /// `U <ns-len> <key-len> <val-len> [ttl] [tag]\n<ns><key><value>`
+    /// (issue #124, cluster-internal like `M`/`X`): a decommissioning
+    /// node handing one of its entries to the key's post-leave owner.
+    /// Executes exactly as `Set`; the difference is in the connection
+    /// handler, which skips the wrong-node check — the receiver becomes
+    /// this key's owner only once discovery publishes the post-leave
+    /// roster, which by design happens *after* the transfer.
+    HandoffSet {
+        key: Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+    },
     /// Internal-only (issue #124): the metrics endpoint's snapshot
     /// request — never produced by `parse()`, constructed by the metrics
     /// server task. Answered with `Response::Stats`.
@@ -140,7 +152,7 @@ impl Command {
                 Some(value) => Response::Value(value),
                 None => Response::NotFound,
             },
-            Self::Set { key, value, ttl } => {
+            Self::Set { key, value, ttl } | Self::HandoffSet { key, value, ttl } => {
                 match ttl {
                     Some(ttl) => cache.set_with_ttl(key, value, ttl),
                     None => cache.set(key, value),
@@ -394,8 +406,11 @@ fn parse_with_mode(
             Ok((Command::ClearAll, tag))
         }
 
-        b"S" | b"s" => {
-            let namespace_length = if command == b"s" {
+        b"S" | b"s" | b"U" => {
+            // Resolved before the body is consumed (`command` borrows the
+            // buffer) — same dance as `G`/`D`'s `is_get`.
+            let handoff = command == b"U";
+            let namespace_length = if command == b"s" || command == b"U" {
                 parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?
             } else {
                 0
@@ -463,7 +478,12 @@ fn parse_with_mode(
             );
             let value = frame.slice(key_end..value_end);
 
-            Ok((Command::Set { key, value, ttl }, tag))
+            let request = if handoff {
+                Command::HandoffSet { key, value, ttl }
+            } else {
+                Command::Set { key, value, ttl }
+            };
+            Ok((request, tag))
         }
 
         b"X" => {
