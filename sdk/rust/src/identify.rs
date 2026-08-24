@@ -2,9 +2,13 @@
 //! out from the server's own `A` response whether it reached a cache node
 //! (`On`) or a discovery server (`Od`) — the caller never says which it
 //! expects (the server type in the auth response). A node's stream is handed back live; a
-//! discovery connection is used once for `L` and dropped, returning the
-//! name/address list and the cluster's replication factor R
-//! (node identity, discovery HA, replication).
+//! discovery connection is used once for `L` (the node roster) or `Q`
+//! (the proxy roster — SDK proxy mode, issue #122; see
+//! `Options::via_proxy` in client.rs) and dropped, returning the
+//! name/address list — and, for `L` only, the cluster's replication
+//! factor R (node identity, discovery HA, replication). Which of the two
+//! a discovery connection is asked for is the caller's choice
+//! ([`DiscoveryQuery`]); a node identifies itself the same way regardless.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -23,7 +27,9 @@ const NO_SECRET_PLACEHOLDER: &[u8] = &[0];
 /// `MAX_VALUE_LENGTH` on the `V` path: a malicious or MITM'd discovery
 /// server must not be able to make the client pre-allocate (and
 /// `handle_alloc_error`-abort on) arbitrary memory from an unverified
-/// length prefix.
+/// length prefix. Shared verbatim by the proxy roster (`Q`, issue #122)
+/// — its entries have exactly the same shape as `L`'s, so the same caps
+/// apply.
 const MAX_NODE_COUNT: usize = 1 << 16;
 const MAX_NODE_FIELD_LENGTH: usize = 64 * 1024;
 
@@ -31,7 +37,9 @@ const MAX_NODE_FIELD_LENGTH: usize = 64 * 1024;
 /// unbounded in practice (`MAX_NODE_COUNT * 2 * MAX_NODE_FIELD_LENGTH` is
 /// ~8.5GB) — this caps the total, bounding a malicious discovery
 /// server's memory pressure on the client while comfortably fitting a
-/// full 65536-node registry of ordinary name/address lengths.
+/// full 65536-node registry of ordinary name/address lengths. Shared
+/// with the proxy roster (`Q`, issue #122) for the same reason as the
+/// two caps above.
 const MAX_NODE_LIST_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A node's hash-ring identity (a random per-process UUID) and its
@@ -214,6 +222,27 @@ pub(crate) enum Identified {
         nodes: Vec<DiscoveredNode>,
         replication: usize,
     },
+    /// A discovery server's answer to `Q` (SDK proxy mode, issue #122):
+    /// every proxy currently announced to it, name and address exactly
+    /// like a `DiscoveredNode`'s (a proxy has no separate identity concept
+    /// of its own worth modeling) — only ever returned when the caller
+    /// asked with [`DiscoveryQuery::Proxies`]. Unlike `Cluster`, carries
+    /// no replication factor: the wire response has no such field (a
+    /// proxy client fans nothing out itself).
+    Proxies { proxies: Vec<DiscoveredNode> },
+}
+
+/// Which roster a discovery connection is asked for once it identifies as
+/// `Od` — `L` (the node roster, normal cluster routing) or `Q` (the proxy
+/// roster, SDK proxy mode / issue #122, see `Options::via_proxy` in
+/// client.rs). Meaningless when the peer turns out to be a cache node
+/// (`On`): a node has no roster to fetch either way, so every call site
+/// that only ever expects to reach nodes (e.g. dialing an individual
+/// node's own address) still passes one, but it's never consulted.
+#[derive(Clone, Copy)]
+pub(crate) enum DiscoveryQuery {
+    Nodes,
+    Proxies,
 }
 
 /// Default bound on dial + handshake, matching the Go and Java SDKs.
@@ -228,8 +257,9 @@ pub(crate) async fn connect_and_identify(
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
     deadline: std::time::Duration,
+    query: DiscoveryQuery,
 ) -> Result<Identified> {
-    match run_identify_attempt(host, port, auth_secret, tls, deadline, true).await {
+    match run_identify_attempt(host, port, auth_secret, tls, deadline, true, query).await {
         Ok(identified) => Ok(identified),
         Err(AuthFailure::LegacyServer) => {
             // Echoed response tags transparent fallback: a pre-0019 server treats the
@@ -237,7 +267,7 @@ pub(crate) async fn connect_and_identify(
             // replying — redial once with the plain form and run the
             // connection untagged (the pre-0019 behavior, desync window
             // included).
-            run_identify_attempt(host, port, auth_secret, tls, deadline, false)
+            run_identify_attempt(host, port, auth_secret, tls, deadline, false, query)
                 .await
                 .map_err(AuthFailure::into_error)
         }
@@ -252,10 +282,11 @@ async fn run_identify_attempt(
     tls: Option<&TlsConfig>,
     deadline: std::time::Duration,
     request_tags: bool,
+    query: DiscoveryQuery,
 ) -> std::result::Result<Identified, AuthFailure> {
     match tokio::time::timeout(
         deadline,
-        do_connect_and_identify(host, port, auth_secret, tls, request_tags),
+        do_connect_and_identify(host, port, auth_secret, tls, request_tags, query),
     )
     .await
     {
@@ -311,6 +342,7 @@ async fn do_connect_and_identify(
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
     request_tags: bool,
+    query: DiscoveryQuery,
 ) -> std::result::Result<Identified, AuthFailure> {
     let stream = open(host, port, tls).await.map_err(AuthFailure::Other)?;
     let mut stream = BufReader::new(stream);
@@ -392,17 +424,32 @@ async fn do_connect_and_identify(
         });
     }
 
-    // A discovery server: one-shot `L`, then this connection is done.
-    // Tags have no meaning on a discovery connection (a single `L` and
-    // done), but the extended ack still had to be parsed above.
-    stream
-        .get_mut()
-        .write_all(b"L\n")
-        .await
-        .map_err(|error| AuthFailure::Other(error.into()))?;
-    read_node_list(&mut stream)
-        .await
-        .map_err(AuthFailure::Other)
+    // A discovery server: one-shot `L` or `Q` (per `query`), then this
+    // connection is done. Tags have no meaning on a discovery connection
+    // (a single request and done), but the extended ack still had to be
+    // parsed above.
+    match query {
+        DiscoveryQuery::Nodes => {
+            stream
+                .get_mut()
+                .write_all(b"L\n")
+                .await
+                .map_err(|error| AuthFailure::Other(error.into()))?;
+            read_node_list(&mut stream)
+                .await
+                .map_err(AuthFailure::Other)
+        }
+        DiscoveryQuery::Proxies => {
+            stream
+                .get_mut()
+                .write_all(b"Q\n")
+                .await
+                .map_err(|error| AuthFailure::Other(error.into()))?;
+            read_proxy_list(&mut stream)
+                .await
+                .map_err(AuthFailure::Other)
+        }
+    }
 }
 
 async fn open(host: &str, port: u16, tls: Option<&TlsConfig>) -> Result<Stream> {
@@ -497,6 +544,70 @@ async fn read_node_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
     Ok(Identified::Cluster { nodes, replication })
 }
 
+/// `Q`'s response (SDK proxy mode, issue #122): `N <count>\n` — unlike
+/// `L`'s header, no replication field, since a proxy client fans nothing
+/// out itself — then, per proxy, exactly `L`'s own entry shape
+/// (`<name-len> <addr-len>\n<name><addr>\n`). Bounded identically to
+/// `read_node_list` (`MAX_NODE_COUNT`/`MAX_NODE_FIELD_LENGTH`/
+/// `MAX_NODE_LIST_RESPONSE_BYTES`, shared with it) — see those constants'
+/// doc comments.
+async fn read_proxy_list(stream: &mut BufReader<Stream>) -> Result<Identified> {
+    let header = read_line_checked(stream).await?;
+
+    if header.starts_with('B') {
+        return Err(Error::DiscoveryBusy);
+    }
+    let Some(count) = header.strip_prefix("N ") else {
+        return Err(Error::Protocol(format!(
+            "nanocached: unexpected response from discovery server: {header}"
+        )));
+    };
+    let count: usize = count.parse().map_err(bad_header)?;
+    if count > MAX_NODE_COUNT {
+        return Err(bad_header(()));
+    }
+
+    let mut proxies = Vec::with_capacity(count.min(1024));
+    let mut total = 0usize;
+    for _ in 0..count {
+        let entry = read_line_checked(stream).await?;
+        total += entry.len();
+        let mut lengths = entry.split(' ');
+        let (name_length, addr_length) = match (lengths.next(), lengths.next(), lengths.next()) {
+            (Some(name), Some(addr), None) => (
+                name.parse::<usize>().map_err(bad_header)?,
+                addr.parse::<usize>().map_err(bad_header)?,
+            ),
+            _ => return Err(bad_header(())),
+        };
+        if name_length > MAX_NODE_FIELD_LENGTH || addr_length > MAX_NODE_FIELD_LENGTH {
+            return Err(bad_header(()));
+        }
+
+        let body_length = name_length + addr_length + 1; // +1: trailing '\n'
+        total += body_length;
+        if total > MAX_NODE_LIST_RESPONSE_BYTES {
+            return Err(Error::Protocol(format!(
+                "nanocached: discovery proxy-list response exceeds {MAX_NODE_LIST_RESPONSE_BYTES} bytes"
+            )));
+        }
+
+        let mut body = vec![0u8; body_length];
+        stream.read_exact(&mut body).await?;
+        if body.last() != Some(&b'\n') {
+            return Err(Error::Protocol(
+                "nanocached: malformed proxy entry in discovery response".to_string(),
+            ));
+        }
+        let name = String::from_utf8(body[..name_length].to_vec()).map_err(|_| bad_header(()))?;
+        let address = String::from_utf8(body[name_length..name_length + addr_length].to_vec())
+            .map_err(|_| bad_header(()))?;
+        proxies.push(DiscoveredNode { name, address });
+    }
+
+    Ok(Identified::Proxies { proxies })
+}
+
 fn bad_header<T>(_: T) -> Error {
     Error::Protocol("nanocached: invalid node-list frame in discovery response".to_string())
 }
@@ -547,6 +658,7 @@ mod tests {
             None,
             None,
             std::time::Duration::from_millis(100),
+            DiscoveryQuery::Nodes,
         )
         .await;
 
@@ -604,7 +716,15 @@ mod tests {
         // `Error::Authentication`, never `Error::Protocol` — it's a
         // well-formed, non-transient rejection, not a wire violation.
         let port = spawn_auth_rejecting_server().await;
-        let result = connect_and_identify("127.0.0.1", port, None, None, CONNECT_DEADLINE).await;
+        let result = connect_and_identify(
+            "127.0.0.1",
+            port,
+            None,
+            None,
+            CONNECT_DEADLINE,
+            DiscoveryQuery::Nodes,
+        )
+        .await;
         match result {
             Err(Error::Authentication(message)) => {
                 assert!(message.contains("requires authentication"), "{message:?}");
@@ -617,8 +737,15 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_secret_is_error_authentication_not_protocol() {
         let port = spawn_auth_rejecting_server().await;
-        let result =
-            connect_and_identify("127.0.0.1", port, Some(b"wrong"), None, CONNECT_DEADLINE).await;
+        let result = connect_and_identify(
+            "127.0.0.1",
+            port,
+            Some(b"wrong"),
+            None,
+            CONNECT_DEADLINE,
+            DiscoveryQuery::Nodes,
+        )
+        .await;
         match result {
             Err(Error::Authentication(message)) => {
                 assert!(message.contains("authentication failed"), "{message:?}");

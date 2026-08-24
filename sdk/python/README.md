@@ -61,6 +61,33 @@ raises `DiscoveryBusyError` — retry shortly.
 client = await NanocachedClient.connect([("10.0.0.1", 8357), ("10.0.0.2", 8357)])
 ```
 
+## Proxy mode
+
+`addresses` must still point at discovery server(s); `via_proxy=True` fetches
+the *proxy* roster from them instead of the node roster, and connects to one
+`nanocached-proxy` at random rather than opening a connection per node —
+useful for a client fleet that would otherwise open far more connections
+than the cluster needs:
+
+```python
+client = await NanocachedClient.connect(
+    [("10.0.0.1", 8357), ("10.0.0.2", 8357)],
+    via_proxy=True,
+)
+```
+
+A proxy looks like a single node that owns every key, so once connected this
+client is in its ordinary single-connection mode: no ring, no client-side
+replication, and `read_hedge_after` is inert — there are no replicas to
+hedge to, so it is simply ignored rather than rejected. Namespaces,
+clear/clear_all, tags, keep-alive and compression all work unchanged.
+Pointing `via_proxy` at an address that turns out to be a cache node (not a
+discovery server) fails `connect()` outright with a clear error; an empty
+proxy roster does the same. On reconnect, the SDK first retries the same
+proxy (it may just have restarted) and, only if that fails too, re-fetches
+the roster from discovery and picks another at random — the same
+`reconnect_cooldown` governs both.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so the
@@ -191,7 +218,8 @@ single copy there is nobody to hedge to. Writes are unaffected — every
 copy must be written, so a slow owner bounds writes to it regardless
 (`fire_and_forget_replicas` moves only the replica legs off the caller's
 path). The losing leg of a hedge is left to finish and is drained by
-`close()`.
+`close()`. Also inert with `via_proxy` (see Proxy mode) for the same
+reason — a proxy connection has no replicas of its own to hedge to either.
 
 ## Reconnect and keep-alive
 

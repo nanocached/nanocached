@@ -26,6 +26,14 @@
 // (issue #105: first-class namespaces). The namespace-less methods on
 // Client remain the default and are unaffected; namespace("") is
 // equivalent to using Client directly.
+//
+// Config.ViaProxy (issue #122) connects through a nanocached-proxy
+// fronting the cluster instead of joining the ring directly: Addresses
+// still names discovery server(s), but Connect fetches the registered
+// proxy roster and picks one at random rather than fetching the node
+// roster and building a ring, and the client then runs in its ordinary
+// single-connection mode for its whole lifetime — see Config.ViaProxy's
+// own doc comment for the full connect/reconnect/caveats story.
 package nanocached
 
 import (
@@ -33,6 +41,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"sort"
@@ -139,6 +148,27 @@ type Config struct {
 	// means "default") and its Options::disable_reconnect_cooldown()
 	// (the equivalent of a negative value here).
 	ReconnectCooldown time.Duration
+	// ViaProxy connects through a nanocached-proxy fronting the cluster
+	// instead of joining the ring directly (issue #122). Only meaningful
+	// when Addresses names discovery server(s): Connect fetches the
+	// registered proxy roster (`Q`, discovery's ListProxies command)
+	// instead of the node roster (`L`), and connects to one proxy chosen
+	// at random — spreading a fleet of clients across the proxy fleet —
+	// failing over through the rest, still in random order, if the first
+	// choice can't be reached. Pointing ViaProxy at a plain node address
+	// (the SDK's identify handshake tells the two apart) fails Connect
+	// with a clear error, since there is no roster to fetch from a node.
+	// A proxy answers the identify handshake exactly like a single node
+	// that owns every key, so from then on the client runs in its
+	// ordinary single-connection mode: no ring, no per-node connections,
+	// and — since a single connection has no replicas to hedge to — a
+	// configured ReadHedgeAfter is inert (every other option — Compress,
+	// FireAndForgetReplicas, ReadRepair, namespaces, clear/clear-all,
+	// keep-alive — is unaffected). Losing the proxy connection first
+	// retries the same proxy (it may simply have restarted); only if
+	// that also fails does the client re-fetch the roster and pick
+	// another at random. Off by default.
+	ViaProxy bool
 }
 
 // String implements fmt.Stringer, redacting AuthSecret so a Config never
@@ -152,9 +182,9 @@ func (c Config) String() string {
 	}
 	return fmt.Sprintf(
 		"Config{Addresses:%v AuthSecret:%s TLS:%v CA:%q Compress:%v CompressionThreshold:%d "+
-			"FireAndForgetReplicas:%v ReadRepair:%v ReadHedgeAfter:%v ReconnectCooldown:%v}",
+			"FireAndForgetReplicas:%v ReadRepair:%v ReadHedgeAfter:%v ReconnectCooldown:%v ViaProxy:%v}",
 		c.Addresses, secret, c.TLS, c.CA, c.Compress, c.CompressionThreshold,
-		c.FireAndForgetReplicas, c.ReadRepair, c.ReadHedgeAfter, c.ReconnectCooldown)
+		c.FireAndForgetReplicas, c.ReadRepair, c.ReadHedgeAfter, c.ReconnectCooldown, c.ViaProxy)
 }
 
 // GoString implements fmt.GoStringer so %#v also redacts AuthSecret —
@@ -328,11 +358,22 @@ type Client struct {
 
 	// targetKey is the address this client's connect() ultimately settled
 	// on — a node's own address in single mode, the winning discovery
-	// server's address in cluster mode. Every socket this client ever
-	// opens (initial connect, lazy reconnect, newly discovered members)
-	// is tracked in openTargets under this one key, mirroring the
-	// TypeScript SDK's `this.url`.
+	// server's address in cluster mode (and in proxy mode, issue #122:
+	// the discovery seed the proxy was fetched from, not the proxy's own
+	// address, which can change across a proxy failover). Every socket
+	// this client ever opens (initial connect, lazy reconnect, newly
+	// discovered members) is tracked in openTargets under this one key,
+	// mirroring the TypeScript SDK's `this.url`.
 	targetKey string
+
+	// viaProxy is Config.ViaProxy (issue #122): true means this client's
+	// single connection (see single/singleAddress below — proxy mode
+	// never populates ring/members, exactly like plain single-node mode)
+	// is to a nanocached-proxy discovered via discovery's `Q`, and a lost
+	// connection's reconnect should fail over to another proxy — chosen
+	// by re-fetching `Q` — rather than only ever retrying singleAddress.
+	// See connectViaProxy and dialSlot.
+	viaProxy bool
 
 	closed        bool
 	stopKeepalive chan struct{}
@@ -402,6 +443,10 @@ func Connect(config Config) (*Client, error) {
 		return nil, fmt.Errorf(
 			"nanocached: ReadHedgeAfter must not be negative, got %v", config.ReadHedgeAfter)
 	}
+	// ReadHedgeAfter isn't rejected alongside ViaProxy: it's merely inert
+	// there (see Config.ViaProxy's doc), not a misconfiguration — a
+	// caller that toggles ViaProxy per environment shouldn't also have to
+	// conditionally unset ReadHedgeAfter.
 
 	tlsConfig, err := buildTLSConfig(config)
 	if err != nil {
@@ -434,9 +479,26 @@ func Connect(config Config) (*Client, error) {
 		backgroundReplicaSem:  make(chan struct{}, maxInFlightBackgroundReplicaWrites),
 		readRepair:            config.ReadRepair,
 		readHedgeAfter:        config.ReadHedgeAfter,
+		viaProxy:              config.ViaProxy,
 	}
 	if config.AuthSecret != "" {
 		client.authSecret = []byte(config.AuthSecret)
+	}
+
+	if config.ViaProxy {
+		// Issue #122: an entirely separate connect flow — a `Q` roster
+		// fetch and a random pick among proxies, rather than `L` and
+		// ring construction — so it doesn't tangle with the node/cluster
+		// loop below. Ends in the same single-connection state
+		// Connect's plain single-node path does (client.single set,
+		// client.ring left nil), so every other method (Get/Set/Delete,
+		// keep-alive, Close) needs no proxy-mode awareness at all.
+		if err := client.connectViaProxy(); err != nil {
+			client.teardown()
+			return nil, err
+		}
+		client.startKeepalive(keepAliveInterval)
+		return client, nil
 	}
 
 	// Walk the addresses until one yields a working target; an address
@@ -608,6 +670,123 @@ func (c *Client) openCluster(result *identified) error {
 	c.ring = NewHashRing(names)
 	c.replication = result.replication
 	return nil
+}
+
+// ── プロキシモード (issue #122) ──────────────────────────────────────
+
+// connectViaProxy implements Config.ViaProxy's connect flow: reach a
+// discovery seed (the same seed-iteration and B/warming-up handling
+// Connect's node/cluster path uses), fetch the registered nanocached-proxy
+// roster (`Q`), and connect to one of them, chosen at random — spreading
+// a fleet of clients across the proxy fleet instead of every client
+// piling onto whichever proxy happens to be listed first. A discovery
+// seed that identifies a listed address as a plain node (not itself —
+// the seed is already known to be discovery by the time result.nodes is
+// populated) is a hard misconfiguration and fails Connect immediately
+// rather than falling through to the next seed, the same treatment
+// openCluster gives a non-node address in an `L` reply.
+func (c *Client) connectViaProxy() error {
+	var lastError error
+	for _, seed := range c.addresses {
+		key := seed.String()
+		result, err := connectAndIdentifyProxies(key, c.authSecret, c.tlsConfig)
+		if err != nil {
+			lastError = err
+			continue
+		}
+
+		if result.conn != nil {
+			// ViaProxy needs a discovery address, not a node's — unlike
+			// the plain single-node path (which happily pins to a lone
+			// node address), this is exactly the misconfiguration
+			// Config.ViaProxy's doc calls out, so fail fast instead of
+			// silently connecting to the wrong thing.
+			_ = result.conn.Close()
+			return fmt.Errorf(
+				"nanocached: ViaProxy requires a discovery server address, but %s identifies as "+
+					"a cache node", key)
+		}
+
+		if len(result.nodes) == 0 {
+			lastError = fmt.Errorf(
+				"nanocached: no proxies registered with the discovery server at %s", key)
+			continue
+		}
+
+		// targetKey is the discovery seed, not whichever proxy is chosen
+		// below — see its own doc comment: it must stay stable across a
+		// later proxy failover for the forgotten-close tracker to mean
+		// anything.
+		c.targetKey = key
+		conn, address, err := c.dialRandomProxy(result.nodes)
+		if err != nil {
+			return err
+		}
+		c.single = conn
+		c.singleAddress = address
+		return nil
+	}
+
+	if lastError == nil {
+		lastError = fmt.Errorf("nanocached: could not connect to any address")
+	}
+	return lastError
+}
+
+// dialRandomProxy connects to one of proxies, tried in a random order
+// (math/rand/v2's top-level functions are auto-seeded as of Go 1.22, so
+// no explicit seeding is needed) so that repeated Connect calls across a
+// client fleet spread themselves over every registered proxy rather than
+// converging on one. A dial failure fails over to the next candidate in
+// that same random order, exactly as the initial connect's own
+// seed-iteration does for discovery addresses; every candidate
+// unreachable (or, oddly, no longer identifying as a node/proxy) returns
+// the last such failure.
+func (c *Client) dialRandomProxy(proxies []discoveredNode) (conn *connection, address string, err error) {
+	var lastError error
+	for _, i := range rand.Perm(len(proxies)) {
+		candidate := proxies[i].Address
+		result, dialErr := connectAndIdentify(candidate, c.authSecret, c.tlsConfig)
+		if dialErr != nil {
+			lastError = dialErr
+			continue
+		}
+		if result.conn == nil {
+			// discovery's own ProxyAnnounce bookkeeping said this was a
+			// proxy; if it no longer identifies as one, treat it like any
+			// other unreachable candidate rather than erroring out
+			// early — another registered proxy may still be reachable.
+			lastError = fmt.Errorf("nanocached: %s no longer identifies as a proxy", candidate)
+			continue
+		}
+		return c.trackedConnection(result.conn, result.tagged), candidate, nil
+	}
+	if lastError == nil {
+		lastError = fmt.Errorf("nanocached: no proxies registered with discovery")
+	}
+	return nil, "", lastError
+}
+
+// fetchProxyList walks every configured discovery address (discovery HA)
+// for the registered-proxy roster (`Q`), mirroring fetchNodeList's own
+// address-walk exactly — ok=false just means none could be reached (or
+// identified as discovery, or listed any proxies) right now.
+func (c *Client) fetchProxyList() ([]discoveredNode, bool) {
+	for _, addr := range c.addresses {
+		result, err := connectAndIdentifyProxies(addr.String(), c.authSecret, c.tlsConfig)
+		if err != nil {
+			continue
+		}
+		if result.conn != nil {
+			_ = result.conn.Close()
+			continue
+		}
+		if len(result.nodes) == 0 {
+			continue
+		}
+		return result.nodes, true
+	}
+	return nil, false
 }
 
 // ── 公開 API ──────────────────────────────────────────────────────
@@ -1437,7 +1616,7 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 		return nil, cooldown.err
 	}
 
-	fresh, err := c.openNodeConnection(address)
+	fresh, dialedAddress, err := c.dialSlot(slot, address)
 	if err != nil {
 		if c.reconnectCooldown > 0 {
 			c.redialCooldownMu.Lock()
@@ -1460,6 +1639,11 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 	}
 	if slot == "" {
 		c.single = fresh
+		// In proxy mode dialedAddress may differ from address — a
+		// failover to another proxy (see dialSlot) — so this must be
+		// re-recorded, not just address, or the next redial would target
+		// the proxy that was just abandoned.
+		c.singleAddress = dialedAddress
 		return fresh, nil
 	}
 	if m, ok := c.members[slot]; ok {
@@ -1481,6 +1665,57 @@ func (c *Client) snapshotSlot(slot string) (string, *connection, error) {
 		return "", nil, connectionLost(slot+" has no open connection", nil)
 	}
 	return m.address, m.connection, nil
+}
+
+// dialSlot dials slot's current address, exactly as a plain redial always
+// has — except in proxy mode's single slot (slot == ""), where a failed
+// redial to the same proxy falls over to a freshly re-fetched, randomly
+// chosen other one instead of simply propagating the dial error (issue
+// #122's reconnect-on-loss: "first retry the same proxy ... if that
+// fails, re-fetch Q from discovery and pick another"). Cluster-mode slots
+// need no such fallback — the per-key owner walk in read()/write()
+// already fails over to a different member when one is dead; proxy mode
+// has no such second member to fall over to on its own, hence this.
+// Returns the address actually dialed, which the caller installs as the
+// slot's new address — in proxy mode's failover case that can differ
+// from address.
+func (c *Client) dialSlot(slot, address string) (conn *connection, dialedAddress string, err error) {
+	conn, err = c.openNodeConnection(address)
+	if err == nil {
+		return conn, address, nil
+	}
+	if slot != "" || !c.viaProxy {
+		return nil, "", err
+	}
+	return c.reconnectAnotherProxy(address)
+}
+
+// reconnectAnotherProxy re-fetches the proxy roster from discovery and
+// connects to one at random (dialRandomProxy), preferring a proxy other
+// than deadAddress — the one that just failed to redial — when the fresh
+// roster offers a choice; deadAddress may simply have been dropped from
+// discovery's roster too, in which case every candidate is already
+// "other". Falls back to deadAddress's own dial error when discovery
+// can't be reached (or reports no proxies) either.
+func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string, error) {
+	proxies, ok := c.fetchProxyList()
+	if !ok || len(proxies) == 0 {
+		return nil, "", connectionLost("proxy "+deadAddress+" is unreachable", nil)
+	}
+
+	candidates := proxies
+	if len(proxies) > 1 {
+		other := make([]discoveredNode, 0, len(proxies)-1)
+		for _, p := range proxies {
+			if p.Address != deadAddress {
+				other = append(other, p)
+			}
+		}
+		if len(other) > 0 {
+			candidates = other
+		}
+	}
+	return c.dialRandomProxy(candidates)
 }
 
 func (c *Client) openNodeConnection(address string) (*connection, error) {

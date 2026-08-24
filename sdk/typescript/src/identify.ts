@@ -47,6 +47,20 @@ export type IdentifyResult =
   // skew from the cluster's setting.
   | { kind: "cluster"; nodes: DiscoveredNode[]; replication: number };
 
+/**
+ * Result of `connectAndListProxies` (SDK proxy mode, issue #122's
+ * `viaProxy`): `Q`'s answer, fetched instead of `L`'s once a discovery
+ * server is identified. `kind: "node"` means the configured address
+ * turned out to be a cache node rather than a discovery server — proxy
+ * mode needs discovery addresses, so `NanocachedClient`'s proxy-mode
+ * connect/reconnect flow (`connectViaProxy`/`fetchProxyList` in
+ * client.ts) treats this as a hard error (at bootstrap) or an unusable
+ * candidate (on a later refresh) rather than something to open `G`/`S`/`D`
+ * traffic on. No `replication` field — a proxy client needs no R (see the
+ * module doc comment on `connectAndListProxies`).
+ */
+export type ProxyListResult = { kind: "node" } | { kind: "cluster"; proxies: DiscoveredNode[] };
+
 // Sent as the `A` secret when the caller didn't configure an authSecret.
 // A server with no secret configured accepts any non-empty secret without
 // even looking at it, so this placeholder authenticates successfully
@@ -219,6 +233,63 @@ const MAX_NODE_LIST_HEADER_LENGTH = 2 + String(MAX_NODE_COUNT).length + 1 + 20 +
 // MAX_NODE_FIELD_LENGTH-digit fields, a space, and the LF.
 const MAX_NODE_ENTRY_HEADER_LENGTH = 2 * String(MAX_NODE_FIELD_LENGTH).length + 1 + 1;
 
+/** Parses `count` `<name-length> <addr-length>\n<name><addr>\n` entries
+ * starting at `offset` (node identity decoupled from address) — the entry
+ * shape shared, byte-for-byte, by `L`'s node list and `Q`'s proxy roster
+ * (issue #122); the two responses differ only in their header
+ * (`tryParseNodeList` vs `tryParseProxyList`), never in how an individual
+ * entry is laid out. Returns `null` while more bytes are still needed for
+ * the next entry. */
+function parseEntries(buf: Buffer, offset: number, count: number): { entries: DiscoveredNode[]; offset: number } | null {
+  const entries: DiscoveredNode[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const entryHeaderEnd = buf.indexOf(0x0a, offset);
+    if (entryHeaderEnd === -1) {
+      if (buf.length - offset > MAX_NODE_ENTRY_HEADER_LENGTH) {
+        throw new NanocachedError("nanocached: invalid entry header in discovery response (missing header terminator)");
+      }
+      return null;
+    }
+
+    const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
+    if (lengths.length !== 2) {
+      throw new NanocachedError("nanocached: invalid entry header in discovery response");
+    }
+
+    const nameLength = Number(lengths[0]);
+    const addrLength = Number(lengths[1]);
+    if (
+      !Number.isInteger(nameLength) ||
+      nameLength < 0 ||
+      nameLength > MAX_NODE_FIELD_LENGTH ||
+      !Number.isInteger(addrLength) ||
+      addrLength < 0 ||
+      addrLength > MAX_NODE_FIELD_LENGTH
+    ) {
+      throw new NanocachedError("nanocached: invalid entry lengths in discovery response");
+    }
+
+    const nameStart = entryHeaderEnd + 1;
+    const addrStart = nameStart + nameLength;
+    const addrEnd = addrStart + addrLength;
+    const entryEnd = addrEnd + 1; // the trailing '\n' after the address
+
+    if (buf.length < entryEnd) return null;
+    if (buf[addrEnd] !== 0x0a) {
+      throw new NanocachedError("nanocached: malformed entry in discovery response");
+    }
+
+    entries.push({
+      name: buf.subarray(nameStart, addrStart).toString("utf8"),
+      address: buf.subarray(addrStart, addrEnd).toString("utf8"),
+    });
+    offset = entryEnd;
+  }
+
+  return { entries, offset };
+}
+
 function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: number } | null {
   const headerEnd = buf.indexOf(0x0a);
   if (headerEnd === -1) {
@@ -255,54 +326,45 @@ function tryParseNodeList(buf: Buffer): { nodes: DiscoveredNode[]; replication: 
     throw new NanocachedError("nanocached: invalid replication factor in discovery response");
   }
 
-  const nodes: DiscoveredNode[] = [];
-  let offset = headerEnd + 1;
+  const parsed = parseEntries(buf, headerEnd + 1, count);
+  return parsed === null ? null : { nodes: parsed.entries, replication };
+}
 
-  for (let i = 0; i < count; i++) {
-    const entryHeaderEnd = buf.indexOf(0x0a, offset);
-    if (entryHeaderEnd === -1) {
-      if (buf.length - offset > MAX_NODE_ENTRY_HEADER_LENGTH) {
-        throw new NanocachedError("nanocached: invalid node entry header in discovery response (missing header terminator)");
-      }
-      return null;
+/** Parses `Q`'s `N <count>\n` response (issue #122) — `L`'s node-list
+ * header minus the trailing replication field (a proxy client needs no
+ * R), followed by the exact same per-entry shape `parseEntries` already
+ * knows. Entry/count caps mirror `tryParseNodeList`'s (MAX_NODE_COUNT,
+ * MAX_NODE_FIELD_LENGTH) rather than inventing separate ones, per the
+ * SDK-port spec — `Q`'s roster is bounded by the same discovery-server
+ * trust model `L`'s is. */
+function tryParseProxyList(buf: Buffer): DiscoveredNode[] | null {
+  const headerEnd = buf.indexOf(0x0a);
+  if (headerEnd === -1) {
+    // `N <count>\n` can only ever be shorter than `N <count> <r>\n`, so
+    // MAX_NODE_LIST_HEADER_LENGTH is a safe (if slightly generous) bound
+    // here too — see the same reasoning on tryParseNodeList above.
+    if (buf.length > MAX_NODE_LIST_HEADER_LENGTH) {
+      throw new NanocachedError("nanocached: invalid proxy-list header in discovery response (missing header terminator)");
     }
-
-    const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
-    if (lengths.length !== 2) {
-      throw new NanocachedError("nanocached: invalid node entry header in discovery response");
-    }
-
-    const nameLength = Number(lengths[0]);
-    const addrLength = Number(lengths[1]);
-    if (
-      !Number.isInteger(nameLength) ||
-      nameLength < 0 ||
-      nameLength > MAX_NODE_FIELD_LENGTH ||
-      !Number.isInteger(addrLength) ||
-      addrLength < 0 ||
-      addrLength > MAX_NODE_FIELD_LENGTH
-    ) {
-      throw new NanocachedError("nanocached: invalid node entry lengths in discovery response");
-    }
-
-    const nameStart = entryHeaderEnd + 1;
-    const addrStart = nameStart + nameLength;
-    const addrEnd = addrStart + addrLength;
-    const entryEnd = addrEnd + 1; // the trailing '\n' after the address
-
-    if (buf.length < entryEnd) return null;
-    if (buf[addrEnd] !== 0x0a) {
-      throw new NanocachedError("nanocached: malformed node entry in discovery response");
-    }
-
-    nodes.push({
-      name: buf.subarray(nameStart, addrStart).toString("utf8"),
-      address: buf.subarray(addrStart, addrEnd).toString("utf8"),
-    });
-    offset = entryEnd;
+    return null;
   }
 
-  return { nodes, replication };
+  if (buf[0] === 0x42 /* 'B' */) {
+    // Same startup-grace refusal as `L` — see DiscoveryBusyError.
+    throw new DiscoveryBusyError();
+  }
+
+  if (buf[0] !== 0x4e /* 'N' */) {
+    throw new NanocachedError(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
+  }
+
+  const count = Number(buf.subarray(2, headerEnd).toString("ascii"));
+  if (!Number.isInteger(count) || count < 0 || count > MAX_NODE_COUNT) {
+    throw new NanocachedError("nanocached: invalid proxy count in discovery response");
+  }
+
+  const parsed = parseEntries(buf, headerEnd + 1, count);
+  return parsed === null ? null : parsed.entries;
 }
 
 /**
@@ -355,9 +417,25 @@ export function remainingDeadline(budgetMs: number, startedAt: number): number {
   return Math.max(0, budgetMs - (Date.now() - startedAt));
 }
 
-async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Promise<IdentifyResult> {
-  const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
-  const startedAt = Date.now();
+interface Authenticated {
+  socket: Socket | TLSSocket;
+  tagged: boolean;
+  kind: "node" | "cluster";
+}
+
+/** The shared `A` handshake — dial, authenticate, read back which kind of
+ * server this is — behind both `identifyOnce` (which follows a
+ * discovery-kind result with `L`) and `listProxiesOnce` (`Q`, issue
+ * #122): identical up through authentication, they only diverge in which
+ * command a discovery-kind result sends next. The socket is handed back
+ * live either way and closing it is left to the caller, exactly as
+ * `identifyOnce` always did before this was factored out of it. */
+async function authenticate(
+  options: IdentifyOptions,
+  requestTags: boolean,
+  deadlineMs: number,
+  startedAt: number,
+): Promise<Authenticated> {
   const socket = await connectSocket(options);
 
   const secret = options.authSecret !== undefined ? Buffer.from(options.authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
@@ -382,20 +460,80 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Pro
     throw new AuthenticationError("nanocached: authentication failed");
   }
 
-  if (identity.kind === "node") {
-    return { kind: "node", socket, tagged: identity.tagged };
+  return { socket, tagged: identity.tagged, kind: identity.kind };
+}
+
+async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Promise<IdentifyResult> {
+  const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
+  const startedAt = Date.now();
+  const identified = await authenticate(options, requestTags, deadlineMs, startedAt);
+
+  if (identified.kind === "node") {
+    return { kind: "node", socket: identified.socket, tagged: identified.tagged };
   }
 
   try {
-    socket.write(Buffer.from("L\n"));
+    identified.socket.write(Buffer.from("L\n"));
     const { nodes, replication } = await readFrame(
-      socket,
+      identified.socket,
       tryParseNodeList,
       remainingDeadline(deadlineMs, startedAt),
       MAX_NODE_LIST_RESPONSE_LENGTH,
     );
     return { kind: "cluster", nodes, replication };
   } finally {
-    socket.destroy();
+    identified.socket.destroy();
+  }
+}
+
+/**
+ * SDK proxy mode (issue #122, `viaProxy`): the `Q` counterpart to
+ * `connectAndIdentify`'s `L` fetch — authenticates exactly the same way,
+ * then asks a discovery server for its registered *proxy* roster instead
+ * of its node list. A proxy looks exactly like a single node that owns
+ * every key (full `G`/`S`/`D`, never `W`), so once one is chosen from
+ * this roster, `NanocachedClient` opens it with the ordinary
+ * `connectAndIdentify` — this function's job is only ever to learn which
+ * addresses to try, mirroring `L`'s role for the plain cluster path.
+ * `kind: "node"` (the configured address is a cache node, not a discovery
+ * server) closes the socket before returning — there is never anything
+ * for the caller to reuse: proxy mode needs discovery addresses.
+ * Used only by `NanocachedClient`'s proxy-mode connect/reconnect flow
+ * (`connectViaProxy`/`fetchProxyList` in client.ts).
+ */
+export async function connectAndListProxies(options: IdentifyOptions): Promise<ProxyListResult> {
+  try {
+    return await listProxiesOnce(options, true);
+  } catch (error) {
+    if (!isLegacyServerSignal(error)) throw error;
+    // Echoed response tags transparent fallback — see connectAndIdentify's
+    // own doc comment on this same retry.
+    return listProxiesOnce(options, false);
+  }
+}
+
+async function listProxiesOnce(options: IdentifyOptions, requestTags: boolean): Promise<ProxyListResult> {
+  const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
+  const startedAt = Date.now();
+  const identified = await authenticate(options, requestTags, deadlineMs, startedAt);
+
+  if (identified.kind === "node") {
+    identified.socket.destroy();
+    return { kind: "node" };
+  }
+
+  try {
+    identified.socket.write(Buffer.from("Q\n"));
+    const proxies = await readFrame(
+      identified.socket,
+      tryParseProxyList,
+      remainingDeadline(deadlineMs, startedAt),
+      // Same aggregate cap as `L` (issue #122) — see tryParseProxyList's
+      // doc comment on why the count/field caps are shared too.
+      MAX_NODE_LIST_RESPONSE_LENGTH,
+    );
+    return { kind: "cluster", proxies };
+  } finally {
+    identified.socket.destroy();
   }
 }

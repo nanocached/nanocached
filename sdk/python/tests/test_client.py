@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import os
+import random
 import ssl
 import traceback
 import unittest
@@ -2898,6 +2899,202 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
         finally:
             await node.close()
+
+
+class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
+    """SDK proxy mode (issue #122): via_proxy fetches the proxy roster
+    (`Q`) from a discovery seed instead of the node roster (`L`), and
+    lands this client on a single proxy connection instead of a ring — a
+    proxy looks exactly like one node that owns every key, so a mock
+    proxy is just a MockNode (see mock_servers.py's own doc comment)."""
+
+    async def test_every_op_lands_on_the_proxy_and_the_node_roster_is_never_touched(self):
+        # The node roster names a port nobody listens on — if via_proxy
+        # ever mistakenly dialed it (instead of the separate proxy
+        # roster), the connect or the first operation would blow up with
+        # a connection error, failing this test loudly rather than
+        # silently passing.
+        unreachable_node_port = await unused_port()
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[(NAMES[0], f"127.0.0.1:{unreachable_node_port}")],
+            proxies=[(NAMES[1], proxy.address)],
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True
+            )
+            try:
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                self.assertTrue(await client.delete("k"))
+
+                users = client.namespace("users")
+                await users.set("alice", "admin")
+                self.assertEqual(await users.get("alice"), "admin")
+
+                await client.clear_all()
+                self.assertIsNone(await users.get("alice"))
+
+                # `L` (the node roster) is never asked for in via_proxy
+                # mode — only `Q` is.
+                self.assertEqual(discovery.list_count, 0)
+                self.assertGreaterEqual(discovery.list_proxies_count, 1)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
+    async def test_random_spread_across_multiple_proxies(self):
+        # Deterministic despite being statistical (issue #122 spec): a
+        # fixed seed pins client.py's random.shuffle() calls, so this
+        # can't flake even though it's asserting about randomness.
+        proxy_a = await MockNode().start()
+        proxy_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[],
+            proxies=[(NAMES[0], proxy_a.address), (NAMES[1], proxy_b.address)],
+        ).start()
+        try:
+            random.seed(1234)
+            for _ in range(20):
+                client = await NanocachedClient.connect(
+                    [("127.0.0.1", discovery.port)], via_proxy=True
+                )
+                await client.close()
+            self.assertGreater(proxy_a.connection_count, 0)
+            self.assertGreater(proxy_b.connection_count, 0)
+        finally:
+            await discovery.close()
+            await proxy_a.close()
+            await proxy_b.close()
+
+    async def test_failover_when_the_first_chosen_proxy_is_down(self):
+        dead_port = await unused_port()
+        live = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[],
+            proxies=[(NAMES[0], f"127.0.0.1:{dead_port}"), (NAMES[1], live.address)],
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True
+            )
+            try:
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(client._single_address, live.address)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await live.close()
+
+    async def test_busy_first_seed_falls_over_to_a_second_seed_serving_q(self):
+        proxy = await MockNode().start()
+        warming = await MockDiscovery(nodes=[], proxies=[]).start()
+        healthy = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        warming.warming_up = True
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", warming.port), ("127.0.0.1", healthy.port)], via_proxy=True
+            )
+            try:
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(client._single_address, proxy.address)
+            finally:
+                await client.close()
+        finally:
+            await warming.close()
+            await healthy.close()
+            await proxy.close()
+
+    async def test_empty_proxy_roster_is_a_clear_connect_error(self):
+        discovery = await MockDiscovery(nodes=[], proxies=[]).start()
+        try:
+            with self.assertRaisesRegex(NanocachedError, "no proxies registered"):
+                await NanocachedClient.connect(
+                    [("127.0.0.1", discovery.port)], via_proxy=True
+                )
+        finally:
+            await discovery.close()
+
+    async def test_via_proxy_pointed_at_a_node_address_is_a_clear_error(self):
+        node = await MockNode().start()
+        try:
+            with self.assertRaisesRegex(NanocachedError, "identifies as a cache node"):
+                await NanocachedClient.connect([("127.0.0.1", node.port)], via_proxy=True)
+        finally:
+            await node.close()
+
+    async def test_reconnect_after_the_proxy_dies_refetches_q_and_lands_on_the_survivor(self):
+        proxy_a = await MockNode().start()
+        proxy_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[],
+            proxies=[(NAMES[0], proxy_a.address), (NAMES[1], proxy_b.address)],
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                connected_address = client._single_address
+                dead, survivor = (
+                    (proxy_a, proxy_b) if connected_address == proxy_a.address else (proxy_b, proxy_a)
+                )
+
+                # The proxy this client is pinned to goes away for good
+                # (not just a blip) — discovery's roster is updated to
+                # match, exactly as it would once discovery notices.
+                await dead.close()
+                discovery.set_proxies([(NAMES[0], survivor.address)])
+                # Wait for the FIN to be observed (mirrors ReconnectTests'
+                # own test_transparently_reconnects_after_a_server_fin)
+                # instead of racing client.set() against it: hitting the
+                # connection while it still looks open would raise a raw
+                # ConnectionError with no retry (via_proxy is single-
+                # connection mode, so _with_wrong_node_retry has no ring
+                # to refresh and fail over through — the same as
+                # standalone single-node mode).
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(client._single_address, survivor.address)
+                self.assertGreaterEqual(discovery.list_proxies_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy_a.close()
+            await proxy_b.close()
+
+    async def test_hedge_option_is_inert_in_proxy_mode(self):
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[], proxies=[(NAMES[0], proxy.address)]
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, read_hedge_after=0.01
+            )
+            try:
+                await client.set("k", "v")
+                proxy.get_count = 0
+                self.assertEqual(await client.get("k"), "v")
+                # No hedge leg — exactly one G reached the wire.
+                self.assertEqual(proxy.get_count, 1)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
 
 
 if __name__ == "__main__":

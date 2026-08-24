@@ -422,12 +422,24 @@ fn store_key(namespace: &[u8], key: &[u8]) -> Vec<u8> {
 
 struct MockDiscovery {
     nodes: Arc<Mutex<Vec<(String, String)>>>,
+    /// The proxy roster `Q` answers with (SDK proxy mode, issue #122) —
+    /// kept entirely separate from `nodes`: a well-behaved discovery
+    /// server never lists a proxy under `L` or a node under `Q` (see
+    /// `proxies_never_appear_in_l_and_nodes_never_in_q` on the server
+    /// side), so the mock enforces that same separation rather than
+    /// deriving one roster from the other.
+    proxies: Arc<Mutex<Vec<(String, String)>>>,
     warming: Arc<Mutex<bool>>,
     /// How many `L` (node-list) requests this discovery server has ever
     /// received — for the single-flight coalescing regression (Fix 2):
     /// without coalescing, a burst of concurrent callers that all observe
     /// a stale node list would each redial discovery independently.
     l_requests: Arc<AtomicUsize>,
+    /// How many `Q` (proxy-roster) requests this discovery server has
+    /// ever received — proxy mode's own counterpart to `l_requests`, used
+    /// to assert a via_proxy client never falls back to (or otherwise
+    /// touches) the node roster.
+    q_requests: Arc<AtomicUsize>,
     /// Artificial delay (ms) before answering `L` — held at 0 normally;
     /// a test raises this to widen the window during which concurrent
     /// callers can pile up behind the single-flight gate instead of the
@@ -437,51 +449,78 @@ struct MockDiscovery {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+/// The handles `serve_discovery` needs, bundled into one `Clone`
+/// (every field is an `Arc` or `Copy`, so cloning this is cheap) rather
+/// than passed as separate parameters — `clippy::too_many_arguments`
+/// territory once the proxy roster (issue #122) joined the node one.
+#[derive(Clone)]
+struct DiscoveryHandles {
+    nodes: Arc<Mutex<Vec<(String, String)>>>,
+    proxies: Arc<Mutex<Vec<(String, String)>>>,
+    warming: Arc<Mutex<bool>>,
+    replication: usize,
+    l_requests: Arc<AtomicUsize>,
+    q_requests: Arc<AtomicUsize>,
+    l_delay_ms: Arc<AtomicUsize>,
+}
+
 impl MockDiscovery {
     async fn start(nodes: Vec<(String, String)>, replication: usize) -> Self {
-        let nodes = Arc::new(Mutex::new(nodes));
-        let warming = Arc::new(Mutex::new(false));
-        let l_requests = Arc::new(AtomicUsize::new(0));
-        let l_delay_ms = Arc::new(AtomicUsize::new(0));
+        Self::start_with_proxies(nodes, replication, Vec::new()).await
+    }
+
+    /// Like `start`, but also seeds the proxy roster `Q` answers with
+    /// (proxy mode, issue #122). `set_proxies` mutates the roster
+    /// mid-test (a mock "proxy" is just a `MockNode` — see the module
+    /// doc comment).
+    async fn start_with_proxies(
+        nodes: Vec<(String, String)>,
+        replication: usize,
+        proxies: Vec<(String, String)>,
+    ) -> Self {
+        let handles = DiscoveryHandles {
+            nodes: Arc::new(Mutex::new(nodes)),
+            proxies: Arc::new(Mutex::new(proxies)),
+            warming: Arc::new(Mutex::new(false)),
+            replication,
+            l_requests: Arc::new(AtomicUsize::new(0)),
+            q_requests: Arc::new(AtomicUsize::new(0)),
+            l_delay_ms: Arc::new(AtomicUsize::new(0)),
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (shutdown, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let accept_nodes = Arc::clone(&nodes);
-        let accept_warming = Arc::clone(&warming);
-        let accept_l_requests = Arc::clone(&l_requests);
-        let accept_l_delay_ms = Arc::clone(&l_delay_ms);
+        let accept_handles = handles.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => return,
                     accepted = listener.accept() => {
                         let Ok((socket, _)) = accepted else { return };
-                        let nodes = Arc::clone(&accept_nodes);
-                        let warming = Arc::clone(&accept_warming);
-                        let l_requests = Arc::clone(&accept_l_requests);
-                        let l_delay_ms = Arc::clone(&accept_l_delay_ms);
-                        tokio::spawn(serve_discovery(
-                            socket,
-                            nodes,
-                            warming,
-                            replication,
-                            l_requests,
-                            l_delay_ms,
-                        ));
+                        tokio::spawn(serve_discovery(socket, accept_handles.clone()));
                     }
                 }
             }
         });
 
         Self {
-            nodes,
-            warming,
-            l_requests,
-            l_delay_ms,
+            nodes: handles.nodes,
+            proxies: handles.proxies,
+            warming: handles.warming,
+            l_requests: handles.l_requests,
+            q_requests: handles.q_requests,
+            l_delay_ms: handles.l_delay_ms,
             port,
             shutdown,
         }
+    }
+
+    /// Replaces the proxy roster `Q` answers with — for the reconnect and
+    /// failover tests (issue #122), which need to change which proxies
+    /// are registered mid-test without restarting the discovery server.
+    fn set_proxies(&self, proxies: Vec<(String, String)>) {
+        *self.proxies.lock().unwrap() = proxies;
     }
 
     fn stop(&self) {
@@ -489,14 +528,7 @@ impl MockDiscovery {
     }
 }
 
-async fn serve_discovery(
-    socket: TcpStream,
-    nodes: Arc<Mutex<Vec<(String, String)>>>,
-    warming: Arc<Mutex<bool>>,
-    replication: usize,
-    l_requests: Arc<AtomicUsize>,
-    l_delay_ms: Arc<AtomicUsize>,
-) {
+async fn serve_discovery(socket: TcpStream, handles: DiscoveryHandles) {
     let mut stream = BufReader::new(socket);
     loop {
         let Ok(header) = read_line(&mut stream).await else {
@@ -511,17 +543,38 @@ async fn serve_discovery(
                 }
             }
             "L" => {
-                l_requests.fetch_add(1, Ordering::SeqCst);
-                let delay = l_delay_ms.load(Ordering::SeqCst);
+                handles.l_requests.fetch_add(1, Ordering::SeqCst);
+                let delay = handles.l_delay_ms.load(Ordering::SeqCst);
                 if delay > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
-                if *warming.lock().unwrap() {
+                if *handles.warming.lock().unwrap() {
                     let _ = stream.get_mut().write_all(b"B\n").await;
                     return;
                 }
-                let snapshot = nodes.lock().unwrap().clone();
-                let mut frame = format!("N {} {}\n", snapshot.len(), replication).into_bytes();
+                let snapshot = handles.nodes.lock().unwrap().clone();
+                let mut frame =
+                    format!("N {} {}\n", snapshot.len(), handles.replication).into_bytes();
+                for (name, address) in &snapshot {
+                    frame.extend_from_slice(
+                        format!("{} {}\n{name}{address}\n", name.len(), address.len()).as_bytes(),
+                    );
+                }
+                if stream.get_mut().write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+            "Q" => {
+                // Proxy roster (issue #122): same `B`/busy and entry
+                // shape as `L`, minus the replication field on the
+                // header — see the server's own `ListProxies` handler.
+                handles.q_requests.fetch_add(1, Ordering::SeqCst);
+                if *handles.warming.lock().unwrap() {
+                    let _ = stream.get_mut().write_all(b"B\n").await;
+                    return;
+                }
+                let snapshot = handles.proxies.lock().unwrap().clone();
+                let mut frame = format!("N {}\n", snapshot.len()).into_bytes();
                 for (name, address) in &snapshot {
                     frame.extend_from_slice(
                         format!("{} {}\n{name}{address}\n", name.len(), address.len()).as_bytes(),
@@ -3259,4 +3312,276 @@ async fn refresh_purges_cooldowns_for_departed_addresses() {
     discovery.stop();
     live.stop();
     revived.stop();
+}
+
+// ── SDK proxy mode (issue #122) ──────────────────────────────────────
+
+#[tokio::test]
+async fn via_proxy_lands_every_op_on_the_proxy_and_never_dials_a_node() {
+    // A node discovery also lists, under `L` — proves via_proxy never
+    // even calls `L`, let alone dials a node.
+    let decoy_node = MockNode::start().await;
+    let proxy = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![(NAMES[0].to_string(), decoy_node.address())],
+        1,
+        vec![("proxy-a".to_string(), proxy.address())],
+    )
+    .await;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+
+    client.set("greeting", "hello", 0).await.unwrap();
+    assert_eq!(
+        client.get("greeting").await.unwrap(),
+        Some("hello".to_string())
+    );
+    let ns = client.namespace("tenant");
+    ns.set("greeting", "hi", 0).await.unwrap();
+    assert_eq!(ns.get("greeting").await.unwrap(), Some("hi".to_string()));
+    ns.clear().await.unwrap();
+    assert_eq!(ns.get("greeting").await.unwrap(), None);
+    assert!(client.delete("greeting").await.unwrap());
+    assert_eq!(client.replication().await, 1);
+
+    assert!(proxy.state.gets.load(Ordering::SeqCst) >= 3);
+    assert_eq!(decoy_node.state.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(discovery.l_requests.load(Ordering::SeqCst), 0);
+    assert!(discovery.q_requests.load(Ordering::SeqCst) >= 1);
+
+    client.close().await;
+    discovery.stop();
+    proxy.stop();
+    decoy_node.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_spreads_fresh_clients_across_the_roster() {
+    let proxy_a = MockNode::start().await;
+    let proxy_b = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![
+            ("proxy-a".to_string(), proxy_a.address()),
+            ("proxy-b".to_string(), proxy_b.address()),
+        ],
+    )
+    .await;
+
+    // Many independent fresh clients, each picking one of the two
+    // proxies at random (the spec's own "spreads a fleet" language) —
+    // over 40 independent draws the odds of either proxy never being
+    // picked at all are astronomically small, so this stays deterministic
+    // enough not to flake without pinning the RNG.
+    for _ in 0..40 {
+        let client = NanocachedClient::connect(
+            Options::new()
+                .addresses([("127.0.0.1", discovery.port)])
+                .via_proxy(true),
+        )
+        .await
+        .unwrap();
+        client.close().await;
+    }
+
+    let a = proxy_a.state.connections.load(Ordering::SeqCst);
+    let b = proxy_b.state.connections.load(Ordering::SeqCst);
+    assert_eq!(a + b, 40, "a={a} b={b}");
+    assert!(a > 0, "proxy-a was never picked (a={a} b={b})");
+    assert!(b > 0, "proxy-b was never picked (a={a} b={b})");
+
+    discovery.stop();
+    proxy_a.stop();
+    proxy_b.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_fails_over_to_the_live_proxy_when_the_chosen_one_is_down() {
+    let dead_port = unused_port().await;
+    let live = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![
+            ("proxy-dead".to_string(), format!("127.0.0.1:{dead_port}")),
+            ("proxy-live".to_string(), live.address()),
+        ],
+    )
+    .await;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    assert_eq!(live.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    discovery.stop();
+    live.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_fails_over_to_the_second_discovery_seed_when_the_first_is_warming() {
+    let proxy = MockNode::start().await;
+    let first = MockDiscovery::start(vec![], 1).await;
+    let second = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy.address())],
+    )
+    .await;
+    *first.warming.lock().unwrap() = true;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", first.port), ("127.0.0.1", second.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+
+    client.close().await;
+    first.stop();
+    second.stop();
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_with_an_empty_roster_is_a_clear_connect_error() {
+    let discovery = MockDiscovery::start(vec![], 1).await;
+
+    let result = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await;
+
+    match result {
+        Err(Error::Protocol(message)) => {
+            assert!(
+                message.contains("no proxies registered"),
+                "err = {message}, want it to name the empty roster"
+            );
+        }
+        Ok(_) => panic!("connect() succeeded, want Error::Protocol"),
+        Err(other) => panic!("connect() = {other}, want Error::Protocol"),
+    }
+    discovery.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_pointed_at_a_node_address_is_a_clear_connect_error() {
+    let node = MockNode::start().await;
+
+    let result = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .via_proxy(true),
+    )
+    .await;
+
+    match result {
+        Err(Error::InvalidArgument(message)) => {
+            assert!(
+                message.contains("discovery"),
+                "err = {message}, want it to name the discovery-address requirement"
+            );
+        }
+        Ok(_) => panic!("connect() succeeded, want Error::InvalidArgument"),
+        Err(other) => panic!("connect() = {other}, want Error::InvalidArgument"),
+    }
+    node.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_reconnect_re_fetches_the_roster_and_lands_on_the_survivor() {
+    let proxy_a = MockNode::start().await;
+    let proxy_b = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    assert!(proxy_a
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(b"k".as_slice()));
+
+    // Kill the connected proxy and update the roster to the survivor
+    // only, so the reconnect this next call drives can only possibly
+    // land on proxy_b.
+    proxy_a.stop();
+    discovery.set_proxies(vec![("proxy-b".to_string(), proxy_b.address())]);
+
+    // apply_reconnecting's own same-address redial (against proxy_a,
+    // now unreachable) fails first; that ConnectionLost is what drives
+    // with_cluster_retry's via_proxy branch to re-fetch `Q` and swap onto
+    // proxy_b — no manual delay needed, the whole chain runs out under
+    // this one `.await`.
+    assert_eq!(client.get("k").await.unwrap(), None);
+    assert_eq!(proxy_b.state.connections.load(Ordering::SeqCst), 1);
+    assert!(proxy_b.state.gets.load(Ordering::SeqCst) >= 1);
+
+    client.close().await;
+    discovery.stop();
+    proxy_b.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_ignores_read_hedge_after_and_sends_a_single_get() {
+    // Hedging is inert in proxy mode (Options::via_proxy's own doc
+    // comment): Target::Single short-circuits before the hedge path ever
+    // runs, so this asserts exactly one `G` reaches the wire even with a
+    // very short hedge window that would otherwise fire immediately.
+    let proxy = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy.address())],
+    )
+    .await;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true)
+            .read_hedge_after(Duration::from_millis(1)),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+
+    assert_eq!(proxy.state.gets.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    discovery.stop();
+    proxy.stop();
 }

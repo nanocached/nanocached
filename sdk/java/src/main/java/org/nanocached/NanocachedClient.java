@@ -70,6 +70,7 @@ public final class NanocachedClient implements AutoCloseable {
         private Duration reconnectCooldown = DEFAULT_RECONNECT_COOLDOWN;
         private boolean reconnectCooldownDisabled;
         private Duration readHedgeAfter;
+        private boolean viaProxy;
 
         /** Discovery replicas (discovery HA), tried in order for connect and every
          * refresh; a one-element list is the single-target case. */
@@ -253,6 +254,41 @@ public final class NanocachedClient implements AutoCloseable {
             this.readHedgeAfter = interval;
             return this;
         }
+
+        /** SDK proxy mode (issue #122). Off by default. Only meaningful
+         * when {@code addresses} names discovery server(s) — {@code
+         * connect()} fails fast, naming the address, if the first one
+         * reached turns out to be a cache node instead (proxy mode needs a
+         * ring to fan a roster fetch out to, not a single node's identity).
+         *
+         * <p>Routes every request through exactly one {@code
+         * nanocached-proxy} instead of joining the cluster ring: no
+         * per-node connections, no ring view, and no hedged reads — a
+         * proxy is the only owner on this one connection, so there is
+         * nobody to hedge to, and a configured {@link #readHedgeAfter} is
+         * simply inert here (never rejected — it may still apply to a
+         * different client sharing these {@code Options}). Namespaces,
+         * clear/clearAll, tags, keep-alive, and compression all work
+         * unchanged; {@code close()} is unchanged too. From here on this
+         * client behaves exactly like single-node mode, because a proxy
+         * answers the identify handshake exactly like a cache node does
+         * (full G/S/D, never {@code W} — it owns every key) and this SDK's
+         * existing single-connection path already speaks to it correctly.
+         *
+         * <p>The proxy itself is chosen at random from the roster
+         * discovery serves via {@code Q} — spreads a client fleet across
+         * the whole proxy tier instead of piling every client onto
+         * whichever proxy answers first — with random fail-over across the
+         * rest of the roster if the chosen one is unreachable. On a later
+         * disconnect the client first retries that same proxy (it may
+         * simply have restarted) before re-fetching the roster and picking
+         * another; both paths reuse the existing single-node reconnect
+         * machinery ({@link #reconnectCooldown} included) rather than a
+         * second one built for this mode. */
+        public Options viaProxy(boolean enabled) {
+            this.viaProxy = enabled;
+            return this;
+        }
     }
 
     /**
@@ -391,6 +427,12 @@ public final class NanocachedClient implements AutoCloseable {
     private final boolean reconnectCooldownDisabled;
     /** Hedged reads (issue #64): 0 means off. See {@link Options#readHedgeAfter}. */
     private final long readHedgeAfterNanos;
+    /** SDK proxy mode (issue #122): {@code true} routes {@link
+     * #singleConnection}'s reconnect through {@link #reconnectProxy}
+     * (retry-same-then-re-fetch-and-pick-another) instead of {@link
+     * #dialWithCooldown}'s plain single-address redial. See {@link
+     * Options#viaProxy}. */
+    private final boolean viaProxy;
     /** Hedge legs still in flight after a read has already returned (the
      * losers): finished detached on {@link #replicaWriters}, their result
      * discarded, drained by {@link #close()} exactly like {@link
@@ -497,7 +539,7 @@ public final class NanocachedClient implements AutoCloseable {
             List<Address> addresses, byte[] authSecret, SSLContext tls,
             boolean compress, int compressionThreshold, boolean fireAndForgetReplicas,
             boolean readRepair, Duration reconnectCooldown, boolean reconnectCooldownDisabled,
-            Duration readHedgeAfter) {
+            Duration readHedgeAfter, boolean viaProxy) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
@@ -508,6 +550,7 @@ public final class NanocachedClient implements AutoCloseable {
         this.reconnectCooldownNanos = reconnectCooldown.toNanos();
         this.reconnectCooldownDisabled = reconnectCooldownDisabled;
         this.readHedgeAfterNanos = readHedgeAfter != null ? readHedgeAfter.toNanos() : 0;
+        this.viaProxy = viaProxy;
     }
 
     public static NanocachedClient connect(Options options) {
@@ -530,7 +573,16 @@ public final class NanocachedClient implements AutoCloseable {
                 options.addresses, options.authSecret, sslContext,
                 options.compress, options.compressionThreshold, options.fireAndForgetReplicas,
                 options.readRepair, options.reconnectCooldown, options.reconnectCooldownDisabled,
-                options.readHedgeAfter);
+                options.readHedgeAfter, options.viaProxy);
+
+        // SDK proxy mode (issue #122): a wholly different connect flow —
+        // fetch a proxy roster via `Q` rather than a node list via `L`,
+        // then dial one proxy at random — so it gets its own top-level
+        // branch rather than being threaded through every arm of the
+        // node/cluster loop below.
+        if (client.viaProxy) {
+            return connectViaProxy(client);
+        }
 
         // Walk the addresses until one yields a working target; an address
         // that is unreachable, warming up (B, discovery HA), or knows no live
@@ -598,6 +650,109 @@ public final class NanocachedClient implements AutoCloseable {
         throw lastError != null
                 ? lastError
                 : new NanocachedException("nanocached: could not connect to any address");
+    }
+
+    /**
+     * SDK proxy mode (issue #122) connect: walks {@code client.addresses}
+     * exactly like {@link #connect}'s own loop does for the non-proxy
+     * path — same per-address tolerance for a busy ({@code B}, discovery
+     * HA startup grace) or unreachable seed, same {@code lastError}
+     * fallback message — but fetches the proxy roster ({@code Q}) instead
+     * of the node list ({@code L}), and stops at the first seed that
+     * serves a non-empty one: unlike {@link #openCluster}, this never
+     * goes back to a different discovery seed for a second opinion on the
+     * roster once one seed has answered.
+     *
+     * <p>An address that identifies as a cache node is a hard,
+     * non-tolerated error (unlike a busy/unreachable seed) — proxy mode
+     * needs a ring to fetch a roster from, and pointing it at a node
+     * instead is a configuration mistake no amount of address fail-over
+     * fixes, so this fails fast naming the address rather than silently
+     * trying the next one.
+     */
+    private static NanocachedClient connectViaProxy(NanocachedClient client) {
+        RuntimeException lastError = null;
+        for (Address address : client.addresses) {
+            String key = address.host() + ":" + address.port();
+
+            if (client.addresses.size() == 1 && OPEN_TARGETS.containsKey(key)) {
+                System.err.println("nanocached: connect() called for " + key
+                        + " while a previous connection to it is still open — was close() forgotten?");
+            }
+
+            Identify.Result identified;
+            try {
+                identified = Identify.connectAndIdentify(
+                        address.host(), address.port(), client.authSecret, client.tls, true);
+            } catch (IOException | RuntimeException error) {
+                lastError = error instanceof RuntimeException runtime
+                        ? runtime
+                        : new NanocachedException.ConnectionFailed(error.getMessage(), error);
+                continue;
+            }
+
+            client.targetKey = key;
+
+            if (identified instanceof Identify.NodeTarget node) {
+                try {
+                    node.socket().close();
+                } catch (IOException ignored) {
+                    // Best-effort cleanup — the config error below is what matters.
+                }
+                throw new NanocachedException(
+                        "nanocached: viaProxy requires a discovery address, but " + key + " is a cache node");
+            }
+
+            List<DiscoveredNode> proxies = ((Identify.ProxyRosterTarget) identified).proxies();
+            if (proxies.isEmpty()) {
+                lastError = new NanocachedException(
+                        "nanocached: no proxies registered with the discovery server at " + key);
+                continue;
+            }
+
+            try {
+                return connectToOneProxy(client, proxies);
+            } catch (RuntimeException error) {
+                client.teardown();
+                throw error;
+            }
+        }
+
+        throw lastError != null
+                ? lastError
+                : new NanocachedException("nanocached: could not connect to any address");
+    }
+
+    /**
+     * Dials one proxy from {@code proxies}, in random order — spreads a
+     * client fleet across the whole proxy tier instead of piling
+     * everyone onto whichever entry happens to be first — returning as
+     * soon as one accepts. A proxy identifies exactly like a cache node
+     * on the wire (full G/S/D, never {@code W}: it owns every key), so
+     * {@link #openNodeConnectionOrThrow} — the same dial this class uses
+     * for any ordinary node — is exactly right here too; every entry
+     * unreachable is this SDK's normal connect error.
+     */
+    private static NanocachedClient connectToOneProxy(NanocachedClient client, List<DiscoveredNode> proxies) {
+        List<DiscoveredNode> shuffled = new ArrayList<>(proxies);
+        java.util.Collections.shuffle(shuffled);
+
+        RuntimeException lastError = null;
+        for (DiscoveredNode proxy : shuffled) {
+            try {
+                client.single = client.openNodeConnectionOrThrow(proxy.address());
+            } catch (RuntimeException error) {
+                lastError = error;
+                continue;
+            }
+            client.singleAddress = proxy.address();
+            client.startKeepAlive();
+            return client;
+        }
+
+        throw lastError != null
+                ? lastError
+                : new NanocachedException("nanocached: no proxies registered with discovery");
     }
 
     /** Builds the TLS context to dial with, or {@code null} for a plain
@@ -1939,10 +2094,94 @@ public final class NanocachedClient implements AutoCloseable {
 
         synchronized (redialLocks.computeIfAbsent("", slot -> new Object())) {
             if (single.isClosed()) {
-                single = dialWithCooldown(singleAddress);
+                // SDK proxy mode (issue #122): a dead proxy connection gets
+                // its own reconnect strategy (retry the same proxy, then
+                // re-fetch the roster) instead of the plain single-address
+                // redial every other single-mode target uses.
+                single = viaProxy ? reconnectProxy() : dialWithCooldown(singleAddress);
             }
             return single;
         }
+    }
+
+    /**
+     * SDK proxy mode reconnect (issue #122). Called with the single-mode
+     * redial lock already held, exactly like {@link #dialWithCooldown}'s
+     * other callers. First retries {@link #singleAddress} — the same
+     * proxy, which may simply have restarted — through {@link
+     * #dialWithCooldown} itself, so a proxy that just failed stays
+     * "down" for the usual cooldown window instead of being redialed on
+     * every call. Only once that fails does this re-fetch the roster
+     * ({@code Q}) from discovery and, in random order, dial the rest of
+     * it through {@link #dialWithCooldown} too — reusing the exact same
+     * per-address cooldown bookkeeping {@link #connectToOneProxy}'s
+     * initial pick and every ordinary node redial already use, rather
+     * than a second reconnect machine built for this mode.
+     */
+    private Connection reconnectProxy() {
+        try {
+            return dialWithCooldown(singleAddress);
+        } catch (RuntimeException sameProxyFailed) {
+            List<DiscoveredNode> proxies = fetchProxyRoster();
+            if (proxies == null || proxies.isEmpty()) {
+                throw sameProxyFailed;
+            }
+
+            List<DiscoveredNode> shuffled = new ArrayList<>(proxies);
+            java.util.Collections.shuffle(shuffled);
+            RuntimeException lastError = sameProxyFailed;
+            for (DiscoveredNode proxy : shuffled) {
+                try {
+                    Connection connection = dialWithCooldown(proxy.address());
+                    singleAddress = proxy.address();
+                    return connection;
+                } catch (RuntimeException error) {
+                    lastError = error;
+                }
+            }
+            throw lastError;
+        }
+    }
+
+    /**
+     * SDK proxy mode (issue #122): re-fetches the proxy roster by walking
+     * {@link #addresses} exactly like {@link #fetchNodeList} walks them
+     * for a cluster-mode node-list refresh — same per-address tolerance
+     * for a busy/unreachable discovery seed, counted the same way via
+     * {@link #refreshFailures} (this is a reconnect, so — like that
+     * method — it must never throw past its caller). {@code null} means
+     * every address failed outright; a caller must still treat a
+     * successfully-fetched but empty roster ({@code proxies.isEmpty()})
+     * as "nothing to fail over to" itself, since that's a legitimate —
+     * if inconvenient — answer, not a fetch failure.
+     */
+    private List<DiscoveredNode> fetchProxyRoster() {
+        for (Address address : addresses) {
+            Identify.Result identified;
+            try {
+                identified = Identify.connectAndIdentify(address.host(), address.port(), authSecret, tls, true);
+            } catch (IOException | RuntimeException error) {
+                refreshFailures.incrementAndGet();
+                continue;
+            }
+            if (identified instanceof Identify.NodeTarget node) {
+                // The same misconfiguration connect() rejects outright —
+                // but a reconnect must never throw past its caller, so
+                // just close the socket and treat this seed as unusable.
+                try {
+                    node.socket().close();
+                } catch (IOException ignored) {
+                    // Best-effort cleanup.
+                }
+                refreshFailures.incrementAndGet();
+                continue;
+            }
+            List<DiscoveredNode> proxies = ((Identify.ProxyRosterTarget) identified).proxies();
+            if (!proxies.isEmpty()) return proxies;
+            // An empty roster from this seed: try the next one, mirroring
+            // fetchNodeList's identical treatment of an empty node list.
+        }
+        return null;
     }
 
     /** Redials {@code address}, honoring the per-address reconnect

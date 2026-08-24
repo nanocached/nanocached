@@ -160,8 +160,11 @@ after a roster refresh, and fans <code>c</code>/<code>F</code> to every
 member. To a client it looks like a single node that owns every key, so
 any SDK pointed at one address — and any bare protocol client — works
 against it unchanged, with no ring view or discovery client of its own.
-Proxies are stateless and scale horizontally behind one address; clients
-that prefer cluster-direct connections keep working as before. Backend
+Proxies are stateless and scale horizontally: each registers itself with
+discovery, and a client in proxy mode asks discovery for the proxy list
+and picks one — the only address anything ever needs is discovery's (a
+LB/VIP in front of the proxies works too). Clients that prefer
+cluster-direct connections keep working as before. Backend
 connection sharing (many clients multiplexed onto few tagged, pipelined
 connections per node — what collapses the node-side count from fleet
 size to proxy count) is the next step, designed in the proxy's module

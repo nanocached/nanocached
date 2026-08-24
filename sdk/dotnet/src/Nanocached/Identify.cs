@@ -43,6 +43,15 @@ internal static class Identify
 
     internal sealed record ClusterTarget(IReadOnlyList<DiscoveredNode> Nodes, int Replication) : Result;
 
+    /// <summary>SDK proxy mode (issue #122): the roster a discovery
+    /// server's <c>Q</c> answers with — every currently-announced
+    /// <c>nanocached-proxy</c>, by (name, address). Unlike
+    /// <see cref="ClusterTarget"/> there is no replication factor on the
+    /// wire (a proxy owns every key, so replication is meaningless to a
+    /// client of one) and no ring — the caller picks exactly one proxy to
+    /// connect to, single-connection style.</summary>
+    internal sealed record ProxyListTarget(IReadOnlyList<DiscoveredNode> Proxies) : Result;
+
     /// <summary>
     /// Always dials with the extended <c>A ... T</c> first (echoed response tags),
     /// so a 0019+ server tags this connection from the start. Only when the
@@ -51,18 +60,28 @@ internal static class Identify
     /// malformed-but-present reply — does this transparently redial once
     /// with the plain <c>A</c> form and run the connection untagged, the
     /// same as before echoed response tags existed.
+    ///
+    /// <para>SDK proxy mode (issue #122): <paramref name="viaProxy"/> only
+    /// changes what happens once the server identifies itself as
+    /// discovery — <c>Q</c> (returning a <see cref="ProxyListTarget"/>)
+    /// instead of the usual <c>L</c> (<see cref="ClusterTarget"/>). A
+    /// server that identifies as a plain cache node answers the same
+    /// <see cref="NodeTarget"/> either way; it is the caller's job (see
+    /// <see cref="NanocachedClient.ConnectAsync"/>) to treat that as a
+    /// hard "ViaProxy needs discovery addresses" error instead of pinning
+    /// to it as a single node the way non-proxy mode would.</para>
     /// </summary>
     internal static async Task<Result> ConnectAndIdentifyAsync(
-        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls)
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool viaProxy = false)
     {
         try
         {
-            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: true)
+            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: true, viaProxy)
                 .ConfigureAwait(false);
         }
         catch (Exception error) when (IsLegacyServerSignal(error))
         {
-            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: false)
+            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: false, viaProxy)
                 .ConfigureAwait(false);
         }
     }
@@ -85,12 +104,13 @@ internal static class Identify
         && error.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted;
 
     private static async Task<Result> ConnectAndIdentifyWithDeadlineAsync(
-        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags)
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags,
+        bool viaProxy)
     {
         using var deadline = new CancellationTokenSource(ConnectDeadline);
         try
         {
-            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, requestTags, deadline.Token)
+            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, requestTags, viaProxy, deadline.Token)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
@@ -102,7 +122,7 @@ internal static class Identify
 
     private static async Task<Result> ConnectAndIdentifyAsync(
         string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags,
-        CancellationToken cancel)
+        bool viaProxy, CancellationToken cancel)
     {
         Stream stream = await OpenAsync(host, port, tls, cancel).ConfigureAwait(false);
         try
@@ -155,12 +175,21 @@ internal static class Identify
                 return new NodeTarget(stream, tagged);
             }
 
-            // A discovery server: one-shot L, then this connection is done.
-            // Tags carry no meaning for discovery (echoed response tags) — L is a
-            // single request/response with nothing to desync — but the
-            // `OdT\n` ack still had to be parsed above since the client
-            // sends the extended `A` before knowing which kind of server
-            // answered.
+            // A discovery server: one-shot L (or, in SDK proxy mode, Q),
+            // then this connection is done. Tags carry no meaning for
+            // discovery (echoed response tags) — both are a single
+            // request/response with nothing to desync — but the `OdT\n`
+            // ack still had to be parsed above since the client sends the
+            // extended `A` before knowing which kind of server answered.
+            if (viaProxy)
+            {
+                await stream.WriteAsync("Q\n"u8.ToArray(), cancel).ConfigureAwait(false);
+                await stream.FlushAsync(cancel).ConfigureAwait(false);
+                ProxyListTarget proxyList = await ReadProxyListAsync(stream, cancel).ConfigureAwait(false);
+                stream.Dispose();
+                return proxyList;
+            }
+
             await stream.WriteAsync("L\n"u8.ToArray(), cancel).ConfigureAwait(false);
             await stream.FlushAsync(cancel).ConfigureAwait(false);
             ClusterTarget cluster = await ReadNodeListAsync(stream, cancel).ConfigureAwait(false);
@@ -353,6 +382,71 @@ internal static class Identify
         }
 
         return new ClusterTarget(nodes, replication);
+    }
+
+    /// <summary>SDK proxy mode (issue #122): parses a <c>Q</c> reply —
+    /// <c>N &lt;count&gt;\n</c> then, per proxy, the exact same
+    /// <c>&lt;name-len&gt; &lt;addr-len&gt;\n&lt;name&gt;&lt;addr&gt;\n</c>
+    /// entry shape <see cref="ReadNodeListAsync"/> reads for <c>L</c> —
+    /// except the header carries no replication field (a proxy needs no
+    /// R: it owns every key). Same bounded parsing throughout
+    /// (<see cref="MaxNodeCount"/>/<see cref="MaxNodeListResponseBytes"/>/
+    /// <see cref="MaxHeaderLineLength"/>, shared with <see cref="ReadNodeListAsync"/>)
+    /// and the same <c>B</c>-during-startup-grace handling.</summary>
+    private static async Task<ProxyListTarget> ReadProxyListAsync(Stream stream, CancellationToken cancel)
+    {
+        string header = await ReadLineAsync(stream, cancel).ConfigureAwait(false);
+
+        if (header.StartsWith('B'))
+        {
+            throw new DiscoveryBusyException();
+        }
+        if (!header.StartsWith("N ", StringComparison.Ordinal))
+        {
+            throw new NanocachedException(
+                $"nanocached: unexpected response from discovery server: {header}");
+        }
+
+        if (!int.TryParse(header[2..], out int count) || count < 0 || count > MaxNodeCount)
+        {
+            throw new NanocachedException("nanocached: invalid proxy count in discovery response");
+        }
+
+        // count is bounded by MaxNodeCount above — safe to size the
+        // list's capacity from it, mirroring ReadNodeListAsync.
+        var proxies = new List<DiscoveredNode>(count);
+        long totalBytes = 0;
+        for (int i = 0; i < count; i++)
+        {
+            string[] lengths = (await ReadLineAsync(stream, cancel).ConfigureAwait(false)).Split(' ');
+            if (lengths.Length != 2
+                || !int.TryParse(lengths[0], out int nameLength)
+                || !int.TryParse(lengths[1], out int addrLength)
+                || nameLength < 0
+                || addrLength < 0)
+            {
+                throw new NanocachedException("nanocached: invalid proxy entry header in discovery response");
+            }
+
+            totalBytes += (long)nameLength + addrLength + 1;
+            if (totalBytes > MaxNodeListResponseBytes)
+            {
+                throw new NanocachedException(
+                    $"nanocached: discovery proxy-list response exceeds {MaxNodeListResponseBytes} bytes");
+            }
+
+            var body = new byte[nameLength + addrLength + 1]; // +1: trailing '\n'
+            await stream.ReadExactlyAsync(body, cancel).ConfigureAwait(false);
+            if (body[^1] != (byte)'\n')
+            {
+                throw new NanocachedException("nanocached: malformed proxy entry in discovery response");
+            }
+            proxies.Add(new DiscoveredNode(
+                Encoding.UTF8.GetString(body, 0, nameLength),
+                Encoding.UTF8.GetString(body, nameLength, addrLength)));
+        }
+
+        return new ProxyListTarget(proxies);
     }
 
     private static async Task<string> ReadLineAsync(Stream stream, CancellationToken cancel)

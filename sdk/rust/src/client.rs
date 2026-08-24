@@ -24,7 +24,8 @@ use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::hash_ring::HashRing;
 use crate::identify::{
-    connect_and_identify, resolve_tls, split_host_port, Identified, TlsConfig, CONNECT_DEADLINE,
+    connect_and_identify, resolve_tls, split_host_port, DiscoveredNode, DiscoveryQuery, Identified,
+    Stream, TlsConfig, CONNECT_DEADLINE,
 };
 use crate::open_targets;
 
@@ -230,6 +231,7 @@ pub struct Options {
     read_repair: bool,
     reconnect_cooldown: ReconnectCooldown,
     read_hedge_after: Option<Duration>,
+    via_proxy: bool,
 }
 
 /// `Options::reconnect_cooldown`'s intent, kept distinct from the
@@ -274,6 +276,7 @@ impl Default for Options {
             read_repair: false,
             reconnect_cooldown: ReconnectCooldown::Default,
             read_hedge_after: None,
+            via_proxy: false,
         }
     }
 }
@@ -454,6 +457,34 @@ impl Options {
         self.read_hedge_after = Some(duration);
         self
     }
+
+    /// SDK proxy mode (issue #122). Off by default. Meaningful only when
+    /// [`Self::addresses`] names discovery server(s): `connect()` fetches
+    /// the proxy roster (`Q`, not the node roster `L`) from a discovery
+    /// seed and lands on ONE proxy chosen at random — spreading a fleet of
+    /// clients across the proxy tier — instead of joining every node
+    /// individually. If the first address reached identifies as a cache
+    /// node rather than a discovery server, `connect()` fails fast with
+    /// [`Error::InvalidArgument`]: proxy mode needs discovery addresses.
+    ///
+    /// A proxy looks, on the wire, exactly like a single node that owns
+    /// every key (`A` answers `On`/`OnT`, full `G`/`S`/`D`/`g`/`s`/`d`/`c`
+    /// support, never `W`), so from here on this client runs in its
+    /// existing single-connection mode: no ring view, no per-node
+    /// connections, and — since there are no replicas to hedge a read
+    /// to — [`Self::read_hedge_after`] is simply inert if also set;
+    /// namespaces, `clear`/`clear_all`, compression, and keep-alive all
+    /// work unchanged over the one connection. If the connection to the
+    /// proxy is lost, the same proxy is redialed first (it may simply have
+    /// restarted); only once that also fails does the client re-fetch the
+    /// roster from discovery and swap onto another, randomly chosen,
+    /// reachable proxy — reusing this crate's existing reconnect/refresh
+    /// plumbing and `stats().refresh_failures` counter rather than a
+    /// second one. `close()` is unchanged.
+    pub fn via_proxy(mut self, enabled: bool) -> Self {
+        self.via_proxy = enabled;
+        self
+    }
 }
 
 struct Member {
@@ -560,6 +591,12 @@ struct Inner {
     /// instead of leaving it dangling past the client's own lifetime.
     hedged_reads: Mutex<tokio::task::JoinSet<()>>,
     stats: StatsCounters,
+    /// SDK proxy mode (issue #122): see [`Options::via_proxy`]. When set,
+    /// `target` is always `Target::Single` (a proxy is single-connection
+    /// from the client's point of view), but `with_cluster_retry` treats a
+    /// `ConnectionLost` from it differently than a genuine standalone
+    /// node's — see `reconnect_proxy`.
+    via_proxy: bool,
 }
 
 impl Inner {
@@ -582,6 +619,189 @@ fn close_all_connections(target: &Target) {
             }
         }
     }
+}
+
+/// SDK proxy mode (issue #122, `Options::via_proxy`): walks `addresses`
+/// exactly like the normal cluster path — the same seed iteration,
+/// unreachable/`B`-busy skipping, and `connect_and_identify` call — but
+/// asks each for the *proxy* roster (`Q`) instead of the node roster
+/// (`L`), and lands on one proxy chosen at random rather than joining
+/// every node. Kept as its own function (called only from `connect`, in
+/// place of the node/cluster loop) rather than threaded through that
+/// loop: the two shapes share only the seed-walking idea, not any actual
+/// code — a `Cluster` target owns a whole ring and every member's
+/// connection, while this always produces a plain `Target::Single`.
+///
+/// An address that identifies as a cache node is a hard error, not a
+/// skip — `Options::via_proxy`'s own doc comment: proxy mode needs
+/// discovery addresses, and the same misconfiguration would just repeat
+/// at every other configured address too. An address whose roster is
+/// empty, or none of whose proxies can be dialed, is skipped in favor of
+/// the next seed exactly like an empty node roster is in the normal
+/// path.
+///
+/// The returned tracking key is the discovery address that actually
+/// served `Q` — not whichever proxy address ends up live — mirroring
+/// `Target::Cluster`'s own convention (see `Member`'s doc comment): every
+/// socket this client ever opens, this first one and every later
+/// reconnect dial alike (same proxy or a freshly chosen one), is counted
+/// against that one open-targets key.
+async fn connect_via_proxy(
+    addresses: &[(String, u16)],
+    auth_secret: Option<&[u8]>,
+    tls: Option<&TlsConfig>,
+) -> Result<(Target, String)> {
+    let mut last_error: Option<Error> = None;
+
+    for (host, port) in addresses {
+        let key = format!("{host}:{port}");
+
+        match connect_and_identify(
+            host,
+            *port,
+            auth_secret,
+            tls,
+            CONNECT_DEADLINE,
+            DiscoveryQuery::Proxies,
+        )
+        .await
+        {
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+            Ok(Identified::Node { .. }) => {
+                // The stream is simply dropped (closing the socket) — a
+                // misconfiguration, not something another seed could fix
+                // (every discovery replica would answer the same way a
+                // single node does), so this fails fast instead of
+                // skipping ahead, mirroring the non-proxy path's own
+                // hard error for a node address that unexpectedly turns
+                // out to be a discovery server.
+                return Err(Error::InvalidArgument(format!(
+                    "nanocached: via_proxy needs discovery server addresses, but {key} identifies \
+                     as a cache node"
+                )));
+            }
+            Ok(Identified::Cluster { .. }) => {
+                // Cannot happen: this function always asks with
+                // `DiscoveryQuery::Proxies`. Kept as a defensive error
+                // rather than `unreachable!()`, matching this crate's
+                // general stance on trusting a remote server's framing.
+                return Err(Error::Protocol(format!(
+                    "nanocached: discovery server at {key} answered a query this client never sent"
+                )));
+            }
+            Ok(Identified::Proxies { proxies }) => {
+                if proxies.is_empty() {
+                    last_error = Some(Error::Protocol(format!(
+                        "nanocached: no proxies registered with the discovery server at {key}"
+                    )));
+                    continue;
+                }
+                let Some((address, stream, tagged)) =
+                    dial_random_proxy(&proxies, auth_secret, tls).await
+                else {
+                    last_error = Some(Error::ConnectionLost(format!(
+                        "nanocached: none of the {} proxy(es) registered with {key} are reachable",
+                        proxies.len()
+                    )));
+                    continue;
+                };
+                let connection = Arc::new(Connection::new(stream, key.clone(), tagged));
+                return Ok((
+                    Target::Single {
+                        address,
+                        connection,
+                    },
+                    key,
+                ));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        Error::ConnectionLost("nanocached: could not connect to any address".to_string())
+    }))
+}
+
+/// Proxy mode (issue #122): tries `proxies` in random order — see
+/// `shuffled_indices` for why this crate rolls its own tiny shuffle
+/// rather than pulling in `rand` — and dials the first entry that
+/// identifies as a cache node, exactly what a proxy looks like on the
+/// wire (the module doc comment). `None` only once every entry has been
+/// tried and failed (an unparseable address, a dial failure, or —
+/// defensively — an address that turns out not to be a node at all).
+async fn dial_random_proxy(
+    proxies: &[DiscoveredNode],
+    auth_secret: Option<&[u8]>,
+    tls: Option<&TlsConfig>,
+) -> Option<(String, Stream, bool)> {
+    for index in shuffled_indices(proxies.len()) {
+        let proxy = &proxies[index];
+        let Ok((host, port)) = split_host_port(&proxy.address) else {
+            continue;
+        };
+        if let Ok(Identified::Node { stream, tagged }) = connect_and_identify(
+            &host,
+            port,
+            auth_secret,
+            tls,
+            CONNECT_DEADLINE,
+            DiscoveryQuery::Nodes,
+        )
+        .await
+        {
+            return Some((proxy.address.clone(), stream, tagged));
+        }
+    }
+    None
+}
+
+/// A Fisher-Yates shuffle of `0..n`, using this module's own
+/// dependency-free `random_u64` (proxy mode, issue #122) — picking which
+/// proxy a client lands on has no security requirement, only "spread a
+/// fleet of clients across proxies" (the spec this shipped against), so
+/// pulling in the `rand` crate for it would be pure overhead this
+/// otherwise-minimal-dependency crate doesn't need (mirrors why `tls`/
+/// `compression` stay behind optional features instead of always-on
+/// dependencies).
+fn shuffled_indices(n: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (random_u64() % (i as u64 + 1)) as usize;
+        indices.swap(i, j);
+    }
+    indices
+}
+
+/// A small, non-cryptographic source of randomness for `shuffled_indices`
+/// (proxy mode, issue #122): seeded from the current time's nanoseconds,
+/// a per-process atomic counter (so two calls within the same nanosecond
+/// still diverge), and this stack frame's own address (ASLR entropy),
+/// mixed with `splitmix64`. Good enough to keep a fleet of fresh clients
+/// from all piling onto the same proxy — not a security boundary, so
+/// nothing here needs to resist prediction.
+fn random_u64() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let stack_entropy = &counter as *const u64 as u64;
+    splitmix64(nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ stack_entropy)
+}
+
+/// The SplitMix64 mixing step (public domain; Vigna's `splitmix64.c`) —
+/// spreads `random_u64`'s not-very-random inputs into a well-distributed
+/// output.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// A cheaply cloneable handle; all clones share one set of connections.
@@ -609,10 +829,6 @@ impl NanocachedClient {
         let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
         let reconnect_cooldown = options.reconnect_cooldown.resolve();
 
-        // Walk the addresses until one yields a working target; an
-        // address that is unreachable, warming up (`B`, discovery HA), or
-        // knows no live nodes is skipped — the next replica may do
-        // better.
         let mut last_error: Option<Error> = None;
         let mut target: Option<Target> = None;
         let mut tracking_key = String::new();
@@ -625,166 +841,208 @@ impl NanocachedClient {
         // behind. Folded into `Inner::reconnect_cooldowns` once it exists.
         let mut initial_cooldowns: HashMap<String, (Instant, Error)> = HashMap::new();
 
-        for (host, port) in &options.addresses {
-            let key = format!("{host}:{port}");
+        if options.via_proxy {
+            // SDK proxy mode (issue #122): a wholly different connect
+            // shape — fetch the proxy roster (`Q`) rather than the node
+            // roster (`L`) and land on one proxy, not join every node —
+            // so it gets its own function entirely rather than being
+            // threaded through the node/cluster loop below. See
+            // `connect_via_proxy`'s own doc comment.
+            let (proxy_target, key) =
+                connect_via_proxy(&options.addresses, auth_secret, tls.as_ref()).await?;
+            target = Some(proxy_target);
+            tracking_key = key;
+        } else {
+            // Walk the addresses until one yields a working target; an
+            // address that is unreachable, warming up (`B`, discovery HA), or
+            // knows no live nodes is skipped — the next replica may do
+            // better.
+            for (host, port) in &options.addresses {
+                let key = format!("{host}:{port}");
 
-            // Only meaningful for a single explicit target: with an
-            // addresses list, another client instance legitimately
-            // holding connections to the same address makes this
-            // heuristic false-positive (issue #12).
-            if options.addresses.len() == 1 && open_targets::has_open(&key) {
-                eprintln!(
+                // Only meaningful for a single explicit target: with an
+                // addresses list, another client instance legitimately
+                // holding connections to the same address makes this
+                // heuristic false-positive (issue #12).
+                if options.addresses.len() == 1 && open_targets::has_open(&key) {
+                    eprintln!(
                     "nanocached: connect() called for {key} while a previous connection to it is \
                      still open — was close() forgotten?"
                 );
-            }
+                }
 
-            match connect_and_identify(host, *port, auth_secret, tls.as_ref(), CONNECT_DEADLINE)
+                match connect_and_identify(
+                    host,
+                    *port,
+                    auth_secret,
+                    tls.as_ref(),
+                    CONNECT_DEADLINE,
+                    DiscoveryQuery::Nodes,
+                )
                 .await
-            {
-                Err(error) => last_error = Some(error),
-                Ok(Identified::Node { stream, tagged }) => {
-                    if options.addresses.len() > 1 {
-                        let remaining = options.addresses.len() - 1;
-                        eprintln!(
+                {
+                    Err(error) => last_error = Some(error),
+                    Ok(Identified::Node { stream, tagged }) => {
+                        if options.addresses.len() > 1 {
+                            let remaining = options.addresses.len() - 1;
+                            eprintln!(
                             "nanocached: {key} is a cache node, so this client is pinned to that \
                              single server — the {remaining} remaining address(es) will not be \
                              used. Point addresses at discovery servers for cluster routing and \
                              failover."
                         );
+                        }
+                        target = Some(Target::Single {
+                            address: key.clone(),
+                            connection: Arc::new(Connection::new(stream, key.clone(), tagged)),
+                        });
+                        tracking_key = key;
+                        break;
                     }
-                    target = Some(Target::Single {
-                        address: key.clone(),
-                        connection: Arc::new(Connection::new(stream, key.clone(), tagged)),
-                    });
-                    tracking_key = key;
-                    break;
-                }
-                Ok(Identified::Cluster { nodes, replication }) => {
-                    if nodes.is_empty() {
-                        last_error = Some(Error::Protocol(format!(
+                    Ok(Identified::Cluster { nodes, replication }) => {
+                        if nodes.is_empty() {
+                            last_error = Some(Error::Protocol(format!(
                             "nanocached: no live nodes registered with the discovery server at {key}"
                         )));
-                        continue;
-                    }
+                            continue;
+                        }
 
-                    // Dials every listed node concurrently (issue #67):
-                    // `join_all` polls every dial together instead of one
-                    // after another, so bootstrap's worst-case latency
-                    // stays one `CONNECT_DEADLINE` regardless of cluster
-                    // size, not `nodes.len()` of them in sequence.
-                    let outcomes = futures_util::future::join_all(nodes.iter().map(|node| async {
-                        let (node_host, node_port) = split_host_port(&node.address)?;
-                        connect_and_identify(
-                            &node_host,
-                            node_port,
-                            auth_secret,
-                            tls.as_ref(),
-                            CONNECT_DEADLINE,
-                        )
-                        .await
-                    }))
-                    .await;
+                        // Dials every listed node concurrently (issue #67):
+                        // `join_all` polls every dial together instead of one
+                        // after another, so bootstrap's worst-case latency
+                        // stays one `CONNECT_DEADLINE` regardless of cluster
+                        // size, not `nodes.len()` of them in sequence.
+                        let outcomes =
+                            futures_util::future::join_all(nodes.iter().map(|node| async {
+                                let (node_host, node_port) = split_host_port(&node.address)?;
+                                connect_and_identify(
+                                    &node_host,
+                                    node_port,
+                                    auth_secret,
+                                    tls.as_ref(),
+                                    CONNECT_DEADLINE,
+                                    DiscoveryQuery::Nodes,
+                                )
+                                .await
+                            }))
+                            .await;
 
-                    let mut members = HashMap::new();
-                    let mut reachable = 0usize;
-                    let mut dial_last_error: Option<Error> = None;
-                    let mut hard_error: Option<Error> = None;
+                        let mut members = HashMap::new();
+                        let mut reachable = 0usize;
+                        let mut dial_last_error: Option<Error> = None;
+                        let mut hard_error: Option<Error> = None;
 
-                    for (node, outcome) in nodes.iter().zip(outcomes) {
-                        match outcome {
-                            Ok(Identified::Node { stream, tagged }) => {
-                                members.insert(
-                                    node.name.clone(),
-                                    Member {
-                                        address: node.address.clone(),
-                                        connection: Arc::new(Connection::new(
-                                            stream,
-                                            key.clone(),
-                                            tagged,
-                                        )),
-                                    },
-                                );
-                                reachable += 1;
-                            }
-                            Ok(Identified::Cluster { .. }) => {
-                                // The same wrong answer would come back
-                                // from every replica of this address, so
-                                // there's no point tolerating it or trying
-                                // another discovery address — a hard
-                                // error, same as before issue #67.
-                                hard_error = Some(Error::Protocol(format!(
+                        for (node, outcome) in nodes.iter().zip(outcomes) {
+                            match outcome {
+                                Ok(Identified::Node { stream, tagged }) => {
+                                    members.insert(
+                                        node.name.clone(),
+                                        Member {
+                                            address: node.address.clone(),
+                                            connection: Arc::new(Connection::new(
+                                                stream,
+                                                key.clone(),
+                                                tagged,
+                                            )),
+                                        },
+                                    );
+                                    reachable += 1;
+                                }
+                                Ok(Identified::Cluster { .. }) | Ok(Identified::Proxies { .. }) => {
+                                    // The same wrong answer would come back
+                                    // from every replica of this address, so
+                                    // there's no point tolerating it or trying
+                                    // another discovery address — a hard
+                                    // error, same as before issue #67. Every
+                                    // dial here uses `DiscoveryQuery::Nodes`,
+                                    // so `Proxies` is only reachable if a
+                                    // discovery-listed node address somehow
+                                    // answers as a discovery server itself.
+                                    hard_error = Some(Error::Protocol(format!(
                                     "nanocached: discovery server returned a non-node address: {}",
                                     node.address
                                 )));
-                                break;
-                            }
-                            Err(error) => {
-                                // Issue #67: a node discovery still lists
-                                // but that can't be reached — typically
-                                // one that just died and hasn't been
-                                // evicted yet (a window of seconds) — is
-                                // installed as a member without a live
-                                // connection (the same `Connection::dead()`
-                                // placeholder a newly-discovered node gets
-                                // in `refresh_node_list`) rather than
-                                // failing `connect()` outright. It stays in
-                                // the ring, so a request for one of its
-                                // keys fails over per request exactly as
-                                // it would after a mid-life death, and the
-                                // reconnect cooldown armed here means the
-                                // very first such request doesn't even pay
-                                // for a doomed redial.
-                                if let Some(cooldown) = reconnect_cooldown {
-                                    initial_cooldowns.insert(
-                                        node.address.clone(),
-                                        (Instant::now() + cooldown, error.clone()),
-                                    );
+                                    break;
                                 }
-                                members.insert(
-                                    node.name.clone(),
-                                    Member {
-                                        address: node.address.clone(),
-                                        connection: Arc::new(Connection::dead()),
-                                    },
-                                );
-                                dial_last_error = Some(error);
+                                Err(error) => {
+                                    // Issue #67: a node discovery still lists
+                                    // but that can't be reached — typically
+                                    // one that just died and hasn't been
+                                    // evicted yet (a window of seconds) — is
+                                    // installed as a member without a live
+                                    // connection (the same `Connection::dead()`
+                                    // placeholder a newly-discovered node gets
+                                    // in `refresh_node_list`) rather than
+                                    // failing `connect()` outright. It stays in
+                                    // the ring, so a request for one of its
+                                    // keys fails over per request exactly as
+                                    // it would after a mid-life death, and the
+                                    // reconnect cooldown armed here means the
+                                    // very first such request doesn't even pay
+                                    // for a doomed redial.
+                                    if let Some(cooldown) = reconnect_cooldown {
+                                        initial_cooldowns.insert(
+                                            node.address.clone(),
+                                            (Instant::now() + cooldown, error.clone()),
+                                        );
+                                    }
+                                    members.insert(
+                                        node.name.clone(),
+                                        Member {
+                                            address: node.address.clone(),
+                                            connection: Arc::new(Connection::dead()),
+                                        },
+                                    );
+                                    dial_last_error = Some(error);
+                                }
                             }
                         }
-                    }
 
-                    if let Some(error) = hard_error {
-                        // Close whatever real connections already opened
-                        // so they aren't leaked (and stay counted forever
-                        // in open_targets); a dead placeholder has none to
-                        // close, but close() on it is a harmless no-op.
-                        for member in members.values() {
-                            member.connection.close();
+                        if let Some(error) = hard_error {
+                            // Close whatever real connections already opened
+                            // so they aren't leaked (and stay counted forever
+                            // in open_targets); a dead placeholder has none to
+                            // close, but close() on it is a harmless no-op.
+                            for member in members.values() {
+                                member.connection.close();
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
-                    }
 
-                    if reachable == 0 {
-                        // No listed node was reachable at all: nothing to
-                        // route to, so connect() itself fails, with the
-                        // last dial error — matching steady-state
-                        // behavior, where a node that never comes back is
-                        // eventually indistinguishable from one that was
-                        // never there.
-                        return Err(dial_last_error.unwrap_or_else(|| {
-                            Error::ConnectionLost(
-                                "nanocached: could not connect to any address".to_string(),
-                            )
-                        }));
-                    }
+                        if reachable == 0 {
+                            // No listed node was reachable at all: nothing to
+                            // route to, so connect() itself fails, with the
+                            // last dial error — matching steady-state
+                            // behavior, where a node that never comes back is
+                            // eventually indistinguishable from one that was
+                            // never there.
+                            return Err(dial_last_error.unwrap_or_else(|| {
+                                Error::ConnectionLost(
+                                    "nanocached: could not connect to any address".to_string(),
+                                )
+                            }));
+                        }
 
-                    target = Some(Target::Cluster {
-                        ring: HashRing::new(nodes.iter().map(|node| node.name.clone()).collect()),
-                        members,
-                        replication,
-                    });
-                    tracking_key = key;
-                    break;
+                        target = Some(Target::Cluster {
+                            ring: HashRing::new(
+                                nodes.iter().map(|node| node.name.clone()).collect(),
+                            ),
+                            members,
+                            replication,
+                        });
+                        tracking_key = key;
+                        break;
+                    }
+                    // Unreachable in practice — this loop always dials with
+                    // `DiscoveryQuery::Nodes`, which never yields `Proxies` —
+                    // but the match must stay exhaustive over `Identified`.
+                    // `Options::via_proxy` connects via `connect_via_proxy`
+                    // instead, never reaching this loop at all.
+                    Ok(Identified::Proxies { .. }) => {
+                        last_error = Some(Error::Protocol(format!(
+                        "nanocached: discovery server at {key} answered a query this client never sent"
+                    )));
+                    }
                 }
             }
         }
@@ -819,6 +1077,7 @@ impl NanocachedClient {
             read_hedge_after: options.read_hedge_after,
             hedged_reads: Mutex::new(tokio::task::JoinSet::new()),
             stats: StatsCounters::default(),
+            via_proxy: options.via_proxy,
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
@@ -1197,6 +1456,19 @@ impl NanocachedClient {
     /// window for a dead node is therefore bounded by discovery's
     /// liveness timeout. A second failure after a fresh refresh
     /// propagates.
+    ///
+    /// Proxy mode (issue #122) gets its own branch here rather than
+    /// reusing the cluster one: `state.target` is always `Target::Single`
+    /// in proxy mode (a proxy is single-connection to this client), so
+    /// `clustered` below is always false for it — without this branch a
+    /// `ConnectionLost` would simply propagate after `apply_reconnecting`'s
+    /// own same-address redial already failed, exactly like a genuine
+    /// standalone node, with no way to fail over to a different proxy at
+    /// all. `reconnect_proxy` is that failover: it re-fetches the roster
+    /// and swaps onto another, randomly chosen, reachable proxy before
+    /// this retries the operation once more. `WrongNode` is not
+    /// special-cased here — a well-behaved proxy never sends one (it owns
+    /// every key), so one arriving anyway propagates rather than looping.
     async fn with_cluster_retry<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
@@ -1204,6 +1476,10 @@ impl NanocachedClient {
     {
         match operation().await {
             Ok(value) => Ok(value),
+            Err(Error::ConnectionLost(_)) if self.inner.via_proxy => {
+                self.reconnect_proxy().await;
+                operation().await
+            }
             Err(error @ (Error::WrongNode | Error::ConnectionLost(_))) => {
                 let clustered =
                     matches!(self.inner.state.lock().await.target, Target::Cluster { .. });
@@ -1781,6 +2057,7 @@ impl NanocachedClient {
             self.inner.auth_secret_bytes(),
             self.inner.tls.as_ref(),
             CONNECT_DEADLINE,
+            DiscoveryQuery::Nodes,
         )
         .await?;
         match identified {
@@ -1790,9 +2067,14 @@ impl NanocachedClient {
                 }
                 Ok((stream, tagged))
             }
-            Identified::Cluster { .. } => Err(Error::Protocol(format!(
-                "nanocached: {address} no longer identifies as a cache node"
-            ))),
+            // `address` is always a node's own address here (a plain
+            // single-node target, a cluster member, or — proxy mode,
+            // issue #122 — the one proxy this client is pinned to): any
+            // other answer means it stopped being a cache node underneath
+            // this client, same treatment either way.
+            Identified::Cluster { .. } | Identified::Proxies { .. } => Err(Error::Protocol(
+                format!("nanocached: {address} no longer identifies as a cache node"),
+            )),
         }
     }
 
@@ -1923,11 +2205,94 @@ impl NanocachedClient {
                 self.inner.auth_secret_bytes(),
                 self.inner.tls.as_ref(),
                 CONNECT_DEADLINE,
+                DiscoveryQuery::Nodes,
             )
             .await
             {
                 if !nodes.is_empty() {
                     return Some((nodes, replication));
+                }
+            }
+        }
+        None
+    }
+
+    /// Proxy mode reconnect-on-loss, second half (issue #122; see
+    /// `Options::via_proxy`'s doc comment). Called from `with_cluster_retry`
+    /// once the same-proxy redial already inside `apply_reconnecting`'s
+    /// own one-shot retry has failed — the proxy itself is down, not just
+    /// this one socket — so this re-fetches the proxy roster from the
+    /// configured discovery address(es) and, if a reachable one turns up,
+    /// swaps `state.target` onto it exactly like `connect_via_proxy` built
+    /// it in the first place.
+    ///
+    /// Swallows every failure the same way `refresh_node_list` does: no
+    /// error escapes this method itself (counted in
+    /// `stats().refresh_failures` instead), leaving the already-dead
+    /// connection in place — the caller's own retry runs against that
+    /// same stale target and simply fails again with a fresh dial error,
+    /// which is exactly what should surface when discovery itself has
+    /// nothing left to offer.
+    async fn reconnect_proxy(&self) {
+        let Some((address, stream, tagged)) = self.dial_a_fresh_proxy().await else {
+            self.inner
+                .stats
+                .refresh_failures
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let connection = Arc::new(Connection::new(
+            stream,
+            self.inner.tracking_key.clone(),
+            tagged,
+        ));
+
+        let mut state = self.inner.state.lock().await;
+        if self.inner.closed.load(Ordering::SeqCst) {
+            // close() ran while this was dialing (issue #10, mirrored
+            // here exactly as in `slot_connection`): installing this
+            // connection now would leak it past teardown.
+            connection.close();
+            return;
+        }
+        if let Target::Single {
+            address: current_address,
+            connection: current_connection,
+        } = &mut state.target
+        {
+            current_connection.close();
+            *current_address = address;
+            *current_connection = connection;
+        }
+    }
+
+    /// Re-fetches the proxy roster from every configured discovery
+    /// address in turn (discovery HA, mirroring `fetch_node_list`) and
+    /// dials a random, reachable entry from the first non-empty roster —
+    /// see `dial_random_proxy`. `None` once every address has been tried
+    /// and none yielded a reachable proxy.
+    async fn dial_a_fresh_proxy(&self) -> Option<(String, crate::identify::Stream, bool)> {
+        for (host, port) in &self.inner.addresses {
+            if let Ok(Identified::Proxies { proxies }) = connect_and_identify(
+                host,
+                *port,
+                self.inner.auth_secret_bytes(),
+                self.inner.tls.as_ref(),
+                CONNECT_DEADLINE,
+                DiscoveryQuery::Proxies,
+            )
+            .await
+            {
+                if !proxies.is_empty() {
+                    if let Some(result) = dial_random_proxy(
+                        &proxies,
+                        self.inner.auth_secret_bytes(),
+                        self.inner.tls.as_ref(),
+                    )
+                    .await
+                    {
+                        return Some(result);
+                    }
                 }
             }
         }

@@ -134,6 +134,40 @@ path). The losing leg of a hedge is left to finish and is drained by
 `Close()`. Zero (the default) disables hedging; a negative value is
 rejected by `Connect`.
 
+## Proxy mode
+
+Off by default. `ViaProxy` connects through a `nanocached-proxy` fronting
+the cluster instead of joining the ring directly:
+
+```go
+client, err := nanocached.Connect(nanocached.Config{
+    Addresses: []nanocached.Address{{Host: "discovery.internal", Port: 8356}},
+    ViaProxy:  true,
+})
+```
+
+`Addresses` must name discovery server(s) — `Connect` fetches the
+registered proxy roster instead of the node roster, and connects to one
+proxy chosen at random, spreading a fleet of clients across the proxy
+fleet rather than piling onto whichever proxy happens to be listed first;
+a proxy that can't be reached fails over to another, still at random.
+Pointing `ViaProxy` at a plain node address (not discovery) fails
+`Connect` with a clear error.
+
+A proxy answers the identify handshake exactly like a single node that
+owns every key, so from there the client runs in its ordinary
+single-connection mode: no ring, no per-node connections, and — since a
+single connection has no replicas to hedge to — **a configured
+`ReadHedgeAfter` is inert in proxy mode** (every read simply goes to the
+one connection; there is nothing to hedge onto). Every other option —
+`Compress`, `FireAndForgetReplicas`, `ReadRepair`, namespaces,
+`Clear`/`ClearAll`, keep-alive — works unchanged over the one connection.
+
+Losing the proxy connection first retries the same proxy (it may simply
+have restarted); only if that also fails does the client re-fetch the
+roster from discovery and fail over to another one at random, reusing the
+same lazy-reconnect-on-use path as the node/cluster modes.
+
 ## Namespaces
 
 `Client.Namespace(ns)` returns a lightweight handle scoping

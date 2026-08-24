@@ -574,6 +574,12 @@ public sealed class MockDiscovery : IDisposable
     private readonly TcpListener _listener;
     private readonly int _replication;
     private volatile IReadOnlyList<(string Name, string Address)> _nodes;
+    // SDK proxy mode (issue #122): the roster `Q` serves — separate from
+    // _nodes (what `L` serves), since a proxy is a different kind of
+    // registration on the wire (Y, not J/P) even though a mock "proxy" is
+    // just a MockNode like any other.
+    private volatile IReadOnlyList<(string Name, string Address)> _proxies =
+        Array.Empty<(string, string)>();
 
     public MockDiscovery(IReadOnlyList<(string Name, string Address)> nodes, int replication = 1)
     {
@@ -587,6 +593,12 @@ public sealed class MockDiscovery : IDisposable
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
 
     public void SetNodes(IReadOnlyList<(string Name, string Address)> nodes) => _nodes = nodes;
+
+    /// <summary>SDK proxy mode: replaces the roster `Q` serves — lets a
+    /// test change which proxies discovery knows about mid-test (e.g. a
+    /// reconnect-failover test dropping a dead one), mirroring
+    /// <see cref="SetNodes"/>.</summary>
+    public void SetProxies(IReadOnlyList<(string Name, string Address)> proxies) => _proxies = proxies;
 
     /// <summary>When set, an L request gets this exact text instead of
     /// the normally generated frame — for tests that need to claim
@@ -641,6 +653,24 @@ public sealed class MockDiscovery : IDisposable
                     }
                     IReadOnlyList<(string Name, string Address)> snapshot = _nodes;
                     var frame = new StringBuilder($"N {snapshot.Count} {_replication}\n");
+                    foreach (var (name, address) in snapshot)
+                    {
+                        frame.Append($"{name.Length} {address.Length}\n{name}{address}\n");
+                    }
+                    await Wire.WriteAsync(stream, frame.ToString());
+                }
+                else if (parts[0] == "Q")
+                {
+                    // SDK proxy mode (issue #122): same startup-grace `B`
+                    // and entry shape as `L`, but no replication field —
+                    // a proxy owns every key, so R means nothing to it.
+                    if (WarmingUp)
+                    {
+                        await Wire.WriteAsync(stream, "B\n");
+                        return;
+                    }
+                    IReadOnlyList<(string Name, string Address)> snapshot = _proxies;
+                    var frame = new StringBuilder($"N {snapshot.Count}\n");
                     foreach (var (name, address) in snapshot)
                     {
                         frame.Append($"{name.Length} {address.Length}\n{name}{address}\n");

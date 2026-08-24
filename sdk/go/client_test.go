@@ -529,7 +529,16 @@ type mockDiscovery struct {
 	replication int
 	mu          sync.Mutex
 	nodes       []discoveredNode
-	warmingUp   bool
+	// proxies is issue #122's registered-proxy roster, served by `Q` —
+	// a mock "proxy" is just a mockNode, exactly as ViaProxy's spec
+	// notes: that is literally what a proxy looks like to a client.
+	proxies   []discoveredNode
+	warmingUp bool
+	// lCount/qCount let a test assert which roster command a client
+	// actually sent — in particular, that ViaProxy never issues `L` at
+	// all (issue #122's "no connection is ever made to a node address").
+	lCount atomic.Int32
+	qCount atomic.Int32
 }
 
 func startMockDiscovery(t *testing.T, nodes []discoveredNode, replication int) *mockDiscovery {
@@ -550,6 +559,16 @@ func (m *mockDiscovery) setNodes(nodes []discoveredNode) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nodes = nodes
+}
+
+// setProxies updates the registered-proxy roster `Q` serves (issue #122)
+// — usable both before Connect and mid-test, exactly like setNodes,
+// since nanocached-discovery.rs's roster is itself live-updatable
+// (ProxyAnnounce) rather than fixed at startup.
+func (m *mockDiscovery) setProxies(proxies []discoveredNode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.proxies = proxies
 }
 
 func (m *mockDiscovery) setWarming(warming bool) {
@@ -592,6 +611,7 @@ func (m *mockDiscovery) serve(conn net.Conn) {
 				return
 			}
 		case "L":
+			m.lCount.Add(1)
 			m.mu.Lock()
 			warming, nodes := m.warmingUp, append([]discoveredNode(nil), m.nodes...)
 			m.mu.Unlock()
@@ -604,6 +624,27 @@ func (m *mockDiscovery) serve(conn net.Conn) {
 			for _, node := range nodes {
 				fmt.Fprintf(&frame, "%d %d\n%s%s\n",
 					len(node.Name), len(node.Address), node.Name, node.Address)
+			}
+			if _, err := conn.Write([]byte(frame.String())); err != nil {
+				return
+			}
+		// Issue #122: `Q`, ListProxies — same reply shape as `L` above,
+		// minus the replication field on the header line (see
+		// nanocached-discovery.rs's ListProxies and readProxyList).
+		case "Q":
+			m.qCount.Add(1)
+			m.mu.Lock()
+			warming, proxies := m.warmingUp, append([]discoveredNode(nil), m.proxies...)
+			m.mu.Unlock()
+			if warming {
+				_, _ = conn.Write([]byte("B\n"))
+				return
+			}
+			var frame strings.Builder
+			fmt.Fprintf(&frame, "N %d\n", len(proxies))
+			for _, proxy := range proxies {
+				fmt.Fprintf(&frame, "%d %d\n%s%s\n",
+					len(proxy.Name), len(proxy.Address), proxy.Name, proxy.Address)
 			}
 			if _, err := conn.Write([]byte(frame.String())); err != nil {
 				return

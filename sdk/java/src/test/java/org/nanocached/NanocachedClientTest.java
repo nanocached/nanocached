@@ -2705,4 +2705,179 @@ class NanocachedClientTest {
             }
         }
     }
+
+    // ── SDK proxy mode (issue #122, viaProxy) ────────────────────────
+
+    private static NanocachedClient.Options viaProxyOptions(int discoveryPort) {
+        return NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", discoveryPort)))
+                .viaProxy(true);
+    }
+
+    @Test
+    void viaProxyRoutesEveryOperationThroughTheChosenProxyAndNeverDialsANode() throws Exception {
+        try (MockNode proxy = new MockNode();
+                MockNode node = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(
+                        List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
+            // A cluster node is registered too, so "never dials a node"
+            // below is an actual assertion, not vacuously true.
+            discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+
+            try (NanocachedClient client =
+                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+                assertTrue(client.delete("k"));
+                assertEquals(Optional.empty(), client.get("k"));
+
+                NanocachedClient.Namespace ns = client.namespace("tenant-a");
+                ns.set("k2", "v2");
+                assertEquals(Optional.of("v2"), ns.get("k2"));
+
+                client.clearAll();
+                assertEquals(Optional.empty(), ns.get("k2"));
+
+                assertTrue(proxy.connectionCount.get() >= 1);
+                assertEquals(0, node.connectionCount.get(),
+                        "viaProxy must never open a connection to a cluster node");
+            }
+        }
+    }
+
+    @Test
+    void viaProxySpreadsClientsAcrossProxiesAtRandom() throws Exception {
+        // Statistical, not seeded, but with p=0.5 per trial and 40 fresh
+        // clients the odds of either proxy going entirely unpicked are
+        // astronomically small (2 * 0.5^40) — deterministic enough in
+        // practice not to flake.
+        try (MockNode proxyA = new MockNode();
+                MockNode proxyB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()),
+                    new DiscoveredNode("proxy-b", proxyB.address()));
+
+            for (int i = 0; i < 40; i++) {
+                try (NanocachedClient client =
+                        NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                    client.set("k", "v");
+                }
+            }
+
+            assertTrue(proxyA.connectionCount.get() > 0, "proxy-a was never picked across 40 connects");
+            assertTrue(proxyB.connectionCount.get() > 0, "proxy-b was never picked across 40 connects");
+        }
+    }
+
+    @Test
+    void viaProxyFailsOverToALiveProxyWhenTheChosenOneIsDown() throws Exception {
+        try (MockNode live = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            int deadPort = MockServers.unusedPort();
+            // Order matters for nothing here: connectToOneProxy shuffles
+            // the roster, so the dead entry is picked first about half the
+            // time — the outcome (landing on the live one) must hold
+            // either way.
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-dead", "127.0.0.1:" + deadPort),
+                    new DiscoveredNode("proxy-live", live.address()));
+
+            try (NanocachedClient client =
+                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+                assertEquals(1, live.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void viaProxySkipsAWarmingUpDiscoverySeedForTheProxyRoster() throws Exception {
+        // Same `B`-then-close startup-grace shape L already has (skipsAWarmingUpAddress
+        // above) — the SDK's existing address fail-over handles it for Q too.
+        try (MockNode proxy = new MockNode();
+                MockDiscovery warming = new MockDiscovery(List.of(), 1);
+                MockDiscovery healthy = new MockDiscovery(List.of(), 1)) {
+            warming.warmingUp = true;
+            healthy.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", warming.port()),
+                            new Address("127.0.0.1", healthy.port())))
+                    .viaProxy(true))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void viaProxyRaisesAClearErrorWhenNoProxiesAreRegistered() throws Exception {
+        try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> NanocachedClient.connect(viaProxyOptions(discovery.port())));
+            assertTrue(error.getMessage().contains("no proxies registered"), error.getMessage());
+        }
+    }
+
+    @Test
+    void viaProxyPointedAtANodeAddressFailsFastNamingTheAddress() throws Exception {
+        try (MockNode node = new MockNode()) {
+            NanocachedException error = assertThrows(NanocachedException.class,
+                    () -> NanocachedClient.connect(viaProxyOptions(node.port())));
+            assertTrue(error.getMessage().contains("viaProxy") && error.getMessage().contains("cache node"),
+                    error.getMessage());
+            assertEquals(0, node.getCount.get(), "the rejected node connection must never be used");
+        }
+    }
+
+    @Test
+    void viaProxyReconnectsToASurvivorAfterTheConnectedProxyDies() throws Exception {
+        try (MockNode proxyA = new MockNode();
+                MockNode proxyB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()),
+                    new DiscoveredNode("proxy-b", proxyB.address()));
+
+            try (NanocachedClient client =
+                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                client.set("k", "v");
+
+                MockNode connected = proxyA.connectionCount.get() > 0 ? proxyA : proxyB;
+                MockNode survivor = connected == proxyA ? proxyB : proxyA;
+                connected.close(); // full teardown — this address can never come back
+                Thread.sleep(50); // let the failure land
+
+                // Retries the dead proxy first (fails), then re-fetches Q
+                // and lands on the survivor — transparently, within this
+                // one call, exactly like any other single-mode redial.
+                assertEquals(Optional.empty(), client.get("k2"));
+                assertTrue(survivor.connectionCount.get() >= 1,
+                        "the survivor must have been dialed after reconnect");
+            }
+        }
+    }
+
+    @Test
+    void viaProxyIgnoresReadHedgeAfterAndSendsASingleGet() throws Exception {
+        try (MockNode proxy = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+            // Slow but alive: would trigger a hedge leg to a second owner
+            // if hedging were ever attempted here — proxy mode has only
+            // one connection, so there is nobody to hedge to regardless.
+            proxy.delayGets(50);
+
+            try (NanocachedClient client = NanocachedClient.connect(
+                    viaProxyOptions(discovery.port()).readHedgeAfter(Duration.ofMillis(10)))) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
+                assertEquals(1, proxy.getCount.get(),
+                        "readHedgeAfter must be inert in viaProxy mode — no hedge leg on the wire");
+            }
+        }
+    }
 }

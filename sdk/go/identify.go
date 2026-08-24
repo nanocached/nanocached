@@ -30,8 +30,19 @@ type discoveredNode struct {
 
 type identified struct {
 	// Exactly one of conn / cluster is set.
-	conn        net.Conn
-	nodes       []discoveredNode
+	conn net.Conn
+	// nodes holds a discovery connection's roster: the node list (`L`)
+	// or, in proxy mode (issue #122), the registered nanocached-proxy
+	// list (`Q`) — the two share the exact same name/address entry
+	// shape, so one field serves both; which command produced it is a
+	// property of how identify() was called (see discoveryListCommand),
+	// not of this struct.
+	nodes []discoveredNode
+	// replication is only meaningful for a node-list (`L`) result — a
+	// proxy roster (`Q`) carries no replication field on the wire (a
+	// proxy client needs no R; see nanocached-discovery.rs's
+	// ListProxies), so this is left zero on a `Q` result and must not be
+	// read by proxy-mode callers.
 	replication int
 	// tagged (echoed response tags): the node accepted the extended `A ... T`,
 	// so this connection's G/S/D traffic must carry tags and its
@@ -40,12 +51,21 @@ type identified struct {
 	tagged bool
 }
 
-// connectAndIdentify dials host:port, authenticates, and figures out from
-// the server's own A response whether it reached a cache node (On) or a
-// discovery server (Od) — the caller never says which it expects
-// (the server type in the auth response). A node's conn is handed back live; a discovery
-// connection is used once for L and closed, returning the name/address
-// list and the cluster's replication factor R (node identity, discovery HA, replication).
+// discoveryListCommand selects which one-shot roster command an identify
+// exchange sends once the peer reveals itself as a discovery server
+// (issue #122): listNodes for the ordinary `L` node roster every
+// non-proxy caller wants, or listProxies for `Q`, the registered
+// nanocached-proxy roster ViaProxy's connect/reconnect flow wants
+// instead. Same single-connection-then-close shape either way (see
+// identify) — only the command byte and the reply parser differ
+// (readNodeList vs. readProxyList).
+type discoveryListCommand byte
+
+const (
+	listNodes   discoveryListCommand = 'L'
+	listProxies discoveryListCommand = 'Q'
+)
+
 // connectDeadline bounds one whole connect attempt — dial, TLS
 // handshake, and the identify exchange share a single 5s budget, the
 // same shape as the other five SDKs (issue #47 item 1: the previous
@@ -57,7 +77,32 @@ type identified struct {
 // only so tests can shorten it.
 var connectDeadline = 5 * time.Second
 
+// connectAndIdentify dials host:port, authenticates, and figures out from
+// the server's own A response whether it reached a cache node (On) or a
+// discovery server (Od) — the caller never says which it expects
+// (the server type in the auth response). A node's conn is handed back live; a discovery
+// connection is used once for L and closed, returning the name/address
+// list and the cluster's replication factor R (node identity, discovery HA, replication).
+// Equivalent to connectAndIdentifyProxies with listNodes — see that
+// function's doc for the proxy-mode (`Q`) counterpart.
 func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config) (*identified, error) {
+	return connectAndIdentifyAs(address, authSecret, tlsConfig, listNodes)
+}
+
+// connectAndIdentifyProxies is connectAndIdentify's proxy-mode counterpart
+// (issue #122, Config.ViaProxy): identical dial/auth/legacy-fallback
+// handling, but a discovery peer is asked for `Q` (the registered
+// nanocached-proxy roster) instead of `L` (the node roster) — see
+// readProxyList. A node peer answers exactly as connectAndIdentify's
+// does; ViaProxy's caller is the one that decides that's a
+// misconfiguration, not this function.
+func connectAndIdentifyProxies(address string, authSecret []byte, tlsConfig *tls.Config) (*identified, error) {
+	return connectAndIdentifyAs(address, authSecret, tlsConfig, listProxies)
+}
+
+func connectAndIdentifyAs(
+	address string, authSecret []byte, tlsConfig *tls.Config, list discoveryListCommand,
+) (*identified, error) {
 	deadline := time.Now().Add(connectDeadline)
 	conn, err := open(address, tlsConfig, deadline)
 	if err != nil {
@@ -65,7 +110,7 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 	}
 
 	_ = conn.SetDeadline(deadline)
-	result, err := identify(conn, address, authSecret, true)
+	result, err := identify(conn, address, authSecret, true, list)
 	if err != nil {
 		_ = conn.Close()
 		if !isLegacyServerSignal(err) {
@@ -82,7 +127,7 @@ func connectAndIdentify(address string, authSecret []byte, tlsConfig *tls.Config
 			return nil, connectionLost("could not connect to "+address, err)
 		}
 		_ = conn.SetDeadline(deadline)
-		result, err = identify(conn, address, authSecret, false)
+		result, err = identify(conn, address, authSecret, false, list)
 		if err != nil {
 			_ = conn.Close()
 			return nil, err
@@ -149,8 +194,11 @@ func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, 
 // on the legacy-server signal below). A write or read failure on the ack
 // itself is returned raw (not connectionLost-wrapped) when requestTags is
 // true, so the caller can tell a pre-0019 server's closed/EOF/reset door
-// apart from an ordinary connection failure and retry untagged.
-func identify(conn net.Conn, address string, authSecret []byte, requestTags bool) (*identified, error) {
+// apart from an ordinary connection failure and retry untagged. list
+// (issue #122) selects `L` or `Q` for the one-shot roster command sent
+// when the peer turns out to be a discovery server — see
+// discoveryListCommand.
+func identify(conn net.Conn, address string, authSecret []byte, requestTags bool, list discoveryListCommand) (*identified, error) {
 	secret := authSecret
 	if secret == nil {
 		secret = noSecretPlaceholder
@@ -215,13 +263,21 @@ func identify(conn net.Conn, address string, authSecret []byte, requestTags bool
 		return &identified{conn: &bufferedConn{Conn: conn, reader: reader}, tagged: tagged}, nil
 	}
 
-	// A discovery server: one-shot L, then this connection is done. Tags
-	// have no meaning here (discovery is a single L per connection), but
-	// the reply above still had to be parsed either way.
-	if _, err := conn.Write([]byte("L\n")); err != nil {
-		return nil, connectionLost("L write failed", err)
+	// A discovery server: one-shot L or Q, then this connection is done.
+	// Tags have no meaning here (discovery answers exactly one roster
+	// request per connection), but the reply above still had to be
+	// parsed either way.
+	if _, writeErr := conn.Write([]byte{byte(list), '\n'}); writeErr != nil {
+		return nil, connectionLost(fmt.Sprintf("%c write failed", list), writeErr)
 	}
-	nodes, replication, err := readNodeList(reader)
+	var nodes []discoveredNode
+	var replication int
+	var err error
+	if list == listProxies {
+		nodes, err = readProxyList(reader)
+	} else {
+		nodes, replication, err = readNodeList(reader)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -285,43 +341,87 @@ func readNodeList(reader *bufio.Reader) ([]discoveredNode, int, error) {
 		return nil, 0, fmt.Errorf("nanocached: invalid replication factor in discovery response")
 	}
 
+	nodes, err := readListEntries(reader, count)
+	if err != nil {
+		return nil, 0, err
+	}
+	return nodes, replication, nil
+}
+
+// readProxyList reads a discovery `Q` reply (issue #122): `N <count>\n`
+// then, per proxy, the exact same `<name-len> <addr-len>\n<name><addr>\n`
+// entry shape readNodeList's `L` reply uses — nanocached-discovery.rs's
+// ListProxies command mirrors List's roster shape, just without the
+// trailing replication field on the header line (a proxy client needs no
+// R: it looks like a single node that owns every key).
+func readProxyList(reader *bufio.Reader) ([]discoveredNode, error) {
+	header, err := readLine(reader)
+	if err != nil {
+		return nil, connectionLost("proxy-list read failed", err)
+	}
+	header = strings.TrimSuffix(header, "\n")
+
+	if strings.HasPrefix(header, "B") {
+		return nil, ErrDiscoveryBusy
+	}
+	rest, ok := strings.CutPrefix(header, "N ")
+	if !ok {
+		return nil, fmt.Errorf("nanocached: unexpected response from discovery server: %s", header)
+	}
+
+	count, err := strconv.Atoi(rest)
+	if err != nil || count < 0 || count > maxNodeCount {
+		return nil, fmt.Errorf("nanocached: invalid proxy count in discovery response")
+	}
+
+	return readListEntries(reader, count)
+}
+
+// readListEntries reads count `<name-len> <addr-len>\n<name><addr>\n`
+// entries off reader — the body shared by a discovery `N` reply, node
+// roster (`L`, readNodeList) or proxy roster (`Q`, readProxyList) alike
+// (issue #122): the same per-field caps (maxNodeFieldLength) and the same
+// running-total cap (maxNodeListResponseBytes) apply either way, since a
+// hostile or MITM'd `Q` reply can exhaust client memory exactly as an `L`
+// one can.
+func readListEntries(reader *bufio.Reader, count int) ([]discoveredNode, error) {
 	nodes := make([]discoveredNode, 0, count)
 	total := 0
 	for i := 0; i < count; i++ {
 		entry, err := readLine(reader)
 		if err != nil {
-			return nil, 0, connectionLost("node-list read failed", err)
+			return nil, connectionLost("node-list read failed", err)
 		}
 		total += len(entry)
 		lengths := strings.Split(strings.TrimSuffix(entry, "\n"), " ")
 		if len(lengths) != 2 {
-			return nil, 0, fmt.Errorf("nanocached: invalid node entry header in discovery response")
+			return nil, fmt.Errorf("nanocached: invalid node entry header in discovery response")
 		}
 		nameLength, err1 := strconv.Atoi(lengths[0])
 		addrLength, err2 := strconv.Atoi(lengths[1])
 		if err1 != nil || err2 != nil || nameLength < 0 || addrLength < 0 ||
 			nameLength > maxNodeFieldLength || addrLength > maxNodeFieldLength {
-			return nil, 0, fmt.Errorf("nanocached: invalid node entry lengths in discovery response")
+			return nil, fmt.Errorf("nanocached: invalid node entry lengths in discovery response")
 		}
 
 		bodyLength := nameLength + addrLength + 1 // +1: trailing '\n'
 		total += bodyLength
 		if total > maxNodeListResponseBytes {
-			return nil, 0, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"nanocached: discovery node-list response exceeds %d bytes", maxNodeListResponseBytes)
 		}
 
 		body := make([]byte, bodyLength)
 		if _, err := readFull(reader, body); err != nil {
-			return nil, 0, connectionLost("node-list read failed", err)
+			return nil, connectionLost("node-list read failed", err)
 		}
 		if body[len(body)-1] != '\n' {
-			return nil, 0, fmt.Errorf("nanocached: malformed node entry in discovery response")
+			return nil, fmt.Errorf("nanocached: malformed node entry in discovery response")
 		}
 		nodes = append(nodes, discoveredNode{
 			Name:    string(body[:nameLength]),
 			Address: string(body[nameLength : nameLength+addrLength]),
 		})
 	}
-	return nodes, replication, nil
+	return nodes, nil
 }

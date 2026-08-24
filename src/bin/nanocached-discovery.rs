@@ -242,6 +242,11 @@ const MAX_CONNECTIONS_PER_IP: usize = 256;
 /// what actually keeps a large registry from producing an `M` a node
 /// will refuse to even parse.
 const MAX_REGISTRY_SIZE: usize = 1 << 16;
+
+/// Issue #122: bound on registered proxies — a fleet has orders of
+/// magnitude fewer proxies than clients, so this is generous, and it
+/// keeps a secret-holder from growing the proxy map without bound.
+const MAX_PROXY_ENTRIES: usize = 1024;
 /// `nanocached-node`'s own inbound request-size cap (`MAX_REQUEST_SIZE`,
 /// `src/server.rs`) — the two binaries share no modules by design (see
 /// this file's own module doc comment), so this is a separate constant
@@ -591,8 +596,26 @@ fn next_connection_id() -> u64 {
 /// per heartbeat) into O(nodes) work per actual membership change. Bump
 /// via `bump_roster` while holding `nodes`, so the counter and map stay
 /// consistent for the rebuild path.
+/// One registered proxy (issue #122): `nanocached-proxy` announces via
+/// `Y` and re-announces on its roster-refresh cadence; clients fetch the
+/// set with `Q`. Entirely separate from membership — proxies are not in
+/// any ring, never join, and never affect `L`/`H`.
+struct ProxyInfo {
+    /// Composed like a node's: announce connection's source IP + the
+    /// declared port (addresses derived from the registration connection).
+    address: String,
+    /// Pins the name (issue #34's rationale): a re-announce with a
+    /// different token is rejected, so another holder of the shared
+    /// secret can't hijack a proxy's name and siphon its clients.
+    token: String,
+    last_seen: Instant,
+}
+
 struct RegistryState {
     nodes: Mutex<FxHashMap<String, NodeInfo>>,
+    /// Issue #122 — keyed by proxy name, swept by `sweep_expired` on the
+    /// same liveness timeout as heartbeats.
+    proxies: Mutex<FxHashMap<String, ProxyInfo>>,
     generation: AtomicU64,
     /// The heartbeat-ack roster, cached and rebuilt only when `generation`
     /// moves (issue #95). Co-located with the map and counter it derives
@@ -605,6 +628,7 @@ impl Default for RegistryState {
     fn default() -> Self {
         RegistryState {
             nodes: Mutex::new(FxHashMap::default()),
+            proxies: Mutex::new(FxHashMap::default()),
             generation: AtomicU64::new(0),
             heartbeat_ack: Mutex::new(None),
         }
@@ -1133,6 +1157,17 @@ enum DiscoveryCommand {
         token: String,
     },
     List,
+    /// Issue #122: a client asking for the registered proxies — `L`'s
+    /// shape without the replication field.
+    ListProxies,
+    /// Issue #122: a `nanocached-proxy` (re-)announcing itself, same
+    /// name/port/token frame as `Join`/`Announce`; the address is
+    /// composed the same way. Refreshes `ProxyInfo::last_seen`.
+    ProxyAnnounce {
+        name: String,
+        port: u16,
+        token: String,
+    },
     /// Staged node join: a node asking to join, identified by its name (node identity decoupled from address)
     /// and the port it serves on — the reachable address is composed from
     /// this connection's own source IP plus that port (addresses derived from the registration connection). `token`
@@ -1231,6 +1266,15 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             Ok(DiscoveryCommand::List)
         }
 
+        b"Q" => {
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let _ = input.split_to(header_end + 1);
+            Ok(DiscoveryCommand::ListProxies)
+        }
+
         b"H" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let replication = parts.next().ok_or(ParseError::InvalidLength)?;
@@ -1286,7 +1330,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             })
         }
 
-        b"J" | b"P" => {
+        b"J" | b"P" | b"Y" => {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let port = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
@@ -1310,6 +1354,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             // reborrowed mutably below.
             let make: fn(String, u16, String) -> DiscoveryCommand = match command {
                 b"J" => |name, port, token| DiscoveryCommand::Join { name, port, token },
+                b"Y" => |name, port, token| DiscoveryCommand::ProxyAnnounce { name, port, token },
                 _ => |name, port, token| DiscoveryCommand::Announce { name, port, token },
             };
             let (name, token) =
@@ -3020,6 +3065,19 @@ async fn sweep_expired(
                 // never actually going to get its turn (a fake
                 // registration with nothing behind it), so they're also
                 // reaped here once `waiting_timeout_for` has elapsed.
+                // Issue #122: proxies that stopped re-announcing.
+                registry
+                    .proxies
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|name, info| {
+                        let keep = now.duration_since(info.last_seen) < liveness_timeout;
+                        if !keep {
+                            println!("INFO proxy dropped after missed announces: {name}");
+                        }
+                        keep
+                    });
+
                 let mut heartbeat_evicted = Vec::new();
                 let mut waiting_evicted = Vec::new();
                 lock(&registry).retain(|name, info| {
@@ -3444,6 +3502,80 @@ async fn handle_connection(
                 }
                 let mut response = format!("N {} {}\n", nodes.len(), config.replication);
                 for (name, addr) in &nodes {
+                    response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
+                }
+                write_response(&mut stream, response.as_bytes()).await?;
+                continue;
+            }
+            Ok(DiscoveryCommand::ProxyAnnounce { name, port, token }) => {
+                // Issue #122. Accepted during the startup grace too, like
+                // `P` — that is exactly when a restarted replica needs
+                // re-announces to refill this map.
+                let addr = format!("{peer_ip}:{port}");
+                let accepted = {
+                    let mut proxies = registry
+                        .proxies
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let at_capacity = proxies.len() >= MAX_PROXY_ENTRIES;
+                    match proxies.get_mut(&name) {
+                        Some(existing) if existing.token == token => {
+                            existing.address = addr;
+                            existing.last_seen = Instant::now();
+                            true
+                        }
+                        // A different token is a name hijack, not a
+                        // refresh — see `ProxyInfo::token`.
+                        Some(_) => false,
+                        None if at_capacity => false,
+                        None => {
+                            proxies.insert(
+                                name.clone(),
+                                ProxyInfo {
+                                    address: addr,
+                                    token,
+                                    last_seen: Instant::now(),
+                                },
+                            );
+                            true
+                        }
+                    }
+                };
+
+                if accepted {
+                    write_response(&mut stream, b"R\n").await?;
+                    continue;
+                }
+                eprintln!(
+                    "WARN rejected proxy announce for {name} from {peer_ip}: token mismatch \
+                     or proxy registry full"
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "proxy announce rejected",
+                ));
+            }
+            Ok(DiscoveryCommand::ListProxies) => {
+                if Instant::now() < config.list_ready_at {
+                    // Same startup-grace refusal as `L`: a freshly
+                    // restarted replica hasn't heard re-announces yet, so
+                    // an empty answer would read as "no proxies exist".
+                    write_response(&mut stream, b"B\n").await?;
+                    return Ok(());
+                }
+
+                let entries: Vec<(String, String)> = {
+                    let proxies = registry
+                        .proxies
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    proxies
+                        .iter()
+                        .map(|(name, info)| (name.clone(), info.address.clone()))
+                        .collect()
+                };
+                let mut response = format!("N {}\n", entries.len());
+                for (name, addr) in &entries {
                     response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
                 }
                 write_response(&mut stream, response.as_bytes()).await?;
@@ -5431,6 +5563,211 @@ mod tests {
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
         ));
+    }
+
+    #[test]
+    fn parses_proxy_announce_and_list_proxies() {
+        // Issue #122.
+        let mut input = BytesMut::from(&b"Y 7 8358 8\nproxy-atk-proxy"[..]);
+        assert_eq!(
+            parse(&mut input),
+            Ok(DiscoveryCommand::ProxyAnnounce {
+                name: "proxy-a".to_string(),
+                port: 8358,
+                token: "tk-proxy".to_string(),
+            })
+        );
+
+        let mut input = BytesMut::from(&b"Q\n"[..]);
+        assert_eq!(parse(&mut input), Ok(DiscoveryCommand::ListProxies));
+
+        let mut input = BytesMut::from(&b"Q extra\n"[..]);
+        assert!(parse(&mut input).is_err());
+    }
+
+    /// Issue #122 helper: one `Y` announce over a fresh connection;
+    /// returns the reply line ("R" on success).
+    async fn announce_proxy(
+        registry: &Registry,
+        current_join: &CurrentJoin,
+        list_ready_at: Instant,
+        shutdown_rx: watch::Receiver<bool>,
+        name: &str,
+        port: u16,
+        token: &str,
+    ) -> String {
+        let (mut client, server) = tcp_pair().await;
+        spawn_grace_connection(server, registry, current_join, list_ready_at, shutdown_rx);
+        let frame = format!("Y {} {port} {}\n{name}{token}", name.len(), token.len());
+        client.write_all(frame.as_bytes()).await.unwrap();
+        let mut reply = [0u8; 2];
+        match client.read_exact(&mut reply).await {
+            Ok(_) => String::from_utf8_lossy(&reply[..1]).into_owned(),
+            Err(_) => "closed".to_string(),
+        }
+    }
+
+    /// Issue #122 helper: one `Q` over a fresh connection; returns the
+    /// raw response text.
+    async fn query_proxies(
+        registry: &Registry,
+        current_join: &CurrentJoin,
+        list_ready_at: Instant,
+        shutdown_rx: watch::Receiver<bool>,
+    ) -> String {
+        let (mut client, server) = tcp_pair().await;
+        spawn_grace_connection(server, registry, current_join, list_ready_at, shutdown_rx);
+        client.write_all(b"Q\n").await.unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match timeout(Duration::from_millis(300), client.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(bytes_read)) => response.extend_from_slice(&chunk[..bytes_read]),
+                Ok(Err(_)) => break,
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn announced_proxies_are_served_by_q() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ready = Instant::now();
+
+        assert_eq!(
+            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await,
+            "R"
+        );
+        assert_eq!(
+            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-b", 9358, "tk-b").await,
+            "R"
+        );
+
+        let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(response.starts_with("N 2\n"), "got {response:?}");
+        assert!(response.contains("proxy-a127.0.0.1:8358"), "got {response:?}");
+        assert!(response.contains("proxy-b127.0.0.1:9358"), "got {response:?}");
+
+        // A re-announce with the right token moves the address.
+        assert_eq!(
+            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8360, "tk-a").await,
+            "R"
+        );
+        let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(response.contains("proxy-a127.0.0.1:8360"), "got {response:?}");
+        assert!(response.starts_with("N 2\n"), "got {response:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proxy_announce_with_the_wrong_token_is_rejected() {
+        // Issue #122: the token pins the name (issue #34's rationale).
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ready = Instant::now();
+
+        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await;
+        let reply =
+            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 9999, "tk-evil").await;
+        assert_ne!(reply, "R");
+
+        // The original registration is untouched.
+        let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(response.contains("proxy-a127.0.0.1:8358"), "got {response:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn q_refuses_during_the_grace_while_y_is_accepted() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let grace_end = Instant::now() + Duration::from_millis(250);
+
+        assert_eq!(
+            announce_proxy(&registry, &current_join, grace_end, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await,
+            "R",
+            "a Y during the grace must be accepted — it is how the map refills"
+        );
+        let response = query_proxies(&registry, &current_join, grace_end, shutdown_rx.clone()).await;
+        assert!(response.starts_with("B\n"), "got {response:?}");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let response = query_proxies(&registry, &current_join, grace_end, shutdown_rx.clone()).await;
+        assert!(response.starts_with("N 1\n"), "got {response:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxies_never_appear_in_l_and_nodes_never_in_q() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ready = Instant::now();
+
+        // One member (P upserts straight to Joined) and one proxy.
+        let (mut member, server) = tcp_pair().await;
+        spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
+        member.write_all(b"P 6 9001 9\nnode-atk-node-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        member.read_exact(&mut ack).await.unwrap();
+        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await;
+
+        let (mut client, server) = tcp_pair().await;
+        spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
+        client.write_all(b"L\n").await.unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match timeout(Duration::from_millis(300), client.read(&mut chunk)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(bytes_read)) => response.extend_from_slice(&chunk[..bytes_read]),
+                Ok(Err(_)) => break,
+            }
+        }
+        let listed = String::from_utf8_lossy(&response).into_owned();
+        assert!(listed.contains("node-a"), "got {listed:?}");
+        assert!(!listed.contains("proxy-a"), "got {listed:?}");
+
+        let proxies = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(proxies.contains("proxy-a"), "got {proxies:?}");
+        assert!(!proxies.contains("node-a"), "got {proxies:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_drops_proxies_that_stopped_announcing() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ready = Instant::now();
+        let liveness = Duration::from_millis(200);
+
+        let _sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            None,
+            None,
+            2,
+            ready,
+            liveness,
+            shutdown_rx.clone(),
+        ));
+
+        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-old", 8358, "tk-old").await;
+        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-live", 8359, "tk-live").await;
+
+        // Keep proxy-live fresh past proxy-old's expiry.
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-live", 8359, "tk-live")
+                .await;
+        }
+
+        let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(response.starts_with("N 1\n"), "got {response:?}");
+        assert!(response.contains("proxy-live"), "got {response:?}");
+        assert!(!response.contains("proxy-old"), "got {response:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

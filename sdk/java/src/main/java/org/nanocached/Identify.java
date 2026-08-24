@@ -26,7 +26,7 @@ final class Identify {
     // requires a real secret correctly rejects this placeholder.
     private static final byte[] NO_SECRET_PLACEHOLDER = {0};
 
-    sealed interface Result permits NodeTarget, ClusterTarget {}
+    sealed interface Result permits NodeTarget, ClusterTarget, ProxyRosterTarget {}
 
     // `tagged` (echoed response tags): the node accepted the extended `A ... T`, so
     // this socket's G/S/D traffic must carry tags and its responses echo
@@ -34,6 +34,15 @@ final class Identify {
     record NodeTarget(Socket socket, boolean tagged) implements Result {}
 
     record ClusterTarget(List<DiscoveredNode> nodes, int replication) implements Result {}
+
+    /** SDK proxy mode (issue #122, {@code viaProxy}): the roster a
+     * discovery server answers `Q` with — the same name/address shape as
+     * {@link ClusterTarget#nodes()}, reusing {@link DiscoveredNode} even
+     * though a proxy's "name" carries no routing meaning to this client
+     * (unlike a cache node's, it's never hashed) — there is simply no
+     * separate replication field on this response for a proxy client to
+     * need (a proxy owns every key). */
+    record ProxyRosterTarget(List<DiscoveredNode> proxies) implements Result {}
 
     private Identify() {}
 
@@ -51,18 +60,34 @@ final class Identify {
 
     static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls)
             throws IOException {
+        return connectAndIdentify(host, port, authSecret, tls, false);
+    }
+
+    /** As {@link #connectAndIdentify(String, int, byte[], SSLContext)}, but
+     * when {@code host:port} identifies as a discovery server, fetches its
+     * proxy roster (`Q`, SDK proxy mode issue #122) instead of its node
+     * list (`L`) — used both for {@code viaProxy}'s initial connect and its
+     * reconnect-time re-fetch. A NODE identity is still returned as a plain
+     * {@link NodeTarget} either way (matches `L`'s own identify-based
+     * dispatch): whether that's a hard "viaProxy needs a discovery address"
+     * error or simply an unusable seed to skip is the caller's call, since
+     * only it knows whether this is the top-level connect address or a
+     * background re-fetch that must never throw. */
+    static Result connectAndIdentify(
+            String host, int port, byte[] authSecret, SSLContext tls, boolean listProxies) throws IOException {
         try {
-            return identifyOnce(host, port, authSecret, tls, true);
+            return identifyOnce(host, port, authSecret, tls, true, listProxies);
         } catch (LegacyServerSignal signal) {
             // Echoed response tags transparent fallback: a pre-0019 server treats the
             // extended `A ... T` as a parse error and closes/resets
             // without replying — redial once with the plain form and run
             // the connection untagged (the pre-0019 behavior).
-            return identifyOnce(host, port, authSecret, tls, false);
+            return identifyOnce(host, port, authSecret, tls, false, listProxies);
         }
     }
 
-    private static Result identifyOnce(String host, int port, byte[] authSecret, SSLContext tls, boolean requestTags)
+    private static Result identifyOnce(
+            String host, int port, byte[] authSecret, SSLContext tls, boolean requestTags, boolean listProxies)
             throws IOException {
         Socket socket = open(host, port, tls);
         try {
@@ -103,7 +128,15 @@ final class Identify {
                 return new NodeTarget(socket, identity.tagged());
             }
 
-            // A discovery server: one-shot L, then this connection is done.
+            // A discovery server: one-shot L (or, for viaProxy, Q), then
+            // this connection is done.
+            if (listProxies) {
+                out.write("Q\n".getBytes(StandardCharsets.US_ASCII));
+                out.flush();
+                ProxyRosterTarget roster = readProxyList(socket.getInputStream());
+                socket.close();
+                return roster;
+            }
             out.write("L\n".getBytes(StandardCharsets.US_ASCII));
             out.flush();
             ClusterTarget cluster = readNodeList(socket.getInputStream());
@@ -245,10 +278,48 @@ final class Identify {
             throw new NanocachedException("nanocached: invalid replication factor in discovery response");
         }
 
-        // count is now bounded by MAX_NODE_COUNT above, so sizing the
+        return new ClusterTarget(readNodeEntries(in, count), replication);
+    }
+
+    // Issue #122: a `Q` response's header carries only the count — no
+    // replication field, since a proxy client needs no R (a proxy owns
+    // every key). Otherwise identical framing to `L`'s `N <count> <r>`,
+    // entries included, so this shares readNodeEntries/MAX_NODE_COUNT/
+    // MAX_NODE_LIST_RESPONSE_BYTES with readNodeList rather than
+    // duplicating them (the spec: "entry cap and name/addr length caps
+    // mirror the L fetch's").
+    private static ProxyRosterTarget readProxyList(InputStream in) throws IOException {
+        String header = readLine(in);
+        if (header.startsWith("B")) {
+            throw new NanocachedException.DiscoveryBusy();
+        }
+        if (!header.startsWith("N ")) {
+            throw new NanocachedException(
+                    "nanocached: unexpected response from discovery server: " + header);
+        }
+
+        int count;
+        try {
+            count = Integer.parseInt(header.substring(2));
+        } catch (NumberFormatException malformed) {
+            throw new NanocachedException("nanocached: invalid proxy-list header in discovery response");
+        }
+        if (count < 0 || count > MAX_NODE_COUNT) {
+            throw new NanocachedException("nanocached: invalid proxy count in discovery response");
+        }
+
+        return new ProxyRosterTarget(readNodeEntries(in, count));
+    }
+
+    /** The `<name-len> <addr-len>\n<name><addr>\n` entries shared,
+     * byte-for-byte, by both `L`'s node list and `Q`'s proxy roster
+     * (issue #122) — {@code count} is already validated against {@link
+     * #MAX_NODE_COUNT} by the caller before this runs. */
+    private static List<DiscoveredNode> readNodeEntries(InputStream in, int count) throws IOException {
+        // count is bounded by MAX_NODE_COUNT by the caller, so sizing the
         // list's capacity from it is safe — never trust an unvalidated
         // wire value for a pre-allocation, validated or not.
-        List<DiscoveredNode> nodes = new ArrayList<>(count);
+        List<DiscoveredNode> entries = new ArrayList<>(count);
         long totalBytes = 0;
         for (int i = 0; i < count; i++) {
             String[] lengths = readLine(in).split(" ");
@@ -280,11 +351,11 @@ final class Identify {
             if (body[body.length - 1] != '\n') {
                 throw new NanocachedException("nanocached: malformed node entry in discovery response");
             }
-            nodes.add(new DiscoveredNode(
+            entries.add(new DiscoveredNode(
                     new String(body, 0, nameLength, StandardCharsets.UTF_8),
                     new String(body, nameLength, addrLength, StandardCharsets.UTF_8)));
         }
-        return new ClusterTarget(nodes, replication);
+        return entries;
     }
 
     /** Reads up to (and consuming) the next '\n', returning what preceded
