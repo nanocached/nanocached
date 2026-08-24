@@ -46,6 +46,10 @@ struct Args {
     /// Issue #124: port for the /metrics + /healthz + /readyz endpoint
     /// (same host as `--host`); `None` = no endpoint.
     metrics_port: Option<u16>,
+    /// Issue #124: SIGTERM drain budget for a clustered node — hand
+    /// entries to their post-leave owners, leave membership, exit. 0
+    /// skips the handoff (fast restarts; replicas cover at R >= 2).
+    drain_timeout: std::time::Duration,
 }
 
 impl Default for Args {
@@ -59,6 +63,7 @@ impl Default for Args {
             tls_ca: None,
             max_memory: server::MAX_CACHE_MEMORY_BYTES,
             metrics_port: None,
+            drain_timeout: std::time::Duration::from_secs(25),
         }
     }
 }
@@ -110,6 +115,12 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 args.metrics_port = Some(value()?.parse().map_err(|_| {
                     "--metrics-port must be a number between 0 and 65535".to_string()
                 })?);
+            }
+            "--drain-timeout" => {
+                let secs: u64 = value()?
+                    .parse()
+                    .map_err(|_| "--drain-timeout must be a number of seconds".to_string())?;
+                args.drain_timeout = std::time::Duration::from_secs(secs);
             }
             "--max-memory" => {
                 let raw_max_memory = value()?;
@@ -165,6 +176,12 @@ Usage: nanocached-node [options]
   --tls-cert <path>           PEM certificate chain; requires TLS on every
                                accepted connection (no plaintext fallback)
   --tls-key <path>            PEM private key matching --tls-cert
+  --drain-timeout <secs>      on SIGTERM, hand this node's entries to their
+                               post-leave owners and leave the cluster before
+                               exiting, within this budget (default 25; 0 =
+                               skip the handoff — fast restarts, replicas
+                               cover at R >= 2). Must fit the orchestrator's
+                               stop grace (ECS stopTimeout etc.)
   --metrics-port <port>       serve GET /metrics (Prometheus text format),
                                /healthz and /readyz on this port at --host;
                                omitted = no operations endpoint. Keep it
@@ -278,6 +295,7 @@ async fn main() -> ExitCode {
         tls_acceptor,
         args.max_memory,
         metrics_address,
+        args.drain_timeout,
     )
     .await
     {

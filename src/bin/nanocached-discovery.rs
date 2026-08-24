@@ -1179,6 +1179,16 @@ enum DiscoveryCommand {
     /// Issue #122: a client asking for the registered proxies — `L`'s
     /// shape without the replication field.
     ListProxies,
+    /// Issue #124: a decommissioning node leaving the cluster — sent
+    /// after its drain-out handoff is done. Removed from the registry
+    /// (and so from `L` and the heartbeat-ack roster) immediately;
+    /// token-checked like every node-identifying command (#34);
+    /// idempotent for an unknown name (a drain retry, or a replica that
+    /// already expired it).
+    NodeLeave {
+        name: String,
+        token: String,
+    },
     /// Issue #124: a draining proxy deregistering itself — removed from
     /// `Q` immediately instead of lingering until the liveness timeout.
     /// Token must match the registration's (same hijack rationale as
@@ -1292,6 +1302,22 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let _ = input.split_to(header_end + 1);
             Ok(DiscoveryCommand::List)
+        }
+
+        b"V" => {
+            let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let name_length = parse_length(name_length)?;
+            let token_length = parse_length(token_length)?;
+            let (name, token) =
+                parse_two_string_fields(input, header_end, name_length, token_length)?;
+
+            Ok(DiscoveryCommand::NodeLeave { name, token })
         }
 
         b"Z" => {
@@ -3696,6 +3722,42 @@ async fn handle_connection(
                 }
                 write_response(&mut stream, response.as_bytes()).await?;
                 continue;
+            }
+            Ok(DiscoveryCommand::NodeLeave { name, token }) => {
+                // Issue #124: the node has finished handing off its
+                // entries; take it out of membership now — every later
+                // heartbeat ack and `L` serves the post-leave roster.
+                let outcome = {
+                    let mut reg = lock(&registry);
+                    match reg.get(&name) {
+                        Some(info) if constant_time_eq(info.token.as_bytes(), token.as_bytes()) => {
+                            reg.remove(&name);
+                            Ok(true)
+                        }
+                        Some(_) => Err(()),
+                        None => Ok(false),
+                    }
+                };
+
+                match outcome {
+                    Ok(removed) => {
+                        if removed {
+                            bump_roster(&registry);
+                            println!("INFO node left the cluster: {name}");
+                        }
+                        write_response(&mut stream, b"R\n").await?;
+                        continue;
+                    }
+                    Err(()) => {
+                        eprintln!(
+                            "WARN rejected node leave for {name} from {peer_ip}: token mismatch"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "node leave rejected",
+                        ));
+                    }
+                }
             }
             Ok(DiscoveryCommand::ProxyDeregister { name, token }) => {
                 // Issue #124: accepted any time (grace included — a
