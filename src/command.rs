@@ -77,6 +77,15 @@ pub enum Command {
         value: Bytes,
         ttl: Option<Duration>,
     },
+    /// `u <ns-len> <key-len> [tag]\n<ns><key>` (issue #124,
+    /// cluster-internal like `U`): a decommissioning node forwarding a
+    /// concurrent client delete to the key's post-leave owner. Executes
+    /// exactly as `Delete`; the connection handler skips the wrong-node
+    /// check for the same reason it does for `U` — the receiver owns the
+    /// key only once the post-leave roster publishes.
+    HandoffDelete {
+        key: Key,
+    },
     /// Internal-only (issue #124): the metrics endpoint's snapshot
     /// request — never produced by `parse()`, constructed by the metrics
     /// server task. Answered with `Response::Stats`.
@@ -160,7 +169,7 @@ impl Command {
                 Response::Stored
             }
 
-            Self::Delete { key } => {
+            Self::Delete { key } | Self::HandoffDelete { key } => {
                 if cache.delete(&key) {
                     Response::Deleted
                 } else {
@@ -319,8 +328,8 @@ fn parse_with_mode(
         // one extra leading `<namespace-length>` field and the namespace
         // bytes lead the body. A length of 0 addresses the default
         // namespace, same as the uppercase form.
-        b"G" | b"D" | b"g" | b"d" => {
-            let namespaced = command == b"g" || command == b"d";
+        b"G" | b"D" | b"g" | b"d" | b"u" => {
+            let namespaced = command == b"g" || command == b"d" || command == b"u";
             let namespace_length = if namespaced {
                 parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?
             } else {
@@ -352,6 +361,8 @@ fn parse_with_mode(
             }
 
             let is_get = command == b"G" || command == b"g";
+            // Resolved before the body is consumed, same dance as `is_get`.
+            let handoff = command == b"u";
 
             let frame = input.split_to(key_end).freeze();
             let key = Key::new(
@@ -362,6 +373,8 @@ fn parse_with_mode(
             Ok((
                 if is_get {
                     Command::Get { key }
+                } else if handoff {
+                    Command::HandoffDelete { key }
                 } else {
                     Command::Delete { key }
                 },
@@ -1408,6 +1421,32 @@ mod tests {
         assert_eq!(
             parse(&mut input),
             Ok(Command::Delete {
+                key: namespaced(b"users", b"name"),
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_handoff_set_and_delete() {
+        // Issue #124: `U`/`u` share `s`/`d`'s namespaced shape and map to
+        // the handoff variants (the connection handler skips the
+        // wrong-node check for them).
+        let mut input = buf(b"U 5 4 5 30\nusersnameAlice");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::HandoffSet {
+                key: namespaced(b"users", b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: Some(Duration::from_secs(30)),
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"u 5 4\nusersname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::HandoffDelete {
                 key: namespaced(b"users", b"name"),
             })
         );

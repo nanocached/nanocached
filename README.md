@@ -110,6 +110,16 @@ the primary is silent for longer than a configured interval. Writes cannot
 it is fixed or removed; `fire_and_forget_replicas` keeps only the replica
 legs off the caller's path.
 
+Leaving is graceful: on SIGTERM a clustered node hands every key it owns
+to the node that inherits it, leaves membership immediately, and keeps
+forwarding concurrent writes while clients catch up — all within
+`--drain-timeout` seconds (default 25; `0` skips the handoff). The proxy
+does the same for its role: deregister from discovery, finish in-flight
+requests, exit. `--metrics-port` on any binary serves Prometheus-format
+`/metrics` plus `/healthz` and `/readyz` probes. See the
+[deployment guide](https://nanocached.org/deployment.html) for wiring
+this into ECS/EKS autoscaling.
+
 ### Authentication
 
 Set `NANOCACHED_AUTH_SECRET` to require clients to authenticate with a shared

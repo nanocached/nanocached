@@ -5,13 +5,14 @@ ap=argparse.ArgumentParser()
 ap.add_argument("--addr",required=True); ap.add_argument("--conns",type=int,default=8); ap.add_argument("--duration",type=float,default=30)
 ap.add_argument("--keyspace",type=int,default=10000); ap.add_argument("--value-size",type=int,default=200); ap.add_argument("--get-ratio",type=float,default=0.7)
 ap.add_argument("--think",type=float,default=0.0); ap.add_argument("--reconnect-on-error",action="store_true"); ap.add_argument("--report-every",type=float,default=30)
-ap.add_argument("--label",default="load"); ap.add_argument("--hedge",type=float,default=0.0)
+ap.add_argument("--label",default="load"); ap.add_argument("--hedge",type=float,default=0.0); ap.add_argument("--via-proxy",action="store_true")
 a=ap.parse_args(); addrs=[(x.rsplit(":",1)[0], int(x.rsplit(":",1)[1])) for x in a.addr.split(",")]
 val=("x"*a.value_size).encode()
 res=dict(ops=0,get=0,set=0,miss=0,corrupt=0,err_total=0,errors=collections.Counter(),lat=[],samples=[],sdk_stats=[])
 async def worker(idx):
     kw={}
     if a.hedge>0: kw["read_hedge_after"]=a.hedge
+    if a.via_proxy: kw["via_proxy"]=True
     c=await NanocachedClient.connect(addrs, **kw)
     try:
         end=time.time()+a.duration

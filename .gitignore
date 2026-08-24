@@ -3,3 +3,4 @@
 /mutants.out.old
 .DS_Store
 sdk/dotnet/out/
+__pycache__/
