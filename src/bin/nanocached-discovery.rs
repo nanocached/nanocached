@@ -1179,6 +1179,15 @@ enum DiscoveryCommand {
     /// Issue #122: a client asking for the registered proxies — `L`'s
     /// shape without the replication field.
     ListProxies,
+    /// Issue #124: a draining proxy deregistering itself — removed from
+    /// `Q` immediately instead of lingering until the liveness timeout.
+    /// Token must match the registration's (same hijack rationale as
+    /// `ProxyAnnounce`); deregistering an unknown name is an idempotent
+    /// no-op (a retry after a partial drain must not error).
+    ProxyDeregister {
+        name: String,
+        token: String,
+    },
     /// Issue #122: a `nanocached-proxy` (re-)announcing itself, same
     /// name/port/token frame as `Join`/`Announce`; the address is
     /// composed the same way. Refreshes `ProxyInfo::last_seen`.
@@ -1283,6 +1292,22 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let _ = input.split_to(header_end + 1);
             Ok(DiscoveryCommand::List)
+        }
+
+        b"Z" => {
+            let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let name_length = parse_length(name_length)?;
+            let token_length = parse_length(token_length)?;
+            let (name, token) =
+                parse_two_string_fields(input, header_end, name_length, token_length)?;
+
+            Ok(DiscoveryCommand::ProxyDeregister { name, token })
         }
 
         b"Q" => {
@@ -3672,6 +3697,46 @@ async fn handle_connection(
                 write_response(&mut stream, response.as_bytes()).await?;
                 continue;
             }
+            Ok(DiscoveryCommand::ProxyDeregister { name, token }) => {
+                // Issue #124: accepted any time (grace included — a
+                // draining proxy must be able to leave whenever).
+                let outcome = {
+                    let mut proxies = registry
+                        .proxies
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match proxies.get(&name) {
+                        Some(existing) if existing.token == token => {
+                            proxies.remove(&name);
+                            Ok(true)
+                        }
+                        Some(_) => Err(()),
+                        // Unknown name: idempotent no-op (already gone,
+                        // or expired by the sweep mid-drain).
+                        None => Ok(false),
+                    }
+                };
+
+                match outcome {
+                    Ok(removed) => {
+                        if removed {
+                            println!("INFO proxy deregistered: {name}");
+                        }
+                        write_response(&mut stream, b"R\n").await?;
+                        continue;
+                    }
+                    Err(()) => {
+                        eprintln!(
+                            "WARN rejected proxy deregister for {name} from {peer_ip}: \
+                             token mismatch"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "proxy deregister rejected",
+                        ));
+                    }
+                }
+            }
             Ok(DiscoveryCommand::ProxyAnnounce { name, port, token }) => {
                 // Issue #122. Accepted during the startup grace too, like
                 // `P` — that is exactly when a restarted replica needs
@@ -5993,6 +6058,67 @@ mod tests {
             response.contains("proxy-a127.0.0.1:8358"),
             "got {response:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_deregistered_proxy_leaves_q_immediately() {
+        // Issue #124: a draining proxy must not linger in Q until the
+        // liveness timeout.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ready = Instant::now();
+
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-a",
+            8358,
+            "tk-a",
+        )
+        .await;
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-b",
+            8359,
+            "tk-b",
+        )
+        .await;
+
+        // Wrong token: rejected, entry intact.
+        let (mut client, server) = tcp_pair().await;
+        spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
+        client.write_all(b"Z 7 7\nproxy-atk-evil").await.unwrap();
+        let mut reply = [0u8; 2];
+        assert!(client.read_exact(&mut reply).await.is_err() || &reply != b"R\n");
+        let listed = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(listed.contains("proxy-a"), "got {listed:?}");
+
+        // Right token: gone at once.
+        let (mut client, server) = tcp_pair().await;
+        spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
+        client.write_all(b"Z 7 4\nproxy-atk-a").await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"R\n");
+
+        let listed = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
+        assert!(listed.starts_with("N 1\n"), "got {listed:?}");
+        assert!(!listed.contains("proxy-a"), "got {listed:?}");
+        assert!(listed.contains("proxy-b"), "got {listed:?}");
+
+        // Deregistering again (unknown now): idempotent R.
+        let (mut client, server) = tcp_pair().await;
+        spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
+        client.write_all(b"Z 7 4\nproxy-atk-a").await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"R\n");
     }
 
     #[tokio::test(flavor = "current_thread")]

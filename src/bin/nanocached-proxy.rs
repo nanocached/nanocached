@@ -292,6 +292,11 @@ struct Args {
     /// Issue #124: port for /metrics + /healthz + /readyz on `host`;
     /// `None` = no operations endpoint.
     metrics_port: Option<u16>,
+    /// Issue #124: how long a drain (SIGTERM/SIGINT) waits for open
+    /// client connections to finish their in-flight requests before the
+    /// process exits anyway. Must fit inside the orchestrator's kill
+    /// grace (ECS `stopTimeout`, k8s `terminationGracePeriodSeconds`).
+    drain_timeout: Duration,
 }
 
 impl Default for Args {
@@ -305,6 +310,7 @@ impl Default for Args {
             tls_key: None,
             tls_ca: None,
             metrics_port: None,
+            drain_timeout: Duration::from_secs(25),
         }
     }
 }
@@ -324,6 +330,7 @@ fn usage() -> String {
     "usage: nanocached-proxy --discovery <host:port>[,<host:port>...] \
      [--host <host>] [--port <port>] [--max-connections <n>] \
      [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
+     [--drain-timeout <secs>]\n\
      The shared auth secret is read from NANOCACHED_SECRET."
         .to_string()
 }
@@ -364,6 +371,12 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 args.metrics_port = Some(value()?.parse().map_err(|_| {
                     "--metrics-port must be a number between 0 and 65535".to_string()
                 })?);
+            }
+            "--drain-timeout" => {
+                let secs: u64 = value()?
+                    .parse()
+                    .map_err(|_| "--drain-timeout must be a number of seconds".to_string())?;
+                args.drain_timeout = Duration::from_secs(secs);
             }
             "-h" | "--help" => return Err(ArgsError::Help(usage())),
             unknown => return Err(format!("unknown flag: {unknown}\n{}", usage()).into()),
@@ -514,6 +527,11 @@ struct ProxyContext {
     /// connection count from "client connections × nodes" to "one per
     /// node per proxy".
     backends: SharedBackends,
+    /// Issue #124: flips to `true` when a drain begins (SIGTERM/SIGINT).
+    /// Connection readers stop taking new requests (writers still
+    /// deliver what is in flight), the accept loop stops, `/readyz`
+    /// answers 503, and the refresher deregisters from discovery.
+    drain: watch::Receiver<bool>,
     /// Issue #124: requests dispatched (any op), for the metrics
     /// endpoint's rate signal.
     requests_total: std::sync::atomic::AtomicU64,
@@ -745,15 +763,37 @@ async fn announce_to(
 /// The background roster refresher: one fetch at startup, then again
 /// every `REFRESH_INTERVAL` or whenever something sends on `refresh_rx`
 /// (a `W`, a failed fan-out). Failures keep the last good view.
-async fn run_refresher(
+/// `run_refresher`'s inputs, bundled (clippy's argument-count lint).
+struct RefresherConfig {
     discovery: Vec<String>,
     secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
     announce: Option<(ProxyIdentity, u16)>,
+    /// Issue #124: when this flips, the refresher deregisters (`Z`) from
+    /// every replica and exits — running the deregistration in the same
+    /// task that sends announces is what guarantees no `Y` follows the
+    /// `Z` and quietly re-registers a draining proxy.
+    drain: watch::Receiver<bool>,
+}
+
+async fn run_refresher(
+    config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
     mut refresh_rx: mpsc::Receiver<()>,
 ) {
+    let RefresherConfig {
+        discovery,
+        secret,
+        tls_connector,
+        announce,
+        mut drain,
+    } = config;
+
     loop {
+        if *drain.borrow() {
+            break;
+        }
+
         match fetch_roster(&discovery, &secret, &tls_connector).await {
             Ok(ring) => {
                 let _ = ring_tx.send(Some(ring));
@@ -768,8 +808,13 @@ async fn run_refresher(
         // gossip), and re-announcing is what keeps the entry alive past
         // the liveness timeout. Failures only warn: an unreachable
         // replica can't take the proxy down, it just won't list it.
+        // Re-checked against the drain flag right before sending, so a
+        // drain that began mid-cycle can't re-register this proxy.
         if let Some((identity, port)) = &announce {
             for addr in &discovery {
+                if *drain.borrow() {
+                    break;
+                }
                 if let Err(error) =
                     announce_to(addr, &secret, &tls_connector, identity, *port).await
                 {
@@ -780,6 +825,7 @@ async fn run_refresher(
 
         tokio::select! {
             _ = sleep(REFRESH_INTERVAL) => {}
+            () = drained(&mut drain) => {}
             received = refresh_rx.recv() => {
                 if received.is_none() {
                     return;
@@ -789,6 +835,60 @@ async fn run_refresher(
             }
         }
     }
+
+    // Issue #124: leave `Q` immediately — a stopped proxy must not
+    // linger there until the liveness timeout, where new clients would
+    // keep dialing it.
+    if let Some((identity, _)) = &announce {
+        for addr in &discovery {
+            if let Err(error) = deregister_from(addr, &secret, &tls_connector, identity).await {
+                eprintln!("WARN proxy deregister to {addr} failed: {error}");
+            }
+        }
+    }
+}
+
+/// One `Z` deregistration to one discovery replica (issue #124).
+async fn deregister_from(
+    addr: &str,
+    secret: &Option<Bytes>,
+    tls_connector: &Option<TlsConnector>,
+    identity: &ProxyIdentity,
+) -> io::Result<()> {
+    timeout(UPSTREAM_IO_TIMEOUT, async {
+        let mut stream = connect_upstream(addr, tls_connector).await?;
+        let mut buf = BytesMut::new();
+
+        if let Some(secret) = secret {
+            let mut auth = format!("A {}\n", secret.len()).into_bytes();
+            auth.extend_from_slice(secret);
+            stream.write_all(&auth).await?;
+            let ack = read_line(&mut stream, &mut buf).await?;
+            if !ack.starts_with("Od") && !ack.starts_with("On") {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("discovery at {addr} rejected authentication: {ack:?}"),
+                ));
+            }
+        }
+
+        let mut frame =
+            format!("Z {} {}\n", identity.name.len(), identity.token.len()).into_bytes();
+        frame.extend_from_slice(identity.name.as_bytes());
+        frame.extend_from_slice(identity.token.as_bytes());
+        stream.write_all(&frame).await?;
+
+        let ack = read_line(&mut stream, &mut buf).await?;
+        if ack != "R" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("discovery at {addr} rejected the proxy deregister: {ack:?}"),
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "proxy deregister timed out"))?
 }
 
 // ─── client frames ───────────────────────────────────────────────────
@@ -1888,6 +1988,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     let mut buf = BytesMut::new();
     let mut authenticated = context.secret.is_none();
     let mut tagged = false;
+    let mut drain = context.drain.clone();
 
     let result: io::Result<()> = 'connection: loop {
         // Parse everything already buffered before reading more.
@@ -1941,8 +2042,17 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
             }
         }
 
+        // Issue #124: a drain stops the intake — everything already
+        // dispatched still flows back through the writer's FIFO below.
+        if *drain.borrow() {
+            break 'connection Ok(());
+        }
+
         let mut chunk = [0u8; 4096];
-        let read = timeout(IDLE_TIMEOUT, read_half.read(&mut chunk)).await;
+        let read = tokio::select! {
+            read = timeout(IDLE_TIMEOUT, read_half.read(&mut chunk)) => read,
+            () = drained(&mut drain) => break 'connection Ok(()),
+        };
         match read {
             Err(_) | Ok(Ok(0)) => break Ok(()),
             Ok(Ok(bytes_read)) => buf.extend_from_slice(&chunk[..bytes_read]),
@@ -2025,22 +2135,35 @@ async fn run(
 
     let (ring_tx, ring_rx) = watch::channel(None);
     let (refresh_tx, refresh_rx) = mpsc::channel(16);
+    let (drain_tx, drain_rx) = watch::channel(false);
     let identity = ProxyIdentity::generate();
     println!("INFO proxy identity: {}", identity.name);
-    tokio::spawn(run_refresher(
-        args.discovery.clone(),
-        secret.clone(),
-        tls_connector.clone(),
-        Some((identity, args.port)),
+    let refresher = tokio::spawn(run_refresher(
+        RefresherConfig {
+            discovery: args.discovery.clone(),
+            secret: secret.clone(),
+            tls_connector: tls_connector.clone(),
+            announce: Some((identity, args.port)),
+            drain: drain_rx.clone(),
+        },
         ring_tx,
         refresh_rx,
     ));
+
+    // Issue #124: SIGTERM/SIGINT begin the drain — the orchestrator's
+    // ordinary stop signal is the graceful path.
+    tokio::spawn(async move {
+        let _ = shutdown_signal().await;
+        println!("INFO drain: stop signal received — deregistering and finishing in-flight work");
+        let _ = drain_tx.send(true);
+    });
 
     let context = Arc::new(ProxyContext {
         secret,
         tls_connector,
         ring: ring_rx,
         refresh_now: refresh_tx,
+        drain: drain_rx,
         backends: SharedBackends::new(),
         requests_total: std::sync::atomic::AtomicU64::new(0),
         upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
@@ -2070,7 +2193,49 @@ async fn run(
         ));
     }
 
-    serve(listener, context, tls_acceptor, permits).await
+    serve(listener, context, tls_acceptor, permits, args.drain_timeout).await?;
+
+    // The refresher exits after sending the deregistration; give it its
+    // moment so `Z` reliably reaches discovery before the process ends.
+    let _ = timeout(UPSTREAM_IO_TIMEOUT, refresher).await;
+    println!("INFO drain complete");
+    Ok(())
+}
+
+/// Resolves when the drain flag is (or becomes) `true`. A dropped
+/// sender means "no drain will ever be signalled" (tests, or shutdown
+/// paths that never arm it) — park forever rather than resolving, so a
+/// `select!` arm built on this can never misread sender-drop as a
+/// drain.
+async fn drained(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// SIGTERM or ctrl-c — mirrors the node's shutdown_signal.
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())?;
+
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 /// Issue #124: minimal, dependency-free HTTP responder for Prometheus
@@ -2143,7 +2308,9 @@ async fn serve_metrics_connection(
         }
         "/healthz" => ("200 OK", "ok\n".to_string()),
         "/readyz" => {
-            if context.ring.borrow().is_some() {
+            if *context.drain.borrow() {
+                ("503 Service Unavailable", "draining\n".to_string())
+            } else if context.ring.borrow().is_some() {
                 ("200 OK", "ok\n".to_string())
             } else {
                 ("503 Service Unavailable", "no roster yet\n".to_string())
@@ -2203,9 +2370,23 @@ async fn serve(
     context: Arc<ProxyContext>,
     tls_acceptor: Option<TlsAcceptor>,
     permits: Arc<Semaphore>,
+    drain_timeout: Duration,
 ) -> io::Result<()> {
+    let mut connections = tokio::task::JoinSet::new();
+    let mut drain = context.drain.clone();
+
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            // Issue #124: drain — stop accepting; the listener drops at
+            // the end of this function, so new dials are refused and a
+            // bootstrapping client moves on to another proxy.
+            () = drained(&mut drain) => break,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => return Err(error),
+        };
 
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             // Over the connection budget: answer busy and move on, the
@@ -2219,7 +2400,7 @@ async fn serve(
 
         let context = Arc::clone(&context);
         let acceptor = tls_acceptor.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
             let stream: ServerStream = match acceptor {
                 None => MaybeTls::Plain(stream),
@@ -2235,7 +2416,33 @@ async fn serve(
                 eprintln!("WARN connection error from {peer}: {error}");
             }
         });
+
+        // Reap finished connection tasks as we go so the set doesn't
+        // grow with connection *history*.
+        while connections.try_join_next().is_some() {}
     }
+
+    // Issue #124: connection readers observe the same drain flag and
+    // stop taking requests; their writers deliver everything already in
+    // flight. Give them the drain window, then cut whatever remains —
+    // the orchestrator's SIGKILL would arrive anyway.
+    drop(listener);
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    while !connections.is_empty() {
+        if tokio::time::timeout_at(deadline, connections.join_next())
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "WARN drain window elapsed with {} connection(s) still open; closing them",
+                connections.len()
+            );
+            connections.abort_all();
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2567,66 +2774,113 @@ mod tests {
         let _ = result;
     }
 
-    /// A mock discovery answering `L` with a fixed roster.
-    async fn start_mock_discovery(roster: Vec<(String, String)>, replication: usize) -> String {
+    /// A mock discovery answering `L` with a fixed roster, accepting
+    /// `Y` announces, and recording `Z` deregistrations (issue #124).
+    async fn start_mock_discovery_recording(
+        roster: Vec<(String, String)>,
+        replication: usize,
+    ) -> (String, Arc<StdMutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let deregistered: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let record = Arc::clone(&deregistered);
         tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     return;
                 };
                 let roster = roster.clone();
+                let record = Arc::clone(&record);
                 tokio::spawn(async move {
                     let mut buf = BytesMut::new();
                     loop {
                         let Ok(line) = read_line(&mut stream, &mut buf).await else {
                             return;
                         };
-                        if line.starts_with("A ") {
-                            let length: usize = line.split(' ').nth(1).unwrap().parse().unwrap();
-                            if read_exact_into(&mut stream, &mut buf, length)
-                                .await
-                                .is_err()
-                            {
-                                return;
+                        let mut parts = line.split(' ');
+                        let command = parts.next().unwrap_or_default().to_string();
+                        let lengths: Vec<usize> = parts
+                            .map(|field| field.parse().unwrap_or_default())
+                            .collect();
+                        match command.as_str() {
+                            "A" => {
+                                if read_exact_into(&mut stream, &mut buf, lengths[0])
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let _ = buf.split_to(lengths[0]);
+                                let _ = stream.write_all(b"Od\n").await;
                             }
-                            let _ = buf.split_to(length);
-                            let _ = stream.write_all(b"Od\n").await;
-                            continue;
-                        }
-                        assert_eq!(line, "L");
-                        let mut response =
-                            format!("N {} {replication}\n", roster.len()).into_bytes();
-                        for (name, addr) in &roster {
-                            response.extend_from_slice(
-                                format!("{} {}\n{name}{addr}\n", name.len(), addr.len()).as_bytes(),
-                            );
-                        }
-                        if stream.write_all(&response).await.is_err() {
-                            return;
+                            "L" => {
+                                let mut response =
+                                    format!("N {} {replication}\n", roster.len()).into_bytes();
+                                for (name, addr) in &roster {
+                                    response.extend_from_slice(
+                                        format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
+                                            .as_bytes(),
+                                    );
+                                }
+                                if stream.write_all(&response).await.is_err() {
+                                    return;
+                                }
+                            }
+                            // `Y <name-len> <port> <token-len>`: consume
+                            // name+token, ack.
+                            "Y" => {
+                                let body = lengths[0] + lengths[2];
+                                if read_exact_into(&mut stream, &mut buf, body).await.is_err() {
+                                    return;
+                                }
+                                let _ = buf.split_to(body);
+                                let _ = stream.write_all(b"R\n").await;
+                            }
+                            // `Z <name-len> <token-len>`: record the name.
+                            "Z" => {
+                                let body = lengths[0] + lengths[1];
+                                if read_exact_into(&mut stream, &mut buf, body).await.is_err() {
+                                    return;
+                                }
+                                let body = buf.split_to(body);
+                                record.lock().unwrap().push(
+                                    String::from_utf8_lossy(&body[..lengths[0]]).into_owned(),
+                                );
+                                let _ = stream.write_all(b"R\n").await;
+                            }
+                            other => panic!("mock discovery got {other:?}"),
                         }
                     }
                 });
             }
         });
-        addr
+        (addr, deregistered)
     }
 
-    /// Boots a proxy over the given roster; returns its address.
-    async fn start_proxy(
+    async fn start_mock_discovery(roster: Vec<(String, String)>, replication: usize) -> String {
+        start_mock_discovery_recording(roster, replication).await.0
+    }
+
+    /// Boots a proxy over the given roster; returns its address and the
+    /// drain trigger (issue #124 tests).
+    async fn start_proxy_with_drain(
         discovery_addr: &str,
         secret: Option<&str>,
         max_connections: usize,
-    ) -> String {
+        announce: Option<ProxyIdentity>,
+    ) -> (String, watch::Sender<bool>, Arc<ProxyContext>) {
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
+        let (drain_tx, drain_rx) = watch::channel(false);
         let secret = secret.map(|secret| Bytes::from(secret.to_string()));
         tokio::spawn(run_refresher(
-            vec![discovery_addr.to_string()],
-            secret.clone(),
-            None,
-            None,
+            RefresherConfig {
+                discovery: vec![discovery_addr.to_string()],
+                secret: secret.clone(),
+                tls_connector: None,
+                announce: announce.map(|identity| (identity, 0)),
+                drain: drain_rx.clone(),
+            },
             ring_tx,
             refresh_rx,
         ));
@@ -2635,6 +2889,7 @@ mod tests {
             tls_connector: None,
             ring: ring_rx.clone(),
             refresh_now: refresh_tx,
+            drain: drain_rx,
             backends: SharedBackends::new(),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
@@ -2643,9 +2898,10 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(serve(
             listener,
-            context,
+            Arc::clone(&context),
             None,
             Arc::new(Semaphore::new(max_connections)),
+            Duration::from_secs(5),
         ));
 
         // Wait until the first roster fetch landed, so tests don't race
@@ -2654,7 +2910,17 @@ mod tests {
         while ring.borrow().is_none() {
             ring.changed().await.unwrap();
         }
-        addr
+        (addr, drain_tx, context)
+    }
+
+    async fn start_proxy(
+        discovery_addr: &str,
+        secret: Option<&str>,
+        max_connections: usize,
+    ) -> String {
+        start_proxy_with_drain(discovery_addr, secret, max_connections, None)
+            .await
+            .0
     }
 
     /// A two-node cluster behind a proxy; returns (nodes, proxy addr).
@@ -3082,11 +3348,13 @@ mod tests {
         // simplest is a dedicated context.
         let (ring_tx, ring_rx) = watch::channel(None);
         let (refresh_tx, _refresh_rx) = mpsc::channel(4);
+        let (_drain_tx, drain_rx) = watch::channel(false);
         let context = Arc::new(ProxyContext {
             secret: None,
             tls_connector: None,
             ring: ring_rx,
             refresh_now: refresh_tx,
+            drain: drain_rx,
             backends: SharedBackends::new(),
             requests_total: std::sync::atomic::AtomicU64::new(7),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(2),
@@ -3135,6 +3403,100 @@ mod tests {
         assert_eq!(status, "HTTP/1.1 200 OK");
         let (status, _) = http_get(&addr, "/healthz").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_drain_deregisters_delivers_in_flight_replies_and_stops_accepting() {
+        // Issue #124: the whole graceful scale-in story in one pass.
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let (discovery, deregistered) = start_mock_discovery_recording(roster, 1).await;
+        let identity = ProxyIdentity {
+            name: "proxy-under-test".to_string(),
+            token: "tk-drain".to_string(),
+        };
+        let (proxy, drain_tx, context) =
+            start_proxy_with_drain(&discovery, None, 64, Some(identity)).await;
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        // An in-flight request straddling the drain: 200ms of node
+        // delay, drain signalled while it is outstanding.
+        *node.get_delay.lock().unwrap() = Duration::from_millis(200);
+        stream.write_all(b"G 1\nk").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drain_tx.send(true).unwrap();
+
+        // The reply still arrives — drains finish in-flight work.
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+
+        // ... and the connection then closes cleanly (no E, just EOF).
+        let closed = read_line(&mut stream, &mut buf).await;
+        assert!(closed.is_err(), "the drained connection must close");
+
+        // The deregistration reached discovery (the refresher sends it).
+        let mut seen = false;
+        for _ in 0..50 {
+            if deregistered.lock().unwrap().as_slice() == ["proxy-under-test".to_string()] {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(seen, "the drain must deregister the proxy from discovery");
+
+        // New connections are refused: the accept loop is gone.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let refused = TcpStream::connect(&proxy).await;
+        assert!(
+            refused.is_err() || refused.unwrap().read_u8().await.is_err(),
+            "a draining proxy must not take new connections"
+        );
+
+        // And readiness reports it.
+        assert!(*context.drain.borrow());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readyz_answers_draining_during_a_drain() {
+        let (ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(4);
+        let (drain_tx, drain_rx) = watch::channel(false);
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: ring_rx,
+            refresh_now: refresh_tx,
+            drain: drain_rx,
+            backends: SharedBackends::new(),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        });
+        ring_tx
+            .send(Some(Arc::new(RingView::new(
+                vec![("a".to_string(), "127.0.0.1:1".to_string())],
+                1,
+            ))))
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(run_metrics_server(
+            listener,
+            Arc::clone(&context),
+            Arc::new(Semaphore::new(4)),
+            4,
+        ));
+
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        drain_tx.send(true).unwrap();
+        let (status, body) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+        assert!(body.contains("draining"), "{body}");
     }
 
     #[tokio::test(flavor = "current_thread")]
