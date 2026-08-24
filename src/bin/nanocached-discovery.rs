@@ -5638,26 +5638,62 @@ mod tests {
         let ready = Instant::now();
 
         assert_eq!(
-            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await,
+            announce_proxy(
+                &registry,
+                &current_join,
+                ready,
+                shutdown_rx.clone(),
+                "proxy-a",
+                8358,
+                "tk-a"
+            )
+            .await,
             "R"
         );
         assert_eq!(
-            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-b", 9358, "tk-b").await,
+            announce_proxy(
+                &registry,
+                &current_join,
+                ready,
+                shutdown_rx.clone(),
+                "proxy-b",
+                9358,
+                "tk-b"
+            )
+            .await,
             "R"
         );
 
         let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
         assert!(response.starts_with("N 2\n"), "got {response:?}");
-        assert!(response.contains("proxy-a127.0.0.1:8358"), "got {response:?}");
-        assert!(response.contains("proxy-b127.0.0.1:9358"), "got {response:?}");
+        assert!(
+            response.contains("proxy-a127.0.0.1:8358"),
+            "got {response:?}"
+        );
+        assert!(
+            response.contains("proxy-b127.0.0.1:9358"),
+            "got {response:?}"
+        );
 
         // A re-announce with the right token moves the address.
         assert_eq!(
-            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8360, "tk-a").await,
+            announce_proxy(
+                &registry,
+                &current_join,
+                ready,
+                shutdown_rx.clone(),
+                "proxy-a",
+                8360,
+                "tk-a"
+            )
+            .await,
             "R"
         );
         let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
-        assert!(response.contains("proxy-a127.0.0.1:8360"), "got {response:?}");
+        assert!(
+            response.contains("proxy-a127.0.0.1:8360"),
+            "got {response:?}"
+        );
         assert!(response.starts_with("N 2\n"), "got {response:?}");
     }
 
@@ -5669,14 +5705,34 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let ready = Instant::now();
 
-        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await;
-        let reply =
-            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 9999, "tk-evil").await;
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-a",
+            8358,
+            "tk-a",
+        )
+        .await;
+        let reply = announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-a",
+            9999,
+            "tk-evil",
+        )
+        .await;
         assert_ne!(reply, "R");
 
         // The original registration is untouched.
         let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
-        assert!(response.contains("proxy-a127.0.0.1:8358"), "got {response:?}");
+        assert!(
+            response.contains("proxy-a127.0.0.1:8358"),
+            "got {response:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5687,15 +5743,26 @@ mod tests {
         let grace_end = Instant::now() + Duration::from_millis(250);
 
         assert_eq!(
-            announce_proxy(&registry, &current_join, grace_end, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await,
+            announce_proxy(
+                &registry,
+                &current_join,
+                grace_end,
+                shutdown_rx.clone(),
+                "proxy-a",
+                8358,
+                "tk-a"
+            )
+            .await,
             "R",
             "a Y during the grace must be accepted — it is how the map refills"
         );
-        let response = query_proxies(&registry, &current_join, grace_end, shutdown_rx.clone()).await;
+        let response =
+            query_proxies(&registry, &current_join, grace_end, shutdown_rx.clone()).await;
         assert!(response.starts_with("B\n"), "got {response:?}");
 
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let response = query_proxies(&registry, &current_join, grace_end, shutdown_rx.clone()).await;
+        let response =
+            query_proxies(&registry, &current_join, grace_end, shutdown_rx.clone()).await;
         assert!(response.starts_with("N 1\n"), "got {response:?}");
     }
 
@@ -5709,10 +5776,22 @@ mod tests {
         // One member (P upserts straight to Joined) and one proxy.
         let (mut member, server) = tcp_pair().await;
         spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
-        member.write_all(b"P 6 9001 9\nnode-atk-node-a").await.unwrap();
+        member
+            .write_all(b"P 6 9001 9\nnode-atk-node-a")
+            .await
+            .unwrap();
         let mut ack = [0u8; 2];
         member.read_exact(&mut ack).await.unwrap();
-        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-a", 8358, "tk-a").await;
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-a",
+            8358,
+            "tk-a",
+        )
+        .await;
 
         let (mut client, server) = tcp_pair().await;
         spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
@@ -5754,14 +5833,40 @@ mod tests {
             shutdown_rx.clone(),
         ));
 
-        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-old", 8358, "tk-old").await;
-        announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-live", 8359, "tk-live").await;
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-old",
+            8358,
+            "tk-old",
+        )
+        .await;
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-live",
+            8359,
+            "tk-live",
+        )
+        .await;
 
         // Keep proxy-live fresh past proxy-old's expiry.
         for _ in 0..4 {
             tokio::time::sleep(Duration::from_millis(80)).await;
-            announce_proxy(&registry, &current_join, ready, shutdown_rx.clone(), "proxy-live", 8359, "tk-live")
-                .await;
+            announce_proxy(
+                &registry,
+                &current_join,
+                ready,
+                shutdown_rx.clone(),
+                "proxy-live",
+                8359,
+                "tk-live",
+            )
+            .await;
         }
 
         let response = query_proxies(&registry, &current_join, ready, shutdown_rx.clone()).await;
