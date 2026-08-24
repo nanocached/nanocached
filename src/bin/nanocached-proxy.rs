@@ -15,10 +15,10 @@
 //! # Design: routing and multiplexing together
 //!
 //! A proxy without backend multiplexing merely moves the FD problem one
-//! hop and adds latency, so the design covers both halves even though
-//! this binary implements only the first (#109); backend multiplexing
-//! and thin-client mode are #110, building on exactly the protocol
-//! primitives that already exist:
+//! hop and adds latency, so the two halves were designed together
+//! (#109) and are now both implemented — routing in #109, backend
+//! multiplexing in #110 — building on exactly the protocol primitives
+//! that already exist:
 //!
 //! - **Routing (this binary).** The proxy is a discovery client: it
 //!   fetches `L` (member roster + replication factor R) at startup and
@@ -38,30 +38,32 @@
 //!   — works against it unchanged. Cluster-internal frames (`M`/`X`)
 //!   are rejected: the proxy is not a member.
 //!
-//! - **Multiplexing (#110, designed here).** Response tags + pipelining
-//!   are the multiplexing primitive: a shared per-node backend
-//!   connection carries interleaved requests from many client
-//!   connections, each stamped with a proxy-chosen tag, and the tag on
-//!   each reply routes it back to its waiting client — no new framing.
-//!   The proxy then holds one tagged connection per (node × proxy), and
-//!   the node-side connection count collapses from fleet size to proxy
-//!   count. Scheduling is FIFO per backend connection with per-client
-//!   and per-backend in-flight caps (fairness across clients sharing a
-//!   backend; backpressure instead of unbounded queues). A poisoned
-//!   backend connection (desynced stream, half-dead peer) is dropped
-//!   whole: every request in flight on it fails over or errors, the tag
-//!   match having bounded the blast radius to exactly those requests,
-//!   and the next request redials. Thin-client mode falls out for free:
-//!   a client that connects to one proxy address needs no ring view, no
-//!   discovery client and no per-node connections — which is already
-//!   this binary's client-facing contract.
-//!
-//! In *this* binary each client connection gets its own lazily-dialed
-//! backend connection per node (so backend connections ≈ clients ×
-//! nodes, one hop removed — explicitly the #109 starting point). The
-//! per-request plumbing is already tag-checked and FIFO-ordered per
-//! backend, so #110 is "share the backend handles across client
-//! connections and add the caps", not a rewrite.
+//! - **Multiplexing (#110, implemented here).** Response tags +
+//!   pipelining are the multiplexing primitive: one shared per-node
+//!   backend connection (`SharedBackends`) carries interleaved requests
+//!   from every client connection, each stamped with a proxy-chosen
+//!   sequence tag, and the tag on each reply routes it back to its
+//!   waiting client — no new framing. The proxy holds one tagged
+//!   connection per (node × proxy), and the node-side connection count
+//!   collapses from fleet size to proxy count. Each backend connection
+//!   is a writer/reader pair: the writer pumps queued frames without
+//!   waiting for replies (genuine pipelining — `run_backend`), the
+//!   reader resolves replies FIFO by tag. Scheduling is FIFO across
+//!   clients with three bounded stages (`CLIENT_IN_FLIGHT` per client
+//!   connection, `BACKEND_QUEUE_DEPTH` admission per backend,
+//!   `MAX_BACKEND_IN_FLIGHT` written-but-unanswered per backend) —
+//!   fairness by arrival order plus per-client allowances, and
+//!   backpressure instead of unbounded queues. A poisoned backend
+//!   connection (desynced stream, half-dead peer, per-reply progress
+//!   timeout) is dropped whole: every request in flight on it errors,
+//!   the tag match having bounded the blast radius to exactly those
+//!   requests, and the next request redials — with the drivers'
+//!   retry/fallback paths (`retry_get_on`, `refan_write`,
+//!   `finish_clear`) absorbing the common node-side idle close so a
+//!   long-lived shared connection's death is invisible to clients.
+//!   Thin-client mode falls out of the client-facing contract above
+//!   (one proxy address, no ring view, no discovery client) and shipped
+//!   with #109/#122 (`via_proxy`).
 //!
 //! # Pipelining and response order
 //!
@@ -143,6 +145,27 @@ const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// force an immediate refresh regardless, so this only bounds how stale
 /// the view can get while nothing is being rerouted.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Issue #110: how many requests may sit written-but-unanswered on one
+/// shared backend connection. The writer stalls (backpressuring every
+/// client queued behind it) once this many replies are outstanding, so
+/// one slow node bounds memory instead of growing an unbounded reply
+/// ledger.
+const MAX_BACKEND_IN_FLIGHT: usize = 256;
+
+/// Issue #110: how many requests may queue for a backend connection's
+/// writer before enqueueing clients start waiting. Queueing is FIFO
+/// across client connections — that, plus this bound and
+/// `CLIENT_IN_FLIGHT`, is the fairness story: no client can occupy more
+/// of a shared backend than its own in-flight allowance, and admission
+/// is strictly arrival-ordered.
+const BACKEND_QUEUE_DEPTH: usize = 256;
+
+/// How many responses one client connection may have outstanding (the
+/// reader stops parsing new requests once this many are undelivered) —
+/// both the per-client in-flight cap and the per-client share bound on
+/// any shared backend.
+const CLIENT_IN_FLIGHT: usize = 256;
 
 /// Bounds on the `L` response, mirroring `verify-staged-join`'s: a
 /// corrupt header must not drive allocations or blocking reads.
@@ -476,6 +499,12 @@ struct ProxyContext {
     /// Nudges the refresher for an immediate re-fetch (a `W` was seen or
     /// a clear fan-out failed) instead of waiting out the interval.
     refresh_now: mpsc::Sender<()>,
+    /// Issue #110: the proxy-wide shared backend connections — one
+    /// tagged, pipelined connection per node, multiplexing every client
+    /// connection's traffic. This is what collapses the node-side
+    /// connection count from "client connections × nodes" to "one per
+    /// node per proxy".
+    backends: SharedBackends,
 }
 
 // ─── shared line/frame helpers ───────────────────────────────────────
@@ -1040,25 +1069,70 @@ impl BackendHandle {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend handshake timed out"))??;
 
-        let (sender, receiver) = mpsc::channel(64);
+        let (sender, receiver) = mpsc::channel(BACKEND_QUEUE_DEPTH);
         tokio::spawn(run_backend(stream, buf, receiver, addr.to_string()));
         Ok(Self { sender })
     }
 }
 
-/// The backend connection's owner task: writes each queued request with
-/// the next sequence tag, reads replies in order, verifies the echoed
-/// tag, and hands each reply back. Any I/O error, tag mismatch or
-/// malformed reply poisons the connection: every queued and in-flight
-/// request gets the error (their oneshot drops), and the handle's next
-/// user redials — the tag check is what bounds a desync's blast radius
-/// to exactly the requests on this connection (see the module docs).
+/// The shared backend connection's writer half (issue #110): assigns
+/// each queued request the next sequence tag, reserves its slot in the
+/// reader's pending FIFO (blocking — the in-flight cap,
+/// `MAX_BACKEND_IN_FLIGHT`), then writes the frame. Requests from every
+/// client connection interleave here in strict queue order; replies are
+/// matched by the reader half. Unlike #109's serial
+/// write-then-await-reply loop, writing never waits for replies — the
+/// connection is genuinely pipelined, so N clients sharing it cost
+/// queueing, not N round-trips.
+///
+/// Poisoning: any reader-side failure (I/O error, tag mismatch,
+/// malformed or ill-fitting reply, per-reply timeout) kills the reader,
+/// which fails this writer's next pending-slot reservation; the writer
+/// exits, dropping the request queue, and every queued/in-flight
+/// request's oneshot resolves as an error. The tag verification is what
+/// bounds the blast radius to exactly the requests on this connection
+/// (see the module docs); the next `enqueue` redials.
 async fn run_backend(
-    mut stream: UpstreamStream,
-    mut buf: BytesMut,
+    stream: UpstreamStream,
+    buf: BytesMut,
     mut receiver: mpsc::Receiver<BackendRequest>,
-    addr: String,
+    _addr: String,
 ) {
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let (pending_tx, mut pending_rx) =
+        mpsc::channel::<(u32, Expect, oneshot::Sender<io::Result<NodeReply>>)>(
+            MAX_BACKEND_IN_FLIGHT,
+        );
+
+    // The reader half: resolves pending replies in FIFO order. The
+    // per-reply timeout is a *progress* bound (each reply must arrive
+    // within it once the reader starts waiting), not an end-to-end
+    // per-request deadline — under pipelining a deep queue's total wait
+    // is the sum of its predecessors', which is exactly the
+    // backpressure `MAX_BACKEND_IN_FLIGHT` exists to bound.
+    let reader = tokio::spawn(async move {
+        let mut buf = buf;
+        while let Some((tag, expect, reply)) = pending_rx.recv().await {
+            let result = timeout(
+                UPSTREAM_IO_TIMEOUT,
+                read_reply(&mut read_half, &mut buf, tag, expect),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "backend reply timed out",
+                ))
+            });
+
+            let poisoned = result.is_err();
+            let _ = reply.send(result);
+            if poisoned {
+                return;
+            }
+        }
+    });
+
     let mut next_tag: u32 = 0;
 
     while let Some(request) = receiver.recv().await {
@@ -1067,26 +1141,28 @@ async fn run_backend(
 
         let frame = substitute_tag(request.frame, tag);
 
-        let result = timeout(UPSTREAM_IO_TIMEOUT, async {
-            stream.write_all(&frame).await?;
-            read_reply(&mut stream, &mut buf, tag, request.expect).await
-        })
-        .await
-        .unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("request to {addr} timed out"),
-            ))
-        });
+        // Reserve the reply slot before writing: if the reader is gone
+        // (poisoned), this fails and the request errors without touching
+        // a desynced stream.
+        if pending_tx
+            .send((tag, request.expect, request.reply))
+            .await
+            .is_err()
+        {
+            break;
+        }
 
-        let poisoned = result.is_err();
-        let _ = request.reply.send(result);
-        if poisoned {
-            // Dropping the receiver fails every queued request's send —
-            // callers see "backend connection is gone" and redial.
-            return;
+        if write_half.write_all(&frame).await.is_err() {
+            // The reader will observe the broken stream (or time out)
+            // and poison; nothing more to write here.
+            break;
         }
     }
+
+    // Queue closed (handle dropped or poisoned): let the reader drain
+    // what is still pending, then stop.
+    drop(pending_tx);
+    let _ = reader.await;
 }
 
 /// The `{tag}` placeholder the framers leave in the header, replaced
@@ -1109,8 +1185,8 @@ fn substitute_tag(frame: Vec<u8>, tag: u32) -> Vec<u8> {
     framed
 }
 
-async fn read_reply(
-    stream: &mut UpstreamStream,
+async fn read_reply<S: AsyncRead + Unpin>(
+    stream: &mut S,
     buf: &mut BytesMut,
     tag: u32,
     expect: Expect,
@@ -1236,31 +1312,46 @@ fn frame_clear_all() -> Vec<u8> {
 
 // ─── request drivers ─────────────────────────────────────────────────
 
-/// Per-client-connection state a driver needs: the lazily-dialed backend
-/// handles (one per node address, private to this client connection —
-/// the #109 model; #110 shares them) behind a mutex since drivers for
-/// different pipelined requests run concurrently.
-struct ClientBackends {
-    handles: tokio::sync::Mutex<HashMap<String, BackendHandle>>,
+/// Issue #110: the proxy-wide backend pool — one shared, tagged,
+/// pipelined connection per node, multiplexing every client
+/// connection's traffic. (#109 kept one per client connection per node,
+/// which merely moved the fleet's connection count one hop; sharing is
+/// what collapses it to "proxy count × nodes".)
+///
+/// Dialing is per-address: the outer map lock is only ever held to
+/// fetch/insert an address's slot, and the dial itself happens under
+/// that slot's own async mutex — so one node being slow to accept
+/// never blocks traffic to the others, and concurrent first-users of
+/// the same node coalesce onto a single dial instead of racing.
+struct SharedBackends {
+    slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<BackendHandle>>>>>,
 }
 
-impl ClientBackends {
+impl SharedBackends {
     fn new() -> Self {
         Self {
-            handles: tokio::sync::Mutex::new(HashMap::new()),
+            slots: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Enqueues one tag-checked request on `addr`'s connection (dialing
-    /// it if needed) and returns the pending reply.
+    fn slot(&self, addr: &str) -> Arc<tokio::sync::Mutex<Option<BackendHandle>>> {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(slots.entry(addr.to_string()).or_default())
+    }
+
+    /// Enqueues one tag-checked request on `addr`'s shared connection
+    /// (dialing it if needed) and returns the pending reply.
     ///
     /// This is the ordering-critical half of a request (see
-    /// `handle_client`'s dispatch note): two requests enqueued on the
-    /// same backend in client order are *sent* in client order, which is
-    /// what preserves a pipelined connection's same-key (and
-    /// clear-then-read) dependency chains through the proxy exactly as a
-    /// node's own single-actor serialization would. A dial failure
-    /// resolves the pending reply immediately with the error.
+    /// `handle_client`'s dispatch note): one client's requests are
+    /// enqueued sequentially by its reader, so they enter this queue —
+    /// and the wire — in that client's request order; different
+    /// clients' requests interleave in arrival order, which is exactly
+    /// a node's own accept-order semantics. A dial failure resolves the
+    /// pending reply immediately with the error.
     async fn enqueue(
         &self,
         context: &ProxyContext,
@@ -1268,22 +1359,24 @@ impl ClientBackends {
         frame: Vec<u8>,
         expect: Expect,
     ) -> PendingReply {
+        let slot = self.slot(addr);
+
         // Two passes: a cached handle whose task has exited (the node's
         // idle timeout closed the connection, or an earlier request
-        // poisoned it) is detected by the failed channel send, dropped,
-        // and replaced by a fresh dial — the same transparent redial a
-        // lazily-reconnecting SDK connection does.
+        // poisoned it) is detected by the failed queue send, dropped —
+        // only if it is still the *same* handle, another client may
+        // have redialed already — and replaced by a fresh dial.
         for _ in 0..2 {
             let handle = {
-                let mut handles = self.handles.lock().await;
-                match handles.get(addr) {
+                let mut guard = slot.lock().await;
+                match guard.as_ref() {
                     Some(handle) => handle.clone(),
                     None => {
                         match BackendHandle::connect(addr, &context.secret, &context.tls_connector)
                             .await
                         {
                             Ok(handle) => {
-                                handles.insert(addr.to_string(), handle.clone());
+                                *guard = Some(handle.clone());
                                 handle
                             }
                             Err(error) => return PendingReply::failed(error),
@@ -1310,13 +1403,19 @@ impl ClientBackends {
                 });
             }
 
-            self.handles.lock().await.remove(addr);
+            let mut guard = slot.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|current| current.sender.same_channel(&handle.sender))
+            {
+                *guard = None;
+            }
         }
 
         PendingReply::failed(io::Error::other("backend connection is gone"))
     }
 
-    /// `enqueue` + await, with one transparent redial when the cached
+    /// `enqueue` + await, with one transparent redial when the shared
     /// handle turned out dead — for the retry/fallback paths that run
     /// *after* initial dispatch, where ordering no longer applies.
     async fn call(
@@ -1332,10 +1431,7 @@ impl ClientBackends {
             .await;
         match first {
             Ok(reply) => Ok(reply),
-            Err(_) => {
-                self.handles.lock().await.remove(addr);
-                self.enqueue(context, addr, frame, expect).await.await
-            }
+            Err(_) => self.enqueue(context, addr, frame, expect).await.await,
         }
     }
 }
@@ -1406,7 +1502,6 @@ type DriverResult = Result<Vec<u8>, Fatal>;
 /// or dropped the ordered attempt.
 async fn dispatch_request(
     context: Arc<ProxyContext>,
-    backends: Arc<ClientBackends>,
     request: Request,
     tag: Option<u32>,
 ) -> oneshot::Receiver<DriverResult> {
@@ -1426,7 +1521,8 @@ async fn dispatch_request(
                 let _ = result_tx.send(Ok(respond("B", None)));
                 return result_rx;
             };
-            let pending = backends
+            let pending = context
+                .backends
                 .enqueue(
                     &context,
                     primary,
@@ -1435,8 +1531,7 @@ async fn dispatch_request(
                 )
                 .await;
             tokio::spawn(async move {
-                let result =
-                    finish_get(&context, &backends, &namespace, &key, owners, pending, tag).await;
+                let result = finish_get(&context, &namespace, &key, owners, pending, tag).await;
                 let _ = result_tx.send(result);
             });
         }
@@ -1446,41 +1541,32 @@ async fn dispatch_request(
             value,
             ttl,
         } => {
-            let pending = enqueue_write(
-                &context,
-                &backends,
-                &ring,
-                &namespace,
-                &key,
-                Some((&value, ttl)),
-            )
-            .await;
+            let pending =
+                enqueue_write(&context, &ring, &namespace, &key, Some((&value, ttl))).await;
             tokio::spawn(async move {
                 let write = Some((value, ttl));
-                let result =
-                    finish_write(&context, &backends, &namespace, &key, write, pending, tag).await;
+                let result = finish_write(&context, &namespace, &key, write, pending, tag).await;
                 let _ = result_tx.send(result);
             });
         }
         Request::Delete { namespace, key } => {
-            let pending = enqueue_write(&context, &backends, &ring, &namespace, &key, None).await;
+            let pending = enqueue_write(&context, &ring, &namespace, &key, None).await;
             tokio::spawn(async move {
-                let result =
-                    finish_write(&context, &backends, &namespace, &key, None, pending, tag).await;
+                let result = finish_write(&context, &namespace, &key, None, pending, tag).await;
                 let _ = result_tx.send(result);
             });
         }
         Request::Clear { namespace } => {
-            let pending = enqueue_clear(&context, &backends, &ring, Some(&namespace)).await;
+            let pending = enqueue_clear(&context, &ring, Some(&namespace)).await;
             tokio::spawn(async move {
-                let result = finish_clear(&context, &backends, Some(namespace), pending, tag).await;
+                let result = finish_clear(&context, Some(namespace), pending, tag).await;
                 let _ = result_tx.send(result);
             });
         }
         Request::ClearAll => {
-            let pending = enqueue_clear(&context, &backends, &ring, None).await;
+            let pending = enqueue_clear(&context, &ring, None).await;
             tokio::spawn(async move {
-                let result = finish_clear(&context, &backends, None, pending, tag).await;
+                let result = finish_clear(&context, None, pending, tag).await;
                 let _ = result_tx.send(result);
             });
         }
@@ -1495,7 +1581,6 @@ async fn dispatch_request(
 /// stance).
 async fn finish_get(
     context: &ProxyContext,
-    backends: &ClientBackends,
     namespace: &[u8],
     key: &[u8],
     owners: Vec<String>,
@@ -1510,42 +1595,31 @@ async fn finish_get(
             let Some(ring) = current_ring(context) else {
                 return Err(Fatal);
             };
-            return retry_get_on(
-                context,
-                backends,
-                namespace,
-                key,
-                ring.owners(namespace, key),
-                tag,
-            )
-            .await;
+            return retry_get_on(context, namespace, key, ring.owners(namespace, key), tag).await;
         }
         Ok(_) | Err(_) => {}
     }
 
     // The ordered primary attempt failed outright: fall through the
     // remaining owners.
-    retry_get_on(
-        context,
-        backends,
-        namespace,
-        key,
-        owners.into_iter().skip(1).collect(),
-        tag,
-    )
-    .await
+    // The full owner list, primary included: the shared connection may
+    // simply have been idle-closed by the node, and `call`'s transparent
+    // redial recovers that without failing the client (issue #110 — a
+    // long-lived shared connection makes this the common case, not the
+    // rare one).
+    retry_get_on(context, namespace, key, owners, tag).await
 }
 
 async fn retry_get_on(
     context: &ProxyContext,
-    backends: &ClientBackends,
     namespace: &[u8],
     key: &[u8],
     owners: Vec<String>,
     tag: Option<u32>,
 ) -> DriverResult {
     for addr in &owners {
-        match backends
+        match context
+            .backends
             .call(context, addr, frame_get(namespace, key), Expect::Value)
             .await
         {
@@ -1561,7 +1635,6 @@ async fn retry_get_on(
 /// pass; returns the pending replies (primary first).
 async fn enqueue_write(
     context: &ProxyContext,
-    backends: &ClientBackends,
     ring: &RingView,
     namespace: &[u8],
     key: &[u8],
@@ -1571,7 +1644,12 @@ async fn enqueue_write(
     let (frame, expect) = write_frame(namespace, key, write);
     let mut pending = Vec::with_capacity(owners.len());
     for addr in &owners {
-        pending.push(backends.enqueue(context, addr, frame.clone(), expect).await);
+        pending.push(
+            context
+                .backends
+                .enqueue(context, addr, frame.clone(), expect)
+                .await,
+        );
     }
     pending
 }
@@ -1594,7 +1672,6 @@ fn write_frame(
 /// forces one refresh-and-refan.
 async fn finish_write(
     context: &ProxyContext,
-    backends: &ClientBackends,
     namespace: &[u8],
     key: &[u8],
     write: Option<(Bytes, Option<u64>)>,
@@ -1620,35 +1697,58 @@ async fn finish_write(
         Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
         Ok(NodeReply::WrongNode) => {
+            // Stale roster: refresh, then re-fan on the new owner set.
             force_refresh(context).await;
-            let Some(ring) = current_ring(context) else {
-                return Err(Fatal);
-            };
-            let owners = ring.owners(namespace, key);
-            let (frame, expect) = write_frame(namespace, key, write_ref);
-            let Some((primary, replicas)) = owners.split_first() else {
-                return Ok(respond("B", None));
-            };
-            for addr in replicas {
-                if let Err(error) = backends.call(context, addr, frame.clone(), expect).await {
-                    eprintln!("WARN replica write to {addr} failed: {error}");
-                }
-            }
-            match backends.call(context, primary, frame, expect).await {
-                Ok(NodeReply::Stored) => Ok(respond("S", tag)),
-                Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
-                Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-                _ => Err(Fatal),
-            }
+            refan_write(context, namespace, key, write_ref, tag).await
         }
-        Ok(_) | Err(_) => Err(Fatal),
+        // A transport failure on the ordered attempt: the shared
+        // connection may simply have been idle-closed by the node
+        // (issue #110 — long-lived shared connections make that the
+        // common case). Re-fan once via `call`, whose transparent
+        // redial recovers it; a second failure is real.
+        Err(_) => refan_write(context, namespace, key, write_ref, tag).await,
+        Ok(_) => Err(Fatal),
+    }
+}
+
+/// One whole write fan-out over the *current* ring via `call` (redials
+/// dead shared connections) — `finish_write`'s retry path for both a
+/// primary `W` and a transport failure.
+async fn refan_write(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    write: Option<(&Bytes, Option<u64>)>,
+    tag: Option<u32>,
+) -> DriverResult {
+    let Some(ring) = current_ring(context) else {
+        return Err(Fatal);
+    };
+    let owners = ring.owners(namespace, key);
+    let (frame, expect) = write_frame(namespace, key, write);
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Ok(respond("B", None));
+    };
+    for addr in replicas {
+        if let Err(error) = context
+            .backends
+            .call(context, addr, frame.clone(), expect)
+            .await
+        {
+            eprintln!("WARN replica write to {addr} failed: {error}");
+        }
+    }
+    match context.backends.call(context, primary, frame, expect).await {
+        Ok(NodeReply::Stored) => Ok(respond("S", tag)),
+        Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        _ => Err(Fatal),
     }
 }
 
 /// Enqueues `c`/`F` on every member in one ordered pass.
 async fn enqueue_clear(
     context: &ProxyContext,
-    backends: &ClientBackends,
     ring: &RingView,
     namespace: Option<&Bytes>,
 ) -> Vec<(String, PendingReply)> {
@@ -1658,7 +1758,8 @@ async fn enqueue_clear(
     };
     let mut pending = Vec::new();
     for addr in ring.all_addresses() {
-        let reply = backends
+        let reply = context
+            .backends
             .enqueue(context, &addr, frame.clone(), Expect::Cleared)
             .await;
         pending.push((addr, reply));
@@ -1671,7 +1772,6 @@ async fn enqueue_clear(
 /// semantics); a second failure is fatal — never a silent partial clear.
 async fn finish_clear(
     context: &ProxyContext,
-    backends: &ClientBackends,
     namespace: Option<Bytes>,
     pending: Vec<(String, PendingReply)>,
     tag: Option<u32>,
@@ -1695,7 +1795,8 @@ async fn finish_clear(
     let mut all_ok = true;
     for addr in ring.all_addresses() {
         all_ok &= matches!(
-            backends
+            context
+                .backends
                 .call(context, &addr, frame.clone(), Expect::Cleared)
                 .await,
             Ok(NodeReply::Cleared)
@@ -1733,7 +1834,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     // The FIFO between reader and writer: each entry resolves to the
     // bytes to send. Bounded, so a client that pipelines without reading
     // responses back-pressures the reader instead of growing a queue.
-    let (fifo_tx, mut fifo_rx) = mpsc::channel::<oneshot::Receiver<DriverResult>>(256);
+    let (fifo_tx, mut fifo_rx) = mpsc::channel::<oneshot::Receiver<DriverResult>>(CLIENT_IN_FLIGHT);
 
     let writer = tokio::spawn(async move {
         while let Some(pending) = fifo_rx.recv().await {
@@ -1752,7 +1853,6 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
         write_half
     });
 
-    let backends = Arc::new(ClientBackends::new());
     let mut buf = BytesMut::new();
     let mut authenticated = context.secret.is_none();
     let mut tagged = false;
@@ -1795,9 +1895,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     // Dispatch inline (awaiting the ordered backend
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
-                    let response_rx =
-                        dispatch_request(Arc::clone(&context), Arc::clone(&backends), request, tag)
-                            .await;
+                    let response_rx = dispatch_request(Arc::clone(&context), request, tag).await;
                     if fifo_tx.send(response_rx).await.is_err() {
                         break 'connection Ok(());
                     }
@@ -1911,6 +2009,7 @@ async fn run(
         tls_connector,
         ring: ring_rx,
         refresh_now: refresh_tx,
+        backends: SharedBackends::new(),
     });
 
     let listener = TcpListener::bind((args.host.as_str(), args.port)).await?;
@@ -2063,8 +2162,16 @@ mod tests {
         cleared: Arc<AtomicUsize>,
         flushed: Arc<AtomicUsize>,
         wrong_node_once: Arc<AtomicBool>,
+        /// Issue #110: drop the connection instead of answering the next
+        /// request — simulates a node-side close (idle timeout, crash)
+        /// on the shared connection.
+        close_once: Arc<AtomicBool>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
+        /// Issue #110: set when a request was already buffered before
+        /// the previous one was answered — only a genuinely pipelined
+        /// sender (not #109's serial write-then-await loop) produces it.
+        saw_pipelined: Arc<AtomicBool>,
     }
 
     impl MockNode {
@@ -2077,15 +2184,19 @@ mod tests {
                 cleared: Arc::new(AtomicUsize::new(0)),
                 flushed: Arc::new(AtomicUsize::new(0)),
                 wrong_node_once: Arc::new(AtomicBool::new(false)),
+                close_once: Arc::new(AtomicBool::new(false)),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
+                saw_pipelined: Arc::new(AtomicBool::new(false)),
             };
             let store = Arc::clone(&node.store);
             let cleared = Arc::clone(&node.cleared);
             let flushed = Arc::clone(&node.flushed);
             let wrong_once = Arc::clone(&node.wrong_node_once);
+            let close_once = Arc::clone(&node.close_once);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
+            let saw_pipelined = Arc::clone(&node.saw_pipelined);
             tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -2093,12 +2204,16 @@ mod tests {
                     };
                     tokio::spawn(serve_mock_node(
                         stream,
-                        Arc::clone(&store),
-                        Arc::clone(&cleared),
-                        Arc::clone(&flushed),
-                        Arc::clone(&wrong_once),
-                        Arc::clone(&delay),
-                        Arc::clone(&auth_count),
+                        MockNodeState {
+                            store: Arc::clone(&store),
+                            cleared: Arc::clone(&cleared),
+                            flushed: Arc::clone(&flushed),
+                            wrong_once: Arc::clone(&wrong_once),
+                            close_once: Arc::clone(&close_once),
+                            delay: Arc::clone(&delay),
+                            auth_count: Arc::clone(&auth_count),
+                            saw_pipelined: Arc::clone(&saw_pipelined),
+                        },
                     ));
                 }
             });
@@ -2118,21 +2233,38 @@ mod tests {
         }
     }
 
-    async fn serve_mock_node(
-        mut stream: TcpStream,
+    struct MockNodeState {
         store: Store,
         cleared: Arc<AtomicUsize>,
         flushed: Arc<AtomicUsize>,
         wrong_once: Arc<AtomicBool>,
+        close_once: Arc<AtomicBool>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
-    ) {
+        saw_pipelined: Arc<AtomicBool>,
+    }
+
+    async fn serve_mock_node(mut stream: TcpStream, state: MockNodeState) {
+        let MockNodeState {
+            store,
+            cleared,
+            flushed,
+            wrong_once,
+            close_once,
+            delay,
+            auth_count,
+            saw_pipelined,
+        } = state;
         let mut buf = BytesMut::new();
         let result: io::Result<()> = async {
             loop {
                 let line = read_line(&mut stream, &mut buf).await?;
                 let mut parts = line.split(' ');
                 let command = parts.next().unwrap_or_default().to_string();
+                if command != "A" && close_once.swap(false, Ordering::SeqCst) {
+                    // Simulated node-side drop: no reply, connection gone.
+                    return Ok(());
+                }
                 let fields: Vec<String> = parts.map(str::to_string).collect();
                 // The proxy always negotiates tagged mode: every
                 // non-A request's last field is the tag.
@@ -2161,6 +2293,12 @@ mod tests {
                         let pause = *delay.lock().unwrap();
                         if !pause.is_zero() {
                             sleep(pause).await;
+                        }
+                        // Issue #110: bytes already buffered while this
+                        // request was still unanswered = the sender
+                        // pipelines rather than awaiting each reply.
+                        if !buf.is_empty() {
+                            saw_pipelined.store(true, Ordering::SeqCst);
                         }
                         if wrong_once.swap(false, Ordering::SeqCst) {
                             stream
@@ -2325,6 +2463,7 @@ mod tests {
             tls_connector: None,
             ring: ring_rx.clone(),
             refresh_now: refresh_tx,
+            backends: SharedBackends::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -2610,6 +2749,126 @@ mod tests {
         let mut second = TcpStream::connect(&proxy).await.unwrap();
         let mut buf = BytesMut::new();
         assert_eq!(read_line(&mut second, &mut buf).await.unwrap(), "B");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_connections_share_one_backend_connection_per_node() {
+        // Issue #110: the point of the multiplexing — N clients, still
+        // exactly one proxy→node connection per node.
+        let (nodes, proxy) = cluster(2).await;
+
+        let (mut first, mut first_buf) = connect_and_auth(&proxy).await;
+        let (mut second, mut second_buf) = connect_and_auth(&proxy).await;
+        let (mut third, mut third_buf) = connect_and_auth(&proxy).await;
+
+        for (stream, buf) in [
+            (&mut first, &mut first_buf),
+            (&mut second, &mut second_buf),
+            (&mut third, &mut third_buf),
+        ] {
+            stream.write_all(b"S 1 1\nkv").await.unwrap();
+            assert_eq!(read_line(stream, buf).await.unwrap(), "S");
+            stream.write_all(b"G 1\nk").await.unwrap();
+            assert_eq!(read_line(stream, buf).await.unwrap(), "V 1");
+            read_exact_into(stream, buf, 1).await.unwrap();
+            let _ = buf.split_to(1);
+        }
+
+        for node in &nodes {
+            assert_eq!(
+                node.auth_count.load(Ordering::SeqCst),
+                1,
+                "three clients must share one backend connection"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_shared_backend_connection_is_genuinely_pipelined() {
+        // Issue #110: with #109's serial write-then-await-reply loop the
+        // node never sees request N+1 before it answered N; the mock
+        // flags bytes that arrive while a delayed request is still
+        // unanswered.
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        *node.get_delay.lock().unwrap() = Duration::from_millis(100);
+        stream.write_all(b"G 1\nkG 1\nkG 1\nk").await.unwrap();
+        for _ in 0..3 {
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+            read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+            let _ = buf.split_to(1);
+        }
+
+        assert!(
+            node.saw_pipelined.load(Ordering::SeqCst),
+            "later requests must reach the node while an earlier one is still unanswered"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_shared_connection_is_redialed_transparently() {
+        // Issue #110: a node closing the shared connection (idle
+        // timeout, restart) fails the in-flight request's ordered
+        // attempt; the retry path redials and the client still gets its
+        // answer — for reads AND writes.
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        node.close_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"G 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+
+        node.close_once.store(true, Ordering::SeqCst);
+        stream.write_all(b"S 1 2\nkv2").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        assert_eq!(
+            node.auth_count.load(Ordering::SeqCst),
+            3,
+            "each drop must cost exactly one redial"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_deep_pipelined_burst_completes_under_the_in_flight_caps() {
+        // Issue #110: 300 outstanding requests exceed every cap in the
+        // chain (CLIENT_IN_FLIGHT, BACKEND_QUEUE_DEPTH,
+        // MAX_BACKEND_IN_FLIGHT); backpressure must slow them down, not
+        // deadlock or drop them.
+        let (_nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let mut request = Vec::new();
+        for index in 0..300u32 {
+            let key = format!("burst-{index}");
+            request.extend_from_slice(format!("S {} 1\n{key}x", key.len()).as_bytes());
+        }
+
+        let (mut read_half, mut write_half) = stream.split();
+        let writer = async {
+            write_half.write_all(&request).await.unwrap();
+        };
+        let reader = async {
+            for _ in 0..300 {
+                assert_eq!(read_line(&mut read_half, &mut buf).await.unwrap(), "S");
+            }
+        };
+        tokio::join!(writer, reader);
     }
 
     #[tokio::test(flavor = "current_thread")]
