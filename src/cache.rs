@@ -61,6 +61,30 @@ impl Namespace {
     }
 }
 
+/// Issue #124: `Cache::stats`'s snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheStats {
+    pub used_bytes: usize,
+    pub max_memory_bytes: usize,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub sets: u64,
+    pub deletes: u64,
+    pub evictions: u64,
+    pub expirations: u64,
+    /// Largest first; one row per live namespace.
+    pub namespaces: Vec<NamespaceStats>,
+}
+
+/// Issue #124: one namespace's share, as `Cache::stats` reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceStats {
+    pub namespace: Bytes,
+    pub entries: usize,
+    pub used_bytes: usize,
+}
+
 pub struct Cache {
     /// One sub-map per namespace — the default namespace lives under the
     /// empty key (issue #105). A sub-map exists exactly while it holds at
@@ -75,6 +99,19 @@ pub struct Cache {
     max_memory_bytes: usize,
     /// Ticks once per `set`/`get`; stamps `Entry::last_used`.
     clock: u64,
+    /// Issue #124: client-visible operation counters, snapshotted by
+    /// `stats()` for the metrics endpoint. Plain fields, not atomics —
+    /// the cache actor is single-threaded.
+    hits: u64,
+    misses: u64,
+    sets: u64,
+    deletes: u64,
+    /// Entries removed by the memory bound (`evict_one`).
+    evictions: u64,
+    /// Entries removed because their TTL had passed — lazily on access
+    /// or proactively by the sweep. Migration-mark reclaims are internal
+    /// bookkeeping and deliberately not counted here.
+    expirations: u64,
     /// Keys handed off to another node during an staged node join migration this
     /// node was the source for, awaiting `sweep`'s next pass.
     migrated: HashSet<Key>,
@@ -100,6 +137,12 @@ impl Cache {
             used_bytes: 0,
             max_memory_bytes,
             clock: 0,
+            hits: 0,
+            misses: 0,
+            sets: 0,
+            deletes: 0,
+            evictions: 0,
+            expirations: 0,
             migrated: HashSet::new(),
             pending_removal: VecDeque::new(),
         }
@@ -139,6 +182,7 @@ impl Cache {
     }
 
     fn insert(&mut self, key: Key, value: Bytes, expires_at: Option<Instant>) {
+        self.sets += 1;
         // Entries stored long-term must not keep a shared receive-buffer
         // chunk (which may span an entire pipelined batch) alive just to
         // retain a few bytes of it, so re-copy into right-sized allocations
@@ -196,6 +240,7 @@ impl Cache {
     /// named-cache workloads namespaces exist for (issue #105), and only
     /// ever paid while over the memory bound.
     fn evict_one(&mut self) {
+        self.evictions += 1;
         let victim_namespace = self
             .namespaces
             .iter()
@@ -232,18 +277,24 @@ impl Cache {
 
     fn get_at(&mut self, key: &Key, now: Instant) -> Option<Bytes> {
         let last_used = self.tick();
-        let entry = self
+        let Some(entry) = self
             .namespaces
-            .get_mut(&key.namespace)?
-            .entries
-            .get_mut(&key.name[..])?;
+            .get_mut(&key.namespace)
+            .and_then(|namespace| namespace.entries.get_mut(&key.name[..]))
+        else {
+            self.misses += 1;
+            return None;
+        };
 
         if entry.is_expired_at(now) {
             self.remove_entry(key);
+            self.expirations += 1;
+            self.misses += 1;
             return None;
         }
 
         entry.last_used = last_used;
+        self.hits += 1;
         Some(entry.value.clone())
     }
 
@@ -392,6 +443,41 @@ impl Cache {
         self.clear_migrated_mark(key);
     }
 
+    /// Issue #124: one consistent snapshot of the counters, accounting,
+    /// and per-namespace breakdown, for the metrics endpoint. O(#live
+    /// namespaces) — never a walk over entries.
+    pub fn stats(&self) -> CacheStats {
+        let mut namespaces: Vec<NamespaceStats> = self
+            .namespaces
+            .iter()
+            .map(|(name, sub_map)| NamespaceStats {
+                namespace: name.clone(),
+                entries: sub_map.entries.len(),
+                used_bytes: sub_map.used_bytes,
+            })
+            .collect();
+        // Deterministic output order (HashMap iteration isn't), largest
+        // first — the read a capacity dashboard wants.
+        namespaces.sort_by(|a, b| {
+            b.used_bytes
+                .cmp(&a.used_bytes)
+                .then_with(|| a.namespace.cmp(&b.namespace))
+        });
+
+        CacheStats {
+            used_bytes: self.used_bytes,
+            max_memory_bytes: self.max_memory_bytes,
+            entries: self.entry_count,
+            hits: self.hits,
+            misses: self.misses,
+            sets: self.sets,
+            deletes: self.deletes,
+            evictions: self.evictions,
+            expirations: self.expirations,
+            namespaces,
+        }
+    }
+
     /// `CLEAR <ns>` (issue #106): drops the whole namespace in O(1) — its
     /// sub-map is one allocation to free, its byte share one subtraction —
     /// rather than scanning and unlinking entries one by one (which would
@@ -497,13 +583,18 @@ impl Cache {
             // the key may have been rewritten (mark cleared, or no longer
             // expired) since it was queued, and a fresh value must never
             // be swept on the strength of an old candidate entry.
-            let removable = (include_marked && self.migrated.contains(&key))
-                || self
-                    .peek(&key)
-                    .is_some_and(|entry| entry.is_expired_at(now));
+            let marked = include_marked && self.migrated.contains(&key);
+            let expired = self
+                .peek(&key)
+                .is_some_and(|entry| entry.is_expired_at(now));
 
-            if removable && self.remove_entry(&key).is_some() {
+            if (marked || expired) && self.remove_entry(&key).is_some() {
                 removed += 1;
+                // A marked reclaim is migration bookkeeping, not a
+                // client-visible expiry — see the counter's field docs.
+                if expired {
+                    self.expirations += 1;
+                }
             }
         }
 

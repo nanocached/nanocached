@@ -457,6 +457,7 @@ pub(crate) async fn run(
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
     max_memory_bytes: usize,
+    metrics_address: Option<String>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
@@ -505,6 +506,25 @@ pub(crate) async fn run(
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
     });
+
+    // Issue #124: the operations sidecar — Prometheus-format /metrics
+    // plus /healthz//readyz probes on their own listener, so scraping
+    // never competes for (or counts against) client connection permits.
+    let metrics_task = match &metrics_address {
+        Some(metrics_address) => {
+            let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
+            println!("INFO metrics endpoint listening on {metrics_address}");
+            Some(tokio::spawn(run_metrics_server(
+                metrics_listener,
+                request_tx.clone(),
+                Arc::clone(&connection_limit),
+                Arc::clone(&known_ring),
+                node_context.is_some(),
+                shutdown_rx.clone(),
+            )))
+        }
+        None => None,
+    };
 
     let heartbeat_task = match (heartbeat, &node_context) {
         (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
@@ -670,6 +690,13 @@ pub(crate) async fn run(
         heartbeat_task
             .await
             .map_err(|error| io::Error::other(format!("heartbeat task failed: {error}")))?;
+    }
+
+    if let Some(metrics_task) = metrics_task {
+        // The metrics server observes the same shutdown signal; nothing
+        // to flush, just don't leave the task behind.
+        metrics_task.abort();
+        let _ = metrics_task.await;
     }
 
     Ok(())
@@ -885,6 +912,255 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
 
 /// Echoed response tags: a `G`/`S`/`D` response on a tagged-mode connection echoes
 /// the request's tag; untagged connections keep the original encoding.
+/// Issue #124: the node's operations endpoint — a deliberately minimal,
+/// dependency-free HTTP/1.1 responder (the server's zero-dependency
+/// policy rules out an HTTP crate, and Prometheus' text exposition
+/// format needs nothing more). Three paths:
+///
+/// - `GET /metrics` — Prometheus text format v0.0.4: memory, entries,
+///   operation counters, connection occupancy, and one gauge pair per
+///   live namespace (see `Cache::stats`).
+/// - `GET /healthz` — liveness: `200` while the process serves at all.
+/// - `GET /readyz` — readiness: `200` once this node can serve clients —
+///   standalone immediately, a cluster node once it has adopted a
+///   membership view (`known_ring`); `503` before that, so an
+///   orchestrator keeps it out of rotation while it is still joining.
+///
+/// Runs on its own listener (`--metrics-port`): scrapes never compete
+/// for, or count against, client connection permits, and the port can
+/// stay unexposed to clients. No auth — the exposition is operational
+/// telemetry, and the deployment guide says to keep the port internal.
+async fn run_metrics_server(
+    listener: TcpListener,
+    request_tx: mpsc::Sender<CacheRequest>,
+    connection_limit: Arc<Semaphore>,
+    known_ring: KnownRing,
+    is_cluster: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = shutdown_rx.changed() => return,
+        };
+        let Ok((stream, _)) = accepted else {
+            continue;
+        };
+
+        let request_tx = request_tx.clone();
+        let connection_limit = Arc::clone(&connection_limit);
+        let known_ring = Arc::clone(&known_ring);
+        tokio::spawn(async move {
+            let _ = timeout(
+                Duration::from_secs(5),
+                serve_metrics_connection(
+                    stream,
+                    request_tx,
+                    connection_limit,
+                    known_ring,
+                    is_cluster,
+                ),
+            )
+            .await;
+        });
+    }
+}
+
+async fn serve_metrics_connection(
+    mut stream: TcpStream,
+    request_tx: mpsc::Sender<CacheRequest>,
+    connection_limit: Arc<Semaphore>,
+    known_ring: KnownRing,
+    is_cluster: bool,
+) -> io::Result<()> {
+    let path = read_http_request_path(&mut stream).await?;
+
+    let (status, body): (&str, String) = match path.as_str() {
+        "/metrics" => match execute_command(&request_tx, Command::Stats).await {
+            Ok(Response::Stats(stats)) => {
+                let connections =
+                    MAX_CONNECTIONS.saturating_sub(connection_limit.available_permits());
+                ("200 OK", render_node_metrics(&stats, connections))
+            }
+            _ => (
+                "500 Internal Server Error",
+                "cache actor unavailable\n".to_string(),
+            ),
+        },
+        "/healthz" => ("200 OK", "ok\n".to_string()),
+        "/readyz" => {
+            let ready = !is_cluster
+                || known_ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_some();
+            if ready {
+                ("200 OK", "ok\n".to_string())
+            } else {
+                ("503 Service Unavailable", "joining\n".to_string())
+            }
+        }
+        _ => ("404 Not Found", "not found\n".to_string()),
+    };
+
+    write_http_response(&mut stream, status, &body).await
+}
+
+/// Reads one HTTP request's head (bounded) and returns the GET path.
+/// Anything that isn't a small, well-formed GET is an error — this is a
+/// scrape endpoint, not a web server.
+async fn read_http_request_path(stream: &mut TcpStream) -> io::Result<String> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > 8192 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized http request head",
+            ));
+        }
+        let bytes_read = stream.read(&mut chunk).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    let head = String::from_utf8_lossy(&head);
+    let request_line = head.lines().next().unwrap_or_default();
+    let mut parts = request_line.split(' ');
+    match (parts.next(), parts.next()) {
+        (Some("GET"), Some(path)) => Ok(path.to_string()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a GET request",
+        )),
+    }
+}
+
+async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// Prometheus label values allow any UTF-8 with `\\`, `\"` and newline
+/// escaped; namespaces are arbitrary bytes, so non-UTF-8 goes through
+/// lossy replacement first.
+fn metrics_label_escape(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn render_node_metrics(stats: &crate::cache::CacheStats, connections: usize) -> String {
+    let mut out = String::new();
+    let mut metric = |name: &str, kind: &str, help: &str, value: String| {
+        out.push_str(&format!(
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{value}"
+        ));
+    };
+
+    metric(
+        "nanocached_node_memory_used_bytes",
+        "gauge",
+        "Bytes of cache memory in use (keys + values + per-entry overhead).",
+        format!("nanocached_node_memory_used_bytes {}\n", stats.used_bytes),
+    );
+    metric(
+        "nanocached_node_memory_max_bytes",
+        "gauge",
+        "The --max-memory bound.",
+        format!(
+            "nanocached_node_memory_max_bytes {}\n",
+            stats.max_memory_bytes
+        ),
+    );
+    metric(
+        "nanocached_node_entries",
+        "gauge",
+        "Live entries across every namespace.",
+        format!("nanocached_node_entries {}\n", stats.entries),
+    );
+    metric(
+        "nanocached_node_connections",
+        "gauge",
+        "Client connections currently held (of the connection limit).",
+        format!("nanocached_node_connections {connections}\n"),
+    );
+    metric(
+        "nanocached_node_hits_total",
+        "counter",
+        "GET requests answered with a value.",
+        format!("nanocached_node_hits_total {}\n", stats.hits),
+    );
+    metric(
+        "nanocached_node_misses_total",
+        "counter",
+        "GET requests answered not-found (expired included).",
+        format!("nanocached_node_misses_total {}\n", stats.misses),
+    );
+    metric(
+        "nanocached_node_sets_total",
+        "counter",
+        "Stored writes.",
+        format!("nanocached_node_sets_total {}\n", stats.sets),
+    );
+    metric(
+        "nanocached_node_deletes_total",
+        "counter",
+        "Deletes that removed a live entry.",
+        format!("nanocached_node_deletes_total {}\n", stats.deletes),
+    );
+    metric(
+        "nanocached_node_evictions_total",
+        "counter",
+        "Entries evicted by the memory bound.",
+        format!("nanocached_node_evictions_total {}\n", stats.evictions),
+    );
+    metric(
+        "nanocached_node_expirations_total",
+        "counter",
+        "Entries removed because their TTL passed.",
+        format!("nanocached_node_expirations_total {}\n", stats.expirations),
+    );
+
+    let mut namespace_entries = String::new();
+    let mut namespace_bytes = String::new();
+    for namespace in &stats.namespaces {
+        let label = metrics_label_escape(&namespace.namespace);
+        namespace_entries.push_str(&format!(
+            "nanocached_node_namespace_entries{{namespace=\"{label}\"}} {}\n",
+            namespace.entries
+        ));
+        namespace_bytes.push_str(&format!(
+            "nanocached_node_namespace_used_bytes{{namespace=\"{label}\"}} {}\n",
+            namespace.used_bytes
+        ));
+    }
+    if !stats.namespaces.is_empty() {
+        metric(
+            "nanocached_node_namespace_entries",
+            "gauge",
+            "Live entries per namespace (empty label = the default namespace).",
+            namespace_entries,
+        );
+        metric(
+            "nanocached_node_namespace_used_bytes",
+            "gauge",
+            "Bytes per namespace.",
+            namespace_bytes,
+        );
+    }
+
+    out
+}
+
 /// `c`/`F` (issue #106): applied to this node's own store unconditionally
 /// — a clear isn't key-addressed, so there is no wrong-node check; the
 /// client fans it out to every member and each drops its own sub-map —
@@ -3762,7 +4038,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
 
-        let error = run(&address, None, None, None, MAX_CACHE_MEMORY_BYTES)
+        let error = run(&address, None, None, None, MAX_CACHE_MEMORY_BYTES, None)
             .await
             .unwrap_err();
 
@@ -4128,6 +4404,127 @@ mod tests {
         .await;
 
         joining_task.await.unwrap();
+    }
+
+    /// Issue #124 helper: one plain HTTP GET, returning (status line,
+    /// body).
+    async fn http_get(addr: &str, path: &str) -> (String, String) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap().to_string(), body.to_string())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_endpoint_reports_cache_state_and_counters() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"k"),
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: Key::new(Bytes::from_static(b"users"), Bytes::from_static(b"a")),
+                value: Bytes::from_static(b"x"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(&request_tx, Command::Get { key: key(b"k") }).await;
+        send_command(
+            &request_tx,
+            Command::Get {
+                key: key(b"missing"),
+            },
+        )
+        .await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let metrics_task = tokio::spawn(run_metrics_server(
+            listener,
+            request_tx.clone(),
+            Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            Arc::new(Mutex::new(None)),
+            false,
+            shutdown_rx,
+        ));
+
+        let (status, body) = http_get(&addr, "/metrics").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(body.contains("nanocached_node_entries 2\n"), "{body}");
+        assert!(body.contains("nanocached_node_hits_total 1\n"), "{body}");
+        assert!(body.contains("nanocached_node_misses_total 1\n"), "{body}");
+        assert!(body.contains("nanocached_node_sets_total 2\n"), "{body}");
+        assert!(
+            body.contains("nanocached_node_namespace_entries{namespace=\"users\"} 1\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_node_namespace_entries{namespace=\"\"} 1\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_node_memory_used_bytes "),
+            "{body}"
+        );
+        assert!(body.contains("nanocached_node_connections 0\n"), "{body}");
+
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let (status, _) = http_get(&addr, "/nope").await;
+        assert_eq!(status, "HTTP/1.1 404 Not Found");
+
+        metrics_task.abort();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readyz_gates_on_membership_for_cluster_nodes() {
+        let (request_tx, _request_rx) = mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let metrics_task = tokio::spawn(run_metrics_server(
+            listener,
+            request_tx,
+            Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            Arc::clone(&known_ring),
+            true,
+            shutdown_rx,
+        ));
+
+        // Cluster node, no membership yet: not ready.
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+
+        // Membership adopted: ready.
+        *known_ring.lock().unwrap() = Some(Arc::new(Membership {
+            ring: Arc::new(HashRing::new(vec!["self".to_string()])),
+            replication: 1,
+        }));
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+
+        metrics_task.abort();
     }
 
     #[test]

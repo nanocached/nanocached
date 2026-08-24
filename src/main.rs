@@ -43,6 +43,9 @@ struct Args {
     tls_key: Option<String>,
     tls_ca: Option<String>,
     max_memory: usize,
+    /// Issue #124: port for the /metrics + /healthz + /readyz endpoint
+    /// (same host as `--host`); `None` = no endpoint.
+    metrics_port: Option<u16>,
 }
 
 impl Default for Args {
@@ -55,6 +58,7 @@ impl Default for Args {
             tls_key: None,
             tls_ca: None,
             max_memory: server::MAX_CACHE_MEMORY_BYTES,
+            metrics_port: None,
         }
     }
 }
@@ -102,6 +106,11 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
+            "--metrics-port" => {
+                args.metrics_port = Some(value()?.parse().map_err(|_| {
+                    "--metrics-port must be a number between 0 and 65535".to_string()
+                })?);
+            }
             "--max-memory" => {
                 let raw_max_memory = value()?;
                 let max_memory: usize = raw_max_memory
@@ -156,6 +165,10 @@ Usage: nanocached-node [options]
   --tls-cert <path>           PEM certificate chain; requires TLS on every
                                accepted connection (no plaintext fallback)
   --tls-key <path>            PEM private key matching --tls-cert
+  --metrics-port <port>       serve GET /metrics (Prometheus text format),
+                               /healthz and /readyz on this port at --host;
+                               omitted = no operations endpoint. Keep it
+                               internal: the endpoint is unauthenticated
   --tls-ca <path>             PEM CA certificate(s) to trust when
                                connecting to a TLS-secured discovery server
                                for heartbeats (see --discovery)
@@ -254,12 +267,17 @@ async fn main() -> ExitCode {
         None => None,
     };
 
+    let metrics_address = args
+        .metrics_port
+        .map(|port| format!("{}:{port}", args.host));
+
     if let Err(err) = server::run(
         &address,
         heartbeat,
         auth_secret,
         tls_acceptor,
         args.max_memory,
+        metrics_address,
     )
     .await
     {

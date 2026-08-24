@@ -289,6 +289,9 @@ struct Args {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
+    /// Issue #124: port for /metrics + /healthz + /readyz on `host`;
+    /// `None` = no operations endpoint.
+    metrics_port: Option<u16>,
 }
 
 impl Default for Args {
@@ -301,6 +304,7 @@ impl Default for Args {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            metrics_port: None,
         }
     }
 }
@@ -319,7 +323,7 @@ impl From<String> for ArgsError {
 fn usage() -> String {
     "usage: nanocached-proxy --discovery <host:port>[,<host:port>...] \
      [--host <host>] [--port <port>] [--max-connections <n>] \
-     [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>]\n\
+     [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
      The shared auth secret is read from NANOCACHED_SECRET."
         .to_string()
 }
@@ -356,6 +360,11 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
+            "--metrics-port" => {
+                args.metrics_port = Some(value()?.parse().map_err(|_| {
+                    "--metrics-port must be a number between 0 and 65535".to_string()
+                })?);
+            }
             "-h" | "--help" => return Err(ArgsError::Help(usage())),
             unknown => return Err(format!("unknown flag: {unknown}\n{}", usage()).into()),
         }
@@ -505,6 +514,12 @@ struct ProxyContext {
     /// connection count from "client connections × nodes" to "one per
     /// node per proxy".
     backends: SharedBackends,
+    /// Issue #124: requests dispatched (any op), for the metrics
+    /// endpoint's rate signal.
+    requests_total: std::sync::atomic::AtomicU64,
+    /// Issue #124: requests that ended in the fatal `E` path (upstream
+    /// failure that survived the retry) — the error-rate signal.
+    upstream_failures_total: std::sync::atomic::AtomicU64,
 }
 
 // ─── shared line/frame helpers ───────────────────────────────────────
@@ -1325,12 +1340,17 @@ fn frame_clear_all() -> Vec<u8> {
 /// the same node coalesce onto a single dial instead of racing.
 struct SharedBackends {
     slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<BackendHandle>>>>>,
+    /// Issue #124: live backend connections, for the metrics gauge —
+    /// incremented on a successful dial, decremented when a dead handle
+    /// is dropped from its slot.
+    dialed: std::sync::atomic::AtomicUsize,
 }
 
 impl SharedBackends {
     fn new() -> Self {
         Self {
             slots: std::sync::Mutex::new(HashMap::new()),
+            dialed: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1377,6 +1397,8 @@ impl SharedBackends {
                         {
                             Ok(handle) => {
                                 *guard = Some(handle.clone());
+                                self.dialed
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 handle
                             }
                             Err(error) => return PendingReply::failed(error),
@@ -1409,6 +1431,8 @@ impl SharedBackends {
                 .is_some_and(|current| current.sender.same_channel(&handle.sender))
             {
                 *guard = None;
+                self.dialed
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -1505,6 +1529,10 @@ async fn dispatch_request(
     request: Request,
     tag: Option<u32>,
 ) -> oneshot::Receiver<DriverResult> {
+    context
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let (result_tx, result_rx) = oneshot::channel();
 
     let Some(ring) = current_ring(&context) else {
@@ -1836,6 +1864,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     // responses back-pressures the reader instead of growing a queue.
     let (fifo_tx, mut fifo_rx) = mpsc::channel::<oneshot::Receiver<DriverResult>>(CLIENT_IN_FLIGHT);
 
+    let writer_context = Arc::clone(&context);
     let writer = tokio::spawn(async move {
         while let Some(pending) = fifo_rx.recv().await {
             match pending.await {
@@ -1845,6 +1874,9 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     }
                 }
                 Ok(Err(Fatal)) | Err(_) => {
+                    writer_context
+                        .upstream_failures_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = write_half.write_all(b"E\n").await;
                     return write_half;
                 }
@@ -2010,6 +2042,8 @@ async fn run(
         ring: ring_rx,
         refresh_now: refresh_tx,
         backends: SharedBackends::new(),
+        requests_total: std::sync::atomic::AtomicU64::new(0),
+        upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
     });
 
     let listener = TcpListener::bind((args.host.as_str(), args.port)).await?;
@@ -2019,7 +2053,147 @@ async fn run(
         args.discovery.join(",")
     );
 
-    serve(listener, context, tls_acceptor, args.max_connections).await
+    let permits = Arc::new(Semaphore::new(args.max_connections));
+
+    // Issue #124: the operations sidecar — /metrics + /healthz + /readyz
+    // on its own listener, mirroring the node's (see that binary's
+    // `run_metrics_server` docs; independent re-implementation per the
+    // no-shared-modules policy).
+    if let Some(port) = args.metrics_port {
+        let metrics_listener = TcpListener::bind((args.host.as_str(), port)).await?;
+        println!("INFO metrics endpoint listening on {}:{port}", args.host);
+        tokio::spawn(run_metrics_server(
+            metrics_listener,
+            Arc::clone(&context),
+            Arc::clone(&permits),
+            args.max_connections,
+        ));
+    }
+
+    serve(listener, context, tls_acceptor, permits).await
+}
+
+/// Issue #124: minimal, dependency-free HTTP responder for Prometheus
+/// text-format metrics and orchestrator probes. `/readyz` answers `503`
+/// until the first roster fetch has landed — a proxy with no ring view
+/// would answer clients `B`, so keep it out of rotation until then.
+/// Unauthenticated by design (operational telemetry; keep the port
+/// internal).
+async fn run_metrics_server(
+    listener: TcpListener,
+    context: Arc<ProxyContext>,
+    permits: Arc<Semaphore>,
+    max_connections: usize,
+) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let context = Arc::clone(&context);
+        let permits = Arc::clone(&permits);
+        tokio::spawn(async move {
+            let _ = timeout(
+                Duration::from_secs(5),
+                serve_metrics_connection(stream, context, permits, max_connections),
+            )
+            .await;
+        });
+    }
+}
+
+async fn serve_metrics_connection(
+    mut stream: TcpStream,
+    context: Arc<ProxyContext>,
+    permits: Arc<Semaphore>,
+    max_connections: usize,
+) -> io::Result<()> {
+    let path = read_http_request_path(&mut stream).await?;
+
+    let (status, body): (&str, String) = match path.as_str() {
+        "/metrics" => {
+            let client_connections = max_connections.saturating_sub(permits.available_permits());
+            let backend_connections = context
+                .backends
+                .dialed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let requests = context
+                .requests_total
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let failures = context
+                .upstream_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let body = format!(
+                "# HELP nanocached_proxy_client_connections Client connections currently held.\n\
+                 # TYPE nanocached_proxy_client_connections gauge\n\
+                 nanocached_proxy_client_connections {client_connections}\n\
+                 # HELP nanocached_proxy_client_connections_max The --max-connections bound.\n\
+                 # TYPE nanocached_proxy_client_connections_max gauge\n\
+                 nanocached_proxy_client_connections_max {max_connections}\n\
+                 # HELP nanocached_proxy_backend_connections Live shared connections to nodes.\n\
+                 # TYPE nanocached_proxy_backend_connections gauge\n\
+                 nanocached_proxy_backend_connections {backend_connections}\n\
+                 # HELP nanocached_proxy_requests_total Requests dispatched (all ops).\n\
+                 # TYPE nanocached_proxy_requests_total counter\n\
+                 nanocached_proxy_requests_total {requests}\n\
+                 # HELP nanocached_proxy_upstream_failures_total Requests that failed upstream after retries (answered E).\n\
+                 # TYPE nanocached_proxy_upstream_failures_total counter\n\
+                 nanocached_proxy_upstream_failures_total {failures}\n"
+            );
+            ("200 OK", body)
+        }
+        "/healthz" => ("200 OK", "ok\n".to_string()),
+        "/readyz" => {
+            if context.ring.borrow().is_some() {
+                ("200 OK", "ok\n".to_string())
+            } else {
+                ("503 Service Unavailable", "no roster yet\n".to_string())
+            }
+        }
+        _ => ("404 Not Found", "not found\n".to_string()),
+    };
+
+    write_http_response(&mut stream, status, &body).await
+}
+
+/// Bounded read of one HTTP request head; GET path or error. Mirrors
+/// the node's copy.
+async fn read_http_request_path(stream: &mut TcpStream) -> io::Result<String> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > 8192 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized http request head",
+            ));
+        }
+        let bytes_read = stream.read(&mut chunk).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    let head = String::from_utf8_lossy(&head);
+    let request_line = head.lines().next().unwrap_or_default();
+    let mut parts = request_line.split(' ');
+    match (parts.next(), parts.next()) {
+        (Some("GET"), Some(path)) => Ok(path.to_string()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a GET request",
+        )),
+    }
+}
+
+async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
 }
 
 /// The accept loop, factored from `run` so tests can drive it against a
@@ -2028,10 +2202,8 @@ async fn serve(
     listener: TcpListener,
     context: Arc<ProxyContext>,
     tls_acceptor: Option<TlsAcceptor>,
-    max_connections: usize,
+    permits: Arc<Semaphore>,
 ) -> io::Result<()> {
-    let permits = Arc::new(Semaphore::new(max_connections));
-
     loop {
         let (stream, peer) = listener.accept().await?;
 
@@ -2464,10 +2636,17 @@ mod tests {
             ring: ring_rx.clone(),
             refresh_now: refresh_tx,
             backends: SharedBackends::new(),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(serve(listener, context, None, max_connections));
+        tokio::spawn(serve(
+            listener,
+            context,
+            None,
+            Arc::new(Semaphore::new(max_connections)),
+        ));
 
         // Wait until the first roster fetch landed, so tests don't race
         // the refresher and see `B`.
@@ -2869,6 +3048,93 @@ mod tests {
             }
         };
         tokio::join!(writer, reader);
+    }
+
+    /// Issue #124 helper: one plain HTTP GET → (status line, body).
+    async fn http_get(addr: &str, path: &str) -> (String, String) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap().to_string(), body.to_string())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_endpoint_reports_proxy_gauges_and_counters() {
+        // A live proxy with real traffic, plus its metrics listener.
+        let (_nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 1 1\nkvG 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        let _ = buf.split_to(1);
+
+        // The metrics server shares the live context; reach it through a
+        // second context handle is not possible from here, so boot one
+        // against the same shape instead: exercised end-to-end below via
+        // the standalone constructor used by start_proxy is private —
+        // simplest is a dedicated context.
+        let (ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(4);
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: ring_rx,
+            refresh_now: refresh_tx,
+            backends: SharedBackends::new(),
+            requests_total: std::sync::atomic::AtomicU64::new(7),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(2),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let permits = Arc::new(Semaphore::new(8));
+        let held = Arc::clone(&permits).try_acquire_owned().unwrap();
+        tokio::spawn(run_metrics_server(
+            listener,
+            Arc::clone(&context),
+            Arc::clone(&permits),
+            8,
+        ));
+
+        let (status, body) = http_get(&addr, "/metrics").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(
+            body.contains("nanocached_proxy_client_connections 1\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_proxy_client_connections_max 8\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_proxy_requests_total 7\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_proxy_upstream_failures_total 2\n"),
+            "{body}"
+        );
+        drop(held);
+
+        // Readiness follows the roster.
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+        ring_tx
+            .send(Some(Arc::new(RingView::new(
+                vec![("a".to_string(), "127.0.0.1:1".to_string())],
+                1,
+            ))))
+            .unwrap();
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
     }
 
     #[tokio::test(flavor = "current_thread")]

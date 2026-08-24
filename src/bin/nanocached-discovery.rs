@@ -616,6 +616,10 @@ struct RegistryState {
     /// Issue #122 — keyed by proxy name, swept by `sweep_expired` on the
     /// same liveness timeout as heartbeats.
     proxies: Mutex<FxHashMap<String, ProxyInfo>>,
+    /// Issue #124: joins completed (nodes promoted to `Joined`) and
+    /// joins abandoned, for the metrics endpoint.
+    joins_total: AtomicU64,
+    joins_abandoned_total: AtomicU64,
     generation: AtomicU64,
     /// The heartbeat-ack roster, cached and rebuilt only when `generation`
     /// moves (issue #95). Co-located with the map and counter it derives
@@ -629,6 +633,8 @@ impl Default for RegistryState {
         RegistryState {
             nodes: Mutex::new(FxHashMap::default()),
             proxies: Mutex::new(FxHashMap::default()),
+            joins_total: AtomicU64::new(0),
+            joins_abandoned_total: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             heartbeat_ack: Mutex::new(None),
         }
@@ -1027,6 +1033,9 @@ struct Args {
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_ca: Option<String>,
+    /// Issue #124: port for /metrics + /healthz + /readyz on `host`;
+    /// `None` = no operations endpoint.
+    metrics_port: Option<u16>,
 }
 
 impl Default for Args {
@@ -1039,6 +1048,7 @@ impl Default for Args {
             tls_cert: None,
             tls_key: None,
             tls_ca: None,
+            metrics_port: None,
         }
     }
 }
@@ -1095,6 +1105,11 @@ fn parse_args() -> Result<Args, ArgsError> {
             "--tls-cert" => args.tls_cert = Some(value()?),
             "--tls-key" => args.tls_key = Some(value()?),
             "--tls-ca" => args.tls_ca = Some(value()?),
+            "--metrics-port" => {
+                args.metrics_port = Some(value()?.parse().map_err(|_| {
+                    "--metrics-port must be a number between 0 and 65535".to_string()
+                })?);
+            }
             "-h" | "--help" => return Err(ArgsError::Help(usage())),
             other => {
                 return Err(ArgsError::Invalid(format!(
@@ -1129,6 +1144,10 @@ Usage: nanocached-discovery [options]
                                  every accepted connection (no plaintext
                                  fallback)
   --tls-key <path>              PEM private key matching --tls-cert
+  --metrics-port <port>         serve GET /metrics (Prometheus text format),
+                                 /healthz and /readyz on this port at --host;
+                                 omitted = no operations endpoint. Keep it
+                                 internal: the endpoint is unauthenticated
   --tls-ca <path>               PEM CA certificate(s) to trust when this
                                  process connects out to a TLS-secured node
                                  to send M/X"
@@ -1473,6 +1492,133 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
             .and_then(|length| length.checked_add((byte - b'0') as usize))
             .ok_or(ParseError::InvalidLength)
     })
+}
+
+/// Issue #124: minimal, dependency-free HTTP responder for Prometheus
+/// text-format metrics and orchestrator probes — see the node's
+/// `run_metrics_server` for the shared design notes. Unauthenticated;
+/// keep the port internal.
+async fn run_metrics_server(listener: TcpListener, registry: Registry, list_ready_at: Instant) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        let registry = Arc::clone(&registry);
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                serve_metrics_connection(stream, registry, list_ready_at),
+            )
+            .await;
+        });
+    }
+}
+
+async fn serve_metrics_connection(
+    mut stream: TcpStream,
+    registry: Registry,
+    list_ready_at: Instant,
+) -> io::Result<()> {
+    let path = read_http_request_path(&mut stream).await?;
+
+    let (status, body): (&str, String) = match path.as_str() {
+        "/metrics" => {
+            let (joined, waiting, joining) = {
+                let guard = lock(&registry);
+                let mut joined = 0usize;
+                let mut waiting = 0usize;
+                let mut joining = 0usize;
+                for info in guard.values() {
+                    match info.state {
+                        NodeState::Joined => joined += 1,
+                        NodeState::Waiting => waiting += 1,
+                        NodeState::Joining => joining += 1,
+                    }
+                }
+                (joined, waiting, joining)
+            };
+            let proxies = registry
+                .proxies
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            let joins = registry.joins_total.load(Ordering::Relaxed);
+            let abandoned = registry.joins_abandoned_total.load(Ordering::Relaxed);
+            let body = format!(
+                "# HELP nanocached_discovery_members Joined cluster members.\n\
+                 # TYPE nanocached_discovery_members gauge\n\
+                 nanocached_discovery_members {joined}\n\
+                 # HELP nanocached_discovery_waiting_nodes Nodes waiting to join.\n\
+                 # TYPE nanocached_discovery_waiting_nodes gauge\n\
+                 nanocached_discovery_waiting_nodes {waiting}\n\
+                 # HELP nanocached_discovery_joining_nodes Nodes mid staged join.\n\
+                 # TYPE nanocached_discovery_joining_nodes gauge\n\
+                 nanocached_discovery_joining_nodes {joining}\n\
+                 # HELP nanocached_discovery_proxies Registered proxies.\n\
+                 # TYPE nanocached_discovery_proxies gauge\n\
+                 nanocached_discovery_proxies {proxies}\n\
+                 # HELP nanocached_discovery_joins_total Joins promoted to membership.\n\
+                 # TYPE nanocached_discovery_joins_total counter\n\
+                 nanocached_discovery_joins_total {joins}\n\
+                 # HELP nanocached_discovery_joins_abandoned_total Joins abandoned.\n\
+                 # TYPE nanocached_discovery_joins_abandoned_total counter\n\
+                 nanocached_discovery_joins_abandoned_total {abandoned}\n"
+            );
+            ("200 OK", body)
+        }
+        "/healthz" => ("200 OK", "ok\n".to_string()),
+        "/readyz" => {
+            if Instant::now() >= list_ready_at {
+                ("200 OK", "ok\n".to_string())
+            } else {
+                ("503 Service Unavailable", "startup grace\n".to_string())
+            }
+        }
+        _ => ("404 Not Found", "not found\n".to_string()),
+    };
+
+    write_http_response(&mut stream, status, &body).await
+}
+
+/// Bounded read of one HTTP request head; GET path or error. Mirrors the
+/// node's copy.
+async fn read_http_request_path(stream: &mut TcpStream) -> io::Result<String> {
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        if head.len() > 8192 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "oversized http request head",
+            ));
+        }
+        let bytes_read = stream.read(&mut chunk).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    let head = String::from_utf8_lossy(&head);
+    let request_line = head.lines().next().unwrap_or_default();
+    let mut parts = request_line.split(' ');
+    match (parts.next(), parts.next()) {
+        (Some("GET"), Some(path)) => Ok(path.to_string()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a GET request",
+        )),
+    }
+}
+
+async fn write_http_response(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
 }
 
 fn lock(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, NodeInfo>> {
@@ -1960,6 +2106,7 @@ fn promote_to_joined(registry: &Registry, name: &str) {
     };
 
     if let Some(promoted) = promoted {
+        registry.joins_total.fetch_add(1, Ordering::Relaxed);
         // A new `Joined` node changes the heartbeat-ack roster (issue #95).
         bump_roster(registry);
         println!("INFO join promoted: {name} (members now {members})");
@@ -2363,6 +2510,9 @@ async fn abandon_current_join(
     let Some(pending) = lock_current_join(current_join).take() else {
         return;
     };
+    registry
+        .joins_abandoned_total
+        .fetch_add(1, Ordering::Relaxed);
 
     eprintln!(
         "WARN join abandoned: {} (reason={reason})",
@@ -2554,6 +2704,7 @@ async fn run(
     auth_secret: Option<Bytes>,
     tls_acceptor: Option<TlsAcceptor>,
     tls_connector: Option<TlsConnector>,
+    metrics_address: Option<String>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     let cluster_state = ClusterState {
@@ -2587,6 +2738,20 @@ async fn run(
         "INFO startup grace: refusing list queries for {}s",
         startup_grace.as_secs()
     );
+
+    // Issue #124: the operations sidecar — /metrics + /healthz +
+    // /readyz, mirroring the node's (independent re-implementation per
+    // the no-shared-modules policy). /readyz answers 503 during the
+    // startup grace, exactly the window where `L`/`Q` answer `B`.
+    if let Some(metrics_address) = &metrics_address {
+        let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
+        println!("INFO metrics endpoint listening on {metrics_address}");
+        tokio::spawn(run_metrics_server(
+            metrics_listener,
+            Arc::clone(&cluster_state.registry),
+            list_ready_at,
+        ));
+    }
 
     let sweep_task = tokio::spawn(sweep_expired(
         Arc::clone(&cluster_state.registry),
@@ -3953,6 +4118,8 @@ async fn main() -> ExitCode {
         read_auth_secret(),
         tls_acceptor,
         tls_connector,
+        args.metrics_port
+            .map(|port| format!("{}:{port}", args.host)),
     )
     .await
     {
@@ -5563,6 +5730,99 @@ mod tests {
             shutdown_rx,
             Arc::new(std::sync::Mutex::new(None)),
         ));
+    }
+
+    /// Issue #124 helper: one plain HTTP GET → (status line, body).
+    async fn http_get(addr: &str, path: &str) -> (String, String) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (head.lines().next().unwrap().to_string(), body.to_string())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_endpoint_reports_registry_gauges_and_join_counters() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ready = Instant::now();
+
+        // One member (P upserts to Joined → also counts as a promoted
+        // join), one waiting J, one proxy.
+        let (mut member, server) = tcp_pair().await;
+        spawn_grace_connection(server, &registry, &current_join, ready, shutdown_rx.clone());
+        member
+            .write_all(b"P 6 9001 9\nnode-atk-node-a")
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        member.read_exact(&mut ack).await.unwrap();
+        let (mut waiter, server) = tcp_pair().await;
+        spawn_grace_connection(
+            server,
+            &registry,
+            &current_join,
+            Instant::now() + Duration::from_secs(60),
+            shutdown_rx.clone(),
+        );
+        waiter
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
+        announce_proxy(
+            &registry,
+            &current_join,
+            ready,
+            shutdown_rx.clone(),
+            "proxy-a",
+            8358,
+            "tk-a",
+        )
+        .await;
+        // Give the parked J a beat to register as Waiting.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(run_metrics_server(listener, Arc::clone(&registry), ready));
+
+        let (status, body) = http_get(&addr, "/metrics").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(body.contains("nanocached_discovery_members 1\n"), "{body}");
+        assert!(
+            body.contains("nanocached_discovery_waiting_nodes 1\n"),
+            "{body}"
+        );
+        assert!(body.contains("nanocached_discovery_proxies 1\n"), "{body}");
+
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readyz_refuses_during_the_startup_grace() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(run_metrics_server(
+            listener,
+            Arc::clone(&registry),
+            Instant::now() + Duration::from_secs(60),
+        ));
+
+        let (status, _) = http_get(&addr, "/readyz").await;
+        assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
+        // Liveness is unconditional.
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
     }
 
     #[test]
