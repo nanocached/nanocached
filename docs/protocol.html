@@ -20,6 +20,7 @@
       <a href="protocol.html" aria-current="page">Protocol</a>
       <a href="architecture.html">Architecture</a>
       <a href="sdks.html">SDKs</a>
+      <a href="deployment.html">Deployment</a>
       <a href="capacity-planner.html">Capacity planner</a>
       <a href="https://github.com/nanocached/nanocached">GitHub</a>
     </div>
@@ -182,9 +183,13 @@ for the design.</p>
 and migration frames — <code>L</code> (node list),
 <code>J</code>/<code>H</code>/<code>P</code> (join, heartbeat,
 announce), <code>M</code>/<code>X</code>/<code>C</code> (migrate,
-cancel, complete), and <code>Y</code>/<code>Q</code> (proxy announce and
-proxy list — how <code>nanocached-proxy</code> registers with discovery
-and how SDKs in proxy mode find one). These are versioned with the
+cancel, complete), <code>Y</code>/<code>Z</code>/<code>Q</code> (proxy
+announce, deregister, and list — how <code>nanocached-proxy</code>
+registers with discovery and how SDKs in proxy mode find one), and
+<code>U</code>/<code>u</code>/<code>V</code> (handoff store, handoff
+delete, and node leave — the graceful-decommission frames a draining
+node uses to move its entries and exit membership; see
+<a href="deployment.html">Deployment</a>). These are versioned with the
 server and not part of
 the public caching API; the server
 source documents them in detail.</p>

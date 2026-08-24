@@ -30,6 +30,8 @@ Each `i*.sh` is one scenario; the paired `*.py` is its probe/loader.
 | `i92.sh` + `fakedisc92.py` | #92 | a hostile discovery flooding the heartbeat ack with a newline-less roster line OOM-kills a node in seconds (`read_heartbeat_ack`'s unbounded `read_until`), bypassing `--max-memory`. `honest` mode is the control. |
 | `i91.sh` + `probe91.py` | #91 | hedge-leg-vs-`close()` race. Did **not** reproduce on the Python SDK (80/80 closes raced active hedged reads, zero leaks); kept as a regression guard and a template for the other SDKs. |
 | `lr.sh` | — | 1-hour soak/churn long-run (kill/restart rounds, dual Python+.NET load, memory-trend analysis). |
+| `scalein.sh` | #124 | graceful node scale-in under load: R=2, 3 nodes, SIGTERM one mid-load → decommission (handoff, immediate leave, forwarding window), exit 0. Asserts zero errors/misses/corruption in the load and zero loss on an untouched key range. Needs `:dev` images built from a post-v0.3.0 commit (see the script header). |
+| `proxydrain.sh` | #124 | graceful proxy scale-in under via-proxy load: 2 proxies, SIGTERM one → immediate `Q` deregistration, in-flight finish, exit 0, clients reconnect to the survivor. Same zero-error/zero-loss assertions. Mounts the repo's Python SDK for `via_proxy`. |
 
 ## Shared helpers
 

@@ -1701,7 +1701,10 @@ async fn handle_connection(
                 }
 
                 // Issue #124: mirror for a decommission in flight — the
-                // key's post-leave entrant must see this write too.
+                // key's post-leave entrant must see this write too. As a
+                // `U`, not a plain `S`: until the post-leave roster
+                // publishes, the entrant doesn't own the key yet and
+                // answers `S` with `W`.
                 if let Some(node_context) = &config.node_context
                     && let Some(target) = leave_target_for(node_context, &key)
                 {
@@ -1710,7 +1713,7 @@ async fn handle_connection(
                         .send(Box::pin(forward_with_retries(
                             node_context.clone(),
                             target,
-                            OwnedForwardedWrite::Set {
+                            OwnedForwardedWrite::HandoffSet {
                                 key: key.clone(),
                                 value: value.clone(),
                                 ttl,
@@ -1754,6 +1757,32 @@ async fn handle_connection(
 
                 continue;
             }
+            Ok((Command::HandoffDelete { key }, tag)) => {
+                // Issue #124: a decommissioning peer forwarding a client's
+                // delete for a key this node is about to own — applied
+                // without the wrong-node check, same reasoning as `U`.
+                let response =
+                    execute_command(&request_tx, Command::HandoffDelete { key: key.clone() })
+                        .await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                // If this node is itself mid-join-handoff for the key,
+                // propagate like any other delete.
+                if let Some(node_context) = &config.node_context
+                    && let Some(target) = migration_target_for(node_context, &key)
+                {
+                    let _ = config
+                        .migration_tx
+                        .send(Box::pin(forward_with_retries(
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Delete { key },
+                        )))
+                        .await;
+                }
+
+                continue;
+            }
             Ok((Command::Delete { key }, tag)) => {
                 if let Some(node_context) = &config.node_context
                     && wrong_node(node_context, &key)
@@ -1780,7 +1809,8 @@ async fn handle_connection(
                         .await;
                 }
 
-                // Issue #124: see the `S` arm's decommission mirror.
+                // Issue #124: see the `S` arm's decommission mirror —
+                // a `u`, not a plain `D`, for the same wrong-node reason.
                 if let Some(node_context) = &config.node_context
                     && let Some(target) = leave_target_for(node_context, &key)
                 {
@@ -1789,7 +1819,7 @@ async fn handle_connection(
                         .send(Box::pin(forward_with_retries(
                             node_context.clone(),
                             target,
-                            OwnedForwardedWrite::Delete { key: key.clone() },
+                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
                         )))
                         .await;
                 }
@@ -3236,7 +3266,10 @@ async fn transfer_with_retries(
     write: ForwardedWrite<'_>,
 ) -> bool {
     let what = match &write {
-        ForwardedWrite::Set { .. } | ForwardedWrite::Delete { .. } => "a key",
+        ForwardedWrite::Set { .. }
+        | ForwardedWrite::Delete { .. }
+        | ForwardedWrite::HandoffSet { .. }
+        | ForwardedWrite::HandoffDelete { .. } => "a key",
         ForwardedWrite::Clear(_) => "a clear",
     };
 
@@ -3284,6 +3317,37 @@ async fn transfer_with_retries(
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "outbound clear timed out",
+                ))
+            }),
+            // The join bulk path never carries these (they're the
+            // decommission's leave-forwards, which go through
+            // `forward_on_shared_connection`); handled for
+            // exhaustiveness with the same bounded send.
+            ForwardedWrite::HandoffSet { key, value, ttl } => timeout(
+                OUTBOUND_IO_TIMEOUT,
+                ForwardedWrite::HandoffSet {
+                    key,
+                    value,
+                    ttl: *ttl,
+                }
+                .send(active_stream),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outbound handoff set timed out",
+                ))
+            }),
+            ForwardedWrite::HandoffDelete { key } => timeout(
+                OUTBOUND_IO_TIMEOUT,
+                ForwardedWrite::HandoffDelete { key }.send(active_stream),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "outbound handoff delete timed out",
                 ))
             }),
         };
@@ -3597,6 +3661,15 @@ fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     message.extend_from_slice(&key.namespace);
     message.extend_from_slice(&key.name);
     message.extend_from_slice(value);
+    message
+}
+
+/// The `u` frame (issue #124) — `delete_message`'s namespaced shape with
+/// the handoff letter, mirroring `handoff_message` for `U`.
+fn handoff_delete_message(key: &Key) -> Vec<u8> {
+    let mut message = format!("u {} {}\n", key.namespace.len(), key.name.len()).into_bytes();
+    message.extend_from_slice(&key.namespace);
+    message.extend_from_slice(&key.name);
     message
 }
 
@@ -4047,6 +4120,20 @@ enum ForwardedWrite<'a> {
     Delete {
         key: &'a Key,
     },
+    /// Issue #124: the decommission's forwarded write — a `U` frame
+    /// rather than a plain `S`, because until discovery publishes the
+    /// post-leave roster the receiving entrant doesn't own the key yet
+    /// and would answer a plain `S` with `W`.
+    HandoffSet {
+        key: &'a Key,
+        value: &'a [u8],
+        ttl: Option<Duration>,
+    },
+    /// Issue #124: the decommission's forwarded delete (`u`), same
+    /// wrong-node reasoning as `HandoffSet`.
+    HandoffDelete {
+        key: &'a Key,
+    },
     Clear(&'a ClearScope),
 }
 
@@ -4074,8 +4161,12 @@ impl ClearScope {
 impl ForwardedWrite<'_> {
     fn timed_out_message(&self) -> &'static str {
         match self {
-            ForwardedWrite::Set { .. } => "forwarding the write to the joining node timed out",
-            ForwardedWrite::Delete { .. } => "forwarding the delete to the joining node timed out",
+            ForwardedWrite::Set { .. } | ForwardedWrite::HandoffSet { .. } => {
+                "forwarding the write to the joining node timed out"
+            }
+            ForwardedWrite::Delete { .. } | ForwardedWrite::HandoffDelete { .. } => {
+                "forwarding the delete to the joining node timed out"
+            }
             ForwardedWrite::Clear(_) => "forwarding the clear to the joining node timed out",
         }
     }
@@ -4083,6 +4174,37 @@ impl ForwardedWrite<'_> {
     async fn send(self, stream: &mut ClientStream) -> io::Result<()> {
         match self {
             ForwardedWrite::Set { key, value, ttl } => send_set(stream, key, value, ttl).await,
+            ForwardedWrite::HandoffSet { key, value, ttl } => {
+                stream.write_all(&handoff_message(key, value, ttl)).await?;
+
+                let mut ack = [0u8; 2];
+                stream.read_exact(&mut ack).await?;
+
+                if &ack != b"S\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "peer did not acknowledge the handed-off entry",
+                    ));
+                }
+                Ok(())
+            }
+            ForwardedWrite::HandoffDelete { key } => {
+                stream.write_all(&handoff_delete_message(key)).await?;
+
+                let mut ack = [0u8; 2];
+                stream.read_exact(&mut ack).await?;
+
+                // `D` (present there too) or `N` (this delete raced ahead
+                // of the drain's own transfer of the key) both mean the
+                // entrant won't serve a stale copy.
+                if &ack != b"D\n" && &ack != b"N\n" {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "peer did not acknowledge the forwarded delete",
+                    ));
+                }
+                Ok(())
+            }
             ForwardedWrite::Delete { key } => {
                 stream.write_all(&delete_message(key)).await?;
 
@@ -4131,6 +4253,17 @@ enum OwnedForwardedWrite {
     Delete {
         key: Key,
     },
+    /// Issue #124: a decommission's leave-forward — sent as `U`/`u`
+    /// frames (see `ForwardedWrite::HandoffSet`/`HandoffDelete` for why
+    /// plain `S`/`D` won't do).
+    HandoffSet {
+        key: Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+    },
+    HandoffDelete {
+        key: Key,
+    },
     Clear(ClearScope),
 }
 
@@ -4147,6 +4280,26 @@ impl OwnedForwardedWrite {
             OwnedForwardedWrite::Delete { key } => {
                 delete_on_joining_node(node_context, target, key).await
             }
+            OwnedForwardedWrite::HandoffSet { key, value, ttl } => {
+                forward_on_shared_connection(
+                    node_context,
+                    target,
+                    ForwardedWrite::HandoffSet {
+                        key,
+                        value,
+                        ttl: *ttl,
+                    },
+                )
+                .await
+            }
+            OwnedForwardedWrite::HandoffDelete { key } => {
+                forward_on_shared_connection(
+                    node_context,
+                    target,
+                    ForwardedWrite::HandoffDelete { key },
+                )
+                .await
+            }
             OwnedForwardedWrite::Clear(scope) => {
                 forward_on_shared_connection(node_context, target, ForwardedWrite::Clear(scope))
                     .await
@@ -4159,8 +4312,10 @@ impl OwnedForwardedWrite {
     /// not the actual `S`/`D` protocol bytes.
     fn kind(&self) -> &'static str {
         match self {
-            OwnedForwardedWrite::Set { .. } => "SET",
-            OwnedForwardedWrite::Delete { .. } => "DELETE",
+            OwnedForwardedWrite::Set { .. } | OwnedForwardedWrite::HandoffSet { .. } => "SET",
+            OwnedForwardedWrite::Delete { .. } | OwnedForwardedWrite::HandoffDelete { .. } => {
+                "DELETE"
+            }
             OwnedForwardedWrite::Clear(_) => "CLEAR",
         }
     }
@@ -6204,6 +6359,63 @@ mod tests {
         // S → W (not owner), U → S (stored anyway), G → W (reads still
         // follow the routing discipline).
         let expected = b"W\nS\nW\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_delete_bypasses_the_wrong_node_check() {
+        // Issue #124: a decommissioning peer's forwarded delete (`u`)
+        // must apply even though this node doesn't own the key yet; a
+        // plain `D` for the same key answers `W`.
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES));
+
+        let node_context = NodeContext {
+            name: "self".to_string(),
+            token: "tk-self".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::new(HashRing::new(vec!["other".to_string()])),
+                replication: 1,
+            })))),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+        };
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        // Store via U first so there is something to delete, then:
+        // D → W (not owner), u → D (deleted anyway), u again → N (gone).
+        client
+            .write_all(b"U 0 4 5\nnameAliceD 4\nnameu 0 4\nnameu 0 4\nname")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\nW\nD\nN\n";
         let mut response = vec![0u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);
