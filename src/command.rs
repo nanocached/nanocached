@@ -65,6 +65,10 @@ pub enum Command {
     UnmarkMigrated {
         key: Key,
     },
+    /// Internal-only (issue #124): the metrics endpoint's snapshot
+    /// request — never produced by `parse()`, constructed by the metrics
+    /// server task. Answered with `Response::Stats`.
+    Stats,
     /// Internal-only (staged node join): the active-deletion pass, run
     /// periodically by a background task. Since TTL expiry is otherwise
     /// only checked lazily on access, proactively removes anything
@@ -170,6 +174,8 @@ impl Command {
                 cache.unmark_migrated(&key);
                 Response::Unmarked
             }
+
+            Self::Stats => Response::Stats(Box::new(cache.stats())),
 
             Self::Sweep { marked: true } => Response::Swept(cache.sweep()),
             Self::Sweep { marked: false } => Response::Swept(cache.sweep_expired()),

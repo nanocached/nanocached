@@ -1,3 +1,4 @@
+use crate::cache::CacheStats;
 use crate::key::Key;
 use bytes::Bytes;
 use std::time::Duration;
@@ -65,6 +66,10 @@ pub enum Response {
     /// Internal-only (staged node join), in answer to `Command::Sweep` — how many
     /// entries the sweep actually removed.
     Swept(usize),
+    /// Internal-only (issue #124), in answer to `Command::Stats` — the
+    /// metrics endpoint's snapshot. Boxed: the snapshot is by far the
+    /// largest variant and would otherwise inflate every `Response`.
+    Stats(Box<CacheStats>),
 }
 
 impl Response {
@@ -95,7 +100,12 @@ impl Response {
                 encoded
             }
 
-            Self::Entries(_) | Self::Keys(_) | Self::Marked | Self::Unmarked | Self::Swept(_) => {
+            Self::Entries(_)
+            | Self::Keys(_)
+            | Self::Marked
+            | Self::Unmarked
+            | Self::Swept(_)
+            | Self::Stats(_) => {
                 unreachable!(
                     "internal-only response (staged node join): never sent to a wire client, only \
                      matched directly in Rust by the migration task"
