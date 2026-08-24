@@ -542,6 +542,16 @@ loud `WARN` if that disagrees with its own configured value.
   (1,048,576 bytes) — a budget that low can never actually be satisfied
   (the cache always keeps at least one entry), so it would just evict
   everything else on every write instead of caching anything
+- Per-namespace caps: `--namespace-budget <ns>=<bytes>` (repeatable)
+  caps one namespace's share — over its cap it evicts from *itself*,
+  oldest first, so a churny namespace (a session store, say) can't
+  evict a small precious one (config lookups) under the shared LRU. A
+  budget is a cap, not a reservation: the global `--max-memory` LRU
+  still evicts the overall-oldest entry regardless of budgets, so
+  protect a small namespace by capping the big churny ones. Uncapped
+  namespaces share whatever remains; a single entry may exceed its
+  namespace's cap, mirroring `--max-memory`'s own floor. Give every
+  node in a cluster the same flags, as with `--max-memory`
 - Idle connection timeout: 60 seconds
 
 ### nanocached-discovery

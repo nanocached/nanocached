@@ -53,6 +53,11 @@ struct Args {
     /// Issue #126: `--max-connections`. Previously the compile-time
     /// `MAX_CONNECTIONS` constant.
     max_connections: usize,
+    /// Issue #127: `--namespace-budget <name>=<bytes>`, repeatable — a
+    /// per-namespace memory cap. Kept in flag order; `parse_args_from`
+    /// rejects a duplicate name outright rather than silently letting
+    /// the last one win.
+    namespace_budgets: Vec<(Bytes, usize)>,
     /// Issue #126: `--max-connections-per-ip`. `None` until the flag is
     /// seen; resolved by `parse_args_from` after the loop to
     /// `min(default, max_connections)` — keeping the raw `Option` until
@@ -77,6 +82,7 @@ impl Default for Args {
             drain_timeout: std::time::Duration::from_secs(25),
             max_connections: server::DEFAULT_MAX_CONNECTIONS,
             max_connections_per_ip: None,
+            namespace_budgets: Vec::new(),
         }
     }
 }
@@ -175,6 +181,41 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 }
                 args.max_connections_per_ip = Some(per_ip);
             }
+            "--namespace-budget" => {
+                let raw = value()?;
+                // Split on the FIRST '=': the namespace name may not
+                // contain '=' when set via this flag (namespaces are
+                // binary-safe on the wire; the flag covers the printable
+                // names the framework adapters actually produce). An
+                // empty name is the default namespace.
+                let Some((name, bytes)) = raw.split_once('=') else {
+                    return Err(format!(
+                        "--namespace-budget must look like <namespace>=<bytes>, got: {raw}"
+                    )
+                    .into());
+                };
+                let budget: usize = bytes.parse().map_err(|_| {
+                    format!("invalid byte count in --namespace-budget {raw}: {bytes}")
+                })?;
+                if budget == 0 {
+                    return Err(format!(
+                        "--namespace-budget {name}=0 would evict the namespace to a single                          entry on every write; omit the flag to leave it uncapped"
+                    )
+                    .into());
+                }
+                let name = Bytes::copy_from_slice(name.as_bytes());
+                if args
+                    .namespace_budgets
+                    .iter()
+                    .any(|(existing, _)| *existing == name)
+                {
+                    return Err(format!(
+                        "--namespace-budget given twice for the same namespace: {raw}"
+                    )
+                    .into());
+                }
+                args.namespace_budgets.push((name, budget));
+            }
             "-h" | "--help" => return Err(ArgsError::Help(usage())),
             other => {
                 return Err(ArgsError::Invalid(format!(
@@ -251,7 +292,16 @@ Usage: nanocached-node [options]
                                --max-connections). Behind NAT or on
                                Kubernetes many clients share one source
                                IP, making this — not the total — the
-                               effective fleet ceiling",
+                               effective fleet ceiling
+  --namespace-budget <ns>=<b> cap namespace <ns> at <b> bytes
+                               (repeatable, one namespace each; empty
+                               <ns> = the default namespace). A
+                               namespace over its cap evicts from
+                               itself, oldest first, so one churny
+                               namespace can't evict every other; the
+                               global --max-memory bound still applies
+                               on top. Uncapped namespaces share
+                               whatever the capped ones don't use",
         server::MAX_CACHE_MEMORY_BYTES,
         MIN_MAX_MEMORY_BYTES,
         MIN_MAX_MEMORY_BYTES / (1024 * 1024),
@@ -372,6 +422,7 @@ async fn main() -> ExitCode {
         metrics_address,
         args.drain_timeout,
         limits,
+        args.namespace_budgets,
     )
     .await
     {
@@ -466,6 +517,50 @@ mod tests {
             };
             assert!(message.contains("at least 1"), "{message}");
         }
+    }
+
+    #[test]
+    fn namespace_budget_flags_parse_and_repeat() {
+        // Issue #127: repeatable, first '=' splits, empty name = the
+        // default namespace.
+        let parsed = parse_args_from(args(&[
+            "--namespace-budget",
+            "sessions=1048576",
+            "--namespace-budget",
+            "=4096",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.namespace_budgets,
+            vec![
+                (Bytes::from_static(b"sessions"), 1_048_576),
+                (Bytes::from_static(b""), 4096),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_namespace_budgets_are_rejected() {
+        for (flags, expect) in [
+            (["--namespace-budget", "sessions"], "must look like"),
+            (["--namespace-budget", "sessions=abc"], "invalid byte count"),
+            (["--namespace-budget", "sessions=0"], "omit the flag"),
+        ] {
+            let Err(ArgsError::Invalid(message)) = parse_args_from(args(&flags)) else {
+                panic!("{flags:?} must be rejected");
+            };
+            assert!(message.contains(expect), "{message}");
+        }
+
+        let Err(ArgsError::Invalid(message)) = parse_args_from(args(&[
+            "--namespace-budget",
+            "sessions=100",
+            "--namespace-budget",
+            "sessions=200",
+        ])) else {
+            panic!("a duplicate namespace must be rejected");
+        };
+        assert!(message.contains("twice"), "{message}");
     }
 
     #[test]

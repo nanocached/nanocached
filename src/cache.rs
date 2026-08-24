@@ -83,6 +83,8 @@ pub struct NamespaceStats {
     pub namespace: Bytes,
     pub entries: usize,
     pub used_bytes: usize,
+    /// Issue #127: this namespace's `--namespace-budget`, if one is set.
+    pub budget_bytes: Option<usize>,
 }
 
 pub struct Cache {
@@ -99,6 +101,17 @@ pub struct Cache {
     max_memory_bytes: usize,
     /// Ticks once per `set`/`get`; stamps `Entry::last_used`.
     clock: u64,
+    /// Issue #127: per-namespace memory budgets (`--namespace-budget`).
+    /// A budget is a *cap*, not a reservation: a namespace over its
+    /// budget evicts from itself (its own LRU order) before the write
+    /// returns, so a churny namespace can't grow past its cap and evict
+    /// everyone else — but the global bound stays authoritative, and the
+    /// global LRU (`evict_one`) still picks the overall-oldest entry
+    /// regardless of budgets. Protecting a small, precious namespace is
+    /// therefore done by capping the big churny ones, not by reserving
+    /// for the small one. Keyed independently of `namespaces` — a budget
+    /// outlives its (empty-and-dropped) sub-map.
+    budgets: HashMap<Bytes, usize, RandomState>,
     /// Issue #124: client-visible operation counters, snapshotted by
     /// `stats()` for the metrics endpoint. Plain fields, not atomics —
     /// the cache actor is single-threaded.
@@ -130,12 +143,25 @@ impl Entry {
 }
 
 impl Cache {
+    /// Test-only convenience since issue #127 made budgets part of
+    /// construction — production goes through `with_budgets` (an empty
+    /// flag list is just an empty budget list).
+    #[cfg(test)]
     pub fn new(max_memory_bytes: usize) -> Self {
+        Self::with_budgets(max_memory_bytes, Vec::new())
+    }
+
+    /// Issue #127: `new` plus per-namespace budgets — see
+    /// `Cache::budgets`. Duplicate names keep the last value
+    /// (`parse_args` already rejects duplicates; this is just the map's
+    /// natural behavior).
+    pub fn with_budgets(max_memory_bytes: usize, budgets: Vec<(Bytes, usize)>) -> Self {
         Self {
             namespaces: HashMap::with_hasher(RandomState::new()),
             entry_count: 0,
             used_bytes: 0,
             max_memory_bytes,
+            budgets: budgets.into_iter().collect(),
             clock: 0,
             hits: 0,
             misses: 0,
@@ -224,12 +250,41 @@ impl Cache {
             self.used_bytes += entry_bytes;
         }
 
+        // Issue #127: a budgeted namespace pays for its own growth first
+        // — evicted from its *own* LRU order — so the global loop below
+        // never has to make an innocent namespace pay for this one's
+        // churn. Runs on overwrites too (a grown value can breach the
+        // budget just like a new entry).
+        self.enforce_namespace_budget(&key.namespace);
+
         // Evict least-recently-used entries until the cache fits its memory
         // budget, but never evict the entry just inserted above: it is
         // always the most-recently-used one, so `evict_one` would only
         // reach it once nothing else is left.
         while self.used_bytes > self.max_memory_bytes && self.entry_count > 1 {
             self.evict_one();
+        }
+    }
+
+    /// Issue #127: evicts this namespace's least-recently-used entries
+    /// until it fits its `--namespace-budget`, if it has one. Mirrors the
+    /// global loop's one-entry floor: the entry just inserted is its
+    /// namespace's most-recently-used, so it survives even when it alone
+    /// exceeds the budget (exactly how a single oversized entry is
+    /// allowed to exceed `--max-memory`).
+    fn enforce_namespace_budget(&mut self, namespace_name: &Bytes) {
+        let Some(&budget) = self.budgets.get(namespace_name) else {
+            return;
+        };
+
+        loop {
+            let Some(namespace) = self.namespaces.get(namespace_name) else {
+                return;
+            };
+            if namespace.used_bytes <= budget || namespace.entries.len() <= 1 {
+                return;
+            }
+            self.evict_one_from(namespace_name.clone());
         }
     }
 
@@ -240,7 +295,6 @@ impl Cache {
     /// named-cache workloads namespaces exist for (issue #105), and only
     /// ever paid while over the memory bound.
     fn evict_one(&mut self) {
-        self.evictions += 1;
         let victim_namespace = self
             .namespaces
             .iter()
@@ -254,25 +308,34 @@ impl Cache {
             .map(|(_, namespace)| namespace.clone())
             .expect("entry_count > 1 guarantees an entry to evict");
 
+        self.evict_one_from(victim_namespace);
+    }
+
+    /// Removes `namespace_name`'s least-recently-used entry — the shared
+    /// tail of the global `evict_one` (which picks the victim namespace
+    /// first) and the per-namespace budget loop (issue #127, where the
+    /// victim namespace is the one over its budget).
+    fn evict_one_from(&mut self, namespace_name: Bytes) {
+        self.evictions += 1;
         let namespace = self
             .namespaces
-            .get_mut(&victim_namespace)
-            .expect("the victim namespace was just found");
+            .get_mut(&namespace_name)
+            .expect("the victim namespace exists");
         let (evicted_name, evicted_entry) = namespace
             .entries
             .pop_lru()
-            .expect("the victim namespace was just found non-empty");
+            .expect("the victim namespace is non-empty");
         let entry_bytes = evicted_name.len() + evicted_entry.value.len() + ENTRY_OVERHEAD_BYTES;
         namespace.used_bytes -= entry_bytes;
         if namespace.entries.is_empty() {
-            self.namespaces.remove(&victim_namespace);
+            self.namespaces.remove(&namespace_name);
         }
 
         self.entry_count -= 1;
         self.used_bytes -= entry_bytes;
         // The marked value is gone; a future entry under this key is a
         // different value and must not inherit the mark.
-        self.clear_migrated_mark(&Key::new(victim_namespace, evicted_name));
+        self.clear_migrated_mark(&Key::new(namespace_name, evicted_name));
     }
 
     fn get_at(&mut self, key: &Key, now: Instant) -> Option<Bytes> {
@@ -454,6 +517,7 @@ impl Cache {
                 namespace: name.clone(),
                 entries: sub_map.entries.len(),
                 used_bytes: sub_map.used_bytes,
+                budget_bytes: self.budgets.get(name).copied(),
             })
             .collect();
         // Deterministic output order (HashMap iteration isn't), largest
@@ -969,6 +1033,113 @@ mod tests {
         assert_eq!(cache.namespaces.len(), 1);
         cache.delete(&namespaced(b"users", b"b"));
         assert_eq!(cache.namespaces.len(), 0);
+    }
+
+    /// One entry's cost with a 2-byte key and 4-byte value — the shape
+    /// every budget test below uses.
+    const SMALL_ENTRY: usize = 2 + 4 + ENTRY_OVERHEAD_BYTES;
+
+    #[test]
+    fn a_namespace_over_its_budget_evicts_from_itself_oldest_first() {
+        // Issue #127: the churny namespace pays for its own growth — the
+        // other namespace's older entries survive untouched.
+        let mut cache = Cache::with_budgets(
+            UNBOUNDED,
+            vec![(Bytes::from_static(b"hot"), 2 * SMALL_ENTRY)],
+        );
+
+        cache.set(namespaced(b"cold", b"c1"), Bytes::from_static(b"vvvv"));
+        cache.set(namespaced(b"hot", b"h1"), Bytes::from_static(b"vvvv"));
+        cache.set(namespaced(b"hot", b"h2"), Bytes::from_static(b"vvvv"));
+        // The third hot entry breaches the 2-entry budget: h1 (hot's own
+        // LRU victim) goes; cold — strictly older — stays.
+        cache.set(namespaced(b"hot", b"h3"), Bytes::from_static(b"vvvv"));
+
+        assert_eq!(cache.get(&namespaced(b"hot", b"h1")), None);
+        assert_eq!(
+            cache.get(&namespaced(b"hot", b"h2")),
+            Some(Bytes::from_static(b"vvvv"))
+        );
+        assert_eq!(
+            cache.get(&namespaced(b"hot", b"h3")),
+            Some(Bytes::from_static(b"vvvv"))
+        );
+        assert_eq!(
+            cache.get(&namespaced(b"cold", b"c1")),
+            Some(Bytes::from_static(b"vvvv"))
+        );
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn an_overwrite_that_grows_past_the_budget_evicts_within_the_namespace() {
+        let mut cache = Cache::with_budgets(
+            UNBOUNDED,
+            vec![(Bytes::from_static(b"hot"), 2 * SMALL_ENTRY)],
+        );
+
+        cache.set(namespaced(b"hot", b"h1"), Bytes::from_static(b"vvvv"));
+        cache.set(namespaced(b"hot", b"h2"), Bytes::from_static(b"vvvv"));
+        // Growing h2 by more than one entry's worth of bytes breaches the
+        // budget without adding an entry — h1 must go.
+        let grown = Bytes::from(vec![b'x'; 4 + SMALL_ENTRY]);
+        cache.set(namespaced(b"hot", b"h2"), grown.clone());
+
+        assert_eq!(cache.get(&namespaced(b"hot", b"h1")), None);
+        assert_eq!(cache.get(&namespaced(b"hot", b"h2")), Some(grown));
+    }
+
+    #[test]
+    fn a_single_entry_may_exceed_its_namespace_budget() {
+        // Mirrors the global bound's floor: the entry just inserted is
+        // never its own eviction victim.
+        let mut cache =
+            Cache::with_budgets(UNBOUNDED, vec![(Bytes::from_static(b"hot"), SMALL_ENTRY)]);
+
+        let oversized = Bytes::from(vec![b'x'; 3 * SMALL_ENTRY]);
+        cache.set(namespaced(b"hot", b"h1"), oversized.clone());
+
+        assert_eq!(cache.get(&namespaced(b"hot", b"h1")), Some(oversized));
+        assert_eq!(cache.evictions, 0);
+    }
+
+    #[test]
+    fn a_budget_does_not_shield_a_namespace_from_the_global_lru() {
+        // Issue #127: the global bound stays authoritative — a budgeted
+        // namespace's oldest entry is still the global victim when the
+        // whole cache is over --max-memory.
+        let mut cache = Cache::with_budgets(
+            2 * SMALL_ENTRY,
+            vec![(Bytes::from_static(b"hot"), 10 * SMALL_ENTRY)],
+        );
+
+        cache.set(namespaced(b"hot", b"h1"), Bytes::from_static(b"vvvv"));
+        cache.set(namespaced(b"cold", b"c1"), Bytes::from_static(b"vvvv"));
+        cache.set(namespaced(b"cold", b"c2"), Bytes::from_static(b"vvvv"));
+
+        // h1 was globally oldest; its namespace's generous budget didn't
+        // protect it.
+        assert_eq!(cache.get(&namespaced(b"hot", b"h1")), None);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn stats_report_the_namespace_budget() {
+        let mut cache = Cache::with_budgets(UNBOUNDED, vec![(Bytes::from_static(b"hot"), 4096)]);
+        cache.set(namespaced(b"hot", b"h1"), Bytes::from_static(b"vvvv"));
+        cache.set(namespaced(b"cold", b"c1"), Bytes::from_static(b"vvvv"));
+
+        let stats = cache.stats();
+        let budget = |name: &[u8]| {
+            stats
+                .namespaces
+                .iter()
+                .find(|row| row.namespace == name)
+                .unwrap()
+                .budget_bytes
+        };
+        assert_eq!(budget(b"hot"), Some(4096));
+        assert_eq!(budget(b"cold"), None);
     }
 
     #[test]
