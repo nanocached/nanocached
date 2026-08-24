@@ -58,7 +58,11 @@ endpoint entirely.</p>
 <code>nanocached_node_memory_used_bytes</code> over the fleet, divide by
 the summed <code>nanocached_node_memory_max_bytes</code>, and target a
 utilization (say 70%) with your autoscaler. Entry counts, hit/miss/set/
-delete/eviction/expiration counters, connection counts, and per-namespace
+delete/eviction/expiration counters, connection counts
+(<code>nanocached_node_connections</code> against
+<code>…_connections_max</code>, the <code>--max-connections</code> bound
+— raise <code>--max-connections-per-ip</code> too when clients share a
+source IP, as behind NAT or on Kubernetes), and per-namespace
 breakdowns (<code>nanocached_node_namespace_used_bytes</code>,
 <code>…_namespace_entries</code>) are exported alongside for dashboards
 and alerting.</p>

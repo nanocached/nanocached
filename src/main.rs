@@ -50,6 +50,17 @@ struct Args {
     /// entries to their post-leave owners, leave membership, exit. 0
     /// skips the handoff (fast restarts; replicas cover at R >= 2).
     drain_timeout: std::time::Duration,
+    /// Issue #126: `--max-connections`. Previously the compile-time
+    /// `MAX_CONNECTIONS` constant.
+    max_connections: usize,
+    /// Issue #126: `--max-connections-per-ip`. `None` until the flag is
+    /// seen; resolved by `parse_args_from` after the loop to
+    /// `min(default, max_connections)` — keeping the raw `Option` until
+    /// then is what lets an explicit value be validated against
+    /// `--max-connections` regardless of flag order, while an implicit
+    /// default silently shrinks to fit a lowered total instead of
+    /// failing.
+    max_connections_per_ip: Option<usize>,
 }
 
 impl Default for Args {
@@ -64,6 +75,8 @@ impl Default for Args {
             max_memory: server::MAX_CACHE_MEMORY_BYTES,
             metrics_port: None,
             drain_timeout: std::time::Duration::from_secs(25),
+            max_connections: server::DEFAULT_MAX_CONNECTIONS,
+            max_connections_per_ip: None,
         }
     }
 }
@@ -140,6 +153,28 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
 
                 args.max_memory = max_memory;
             }
+            "--max-connections" => {
+                let raw = value()?;
+                let max_connections: usize = raw
+                    .parse()
+                    .map_err(|_| format!("invalid value for --max-connections: {raw}"))?;
+                if max_connections == 0 {
+                    return Err("--max-connections must be at least 1".to_string().into());
+                }
+                args.max_connections = max_connections;
+            }
+            "--max-connections-per-ip" => {
+                let raw = value()?;
+                let per_ip: usize = raw
+                    .parse()
+                    .map_err(|_| format!("invalid value for --max-connections-per-ip: {raw}"))?;
+                if per_ip == 0 {
+                    return Err("--max-connections-per-ip must be at least 1"
+                        .to_string()
+                        .into());
+                }
+                args.max_connections_per_ip = Some(per_ip);
+            }
             "-h" | "--help" => return Err(ArgsError::Help(usage())),
             other => {
                 return Err(ArgsError::Invalid(format!(
@@ -154,6 +189,19 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
         return Err(ArgsError::Invalid(
             "--tls-cert and --tls-key must be set together".to_string(),
         ));
+    }
+
+    // Issue #126: an explicit per-IP cap above the total is a
+    // misconfiguration (it could never bind); the implicit default
+    // instead shrinks to fit a lowered total. Checked here, after the
+    // loop, so the two flags may appear in either order.
+    if let Some(per_ip) = args.max_connections_per_ip
+        && per_ip > args.max_connections
+    {
+        return Err(ArgsError::Invalid(format!(
+            "--max-connections-per-ip ({per_ip}) must not exceed --max-connections ({})",
+            args.max_connections
+        )));
     }
 
     Ok(args)
@@ -194,11 +242,36 @@ Usage: nanocached-node [options]
                                small per-entry accounting overhead
                                (default {} — 256 MiB, minimum {} — {} MiB);
                                least-recently-used entries are evicted
-                               first once over budget",
+                               first once over budget
+  --max-connections <n>       accepted client connections at once
+                               (default {}); over the cap new
+                               connections get a Busy reply
+  --max-connections-per-ip <n> connections one source IP may hold
+                               (default {}, never above
+                               --max-connections). Behind NAT or on
+                               Kubernetes many clients share one source
+                               IP, making this — not the total — the
+                               effective fleet ceiling",
         server::MAX_CACHE_MEMORY_BYTES,
         MIN_MAX_MEMORY_BYTES,
         MIN_MAX_MEMORY_BYTES / (1024 * 1024),
+        server::DEFAULT_MAX_CONNECTIONS,
+        server::DEFAULT_MAX_CONNECTIONS_PER_IP,
     )
+}
+
+/// Issue #126: the resolved `--max-connections`/`--max-connections-per-ip`
+/// pair. An unset per-IP cap follows a lowered total down (a
+/// 100-connection node shouldn't keep a 256 per-IP default that could
+/// never bind); an explicit value was already validated by
+/// `parse_args_from` to not exceed the total.
+fn connection_limits(args: &Args) -> server::ConnectionLimits {
+    server::ConnectionLimits {
+        max_connections: args.max_connections,
+        max_connections_per_ip: args
+            .max_connections_per_ip
+            .unwrap_or_else(|| server::DEFAULT_MAX_CONNECTIONS_PER_IP.min(args.max_connections)),
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -260,6 +333,8 @@ async fn main() -> ExitCode {
 
     let address = format!("{}:{}", args.host, args.port);
     let auth_secret = read_auth_secret();
+    // Resolved before `args.discovery` is moved out below.
+    let limits = connection_limits(&args);
     let heartbeat = match args.discovery {
         Some(list) => {
             let discovery_addrs: Vec<String> = list
@@ -296,6 +371,7 @@ async fn main() -> ExitCode {
         args.max_memory,
         metrics_address,
         args.drain_timeout,
+        limits,
     )
     .await
     {
@@ -319,6 +395,77 @@ mod tests {
             .map(|flag| flag.to_string())
             .collect::<Vec<_>>()
             .into_iter()
+    }
+
+    #[test]
+    fn connection_limit_flags_parse_and_default_correctly() {
+        // Issue #126: defaults unchanged from the old compile-time
+        // constants when the flags are omitted...
+        let parsed = parse_args_from(args(&[])).unwrap();
+        let limits = connection_limits(&parsed);
+        assert_eq!(limits.max_connections, server::DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(
+            limits.max_connections_per_ip,
+            server::DEFAULT_MAX_CONNECTIONS_PER_IP
+        );
+
+        // ...and both configurable when given.
+        let parsed = parse_args_from(args(&[
+            "--max-connections",
+            "4096",
+            "--max-connections-per-ip",
+            "1000",
+        ]))
+        .unwrap();
+        let limits = connection_limits(&parsed);
+        assert_eq!(limits.max_connections, 4096);
+        assert_eq!(limits.max_connections_per_ip, 1000);
+    }
+
+    #[test]
+    fn an_unset_per_ip_cap_follows_a_lowered_total_down() {
+        // Issue #126: --max-connections 100 alone must not keep the 256
+        // per-IP default — a per-IP cap above the total could never bind.
+        let parsed = parse_args_from(args(&["--max-connections", "100"])).unwrap();
+        let limits = connection_limits(&parsed);
+        assert_eq!(limits.max_connections, 100);
+        assert_eq!(limits.max_connections_per_ip, 100);
+    }
+
+    #[test]
+    fn an_explicit_per_ip_cap_above_the_total_is_rejected_in_either_flag_order() {
+        for flags in [
+            [
+                "--max-connections",
+                "100",
+                "--max-connections-per-ip",
+                "200",
+            ],
+            [
+                "--max-connections-per-ip",
+                "200",
+                "--max-connections",
+                "100",
+            ],
+        ] {
+            let Err(ArgsError::Invalid(message)) = parse_args_from(args(&flags)) else {
+                panic!("a per-IP cap above the total must be rejected");
+            };
+            assert!(message.contains("must not exceed"), "{message}");
+        }
+    }
+
+    #[test]
+    fn zero_connection_limits_are_rejected() {
+        for flags in [
+            ["--max-connections", "0"],
+            ["--max-connections-per-ip", "0"],
+        ] {
+            let Err(ArgsError::Invalid(message)) = parse_args_from(args(&flags)) else {
+                panic!("a zero limit must be rejected");
+            };
+            assert!(message.contains("at least 1"), "{message}");
+        }
     }
 
     #[test]
