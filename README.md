@@ -524,10 +524,17 @@ loud `WARN` if that disagrees with its own configured value.
 ### nanocached-node
 
 - Maximum request size: 1 MiB
-- Maximum concurrent connections: 1,024, and at most 256 from any one
-  source IP — anything that collapses source addresses (Docker Desktop's
-  port publishing, a NAT gateway, a load balancer without proxy protocol)
-  makes 256 the effective limit for everything behind it
+- Maximum concurrent connections: 1,024 by default, configurable with
+  `--max-connections <n>`, and at most 256 from any one source IP by
+  default, configurable with `--max-connections-per-ip <n>` (never above
+  the total; an unset per-IP cap shrinks to match a lowered total) —
+  anything that collapses source addresses (Docker Desktop's port
+  publishing, a NAT gateway, Kubernetes pods behind one egress, a load
+  balancer without proxy protocol) makes the per-IP cap the effective
+  limit for everything behind it, so raise it in those deployments. A
+  proxy tier (`nanocached-proxy`) multiplexes all its clients over a
+  handful of node connections, which keeps a node well clear of both
+  caps; a client fleet dialing nodes directly is what runs into them
 - Maximum cache memory usage: 256 MiB by default, configurable with
   `--max-memory <bytes>` (approximate: sum of stored key and value bytes
   plus a small per-entry accounting overhead), least-recently-used
@@ -541,7 +548,8 @@ loud `WARN` if that disagrees with its own configured value.
 
 - Maximum request size: 4 KiB
 - Maximum concurrent connections: 1,024, and at most 256 from any one
-  source IP (same caveat as for nodes)
+  source IP (fixed — the node's `--max-connections*` flags don't exist
+  here; discovery serves only brief roster fetches and heartbeats)
 - Idle connection timeout: 60 seconds
 
 ## License

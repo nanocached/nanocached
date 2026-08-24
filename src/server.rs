@@ -25,20 +25,44 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
 
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
-const MAX_CONNECTIONS: usize = 1024;
-/// Coarse cap on how many live connections a single source IP may hold at
-/// once, layered under the global `MAX_CONNECTIONS` semaphore (issue: no
+/// Default for `--max-connections` (issue #126): previously a fixed
+/// constant with no way to tune it — small deployments couldn't lower
+/// it, and large ones couldn't raise it.
+pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// Default for `--max-connections-per-ip` (issue #126): a coarse cap on
+/// how many live connections a single source IP may hold at once,
+/// layered under the global `--max-connections` semaphore (issue: no
 /// per-source-IP limit — a single misbehaving or compromised peer could
-/// otherwise claim the entire `MAX_CONNECTIONS` budget by itself,
-/// starving every other client, without the global semaphore ever
-/// reporting anything unusual). Deliberately coarse, not a tight
-/// per-client budget: a pooled application host — many worker processes
-/// or threads sharing one egress IP, or a fleet behind one NAT — can
-/// legitimately hold a large number of concurrent connections to this
-/// cache, and this guard exists only to stop one source from
-/// monopolising the whole server, not to bound ordinary legitimate
-/// concurrency. See `try_acquire_per_ip`.
-const MAX_CONNECTIONS_PER_IP: usize = 256;
+/// otherwise claim the entire connection budget by itself, starving
+/// every other client, without the global semaphore ever reporting
+/// anything unusual). Deliberately coarse, not a tight per-client
+/// budget: a pooled application host — many worker processes or threads
+/// sharing one egress IP, or a fleet behind one NAT — can legitimately
+/// hold a large number of concurrent connections to this cache, and
+/// this guard exists only to stop one source from monopolising the
+/// whole server, not to bound ordinary legitimate concurrency. Behind
+/// NAT or on Kubernetes, where many clients share one source IP, *this*
+/// — not the global cap — is the effective fleet ceiling, which is
+/// exactly why it's now a flag. See `try_acquire_per_ip`.
+pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 256;
+
+/// The two accepted-connection caps, resolved from `--max-connections` /
+/// `--max-connections-per-ip` by `main.rs` (issue #126) and threaded to
+/// the global semaphore, the per-IP reservation, and the metrics gauge.
+#[derive(Clone, Copy)]
+pub(crate) struct ConnectionLimits {
+    pub(crate) max_connections: usize,
+    pub(crate) max_connections_per_ip: usize,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_connections_per_ip: DEFAULT_MAX_CONNECTIONS_PER_IP,
+        }
+    }
+}
 /// Default for `--max-memory` (issue #19): the cap was previously a fixed
 /// constant with no way to tune it, even though the capacity planner
 /// (`tools/capacity-planner.html`) already modeled capacity as a function
@@ -50,7 +74,7 @@ pub(crate) const MAX_CACHE_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// (or to accept-time, before any command has completed) — not to the
 /// last byte read. Resetting it on every read, as an earlier version did,
 /// let a client that trickles in one byte just under this interval apart
-/// hold a `MAX_CONNECTIONS` permit forever without ever finishing a
+/// hold a `DEFAULT_MAX_CONNECTIONS` permit forever without ever finishing a
 /// request. The practical consequence: a legitimate request must arrive
 /// in full within this long of the previous one completing, not merely
 /// send *some* bytes that often.
@@ -59,7 +83,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// than `IDLE_TIMEOUT`: that one tolerates a normal gap between a
 /// client's requests, but a peer that has simply stopped draining its
 /// receive buffer is a distinct failure that shouldn't get to hold a
-/// `MAX_CONNECTIONS` permit for as long as an idle-but-otherwise-fine
+/// `DEFAULT_MAX_CONNECTIONS` permit for as long as an idle-but-otherwise-fine
 /// connection is allowed to sit.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Base and per-entry components of how long after this node's own
@@ -93,7 +117,7 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// that accepts TCP but never answers (crashed-but-socket-open, a
 /// blackholed route, no keepalive configured) blocks a single leg (the
 /// dial, the TLS handshake, the auth round trip, or the write/ack)
-/// forever while it still holds a `MAX_CONNECTIONS` permit; enough such
+/// forever while it still holds a `DEFAULT_MAX_CONNECTIONS` permit; enough such
 /// requests during one stalled migration exhaust every permit. Mirrors
 /// discovery's own `OUTBOUND_IO_TIMEOUT`.
 ///
@@ -494,6 +518,7 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     address: &str,
     heartbeat: Option<HeartbeatConfig>,
@@ -502,11 +527,12 @@ pub(crate) async fn run(
     max_memory_bytes: usize,
     metrics_address: Option<String>,
     drain_timeout: Duration,
+    limits: ConnectionLimits,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
 
     let (request_tx, request_rx) = mpsc::channel(1024);
-    let connection_limit = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connection_limit = Arc::new(Semaphore::new(limits.max_connections));
     let per_ip_connections: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
     let mut connection_tasks = JoinSet::new();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -563,6 +589,7 @@ pub(crate) async fn run(
                 metrics_listener,
                 request_tx.clone(),
                 Arc::clone(&connection_limit),
+                limits.max_connections,
                 Arc::clone(&known_ring),
                 node_context.is_some(),
                 shutdown_rx.clone(),
@@ -742,6 +769,7 @@ pub(crate) async fn run(
                     request_tx.clone(),
                     Arc::clone(&connection_limit),
                     Arc::clone(&per_ip_connections),
+                    limits.max_connections_per_ip,
                     connection_config.clone(),
                     shutdown_rx.clone(),
                     &mut connection_tasks,
@@ -818,7 +846,7 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Live connection counts per source IP, backing `MAX_CONNECTIONS_PER_IP`
+/// Live connection counts per source IP, backing `DEFAULT_MAX_CONNECTIONS_PER_IP`
 /// (see that constant). A plain `Mutex<HashMap<..>>` rather than anything
 /// fancier: every access here is a brief increment/decrement with no I/O
 /// under the lock, and every accepted connection already pays for a
@@ -826,9 +854,9 @@ pub(crate) async fn run(
 /// no bottleneck relative to that existing one.
 type PerIpConnections = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
-/// Releases one `MAX_CONNECTIONS_PER_IP` slot on drop — the per-IP
+/// Releases one `DEFAULT_MAX_CONNECTIONS_PER_IP` slot on drop — the per-IP
 /// counterpart to the `Semaphore` permit `dispatch_connection` already
-/// holds for `MAX_CONNECTIONS` (`_connection_permit`, which frees itself
+/// holds for `DEFAULT_MAX_CONNECTIONS` (`_connection_permit`, which frees itself
 /// the same way).
 struct PerIpConnectionGuard {
     counts: PerIpConnections,
@@ -854,15 +882,20 @@ impl Drop for PerIpConnectionGuard {
     }
 }
 
-/// Reserves one of `MAX_CONNECTIONS_PER_IP` slots for `ip`, or `None` if
-/// it's already at the cap — see `MAX_CONNECTIONS_PER_IP`.
-fn try_acquire_per_ip(counts: &PerIpConnections, ip: IpAddr) -> Option<PerIpConnectionGuard> {
+/// Reserves one of `cap` (`--max-connections-per-ip`) slots for `ip`, or
+/// `None` if it's already at the cap — see
+/// `DEFAULT_MAX_CONNECTIONS_PER_IP`.
+fn try_acquire_per_ip(
+    counts: &PerIpConnections,
+    ip: IpAddr,
+    cap: usize,
+) -> Option<PerIpConnectionGuard> {
     let mut guard = counts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let count = guard.entry(ip).or_insert(0);
-    if *count >= MAX_CONNECTIONS_PER_IP {
+    if *count >= cap {
         return None;
     }
     *count += 1;
@@ -876,7 +909,7 @@ fn try_acquire_per_ip(counts: &PerIpConnections, ip: IpAddr) -> Option<PerIpConn
 
 /// Best-effort "Busy" reply on `stream` before the caller drops it —
 /// shared by every over-limit rejection in `dispatch_connection`
-/// (`MAX_CONNECTIONS` and, per source IP, `MAX_CONNECTIONS_PER_IP`). A
+/// (`DEFAULT_MAX_CONNECTIONS` and, per source IP, `DEFAULT_MAX_CONNECTIONS_PER_IP`). A
 /// TLS-configured server has no plaintext channel to answer on before the
 /// handshake completes (TLS support: no plaintext fallback once TLS is set)
 /// — it just closes. A plaintext server can still reply on the raw
@@ -911,6 +944,7 @@ fn dispatch_connection(
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
     per_ip_connections: PerIpConnections,
+    max_connections_per_ip: usize,
     config: ConnectionConfig,
     shutdown_rx: watch::Receiver<bool>,
     connection_tasks: &mut JoinSet<()>,
@@ -927,7 +961,7 @@ fn dispatch_connection(
     connection_tasks.spawn(async move {
         // Issue #5: acquired *before* the TLS handshake (previously
         // after), so a peer can't spend handshake CPU/fds past
-        // `MAX_CONNECTIONS` just by dialing and stalling — only a
+        // `DEFAULT_MAX_CONNECTIONS` just by dialing and stalling — only a
         // permit-holding connection ever performs one.
         let permit = match connection_limit.try_acquire_owned() {
             Ok(permit) => permit,
@@ -938,18 +972,19 @@ fn dispatch_connection(
         };
 
         // No per-source-IP connection limit: without this, a single
-        // source could hold `MAX_CONNECTIONS` connections all by itself
+        // source could hold `DEFAULT_MAX_CONNECTIONS` connections all by itself
         // and starve every other client, even though the global
         // semaphore above isn't literally exhausted until the very last
         // one. Reserved before the TLS handshake for the same reason as
-        // the global permit (issue #5) — see `MAX_CONNECTIONS_PER_IP`.
-        let per_ip_permit = match try_acquire_per_ip(&per_ip_connections, address.ip()) {
-            Some(permit) => permit,
-            None => {
-                reject_over_limit(stream, address, &config.tls_acceptor).await;
-                return;
-            }
-        };
+        // the global permit (issue #5) — see `DEFAULT_MAX_CONNECTIONS_PER_IP`.
+        let per_ip_permit =
+            match try_acquire_per_ip(&per_ip_connections, address.ip(), max_connections_per_ip) {
+                Some(permit) => permit,
+                None => {
+                    reject_over_limit(stream, address, &config.tls_acceptor).await;
+                    return;
+                }
+            };
 
         let stream: ServerStream = match &config.tls_acceptor {
             Some(acceptor) => match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
@@ -1015,7 +1050,7 @@ fn log_connection_error(address: &SocketAddr, error: &io::Error) {
 /// Bounds every response write in `handle_connection` (issue #4): the read
 /// side already has `IDLE_TIMEOUT`, but an unbounded `write_all` let a peer
 /// that stops reading (without closing the TCP connection — e.g. a full
-/// receive buffer) hold this connection's `MAX_CONNECTIONS` permit forever.
+/// receive buffer) hold this connection's `DEFAULT_MAX_CONNECTIONS` permit forever.
 /// Uses `WRITE_TIMEOUT` rather than reusing `IDLE_TIMEOUT`: the two are
 /// different failure modes (a normal gap between requests vs. a peer that
 /// isn't draining its receive buffer at all), and reusing the 60s read
@@ -1050,6 +1085,7 @@ async fn run_metrics_server(
     listener: TcpListener,
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
+    max_connections: usize,
     known_ring: KnownRing,
     is_cluster: bool,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1073,6 +1109,7 @@ async fn run_metrics_server(
                     stream,
                     request_tx,
                     connection_limit,
+                    max_connections,
                     known_ring,
                     is_cluster,
                 ),
@@ -1086,6 +1123,7 @@ async fn serve_metrics_connection(
     mut stream: TcpStream,
     request_tx: mpsc::Sender<CacheRequest>,
     connection_limit: Arc<Semaphore>,
+    max_connections: usize,
     known_ring: KnownRing,
     is_cluster: bool,
 ) -> io::Result<()> {
@@ -1095,8 +1133,11 @@ async fn serve_metrics_connection(
         "/metrics" => match execute_command(&request_tx, Command::Stats).await {
             Ok(Response::Stats(stats)) => {
                 let connections =
-                    MAX_CONNECTIONS.saturating_sub(connection_limit.available_permits());
-                ("200 OK", render_node_metrics(&stats, connections))
+                    max_connections.saturating_sub(connection_limit.available_permits());
+                (
+                    "200 OK",
+                    render_node_metrics(&stats, connections, max_connections),
+                )
             }
             _ => (
                 "500 Internal Server Error",
@@ -1174,7 +1215,11 @@ fn metrics_label_escape(raw: &[u8]) -> String {
         .replace('\n', "\\n")
 }
 
-fn render_node_metrics(stats: &crate::cache::CacheStats, connections: usize) -> String {
+fn render_node_metrics(
+    stats: &crate::cache::CacheStats,
+    connections: usize,
+    max_connections: usize,
+) -> String {
     let mut out = String::new();
     let mut metric = |name: &str, kind: &str, help: &str, value: String| {
         out.push_str(&format!(
@@ -1208,6 +1253,13 @@ fn render_node_metrics(stats: &crate::cache::CacheStats, connections: usize) -> 
         "gauge",
         "Client connections currently held (of the connection limit).",
         format!("nanocached_node_connections {connections}\n"),
+    );
+    metric(
+        "nanocached_node_connections_max",
+        "gauge",
+        "The --max-connections bound (issue #126) — the proxy exports the \
+         same pair, so utilization dashboards can treat both tiers alike.",
+        format!("nanocached_node_connections_max {max_connections}\n"),
     );
     metric(
         "nanocached_node_hits_total",
@@ -4823,6 +4875,7 @@ mod tests {
             MAX_CACHE_MEMORY_BYTES,
             None,
             Duration::from_secs(25),
+            ConnectionLimits::default(),
         )
         .await
         .unwrap_err();
@@ -4864,7 +4917,7 @@ mod tests {
         // Slowloris regression: before this fix, every byte read reset
         // the idle deadline to `now + IDLE_TIMEOUT`, regardless of
         // whether it completed a command — so a client sending one byte
-        // just under `IDLE_TIMEOUT` apart could hold a `MAX_CONNECTIONS`
+        // just under `IDLE_TIMEOUT` apart could hold a `DEFAULT_MAX_CONNECTIONS`
         // permit forever without ever finishing a request. The deadline
         // must instead be anchored to the last *completed* parse (or to
         // accept-time, before any request has completed).
@@ -5248,7 +5301,8 @@ mod tests {
         let metrics_task = tokio::spawn(run_metrics_server(
             listener,
             request_tx.clone(),
-            Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            DEFAULT_MAX_CONNECTIONS,
             Arc::new(Mutex::new(None)),
             false,
             shutdown_rx,
@@ -5295,7 +5349,8 @@ mod tests {
         let metrics_task = tokio::spawn(run_metrics_server(
             listener,
             request_tx,
-            Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            DEFAULT_MAX_CONNECTIONS,
             Arc::clone(&known_ring),
             true,
             shutdown_rx,
@@ -5406,6 +5461,7 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             Arc::clone(&per_ip_connections),
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -5431,6 +5487,7 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             Arc::clone(&per_ip_connections),
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -5460,10 +5517,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rejects_connection_when_the_per_ip_connection_limit_is_reached() {
-        // Regression: `MAX_CONNECTIONS` alone lets a single source IP hold
+        // Regression: `DEFAULT_MAX_CONNECTIONS` alone lets a single source IP hold
         // every one of the global permits by itself, starving every other
         // client, without the global semaphore ever reporting anything
-        // unusual short of the very last permit. `MAX_CONNECTIONS_PER_IP`
+        // unusual short of the very last permit. `DEFAULT_MAX_CONNECTIONS_PER_IP`
         // must reject a source once it individually reaches its own cap,
         // independent of how much global headroom remains.
         let connection_limit = Arc::new(Semaphore::new(10));
@@ -5471,13 +5528,13 @@ mod tests {
         let (request_tx, _request_rx) = mpsc::channel(1);
 
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        // Stands in for `MAX_CONNECTIONS_PER_IP - 1` other already-live
+        // Stands in for `DEFAULT_MAX_CONNECTIONS_PER_IP - 1` other already-live
         // connections from this IP, without actually dispatching that
         // many for the test.
         per_ip_connections
             .lock()
             .unwrap()
-            .insert(ip, MAX_CONNECTIONS_PER_IP - 1);
+            .insert(ip, DEFAULT_MAX_CONNECTIONS_PER_IP - 1);
 
         let (_first_client, first_server) = tcp_pair().await;
         let first_address = SocketAddr::new(ip, 9000);
@@ -5491,6 +5548,7 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             Arc::clone(&per_ip_connections),
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -5508,7 +5566,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(
             per_ip_connections.lock().unwrap().get(&ip).copied(),
-            Some(MAX_CONNECTIONS_PER_IP)
+            Some(DEFAULT_MAX_CONNECTIONS_PER_IP)
         );
 
         let (mut second_client, second_server) = tcp_pair().await;
@@ -5520,6 +5578,7 @@ mod tests {
             request_tx.clone(),
             Arc::clone(&connection_limit),
             Arc::clone(&per_ip_connections),
+            DEFAULT_MAX_CONNECTIONS_PER_IP,
             ConnectionConfig {
                 idle_timeout: IDLE_TIMEOUT,
                 auth_secret: None,
@@ -5539,7 +5598,7 @@ mod tests {
         assert_eq!(response, b"B\n");
         assert_eq!(
             per_ip_connections.lock().unwrap().get(&ip).copied(),
-            Some(MAX_CONNECTIONS_PER_IP),
+            Some(DEFAULT_MAX_CONNECTIONS_PER_IP),
             "the rejected connection must not have reserved a slot"
         );
         // The global limit was never the bottleneck here.
@@ -5556,22 +5615,38 @@ mod tests {
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
         let mut guards = Vec::new();
-        for _ in 0..MAX_CONNECTIONS_PER_IP {
-            guards.push(try_acquire_per_ip(&counts, ip).expect("under the per-IP cap"));
+        for _ in 0..DEFAULT_MAX_CONNECTIONS_PER_IP {
+            guards.push(
+                try_acquire_per_ip(&counts, ip, DEFAULT_MAX_CONNECTIONS_PER_IP)
+                    .expect("under the per-IP cap"),
+            );
         }
 
         assert!(
-            try_acquire_per_ip(&counts, ip).is_none(),
-            "the per-IP cap must reject a connection once MAX_CONNECTIONS_PER_IP is reached"
+            try_acquire_per_ip(&counts, ip, DEFAULT_MAX_CONNECTIONS_PER_IP).is_none(),
+            "the per-IP cap must reject a connection once DEFAULT_MAX_CONNECTIONS_PER_IP is reached"
         );
 
         // A different source IP has its own, independent budget.
         let other_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
-        assert!(try_acquire_per_ip(&counts, other_ip).is_some());
+        assert!(try_acquire_per_ip(&counts, other_ip, DEFAULT_MAX_CONNECTIONS_PER_IP).is_some());
 
         // Dropping one guard frees its slot for the same IP again.
         guards.pop();
-        assert!(try_acquire_per_ip(&counts, ip).is_some());
+        assert!(try_acquire_per_ip(&counts, ip, DEFAULT_MAX_CONNECTIONS_PER_IP).is_some());
+    }
+
+    #[test]
+    fn a_lowered_per_ip_cap_is_honored() {
+        // Issue #126: the cap is a runtime value now — a small deployment
+        // running with --max-connections-per-ip 2 must reject the third
+        // connection from one source, not the 257th.
+        let counts: PerIpConnections = Arc::new(Mutex::new(HashMap::new()));
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+        let _first = try_acquire_per_ip(&counts, ip, 2).expect("first fits");
+        let _second = try_acquire_per_ip(&counts, ip, 2).expect("second fits");
+        assert!(try_acquire_per_ip(&counts, ip, 2).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -9266,6 +9341,7 @@ mod tests {
                 request_tx,
                 connection_limit,
                 per_ip_connections,
+                DEFAULT_MAX_CONNECTIONS_PER_IP,
                 config,
                 shutdown_rx,
                 &mut connection_tasks,
