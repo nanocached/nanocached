@@ -164,11 +164,11 @@ Proxies are stateless and scale horizontally: each registers itself with
 discovery, and a client in proxy mode asks discovery for the proxy list
 and picks one — the only address anything ever needs is discovery's (a
 LB/VIP in front of the proxies works too). Clients that prefer
-cluster-direct connections keep working as before. Backend
-connection sharing (many clients multiplexed onto few tagged, pipelined
-connections per node — what collapses the node-side count from fleet
-size to proxy count) is the next step, designed in the proxy's module
-docs.</p>
+cluster-direct connections keep working as before. Every client
+connection shares one tagged, pipelined backend connection per node, so
+the node-side connection count is the proxy count — not the fleet size —
+with bounded per-client and per-backend in-flight windows providing
+fairness and backpressure.</p>
 
 <h2>Design decisions</h2>
 <p>The main choices, in summary:</p>
