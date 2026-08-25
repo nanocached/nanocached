@@ -183,7 +183,9 @@ and clustered production use identical code. See
     <code>--max-connections-per-ip</code> — the effective ceiling behind
     NAT or on Kubernetes, where clients share a source IP)</td><td>1,024
     (fixed)</td></tr>
-    <tr><td>Cache memory bound</td><td>256 MiB by default (<code>--max-memory</code>), LRU eviction</td><td>—</td></tr>
+    <tr><td>Cache memory bound</td><td>256 MiB by default (<code>--max-memory</code>), LRU eviction;
+    per-namespace caps via <code>--namespace-budget &lt;ns&gt;=&lt;bytes&gt;</code>
+    (a namespace over its cap evicts from itself first)</td><td>—</td></tr>
     <tr><td>Idle connection timeout</td><td>60 s</td><td>60 s</td></tr>
   </tbody>
 </table>
