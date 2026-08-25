@@ -251,6 +251,52 @@ pub(crate) enum DiscoveryQuery {
 /// the kernel's own timeout — minutes — instead of failing over.
 pub(crate) const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Which optional tokens this attempt's `A` line asks for, in the wire's
+/// fixed `[T] [R]` order — retryable-error capability (issue #125) always
+/// rides *after* `T`, never alone, so there is no `Plain`-with-`R` stage:
+/// a server old enough to reject `T` would reject `R` for the same reason
+/// (an unrecognized trailing token), and probing that combination would
+/// only cost an extra round trip nothing can ever accept.
+///
+/// `connect_and_identify` walks these three stages outermost-first
+/// (`TaggedRetryable` → `Tagged` → `Plain`) on the legacy-server signal —
+/// one more stage in front of the pre-existing `T`/plain fallback
+/// (Echoed response tags), not a new mechanism: a server that predates
+/// `R` but understands `T` slams the door on `TaggedRetryable` exactly
+/// like a pre-0019 server slams the door on `Tagged`, and the existing
+/// `AuthFailure::LegacyServer` detection (`classify_auth_io_error`)
+/// already covers both.
+#[derive(Clone, Copy)]
+enum ProbeStage {
+    /// `A <len> T R` — tags plus the retryable-error capability
+    /// (issue #125). Tried first on every dial this SDK makes.
+    TaggedRetryable,
+    /// `A <len> T` — tags only, no `R` capability declared. The
+    /// pre-#125 extended form; a server that understands it but not `R`
+    /// accepts this stage.
+    Tagged,
+    /// `A <len>` — the original pre-0019 form: no tags, no `R`.
+    Plain,
+}
+
+impl ProbeStage {
+    /// The trailing tokens this stage's `A` line carries, exactly as they
+    /// go on the wire after the secret length.
+    fn suffix(self) -> &'static str {
+        match self {
+            ProbeStage::TaggedRetryable => " T R",
+            ProbeStage::Tagged => " T",
+            ProbeStage::Plain => "",
+        }
+    }
+}
+
+/// Probes with the capability token before the tag-only form before the
+/// plain pre-0019 form (see [`ProbeStage`]) — every connection this SDK
+/// dials (per-node, proxy, discovery, hedge, reconnect) goes through this
+/// one function, so `R` (issue #125) and echoed response tags are
+/// consistently available wherever the server supports them, with no
+/// separate opt-in.
 pub(crate) async fn connect_and_identify(
     host: &str,
     port: u16,
@@ -259,17 +305,52 @@ pub(crate) async fn connect_and_identify(
     deadline: std::time::Duration,
     query: DiscoveryQuery,
 ) -> Result<Identified> {
-    match run_identify_attempt(host, port, auth_secret, tls, deadline, true, query).await {
+    match run_identify_attempt(
+        host,
+        port,
+        auth_secret,
+        tls,
+        deadline,
+        ProbeStage::TaggedRetryable,
+        query,
+    )
+    .await
+    {
         Ok(identified) => Ok(identified),
         Err(AuthFailure::LegacyServer) => {
-            // Echoed response tags transparent fallback: a pre-0019 server treats the
-            // extended `A ... T` as a parse error and closes without
-            // replying — redial once with the plain form and run the
-            // connection untagged (the pre-0019 behavior, desync window
-            // included).
-            run_identify_attempt(host, port, auth_secret, tls, deadline, false, query)
-                .await
-                .map_err(AuthFailure::into_error)
+            match run_identify_attempt(
+                host,
+                port,
+                auth_secret,
+                tls,
+                deadline,
+                ProbeStage::Tagged,
+                query,
+            )
+            .await
+            {
+                Ok(identified) => Ok(identified),
+                Err(AuthFailure::LegacyServer) => {
+                    // Transparent fallback, second stage: a pre-0019
+                    // server treats even the tag-only extended `A ... T`
+                    // as a parse error and closes without replying —
+                    // redial once more with the plain form and run the
+                    // connection untagged (the pre-0019 behavior, desync
+                    // window included).
+                    run_identify_attempt(
+                        host,
+                        port,
+                        auth_secret,
+                        tls,
+                        deadline,
+                        ProbeStage::Plain,
+                        query,
+                    )
+                    .await
+                    .map_err(AuthFailure::into_error)
+                }
+                Err(failure) => Err(failure.into_error()),
+            }
         }
         Err(failure) => Err(failure.into_error()),
     }
@@ -281,12 +362,12 @@ async fn run_identify_attempt(
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
     deadline: std::time::Duration,
-    request_tags: bool,
+    stage: ProbeStage,
     query: DiscoveryQuery,
 ) -> std::result::Result<Identified, AuthFailure> {
     match tokio::time::timeout(
         deadline,
-        do_connect_and_identify(host, port, auth_secret, tls, request_tags, query),
+        do_connect_and_identify(host, port, auth_secret, tls, stage, query),
     )
     .await
     {
@@ -341,23 +422,19 @@ async fn do_connect_and_identify(
     port: u16,
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
-    request_tags: bool,
+    stage: ProbeStage,
     query: DiscoveryQuery,
 ) -> std::result::Result<Identified, AuthFailure> {
     let stream = open(host, port, tls).await.map_err(AuthFailure::Other)?;
     let mut stream = BufReader::new(stream);
 
     let secret = auth_secret.unwrap_or(NO_SECRET_PLACEHOLDER);
-    // Echoed response tags: always send the extended form — a `T` after the secret
-    // length asks the server to echo tags on this connection's G/S/D
-    // traffic. A pre-0019 server can't parse this and slams the door
-    // (see `classify_auth_io_error`/`connect_and_identify`'s fallback).
-    let mut auth = format!(
-        "A {}{}\n",
-        secret.len(),
-        if request_tags { " T" } else { "" }
-    )
-    .into_bytes();
+    // Echoed response tags / retryable-error capability (issue #125):
+    // `connect_and_identify` always starts at the most-capable stage and
+    // falls back — a pre-0019 or pre-#125 server can't parse the extra
+    // token(s) and slams the door (see `classify_auth_io_error`/
+    // `connect_and_identify`'s fallback chain).
+    let mut auth = format!("A {}{}\n", secret.len(), stage.suffix()).into_bytes();
     auth.extend_from_slice(secret);
     stream
         .get_mut()

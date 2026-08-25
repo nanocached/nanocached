@@ -9,6 +9,7 @@ import {
   DiscoveryBusyError,
   NanocachedClient,
   NanocachedError,
+  RetryableError,
   WrongNodeError,
 } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
@@ -1971,7 +1972,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
-        assert.deepEqual(client.stats(), { replicaWriteFailures: 0, readRepairFailures: 0, refreshFailures: 0 });
+        assert.deepEqual(client.stats(), { replicaWriteFailures: 0, readRepairFailures: 0, refreshFailures: 0, transientRetries: 0 });
       } finally {
         client.close();
       }
@@ -2324,23 +2325,161 @@ describe("NanocachedClient response tags (echoed response tags)", () => {
   });
 
   it("falls back to the untagged protocol against a pre-0019 server", async () => {
-    // An old server treats `A ... T` as a parse error and closes without
-    // replying; the client must redial once with the plain form and run
-    // untagged — transparently, with the same results.
+    // An old server treats any extended `A` (with `T`, or `T R` —
+    // retryable-error status, issue #125) as a parse error and closes
+    // without replying; the client must redial down to the plain form
+    // and run untagged — transparently, with the same results.
     const node = await startMockNode({ closeOnExtendedAuth: true });
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
         await client.set("k", "v");
         assert.equal(await client.get("k"), "v");
-        // Two dials: the extended attempt the server slammed shut, then
-        // the plain fallback that stuck.
-        assert.equal(node.connectionCount(), 2);
+        // Three dials: the `A ... T R` probe and the `A ... T` fallback
+        // the server slammed shut in turn, then the plain fallback that
+        // stuck.
+        assert.equal(node.connectionCount(), 3);
       } finally {
         client.close();
       }
     } finally {
       await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient retryable-error status (issue #125)", () => {
+  it("probes with A <len> T R, recorded by the mock", async () => {
+    const node = await startMockNode({ supportTags: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        assert.equal(node.lastAuthHeader(), "A 1 T R");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("falls back to A <len> T against a server that understands tags but predates R", async () => {
+    // The middle stage of the three-stage probe (A <len> T R -> A <len> T
+    // -> A <len>): a server that predates R treats the fuller extended
+    // form as a parse error and closes without replying.
+    const node = await startMockNode({ supportTags: true, closeOnRetryableAuth: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        assert.equal(await client.get("k"), "v");
+        // Two dials: the `A ... T R` probe the server slammed shut, then
+        // the `A ... T` fallback that stuck.
+        assert.equal(node.connectionCount(), 2);
+        assert.equal(node.lastAuthHeader(), "A 1 T");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("R once then success: transparently retries, no new connection, transientRetries == 1", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        node.answerRetryableTimes(1);
+
+        const start = Date.now();
+        assert.equal(await client.get("k"), "v");
+        // Bounded retry sleeps 50ms before the first retry.
+        assert.ok(Date.now() - start >= 45, "expected the 50ms pre-retry delay to have elapsed");
+
+        // Two G requests reached the mock (the R'd attempt and the retry
+        // that succeeded), but only one connection was ever dialed.
+        assert.equal(node.getCount(), 2);
+        assert.equal(node.connectionCount(), 1);
+        assert.equal(client.stats().transientRetries, 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("R three times: raises RetryableError without poisoning the connection; transientRetries == 3", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v");
+        node.answerRetryableTimes(3);
+
+        await assert.rejects(client.get("k"), RetryableError);
+
+        // The connection stays open and usable for a following op —
+        // no teardown, no reconnect/refresh path.
+        assert.equal(node.connectionCount(), 1);
+        assert.equal(await client.get("k"), "v");
+        assert.equal(client.stats().transientRetries, 3);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("tagged mode: a retried R pairs with the right in-flight request among pipelined ops", async () => {
+    const node = await startMockNode({ supportTags: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "value-a");
+        await client.set("b", "value-b");
+
+        // Only the first of the two pipelined GETs the mock receives is
+        // answered R; the client must retry exactly that one (with a
+        // fresh tag) without disturbing the other in-flight request.
+        node.answerRetryableTimes(1);
+        const [a, b] = await Promise.all([client.get("a"), client.get("b")]);
+        assert.equal(a, "value-a");
+        assert.equal(b, "value-b");
+
+        assert.equal(node.connectionCount(), 1);
+        assert.equal(client.stats().transientRetries, 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("works via SDK proxy mode (viaProxy) too", async () => {
+    const proxy = await startMockNode();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        await client.set("k", "v");
+        proxy.answerRetryableTimes(1);
+        assert.equal(await client.get("k"), "v");
+        assert.equal(proxy.connectionCount(), 1);
+        assert.equal(client.stats().transientRetries, 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxy.close()]);
     }
   });
 });

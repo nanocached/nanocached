@@ -4,3 +4,4 @@
 .DS_Store
 sdk/dotnet/out/
 __pycache__/
+.pnpm-store/

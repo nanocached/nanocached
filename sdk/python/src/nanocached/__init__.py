@@ -9,6 +9,7 @@ from ._errors import (
     AuthenticationError,
     DiscoveryBusyError,
     NanocachedError,
+    RetryableError,
     WrongNodeError,
 )
 from ._hashring import HashRing
@@ -26,6 +27,7 @@ __all__ = [
     "Namespace",
     "NanocachedClient",
     "NanocachedError",
+    "RetryableError",
     "WrongNodeError",
 ]
 

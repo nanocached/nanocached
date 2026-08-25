@@ -185,14 +185,20 @@ public sealed class NanocachedClient : IDisposable
     /// to the caller — a dead replica leg on a write (client-side replication,
     /// Fire-and-forget replica writes), a failed background repair of the primary
     /// after read-repair found a value on another owner (read repair),
-    /// and a failed node-list refresh attempt or per-node reconnect
-    /// during one. None of these ever fail an operation; this is purely
-    /// observability so an operator who only watches for thrown
-    /// exceptions can still notice replication silently degrading or a
-    /// node-list refresh stuck failing.
+    /// a failed node-list refresh attempt or per-node reconnect
+    /// during one, and (issue #125) every retryable-error status <c>R</c>
+    /// a connection received, whether it was transparently retried away or
+    /// ultimately raised <see cref="RetryableException"/>. None of these
+    /// ever fail an operation by themselves — an <c>R</c> retry only fails
+    /// the call after 3 straight attempts (see
+    /// <see cref="RetryableException"/>) — so this is purely observability:
+    /// an operator who only watches for thrown exceptions can still notice
+    /// replication silently degrading, a node-list refresh stuck failing,
+    /// or an upstream (e.g. behind a proxy) degrading before it ever
+    /// surfaces as a hard failure.
     /// </summary>
     public readonly record struct ClientStats(
-        long ReplicaWriteFailures, long ReadRepairFailures, long RefreshFailures);
+        long ReplicaWriteFailures, long ReadRepairFailures, long RefreshFailures, long TransientRetries);
 
     // The server rejects (and drops the connection for) any request frame
     // over MAX_REQUEST_SIZE (src/server.rs), 1 MiB — a hard cap on the
@@ -340,6 +346,11 @@ public sealed class NanocachedClient : IDisposable
     private long _replicaWriteFailures;
     private long _readRepairFailures;
     private long _refreshFailures;
+    // issue #125 — retryable-error status R: every R any connection this
+    // client owns has received, whether transparently retried away or
+    // ultimately surfaced as RetryableException — see NewConnection's
+    // onTransientRetry callback and ClientStats.TransientRetries.
+    private long _transientRetries;
 
     private volatile bool _closed;
     // 0 = open, 1 = closed. Gates Close() with Interlocked.Exchange the
@@ -582,7 +593,8 @@ public sealed class NanocachedClient : IDisposable
     {
         string key = _targetKey!;
         IncrementOpenTarget(key);
-        return new Connection(stream, tagged, () => DecrementOpenTarget(key));
+        return new Connection(
+            stream, tagged, () => DecrementOpenTarget(key), () => Interlocked.Increment(ref _transientRetries));
     }
 
     /// <summary>Dials every node discovery listed, concurrently. A node
@@ -739,7 +751,8 @@ public sealed class NanocachedClient : IDisposable
     public ClientStats Stats() => new(
         Interlocked.Read(ref _replicaWriteFailures),
         Interlocked.Read(ref _readRepairFailures),
-        Interlocked.Read(ref _refreshFailures));
+        Interlocked.Read(ref _refreshFailures),
+        Interlocked.Read(ref _transientRetries));
 
     /// <summary>
     /// issue #105 — first-class namespaces: a lightweight handle scoping

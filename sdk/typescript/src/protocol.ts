@@ -163,7 +163,7 @@ export function encodeClearAll(tag?: number): Buffer {
 }
 
 export interface ParsedResponse {
-  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode" | "cleared";
+  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode" | "cleared" | "retryable";
   value?: Buffer;
   /** echoed response tags: the echoed request tag, present on every response parsed
    * in tagged mode except the unsolicited `busy`. */
@@ -205,6 +205,13 @@ const MARKER_BUSY = 0x42; // 'B'
 const MARKER_VALUE = 0x56; // 'V'
 const MARKER_WRONG_NODE = 0x57; // 'W'
 const MARKER_CLEARED = 0x43; // 'C' — answers both `c` and `F` (issue #106)
+// Retryable-error status (issue #125): this request failed transiently
+// (e.g. a proxy's upstream node was briefly unreachable) — the
+// connection is fine and stays open, unlike every other status here.
+// Possible on any data command (G/S/D/g/s/d/c/F). Only nanocached-proxy
+// emits it today, but the SDK must handle it on any connection
+// regardless — see Connection.send's bounded retry.
+const MARKER_RETRYABLE = 0x52; // 'R'
 const LF = 0x0a;
 
 // Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
@@ -237,7 +244,8 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
     case MARKER_DELETED:
     case MARKER_NOT_FOUND:
     case MARKER_WRONG_NODE:
-    case MARKER_CLEARED: {
+    case MARKER_CLEARED:
+    case MARKER_RETRYABLE: {
       const kind =
         buf[0] === MARKER_STORED
           ? "stored"
@@ -247,7 +255,9 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
               ? "notFound"
               : buf[0] === MARKER_WRONG_NODE
                 ? "wrongNode"
-                : "cleared";
+                : buf[0] === MARKER_CLEARED
+                  ? "cleared"
+                  : "retryable";
 
       if (!tagged) {
         if (buf.length < 2) return null;

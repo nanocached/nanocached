@@ -76,4 +76,24 @@ public class NanocachedException extends RuntimeException {
             super(message, cause);
         }
     }
+
+    /**
+     * A request answered {@code R} (issue #125's retryable-error status)
+     * three times running — bounded transparent retry on the SAME
+     * connection (up to 2 retries, 3 attempts total, 50ms then 100ms
+     * between them) exhausted without a real answer. Today only
+     * {@code nanocached-proxy} sends {@code R}, when its upstream node was
+     * briefly unreachable and survived its own one refresh-and-retry; this
+     * is the signal that even that didn't resolve in time.
+     *
+     * <p>Unlike {@link ConnectionFailed} or {@link WrongNode}, this never
+     * closes or redials the connection — it stays open and usable for the
+     * next call. Every {@code R} answer, including the three that led
+     * here, is counted in {@link NanocachedClient.ClientStats#transientRetries()}.
+     */
+    public static final class RetryableError extends NanocachedException {
+        public RetryableError() {
+            super("nanocached: request failed transiently (R) after 3 attempts on this connection");
+        }
+    }
 }

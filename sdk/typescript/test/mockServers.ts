@@ -62,6 +62,15 @@ export interface MockNode extends MockServerBase {
    * ever received — lets a test assert a clear fanned out to every node,
    * even one holding no keys in the cleared namespace. */
   clearCount(): number;
+  /** Retryable-error status (issue #125): queue `n` one-off `R` replies
+   * (tagged correctly on a tagged connection) for the next `n` data
+   * requests — any of `G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`, in whatever order
+   * they arrive. */
+  answerRetryableTimes(n: number): void;
+  /** The raw `A ...` header line this server most recently received (no
+   * trailing LF) — lets a test assert the exact probe form a connect
+   * sent, e.g. `"A 1 T R"`. */
+  lastAuthHeader(): string;
   /** Queue a one-off failure for the next `c`/`F` request: instead of
    * acking with `C`, the connection is destroyed — the "some node
    * failed" half of the clear fan-out's refresh-once-and-retry path
@@ -190,6 +199,13 @@ export async function startMockNode(
     /** Behave like a legacy pre-tag server: an extended `A ... T` is a
      * parse error — close the connection without replying. */
     closeOnExtendedAuth?: boolean;
+    /** Retryable-error status (issue #125): behave like a server that
+     * understands `T` but predates `R` — an `A ... T R` is a parse error,
+     * closing the connection without replying, while a plain `A ... T`
+     * (or bare `A`) still works. Exercises the middle stage of the
+     * SDK's three-stage connect probe (`A <len> T R` → `A <len> T` →
+     * `A <len>`). */
+    closeOnRetryableAuth?: boolean;
     /** Pin the listener to this port instead of an ephemeral one — for a
      * node that comes back on the address discovery already advertised
      * (issue #67 tests). */
@@ -232,6 +248,9 @@ export async function startMockNode(
   let lastSetTtl = 0;
   let lastCommand = "";
   let silent = false;
+  // Retryable-error status (issue #125).
+  let retryableReplies = 0;
+  let lastAuthHeader = "";
 
   const server = createServer((socket) => {
     connections++;
@@ -255,7 +274,16 @@ export async function startMockNode(
 
         switch (parts[0]) {
           case "A": {
+            lastAuthHeader = buffer.subarray(0, lf).toString("ascii");
+
             if (parts.length > 2 && options.closeOnExtendedAuth) {
+              socket.destroy();
+              return;
+            }
+            // Retryable-error status (issue #125): a server that
+            // understands `T` but predates `R` slams the door on the
+            // fuller `A <len> T R` form — parts beyond `A <len> T`.
+            if (parts.length > 3 && options.closeOnRetryableAuth) {
               socket.destroy();
               return;
             }
@@ -299,6 +327,14 @@ export async function startMockNode(
             // reply below, same as the Python mock's delay_gets — instead
             // of only the plain store lookup.
             const sendGetReply = () => {
+              // Retryable-error status (issue #125): checked first, ahead
+              // of every other one-off reply below.
+              if (retryableReplies > 0) {
+                retryableReplies--;
+                socket.write(`R${tag}\n`);
+                return;
+              }
+
               if (swallowedGets > 0) {
                 swallowedGets--;
                 return;
@@ -396,6 +432,12 @@ export async function startMockNode(
 
             if (silent) break;
 
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
             if (wrongNodeOnSetReplies > 0) {
               wrongNodeOnSetReplies--;
               socket.write(`W${tag}\n`);
@@ -430,6 +472,12 @@ export async function startMockNode(
 
             if (silent) break;
 
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
             if (wrongNodeReplies > 0) {
               wrongNodeReplies--;
               socket.write(`W${tag}\n`);
@@ -454,6 +502,12 @@ export async function startMockNode(
 
             if (silent) break;
 
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
             if (failClearReplies > 0) {
               failClearReplies--;
               socket.destroy();
@@ -473,6 +527,12 @@ export async function startMockNode(
             clears++;
 
             if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
 
             if (failClearReplies > 0) {
               failClearReplies--;
@@ -505,6 +565,10 @@ export async function startMockNode(
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
     },
+    answerRetryableTimes: (n) => {
+      retryableReplies += n;
+    },
+    lastAuthHeader: () => lastAuthHeader,
     answerWrongNodeOnSetOnce: () => {
       wrongNodeOnSetReplies++;
     },

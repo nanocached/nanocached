@@ -300,6 +300,14 @@ type Stats struct {
 	ReplicaWriteFailures uint64
 	ReadRepairFailures   uint64
 	RefreshFailures      uint64
+	// TransientRetries counts every retryable-error status `R` this
+	// client has received (issue #125) — one nanocached-proxy (today, the
+	// only server that sends it) reported a single request failed
+	// transiently and asked for a retry on the same connection. Counted
+	// whether or not the retry that followed it succeeded, so this can
+	// run ahead of any visible error: a request that ultimately succeeded
+	// after one `R` still bumps this once.
+	TransientRetries uint64
 }
 
 // clientStats holds the live, atomically-updated counters Stats()
@@ -309,6 +317,7 @@ type clientStats struct {
 	replicaWriteFailures atomic.Uint64
 	readRepairFailures   atomic.Uint64
 	refreshFailures      atomic.Uint64
+	transientRetries     atomic.Uint64
 }
 
 // Client is a nanocached client handle.
@@ -427,7 +436,7 @@ func openTargetCount(key string) int {
 func (c *Client) trackedConnection(netConn net.Conn, tagged bool) *connection {
 	key := c.targetKey
 	trackOpenTarget(key)
-	return newConnection(netConn, func() { untrackOpenTarget(key) }, tagged)
+	return newConnection(netConn, func() { untrackOpenTarget(key) }, tagged, &c.stats.transientRetries)
 }
 
 // Connect dials the first working address and returns a ready client.
@@ -817,6 +826,7 @@ func (c *Client) Stats() Stats {
 		ReplicaWriteFailures: c.stats.replicaWriteFailures.Load(),
 		ReadRepairFailures:   c.stats.readRepairFailures.Load(),
 		RefreshFailures:      c.stats.refreshFailures.Load(),
+		TransientRetries:     c.stats.transientRetries.Load(),
 	}
 }
 

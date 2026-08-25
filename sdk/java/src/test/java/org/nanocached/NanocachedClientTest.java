@@ -2296,16 +2296,153 @@ class NanocachedClientTest {
 
     @Test
     void fallsBackToTheUntaggedProtocolAgainstAPre0019Server() throws Exception {
-        // An old server treats `A ... T` as a parse error and closes
-        // without replying; the client must redial once with the plain
-        // form and run untagged — transparently, with the same results.
+        // An old server treats any extended `A` (`T R` or plain `T`) as a
+        // parse error and closes without replying; the client must step
+        // back one probe stage at a time and run untagged — transparently,
+        // with the same results.
         try (MockNode node = MockNode.legacyServer()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
-                // Two dials: the extended attempt the server slammed
+                // Three dials (issue #125 added a probe stage in front of
+                // the pre-existing one): the full `T R` attempt the server
+                // slammed shut, then the `T`-only attempt it also slammed
                 // shut, then the plain fallback that stuck.
+                assertEquals(3, node.connectionCount.get());
+                assertEquals(List.of("A 1 T R", "A 1 T", "A 1"), node.authHeaders);
+            }
+        }
+    }
+
+    // ── issue #125: retryable-error status `R` ───────────────────────
+
+    @Test
+    void connectProbeSendsTheFullCapabilityHeader() throws Exception {
+        // Every dial's first attempt asks for both `T` and `R`, in that
+        // fixed order. A modern server — this suite's default MockNode —
+        // simply ignores the trailing `R` it doesn't act on and acks
+        // normally, so this is the only dial that ever happens.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertEquals(List.of("A 1 T R"), node.authHeaders);
+                assertEquals(1, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void fallsBackToTheTagOnlyProtocolAgainstAServerThatPredatesRetryCapability() throws Exception {
+        // A server that supports `T` (issue #19) but predates `R` (issue
+        // #125): the doubly-extended `A <len> T R` is a parse error to
+        // it, so the client steps back exactly one probe stage — to `T`
+        // alone — rather than falling all the way to the untagged form.
+        try (MockNode node = MockNode.predatesRetryCapability()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                assertEquals(Optional.of("v"), client.get("k"));
                 assertEquals(2, node.connectionCount.get());
+                assertEquals(List.of("A 1 T R", "A 1 T"), node.authHeaders);
+            }
+
+            // The stuck connection did negotiate tags — confirmed with a
+            // second, independent probe against the same mock.
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            assertTrue(target.tagged());
+            target.socket().close();
+        }
+    }
+
+    @Test
+    void aTransientRResponseIsTransparentlyRetriedOnTheSameConnection() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                assertEquals(0, client.stats().transientRetries());
+
+                node.answerRetryableFor(1);
+                assertEquals(Optional.of("v"), client.get("k"));
+
+                assertEquals(1, client.stats().transientRetries());
+                assertEquals(1, node.connectionCount.get(), "no new connection was dialed");
+                assertEquals(2, node.getCount.get(), "the R'd attempt plus the retry that succeeded");
+            }
+        }
+    }
+
+    @Test
+    void threeTransientRResponsesExhaustTheRetryBudgetButLeaveTheConnectionUsable() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+
+                node.answerRetryableFor(3);
+                long started = System.nanoTime();
+                assertThrows(NanocachedException.RetryableError.class, () -> client.get("k"));
+                long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
+                // The spec's fixed backoff: 50ms before the first retry,
+                // 100ms before the second.
+                assertTrue(elapsedMillis >= 150,
+                        "expected at least the 50ms+100ms retry backoff, took " + elapsedMillis + "ms");
+
+                assertEquals(3, client.stats().transientRetries());
+                assertEquals(1, node.connectionCount.get(), "still the same connection — no redial");
+
+                // The SAME connection still serves a following op.
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void aTaggedRResponsePairsWithItsOwnRequestAmongPipelinedOps() throws Exception {
+        // Tagged mode (issue #125): `R <tag>` must pair with the exact
+        // in-flight request it answers, not just whichever happens to be
+        // oldest — proven by letting a transient retry interleave with a
+        // second pipelined get for a different key.
+        try (MockNode node = MockNode.withTagSupport()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k1", "v1");
+                client.set("k2", "v2");
+
+                node.delayGets(80);
+                node.answerRetryableFor(1); // exactly one of the two G's below
+
+                ExecutorService pool = Executors.newFixedThreadPool(2);
+                try {
+                    Future<Optional<String>> a = pool.submit(() -> client.get("k1"));
+                    Future<Optional<String>> b = pool.submit(() -> client.get("k2"));
+                    assertEquals(Optional.of("v1"), a.get());
+                    assertEquals(Optional.of("v2"), b.get());
+                } finally {
+                    pool.shutdown();
+                }
+
+                assertEquals(1, client.stats().transientRetries());
+                assertEquals(1, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void viaProxyRetriesATransientRResponseOnTheSameProxyConnection() throws Exception {
+        // The R path works identically in viaProxy mode — a proxy
+        // connection is exactly a single-node connection under the hood,
+        // so one confirmation test is enough (mirrors the spec's own
+        // "one test is enough" for this mode).
+        try (MockNode proxy = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+
+            try (NanocachedClient client =
+                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                client.set("k", "v");
+
+                proxy.answerRetryableFor(1);
+                assertEquals(Optional.of("v"), client.get("k"));
+
+                assertEquals(1, client.stats().transientRetries());
+                assertEquals(1, proxy.connectionCount.get());
             }
         }
     }

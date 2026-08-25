@@ -253,6 +253,40 @@ connection, requests for its keys fail over per request exactly as they
 would after a mid-life death, and it is redialed after the cooldown.
 Only a cluster with no reachable node at all fails `Connect`.
 
+## Transient retries
+
+Some servers (today, only `nanocached-proxy`) can answer a single
+request `R` instead of a value: the request itself failed transiently
+(e.g. the proxy's upstream node was briefly unreachable and survived its
+own one refresh-and-retry), but the connection is fine and the same
+request is worth trying again right away. The SDK handles this
+automatically and transparently — callers never see `R` as such:
+
+- Every connection this SDK opens probes for the capability during
+  connect, so this needs no configuration.
+- An `R` reply is retried on the *same* connection, up to 2 retries (3
+  attempts total), sleeping 50ms before the first retry and 100ms before
+  the second. If the third attempt still answers `R`, `Get`/`Set`/
+  `Delete`/etc. return `ErrRetryable` (an `errors.Is`-matchable
+  sentinel, like the SDK's other error kinds) — the connection itself is
+  untouched and stays open and usable for the caller's next operation.
+- `Stats().TransientRetries` counts every `R` this client has received,
+  whether or not the retry that followed it went on to succeed —
+  observability for a proxy backend that's flaking, even when every
+  individual call still came back with a value.
+
+```go
+value, ok, err := client.Get("k")
+if errors.Is(err, nanocached.ErrRetryable) {
+    // The request itself kept failing transiently after 3 attempts;
+    // the connection is still fine, try again (or give up) as fits
+    // the caller.
+}
+```
+
+An older server that predates this capability, or `R` entirely,
+never sends it — this SDK talks to those exactly as before.
+
 ## Authentication and TLS
 
 ```go
@@ -318,11 +352,12 @@ unchanged rather than bloated.
   pipeline is pinned to cross-language test vectors that the server and
   the TypeScript/Python/Java/Rust/.NET SDKs also assert.
 - Errors: `ErrClosed`, `ErrWrongNode`, `ErrDiscoveryBusy`,
-  `ErrConnectionLost`, `ErrAuthenticationFailed`, and `ErrDecompression`
-  are sentinels for `errors.Is`. Caller mistakes (an invalid TTL, an
-  empty address list) surface as ordinary errors outside the sentinel
-  set — they indicate a bug in the calling code, not a nanocached
-  failure; this convention is shared across the SDKs (issue #47).
+  `ErrConnectionLost`, `ErrAuthenticationFailed`, `ErrDecompression`, and
+  `ErrRetryable` (see "Transient retries" above) are sentinels for
+  `errors.Is`. Caller mistakes (an invalid TTL, an empty address list)
+  surface as ordinary errors outside the sentinel set — they indicate a
+  bug in the calling code, not a nanocached failure; this convention is
+  shared across the SDKs (issue #47).
 - `Close()` is idempotent; calling it a second time warns to stderr
   instead of erroring. `Connect()` also warns to stderr if it's called
   for a single address that a previous, still-open connection from this

@@ -17,6 +17,7 @@ from nanocached import (
     HashRing,
     NanocachedClient,
     NanocachedError,
+    RetryableError,
     WrongNodeError,
 )
 
@@ -2172,7 +2173,12 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             try:
                 self.assertEqual(
                     client.stats(),
-                    ClientStats(replica_write_failures=0, read_repair_failures=0, refresh_failures=0),
+                    ClientStats(
+                        replica_write_failures=0,
+                        read_repair_failures=0,
+                        refresh_failures=0,
+                        transient_retries=0,
+                    ),
                 )
             finally:
                 await client.close()
@@ -2846,18 +2852,21 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
             await node.close()
 
     async def test_falls_back_to_the_untagged_protocol_against_a_pre_0019_server(self):
-        # An old server treats `A ... T` as a parse error and closes
-        # without replying; the client must redial once with the plain
-        # form and run untagged — transparently, with the same results.
+        # An old server treats `A ... T` (and the further-extended `A ...
+        # T R` — issue #125) as a parse error and closes without
+        # replying; the client must redial through both extended stages
+        # down to the plain form and run untagged — transparently, with
+        # the same results.
         node = await MockNode(close_on_extended_auth=True).start()
         try:
             client = await NanocachedClient.connect([("127.0.0.1", node.port)])
             try:
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
-                # Two dials: the extended attempt the server slammed shut,
-                # then the plain fallback that stuck.
-                self.assertEqual(node.connection_count, 2)
+                # Three dials: the `T R` attempt the server slammed shut,
+                # then the `T`-only attempt it also slammed shut, then the
+                # plain fallback that stuck.
+                self.assertEqual(node.connection_count, 3)
             finally:
                 await client.close()
         finally:
@@ -2892,13 +2901,158 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
                 # Transparently retried untagged — still fully usable.
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
-                # Two dials: the extended attempt that reset on write,
-                # then the plain fallback that stuck.
-                self.assertEqual(node.connection_count, 2)
+                # Three dials: both extended attempts (`T R`, then `T`)
+                # reset on write — flaky_write matches any header
+                # containing ` T` — then the plain fallback that stuck.
+                self.assertEqual(node.connection_count, 3)
             finally:
                 await client.close()
         finally:
             await node.close()
+
+
+class RetryableErrorTests(unittest.IsolatedAsyncioTestCase):
+    # Retryable-error status `R` (issue #125): the proxy's transient-
+    # failure signal — retry the same request on the SAME connection, up
+    # to 2 retries (3 attempts total), never a connection error/W/E.
+
+    async def test_the_connect_probe_sends_the_retryable_capability_token(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                self.assertEqual(node.last_auth_header, b"A 1 T R")
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_falls_back_from_retryable_to_tagged_against_a_server_that_predates_r(self):
+        # A server that understands `T` but not the further-extended `T
+        # R` closes on the retryable probe only — the client must redial
+        # once with plain `A <len> T` and end up on a tagged connection.
+        node = await MockNode(support_tags=True, close_on_retryable_auth=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                # Two dials: the `T R` attempt the server slammed shut,
+                # then the `T`-only fallback that stuck.
+                self.assertEqual(node.connection_count, 2)
+                self.assertEqual(node.auth_headers, [b"A 1 T R", b"A 1 T"])
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_falls_all_the_way_back_to_plain_against_a_pre_tag_server(self):
+        # Mirrors ResponseTagTests' own pre-0019-server fallback test: a
+        # server that predates tagging entirely closes on any extended
+        # `A`, so the client must walk all three stages (`T R` -> `T` ->
+        # plain) before it sticks.
+        node = await MockNode(close_on_extended_auth=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 3)
+                self.assertEqual(node.auth_headers, [b"A 1 T R", b"A 1 T", b"A 1"])
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_single_r_is_retried_transparently_on_the_same_connection(self):
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                requests_before = node.get_count
+                node.answer_retryable(1)
+                self.assertEqual(await client.get("k"), "v")
+                # Exactly one retry: the original G plus one retried G.
+                self.assertEqual(node.get_count - requests_before, 2)
+                # No new connection was dialed for the retry.
+                self.assertEqual(node.connection_count, 1)
+                self.assertEqual(client.stats().transient_retries, 1)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_three_rs_in_a_row_raise_retryableerror_without_poisoning_the_connection(self):
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                requests_before = node.get_count
+                node.answer_retryable(3)
+                with self.assertRaises(RetryableError):
+                    await client.get("k")
+                # 1 original + 2 retries = 3 attempts, all answered R.
+                self.assertEqual(node.get_count - requests_before, 3)
+                self.assertEqual(client.stats().transient_retries, 3)
+
+                # The same connection still serves a following op.
+                await client.set("k", "v")
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 1)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_tagged_r_pairs_with_the_right_in_flight_request(self):
+        # A pipelined request answered `R` must not desync the other
+        # requests already outstanding on the same tagged connection: the
+        # retried request's response has to keep pairing with its own
+        # slot even though other responses were dispatched in between.
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                requests_before = node.get_count
+
+                node.answer_retryable(1)
+                first = asyncio.ensure_future(client.get("a"))
+                second = asyncio.ensure_future(client.get("k"))
+
+                self.assertIsNone(await first)
+                self.assertEqual(await second, "v")
+                self.assertEqual(node.get_count - requests_before, 3)
+                self.assertEqual(node.connection_count, 1)
+                self.assertEqual(client.stats().transient_retries, 1)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_r_is_retried_transparently_via_proxy(self):
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[(NAMES[0], "127.0.0.1:1")], proxies=[(NAMES[1], proxy.address)]
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True
+            )
+            try:
+                await client.set("k", "v")
+                requests_before = proxy.get_count
+                proxy.answer_retryable(1)
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(proxy.get_count - requests_before, 2)
+                self.assertEqual(proxy.connection_count, 1)
+                self.assertEqual(client.stats().transient_retries, 1)
+            finally:
+                await client.close()
+        finally:
+            await proxy.close()
+            await discovery.close()
 
 
 class ProxyModeTests(unittest.IsolatedAsyncioTestCase):

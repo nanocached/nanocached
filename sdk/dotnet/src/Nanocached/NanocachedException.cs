@@ -69,3 +69,21 @@ public sealed class DecompressionException : NanocachedException
 
     public DecompressionException(string message, Exception inner) : base(message, inner) { }
 }
+
+/// <summary>
+/// issue #125 — retryable-error status <c>R</c>: a single request answered
+/// <c>R</c> (this request failed transiently — e.g. the proxy's upstream
+/// node was briefly unreachable — but the connection itself is fine) on
+/// every one of its bounded attempts (an initial attempt plus up to 2
+/// transparent retries on the same connection, 50ms then 100ms apart).
+/// Unlike every other <see cref="NanocachedException"/> raised by a bad
+/// response, this one never closes or redials the connection — <c>R</c>
+/// is not a connection error, not a <c>W</c>, not an <c>E</c> — the
+/// connection remains usable for the caller's next operation. Every
+/// <c>R</c> received, whether it led to this exception or was transparently
+/// retried away, is counted in <see cref="NanocachedClient.ClientStats.TransientRetries"/>.
+/// </summary>
+public sealed class RetryableException : NanocachedException
+{
+    public RetryableException(string message) : base(message) { }
+}

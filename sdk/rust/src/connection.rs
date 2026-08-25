@@ -140,6 +140,14 @@ impl Shared {
 pub(crate) struct Connection {
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
+    /// Retryable-error status `R` (issue #125): every `R` this connection
+    /// ever receives increments this — shared with every other connection
+    /// this client opens (see `NanocachedClient::connect`'s
+    /// `transient_retries` and `slot_connection`/`reconnect_proxy`'s
+    /// reuse of `Inner.stats.transient_retries`), so the count survives
+    /// this one connection being replaced by a later redial. Never read
+    /// directly here; `NanocachedClient::stats()` is the only reader.
+    transient_retries: Arc<AtomicU64>,
 }
 
 pub(crate) enum ResponseKind {
@@ -192,8 +200,15 @@ impl Connection {
     /// `tracking_key` is the client's winning connect address ("host:port"
     /// of whichever configured address answered `connect()`) — every
     /// socket the client ever opens, regardless of which node it dials,
-    /// is counted against that one key (see `open_targets`).
-    pub(crate) fn new(stream: Stream, tracking_key: String, tagged: bool) -> Self {
+    /// is counted against that one key (see `open_targets`). `transient_retries`
+    /// is the client-wide counter (issue #125) every connection this
+    /// client ever opens shares — see the field's own doc comment.
+    pub(crate) fn new(
+        stream: Stream,
+        tracking_key: String,
+        tagged: bool,
+        transient_retries: Arc<AtomicU64>,
+    ) -> Self {
         crate::open_targets::increment(&tracking_key);
         let (read_half, write_half) = split(stream);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -223,11 +238,15 @@ impl Connection {
         Self {
             shared,
             shutdown: shutdown_tx,
+            transient_retries,
         }
     }
 
     /// A pre-poisoned placeholder for a newly discovered node — see the
-    /// `write_state` field docs.
+    /// `write_state` field docs. Never actually processes a request (it
+    /// fails closed before touching the wire), so its own
+    /// `transient_retries` counter is a throwaway, never shared with — or
+    /// read back through — the client's real one.
     pub(crate) fn dead() -> Self {
         let (shutdown_tx, _) = watch::channel(true);
         Self {
@@ -244,6 +263,7 @@ impl Connection {
                 tagged: false,
             }),
             shutdown: shutdown_tx,
+            transient_retries: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -339,7 +359,7 @@ impl Connection {
     /// eventually skip over.
     async fn request<F>(&self, build: F) -> Result<ResponseKind>
     where
-        F: FnOnce(Option<u32>) -> Vec<u8>,
+        F: Fn(Option<u32>) -> Vec<u8>,
     {
         let timeout = Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::SeqCst));
         match tokio::time::timeout(timeout, self.request_uncapped(build)).await {
@@ -353,20 +373,67 @@ impl Connection {
         }
     }
 
-    /// Enqueues a pending slot and writes `frame` under one lock (see the
-    /// module doc comment), then waits on its own oneshot receiver — not
-    /// the socket. If this future is dropped while awaiting that
-    /// receiver (the write already completed), the slot is simply left
-    /// in the queue: the read task will eventually find no receiver
-    /// listening and move on, exactly like the TypeScript SDK's
-    /// Connection, whose plain Promises can't be cancelled out from
-    /// under `pending` at all — every request behind it in the queue is
-    /// unaffected. (`request`'s timeout wrapper additionally poisons the
-    /// connection outright when it fires, since in that case nothing is
-    /// ever going to answer.)
+    /// Retryable-error status `R` (issue #125): up to 2 retries (3
+    /// attempts total) of the same request on this same connection, no
+    /// redial, no teardown — see the module-level `R` notes on
+    /// `read_one_response`/`read_loop`. Slept before the first and
+    /// second retry respectively; `RETRY_DELAYS_MS.len()` is the number
+    /// of retries, one less than the attempt count.
+    const RETRY_DELAYS_MS: [u64; 2] = [50, 100];
+
+    /// Runs `build` against this connection, transparently retrying up to
+    /// [`Self::RETRY_DELAYS_MS`]'s length more times (issue #125) whenever
+    /// the server answers `R` — this request specifically failed
+    /// transiently (e.g. a proxy's upstream node was briefly unreachable)
+    /// and the connection itself is fine, so unlike a `ConnectionLost`
+    /// this never redials: the exact same connection just tries again,
+    /// after the matching delay. Every `R` received — including the
+    /// last, exhausting one — counts in `transient_retries`. If every
+    /// attempt answers `R`, this gives up (without closing anything) and
+    /// returns [`Error::Retryable`] instead.
+    ///
+    /// `build` must be callable more than once (`Fn`, not `FnOnce`) since
+    /// a retry claims a fresh tag and rebuilds the frame from scratch —
+    /// every call site here only ever closes over `Copy` data (references,
+    /// a `u64` TTL), so this is free.
     async fn request_uncapped<F>(&self, build: F) -> Result<ResponseKind>
     where
-        F: FnOnce(Option<u32>) -> Vec<u8>,
+        F: Fn(Option<u32>) -> Vec<u8>,
+    {
+        const ATTEMPTS: usize = Connection::RETRY_DELAYS_MS.len() + 1;
+        for attempt in 0..ATTEMPTS {
+            let raw = self.single_attempt(&build).await?;
+            if raw.0 != b'R' {
+                return ResponseKind::try_from(raw);
+            }
+            self.transient_retries.fetch_add(1, Ordering::Relaxed);
+            if let Some(&delay_ms) = Self::RETRY_DELAYS_MS.get(attempt) {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+        Err(Error::Retryable(format!(
+            "nanocached: request failed transiently {ATTEMPTS} times in a row"
+        )))
+    }
+
+    /// One request/response round trip: enqueues a pending slot and
+    /// writes `frame` under one lock (see the module doc comment), then
+    /// waits on its own oneshot receiver — not the socket. If this future
+    /// is dropped while awaiting that receiver (the write already
+    /// completed), the slot is simply left in the queue: the read task
+    /// will eventually find no receiver listening and move on, exactly
+    /// like the TypeScript SDK's Connection, whose plain Promises can't
+    /// be cancelled out from under `pending` at all — every request
+    /// behind it in the queue is unaffected. (`request`'s timeout wrapper
+    /// additionally poisons the connection outright when it fires, since
+    /// in that case nothing is ever going to answer.)
+    ///
+    /// Returns the raw `(marker, value)` rather than a [`ResponseKind`] —
+    /// `request_uncapped` inspects the marker itself first (`R`, issue
+    /// #125, never becomes a `ResponseKind` at all) before converting.
+    async fn single_attempt<F>(&self, build: &F) -> Result<RawResponse>
+    where
+        F: Fn(Option<u32>) -> Vec<u8>,
     {
         if self.is_closed() {
             return Err(Error::ConnectionLost(
@@ -422,7 +489,7 @@ impl Connection {
         }
 
         match rx.await {
-            Ok(Ok(raw)) => ResponseKind::try_from(raw),
+            Ok(Ok(raw)) => Ok(raw),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(Error::ConnectionLost(
                 "nanocached: connection is closed".to_string(),
@@ -669,7 +736,7 @@ async fn read_loop(
         // plain `Protocol` error would leave the connection open and
         // permanently off by one — poison it here instead, the same way
         // as a tag mismatch (mirrors Go's `default: mismatch`).
-        if !matches!(marker, b'V' | b'N' | b'S' | b'D' | b'W' | b'C') {
+        if !matches!(marker, b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R') {
             let message = format!(
                 "nanocached: unexpected response from server: {} (connection desynced)",
                 marker as char
@@ -773,10 +840,12 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
             read_half.read_u8().await?; // the trailing '\n'
             Ok((marker, None, None))
         }
-        b'S' | b'D' | b'N' | b'W' | b'C' => {
+        b'S' | b'D' | b'N' | b'W' | b'C' | b'R' => {
             if tagged {
                 // `S <tag>\n` / `D <tag>\n` / `N <tag>\n` / `W <tag>\n` /
-                // `C <tag>\n` (issue #106).
+                // `C <tag>\n` (issue #106) / `R <tag>\n` (retryable-error
+                // status, issue #125) — every no-value marker's tag rides
+                // as its header line's sole field.
                 let line = read_line(read_half).await?;
                 Ok((marker, None, Some(parse_tag(line.trim())?)))
             } else {

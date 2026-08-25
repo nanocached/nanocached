@@ -21,6 +21,18 @@ pub enum Error {
     /// startup grace (discovery HA), re-learning membership after a restart.
     /// Try another address, or retry shortly.
     DiscoveryBusy,
+    /// Retryable-error status `R` (issue #125): this one request failed
+    /// transiently three times in a row (e.g. `nanocached-proxy`'s
+    /// upstream node was briefly unreachable and survived its own
+    /// refresh-and-retry, more than once) even after this SDK's own
+    /// bounded, same-connection retry (up to 2 retries, 50ms then 100ms
+    /// apart). The connection itself is fine — it was never closed or
+    /// redialed to produce this error, and stays usable for whatever the
+    /// caller does next. Retrying the operation again, later, is
+    /// reasonable; unlike [`Self::ConnectionLost`], this SDK does not
+    /// retry it a second time on its own past the bounded retry already
+    /// spent producing this error.
+    Retryable(String),
     /// A connection-level failure; the client redials lazily on the next
     /// use, and in cluster mode retries once through a node-list refresh.
     ConnectionLost(String),
@@ -62,7 +74,8 @@ impl fmt::Display for Error {
             ),
             Error::ConnectionLost(message)
             | Error::Protocol(message)
-            | Error::Authentication(message) => write!(f, "{message}"),
+            | Error::Authentication(message)
+            | Error::Retryable(message) => write!(f, "{message}"),
             Error::InvalidArgument(message) => write!(f, "{message}"),
             Error::InvalidUtf8(error) => {
                 write!(f, "nanocached: value is not valid UTF-8: {error}")

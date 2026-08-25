@@ -23,6 +23,7 @@ class MockNode:
         required_secret: bytes | None = None,
         support_tags: bool = False,
         close_on_extended_auth: bool = False,
+        close_on_retryable_auth: bool = False,
     ) -> None:
         self.store: dict[bytes, bytes] = {}
         # Namespaces (issue #105): entries under a non-empty namespace live
@@ -43,7 +44,22 @@ class MockNode:
         # Behave like a legacy pre-tag server: an extended `A ... T` is a
         # parse error — close the connection without replying.
         self.close_on_extended_auth = close_on_extended_auth
+        # Retryable-error status `R` (issue #125): behave like a server
+        # that understands `T` but predates the `R` capability token — it
+        # accepts `A <len> T` normally but closes on the further-extended
+        # `A <len> T R` without replying, exercising the middle fallback
+        # stage (T R -> T) as opposed to close_on_extended_auth's oldest-
+        # server stage (T -> plain).
+        self.close_on_retryable_auth = close_on_retryable_auth
         self.connection_count = 0
+        # Retryable-error status `R` (issue #125): the exact `A` header
+        # line received on the most recent connection (without the
+        # trailing `\n`), and the full history across every connection
+        # this node has accepted — lets a test assert the probe form
+        # (`A <len> T R`) as well as the fallback sequence across
+        # multiple dials to the same mock.
+        self.last_auth_header: bytes | None = None
+        self.auth_headers: list[bytes] = []
         self.get_count = 0
         # Namespaces (issue #105): counts every `g`/`s`/`d` frame received,
         # regardless of outcome — lets a test prove the default (empty)
@@ -68,6 +84,10 @@ class MockNode:
         self._malformed_status_replies = 0
         self._missing_tag_replies = 0
         self._invalid_tag_value_replies = 0
+        # Retryable-error status `R` (issue #125): answers the next N data
+        # requests (G/S/D/g/s/d/c/F) with `R` (tagged correctly) instead
+        # of their normal reply — see answer_retryable().
+        self._retryable_replies = 0
         self._get_delay = 0.0
         self._gets_delay = 0.0
         self._set_delay = 0.0
@@ -138,6 +158,14 @@ class MockNode:
         item 5), as opposed to answer_missing_tag_once's missing-field
         desync above."""
         self._invalid_tag_value_replies += 1
+
+    def answer_retryable(self, times: int = 1) -> None:
+        """Answers the next ``times`` data requests (G/S/D/g/s/d/c/F,
+        whichever arrives next, in any mix) with `R` (issue #125) instead
+        of their normal reply — `R <tag>` on a tagged connection, plain
+        `R` otherwise. Simulates nanocached-proxy answering a transiently
+        failed request without closing the connection."""
+        self._retryable_replies += times
 
     def fail_next_clear_once(self) -> None:
         """Closes the connection instead of acking the next `c`/`F` this
@@ -229,7 +257,17 @@ class MockNode:
                 tag_suffix = b" " + parts[-1] if tagged else b""
 
                 if parts[0] == b"A":
+                    # Retryable-error status `R` (issue #125): recorded
+                    # before any close-on-legacy-mode branch below, so a
+                    # test can assert the exact probe form even against a
+                    # mock that then slams the door on it.
+                    self.last_auth_header = header[:-1]
+                    self.auth_headers.append(header[:-1])
+
                     if len(parts) > 2 and self.close_on_extended_auth:
+                        writer.close()
+                        return
+                    if len(parts) > 3 and self.close_on_retryable_auth:
                         writer.close()
                         return
 
@@ -258,6 +296,11 @@ class MockNode:
                         key = await reader.readexactly(int(parts[1]))
                     self.get_count += 1
                     if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
                         continue
                     if self._get_delay > 0:
                         delay, self._get_delay = self._get_delay, 0.0
@@ -346,6 +389,11 @@ class MockNode:
                         self.last_set_ttl = int(parts[3]) if len(parts) > base_field_count else 0
                     if self._silent:
                         continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
                     if self._set_delay > 0:
                         await asyncio.sleep(self._set_delay)
                     if self._wrong_node_on_set_replies > 0:
@@ -368,6 +416,11 @@ class MockNode:
                         key = await reader.readexactly(int(parts[1]))
                     if self._silent:
                         continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
                     if self._wrong_node_replies > 0:
                         self._wrong_node_replies -= 1
                         writer.write(b"W" + tag_suffix + b"\n")
@@ -388,6 +441,11 @@ class MockNode:
                     else:
                         self.flush_count += 1
                     if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
                         continue
                     if self._fail_clear_replies > 0:
                         self._fail_clear_replies -= 1

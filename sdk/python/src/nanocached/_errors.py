@@ -40,3 +40,22 @@ class DiscoveryBusyError(NanocachedError):
 
     def __init__(self) -> None:
         super().__init__("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's")
+
+
+class RetryableError(NanocachedError):
+    """A single request was answered ``R`` (issue #125) three times
+    running — the connection's bounded transient-retry budget (2 retries,
+    3 attempts total, sleeping 50ms then 100ms between attempts) was
+    exhausted without a non-``R`` answer. ``R`` means the request itself
+    failed transiently (e.g. nanocached-proxy's upstream node was briefly
+    unreachable across every retry) while the connection stayed healthy
+    the whole time — this is never a connection error, a ``W``, or an
+    ``E``, so it never triggers this SDK's reconnect/node-list-refresh
+    machinery. The connection remains open and usable; the caller decides
+    whether and when to retry the call itself."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "nanocached: the server answered R three times in a row for this request "
+            "(transient-retry budget exhausted); the connection is still usable"
+        )

@@ -44,6 +44,12 @@ final class Connection {
     private final InputStream in;
     private final OutputStream out;
     private final Runnable onClose;
+    /** Fired once for every {@code R} (transient-failure, issue #125)
+     * response this connection sees, win or lose — {@link
+     * NanocachedClient} wires its own {@code transientRetries} counter
+     * here; every test that constructs a {@code Connection} directly via
+     * the 3-arg constructor gets a no-op instead. */
+    private final Runnable onTransientRetry;
     /** echoed response tags: negotiated during identify — when true, every request
      * carries a tag the server echoes, and {@link #readLoop} verifies the
      * echo against the oldest pending request before dispatching it. */
@@ -73,9 +79,17 @@ final class Connection {
      * forgotten-close open-sockets tracker accurate without every call
      * site remembering to decrement it by hand. */
     Connection(Socket socket, boolean tagged, Runnable onClose) throws IOException {
+        this(socket, tagged, onClose, () -> {});
+    }
+
+    /** As {@link #Connection(Socket, boolean, Runnable)}, additionally
+     * reporting every {@code R} response via {@code onTransientRetry} (see
+     * that field's doc). */
+    Connection(Socket socket, boolean tagged, Runnable onClose, Runnable onTransientRetry) throws IOException {
         this.socket = socket;
         this.tagged = tagged;
         this.onClose = onClose;
+        this.onTransientRetry = onTransientRetry;
         this.in = new BufferedInputStream(socket.getInputStream());
         this.out = new BufferedOutputStream(socket.getOutputStream());
         Thread reader = new Thread(this::readLoop, "nanocached-connection-reader");
@@ -365,55 +379,118 @@ final class Connection {
      * connection. */
     private record Pending(CompletableFuture<Response> future, int tag) {}
 
+    /** A request's frame, fixed for the whole call including any
+     * transient ({@code R}) retries (issue #125) — a retry resends this
+     * exact same {@code frame}/{@code tag} pair, since it is the same
+     * logical request, not a new one; only the pending slot and its
+     * future are recreated per attempt. */
+    private record PreparedRequest(byte[] frame, int tag) {}
+
+    // Transient-error retry (issue #125): an `R` answer means THIS
+    // request failed transiently on the server (today only
+    // nanocached-proxy sends it, when its upstream node briefly survived
+    // its own one refresh-and-retry) — the connection itself is fine, so
+    // the same request is resent on it up to twice more before giving up.
+    // 3 total attempts (the original send plus these 2 retries), 50ms
+    // before the first retry and 100ms before the second — fixed by the
+    // spec, not caller-configurable.
+    private static final int MAX_TRANSIENT_ATTEMPTS = 3;
+    private static final long[] TRANSIENT_RETRY_DELAYS_MILLIS = {50, 100};
+
     /** Enqueues a pending slot and writes frame under one monitor — see
      * the class doc comment — then blocks this caller's own thread on
      * its own future, not the socket. {@code build} receives this
      * request's claimed tag ({@code null} on an untagged connection) and
-     * must return the frame to write. */
+     * must return the frame to write.
+     *
+     * <p>An {@code R} response (issue #125) is never handed back to the
+     * caller: it is retried here, transparently, on this same connection
+     * — bounded by {@link #MAX_TRANSIENT_ATTEMPTS} — until either a real
+     * answer arrives or the budget is exhausted, at which point this
+     * throws {@link NanocachedException.RetryableError} without touching
+     * the connection's open/closed state. {@code R} is therefore never
+     * seen by {@link #readResponse}'s callers (the {@code get}/{@code
+     * set}/{@code delete}/etc. marker switches), exactly like a normal
+     * marker mismatch never is. */
     private Response request(Function<Integer, byte[]> build) {
         if (isClosed()) {
             throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
         }
 
-        CompletableFuture<Response> future = new CompletableFuture<>();
-        synchronized (this) {
-            if (isClosed()) {
-                throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
+        PreparedRequest prepared = null;
+        for (int attempt = 1; ; attempt++) {
+            CompletableFuture<Response> future = new CompletableFuture<>();
+            synchronized (this) {
+                if (isClosed()) {
+                    throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
+                }
+                lastUsedNanos = System.nanoTime();
+                if (prepared == null) {
+                    // Echoed response tags: the tag is claimed in the same synchronous span
+                    // that enqueues the pending slot and writes the frame
+                    // (request pipelining's enqueue+write atomicity), so tag order
+                    // can never skew from queue/wire order. Built before
+                    // enqueueing: a builder that fails (e.g. an invalid TTL) must
+                    // fail with nothing queued, or the next response would
+                    // resolve an orphaned slot and desync the stream. Computed
+                    // once — a transient retry below reuses this same frame/tag
+                    // rather than calling build again.
+                    Integer tag = tagged ? claimTag() : null;
+                    prepared = new PreparedRequest(build.apply(tag), tag == null ? -1 : tag);
+                }
+                pending.addLast(new Pending(future, prepared.tag()));
+                // Armed only on the empty→non-empty transition: arming on
+                // *every* request would let a continuous stream of new
+                // requests push the deadline forever ahead of a server that
+                // has stopped answering — exactly the half-open hang the
+                // timeout exists to catch (issue #42).
+                if (pending.size() == 1) armDeadline();
+                try {
+                    out.write(prepared.frame());
+                    out.flush();
+                } catch (IOException error) {
+                    // The stream state after a failed write is unknown —
+                    // poison the connection so the client redials lazily.
+                    poison(new NanocachedException.ConnectionFailed(
+                            "nanocached: connection failed: " + error.getMessage(), error));
+                }
             }
-            lastUsedNanos = System.nanoTime();
-            // Echoed response tags: the tag is claimed in the same synchronous span
-            // that enqueues the pending slot and writes the frame
-            // (request pipelining's enqueue+write atomicity), so tag order
-            // can never skew from queue/wire order. Built before
-            // enqueueing: a builder that fails (e.g. an invalid TTL) must
-            // fail with nothing queued, or the next response would
-            // resolve an orphaned slot and desync the stream.
-            Integer tag = tagged ? claimTag() : null;
-            byte[] frame = build.apply(tag);
-            pending.addLast(new Pending(future, tag == null ? -1 : tag));
-            // Armed only on the empty→non-empty transition: arming on
-            // *every* request would let a continuous stream of new
-            // requests push the deadline forever ahead of a server that
-            // has stopped answering — exactly the half-open hang the
-            // timeout exists to catch (issue #42).
-            if (pending.size() == 1) armDeadline();
-            try {
-                out.write(frame);
-                out.flush();
-            } catch (IOException error) {
-                // The stream state after a failed write is unknown —
-                // poison the connection so the client redials lazily.
-                poison(new NanocachedException.ConnectionFailed(
-                        "nanocached: connection failed: " + error.getMessage(), error));
-            }
-        }
 
+            Response response;
+            try {
+                response = future.join();
+            } catch (CompletionException wrapped) {
+                Throwable cause = wrapped.getCause();
+                if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
+                throw new NanocachedException.ConnectionFailed("nanocached: connection failed", cause);
+            }
+
+            if (response.marker != 'R') return response;
+
+            // Every R seen counts toward transient_retries (issue #125),
+            // including the final one that exhausts the budget.
+            onTransientRetry.run();
+            if (attempt >= MAX_TRANSIENT_ATTEMPTS) {
+                throw new NanocachedException.RetryableError();
+            }
+            sleepBeforeTransientRetry(TRANSIENT_RETRY_DELAYS_MILLIS[attempt - 1]);
+        }
+    }
+
+    /** Sleeps between transient-error retries (issue #125) — an
+     * interruption here is treated like any other wait this SDK does on
+     * the caller's own thread (e.g. {@link
+     * NanocachedClient#readHedged}'s queue poll): the interrupt flag is
+     * restored and a {@link NanocachedException} surfaces rather than a
+     * raw {@link InterruptedException}, since every exception this SDK
+     * throws must extend it. */
+    private static void sleepBeforeTransientRetry(long millis) {
         try {
-            return future.join();
-        } catch (CompletionException wrapped) {
-            Throwable cause = wrapped.getCause();
-            if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
-            throw new NanocachedException.ConnectionFailed("nanocached: connection failed", cause);
+            Thread.sleep(millis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new NanocachedException(
+                    "nanocached: interrupted while waiting to retry a transient (R) failure", interrupted);
         }
     }
 
@@ -556,8 +633,13 @@ final class Connection {
                 return new Response(marker, null, -1);
             }
             // 'C' is CLEAR namespace / flush everything's (issue #106) only
-            // reply — same bare-or-tagged shape as S/D/N/W.
-            case 'S', 'D', 'N', 'W', 'C' -> {
+            // reply — same bare-or-tagged shape as S/D/N/W. 'R' (issue
+            // #125's retryable-error status) is possible on any data
+            // command (G/S/D/g/s/d/c/F this connection sends) and shares
+            // that exact bare-or-tagged shape too: `R\n` untagged, `R
+            // <tag>\n` tagged — request() intercepts it before any caller
+            // ever sees it.
+            case 'S', 'D', 'N', 'W', 'C', 'R' -> {
                 if (!tagged) {
                     expectLf(); // the trailing '\n'
                     return new Response(marker, null, -1);

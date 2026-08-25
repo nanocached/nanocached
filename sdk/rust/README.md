@@ -236,6 +236,40 @@ request mid-write could leave the connection desynced — so it is left
 to finish and drained by `close()`, the same way a fire-and-forget
 replica write is.
 
+## Transient retries and `Error::Retryable`
+
+`nanocached-proxy` can answer an individual request with a transient
+"try again shortly" status instead of failing it outright — its upstream
+node was briefly unreachable and its own one refresh-and-retry didn't
+land in time, but the proxy connection itself is perfectly healthy.
+Nodes and discovery servers never send this on their own, but every
+connection this SDK opens (per-node, proxy, discovery, hedge leg,
+reconnect) understands it regardless, since a node or proxy address can
+change roles over a cluster's lifetime.
+
+When that happens, this SDK retries the same request on the exact same
+connection — no redial, nothing torn down — up to twice more (three
+attempts total, 50ms before the first retry and 100ms before the
+second). If the third attempt still comes back transient, `get`/`set`/
+`delete`/`clear`/`clear_all` return `Error::Retryable` instead of
+succeeding — the connection stays open and usable for whatever the
+caller does next; only that one operation failed. This is entirely
+transparent to hedged reads: a hedge leg that lands on a proxy answering
+transiently just retries on its own connection like any other read, and
+its eventual `Error::Retryable` (if the retry budget runs out) is
+treated like any other leg failure — hedging onward to the next owner
+immediately, or propagating if none are left.
+
+`client.stats().transient_retries` counts every one of these transient
+replies this client has ever received, across every connection it has
+opened over its lifetime — including the ones that were later replaced
+by a redial, and including the last, exhausting reply that produced an
+`Error::Retryable`. It never resets, and complements the other
+`stats()` counters (`replica_write_failures`, `read_repair_failures`,
+`refresh_failures`) as an observability signal: a client whose
+`transient_retries` is climbing is talking to a proxy tier under strain,
+even though most of those requests still ultimately succeed.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
@@ -366,7 +400,9 @@ rather than bloated.
 - Every failure is a variant of the one `Error` enum. Caller mistakes
   are `Error::InvalidArgument` — this SDK's `Result`-based idiom for
   what the other SDKs raise as host-language builtins (issue #47);
-  authentication failure surfaces as `Error::Protocol`.
+  authentication failure surfaces as `Error::Protocol`. `Error::Retryable`
+  is the one variant that's never a sign of a real problem with the
+  connection — see "Transient retries and `Error::Retryable`" above.
 
 ## License
 

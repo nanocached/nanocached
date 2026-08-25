@@ -74,6 +74,15 @@ final class MockServers {
          * unverified-trailing-byte fix (issue: audit finding, "connection
          * desynced" on a bad trailer). */
         private final AtomicInteger badTrailerReplies = new AtomicInteger();
+        /** Every `A` header line this node received verbatim (issue
+         * #125) — e.g. {@code "A 1 T R"} — across every dial attempt
+         * including any fallback redials, so a test can assert the exact
+         * probe form the client sent. */
+        final List<String> authHeaders = new CopyOnWriteArrayList<>();
+        /** Countdown of data requests (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`) to
+         * answer with a transient `R` instead of their real reply (issue
+         * #125), tagged correctly on a tagged connection. */
+        private final AtomicInteger retryableReplies = new AtomicInteger();
         private volatile long setDelayMillis = 0;
         private volatile long getDelayMillis = 0;
         private volatile boolean failSets = false;
@@ -98,6 +107,14 @@ final class MockServers {
          * `A ... T` is a parse error, so close the connection without
          * replying. */
         private final boolean closeOnExtendedAuth;
+        /** issue #125: behave like a server that supports the `T` tag
+         * capability but predates the further-extended `R` retryable-error
+         * token — accepts `A <len> T` normally, but the doubly-extended
+         * `A <len> T R` is a parse error to it, so close without replying
+         * (forcing the client's middle fallback stage: full → tags-only).
+         * Independent of {@link #closeOnExtendedAuth}, which closes on
+         * either extension. */
+        private final boolean closeOnRetryToken;
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
         private final List<Thread> threads = new CopyOnWriteArrayList<>();
@@ -131,6 +148,15 @@ final class MockServers {
             return new MockNode(null, false, true, null);
         }
 
+        /** issue #125: a node that supports `T` (issue #19) but predates
+         * `R` — accepts `A <len> T` exactly like {@link #withTagSupport},
+         * but closes without replying on the further-extended `A <len> T
+         * R`, forcing the client's middle fallback stage (full →
+         * tags-only) rather than all the way down to plain. */
+        static MockNode predatesRetryCapability() throws IOException {
+            return new MockNode(null, true, false, null, 0, true);
+        }
+
         /** J1: a node that speaks TLS, presenting whatever certificate
          * {@code serverTls} was built with (see {@link Tls#generate}).
          * Everything past the handshake (A/G/S/D) is identical to a plain
@@ -147,9 +173,15 @@ final class MockServers {
 
         private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
                 SSLContext serverTls, int port) throws IOException {
+            this(requiredSecret, supportTags, closeOnExtendedAuth, serverTls, port, false);
+        }
+
+        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
+                SSLContext serverTls, int port, boolean closeOnRetryToken) throws IOException {
             this.requiredSecret = requiredSecret;
             this.supportTags = supportTags;
             this.closeOnExtendedAuth = closeOnExtendedAuth;
+            this.closeOnRetryToken = closeOnRetryToken;
             this.server = serverTls == null
                     ? new ServerSocket(port)
                     : serverTls.getServerSocketFactory().createServerSocket(port);
@@ -207,6 +239,22 @@ final class MockServers {
          * bytes on the wire, so anything else here is a desync. */
         void answerBadTrailerOnce() {
             badTrailerReplies.incrementAndGet();
+        }
+
+        /** Answer the next {@code count} data requests
+         * (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`) with a transient `R` instead
+         * of their real reply — issue #125's retryable-error status,
+         * tagged correctly (`R <tag>`) on a tagged connection. */
+        void answerRetryableFor(int count) {
+            retryableReplies.addAndGet(count);
+        }
+
+        private boolean takeRetryable() {
+            while (true) {
+                int pending = retryableReplies.get();
+                if (pending == 0) return false;
+                if (retryableReplies.compareAndSet(pending, pending - 1)) return true;
+            }
         }
 
         /** Holds every future S reply for {@code millis} first — for tests
@@ -320,8 +368,23 @@ final class MockServers {
 
                     switch (parts[0]) {
                         case "A" -> {
+                            // issue #125: record the exact probe form
+                            // received, across every dial attempt this
+                            // connection's caller makes (including
+                            // fallback redials to a fresh MockNode
+                            // connection — each gets its own `serve`
+                            // call, so this always reflects that one
+                            // attempt's header).
+                            authHeaders.add(String.join(" ", parts));
                             if (parts.length > 2 && closeOnExtendedAuth) {
                                 return; // pre-0019 behavior: close without replying
+                            }
+                            if (parts.length > 3 && closeOnRetryToken) {
+                                // Predates the `R` capability token (issue
+                                // #125): the plain `T` extension it
+                                // understands is fine, but the further
+                                // `T R` form is a parse error to it.
+                                return;
                             }
                             byte[] secret = in.readNBytes(Integer.parseInt(parts[1]));
                             boolean accepted = requiredSecret == null
@@ -347,6 +410,11 @@ final class MockServers {
                             }
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
                             }
                             if (swallowedGets.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                                 break; // no reply — simulates an off-by-one stream desync
@@ -417,6 +485,11 @@ final class MockServers {
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (failSets) {
                                 // Reset the connection instead of acking:
                                 // the frame is fully consumed above, so the
@@ -444,6 +517,11 @@ final class MockServers {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
                             }
                             if (takeWrongNode()) {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
@@ -479,6 +557,11 @@ final class MockServers {
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (takeWrongNode()) {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
@@ -507,6 +590,11 @@ final class MockServers {
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (failSets) {
                                 return;
                             }
@@ -533,6 +621,11 @@ final class MockServers {
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (takeWrongNode()) {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
@@ -553,6 +646,11 @@ final class MockServers {
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
                             if (takeClearFailure()) {
                                 return; // server-side reset instead of acking
                             }
@@ -568,6 +666,11 @@ final class MockServers {
                             clearAllCount.incrementAndGet();
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
                             }
                             if (takeClearFailure()) {
                                 return; // server-side reset instead of acking

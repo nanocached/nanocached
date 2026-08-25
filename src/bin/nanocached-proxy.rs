@@ -99,14 +99,15 @@
 //!   exposure needs it. Requests are bounded by the node's own 1 MiB
 //!   request cap, enforced here too so a hostile client can't balloon
 //!   proxy memory.
-//! - Failure surface: an upstream failure that survives one
-//!   refresh-and-retry answers the client `E\n` and closes, the
-//!   protocol's existing (fatal) error status — the protocol has no
-//!   non-fatal server-error reply, and inventing one here would break
-//!   every existing client's `E` handling. Single-address SDK clients
-//!   reconnect and retry exactly as they do against a restarting node.
-//!   (A retryable-error status is a protocol-level follow-up, noted in
-//!   #110's scheduling work.)
+//! - Failure surface (issue #125): for a client that declared the
+//!   retryable-error capability (`A ... R`), an upstream failure that
+//!   survives one refresh-and-retry answers that request `R` (+tag) and
+//!   the connection stays open — the client retries the request itself,
+//!   bounded, against a backend the proxy has already dropped for
+//!   redial. A legacy client (no `R` in its `A`) keeps the old
+//!   contract: `E\n` and close, which its existing `E` handling
+//!   understands; single-address SDK clients reconnect and retry
+//!   exactly as they do against a restarting node.
 //!
 //! Self-contained by repo policy: binaries share no modules (see
 //! `verify-staged-join`'s module docs), so the HRW ring, the `L` client
@@ -925,8 +926,14 @@ enum ParseOutcome {
     Ready(Request, Option<u32>),
     /// More bytes are needed; the buffer is untouched.
     Incomplete,
-    /// `A <len> [T]` — handled by the caller (auth state lives there).
-    Auth { secret: Bytes, tagging: bool },
+    /// `A <len> [T] [R]` — handled by the caller (auth state lives
+    /// there). `retry_capable` (issue #125): the client understands the
+    /// retryable-error status `R`.
+    Auth {
+        secret: Bytes,
+        tagging: bool,
+        retry_capable: bool,
+    },
 }
 
 fn parse_length_field(field: &str) -> io::Result<usize> {
@@ -1000,10 +1007,15 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
 
     match command {
         "A" => {
-            // `A <len>` or `A <len> T`; never carries a tag.
-            let (length_field, tagging) = match fields.as_slice() {
-                [length] => (*length, false),
-                [length, "T"] => (*length, true),
+            // `A <len> [T] [R]`; never carries a tag. The trailing `R`
+            // (issue #125) is the client declaring it understands the
+            // retryable-error status — the gate for answering `R`
+            // instead of the fatal `E`-and-close below.
+            let (length_field, tagging, retry_capable) = match fields.as_slice() {
+                [length] => (*length, false, false),
+                [length, "T"] => (*length, true, false),
+                [length, "R"] => (*length, false, true),
+                [length, "T", "R"] => (*length, true, true),
                 _ => return Err(invalid("bad A header")),
             };
             let secret_length = parse_length_field(length_field)?;
@@ -1014,6 +1026,7 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
             Ok(ParseOutcome::Auth {
                 secret: body,
                 tagging,
+                retry_capable,
             })
         }
 
@@ -1614,6 +1627,46 @@ struct Fatal;
 
 type DriverResult = Result<Vec<u8>, Fatal>;
 
+/// Issue #125: on a connection whose client declared the retryable-error
+/// capability (`A ... R`), an upstream failure that would otherwise be
+/// the fatal `E`-and-close becomes a per-request `R` (+tag) and the
+/// connection stays open — "this request failed transiently, retry it
+/// shortly" is the honest answer, and the poisoned backend has already
+/// been dropped for redial by the time this reply is written, so the
+/// retry has a fresh connection to land on. Counted as an upstream
+/// failure either way (the writer counts the fatal path; this counts
+/// the softened one).
+/// Issue #125: the per-request "no roster / no owners yet" reply. For a
+/// retry-capable client this is a tagged `R` — it is answering one
+/// specific request, and the bare untagged `B` desyncs a tagged
+/// connection's response pairing. Legacy clients keep the exact
+/// pre-#125 bytes (bare `B`), warts and all, rather than being handed
+/// a frame shape they never learned.
+fn transient_reply(retry_capable: bool, tag: Option<u32>) -> Vec<u8> {
+    if retry_capable {
+        respond("R", tag)
+    } else {
+        respond("B", None)
+    }
+}
+
+fn soften(
+    result: DriverResult,
+    retry_capable: bool,
+    tag: Option<u32>,
+    context: &ProxyContext,
+) -> DriverResult {
+    match result {
+        Err(Fatal) if retry_capable => {
+            context
+                .upstream_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(respond("R", tag))
+        }
+        other => other,
+    }
+}
+
 /// Dispatches one parsed request: performs the *initial* backend
 /// enqueues inline — in the reader's request order, which is what
 /// preserves a pipelined connection's dependency chains (same key →
@@ -1628,6 +1681,7 @@ async fn dispatch_request(
     context: Arc<ProxyContext>,
     request: Request,
     tag: Option<u32>,
+    retry_capable: bool,
 ) -> oneshot::Receiver<DriverResult> {
     context
         .requests_total
@@ -1636,9 +1690,9 @@ async fn dispatch_request(
     let (result_tx, result_rx) = oneshot::channel();
 
     let Some(ring) = current_ring(&context) else {
-        // No roster yet: `B`, the "not ready, retry" clients already
-        // understand — untagged like the node's own unsolicited busy.
-        let _ = result_tx.send(Ok(respond("B", None)));
+        // No roster yet: `R` for a retry-capable client (tagged — this
+        // answers a specific request), the legacy bare `B` otherwise.
+        let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
         return result_rx;
     };
 
@@ -1646,7 +1700,7 @@ async fn dispatch_request(
         Request::Get { namespace, key } => {
             let owners = ring.owners(&namespace, &key);
             let Some(primary) = owners.first() else {
-                let _ = result_tx.send(Ok(respond("B", None)));
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
                 return result_rx;
             };
             let pending = context
@@ -1660,7 +1714,7 @@ async fn dispatch_request(
                 .await;
             tokio::spawn(async move {
                 let result = finish_get(&context, &namespace, &key, owners, pending, tag).await;
-                let _ = result_tx.send(result);
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
         Request::Set {
@@ -1673,29 +1727,47 @@ async fn dispatch_request(
                 enqueue_write(&context, &ring, &namespace, &key, Some((&value, ttl))).await;
             tokio::spawn(async move {
                 let write = Some((value, ttl));
-                let result = finish_write(&context, &namespace, &key, write, pending, tag).await;
-                let _ = result_tx.send(result);
+                let result = finish_write(
+                    &context,
+                    &namespace,
+                    &key,
+                    write,
+                    pending,
+                    tag,
+                    retry_capable,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
         Request::Delete { namespace, key } => {
             let pending = enqueue_write(&context, &ring, &namespace, &key, None).await;
             tokio::spawn(async move {
-                let result = finish_write(&context, &namespace, &key, None, pending, tag).await;
-                let _ = result_tx.send(result);
+                let result = finish_write(
+                    &context,
+                    &namespace,
+                    &key,
+                    None,
+                    pending,
+                    tag,
+                    retry_capable,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
         Request::Clear { namespace } => {
             let pending = enqueue_clear(&context, &ring, Some(&namespace)).await;
             tokio::spawn(async move {
                 let result = finish_clear(&context, Some(namespace), pending, tag).await;
-                let _ = result_tx.send(result);
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
         Request::ClearAll => {
             let pending = enqueue_clear(&context, &ring, None).await;
             tokio::spawn(async move {
                 let result = finish_clear(&context, None, pending, tag).await;
-                let _ = result_tx.send(result);
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
     }
@@ -1805,6 +1877,7 @@ async fn finish_write(
     write: Option<(Bytes, Option<u64>)>,
     pending: Vec<PendingReply>,
     tag: Option<u32>,
+    retry_capable: bool,
 ) -> DriverResult {
     let write_ref = write.as_ref().map(|(value, ttl)| (value, *ttl));
     let mut replies = Vec::with_capacity(pending.len());
@@ -1812,7 +1885,9 @@ async fn finish_write(
         replies.push(reply.await);
     }
     let Some(primary_reply) = replies.first() else {
-        return Ok(respond("B", None));
+        // Empty roster at enqueue time — same transient class as the
+        // dispatch-time check above.
+        return Ok(transient_reply(retry_capable, tag));
     };
     for replica_reply in replies.iter().skip(1) {
         if let Err(error) = replica_reply {
@@ -1827,14 +1902,14 @@ async fn finish_write(
         Ok(NodeReply::WrongNode) => {
             // Stale roster: refresh, then re-fan on the new owner set.
             force_refresh(context).await;
-            refan_write(context, namespace, key, write_ref, tag).await
+            refan_write(context, namespace, key, write_ref, tag, retry_capable).await
         }
         // A transport failure on the ordered attempt: the shared
         // connection may simply have been idle-closed by the node
         // (issue #110 — long-lived shared connections make that the
         // common case). Re-fan once via `call`, whose transparent
         // redial recovers it; a second failure is real.
-        Err(_) => refan_write(context, namespace, key, write_ref, tag).await,
+        Err(_) => refan_write(context, namespace, key, write_ref, tag, retry_capable).await,
         Ok(_) => Err(Fatal),
     }
 }
@@ -1848,6 +1923,7 @@ async fn refan_write(
     key: &[u8],
     write: Option<(&Bytes, Option<u64>)>,
     tag: Option<u32>,
+    retry_capable: bool,
 ) -> DriverResult {
     let Some(ring) = current_ring(context) else {
         return Err(Fatal);
@@ -1855,7 +1931,7 @@ async fn refan_write(
     let owners = ring.owners(namespace, key);
     let (frame, expect) = write_frame(namespace, key, write);
     let Some((primary, replicas)) = owners.split_first() else {
-        return Ok(respond("B", None));
+        return Ok(transient_reply(retry_capable, tag));
     };
     for addr in replicas {
         if let Err(error) = context
@@ -1988,6 +2064,10 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
     let mut buf = BytesMut::new();
     let mut authenticated = context.secret.is_none();
     let mut tagged = false;
+    // Issue #125: set when the client's `A` carried the `R` token.
+    // Stable before any request is dispatched (auth precedes requests),
+    // so it can be passed to `dispatch_request` by value.
+    let mut retry_capable = false;
     let mut drain = context.drain.clone();
 
     let result: io::Result<()> = 'connection: loop {
@@ -1995,7 +2075,11 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
         loop {
             match parse_request(&mut buf, tagged) {
                 Ok(ParseOutcome::Incomplete) => break,
-                Ok(ParseOutcome::Auth { secret, tagging }) => {
+                Ok(ParseOutcome::Auth {
+                    secret,
+                    tagging,
+                    retry_capable: retryable,
+                }) => {
                     let accepted = match &context.secret {
                         Some(required) => secrets_match(&secret, required),
                         // No secret configured: any non-empty secret is
@@ -2006,6 +2090,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     let reply: &[u8] = if accepted {
                         authenticated = true;
                         tagged = tagging;
+                        retry_capable = retryable;
                         if tagging { b"OnT\n" } else { b"On\n" }
                     } else {
                         b"En\n"
@@ -2028,7 +2113,8 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     // Dispatch inline (awaiting the ordered backend
                     // enqueues) before parsing the next request — see
                     // `dispatch_request` on why order matters here.
-                    let response_rx = dispatch_request(Arc::clone(&context), request, tag).await;
+                    let response_rx =
+                        dispatch_request(Arc::clone(&context), request, tag, retry_capable).await;
                     if fifo_tx.send(response_rx).await.is_err() {
                         break 'connection Ok(());
                     }
@@ -2946,6 +3032,102 @@ mod tests {
     }
 
     // ── end-to-end ───────────────────────────────────────────────────
+
+    /// Issue #125: a roster whose only node is a dead address — every
+    /// upstream attempt fails, which is the transient-failure shape the
+    /// retryable status exists for.
+    async fn dead_node_cluster() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let discovery = start_mock_discovery(vec![("node-dead".to_string(), dead_addr)], 1).await;
+        start_proxy(&discovery, None, 64).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retry_capable_client_gets_r_and_keeps_its_connection() {
+        let proxy = dead_node_cluster().await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+
+        stream.write_all(b"G 4\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+
+        // The connection survived the failure: a second request gets its
+        // own answer instead of a closed socket.
+        stream.write_all(b"G 4\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tagged_retry_capable_client_gets_a_tagged_r() {
+        let proxy = dead_node_cluster().await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 T R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "OnT");
+
+        stream.write_all(b"G 4 7\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 7");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_empty_roster_answers_r_tagged_to_a_capable_client_and_bare_b_to_legacy() {
+        // Issue #125: the per-request no-roster reply must not desync a
+        // tagged connection — `R <tag>` for capable clients; legacy
+        // clients keep the pre-#125 bare `B`.
+        let discovery = start_mock_discovery(Vec::new(), 1).await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1 T R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "OnT");
+        stream.write_all(b"G 4 9\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 9");
+
+        let mut legacy = TcpStream::connect(&proxy).await.unwrap();
+        legacy.write_all(b"A 1\nx").await.unwrap();
+        let mut legacy_buf = BytesMut::new();
+        assert_eq!(read_line(&mut legacy, &mut legacy_buf).await.unwrap(), "On");
+        legacy.write_all(b"G 4\nname").await.unwrap();
+        assert_eq!(read_line(&mut legacy, &mut legacy_buf).await.unwrap(), "B");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_client_still_gets_the_fatal_e_and_close() {
+        // Back-compat (issue #125): no `R` in the client's `A` means the
+        // old contract — `E` then close.
+        let proxy = dead_node_cluster().await;
+
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 1\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+
+        stream.write_all(b"G 4\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        // The writer is gone after a fatal `E`: a further request gets
+        // no reply (either silence until the idle close, or an
+        // immediate EOF) — bounded here rather than waiting out the
+        // 60s idle timeout for the actual FIN.
+        stream.write_all(b"G 4\nname").await.unwrap();
+        let more =
+            tokio::time::timeout(Duration::from_millis(500), read_line(&mut stream, &mut buf))
+                .await;
+        assert!(
+            match more {
+                Err(_elapsed) => true,
+                Ok(Err(_eof)) => true,
+                Ok(Ok(line)) => panic!("got a reply after the fatal E: {line}"),
+            },
+            "no further replies after the fatal E"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn round_trips_and_isolates_namespaces_through_the_proxy() {

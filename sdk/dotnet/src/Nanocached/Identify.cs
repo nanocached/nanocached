@@ -53,13 +53,31 @@ internal static class Identify
     internal sealed record ProxyListTarget(IReadOnlyList<DiscoveredNode> Proxies) : Result;
 
     /// <summary>
-    /// Always dials with the extended <c>A ... T</c> first (echoed response tags),
-    /// so a 0019+ server tags this connection from the start. Only when the
-    /// extended form itself signals a pre-0019 server — the connection
-    /// closed/EOF/reset before any reply arrived, never a timeout or a
-    /// malformed-but-present reply — does this transparently redial once
-    /// with the plain <c>A</c> form and run the connection untagged, the
-    /// same as before echoed response tags existed.
+    /// Always dials with the extended <c>A ... T R</c> first (echoed
+    /// response tags plus the retryable-error capability token, issue
+    /// #125), so a server that supports both tags this connection and
+    /// knows it may answer a data command <c>R</c> from the start. Only
+    /// when that extended form itself signals a server that doesn't
+    /// understand the <c>R</c> token — the connection closed/EOF/reset
+    /// before any reply arrived, never a timeout or a malformed-but-present
+    /// reply — does this transparently redial once with <c>A ... T</c>
+    /// (tags only, the pre-#125 extended form); and if THAT signals a
+    /// pre-0019 server the same way, redial once more with the plain
+    /// <c>A</c> form and run the connection untagged, exactly as before
+    /// echoed response tags existed. Three stages, one fallback signal,
+    /// reused at each stage — not three different mechanisms.
+    ///
+    /// <para>The <c>R</c> token is never sent on its own — the wire
+    /// contract fixes the token order as <c>[T] [R]</c> — so a connection
+    /// is either tagged-and-retryable-declared, tagged-only, or neither;
+    /// there is no tagged-but-not-declaring-R stage to fall back to
+    /// separately. <c>R</c> is a pure client-declared capability: the
+    /// server's <c>A</c> reply shape (<c>On</c>/<c>OnT</c>/<c>Od</c>/<c>OdT</c>)
+    /// is unchanged and never echoes it, and a data command can answer
+    /// <c>R</c> on ANY connection regardless of what was declared (a
+    /// server too old to know the token simply never sends <c>R</c>), so
+    /// <see cref="Connection"/>'s handling of it needs no per-connection
+    /// flag the way tagging does.</para>
     ///
     /// <para>SDK proxy mode (issue #122): <paramref name="viaProxy"/> only
     /// changes what happens once the server identifies itself as
@@ -76,15 +94,53 @@ internal static class Identify
     {
         try
         {
-            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: true, viaProxy)
+            return await ConnectAndIdentifyWithDeadlineAsync(
+                    host, port, authSecret, tls, AuthProbeStage.TaggedAndRetryable, viaProxy)
                 .ConfigureAwait(false);
         }
         catch (Exception error) when (IsLegacyServerSignal(error))
         {
-            return await ConnectAndIdentifyWithDeadlineAsync(host, port, authSecret, tls, requestTags: false, viaProxy)
-                .ConfigureAwait(false);
+            try
+            {
+                return await ConnectAndIdentifyWithDeadlineAsync(
+                        host, port, authSecret, tls, AuthProbeStage.TaggedOnly, viaProxy)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception error2) when (IsLegacyServerSignal(error2))
+            {
+                return await ConnectAndIdentifyWithDeadlineAsync(
+                        host, port, authSecret, tls, AuthProbeStage.Legacy, viaProxy)
+                    .ConfigureAwait(false);
+            }
         }
     }
+
+    /// <summary>issue #125: the three stages the public
+    /// <c>ConnectAndIdentifyAsync</c> tries in order, each one's
+    /// extended-<c>A</c>-rejected signal falling back to the next. Token
+    /// order on the wire is fixed as <c>[T] [R]</c>, so <c>R</c> only ever
+    /// accompanies <c>T</c>.</summary>
+    private enum AuthProbeStage
+    {
+        /// <summary><c>A &lt;len&gt; T R</c> — tags plus the retryable-error capability.</summary>
+        TaggedAndRetryable,
+
+        /// <summary><c>A &lt;len&gt; T</c> — tags only, the pre-#125 extended form.</summary>
+        TaggedOnly,
+
+        /// <summary><c>A &lt;len&gt;</c> — the plain pre-0019 form, untagged.</summary>
+        Legacy,
+    }
+
+    /// <summary>The <c>A</c> header's trailing token field for
+    /// <paramref name="stage"/> — see <see cref="AuthProbeStage"/>.</summary>
+    private static string AuthTokenSuffix(AuthProbeStage stage) => stage switch
+    {
+        AuthProbeStage.TaggedAndRetryable => " T R",
+        AuthProbeStage.TaggedOnly => " T",
+        AuthProbeStage.Legacy => "",
+        _ => throw new ArgumentOutOfRangeException(nameof(stage)),
+    };
 
     /// <summary>Whether an identify failure looks like a pre-0019 server
     /// slamming the door on the extended <c>A</c> (close/reset before any
@@ -104,13 +160,13 @@ internal static class Identify
         && error.SocketErrorCode is SocketError.ConnectionReset or SocketError.ConnectionAborted;
 
     private static async Task<Result> ConnectAndIdentifyWithDeadlineAsync(
-        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags,
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, AuthProbeStage stage,
         bool viaProxy)
     {
         using var deadline = new CancellationTokenSource(ConnectDeadline);
         try
         {
-            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, requestTags, viaProxy, deadline.Token)
+            return await ConnectAndIdentifyAsync(host, port, authSecret, tls, stage, viaProxy, deadline.Token)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (deadline.IsCancellationRequested)
@@ -121,14 +177,14 @@ internal static class Identify
     }
 
     private static async Task<Result> ConnectAndIdentifyAsync(
-        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, bool requestTags,
+        string host, int port, byte[]? authSecret, SslClientAuthenticationOptions? tls, AuthProbeStage stage,
         bool viaProxy, CancellationToken cancel)
     {
         Stream stream = await OpenAsync(host, port, tls, cancel).ConfigureAwait(false);
         try
         {
             byte[] secret = authSecret ?? NoSecretPlaceholder;
-            byte[] header = Encoding.ASCII.GetBytes($"A {secret.Length}{(requestTags ? " T" : "")}\n");
+            byte[] header = Encoding.ASCII.GetBytes($"A {secret.Length}{AuthTokenSuffix(stage)}\n");
             await stream.WriteAsync(header, cancel).ConfigureAwait(false);
             await stream.WriteAsync(secret, cancel).ConfigureAwait(false);
             await stream.FlushAsync(cancel).ConfigureAwait(false);
