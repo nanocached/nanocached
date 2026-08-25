@@ -8,6 +8,29 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Added
 
+- Retryable-error status `R` (issue #125): the connect/identify handshake
+  now probes with `A <len> T R` first — one more capability token in
+  front of the existing `T` negotiation — declaring that this client
+  understands a transient-failure reply on any data command
+  (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`). Falls back transparently to `A <len>
+  T` and then plain `A <len>` on the existing legacy-server signal (a
+  connection closed before any reply), exactly like the pre-existing `T`
+  fallback, just with one more stage in front — every connection this SDK
+  dials (per-node, proxy, discovery, hedge, reconnect) goes through the
+  same probe. Only `nanocached-proxy` sends `R` today (an upstream node
+  was briefly unreachable and survived its own one refresh-and-retry),
+  but any connection handles it regardless. When a request is answered
+  `R`, it is transparently retried on the very same connection, up to
+  twice more (three attempts total, 50ms then 100ms apart); if the third
+  attempt still answers `R`, the operation fails with the new
+  `Error::Retryable` — the connection is never closed or redialed, either
+  while retrying or after giving up, and stays usable for whatever the
+  caller does next. Every `R` received, including the final exhausting
+  one, is counted in the new `stats().transient_retries` counter, which
+  never resets. Hedged reads need no special-casing: a hedge leg answered
+  `R` retries on its own connection exactly like a non-hedged read, and
+  an eventual `Error::Retryable` is treated like any other leg failure.
+
 - SDK proxy mode (issue #122): `Options::via_proxy(true)` connects
   through a `nanocached-proxy` tier instead of joining the cluster
   directly. `addresses` must still name discovery server(s); `connect()`

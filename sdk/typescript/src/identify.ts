@@ -380,14 +380,26 @@ function tryParseProxyList(buf: Buffer): DiscoveredNode[] | null {
  */
 export async function connectAndIdentify(options: IdentifyOptions): Promise<IdentifyResult> {
   try {
-    return await identifyOnce(options, true);
+    // Retryable-error status (issue #125): probe with the fullest
+    // extended form first — `A <len> T R`. This adds one stage in front
+    // of the existing tag fallback below; it doesn't build a new
+    // mechanism.
+    return await identifyOnce(options, true, true);
   } catch (error) {
     if (!isLegacyServerSignal(error)) throw error;
-    // Echoed response tags transparent fallback: a pre-0019 server rejects the
-    // extended `A ... T` as a parse error and closes without replying —
-    // redial once with the plain form and run the connection untagged
-    // (the pre-0019 behavior, desync window included).
-    return identifyOnce(options, false);
+    try {
+      // A server that understands `T` but predates `R` treats the
+      // extended `A ... T R` as a parse error and closes without
+      // replying — redial once with just `T`.
+      return await identifyOnce(options, true, false);
+    } catch (innerError) {
+      if (!isLegacyServerSignal(innerError)) throw innerError;
+      // Echoed response tags transparent fallback: a pre-0019 server rejects the
+      // extended `A ... T` as a parse error and closes without replying —
+      // redial once with the plain form and run the connection untagged
+      // (the pre-0019 behavior, desync window included).
+      return identifyOnce(options, false, false);
+    }
   }
 }
 
@@ -433,13 +445,21 @@ interface Authenticated {
 async function authenticate(
   options: IdentifyOptions,
   requestTags: boolean,
+  requestRetryable: boolean,
   deadlineMs: number,
   startedAt: number,
 ): Promise<Authenticated> {
   const socket = await connectSocket(options);
 
   const secret = options.authSecret !== undefined ? Buffer.from(options.authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
-  const authFrame = Buffer.concat([Buffer.from(`A ${secret.length}${requestTags ? " T" : ""}\n`, "ascii"), secret]);
+  // Retryable-error status (issue #125): the capability token order on
+  // the wire is fixed as `[T] [R]` — `R` never rides without `T`, since
+  // the probe only ever asks for it alongside tags (see
+  // connectAndIdentify's three-stage fallback below).
+  const authFrame = Buffer.concat([
+    Buffer.from(`A ${secret.length}${requestTags ? " T" : ""}${requestRetryable ? " R" : ""}\n`, "ascii"),
+    secret,
+  ]);
 
   let identity: AuthIdentity;
   try {
@@ -463,10 +483,10 @@ async function authenticate(
   return { socket, tagged: identity.tagged, kind: identity.kind };
 }
 
-async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Promise<IdentifyResult> {
+async function identifyOnce(options: IdentifyOptions, requestTags: boolean, requestRetryable: boolean): Promise<IdentifyResult> {
   const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
   const startedAt = Date.now();
-  const identified = await authenticate(options, requestTags, deadlineMs, startedAt);
+  const identified = await authenticate(options, requestTags, requestRetryable, deadlineMs, startedAt);
 
   if (identified.kind === "node") {
     return { kind: "node", socket: identified.socket, tagged: identified.tagged };
@@ -503,19 +523,26 @@ async function identifyOnce(options: IdentifyOptions, requestTags: boolean): Pro
  */
 export async function connectAndListProxies(options: IdentifyOptions): Promise<ProxyListResult> {
   try {
-    return await listProxiesOnce(options, true);
+    // Retryable-error status (issue #125) — see connectAndIdentify's own
+    // doc comment on this same three-stage probe.
+    return await listProxiesOnce(options, true, true);
   } catch (error) {
     if (!isLegacyServerSignal(error)) throw error;
-    // Echoed response tags transparent fallback — see connectAndIdentify's
-    // own doc comment on this same retry.
-    return listProxiesOnce(options, false);
+    try {
+      return await listProxiesOnce(options, true, false);
+    } catch (innerError) {
+      if (!isLegacyServerSignal(innerError)) throw innerError;
+      // Echoed response tags transparent fallback — see connectAndIdentify's
+      // own doc comment on this same retry.
+      return listProxiesOnce(options, false, false);
+    }
   }
 }
 
-async function listProxiesOnce(options: IdentifyOptions, requestTags: boolean): Promise<ProxyListResult> {
+async function listProxiesOnce(options: IdentifyOptions, requestTags: boolean, requestRetryable: boolean): Promise<ProxyListResult> {
   const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
   const startedAt = Date.now();
-  const identified = await authenticate(options, requestTags, deadlineMs, startedAt);
+  const identified = await authenticate(options, requestTags, requestRetryable, deadlineMs, startedAt);
 
   if (identified.kind === "node") {
     identified.socket.destroy();

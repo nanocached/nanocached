@@ -59,6 +59,19 @@ var (
 	// invalid TTL. Never transient — retrying with the same arguments
 	// cannot succeed.
 	ErrInvalidArgument = errors.New("nanocached: invalid argument")
+
+	// ErrRetryable is returned when a single request was answered `R`
+	// (issue #125) on every attempt of the bounded retry budget — the
+	// server (today, only nanocached-proxy) reported the request itself
+	// failed transiently (e.g. its upstream node was briefly unreachable)
+	// and asked for a retry, but that still didn't succeed within 3
+	// attempts. Unlike ErrConnectionLost, the connection itself is fine
+	// and stays open and usable — this is a per-request outcome, not a
+	// connection-level failure, so a later call on the same connection
+	// may still succeed. Possible on any connection: the SDK always
+	// probes for the `R` capability during identify (see identify.go),
+	// regardless of what the caller configured.
+	ErrRetryable = errors.New("nanocached: request failed transiently and retries were exhausted")
 )
 
 func connectionLost(context string, cause error) error {
@@ -78,4 +91,8 @@ func protocolError(context string) error {
 
 func invalidArgument(context string) error {
 	return errors.Join(ErrInvalidArgument, errors.New(context))
+}
+
+func retryableFailed(context string) error {
+	return errors.Join(ErrRetryable, errors.New(context))
 }

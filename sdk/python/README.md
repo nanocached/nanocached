@@ -244,6 +244,44 @@ the original dial error instead of each paying another full 5-second
 connect timeout. Keep it short — a node that genuinely recovers is shut
 out for at most this long.
 
+## Errors and stats
+
+Every failure this SDK raises on its own behalf is a `NanocachedError`
+subclass — catch that one class when you don't care which:
+
+- `AuthenticationError` — the `auth_secret` handshake failed. Never
+  transient; retrying with the same configuration cannot succeed.
+- `WrongNodeError` — normally handled internally (a stale routing table
+  is refreshed and the call retried once); it only escapes in
+  single-node mode, where there is no discovery to refresh from.
+- `DiscoveryBusyError` — a discovery server is warming up after a
+  restart. Try another address, or retry shortly.
+- `RetryableError` — a request was answered the retryable-error status
+  `R` three times running. `R` means the request itself failed
+  transiently — today, `nanocached-proxy` sends it when its upstream
+  node was briefly unreachable and survived its own one refresh-and-
+  retry — while the connection stayed perfectly healthy throughout. This
+  SDK already retries transparently on `R`: up to 2 retries (3 attempts
+  total, sleeping 50ms then 100ms between attempts) on the SAME
+  connection, with no reconnect and no node-list refresh — `R` is never
+  treated as a connection error, a `W`, or an `E`. `RetryableError` only
+  surfaces once that budget is exhausted; the connection remains open
+  and usable, so retrying the call itself (most likely against the same
+  connection) is safe and often immediately successful.
+
+`client.stats()` returns a `ClientStats` snapshot of counters for
+failures this client swallows or retries by design, so they stay
+observable instead of silently invisible:
+
+```python
+stats = client.stats()
+stats.replica_write_failures  # swallowed dead/disagreeing replica legs (client-side replication)
+stats.read_repair_failures    # swallowed read-repair write-back failures (read repair)
+stats.refresh_failures        # failed node-list refresh attempts / per-node reconnects
+stats.transient_retries       # every `R` received, whether the retry that followed succeeded
+                               # or, after 3 attempts running, raised RetryableError
+```
+
 ## Authentication and TLS
 
 ```python

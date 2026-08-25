@@ -121,6 +121,8 @@ describe("tryParseResponse", () => {
       ["B\n", "busy"],
       ["W\n", "wrongNode"],
       ["C\n", "cleared"],
+      // Retryable-error status (issue #125): possible on any data command.
+      ["R\n", "retryable"],
     ] as const;
 
     for (const [wire, kind] of cases) {
@@ -137,7 +139,7 @@ describe("tryParseResponse", () => {
     // Issue: audit finding — the untagged form is always exactly
     // `<marker>\n`; a second byte other than LF means the streams are
     // desynced (this used to be accepted silently, with consumed: 2).
-    for (const wire of ["SX", "DX", "NX", "WX", "CX"]) {
+    for (const wire of ["SX", "DX", "NX", "WX", "CX", "RX"]) {
       assert.throws(() => tryParseResponse(Buffer.from(wire)), /connection desynced/);
     }
   });
@@ -225,6 +227,12 @@ describe("tagged frames (echoed response tags)", () => {
     });
     assert.deepEqual(tryParseResponse(Buffer.from("C 7\n"), true), {
       response: { kind: "cleared", tag: 7 },
+      consumed: 4,
+    });
+    // Retryable-error status (issue #125): tagged like every other
+    // request-answering status above.
+    assert.deepEqual(tryParseResponse(Buffer.from("R 7\n"), true), {
+      response: { kind: "retryable", tag: 7 },
       consumed: 4,
     });
   });

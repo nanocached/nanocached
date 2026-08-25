@@ -20,7 +20,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from ._errors import NanocachedError, WrongNodeError
+from ._errors import NanocachedError, RetryableError, WrongNodeError
 
 # The server's own request cap is 1 MiB; this constant doubles that as
 # headroom, so a claimed length beyond it is definitely a corrupt or
@@ -29,6 +29,15 @@ _MAX_VALUE_LENGTH = 2 * 1024 * 1024
 
 # A tag is a u32 in decimal (echoed response tags).
 _MAX_TAG = 0xFFFFFFFF
+
+# Retryable-error status `R` (issue #125): a request answered `R` failed
+# transiently (e.g. nanocached-proxy's upstream node was briefly
+# unreachable) and must be retried on the SAME connection — up to 2
+# retries (3 attempts total), sleeping 50ms before the first retry and
+# 100ms before the second. A third `R` in a row raises RetryableError
+# without closing or redialing the connection.
+_MAX_RETRYABLE_ATTEMPTS = 3
+_RETRYABLE_RETRY_DELAYS = (0.05, 0.10)
 
 # Bounds how long the connection may go without progress while requests
 # are outstanding (issue #42) — each response must arrive within this
@@ -108,6 +117,7 @@ class Connection:
         writer: asyncio.StreamWriter,
         on_close: Callable[[], None] | None = None,
         tagged: bool = False,
+        on_transient_retry: Callable[[], None] | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
@@ -116,6 +126,14 @@ class Connection:
         # echo against the oldest pending slot before resolving it.
         self._tagged = tagged
         self._next_tag = 0
+        # Retryable-error status `R` (issue #125): invoked once per `R`
+        # response this connection receives, whether it ends up retried
+        # successfully or exhausts the budget into RetryableError — lets
+        # the owning client maintain a `transient_retries` counter (see
+        # ClientStats) without this module knowing anything about client
+        # stats itself. None off a connection nobody wants to count for
+        # (there is none today, but mirrors on_close's own optionality).
+        self._on_transient_retry = on_transient_retry
         # Serializes "enqueue the pending slot, then write the frame" —
         # not the whole round trip — across concurrent callers, so queue
         # order always matches wire order for the dedicated reader below.
@@ -262,6 +280,39 @@ class Connection:
         return tag
 
     async def _request(self, build: Callable[[int | None], bytes]) -> tuple[bytes, bytes | None]:
+        """Sends ``build``'s request and returns its (marker, value)
+        answer. Retryable-error status `R` (issue #125): when the answer
+        is `R`, this request is transparently retried on this SAME
+        connection — up to 2 retries (3 attempts total), sleeping 50ms
+        before the first retry and 100ms before the second — instead of
+        being handed back to the caller; every get/set/delete/clear
+        caller below therefore never sees marker `R` at all. A third `R`
+        in a row raises RetryableError instead of a fourth attempt,
+        without closing or redialing the connection (`R` is never treated
+        as a connection failure, a `W`, or an `E`). Each retry is just an
+        ordinary fresh _send() call, so it naturally lands at the back of
+        the pending queue behind whatever other pipelined requests were
+        already written while this one was in flight — no manual queue
+        reordering needed for request pipelining to stay correct."""
+        attempt = 0
+        while True:
+            future = await self._send(build)
+            marker, value = await future
+            if marker != b"R":
+                return marker, value
+            if self._on_transient_retry is not None:
+                self._on_transient_retry()
+            attempt += 1
+            if attempt >= _MAX_RETRYABLE_ATTEMPTS:
+                raise RetryableError()
+            await asyncio.sleep(_RETRYABLE_RETRY_DELAYS[attempt - 1])
+
+    async def _send(
+        self, build: Callable[[int | None], bytes]
+    ) -> asyncio.Future[tuple[bytes, bytes | None]]:
+        """Enqueues one request frame and returns its pending future,
+        unawaited — the raw "write one frame, get back a slot to await"
+        primitive _request() calls once per attempt (including retries)."""
         if self.closed:
             raise ConnectionError("nanocached: connection is closed")
 
@@ -315,7 +366,7 @@ class Connection:
         # just preserving it (request pipelining): cancellation is supported, and
         # kept safe by leaving the cancelled future in place instead of
         # ripping it out from under the read loop.
-        return await future
+        return future
 
     async def _read_loop(self) -> None:
         while True:
@@ -425,7 +476,7 @@ class Connection:
             value = await self._reader.readexactly(length)
             return marker, value, tag
 
-        if marker in (b"S", b"D", b"N", b"W", b"C"):
+        if marker in (b"S", b"D", b"N", b"W", b"C", b"R"):
             if self._tagged:
                 # `<marker> <tag>\n` (echoed response tags).
                 header = await self._reader.readuntil(b"\n")

@@ -294,6 +294,18 @@ request response tags; a server that supports them echoes the capability
 in its reply (`OnT\n`/`OdT\n`) and the connection runs in tagged mode —
 see "Response tags" below.
 
+A further optional `R` field (`A <secret-length> [T] R\n<secret>`,
+issue #125) declares that the client understands the retryable-error
+status: a server may then answer a *transiently* failed request with
+`R\n` (`R <tag>\n` in tagged mode) instead of the fatal
+`E`-and-close — the client retries that one request, bounded, on the
+same connection. Today `nanocached-proxy` is the only emitter (an
+upstream failure that survives its refresh-and-retry); nodes and
+discovery accept the token so the capability probe succeeds everywhere.
+A server that predates the token treats the extended `A` as malformed
+and closes, which the SDKs' existing capability fallback (retry with
+`A ... T`, then plain `A`) already handles.
+
 ### G (get)
 
 ```text

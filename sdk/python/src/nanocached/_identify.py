@@ -133,18 +133,52 @@ async def _connect_and_identify_generic(
     ssl_context: ssl_module.SSLContext | None,
     fetch_discovery: _FetchDiscovery[_DiscoveryResult],
 ) -> NodeTarget | _DiscoveryResult:
+    # Retryable-error capability (issue #125) extends the existing
+    # echoed-response-tags negotiation with one more stage in front,
+    # reusing the same fallback machinery rather than building a new one:
+    # `A <len> T R` first, then `A <len> T`, then plain `A <len>`. Each
+    # stage's door-slam (_LegacyServerSignal) only proves that *that*
+    # stage's extra token wasn't understood, so it falls exactly one
+    # stage, never straight to the bottom.
     try:
         return await _connect_and_identify_with_deadline(
-            host, port, auth_secret, ssl_context, request_tags=True, fetch_discovery=fetch_discovery
+            host,
+            port,
+            auth_secret,
+            ssl_context,
+            request_tags=True,
+            request_retryable=True,
+            fetch_discovery=fetch_discovery,
+        )
+    except _LegacyServerSignal:
+        pass
+
+    try:
+        return await _connect_and_identify_with_deadline(
+            host,
+            port,
+            auth_secret,
+            ssl_context,
+            request_tags=True,
+            request_retryable=False,
+            fetch_discovery=fetch_discovery,
         )
     except _LegacyServerSignal:
         # Echoed response tags transparent fallback: a pre-0019 server treats the
         # extended `A ... T` as a parse error and closes without replying
         # — redial once with the plain form and run the connection
         # untagged (the pre-0019 behavior, desync window included).
-        return await _connect_and_identify_with_deadline(
-            host, port, auth_secret, ssl_context, request_tags=False, fetch_discovery=fetch_discovery
-        )
+        pass
+
+    return await _connect_and_identify_with_deadline(
+        host,
+        port,
+        auth_secret,
+        ssl_context,
+        request_tags=False,
+        request_retryable=False,
+        fetch_discovery=fetch_discovery,
+    )
 
 
 async def _connect_and_identify_with_deadline(
@@ -153,11 +187,14 @@ async def _connect_and_identify_with_deadline(
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
     request_tags: bool,
+    request_retryable: bool,
     fetch_discovery: _FetchDiscovery[_DiscoveryResult],
 ) -> NodeTarget | _DiscoveryResult:
     try:
         return await asyncio.wait_for(
-            _connect_and_identify(host, port, auth_secret, ssl_context, request_tags, fetch_discovery),
+            _connect_and_identify(
+                host, port, auth_secret, ssl_context, request_tags, request_retryable, fetch_discovery
+            ),
             CONNECT_DEADLINE,
         )
     except TimeoutError as error:
@@ -172,13 +209,21 @@ async def _connect_and_identify(
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
     request_tags: bool,
+    request_retryable: bool,
     fetch_discovery: _FetchDiscovery[_DiscoveryResult],
 ) -> NodeTarget | _DiscoveryResult:
     reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
 
     try:
         secret = auth_secret if auth_secret is not None else _NO_SECRET_PLACEHOLDER
-        tag_field = b" T" if request_tags else b""
+        # Token order is fixed: `[T] [R]` (issue #125 spec) — `R` is only
+        # ever sent alongside `T`, never on its own.
+        if request_retryable:
+            tag_field = b" T R"
+        elif request_tags:
+            tag_field = b" T"
+        else:
+            tag_field = b""
 
         # Echoed response tags: read 3 bytes first. `byte[2] == '\n'` is the
         # traditional fixed-width ack (`On\n`/`En\n`/`Od\n`/`Ed\n`),
@@ -215,13 +260,14 @@ async def _connect_and_identify(
             else:
                 raise NanocachedError("nanocached: unexpected response to A")
         except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError) as error:
-            # Only a request_tags=True attempt can fall back further — the
-            # transparent fallback itself must fail like any other
-            # connection error. A timeout is not this: the server kept the
-            # connection open, it just didn't answer (handled by the
-            # asyncio.wait_for wrapper instead), and a malformed-but-present
-            # reply is not this either — both are real protocol errors, not
-            # a legacy server's silent door-slam.
+            # Only a request_tags=True attempt can fall back further (the
+            # `T R` stage falls to `T`, and `T` falls to plain) — the final,
+            # plain-`A` fallback itself must fail like any other connection
+            # error, not raise _LegacyServerSignal again. A timeout is not
+            # this: the server kept the connection open, it just didn't
+            # answer (handled by the asyncio.wait_for wrapper instead), and
+            # a malformed-but-present reply is not this either — both are
+            # real protocol errors, not a legacy server's silent door-slam.
             if request_tags:
                 raise _LegacyServerSignal() from error
             if isinstance(error, asyncio.IncompleteReadError):

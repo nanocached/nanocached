@@ -93,6 +93,21 @@ type mockNode struct {
 	silent           atomic.Bool  // once true, every G/S/D is read but never answered
 	failClearLeft    atomic.Int32 // issue #106: fail the next N c/F requests (read, then drop the connection with no reply)
 	clearCount       atomic.Int32 // issue #106: how many c/F requests this node has received, failed or not
+	// retryableLeft is issue #125's "answer the next N data requests with
+	// R" knob — consumed by any of G/g/S/s/D/d/c/F, tagged correctly like
+	// every other reply.
+	retryableLeft atomic.Int32
+	// dataRequestCount counts every data command (G/g/S/s/D/d/c/F) this
+	// node has read off the wire, R-answered or not — issue #125's tests
+	// assert the exact number of attempts a retry sequence made,
+	// regardless of which command type they used.
+	dataRequestCount atomic.Int32
+	// authHeaders records, in order, every `A` header line this node has
+	// received (issue #125: lets a test assert the exact probe form —
+	// `A <len> T R`, `A <len> T`, or plain `A <len>` — a connect/fallback
+	// attempt sent), trailing '\n' stripped.
+	authHeadersMu sync.Mutex
+	authHeaders   []string
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -105,9 +120,19 @@ type mockNodeOpts struct {
 	// of the suite keeps exercising the legacy untagged path.
 	supportTags bool
 	// closeOnExtendedAuth: behave like a legacy pre-tag server — an
-	// extended `A ... T` is a parse error, so close the connection without
-	// replying.
+	// extended `A ... T` (or `A ... T R`) is a parse error, so close the
+	// connection without replying. The oldest generation: rejects every
+	// extension, so the SDK's probe falls all the way back to plain `A`.
 	closeOnExtendedAuth bool
+	// closeOnRetryableCapability: behave like a server that predates
+	// issue #125's `R` capability token but still understands issue #47's
+	// `T` — accepts `A <len> T` normally, but treats any `A` with more
+	// fields than that (i.e. a trailing `R`) as a parse error and closes
+	// without replying. A middle generation, distinct from
+	// closeOnExtendedAuth: exercises the new front fallback stage
+	// (`A <len> T R` -> `A <len> T`) in isolation, without also falling
+	// all the way back to the untagged form.
+	closeOnRetryableCapability bool
 }
 
 // delaySets makes every future S reply from this node wait d first — for
@@ -130,6 +155,27 @@ func (m *mockNode) goSilentAfterHandshake() { m.silent.Store(true) }
 // tagged connection that echoes the wrong tag (the request's tag + 1) —
 // the desync a pre-tag stream misalignment would produce.
 func (m *mockNode) answerWrongTagOnce() { m.wrongTagLeft.Add(1) }
+
+// answerRetryableTimes queues n one-off `R` replies (issue #125),
+// consumed by the next n data requests (G/g/S/s/D/d/c/F, in whatever
+// order they arrive) on any connection to this node.
+func (m *mockNode) answerRetryableTimes(n int32) { m.retryableLeft.Add(n) }
+
+// dataRequestsReceived reports how many data commands (G/g/S/s/D/d/c/F)
+// this node has read off the wire in total, R-answered or not — issue
+// #125's tests use this to assert the exact number of attempts a bounded
+// retry sequence made.
+func (m *mockNode) dataRequestsReceived() int32 { return m.dataRequestCount.Load() }
+
+// authHeadersSeen returns, in order, every `A` header line this node has
+// received so far (trailing '\n' stripped) — issue #125's tests use this
+// to assert the exact probe form (`A <len> T R`, `A <len> T`, or plain
+// `A <len>`) a connect/fallback attempt sent.
+func (m *mockNode) authHeadersSeen() []string {
+	m.authHeadersMu.Lock()
+	defer m.authHeadersMu.Unlock()
+	return append([]string(nil), m.authHeaders...)
+}
 
 // swallowGetOnce swallows the next G request entirely (no reply) — the
 // off-by-one stream desync where every later response answers the
@@ -246,7 +292,16 @@ func (m *mockNode) serve(conn net.Conn) {
 		}
 		switch parts[0] {
 		case "A":
+			m.authHeadersMu.Lock()
+			m.authHeaders = append(m.authHeaders, strings.TrimSuffix(header, "\n"))
+			m.authHeadersMu.Unlock()
 			if len(parts) > 2 && m.opts.closeOnExtendedAuth {
+				return
+			}
+			// issue #125: a server that understands `T` but predates the
+			// trailing `R` capability token treats anything past
+			// `A <len> T` as a parse error too.
+			if len(parts) > 3 && m.opts.closeOnRetryableCapability {
 				return
 			}
 			secret := mustRead(reader, atoiOrPanic(parts[1]))
@@ -270,8 +325,15 @@ func (m *mockNode) serve(conn net.Conn) {
 				continue
 			}
 			m.getCount.Add(1)
+			m.dataRequestCount.Add(1)
 			if delay := time.Duration(m.getDelay.Load()); delay > 0 {
 				time.Sleep(delay)
+			}
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
 			}
 			if m.takeOne(&m.swallowLeft) {
 				continue // no reply at all — the off-by-one desync injection
@@ -328,8 +390,15 @@ func (m *mockNode) serve(conn net.Conn) {
 				continue
 			}
 			m.getCount.Add(1)
+			m.dataRequestCount.Add(1)
 			if delay := time.Duration(m.getDelay.Load()); delay > 0 {
 				time.Sleep(delay)
+			}
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
 			}
 			if m.takeOne(&m.swallowLeft) {
 				continue
@@ -371,6 +440,7 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.silent.Load() {
 				continue
 			}
+			m.dataRequestCount.Add(1)
 			// The TTL, when present, is the field after the two lengths
 			// (omitted on the wire means "no expiry", i.e. 0); on a
 			// tagged connection the tag sits after it as the last field.
@@ -385,6 +455,12 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			if delay := time.Duration(m.setDelay.Load()); delay > 0 {
 				time.Sleep(delay)
+			}
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
 			}
 			reply := "S" + tagSuffix + "\n"
 			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
@@ -410,6 +486,7 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.silent.Load() {
 				continue
 			}
+			m.dataRequestCount.Add(1)
 			ttlBase := 4
 			if tagged {
 				ttlBase = 5
@@ -421,6 +498,12 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			if delay := time.Duration(m.setDelay.Load()); delay > 0 {
 				time.Sleep(delay)
+			}
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
 			}
 			reply := "S" + tagSuffix + "\n"
 			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
@@ -434,6 +517,13 @@ func (m *mockNode) serve(conn net.Conn) {
 		case "D":
 			key := string(mustRead(reader, atoiOrPanic(parts[1])))
 			if m.silent.Load() {
+				continue
+			}
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
 				continue
 			}
 			reply := "N" + tagSuffix + "\n"
@@ -456,6 +546,13 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.silent.Load() {
 				continue
 			}
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
 			reply := "N" + tagSuffix + "\n"
 			if m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
@@ -474,6 +571,13 @@ func (m *mockNode) serve(conn net.Conn) {
 			nsLen := atoiOrPanic(parts[1])
 			namespace := string(mustRead(reader, nsLen))
 			m.clearCount.Add(1)
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
 			if m.takeOne(&m.failClearLeft) {
 				return // simulate a connection-level failure: no reply, drop
 			}
@@ -490,6 +594,13 @@ func (m *mockNode) serve(conn net.Conn) {
 		// namespace, default included.
 		case "F":
 			m.clearCount.Add(1)
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
 			if m.takeOne(&m.failClearLeft) {
 				return
 			}
@@ -1071,7 +1182,7 @@ func TestASwallowedResponseDesyncsAndIsCaughtBeforeDispatchTagged(t *testing.T) 
 	if !result.tagged {
 		t.Fatal("expected the mock node to negotiate tags")
 	}
-	conn := newConnection(result.conn, func() {}, result.tagged)
+	conn := newConnection(result.conn, func() {}, result.tagged, nil)
 	defer conn.close()
 
 	if err := conn.set([]byte("k"), []byte("v"), -1); err != nil {
@@ -1118,7 +1229,7 @@ func TestASwallowedResponseDesyncsAndIsCaughtBeforeDispatchTagged(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn2 := newConnection(result2.conn, func() {}, result2.tagged)
+	conn2 := newConnection(result2.conn, func() {}, result2.tagged, nil)
 	defer conn2.close()
 	value, ok, err := conn2.get([]byte("k"))
 	if err != nil || !ok || string(value) != "v" {
@@ -1157,9 +1268,14 @@ func TestAWrongResponseTagPoisonsTheConnection(t *testing.T) {
 }
 
 // TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer: an old
-// (pre-tag) server treats the extended `A ... T` as a parse
-// error and closes without replying; the client must redial once with the
-// plain form and run untagged — transparently, with the same results.
+// (pre-tag) server treats any extended `A` (`A ... T R` or `A ... T`) as
+// a parse error and closes without replying; the client must fall all
+// the way back to the plain form and run untagged — transparently, with
+// the same results. Issue #125 adds a probe stage in front of issue
+// #47's own (`A <len> T R` tried first, then `A <len> T`), so a fully
+// legacy server now draws two closed dials before the plain fallback
+// sticks, not one — see TestConnectFallsBackFromRetryableCapabilityToTaggedOnly
+// for the middle stage in isolation.
 func TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer(t *testing.T) {
 	node := startMockNodeOpts(t, nil, mockNodeOpts{closeOnExtendedAuth: true})
 	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
@@ -1175,10 +1291,220 @@ func TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer(t *testing.T)
 	if err != nil || !ok || value != "v" {
 		t.Fatalf("Get = %q, %v, %v, want \"v\", true, nil", value, ok, err)
 	}
-	// Two dials: the extended attempt the server slammed shut, then the
-	// plain fallback that stuck.
+	// Three dials: the `T R` attempt the server slammed shut, then the
+	// `T`-only attempt it slammed shut too, then the plain fallback that
+	// stuck.
+	if got := node.connectionCount.Load(); got != 3 {
+		t.Fatalf("connectionCount = %d, want 3 (T R attempt + T attempt + plain fallback)", got)
+	}
+	headers := node.authHeadersSeen()
+	if len(headers) != 3 {
+		t.Fatalf("authHeadersSeen() = %v, want 3 headers", headers)
+	}
+	if !strings.HasSuffix(headers[0], " T R") {
+		t.Fatalf("first A header = %q, want a trailing \" T R\"", headers[0])
+	}
+	if !strings.HasSuffix(headers[1], " T") || strings.HasSuffix(headers[1], " T R") {
+		t.Fatalf("second A header = %q, want a trailing \" T\" (not \" T R\")", headers[1])
+	}
+	if strings.Contains(headers[2], "T") {
+		t.Fatalf("third A header = %q, want the plain form", headers[2])
+	}
+}
+
+// TestConnectProbesWithTheRetryableCapabilityFirst: the very first thing
+// every connect/identify exchange sends is the full `A <len> T R` probe
+// (issue #125) — asserted here against a normal (issue #47 tag-capable)
+// mock node that accepts it outright, so there's exactly one dial and
+// one recorded header to check.
+func TestConnectProbesWithTheRetryableCapabilityFirst(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	headers := node.authHeadersSeen()
+	if len(headers) != 1 {
+		t.Fatalf("authHeadersSeen() = %v, want exactly 1 header", headers)
+	}
+	if !strings.HasSuffix(headers[0], " T R") {
+		t.Fatalf("A header = %q, want a trailing \" T R\"", headers[0])
+	}
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (the R capability was accepted outright)", got)
+	}
+}
+
+// TestConnectFallsBackFromRetryableCapabilityToTaggedOnly: a server that
+// understands issue #47's `T` but predates issue #125's `R` rejects
+// `A <len> T R` as a parse error and closes without replying; the client
+// must fall back one stage, to `A <len> T`, and run tagged (not all the
+// way to the untagged form) — the front-of-chain fallback stage in
+// isolation, distinct from TestConnectFallsBackToTheUntaggedProtocolAgainstALegacyServer's
+// fully-legacy server.
+func TestConnectFallsBackFromRetryableCapabilityToTaggedOnly(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true, closeOnRetryableCapability: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v, want \"v\", true, nil", value, ok, err)
+	}
 	if got := node.connectionCount.Load(); got != 2 {
-		t.Fatalf("connectionCount = %d, want 2 (extended attempt + plain fallback)", got)
+		t.Fatalf("connectionCount = %d, want 2 (T R attempt + T fallback)", got)
+	}
+	headers := node.authHeadersSeen()
+	if len(headers) != 2 {
+		t.Fatalf("authHeadersSeen() = %v, want 2 headers", headers)
+	}
+	if !strings.HasSuffix(headers[0], " T R") {
+		t.Fatalf("first A header = %q, want a trailing \" T R\"", headers[0])
+	}
+	if !strings.HasSuffix(headers[1], " T") || strings.HasSuffix(headers[1], " T R") {
+		t.Fatalf("second A header = %q, want a trailing \" T\" (not \" T R\")", headers[1])
+	}
+}
+
+// TestRetryableStatusTransparentlyRetriesOnTheSameConnection: a single
+// `R` answers a request, then a second attempt succeeds — the retry must
+// be invisible to the caller (the op just succeeds), happen on the same
+// connection (no redial), and bump Stats().TransientRetries by exactly 1
+// (issue #125).
+func TestRetryableStatusTransparentlyRetriesOnTheSameConnection(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	node.answerRetryableTimes(1)
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatalf("Set() with one R = %v, want it to transparently succeed", err)
+	}
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get() = %q, %v, %v, want \"v\", true, nil", value, ok, err)
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (the R retry must not redial)", got)
+	}
+	// One S that drew R, one S retry, one G: 3 data requests total.
+	if got := node.dataRequestsReceived(); got != 3 {
+		t.Fatalf("dataRequestsReceived() = %d, want 3 (1 failed S + 1 retried S + 1 G)", got)
+	}
+	if got := client.Stats().TransientRetries; got != 1 {
+		t.Fatalf("Stats().TransientRetries = %d, want 1", got)
+	}
+}
+
+// TestRetryableStatusExhaustsToRetryableErrorButLeavesTheConnectionUsable:
+// 3 straight `R` answers exhaust the bounded retry budget (2 retries) —
+// the op must surface ErrRetryable, WITHOUT closing or re-dialing the
+// connection, which must still serve a following op normally (issue
+// #125).
+func TestRetryableStatusExhaustsToRetryableErrorButLeavesTheConnectionUsable(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	node.answerRetryableTimes(3)
+	err = client.Set("k", "v", 0)
+	if err == nil || !errors.Is(err, ErrRetryable) {
+		t.Fatalf("Set() with 3 R = %v, want ErrRetryable", err)
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (exhausting the retry budget must not redial)", got)
+	}
+	if got := node.dataRequestsReceived(); got != 3 {
+		t.Fatalf("dataRequestsReceived() = %d, want 3 (the bounded budget: 1 attempt + 2 retries)", got)
+	}
+	if got := client.Stats().TransientRetries; got != 3 {
+		t.Fatalf("Stats().TransientRetries = %d, want 3", got)
+	}
+
+	// The same connection still works for a following op.
+	if err := client.Set("k", "v2", 0); err != nil {
+		t.Fatalf("Set() after ErrRetryable = %v, want it to succeed", err)
+	}
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v2" {
+		t.Fatalf("Get() after ErrRetryable = %q, %v, %v, want \"v2\", true, nil", value, ok, err)
+	}
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (still the original connection)", got)
+	}
+}
+
+// TestRetryableStatusTaggedPairsWithTheRightPipelinedRequest: on a
+// tagged connection, an `R <tag>` reply must pair with the in-flight
+// request it actually answers, even with another request outstanding at
+// the same time (issue #125) — mirrors the tag-pairing coverage the
+// existing echoed-response-tags tests give V/S/D/N/W/C.
+func TestRetryableStatusTaggedPairsWithTheRightPipelinedRequest(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	node.delaySets(20 * time.Millisecond) // keeps the S outstanding while the G below is also in flight
+	result, err := connectAndIdentify(node.address(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.tagged {
+		t.Fatal("expected the mock node to negotiate tags")
+	}
+	conn := newConnection(result.conn, func() {}, result.tagged, nil)
+	defer conn.close()
+
+	node.answerRetryableTimes(1) // consumed by whichever data request reaches the server first
+
+	type setResult struct{ err error }
+	type getResult struct {
+		value []byte
+		ok    bool
+		err   error
+	}
+	setCh := make(chan setResult, 1)
+	go func() {
+		err := conn.set([]byte("k"), []byte("v"), -1)
+		setCh <- setResult{err}
+	}()
+	time.Sleep(5 * time.Millisecond) // let the S claim the queued R and hit the wire first
+	getCh := make(chan getResult, 1)
+	go func() {
+		value, ok, err := conn.get([]byte("other"))
+		getCh <- getResult{value, ok, err}
+	}()
+
+	set := <-setCh
+	get := <-getCh
+	if set.err != nil {
+		t.Fatalf("set() = %v, want the R to have been transparently retried", set.err)
+	}
+	if get.err != nil || get.ok {
+		t.Fatalf("get() = %v, %v, %v, want a clean miss (not desynced by the R)", get.value, get.ok, get.err)
+	}
+	if conn.isClosed() {
+		t.Fatal("expected the connection to remain open")
+	}
+	if got := node.dataRequestsReceived(); got != 3 {
+		t.Fatalf("dataRequestsReceived() = %d, want 3 (1 failed S + 1 retried S + 1 G)", got)
 	}
 }
 

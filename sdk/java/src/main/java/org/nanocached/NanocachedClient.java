@@ -311,9 +311,19 @@ public final class NanocachedClient implements AutoCloseable {
      * silently the way an ignored {@code CompletableFuture.whenComplete}
      * error previously could (issue: audit finding). Also logged to
      * stderr when it happens — see {@link #reportBackgroundWriteBug}.
+     * @param transientRetries every {@code R} (transient-failure, issue
+     * #125) response this client has received across every connection,
+     * including the final one on any request that went on to exhaust its
+     * bounded retry budget and raise {@link
+     * NanocachedException.RetryableError}. Unlike the other counters
+     * here, a transient retry is never silently swallowed on its own — a
+     * request either transparently succeeds after one or more, or the
+     * caller sees {@code RetryableError} — this counter exists purely so
+     * an operator can see how often it's happening even when every
+     * individual occurrence resolved fine.
      */
     public record ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures,
-            long backgroundWriteBugs) {}
+            long backgroundWriteBugs, long transientRetries) {}
 
     private static final int DEFAULT_COMPRESSION_THRESHOLD = 256;
 
@@ -476,6 +486,11 @@ public final class NanocachedClient implements AutoCloseable {
     private final AtomicLong readRepairFailures = new AtomicLong();
     private final AtomicLong refreshFailures = new AtomicLong();
     private final AtomicLong backgroundWriteBugs = new AtomicLong();
+    /** Issue #125: every {@code R} (transient-failure) response any
+     * {@link Connection} this client owns has received — wired into each
+     * one via {@link #newTrackedConnection}'s {@code onTransientRetry}
+     * callback. See {@link ClientStats#transientRetries()}. */
+    private final AtomicLong transientRetries = new AtomicLong();
     private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
     // The permit count backgroundReplicaWritePermits was built with,
     // captured so close() can acquire exactly all of them even if a test
@@ -1119,7 +1134,7 @@ public final class NanocachedClient implements AutoCloseable {
     public ClientStats stats() {
         return new ClientStats(
                 replicaWriteFailures.get(), readRepairFailures.get(), refreshFailures.get(),
-                backgroundWriteBugs.get());
+                backgroundWriteBugs.get(), transientRetries.get());
     }
 
     /** Inspects a background replica write's ({@code fireAndForgetReplicas},
@@ -2334,7 +2349,8 @@ public final class NanocachedClient implements AutoCloseable {
     private Connection newTrackedConnection(Socket socket, boolean tagged) throws IOException {
         trackOpenTarget(targetKey);
         try {
-            return new Connection(socket, tagged, () -> untrackOpenTarget(targetKey));
+            return new Connection(
+                    socket, tagged, () -> untrackOpenTarget(targetKey), transientRetries::incrementAndGet);
         } catch (IOException | RuntimeException error) {
             untrackOpenTarget(targetKey);
             try {

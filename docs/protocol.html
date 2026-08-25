@@ -153,7 +153,8 @@ F &lt;tag&gt;\n</code></pre>
 <code>N &lt;tag&gt;\n</code>, <code>W &lt;tag&gt;\n</code>, and
 <code>C &lt;tag&gt;\n</code>;
 <code>B\n</code> stays bare (it is unsolicited, sent before
-authentication). Tagged mode is per connection and entirely opt-in — a
+authentication); a retryable error is <code>R &lt;tag&gt;\n</code> (see
+below). Tagged mode is per connection and entirely opt-in — a
 plain <code>A</code> keeps every frame exactly as documented above. See
 Echoed response tags
 for the design.</p>
@@ -171,6 +172,17 @@ for the design.</p>
     node's own view of membership it does not own this key, so the
     client's routing table is stale. SDKs respond by refreshing the node
     list and retrying once.</td></tr>
+    <tr><td><code>R\n</code></td><td>Retryable error (issue #125): this
+    one request failed transiently — an upstream briefly unreachable
+    behind <code>nanocached-proxy</code>, typically — and should be
+    retried shortly <em>on the same connection</em>; nothing is torn
+    down. Sent only to clients that declared the capability by
+    appending <code>R</code> to their <code>A</code> frame
+    (<code>A &lt;len&gt; [T] R</code>); legacy clients keep getting the
+    fatal <code>E</code>-and-close. Tagged connections receive
+    <code>R &lt;tag&gt;\n</code>. Today the proxy is the only emitter —
+    nodes and discovery accept the capability token but have no
+    transient per-request failure to report.</td></tr>
     <tr><td><code>E\n</code></td><td>Error — authentication required or
     failed, or the request was malformed. Usually followed by the server
     closing the connection.</td></tr>

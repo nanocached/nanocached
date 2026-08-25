@@ -47,8 +47,27 @@ public sealed class MockNode : IDisposable
     /// the suite keeps exercising the legacy untagged path.</summary>
     private readonly bool _supportTags;
     /// <summary>Behave like a legacy pre-tag server: an extended `A ... T`
-    /// is a parse error — close the connection without replying.</summary>
+    /// (or `A ... T R`) is a parse error — close the connection without
+    /// replying.</summary>
     private readonly bool _closeOnExtendedAuth;
+    /// <summary>issue #125: behave like a server that understands `T` but
+    /// predates the `R` capability token — accepts a plain `A ... T`
+    /// exactly like <see cref="_supportTags"/> would, but treats the
+    /// longer `A ... T R` as a parse error and closes without replying.
+    /// Exercises the SDK's middle fallback stage (extended-with-R ->
+    /// extended-tags-only). Requires <see cref="_supportTags"/> to also be
+    /// set, or there is no `T`-only form for the SDK to fall back
+    /// to.</summary>
+    private readonly bool _closeOnRetryableAuth;
+    /// <summary>issue #125: the exact `A` header line (everything up to,
+    /// not including, the trailing '\n' — the secret bytes that follow are
+    /// never part of it) this mock most recently received, letting a test
+    /// assert the probe form a connect actually sent (e.g. `"A 1 T R"`).
+    /// Volatile: written on the mock's own accept-loop thread, read from
+    /// the test thread after the SDK call that triggered it has already
+    /// completed.</summary>
+    public string? LastAuthHeader => _lastAuthHeader;
+    private volatile string? _lastAuthHeader;
     private int _connectionCount;
     private int _getCount;
     private int _wrongNodeReplies;
@@ -66,6 +85,11 @@ public sealed class MockNode : IDisposable
     private int _clearRequestCount;
     private int _clearAllRequestCount;
     private int _failClearReplies;
+    /// <summary>issue #125: how many of the NEXT data requests (any of
+    /// G/S/D/g/s/d/c/F) get answered `R` (tagged correctly for the
+    /// connection they arrived on) instead of their normal reply — set via
+    /// <see cref="AnswerRetryableTimes"/>.</summary>
+    private int _retryableReplies;
     /// <summary>J1/D1: when set, every accepted connection is wrapped in
     /// an <see cref="SslStream"/> presenting this certificate before the
     /// A/G/S/D protocol loop runs — everything past the handshake is
@@ -77,12 +101,14 @@ public sealed class MockNode : IDisposable
         string? requiredSecret = null,
         bool supportTags = false,
         bool closeOnExtendedAuth = false,
+        bool closeOnRetryableAuth = false,
         X509Certificate2? serverCertificate = null,
         int port = 0)
     {
         _requiredSecret = requiredSecret is null ? null : Encoding.UTF8.GetBytes(requiredSecret);
         _supportTags = supportTags;
         _closeOnExtendedAuth = closeOnExtendedAuth;
+        _closeOnRetryableAuth = closeOnRetryableAuth;
         _serverCertificate = serverCertificate;
         // port = 0 (the default) picks any free port, as before; a
         // caller that needs to revive a node on a specific, previously
@@ -139,6 +165,13 @@ public sealed class MockNode : IDisposable
     /// first — for tests proving a caller isn't blocked on a slow replica
     /// leg (fire-and-forget replica writes).</summary>
     public void DelaySets(int millis) => _setDelayMillis = millis;
+
+    /// <summary>issue #125: the next <paramref name="count"/> data requests
+    /// this node receives (any of G/S/D/g/s/d/c/F, in arrival order, across
+    /// however many connections) are answered <c>R</c> — tagged correctly
+    /// when the connection they arrive on is tagged — instead of their
+    /// normal reply.</summary>
+    public void AnswerRetryableTimes(int count) => Interlocked.Add(ref _retryableReplies, count);
 
     /// <summary>issue #106: makes the next <c>c</c>/<c>F</c> request this
     /// node receives fail at the connection level — the request is read
@@ -236,7 +269,23 @@ public sealed class MockNode : IDisposable
                 {
                     case "A":
                     {
+                        // issue #125: record the exact header line (minus
+                        // the secret bytes, which follow separately) so a
+                        // test can assert the probe form a connect
+                        // actually sent — before any close-without-reply
+                        // branch below, since those are exactly the forms
+                        // a test needs to see were tried.
+                        _lastAuthHeader = string.Join(' ', parts);
+
                         if (parts.Length > 2 && _closeOnExtendedAuth)
+                        {
+                            client.Close();
+                            return;
+                        }
+                        // issue #125: predates the R token specifically —
+                        // `A <len> T R` (4 fields) is a parse error, but
+                        // `A <len> T` (3 fields, or fewer) is fine.
+                        if (parts.Length > 3 && _closeOnRetryableAuth)
                         {
                             client.Close();
                             return;
@@ -258,6 +307,15 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
                         }
                         if (_getDelayMillis > 0)
                         {
@@ -311,6 +369,15 @@ public sealed class MockNode : IDisposable
                         {
                             break; // half-open: frame consumed, never answered
                         }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
                         if (_setDelayMillis > 0)
                         {
                             await Task.Delay(_setDelayMillis);
@@ -338,6 +405,15 @@ public sealed class MockNode : IDisposable
                         {
                             break; // half-open: frame consumed, never answered
                         }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
                         if (TakeWrongNode())
                         {
                             await Wire.WriteAsync(stream, $"W{tag}\n");
@@ -364,6 +440,15 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
                         }
                         if (_getDelayMillis > 0)
                         {
@@ -419,6 +504,15 @@ public sealed class MockNode : IDisposable
                         {
                             break; // half-open: frame consumed, never answered
                         }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
                         if (_setDelayMillis > 0)
                         {
                             await Task.Delay(_setDelayMillis);
@@ -442,6 +536,15 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
                         }
                         if (TakeWrongNode())
                         {
@@ -470,6 +573,15 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
                         }
                         if (TakeOne(ref _failClearReplies))
                         {
@@ -502,6 +614,15 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #125: answered before any other
+                        // failure-injection check — a retryable-status test
+                        // doesn't need to reason about interaction with the
+                        // rest of this mock's hooks.
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
                         }
                         if (TakeOne(ref _failClearReplies))
                         {

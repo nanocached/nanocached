@@ -360,6 +360,27 @@ catch clause covers "an expected nanocached failure". Caller mistakes
 instead: they indicate a bug in the calling code, not a nanocached
 failure, a convention shared across the SDKs (issue #47).
 
+### Retryable errors and `transient_retries`
+
+`nanocached-proxy` may answer a request `R` instead of its usual reply
+when the request specifically failed transiently (e.g. its upstream node
+was briefly unreachable) — the connection itself is fine. This SDK
+handles `R` transparently: it retries the same request on the same
+connection up to twice more (three attempts total, 50ms then 100ms
+apart) before the caller ever sees anything. Only if the third attempt
+still answers `R` does the call fail, with `RetryableException` — the
+connection is never closed or redialed for this (`R` is not a connection
+error) and stays usable for the next operation.
+
+Every `R` a connection receives — whether retried away transparently or
+not — is counted in `client.Stats().TransientRetries`, alongside the
+other swallowed-failure counters (`ReplicaWriteFailures`,
+`ReadRepairFailures`, `RefreshFailures`). Nodes and discovery servers
+accept the capability but never send `R` today; only
+`nanocached-proxy` does, so this mainly matters in [SDK proxy
+mode](#sdk-proxy-mode) — but the SDK handles it on every connection
+regardless.
+
 ## Build
 
 ```sh

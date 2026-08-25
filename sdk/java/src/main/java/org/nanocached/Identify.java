@@ -63,6 +63,29 @@ final class Identify {
         return connectAndIdentify(host, port, authSecret, tls, false);
     }
 
+    /** The extended {@code A} capability tokens this client asks for,
+     * from most to least capable — fixed wire order {@code [T] [R]}
+     * (issue #125's retryable-error probe is layered in front of the
+     * existing {@code T} probe, not a new mechanism of its own). {@link
+     * #connectAndIdentify} starts at {@link #FULL} and steps back one
+     * stage at a time on the legacy-server signal: a server that predates
+     * a token it was sent treats the whole extended {@code A} as a parse
+     * error and closes without replying, rather than rejecting just the
+     * unrecognized token. */
+    private enum ProbeStage {
+        FULL(true, true), // "A <len> T R"
+        TAGS_ONLY(true, false), // "A <len> T"
+        LEGACY(false, false); // "A <len>"
+
+        final boolean requestTags;
+        final boolean requestRetryCapability;
+
+        ProbeStage(boolean requestTags, boolean requestRetryCapability) {
+            this.requestTags = requestTags;
+            this.requestRetryCapability = requestRetryCapability;
+        }
+    }
+
     /** As {@link #connectAndIdentify(String, int, byte[], SSLContext)}, but
      * when {@code host:port} identifies as a discovery server, fetches its
      * proxy roster (`Q`, SDK proxy mode issue #122) instead of its node
@@ -76,18 +99,26 @@ final class Identify {
     static Result connectAndIdentify(
             String host, int port, byte[] authSecret, SSLContext tls, boolean listProxies) throws IOException {
         try {
-            return identifyOnce(host, port, authSecret, tls, true, listProxies);
+            return identifyOnce(host, port, authSecret, tls, ProbeStage.FULL, listProxies);
         } catch (LegacyServerSignal signal) {
-            // Echoed response tags transparent fallback: a pre-0019 server treats the
-            // extended `A ... T` as a parse error and closes/resets
-            // without replying — redial once with the plain form and run
-            // the connection untagged (the pre-0019 behavior).
-            return identifyOnce(host, port, authSecret, tls, false, listProxies);
+            try {
+                // Echoed response tags transparent fallback, stage 1: a server that
+                // predates the `R` capability token (issue #125) treats
+                // the doubly-extended `A ... T R` as a parse error and
+                // closes/resets without replying — redial once with just
+                // `T` and see whether it understands that.
+                return identifyOnce(host, port, authSecret, tls, ProbeStage.TAGS_ONLY, listProxies);
+            } catch (LegacyServerSignal signal2) {
+                // Stage 2: a pre-0019 server treats even the plain `T`
+                // extension as a parse error — fall all the way back to
+                // the original untagged form.
+                return identifyOnce(host, port, authSecret, tls, ProbeStage.LEGACY, listProxies);
+            }
         }
     }
 
     private static Result identifyOnce(
-            String host, int port, byte[] authSecret, SSLContext tls, boolean requestTags, boolean listProxies)
+            String host, int port, byte[] authSecret, SSLContext tls, ProbeStage stage, boolean listProxies)
             throws IOException {
         Socket socket = open(host, port, tls);
         try {
@@ -96,19 +127,23 @@ final class Identify {
 
             AuthIdentity identity;
             try {
-                out.write(("A " + secret.length + (requestTags ? " T" : "") + "\n")
+                out.write(("A " + secret.length
+                                + (stage.requestTags ? " T" : "")
+                                + (stage.requestRetryCapability ? " R" : "")
+                                + "\n")
                         .getBytes(StandardCharsets.US_ASCII));
                 out.write(secret);
                 out.flush();
                 identity = readIdentity(socket.getInputStream());
             } catch (IOException error) {
-                // Only the extended attempt is worth retrying untagged —
-                // a failure while already running untagged is a real
-                // failure. A read timeout is not a legacy-server signal
-                // either: the server kept the connection open, it just
-                // didn't answer (issue #40) — retrying it untagged would
-                // only hang another CONNECT_TIMEOUT_MS.
-                boolean legacyShaped = requestTags && !(error instanceof java.io.InterruptedIOException);
+                // Only an extended attempt is worth stepping back a stage
+                // for — a failure while already running the plain (LEGACY)
+                // form is a real failure. A read timeout is not a
+                // legacy-server signal either: the server kept the
+                // connection open, it just didn't answer (issue #40) —
+                // stepping back a stage would only hang another
+                // CONNECT_TIMEOUT_MS.
+                boolean legacyShaped = stage.requestTags && !(error instanceof java.io.InterruptedIOException);
                 throw legacyShaped ? new LegacyServerSignal(error) : error;
             }
 

@@ -53,6 +53,24 @@ struct NodeState {
     /// Echoed response tags: behave like a pre-0019 server — an extended `A ... T` is
     /// a parse error, so close the connection without replying.
     close_on_extended_auth: bool,
+    /// Retryable-error status `R` (issue #125): behave like a server that
+    /// understands the pre-#125 extended `A ... T` but not the trailing
+    /// `R` capability token — an `A` header with more than 3 fields (i.e.
+    /// carrying `R`) is a parse error, closed without replying; `A <len>
+    /// T` alone is accepted normally. Exercises the new fallback stage on
+    /// its own, distinct from `close_on_extended_auth`'s "rejects `T` at
+    /// all" (a genuinely pre-0019 server).
+    close_on_retryable_auth: bool,
+    /// Every request header this node has ever received for `A` — so
+    /// tests can assert the exact probe form(s) a connect dialed, in
+    /// order (issue #125).
+    auth_headers: Mutex<Vec<String>>,
+    /// Answer the next N data requests (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`)
+    /// with `R` instead of processing them (issue #125's retryable-error
+    /// status) — tagged correctly when the connection negotiated tags.
+    /// The request is not otherwise acted on: a swallowed `S` does not
+    /// store, a swallowed `D` does not delete, and so on.
+    retryable_replies: AtomicUsize,
     /// Swallow the next `G` entirely (no reply) — the off-by-one stream
     /// desync where every later response answers the previous request.
     swallow_get_replies: AtomicUsize,
@@ -166,7 +184,11 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
         };
         match parts[0] {
             "A" => {
+                state.auth_headers.lock().unwrap().push(header.clone());
                 if parts.len() > 2 && state.close_on_extended_auth {
+                    return;
+                }
+                if parts.len() > 3 && state.close_on_retryable_auth {
                     return;
                 }
 
@@ -237,6 +259,16 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     }
                     continue;
                 }
+                if take_one(&state.retryable_replies) {
+                    // Retryable-error status `R` (issue #125): this
+                    // request failed transiently — not stored/fetched,
+                    // just answered `R` — the connection stays open.
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let reply = if take_wrong_node(&state) {
                     format!("W{tag_suffix}\n").into_bytes()
                 } else {
@@ -280,6 +312,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                 }
                 *state.last_set_header.lock().unwrap() = Some(header.clone());
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let reply = if take_one(&state.set_wrong_node_replies) || take_wrong_node(&state) {
                     format!("W{tag_suffix}\n")
                 } else {
@@ -321,6 +360,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     // refresh-and-retry path has something to exercise.
                     return;
                 }
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if parts[0] == "c" {
                     let mut namespaces = state.store_namespaces.lock().unwrap();
                     let mut store = state.store.lock().unwrap();
@@ -345,6 +391,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
             "D" | "d" => {
                 let (namespace, key) = read_ns_and_key(&mut stream, &parts, parts[0] == "d").await;
                 if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
                     continue;
                 }
                 let reply = if take_wrong_node(&state) {
@@ -2888,6 +2941,81 @@ async fn a_response_echoing_the_wrong_tag_poisons_the_connection() {
     node.stop();
 }
 
+// ── 一時的失敗ステータス R (issue #125) ──────────────────────────────
+
+#[tokio::test]
+async fn a_retryable_reply_once_then_success_retries_transparently() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    node.state.retryable_replies.fetch_add(1, Ordering::SeqCst);
+    let value = client.get("k").await.unwrap();
+
+    assert_eq!(value, Some("v".to_string()));
+    // Exactly one retry happened on the same connection — no redial.
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(client.stats().transient_retries, 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_retryable_reply_three_times_in_a_row_raises_retryable_but_keeps_the_connection() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    // Up to 2 retries (3 attempts total): three `R` replies in a row
+    // exhausts the bounded retry.
+    node.state.retryable_replies.fetch_add(3, Ordering::SeqCst);
+    let result = client.get("k").await;
+    assert!(
+        matches!(result, Err(Error::Retryable(_))),
+        "{result:?}, want Err(Error::Retryable(_))"
+    );
+    assert_eq!(client.stats().transient_retries, 3);
+    // Never redialed, never closed — R is not a connection error.
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+
+    // The same connection still serves a following op successfully.
+    let value = client.get("k").await.unwrap();
+    assert_eq!(value, Some("v".to_string()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_retryable_reply_pairs_with_the_right_request_on_a_tagged_connection_under_pipelining() {
+    // Tagged mode: whichever of two concurrently pipelined requests the
+    // mock answers `R` for must retry and resolve on its own — the other,
+    // unrelated request must be entirely unaffected, and the tag on the
+    // retried request's fresh attempt must still land on the right
+    // caller.
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("a", "1", 0).await.unwrap();
+    client.set("b", "2", 0).await.unwrap();
+
+    node.state.retryable_replies.fetch_add(1, Ordering::SeqCst);
+    let (a, b) = tokio::join!(client.get("a"), client.get("b"));
+
+    assert_eq!(a.unwrap(), Some("1".to_string()));
+    assert_eq!(b.unwrap(), Some("2".to_string()));
+    assert_eq!(client.stats().transient_retries, 1);
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
 // ── アドレスごとの再接続クールダウン ────────────────────────────────
 
 #[tokio::test]
@@ -3109,9 +3237,10 @@ async fn disable_reconnect_cooldown_redials_immediately() {
 
 #[tokio::test]
 async fn falls_back_to_the_untagged_protocol_against_a_pre_0019_server() {
-    // An old server treats `A ... T` as a parse error and closes without
-    // replying; the client must redial once with the plain form and run
-    // untagged — transparently, with the same results.
+    // An old server treats any extended `A` (`T R` or `T` alone) as a
+    // parse error and closes without replying; the client must fall all
+    // the way back to the plain form and run untagged — transparently,
+    // with the same results.
     let node = MockNode::start_with(NodeState {
         close_on_extended_auth: true,
         ..NodeState::default()
@@ -3121,10 +3250,54 @@ async fn falls_back_to_the_untagged_protocol_against_a_pre_0019_server() {
 
     client.set("k", "v", 0).await.unwrap();
     assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
-    // Two dials: the extended attempt the server slammed shut, then the
-    // plain fallback that stuck.
-    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+    // Three dials (issue #125): `A <len> T R` slammed shut, then
+    // `A <len> T` also slammed shut, then the plain fallback that stuck.
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        *node.state.auth_headers.lock().unwrap(),
+        vec!["A 1 T R", "A 1 T", "A 1"],
+    );
 
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn falls_back_to_tags_only_against_a_server_that_predates_the_r_capability() {
+    // A server that understands the pre-#125 extended `A ... T` but not
+    // the trailing `R` capability token closes only on the `T R` form —
+    // the client must retry with `A <len> T` and run tagged, without
+    // falling all the way back to plain (issue #125's own new fallback
+    // stage, one in front of the pre-existing `T`/plain one above).
+    let node = MockNode::start_with(NodeState {
+        close_on_retryable_auth: true,
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    // Two dials: `A <len> T R` slammed shut, then `A <len> T` that stuck.
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *node.state.auth_headers.lock().unwrap(),
+        vec!["A 1 T R", "A 1 T"],
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn the_connect_probe_sends_the_extended_t_r_form_first() {
+    // Every connection this SDK dials asks for both capabilities up
+    // front (issue #125's own probe requirement) — a plain, fully
+    // up-to-date mock records exactly one auth header, the extended one.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    assert_eq!(*node.state.auth_headers.lock().unwrap(), vec!["A 1 T R"]);
     client.close().await;
     node.stop();
 }
@@ -3457,6 +3630,38 @@ async fn via_proxy_fails_over_to_the_second_discovery_seed_when_the_first_is_war
     client.close().await;
     first.stop();
     second.stop();
+    proxy.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_retries_transparently_on_a_retryable_reply() {
+    // The R path (issue #125) works the same over a proxy connection —
+    // one test is enough, since via_proxy is single-connection just like
+    // single-node mode from Connection's point of view.
+    let proxy = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy.address())],
+    )
+    .await;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    proxy.state.retryable_replies.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+    assert_eq!(client.stats().transient_retries, 1);
+    assert_eq!(proxy.state.connections.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    discovery.stop();
     proxy.stop();
 }
 

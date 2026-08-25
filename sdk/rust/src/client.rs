@@ -207,16 +207,28 @@ pub struct Stats {
     pub replica_write_failures: u64,
     pub read_repair_failures: u64,
     pub refresh_failures: u64,
+    /// Retryable-error status `R` (issue #125): every `R` this client has
+    /// ever received across every connection it has opened — including
+    /// ones already superseded by a later redial — whether or not that
+    /// particular request went on to succeed once retried transparently.
+    /// See [`Error::Retryable`] for the case where the bounded retry
+    /// itself was exhausted.
+    pub transient_retries: u64,
 }
 
 /// The live, atomically-updated counters [`NanocachedClient::stats`]
 /// snapshots into a [`Stats`]; kept separate so the atomic types stay an
 /// implementation detail of `Inner`.
-#[derive(Default)]
 struct StatsCounters {
     replica_write_failures: AtomicU64,
     read_repair_failures: AtomicU64,
     refresh_failures: AtomicU64,
+    /// Shared verbatim (the same `Arc`, not a copy) with every
+    /// [`Connection`] this client ever opens — see `Connection::new`'s
+    /// `transient_retries` parameter and its own field doc comment for
+    /// why a plain `AtomicU64` here wouldn't be reachable from
+    /// `connection.rs`'s retry loop.
+    transient_retries: Arc<AtomicU64>,
 }
 
 /// Options for [`NanocachedClient::connect`].
@@ -650,6 +662,7 @@ async fn connect_via_proxy(
     addresses: &[(String, u16)],
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
+    transient_retries: &Arc<AtomicU64>,
 ) -> Result<(Target, String)> {
     let mut last_error: Option<Error> = None;
 
@@ -708,7 +721,12 @@ async fn connect_via_proxy(
                     )));
                     continue;
                 };
-                let connection = Arc::new(Connection::new(stream, key.clone(), tagged));
+                let connection = Arc::new(Connection::new(
+                    stream,
+                    key.clone(),
+                    tagged,
+                    Arc::clone(transient_retries),
+                ));
                 return Ok((
                     Target::Single {
                         address,
@@ -840,6 +858,12 @@ impl NanocachedClient {
         // exactly the cooldown a mid-life redial failure would leave
         // behind. Folded into `Inner::reconnect_cooldowns` once it exists.
         let mut initial_cooldowns: HashMap<String, (Instant, Error)> = HashMap::new();
+        // Retryable-error status `R` (issue #125): one counter, shared
+        // (the same `Arc`, never re-created) with every connection this
+        // client will ever open, initial ones included — see
+        // `Connection::new`'s `transient_retries` parameter and
+        // `StatsCounters::transient_retries`'s own doc comment.
+        let transient_retries = Arc::new(AtomicU64::new(0));
 
         if options.via_proxy {
             // SDK proxy mode (issue #122): a wholly different connect
@@ -848,8 +872,13 @@ impl NanocachedClient {
             // so it gets its own function entirely rather than being
             // threaded through the node/cluster loop below. See
             // `connect_via_proxy`'s own doc comment.
-            let (proxy_target, key) =
-                connect_via_proxy(&options.addresses, auth_secret, tls.as_ref()).await?;
+            let (proxy_target, key) = connect_via_proxy(
+                &options.addresses,
+                auth_secret,
+                tls.as_ref(),
+                &transient_retries,
+            )
+            .await?;
             target = Some(proxy_target);
             tracking_key = key;
         } else {
@@ -894,7 +923,12 @@ impl NanocachedClient {
                         }
                         target = Some(Target::Single {
                             address: key.clone(),
-                            connection: Arc::new(Connection::new(stream, key.clone(), tagged)),
+                            connection: Arc::new(Connection::new(
+                                stream,
+                                key.clone(),
+                                tagged,
+                                Arc::clone(&transient_retries),
+                            )),
                         });
                         tracking_key = key;
                         break;
@@ -943,6 +977,7 @@ impl NanocachedClient {
                                                 stream,
                                                 key.clone(),
                                                 tagged,
+                                                Arc::clone(&transient_retries),
                                             )),
                                         },
                                     );
@@ -1076,7 +1111,16 @@ impl NanocachedClient {
             read_repair: options.read_repair,
             read_hedge_after: options.read_hedge_after,
             hedged_reads: Mutex::new(tokio::task::JoinSet::new()),
-            stats: StatsCounters::default(),
+            stats: StatsCounters {
+                replica_write_failures: AtomicU64::new(0),
+                read_repair_failures: AtomicU64::new(0),
+                refresh_failures: AtomicU64::new(0),
+                // The exact same `Arc` every connection created above
+                // (initial dials) already shares — not a fresh counter —
+                // so retries that happened before `Inner` even existed
+                // still show up in `stats()`.
+                transient_retries,
+            },
             via_proxy: options.via_proxy,
         });
 
@@ -1149,6 +1193,7 @@ impl NanocachedClient {
                 .read_repair_failures
                 .load(Ordering::Relaxed),
             refresh_failures: self.inner.stats.refresh_failures.load(Ordering::Relaxed),
+            transient_retries: self.inner.stats.transient_retries.load(Ordering::Relaxed),
         }
     }
 
@@ -2011,6 +2056,7 @@ impl NanocachedClient {
             stream,
             self.inner.tracking_key.clone(),
             tagged,
+            Arc::clone(&self.inner.stats.transient_retries),
         ));
 
         let mut state = self.inner.state.lock().await;
@@ -2245,6 +2291,7 @@ impl NanocachedClient {
             stream,
             self.inner.tracking_key.clone(),
             tagged,
+            Arc::clone(&self.inner.stats.transient_retries),
         ));
 
         let mut state = self.inner.state.lock().await;

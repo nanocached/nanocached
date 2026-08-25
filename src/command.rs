@@ -11,6 +11,15 @@ pub enum Command {
         /// Echoed response tags: the client sent `A <len> T\n` — it wants response
         /// tags echoed on this connection's `G`/`S`/`D` replies.
         tagging: bool,
+        /// Issue #125: the client sent the trailing `R` — it understands
+        /// the retryable-error status, so a server may answer a
+        /// transiently failed request `R` (+tag) instead of the fatal
+        /// `E`-and-close, and only on such connections. The node itself
+        /// currently has no transient per-request failure to report and
+        /// never emits `R`; it accepts and records the token so the
+        /// negotiation is uniform across node, proxy, and discovery
+        /// (the proxy is the emitter today).
+        retry_capable: bool,
     },
     Get {
         key: Key,
@@ -292,12 +301,27 @@ fn parse_with_mode(
 
             // Echoed response tags: an optional literal `T` requests tagged mode.
             // Accepted regardless of the connection's current mode, since
-            // this is the field that *establishes* the mode.
-            let tagging = match parts.next() {
-                None => false,
-                Some(b"T") => true,
+            // this is the field that *establishes* the mode. An optional
+            // trailing `R` (issue #125) declares that this client
+            // understands the retryable-error status — a server may then
+            // answer a failed request `R` instead of the fatal
+            // `E`-and-close. Order is fixed (`[T] [R]`), matching how the
+            // SDKs probe capabilities in one deterministic frame.
+            let mut tagging = false;
+            let mut retry_capable = false;
+            match parts.next() {
+                None => {}
+                Some(b"T") => {
+                    tagging = true;
+                    match parts.next() {
+                        None => {}
+                        Some(b"R") => retry_capable = true,
+                        Some(_) => return Err(ParseError::InvalidCommand),
+                    }
+                }
+                Some(b"R") => retry_capable = true,
                 Some(_) => return Err(ParseError::InvalidCommand),
-            };
+            }
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -321,7 +345,14 @@ fn parse_with_mode(
             let frame = input.split_to(secret_end).freeze();
             let secret = frame.slice(secret_start..secret_end);
 
-            Ok((Command::Auth { secret, tagging }, None))
+            Ok((
+                Command::Auth {
+                    secret,
+                    tagging,
+                    retry_capable,
+                },
+                None,
+            ))
         }
 
         // Namespaced variants (issue #105): the lowercase letter carries
@@ -825,9 +856,47 @@ mod tests {
             Ok(Command::Auth {
                 secret: Bytes::from_static(b"secret"),
                 tagging: false,
+                retry_capable: false,
             })
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_auth_command_with_retry_capability() {
+        // Issue #125: `[T] [R]` in that order; `R` alone is valid too.
+        let mut input = buf(b"A 6 T R\nsecret");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Auth {
+                secret: Bytes::from_static(b"secret"),
+                tagging: true,
+                retry_capable: true,
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"A 6 R\nsecret");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Auth {
+                secret: Bytes::from_static(b"secret"),
+                tagging: false,
+                retry_capable: true,
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn rejects_auth_capability_tokens_out_of_order_or_unknown() {
+        // `R` before `T` parses `R`, then trips the trailing-field
+        // check — a rejection either way, just via the length error.
+        let mut input = buf(b"A 6 R T\nsecret");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+
+        let mut input = buf(b"A 6 T X\nsecret");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
     }
 
     #[test]
@@ -839,6 +908,7 @@ mod tests {
             Ok(Command::Auth {
                 secret: Bytes::from_static(b"secret"),
                 tagging: true,
+                retry_capable: false,
             })
         );
         assert!(input.is_empty());
@@ -1052,6 +1122,7 @@ mod tests {
         let command = Command::Auth {
             secret: Bytes::from_static(b"secret"),
             tagging: false,
+            retry_capable: false,
         };
 
         let _ = command.execute(&mut cache);
@@ -1388,6 +1459,7 @@ mod tests {
                 Command::Auth {
                     secret: Bytes::from_static(b"secret"),
                     tagging: true,
+                    retry_capable: false,
                 },
                 None,
             ))

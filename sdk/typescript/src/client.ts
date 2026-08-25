@@ -8,7 +8,7 @@ import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
 import { checkKeyAndValue, EMPTY_NAMESPACE } from "./protocol.js";
 
-export { ConnectionLostError, WrongNodeError } from "./connection.js";
+export { ConnectionLostError, RetryableError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
 
@@ -67,6 +67,15 @@ export interface ClientStats {
    * (refreshNodeList/fetchNodeList) — discovery outages degrade only
    * topology updates, never already-established cache traffic. */
   refreshFailures: number;
+  /** Retryable-error status (issue #125): every `R` this client has
+   * received on any data command (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`),
+   * whether the transparent, bounded retry that followed it ultimately
+   * succeeded or exhausted into a `RetryableError`. Today only
+   * `nanocached-proxy` emits `R` — for a request whose upstream node was
+   * briefly unreachable and survived its own refresh-and-retry — but this
+   * counts it on any connection, since the SDK handles `R` uniformly
+   * regardless of what's on the other end. */
+  transientRetries: number;
 }
 
 export interface NanocachedAddress {
@@ -449,6 +458,13 @@ export class NanocachedClient {
   private replicaWriteFailures = 0;
   private readRepairFailures = 0;
   private refreshFailures = 0;
+  /** Retryable-error status (issue #125) — see ClientStats.transientRetries.
+   * Wired into every `Connection` this client ever opens: the handful
+   * created before this instance exists (the initial `connect()`/
+   * `connectViaProxy()` dial) via `Connection.setOnTransientRetry` right
+   * after construction, every later one (reconnects, refreshes) by
+   * passing the callback straight to `new Connection(...)`. */
+  private transientRetries = 0;
 
   /** The node(s) actually being talked to, by address (for display/
    * introspection — routing itself uses each node's name, not its
@@ -562,8 +578,15 @@ export class NanocachedClient {
         }
 
         trackOpenTarget(key, [identified.socket]);
-        return new NanocachedClient(
-          { kind: "single", connection: new Connection(identified.socket, identified.tagged) },
+        // Retryable-error status (issue #125): this connection is opened
+        // before the client instance exists, so `transientRetries` can't
+        // be closed over yet — wire it up right after construction
+        // instead (see the `transientRetries` field's doc comment). Safe
+        // because no `R` can arrive before then: identify traffic never
+        // produces one.
+        const connection = new Connection(identified.socket, identified.tagged);
+        const client = new NanocachedClient(
+          { kind: "single", connection },
           key,
           [key],
           addresses,
@@ -577,6 +600,8 @@ export class NanocachedClient {
           reconnectCooldownMs,
           options.readHedgeAfterMs,
         );
+        connection.setOnTransientRetry(() => client.transientRetries++);
+        return client;
       }
 
       if (identified.nodes.length === 0) {
@@ -664,6 +689,11 @@ export class NanocachedClient {
       for (const [address, cooldown] of cooldowns) {
         client.reconnectCooldowns.set(address, cooldown);
       }
+      // Retryable-error status (issue #125): same deferred wiring as the
+      // single-target branch above, one member connection at a time.
+      for (const member of members.values()) {
+        member.connection?.setOnTransientRetry(() => client.transientRetries++);
+      }
       return client;
     }
 
@@ -741,8 +771,11 @@ export class NanocachedClient {
 
         const key = targetKey(address);
         trackOpenTarget(key, [identified.socket]);
-        return new NanocachedClient(
-          { kind: "proxy", connection: new Connection(identified.socket, identified.tagged), address: proxy.address },
+        // Retryable-error status (issue #125): same deferred wiring as
+        // the plain-node branch of connect() above.
+        const connection = new Connection(identified.socket, identified.tagged);
+        const client = new NanocachedClient(
+          { kind: "proxy", connection, address: proxy.address },
           key,
           [proxy.address],
           addresses,
@@ -756,6 +789,8 @@ export class NanocachedClient {
           reconnectCooldownMs,
           options.readHedgeAfterMs,
         );
+        connection.setOnTransientRetry(() => client.transientRetries++);
+        return client;
       }
       // Every listed proxy was unreachable: unlike cluster bootstrap
       // (issue #67), a proxy target needs exactly one live connection to
@@ -841,6 +876,7 @@ export class NanocachedClient {
       replicaWriteFailures: this.replicaWriteFailures,
       readRepairFailures: this.readRepairFailures,
       refreshFailures: this.refreshFailures,
+      transientRetries: this.transientRetries,
     };
   }
 
@@ -1507,7 +1543,7 @@ export class NanocachedClient {
         }
 
         trackOpenTarget(this.url, [nodeIdentified.socket]);
-        members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged) });
+        members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged, () => this.transientRetries++) });
       } catch (error) {
         // Connecting to this new node failed — skip it silently and retry
         // on the next refresh (see the doc comment above), counted in
@@ -1663,7 +1699,7 @@ export class NanocachedClient {
       }
 
       trackOpenTarget(this.url, [identified.socket]);
-      this.target = { kind: "proxy", connection: new Connection(identified.socket, identified.tagged), address: proxy.address };
+      this.target = { kind: "proxy", connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++), address: proxy.address };
       this.nodeUrls = [proxy.address];
       this.lastNodeListFetch = Date.now();
       return;
@@ -1806,7 +1842,7 @@ export class NanocachedClient {
     }
 
     trackOpenTarget(this.url, [identified.socket]);
-    return new Connection(identified.socket, identified.tagged);
+    return new Connection(identified.socket, identified.tagged, () => this.transientRetries++);
   }
 
   /** See KEEPALIVE_TUNING. Each tick pings only

@@ -1474,7 +1474,19 @@ async fn handle_connection(
         }
 
         match parsed {
-            Ok((Command::Auth { secret, tagging }, _)) => {
+            Ok((
+                Command::Auth {
+                    secret,
+                    tagging,
+                    // Issue #125: accepted so the `A ... T R` probe
+                    // succeeds against a node without a fallback round
+                    // trip, but unused — the node has no transient
+                    // per-request failure to report and never emits `R`
+                    // (the proxy is the emitter today).
+                    retry_capable: _,
+                },
+                _,
+            )) => {
                 let accepted = match &config.auth_secret {
                     Some(expected) => constant_time_eq(&secret, expected),
                     None => true,

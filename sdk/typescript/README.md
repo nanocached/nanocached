@@ -344,6 +344,29 @@ connection, requests for its keys fail over per request exactly as they
 would after a mid-life death, and it is redialed after the cooldown. Only
 a cluster with no reachable node at all fails `connect()`.
 
+## Retryable-error status (`R`)
+
+A node or proxy may answer any data operation (`get`/`set`/`delete`/
+`clear`/`clearAll`) with a retryable-error status instead of the usual
+reply: the request itself failed transiently — e.g. a `nanocached-proxy`'s
+upstream node was briefly unreachable and stayed that way through the
+proxy's own refresh-and-retry — but the connection is fine. Today only
+`nanocached-proxy` emits this; the SDK handles it the same way on every
+connection regardless.
+
+The SDK retries such a request transparently, on the same connection: up
+to 2 retries (3 attempts total), sleeping 50ms before the first retry and
+100ms before the second. If the third attempt is still answered this way,
+the operation rejects with `RetryableError` — but the connection itself is
+never torn down or redialed over this, unlike every other error the SDK
+raises; it stays open and immediately usable for the next operation.
+Hedged reads (`readHedgeAfterMs`) need no special handling: a hedge leg
+that hits this follows the same bounded retry on its own connection.
+
+Every retry (whether it eventually succeeds or exhausts into
+`RetryableError`) is counted in `client.stats().transientRetries` — see
+[`client.stats()`](#api) below.
+
 ## API
 
 - `NanocachedClient.connect(options)` —
@@ -372,17 +395,24 @@ a cluster with no reachable node at all fails `connect()`.
   stays idempotent. Awaiting it is optional — un-awaited, teardown still
   happens once the drain settles
 - `client.nodeUrls` — addresses currently connected to (introspection)
+- `client.stats()` — a snapshot `ClientStats` of counters for failures and
+  events this client swallows or retries by design instead of raising
+  them to a caller: `replicaWriteFailures`, `readRepairFailures`,
+  `refreshFailures`, and `transientRetries` (every `R` received — see
+  [Retryable-error status](#retryable-error-status-r) above); each count
+  is monotonic for the lifetime of this client
 
 Every error the SDK itself raises — `AlreadyClosedError`,
-`WrongNodeError`, `ConnectionLostError`, `DecompressionError`,
-`DiscoveryBusyError`, and protocol/auth failures — extends the exported
-`NanocachedError` base class, so `error instanceof NanocachedError`
-distinguishes an expected nanocached failure from everything else. Node
-system errors from the socket itself (`ECONNREFUSED`, `ECONNRESET`, …)
-surface as-is, outside the family — and so do caller mistakes caught
-by argument validation (e.g. an invalid `ttlSeconds` throws a builtin
-`RangeError`): those indicate a bug in the calling code, not a
-nanocached failure, a convention shared across the SDKs (issue #47).
+`WrongNodeError`, `ConnectionLostError`, `RetryableError`,
+`DecompressionError`, `DiscoveryBusyError`, and protocol/auth failures —
+extends the exported `NanocachedError` base class, so `error instanceof
+NanocachedError` distinguishes an expected nanocached failure from
+everything else. Node system errors from the socket itself
+(`ECONNREFUSED`, `ECONNRESET`, …) surface as-is, outside the family — and
+so do caller mistakes caught by argument validation (e.g. an invalid
+`ttlSeconds` throws a builtin `RangeError`): those indicate a bug in the
+calling code, not a nanocached failure, a convention shared across the
+SDKs (issue #47).
 
 ## License
 

@@ -200,6 +200,36 @@ func TestViaProxyReconnectsToAnotherProxyOnLoss(t *testing.T) {
 	}
 }
 
+// TestViaProxyTransientRetryStatusWorksAgainstAProxy: issue #125's `R`
+// path isn't node-specific — a proxy connection retries transparently
+// the same way (spec: "one test is enough" for via_proxy coverage).
+func TestViaProxyTransientRetryStatusWorksAgainstAProxy(t *testing.T) {
+	proxy := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	discovery := startMockDiscovery(t, nil, 2)
+	discovery.setProxies([]discoveredNode{{Name: "proxy-a", Address: proxy.address()}})
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ViaProxy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	proxy.answerRetryableTimes(1)
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatalf("Set() with one R via proxy = %v, want it to transparently succeed", err)
+	}
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get() via proxy = %q, %v, %v, want \"v\", true, nil", value, ok, err)
+	}
+	if got := proxy.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (the R retry must not redial)", got)
+	}
+	if got := client.Stats().TransientRetries; got != 1 {
+		t.Fatalf("Stats().TransientRetries = %d, want 1", got)
+	}
+}
+
 func TestViaProxyHedgedReadOptionIsInert(t *testing.T) {
 	proxy := startMockNode(t, nil)
 	discovery := startMockDiscovery(t, nil, 2)

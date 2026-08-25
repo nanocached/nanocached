@@ -31,6 +31,16 @@ namespace Nanocached;
 /// the desync window an off-by-one stream corruption (e.g. a swallowed
 /// response) would otherwise leave open (the caller-side kind check in
 /// <see cref="Mismatch"/> only ever notices that after the fact).</para>
+///
+/// <para>issue #125 — retryable-error status <c>R</c>: any data command
+/// (G/S/D/g/s/d/c/F) may be answered <c>R</c> instead of its usual
+/// response — the request specifically failed transiently (e.g. a proxy's
+/// upstream node was briefly unreachable); the connection itself is fine.
+/// <see cref="RequestAsync"/> retries the SAME request transparently, up
+/// to twice more on this SAME connection, before ever surfacing anything
+/// to the caller — see its own doc comment. <c>R</c> is never a reason to
+/// close or redial: it is not a connection error, not a <c>W</c>, not an
+/// <c>E</c>.</para>
 /// </summary>
 internal sealed class Connection
 {
@@ -67,6 +77,12 @@ internal sealed class Connection
     /// request carries a tag the server echoes, and the read loop verifies
     /// the echo against the oldest pending slot before resolving it.</summary>
     private readonly bool _tagged;
+    /// <summary>issue #125 — retryable-error status <c>R</c>: fired once
+    /// per <c>R</c> response this connection sees, whether it was
+    /// transparently retried away or ultimately surfaced as
+    /// <see cref="RetryableException"/> — the client's hook for
+    /// <c>Stats().TransientRetries</c>.</summary>
+    private readonly Action? _onTransientRetry;
     // A u32 wrapping counter (echoed response tags), claimed only inside the
     // _writeGate critical section — never touched concurrently, so no
     // Interlocked ceremony is needed here the way _closedFlag needs one.
@@ -115,11 +131,12 @@ internal sealed class Connection
     /// <see cref="Close"/> on it. Lets the client hook every place it
     /// closes or discards a connection (issue #12's forgotten-close
     /// tracking) without each call site worrying about double-counting.</summary>
-    internal Connection(Stream stream, bool tagged = false, Action? onClosed = null)
+    internal Connection(Stream stream, bool tagged = false, Action? onClosed = null, Action? onTransientRetry = null)
     {
         _stream = stream;
         _tagged = tagged;
         _onClosed = onClosed;
+        _onTransientRetry = onTransientRetry;
         _watchdog = new Timer(OnRequestTimeout, null, Timeout.Infinite, Timeout.Infinite);
         _ = ReadLoopAsync();
     }
@@ -387,6 +404,59 @@ internal sealed class Connection
             $"nanocached: response '{(char)marker}' does not match the request (connection desynced)");
     }
 
+    /// <summary>issue #125 — retryable-error status <c>R</c>: how many
+    /// times a single logical request is attempted in total before a
+    /// still-<c>R</c> answer surfaces as <see cref="RetryableException"/> —
+    /// 1 initial attempt plus up to 2 retries. Fixed by the protocol's
+    /// spec, not configurable.</summary>
+    private const int MaxRequestAttempts = 3;
+
+    /// <summary>issue #125: the delay before each retry —
+    /// <c>RetryDelays[0]</c> before the 2nd attempt, <c>RetryDelays[1]</c>
+    /// before the 3rd.</summary>
+    private static readonly TimeSpan[] RetryDelays =
+    {
+        TimeSpan.FromMilliseconds(50),
+        TimeSpan.FromMilliseconds(100),
+    };
+
+    /// <summary>issue #125 — retryable-error status <c>R</c>: wraps
+    /// <see cref="SendOnceAsync"/> with the protocol's bounded transient
+    /// retry. An <c>R</c> answer means THIS request specifically failed
+    /// transiently and the connection is fine — retry the same request on
+    /// the same connection, up to <see cref="MaxRequestAttempts"/> attempts
+    /// total, sleeping <see cref="RetryDelays"/> between attempts. Every
+    /// <c>R</c> seen is reported via <see cref="_onTransientRetry"/>
+    /// (<c>Stats().TransientRetries</c>) whether or not it's the one that
+    /// ultimately fails the call. A still-<c>R</c> answer on the final
+    /// attempt raises <see cref="RetryableException"/> — this connection is
+    /// never closed or redialed for that (<c>R</c> is not a connection
+    /// error, not a <c>W</c>, not an <c>E</c>) and stays usable for the
+    /// next operation. <paramref name="buildFrame"/> runs again for each
+    /// attempt, so a tagged connection claims a fresh tag per attempt —
+    /// see <see cref="SendOnceAsync"/>'s own doc comment for what it does
+    /// with it.</summary>
+    private async Task<(byte Marker, byte[]? Value)> RequestAsync(Func<uint?, byte[]> buildFrame)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            (byte Marker, byte[]? Value) response = await SendOnceAsync(buildFrame).ConfigureAwait(false);
+            if (response.Marker != (byte)'R')
+            {
+                return response;
+            }
+
+            _onTransientRetry?.Invoke();
+            if (attempt >= MaxRequestAttempts)
+            {
+                throw new RetryableException(
+                    $"nanocached: request answered R on all {MaxRequestAttempts} attempts (transient failure); "
+                    + "the connection is still usable");
+            }
+            await Task.Delay(RetryDelays[attempt - 1]).ConfigureAwait(false);
+        }
+    }
+
     /// <summary>Enqueues a pending slot and writes the built frame under
     /// one semaphore — see the class doc comment — then awaits its own
     /// <see cref="TaskCompletionSource{TResult}"/>, not the stream.
@@ -400,14 +470,16 @@ internal sealed class Connection
     /// <see cref="TaskCompletionSource{TResult}"/> that nothing is
     /// awaiting anymore is harmless. The await below is still bounded:
     /// <see cref="RequestTimeout"/>'s watchdog poisons the connection
-    /// when a response stops making progress (issue #42).</summary>
+    /// when a response stops making progress (issue #42). One send-and-await
+    /// of ONE attempt — <see cref="RequestAsync"/>, the only caller, is
+    /// what turns a run of these into the bounded <c>R</c> retry.</summary>
     /// <param name="buildFrame">Builds the wire frame from this request's
     /// claimed tag (<c>null</c> on an untagged connection). Called inside
     /// the write-gate critical section, after the tag is claimed but
     /// before anything is enqueued — an encoder that rejects its input
     /// must fail with nothing queued, or the next response would resolve
     /// an orphaned waiter and desync the stream (echoed response tags).</param>
-    private async Task<(byte Marker, byte[]? Value)> RequestAsync(Func<uint?, byte[]> buildFrame)
+    private async Task<(byte Marker, byte[]? Value)> SendOnceAsync(Func<uint?, byte[]> buildFrame)
     {
         if (IsClosed)
         {
@@ -625,6 +697,7 @@ internal sealed class Connection
             case (byte)'N':
             case (byte)'W':
             case (byte)'C': // issue #106: same fixed shape as S/D/N/W.
+            case (byte)'R': // issue #125: same fixed shape — retryable-error status; RequestAsync retries this transparently before it can ever reach a caller.
             {
                 if (!_tagged)
                 {

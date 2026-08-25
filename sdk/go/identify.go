@@ -66,6 +66,52 @@ const (
 	listProxies discoveryListCommand = 'Q'
 )
 
+// authProbe is one stage of the connect/identify handshake's auth
+// capability probe (issue #47's echoed response tags `T`, extended by
+// issue #125's retryable-error status `R`). The client always tries the
+// richest form first and falls back a stage at a time on the legacy
+// signal (isLegacyServerSignal) — see connectAndIdentifyAs. Token order
+// on the wire is fixed: `[T] [R]`.
+type authProbe int
+
+const (
+	// probeRetryable sends `A <len> T R` — echoed response tags plus the
+	// retryable-error capability, the form every connection tries first.
+	probeRetryable authProbe = iota
+	// probeTagged sends `A <len> T` — a server that predates `R` but
+	// still understands `T` (issue #47).
+	probeTagged
+	// probeLegacy sends the bare `A <len>` — a pre-0019 server that
+	// predates both extensions. The final stage: no further fallback.
+	probeLegacy
+)
+
+// wireSuffix is the extra header text authProbe appends after `A <len>`.
+func (p authProbe) wireSuffix() string {
+	switch p {
+	case probeRetryable:
+		return " T R"
+	case probeTagged:
+		return " T"
+	default:
+		return ""
+	}
+}
+
+// fallback reports the next, less-capable stage to retry with after this
+// one's extended `A` drew the legacy-server signal, and whether there is
+// one at all (probeLegacy has none — it's already the most basic form).
+func (p authProbe) fallback() (authProbe, bool) {
+	switch p {
+	case probeRetryable:
+		return probeTagged, true
+	case probeTagged:
+		return probeLegacy, true
+	default:
+		return probeLegacy, false
+	}
+}
+
 // connectDeadline bounds one whole connect attempt — dial, TLS
 // handshake, and the identify exchange share a single 5s budget, the
 // same shape as the other five SDKs (issue #47 item 1: the previous
@@ -103,42 +149,39 @@ func connectAndIdentifyProxies(address string, authSecret []byte, tlsConfig *tls
 func connectAndIdentifyAs(
 	address string, authSecret []byte, tlsConfig *tls.Config, list discoveryListCommand,
 ) (*identified, error) {
-	deadline := time.Now().Add(connectDeadline)
-	conn, err := open(address, tlsConfig, deadline)
-	if err != nil {
-		return nil, connectionLost("could not connect to "+address, err)
-	}
-
-	_ = conn.SetDeadline(deadline)
-	result, err := identify(conn, address, authSecret, true, list)
-	if err != nil {
-		_ = conn.Close()
-		if !isLegacyServerSignal(err) {
-			return nil, err
-		}
-		// Echoed response tags transparent fallback: a pre-0019 server rejects
-		// the extended `A ... T` as a parse error and closes without
-		// replying — redial once with the plain form and run the
-		// connection untagged (the pre-0019 behavior, desync window
-		// included).
-		deadline = time.Now().Add(connectDeadline)
-		conn, err = open(address, tlsConfig, deadline)
+	// Capability-probe fallback chain (issue #125 adds a stage in front
+	// of issue #47's existing one): `A <len> T R`, then `A <len> T`, then
+	// plain `A <len>` — each stage retried, on a fresh dial, only when the
+	// previous one drew the legacy-server signal (a pre-that-capability
+	// server rejects the extended `A` as a parse error and closes without
+	// replying; see isLegacyServerSignal). Every connection this SDK
+	// dials (per-node, proxy, discovery, hedge, reconnect) goes through
+	// this same probe, since connectAndIdentifyAs is the sole dial path.
+	for probe := probeRetryable; ; {
+		deadline := time.Now().Add(connectDeadline)
+		conn, err := open(address, tlsConfig, deadline)
 		if err != nil {
 			return nil, connectionLost("could not connect to "+address, err)
 		}
+
 		_ = conn.SetDeadline(deadline)
-		result, err = identify(conn, address, authSecret, false, list)
-		if err != nil {
-			_ = conn.Close()
+		result, err := identify(conn, address, authSecret, probe, list)
+		if err == nil {
+			if result.conn != nil {
+				// The deadline only bounds the handshake; a live node
+				// connection must not inherit it.
+				_ = result.conn.SetDeadline(time.Time{})
+			}
+			return result, nil
+		}
+		_ = conn.Close()
+
+		next, ok := probe.fallback()
+		if !ok || !isLegacyServerSignal(err) {
 			return nil, err
 		}
+		probe = next
 	}
-	if result.conn != nil {
-		// The deadline only bounds the handshake; a live node connection
-		// must not inherit it.
-		_ = result.conn.SetDeadline(time.Time{})
-	}
-	return result, nil
 }
 
 // isLegacyServerSignal reports whether err looks like a pre-tag
@@ -187,29 +230,29 @@ func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, 
 	return tls.DialWithDialer(&dialer, "tcp", address, config)
 }
 
-// identify runs the `A` handshake on conn. requestTags (echoed response tags)
-// says whether to send the extended form (`A <len> T\n<secret>`), asking
-// the server to echo tags on this connection's G/S/D traffic; the client
-// always tries this first (connectAndIdentify falls back to the plain form
-// on the legacy-server signal below). A write or read failure on the ack
-// itself is returned raw (not connectionLost-wrapped) when requestTags is
-// true, so the caller can tell a pre-0019 server's closed/EOF/reset door
-// apart from an ordinary connection failure and retry untagged. list
-// (issue #122) selects `L` or `Q` for the one-shot roster command sent
-// when the peer turns out to be a discovery server — see
-// discoveryListCommand.
-func identify(conn net.Conn, address string, authSecret []byte, requestTags bool, list discoveryListCommand) (*identified, error) {
+// identify runs the `A` handshake on conn. probe (issue #47's echoed
+// response tags `T`, extended by issue #125's retryable-error status `R`)
+// selects which capability tokens the extended form asks for
+// (`A <len>[ T][ R]\n<secret>`) — the client always tries probeRetryable
+// first (connectAndIdentifyAs falls back a stage at a time on the
+// legacy-server signal below). Server replies are unchanged either way
+// (`On`/`OnT`/`Od`/`OdT`): `R` is a purely client-declared capability,
+// never echoed back on the ack. A write or read failure
+// on the ack itself is returned raw (not connectionLost-wrapped) unless
+// probe is already probeLegacy, so the caller can tell a too-old
+// server's closed/EOF/reset door apart from an ordinary connection
+// failure and retry with a less capable probe. list (issue #122) selects
+// `L` or `Q` for the one-shot roster command sent when the peer turns
+// out to be a discovery server — see discoveryListCommand.
+func identify(conn net.Conn, address string, authSecret []byte, probe authProbe, list discoveryListCommand) (*identified, error) {
 	secret := authSecret
 	if secret == nil {
 		secret = noSecretPlaceholder
 	}
-	tagSuffix := ""
-	if requestTags {
-		tagSuffix = " T"
-	}
-	frame := append([]byte(fmt.Sprintf("A %d%s\n", len(secret), tagSuffix)), secret...)
+	extended := probe != probeLegacy
+	frame := append([]byte(fmt.Sprintf("A %d%s\n", len(secret), probe.wireSuffix())), secret...)
 	if _, err := conn.Write(frame); err != nil {
-		if requestTags && isLegacyServerSignal(err) {
+		if extended && isLegacyServerSignal(err) {
 			return nil, err
 		}
 		return nil, connectionLost("handshake write failed", err)
@@ -218,7 +261,7 @@ func identify(conn net.Conn, address string, authSecret []byte, requestTags bool
 	reader := bufio.NewReader(conn)
 	ack := make([]byte, 3)
 	if _, err := readFull(reader, ack); err != nil {
-		if requestTags && isLegacyServerSignal(err) {
+		if extended && isLegacyServerSignal(err) {
 			return nil, err
 		}
 		return nil, connectionLost("handshake read failed", err)

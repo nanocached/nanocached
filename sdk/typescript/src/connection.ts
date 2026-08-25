@@ -76,6 +76,32 @@ export function isConnectionError(error: unknown): boolean {
   return error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string";
 }
 
+/** Thrown by get/set/delete/clear/clearAll when a request is answered the
+ * retryable-error status `R` (issue #125) on every one of
+ * `RETRYABLE_RETRY_DELAYS_MS.length + 1` attempts: the request itself
+ * kept failing transiently — e.g. a `nanocached-proxy`'s upstream node was
+ * briefly unreachable and stayed that way through the proxy's own
+ * refresh-and-retry — but unlike every other error this SDK raises, the
+ * connection itself is fine. It is never poisoned by `R`: a caller
+ * catching (or ignoring) this error can immediately reuse the same
+ * `NanocachedClient`/`Connection` for another operation. */
+export class RetryableError extends NanocachedError {
+  constructor() {
+    super("nanocached: request failed transiently and was not accepted after retrying (connection is still usable)");
+    this.name = "RetryableError";
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Retryable-error status (issue #125): up to 2 retries (3 attempts total)
+// on the same connection before giving up with a RetryableError. The
+// delay before each retry — 50ms before the first, 100ms before the
+// second — mirrors the other five SDKs' identical bounded-retry policy.
+const RETRYABLE_RETRY_DELAYS_MS = [50, 100];
+
 /**
  * One already-identified (see `identify.ts`) connection to a single
  * nanocached-node. Requests are pipelined onto one TCP (or TLS) connection
@@ -106,13 +132,28 @@ export class Connection {
    * time a response is dispatched with more still outstanding, cleared
    * once nothing is. Never fires on an idle connection. */
   private requestTimer: NodeJS.Timeout | null = null;
+  /** Retryable-error status (issue #125): invoked once per `R` this
+   * connection receives (whether the retry that followed ultimately
+   * succeeded or not) — backs `NanocachedClient`'s `stats().transientRetries`
+   * counter. `undefined` until wired up (see `setOnTransientRetry`), which
+   * matters only for the handful of connections `NanocachedClient.connect`
+   * opens before the client instance (and so this callback) exists; no `R`
+   * can arrive before then, since identify traffic never sees one. */
+  private onTransientRetry: (() => void) | undefined;
 
-  constructor(socket: Socket | TLSSocket, tagged = false) {
+  constructor(socket: Socket | TLSSocket, tagged = false, onTransientRetry?: () => void) {
     this.socket = socket;
     this.tagged = tagged;
+    this.onTransientRetry = onTransientRetry;
     this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
     this.socket.on("error", (error: Error) => this.onError(error));
     this.socket.on("close", () => this.onClose());
+  }
+
+  /** Deferred wiring for the `onTransientRetry` callback — see its own
+   * doc comment on why this exists alongside the constructor parameter. */
+  setOnTransientRetry(callback: () => void): void {
+    this.onTransientRetry = callback;
   }
 
   /** `namespace` (first-class namespaces, issue #105) defaults to the
@@ -214,7 +255,29 @@ export class Connection {
     return Date.now() - this.lastUsed;
   }
 
-  private send(build: (tag: number | undefined) => Buffer): Promise<ParsedResponse> {
+  /** Retryable-error status (issue #125): wraps `sendOnce`, transparently
+   * retrying an `R`-answered request — possible on any data command — up
+   * to `RETRYABLE_RETRY_DELAYS_MS.length` times, sleeping the configured
+   * delay before each retry. `R` is not a connection error (no `mismatch`,
+   * no `poison`): the connection stays open and reusable throughout,
+   * whether this ultimately resolves or throws `RetryableError`. Every
+   * retry re-sends the request fresh (a new tag in tagged mode), same as
+   * calling `sendOnce` again — the protocol has no concept of resuming a
+   * specific prior attempt. */
+  private async send(build: (tag: number | undefined) => Buffer): Promise<ParsedResponse> {
+    let response = await this.sendOnce(build);
+    for (let attempt = 0; response.kind === "retryable"; attempt++) {
+      this.onTransientRetry?.();
+      if (attempt >= RETRYABLE_RETRY_DELAYS_MS.length) {
+        throw new RetryableError();
+      }
+      await sleep(RETRYABLE_RETRY_DELAYS_MS[attempt]);
+      response = await this.sendOnce(build);
+    }
+    return response;
+  }
+
+  private sendOnce(build: (tag: number | undefined) => Buffer): Promise<ParsedResponse> {
     if (this.closed) {
       return Promise.reject(this.lastError ?? new ConnectionLostError("nanocached: connection is closed"));
     }

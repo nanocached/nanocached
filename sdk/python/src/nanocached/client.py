@@ -80,11 +80,21 @@ class ClientStats:
     per-node connect failures swallowed while reconciling a refresh's
     member list — discovery outages degrade only topology updates, never
     already-established cache traffic.
+
+    ``transient_retries``: every retryable-error status (``R``, issue
+    #125) received on any connection this client owns — counted whether
+    the retry that followed it eventually succeeded or, after 3 attempts
+    running, raised ``RetryableError``. ``R`` means the request itself
+    failed transiently (e.g. nanocached-proxy's upstream node was briefly
+    unreachable); the connection stays open and is retried transparently,
+    so this counter is the only visibility into how often that's
+    happening.
     """
 
     replica_write_failures: int
     read_repair_failures: int
     refresh_failures: int
+    transient_retries: int
 
 
 # Value compression: values shorter than this (bytes) are never
@@ -355,6 +365,7 @@ class NanocachedClient:
         self._replica_write_failures = 0
         self._read_repair_failures = 0
         self._refresh_failures = 0
+        self._transient_retries = 0
 
     # ── 接続 ──────────────────────────────────────────────────────
 
@@ -535,7 +546,13 @@ class NanocachedClient:
         assert self._target_key is not None
         key = self._target_key
         _increment_open_target(key)
-        return Connection(reader, writer, on_close=lambda: _decrement_open_target(key), tagged=tagged)
+        return Connection(
+            reader,
+            writer,
+            on_close=lambda: _decrement_open_target(key),
+            tagged=tagged,
+            on_transient_retry=self._record_transient_retry,
+        )
 
     async def _open_cluster(self, identified: ClusterTarget) -> None:
         """Dials every node discovery listed, concurrently. A node that
@@ -716,7 +733,17 @@ class NanocachedClient:
             replica_write_failures=self._replica_write_failures,
             read_repair_failures=self._read_repair_failures,
             refresh_failures=self._refresh_failures,
+            transient_retries=self._transient_retries,
         )
+
+    def _record_transient_retry(self) -> None:
+        """Connection's on_transient_retry hook (issue #125): every
+        connection this client creates (_new_connection) reports its own
+        `R` responses here, regardless of which routing mode created it
+        (single node, cluster member, proxy, hedge leg) — one shared
+        counter, mirroring how replica_write_failures/read_repair_failures
+        are already shared across their own call sites."""
+        self._transient_retries += 1
 
     @property
     def closed(self) -> bool:

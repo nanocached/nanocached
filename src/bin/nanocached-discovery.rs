@@ -1264,9 +1264,18 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let secret_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             // Echoed response tags: an optional literal `T` requests tagged mode.
+            // A trailing `R` (issue #125, retryable-error capability) is
+            // accepted and ignored: discovery never emits `R`, but
+            // rejecting the token would force every new SDK's `A ... T R`
+            // probe into a reconnect-and-fallback round trip here.
             let tagging = match parts.next() {
                 None => false,
-                Some(b"T") => true,
+                Some(b"T") => match parts.next() {
+                    None => true,
+                    Some(b"R") => true,
+                    Some(_) => return Err(ParseError::InvalidCommand),
+                },
+                Some(b"R") => false,
                 Some(_) => return Err(ParseError::InvalidCommand),
             };
 

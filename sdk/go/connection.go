@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,6 +52,14 @@ const maxHeaderLineLength = 4 * 1024
 // only so tests can shorten it.
 var requestTimeout = 30 * time.Second
 
+// transientRetryDelays is the retryable-error status `R` (issue #125)
+// bounded retry budget: up to 2 retries (3 attempts total) at a single
+// request, sleeping 50ms before the first retry and 100ms before the
+// second. len(transientRetryDelays) is the number of retries available;
+// index i is the sleep before retry i+1. A var only so tests can shorten
+// it, matching connectDeadline/requestTimeout's own convention.
+var transientRetryDelays = []time.Duration{50 * time.Millisecond, 100 * time.Millisecond}
+
 type roundTripResult struct {
 	marker byte
 	value  []byte
@@ -83,18 +92,26 @@ type connection struct {
 	// open-connection count (the forgotten-close tracker in client.go)
 	// accurate no matter which of the several close() call sites fires.
 	onClose func()
+	// transientRetries, when set, is incremented once for every `R`
+	// response this connection receives (issue #125) — the Client's
+	// Stats().TransientRetries counter. nil in tests that build a
+	// connection directly without a Client (deadConnection, some unit
+	// tests), where retries still work, just uncounted.
+	transientRetries *atomic.Uint64
 }
 
 // onClose is taken here, not assigned afterward, so it's fully set
 // before the read loop goroutine — started before newConnection even
-// returns — can possibly read it in poison().
-func newConnection(conn net.Conn, onClose func(), tagged bool) *connection {
+// returns — can possibly read it in poison(). transientRetries (issue
+// #125) may be nil — see the connection field's doc.
+func newConnection(conn net.Conn, onClose func(), tagged bool, transientRetries *atomic.Uint64) *connection {
 	c := &connection{
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		tagged:   tagged,
-		lastUsed: time.Now(),
-		onClose:  onClose,
+		conn:             conn,
+		reader:           bufio.NewReader(conn),
+		tagged:           tagged,
+		lastUsed:         time.Now(),
+		onClose:          onClose,
+		transientRetries: transientRetries,
 	}
 	go c.readLoop()
 	return c
@@ -382,16 +399,44 @@ func (c *connection) poison(err error) {
 	}
 }
 
-// request builds a frame via build and waits for its matched response.
-// build receives this request's echoed response tags tag (claimed here,
-// meaningless when the connection is untagged) so it can render the
-// frame's trailing tag field. Claiming the tag, pushing onto the pending
-// queue, and writing the frame all happen under the same lock, so
-// concurrent callers' tag order and queue order always match the order
-// their frames actually hit the wire — required for the read loop's FIFO
-// dispatch, and the tag echo it verifies before dispatching, to stay
-// correct.
+// request builds a frame via build, sends it, and waits for its matched
+// response — transparently retrying on the retryable-error status `R`
+// (issue #125): up to len(transientRetryDelays) retries of the SAME
+// request on the SAME connection (no redial, no poison — see attemptRequest's
+// callers for why `R` never reaches the marker switches in get/set/
+// delete/clear), sleeping transientRetryDelays[attempt] before each
+// retry. build is called again for each retry (a fresh tag on a tagged
+// connection); the request/response semantics are otherwise identical to
+// a single round trip, so every caller (G/S/D/g/s/d/c/F alike, including
+// a hedge leg's own connection — issue #64) gets the bounded retry for
+// free just by going through request(). Every `R` received — whether the
+// retry that follows it succeeds or not — bumps transientRetries. If the
+// budget is exhausted (every attempt answered `R`), returns ErrRetryable
+// without touching the connection's open/closed state.
 func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, error) {
+	for attempt := 0; ; attempt++ {
+		marker, value, err := c.attemptRequest(build)
+		if err != nil {
+			return 0, nil, err
+		}
+		if marker != 'R' {
+			return marker, value, nil
+		}
+		if c.transientRetries != nil {
+			c.transientRetries.Add(1)
+		}
+		if attempt >= len(transientRetryDelays) {
+			return 0, nil, retryableFailed(fmt.Sprintf(
+				"request failed transiently (server answered R) %d times in a row", attempt+1))
+		}
+		time.Sleep(transientRetryDelays[attempt])
+	}
+}
+
+// attemptRequest is a single request/response round trip — request's
+// retry-on-`R` loop body. See request for the retry semantics built on
+// top of this.
+func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte, error) {
 	resultCh := make(chan roundTripResult, 1)
 
 	c.mu.Lock()
@@ -570,7 +615,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			return 0, nil, 0, err
 		}
 		return marker, nil, 0, nil
-	case 'S', 'D', 'N', 'W', 'C':
+	case 'S', 'D', 'N', 'W', 'C', 'R':
 		if !c.tagged {
 			if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
 				return 0, nil, 0, err
@@ -578,7 +623,9 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, e
 			return marker, nil, 0, nil
 		}
 		// Tagged wire: `S <seq>\n` etc. (echoed response tags) — `C`
-		// (issue #106's clear/flush ack) included.
+		// (issue #106's clear/flush ack) and `R` (issue #125's
+		// retryable-error status — `R <tag>\n`, pairing it to the request
+		// it answers exactly like any other response) included.
 		header, err := readLine(c.reader)
 		if err != nil {
 			return 0, nil, 0, err

@@ -2004,17 +2004,141 @@ public class NanocachedClientTests
     [Fact]
     public async Task FallsBackToTheUntaggedProtocolAgainstAPre0019Server()
     {
-        // An old server treats `A ... T` as a parse error and closes
-        // without replying; the client must redial once with the plain
-        // form and run untagged — transparently, with the same results.
+        // A genuinely pre-0019 server treats ANY extra field on A as a
+        // parse error and closes without replying — both the `T R` probe
+        // (issue #125) and the plain `T` one behind it — so the client
+        // must fall all the way back to the bare `A <len>` form and run
+        // untagged, transparently, with the same results.
         using var node = new MockNode(closeOnExtendedAuth: true);
         using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
         await client.SetAsync("k", "v");
         Assert.Equal("v", await client.GetAsync("k"));
-        // Two dials: the extended attempt the server slammed shut, then
-        // the plain fallback that stuck.
+        // Three dials: the `T R` attempt the server slammed shut, then the
+        // `T`-only attempt it slammed shut too, then the plain fallback
+        // that stuck.
+        Assert.Equal(3, node.ConnectionCount);
+        Assert.Equal("A 1", node.LastAuthHeader);
+    }
+
+    // ── retryable-error status R (issue #125) ─────────────────────────
+
+    [Fact]
+    public async Task ProbesWithTaggedAndRetryableFirstAndTheMockRecordsIt()
+    {
+        // Every connect probes with the extended `A <len> T R` form first
+        // — the mock, even one with no special R handling, just accepts it
+        // (unrecognized trailing tokens are the server's problem, not
+        // this test's) and records the exact header the SDK sent.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        Assert.Equal("A 1 T R", node.LastAuthHeader);
+        Assert.Equal(1, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task FallsBackFromTheRetryableProbeToTaggedOnlyAgainstAServerThatPredatesR()
+    {
+        // A server that understands `T` but not the newer `R` token
+        // (issue #125) treats the longer `A <len> T R` as a parse error
+        // and closes without replying, same legacy-fallback signal as a
+        // pre-0019 server closing on `T` — the client falls back exactly
+        // one stage, to `A <len> T`, and the connection ends up tagged.
+        using var node = new MockNode(supportTags: true, closeOnRetryableAuth: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        Assert.Equal("v", await client.GetAsync("k"));
+        // Two dials: the `T R` attempt the server slammed shut, then the
+        // `T`-only fallback that stuck.
         Assert.Equal(2, node.ConnectionCount);
+        Assert.Equal("A 1 T", node.LastAuthHeader);
+    }
+
+    [Fact]
+    public async Task RRespondedOnceThenSuccessRetriesTransparentlyOnTheSameConnection()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        node.AnswerRetryableTimes(1);
+
+        Assert.Equal("v", await client.GetAsync("k"));
+        // Exactly one retry: the mock saw two G frames for this one call
+        // (the R-answered attempt, then the one that succeeded), no new
+        // connection was dialed, and the retry is counted exactly once.
+        Assert.Equal(2, node.GetCount);
+        Assert.Equal(1, node.ConnectionCount);
+        Assert.Equal(1, client.Stats().TransientRetries);
+    }
+
+    [Fact]
+    public async Task RRespondedThreeTimesRaisesRetryableExceptionButKeepsTheConnectionUsable()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        node.AnswerRetryableTimes(3);
+
+        await Assert.ThrowsAsync<RetryableException>(() => client.GetAsync("k"));
+        Assert.Equal(1, node.ConnectionCount);
+        Assert.Equal(3, client.Stats().TransientRetries);
+
+        // R is never a reason to close or redial: the same connection
+        // must still serve a following operation correctly.
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal(1, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task ATaggedRRepliesToTheRightInFlightRequestWhenPipelined()
+    {
+        // Whichever of these two concurrent GETs the mock happens to
+        // answer R to first, the pairing must not be by luck: R carries
+        // this connection's per-request tag exactly like every other
+        // reply (Connection's shared tag-verifying read path), so it can
+        // only ever retry the request it actually belongs to — the other,
+        // untouched, in-flight GET must still resolve with its own
+        // correct value.
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("a", "va");
+        await client.SetAsync("b", "vb");
+
+        node.AnswerRetryableTimes(1);
+        Task<string?> first = client.GetAsync("a");
+        Task<string?> second = client.GetAsync("b");
+
+        string?[] results = await Task.WhenAll(first, second);
+        Assert.Equal(new[] { "va", "vb" }, results);
+        Assert.Equal(1, node.ConnectionCount);
+        Assert.Equal(1, client.Stats().TransientRetries);
+    }
+
+    [Fact]
+    public async Task ViaProxyRRespondedOnceThenSuccessRetriesTransparently()
+    {
+        // SDK proxy mode (issue #122): the R path works the same way over
+        // the single proxy connection — one test is enough (per the
+        // issue #125 spec), since Connection's retry loop doesn't know or
+        // care whether it's talking to a node or a proxy.
+        using var proxy = new MockNode();
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-1", proxy.Address) });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+
+        await client.SetAsync("k", "v");
+        proxy.AnswerRetryableTimes(1);
+
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal(1, proxy.ConnectionCount);
+        Assert.Equal(1, client.Stats().TransientRetries);
     }
 
     // ── TLS hostname verification (audit finding D1) ─────────────────

@@ -317,6 +317,26 @@ invalid TTL, an empty address list) throw `IllegalArgumentException`
 instead: they indicate a bug in the calling code, not a nanocached
 failure, a convention shared across the SDKs (issue #47).
 
+A `nanocached-proxy` may answer an individual request with a transient
+failure (its upstream node was briefly unreachable and survived its own
+one refresh-and-retry) instead of the fatal error-and-close a genuine
+failure gets. The SDK retries that request transparently on the SAME
+connection — up to 2 retries (3 attempts total), waiting 50ms then
+100ms — before it ever surfaces to your code. If the third attempt is
+still transient, `get`/`set`/`delete` throw
+`NanocachedException.RetryableError`; the connection itself is
+untouched — it is not closed or redialed, and stays usable for whatever
+you call next. This never affects a `nanocached-node` or discovery
+connection directly, but the SDK negotiates the capability on every
+connection it dials regardless of what's on the other end.
+
+`client.stats().transientRetries()` counts every retryable response
+this client has received, including the final one on a request that
+went on to throw `RetryableError` — next to the other by-design-swallow
+counters (`replicaWriteFailures`, `readRepairFailures`,
+`refreshFailures`, `backgroundWriteBugs`) that `stats()` already
+exposes.
+
 ## Build
 
 ```sh
