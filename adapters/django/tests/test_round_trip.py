@@ -99,12 +99,36 @@ class RoundTripTests(unittest.TestCase):
         self.cache.delete_many(["a", "b"])
         self.assertEqual(self.cache.get_many(["a", "b", "c"]), {"c": 3})
 
-    def test_incr_and_decr_are_refused(self) -> None:
-        self.cache.set("counter", 1)
-        with self.assertRaises(NotImplementedError):
-            self.cache.incr("counter")
-        with self.assertRaises(NotImplementedError):
-            self.cache.decr("counter")
+    def test_incr_and_decr(self) -> None:
+        self.cache.set("counter", 10)
+        self.assertEqual(self.cache.incr("counter"), 11)
+        self.assertEqual(self.cache.incr("counter", 4), 15)
+        self.assertEqual(self.cache.decr("counter"), 14)
+        self.assertEqual(self.cache.decr("counter", 4), 10)
+        self.assertEqual(self.cache.get("counter"), 10)
+
+    def test_incr_on_a_missing_key_raises_value_error(self) -> None:
+        with self.assertRaises(ValueError):
+            self.cache.incr("does-not-exist")
+        with self.assertRaises(ValueError):
+            self.cache.decr("does-not-exist")
+
+    def test_incr_on_a_non_numeric_value_raises_not_numeric_error(self) -> None:
+        from nanocached import NotNumericError
+
+        self.cache.set("greeting", "hello")
+        with self.assertRaises(NotNumericError):
+            self.cache.incr("greeting")
+
+    def test_int_values_round_trip_without_pickling(self) -> None:
+        # Issue #129: a plain int is stored as INCR's own decimal-ASCII
+        # grammar, not pickled — bool is excluded (it's not a counter).
+        self.cache.set("count", 42)
+        self.assertEqual(self.cache.get("count"), 42)
+        self.assertIsInstance(self.cache.get("count"), int)
+
+        self.cache.set("flag", True)
+        self.assertIs(self.cache.get("flag"), True)
 
     def test_wire_key_matches_pickled_value(self) -> None:
         # OPTIONS.NAMESPACE ("django", the default here) is what actually

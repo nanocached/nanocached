@@ -60,6 +60,38 @@ _DO_NOT_CACHE = object()
 
 _ADDRESS_SPLIT_RE = re.compile(r"[;,]")
 
+# Issue #129: INCR needs a real counter on the wire, and a pickled int
+# isn't one — the server can't add to an opaque pickle stream. So a
+# plain ``int`` value (``bool`` excluded: Django, like Python, treats
+# booleans as their own type, not a number a counter makes sense for) is
+# stored as INCR's own canonical decimal-ASCII grammar instead of
+# pickled; everything else keeps the existing pickle round trip.
+#
+# The two encodings never collide: pickle protocol 2+ (Python 3's
+# ``HIGHEST_PROTOCOL`` always is) begins every stream with the PROTO
+# opcode, ``0x80`` — a byte that can never appear in an ASCII decimal
+# integer — so ``get()`` can tell which decoder to use just by looking
+# at the stored bytes, with no extra marker byte needed. This also means
+# a value written by an un-upgraded peer, or from before this change,
+# still decodes correctly: its pickled ints just keep unpickling.
+_DECIMAL_INT_RE = re.compile(rb"^-?(0|[1-9]\d*)$")
+
+
+def _is_counter_value(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _encode_value(value: object) -> bytes:
+    if _is_counter_value(value):
+        return str(value).encode("ascii")
+    return pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
+
+
+def _decode_value(raw: bytes) -> object:
+    if _DECIMAL_INT_RE.match(raw):
+        return int(raw)
+    return pickle.loads(raw)
+
 
 def _split_host_port(address: str) -> tuple[str, int]:
     """Parses one ``"host:port"`` LOCATION entry. Deliberately not reusing
@@ -265,8 +297,8 @@ class NanocachedCache(BaseCache):
             # "logically added, immediately expired" contract other
             # backends give a zero/negative timeout (e.g. LocMemCache).
             return True
-        pickled = pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
-        self._run(lambda: self._namespace_handle.set(cache_key, pickled, ttl_seconds=wire_ttl))
+        encoded = _encode_value(value)
+        self._run(lambda: self._namespace_handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
         return True
 
     def get(self, key, default=None, version=None):
@@ -274,7 +306,7 @@ class NanocachedCache(BaseCache):
         raw = self._run(lambda: self._namespace_handle.get_bytes(cache_key))
         if raw is None:
             return default
-        return pickle.loads(raw)
+        return _decode_value(raw)
 
     def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         cache_key = self.make_and_validate_key(key, version=version)
@@ -282,8 +314,8 @@ class NanocachedCache(BaseCache):
         if wire_ttl is _DO_NOT_CACHE:
             self._run(lambda: self._namespace_handle.delete(cache_key))
             return
-        pickled = pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
-        self._run(lambda: self._namespace_handle.set(cache_key, pickled, ttl_seconds=wire_ttl))
+        encoded = _encode_value(value)
+        self._run(lambda: self._namespace_handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
         """get_bytes + re-set with the new timeout — also not atomic (a
@@ -298,9 +330,10 @@ class NanocachedCache(BaseCache):
         if wire_ttl is _DO_NOT_CACHE:
             self._run(lambda: self._namespace_handle.delete(cache_key))
             return True
-        # Re-sent as the raw bytes already read back — already pickled,
-        # so there's nothing to gain (and a value round-trip to lose) by
-        # unpickling and re-pickling it just to change the TTL.
+        # Re-sent as the raw bytes already read back — already encoded
+        # (pickled, or a counter's decimal-ASCII form), so there's
+        # nothing to gain (and a value round-trip to lose) by decoding
+        # and re-encoding it just to change the TTL.
         self._run(lambda: self._namespace_handle.set(cache_key, raw, ttl_seconds=wire_ttl))
         return True
 
@@ -341,15 +374,28 @@ class NanocachedCache(BaseCache):
         self._run(lambda: self._namespace_handle.clear())
 
     def incr(self, key, delta=1, version=None):
-        raise NotImplementedError(
-            "nanocached_django: incr()/decr() need an atomic counter the wire protocol "
-            "doesn't have; BaseCache's default get-then-set emulation would silently race "
-            "under concurrent access, so this backend refuses instead of pretending to be atomic"
-        )
+        """The SDK's own INCR (issue #129) — atomic on the node that owns
+        the key, unlike ``add()``/``touch()`` above. Matches
+        ``BaseCache.incr``'s own contract exactly: raises ``ValueError``
+        if the key doesn't exist (never creates one), and returns the new
+        value on success. If the key exists but holds a value this
+        backend never wrote as a counter (e.g. a pickled non-int, or a
+        counter that overflowed a signed 64-bit integer),
+        ``nanocached.NotNumericError`` propagates as-is rather than being
+        papered over as a ``ValueError`` — it names the actual condition
+        BaseCache's own contract has no vocabulary for.
+
+        As volatile as ``set()``: LRU eviction or this alias's TIMEOUT
+        reclaim a counter the same as any other entry, so this is a fit
+        for rate limiting or approximate counts, not for a count that
+        must survive (billing, inventory)."""
+        cache_key = self.make_and_validate_key(key, version=version)
+        new_value = self._run(lambda: self._namespace_handle.incr(cache_key, delta))
+        if new_value is None:
+            raise ValueError(f"Key '{key}' not found")
+        return new_value
 
     def decr(self, key, delta=1, version=None):
-        raise NotImplementedError(
-            "nanocached_django: incr()/decr() need an atomic counter the wire protocol "
-            "doesn't have; BaseCache's default get-then-set emulation would silently race "
-            "under concurrent access, so this backend refuses instead of pretending to be atomic"
-        )
+        """``incr(key, -delta, version)`` — decr never sends a separate
+        wire op; see incr()."""
+        return self.incr(key, -delta, version=version)

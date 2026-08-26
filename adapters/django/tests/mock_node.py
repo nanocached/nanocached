@@ -1,8 +1,9 @@
 """A trimmed, synchronous stand-in for nanocached-node, speaking just
 enough of the wire protocol — ``A``, namespaced ``g``/``s``/``d`` (issue
-#105) with their legacy ``G``/``S``/``D`` counterparts, and ``c``/``F``
-(issue #106) — for these adapter tests to exercise NanocachedCache over a
-real TCP socket without the Rust binary. A trimmed re-implementation of
+#105) with their legacy ``G``/``S``/``D`` counterparts, ``c``/``F``
+(issue #106), and ``i`` (issue #129) — for these adapter tests to
+exercise NanocachedCache over a real TCP socket without the Rust binary.
+A trimmed re-implementation of
 ``sdk/python/tests/mock_servers.py``'s ``MockNode`` (that module is
 private to the SDK's own test suite, see the shared adapters spec) built
 on ``socketserver`` instead of asyncio: this backend's sync/async bridge
@@ -42,6 +43,7 @@ class MockNode:
         self.delete_count = 0
         self.clear_count = 0
         self.flush_count = 0
+        self.incr_count = 0
 
         self._lock = threading.Lock()
         self._server: socketserver.ThreadingTCPServer | None = None
@@ -199,6 +201,44 @@ class MockNode:
                     self.flush_count += 1
                     self._flush()
                     wfile.write(b"C\n")
+                    wfile.flush()
+
+                elif cmd == b"i":
+                    # Increment/decrement (issue #129): always carries a
+                    # namespace-length header field, even 0 for the
+                    # default namespace — no legacy uppercase form, same
+                    # as `c`. Untagged only, per this module's docstring.
+                    namespace = rfile.read(int(parts[1]))
+                    key = rfile.read(int(parts[2]))
+                    delta = int(parts[3])
+                    self.incr_count += 1
+                    with self._lock:
+                        current = (
+                            self.ns_store.get((namespace, key))
+                            if namespace
+                            else self.store.get(key)
+                        )
+                        if current is None:
+                            reply = b"N\n"
+                        else:
+                            try:
+                                new_value = int(current) + delta
+                            except ValueError:
+                                reply = b"T\n"
+                            else:
+                                new_bytes = str(new_value).encode("ascii")
+                                if namespace:
+                                    self.ns_store[(namespace, key)] = new_bytes
+                                else:
+                                    self.store[key] = new_bytes
+                                ttl = self.ttls.get((namespace, key), 0)
+                                ttl_field = b" %d" % ttl if ttl else b""
+                                reply = b"I %d%b\n%b" % (
+                                    len(new_bytes),
+                                    ttl_field,
+                                    new_bytes,
+                                )
+                    wfile.write(reply)
                     wfile.flush()
 
                 else:
