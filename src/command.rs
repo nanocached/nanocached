@@ -1,4 +1,4 @@
-use crate::cache::Cache;
+use crate::cache::{Cache, IncrResult, parse_decimal_i64};
 use crate::key::Key;
 use crate::response::Response;
 use bytes::{Buf, Bytes, BytesMut};
@@ -31,6 +31,29 @@ pub enum Command {
     },
     Delete {
         key: Key,
+    },
+    /// `i <namespace-length> <key-length> <delta> [tag]\n<namespace><key>`
+    /// (issue #129): adds `delta` (signed decimal ASCII `i64`; a negative
+    /// `delta` is a decrement, so there is no separate decr opcode) to the
+    /// key's stored value, in place, and returns the new value. Always
+    /// namespaced — unlike `G`/`S`/`D`, this op has no pre-namespace
+    /// legacy form to stay compatible with, so it carries
+    /// `<namespace-length>` unconditionally (a length of 0 addresses the
+    /// default namespace, same as everywhere else).
+    ///
+    /// Runs on the single-threaded cache actor like every other command,
+    /// so the read-modify-write is atomic against every other command on
+    /// *this node* — but not across a cluster: see `Cache::incr`'s doc
+    /// comment and `src/server.rs`'s `Incr` connection-handler arm for how
+    /// replication and migration/decommission forwarding stay consistent
+    /// despite that. And not durable: a value INCR'd is exactly as
+    /// volatile as one SET — LRU eviction or a TTL still reclaims it. See
+    /// `docs/protocol.html`'s `INCR` section for the full caveat this
+    /// implies (rate limiting and approximate counters are a good fit;
+    /// billing or inventory counts are not).
+    Incr {
+        key: Key,
+        delta: i64,
     },
     /// `c <namespace-length> [tag]\n<namespace>` (issue #106): drops one
     /// namespace's every entry. A zero-length namespace clears the
@@ -185,6 +208,14 @@ impl Command {
                     Response::NotFound
                 }
             }
+
+            Self::Incr { key, delta } => match cache.incr(&key, delta) {
+                IncrResult::Value(value, remaining_ttl) => {
+                    Response::Incremented(Bytes::from(value.to_string()), remaining_ttl)
+                }
+                IncrResult::NotFound => Response::NotFound,
+                IncrResult::NotNumeric => Response::NotNumeric,
+            },
 
             Self::Clear { namespace } => Response::Cleared(cache.clear(&namespace)),
             Self::ClearAll => Response::Cleared(cache.clear_all()),
@@ -411,6 +442,59 @@ fn parse_with_mode(
                 },
                 tag,
             ))
+        }
+
+        // Issue #129: `i <ns-len> <key-len> <delta> [tag]\n<ns><key>` —
+        // always namespaced (see `Command::Incr`'s doc comment), so this
+        // follows `G`/`D`'s namespaced-only shape (`g`/`d`) rather than
+        // needing an uppercase/lowercase pair. `<delta>` is a mandatory
+        // field ahead of the optional trailing tag, same position `S`'s
+        // `<value-length>` holds — no multi-field trailing ambiguity like
+        // `S`'s `[ttl] [tag]` (`parse_trailing_tag` disambiguates below on
+        // the connection's negotiated mode alone, same as everywhere
+        // else).
+        b"i" => {
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let delta = parts.next().ok_or(ParseError::InvalidLength)?;
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let key_length = parse_length(key_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
+
+            // Malformed here means the client's own frame is broken (not
+            // a data-dependent condition), so this is a fatal parse error
+            // like every other structural field — never the wire's `T`
+            // status, which is reserved for a well-formed request whose
+            // *stored value* isn't a counter (see `Response::NotNumeric`).
+            let delta = parse_decimal_i64(delta).ok_or(ParseError::InvalidLength)?;
+
+            let namespace_start = header_end + 1;
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < key_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(key_end).freeze();
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
+
+            Ok((Command::Incr { key, delta }, tag))
         }
 
         b"c" => {
@@ -1497,6 +1581,130 @@ mod tests {
             })
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_incr() {
+        // Issue #129: always namespaced, `<delta>` ahead of the optional
+        // trailing tag — like `g`/`d`, but with an extra mandatory field.
+        let mut input = buf(b"i 5 4 3\nusersname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Incr {
+                key: namespaced(b"users", b"name"),
+                delta: 3,
+            })
+        );
+        assert!(input.is_empty());
+
+        let mut input = buf(b"i 0 4 -3\nname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Incr {
+                key: key(b"name"),
+                delta: -3,
+            })
+        );
+    }
+
+    #[test]
+    fn incr_carries_the_tag_last_in_tagged_mode() {
+        let mut input = buf(b"i 5 4 3 7\nusersname");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::Incr {
+                    key: namespaced(b"users", b"name"),
+                    delta: 3,
+                },
+                Some(7),
+            ))
+        );
+    }
+
+    #[test]
+    fn incr_rejects_a_malformed_delta_as_a_fatal_parse_error() {
+        // Unlike a stored non-numeric value (which answers the wire's `T`
+        // status — see execute()'s test below), a malformed `<delta>`
+        // field is the client's own frame being broken, same severity as
+        // a malformed length field.
+        let mut input = buf(b"i 5 4 abc\nusersname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+
+        let mut input = buf(b"i 5 4 +3\nusersname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+
+        let mut input = buf(b"i 5 4 03\nusersname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn incr_requires_the_namespace_length_field() {
+        let mut input = buf(b"i 4 3\nname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn incr_rejects_an_empty_key() {
+        let mut input = buf(b"i 5 0 1\nusers");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn parse_leaves_an_incr_command_untouched_when_incomplete() {
+        let original = b"i 5 4 3\nusersnam".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn incr_executes_against_the_cache_and_maps_every_outcome() {
+        let mut cache = Cache::new(usize::MAX);
+
+        // Missing key -> NotFound, same status as G/D would give.
+        assert_eq!(
+            Command::Incr {
+                key: key(b"counter"),
+                delta: 1,
+            }
+            .execute(&mut cache),
+            Response::NotFound
+        );
+
+        Command::Set {
+            key: key(b"counter"),
+            value: Bytes::from_static(b"10"),
+            ttl: None,
+        }
+        .execute(&mut cache);
+
+        assert_eq!(
+            Command::Incr {
+                key: key(b"counter"),
+                delta: 5,
+            }
+            .execute(&mut cache),
+            Response::Incremented(Bytes::from_static(b"15"), None)
+        );
+
+        // A stored non-numeric value -> the wire's T status, not NotFound.
+        Command::Set {
+            key: key(b"name"),
+            value: Bytes::from_static(b"Alice"),
+            ttl: None,
+        }
+        .execute(&mut cache);
+
+        assert_eq!(
+            Command::Incr {
+                key: key(b"name"),
+                delta: 1,
+            }
+            .execute(&mut cache),
+            Response::NotNumeric
+        );
     }
 
     #[test]

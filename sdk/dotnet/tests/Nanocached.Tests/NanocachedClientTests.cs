@@ -1071,6 +1071,226 @@ public class NanocachedClientTests
         }
     }
 
+    // ── incr / decr (issue #129) ─────────────────────────────────
+
+    [Fact]
+    public async Task IncrOnAMissingKeyReturnsNull()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        // Same not-found convention as GetAsync's miss (null, not an
+        // exception) — INCR never creates a counter from nothing.
+        Assert.Null(await client.IncrAsync("missing", 1));
+        // The request still reached the node exactly once.
+        Assert.Equal(1, node.IncrRequestCount);
+    }
+
+    [Fact]
+    public async Task IncrOnANonNumericStoredValueThrowsNotNumeric()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("greeting", "hello");
+        await Assert.ThrowsAsync<NotNumericException>(() => client.IncrAsync("greeting", 1));
+        // Untouched — a not-numeric INCR must not have mutated the entry.
+        Assert.Equal("hello", await client.GetAsync("greeting"));
+    }
+
+    [Fact]
+    public async Task ASuccessfulIncrReturnsTheNewValue()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "10");
+        Assert.Equal(13, await client.IncrAsync("counter", 3));
+        Assert.Equal(10, await client.IncrAsync("counter", -3));
+        Assert.Equal("10", await client.GetAsync("counter"));
+    }
+
+    [Fact]
+    public async Task DecrWithAPositiveAmountMatchesIncrWithTheEquivalentNegativeDelta()
+    {
+        using var nodeA = new MockNode();
+        using var nodeB = new MockNode();
+        using NanocachedClient clientA = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", nodeA.Port));
+        using NanocachedClient clientB = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", nodeB.Port));
+
+        await clientA.SetAsync("counter", "100");
+        await clientB.SetAsync("counter", "100");
+
+        long? viaDecr = await clientA.DecrAsync("counter", 7);
+        long? viaNegativeIncr = await clientB.IncrAsync("counter", -7);
+
+        Assert.Equal(viaNegativeIncr, viaDecr);
+        Assert.Equal(93, viaDecr);
+        // DecrAsync sends the same "i" opcode with a negated delta, never
+        // a different wire op.
+        Assert.Equal("i 0 7 -7", nodeA.LastIncrHeader);
+    }
+
+    [Fact]
+    public async Task IncrFrameIsExactlyTheWireGrammarNamespacedAndAlwaysIncludingNamespaceLength()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "1");
+        await client.IncrAsync("counter", 41);
+        // Default (empty) namespace still carries an explicit namespace
+        // length of 0 on the wire — "i" has no legacy uppercase form to
+        // fall back to.
+        Assert.Equal("i 0 7 41", node.LastIncrHeader);
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("counter", "1");
+        await ns.IncrAsync("counter", -5);
+        Assert.Equal("i 5 7 -5", node.LastIncrHeader);
+    }
+
+    [Fact]
+    public async Task IncrFrameCarriesTheTagOnATaggedConnection()
+    {
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "1");
+        await client.IncrAsync("counter", 2);
+        // "i <ns-len> <key-len> <delta> <tag>" — the tag is the trailing
+        // header field, exactly like every other request on a tagged
+        // connection.
+        string[] fields = node.LastIncrHeader!.Split(' ');
+        Assert.Equal(5, fields.Length);
+        Assert.Equal(new[] { "i", "0", "7", "2" }, fields[..4]);
+        Assert.True(uint.TryParse(fields[4], out _));
+    }
+
+    [Fact]
+    public async Task IncrOnAnEntryWithATtlRoundTripsThatTtlAndNeverChangesIt()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "1", ttlSeconds: 60);
+        Assert.Equal(2, await client.IncrAsync("counter", 1));
+        Assert.Equal(60, node.LastSetTtl);
+    }
+
+    [Fact]
+    public async Task IncrPropagatesNotNumericOnATaggedConnection()
+    {
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("greeting", "hello");
+        await Assert.ThrowsAsync<NotNumericException>(() => client.IncrAsync("greeting", 1));
+    }
+
+    [Fact]
+    public async Task WrongNodeOnIncrPropagatesInSingleMode()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        node.AnswerWrongNodeOnce();
+        // No discovery/ring to refresh from in single mode, same as
+        // WrongNodePropagatesInSingleMode for Get.
+        await Assert.ThrowsAsync<WrongNodeException>(() => client.IncrAsync("counter", 1));
+    }
+
+    [Fact]
+    public async Task OnlyThePrimaryEverRunsIncrReplicasReceiveTheResultAsAnOrdinarySet()
+    {
+        // The single most important test for issue #129: replaying the
+        // increment on a replica (instead of forwarding the primary's
+        // literal result) would let that replica drift from the primary.
+        // Seeding both owners with the SAME starting value means a buggy
+        // implementation that mistakenly replays "i" on the replica would
+        // still land on the same final byte value here — so the real
+        // proof isn't the stored value, it's that the replica's own
+        // IncrRequestCount stays exactly 0.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-counter";
+        await client.SetAsync(key, "10");
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.Equal(15, await client.IncrAsync(key, 5));
+
+        Assert.Equal(1, primary.IncrRequestCount);
+        Assert.Equal(0, replica.IncrRequestCount);
+
+        string storeKey = MockNode.KeyOf(Bytes(key));
+        Assert.Equal(Bytes("15"), primary.Store[storeKey]);
+        Assert.Equal(Bytes("15"), replica.Store[storeKey]);
+    }
+
+    [Fact]
+    public async Task IncrReplicationForwardsTheResultingTtlToTheReplicaViaSet()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "ttl-counter";
+        await client.SetAsync(key, "1", ttlSeconds: 45);
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.Equal(2, await client.IncrAsync(key, 1));
+
+        // Verified via the replica's own recorded state, not the
+        // primary's — this is what proves the TTL actually rode along on
+        // the replica-leg Set frame.
+        Assert.Equal(45, replica.LastSetTtl);
+    }
+
+    [Fact]
+    public async Task AMissedIncrTouchesNoReplicaAtAll()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "never-set";
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.Null(await client.IncrAsync(key, 1));
+
+        Assert.Equal(1, primary.IncrRequestCount);
+        Assert.Equal(0, replica.IncrRequestCount);
+        Assert.False(replica.Store.ContainsKey(MockNode.KeyOf(Bytes(key))));
+    }
+
+    [Fact]
+    public async Task NamespacedIncrRoutesByNamespaceAndKeyAndReplicatesTheResultOnly()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        byte[] namespaceBytes = Bytes("users");
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("counter", "1");
+
+        IReadOnlyList<string> owners = new HashRing(Names).Owners(namespaceBytes, Bytes("counter"), 2);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.Equal(2, await ns.IncrAsync("counter", 1));
+        Assert.Equal(1, primary.IncrRequestCount);
+        Assert.Equal(0, replica.IncrRequestCount);
+        Assert.Equal(Bytes("2"), replica.Store[MockNode.KeyOf(namespaceBytes, Bytes("counter"))]);
+    }
+
     // ── namespaces (issue #105) ──────────────────────────────────
 
     [Fact]

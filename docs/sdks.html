@@ -182,6 +182,19 @@ existed, err := client.Delete("greeting")</code></pre>
   node failure the SDK refreshes the node list once and retries before
   raising an error naming the node — never a silent partial clear. See
   <a href="protocol.html#clear">c / F</a>.</li>
+  <li><b>Counters</b> — <code>client.incr(key, delta)</code>
+  (<code>Incr</code>/<code>IncrAsync</code> in Go/.NET) adds a signed
+  <code>delta</code> to a key's stored value atomically on the node that
+  owns it and returns the new value; a negative <code>delta</code>
+  decrements, so there is no separate <code>decr</code>. Available on a
+  namespace handle too. As volatile as a plain <code>set</code> — LRU
+  eviction and TTL expiry reclaim a counter the same as any other entry,
+  so this is a fit for rate limiting and approximate counters, not for
+  counts that must survive. In a cluster only the primary owner runs the
+  increment; the SDK writes the <em>result</em> to the remaining owners
+  as an ordinary <code>set</code>, never by replaying the increment
+  itself (replaying it could drift a replica from the primary). See
+  <a href="protocol.html#incr">i</a>.</li>
   <li><b>Failure recovery</b> — a stale routing table (a node answers
   <code>W</code>) or a dead primary both trigger one node-list refresh
   and one retry; recovery is bounded by discovery's liveness timeout.</li>

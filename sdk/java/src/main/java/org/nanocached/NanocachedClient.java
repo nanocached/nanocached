@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -1113,6 +1114,51 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.delete(namespace, key);
         }
 
+        public OptionalLong incr(String key, long delta) {
+            return incr(key.getBytes(StandardCharsets.UTF_8), delta);
+        }
+
+        /** As {@link #incr(String, long)} with a delta of 1. */
+        public OptionalLong incr(String key) {
+            return incr(key, 1L);
+        }
+
+        /** As {@link NanocachedClient#incr(byte[], long)}, scoped to
+         * {@link #namespace()} (issue #129). */
+        public OptionalLong incr(byte[] key, long delta) {
+            return NanocachedClient.this.incr(namespace, key, delta);
+        }
+
+        /** As {@link #incr(byte[], long)} with a delta of 1. */
+        public OptionalLong incr(byte[] key) {
+            return incr(key, 1L);
+        }
+
+        public OptionalLong decr(String key, long delta) {
+            return decr(key.getBytes(StandardCharsets.UTF_8), delta);
+        }
+
+        /** As {@link #decr(String, long)} with an amount of 1. */
+        public OptionalLong decr(String key) {
+            return decr(key, 1L);
+        }
+
+        /** As {@link NanocachedClient#decr(byte[], long)}, scoped to
+         * {@link #namespace()} — the same negated-delta {@code i}, never a
+         * separate wire op. */
+        public OptionalLong decr(byte[] key, long delta) {
+            if (delta == Long.MIN_VALUE) {
+                throw new IllegalArgumentException(
+                        "nanocached: decr delta must not be Long.MIN_VALUE (has no positive negation)");
+            }
+            return incr(key, -delta);
+        }
+
+        /** As {@link #decr(byte[], long)} with an amount of 1. */
+        public OptionalLong decr(byte[] key) {
+            return decr(key, 1L);
+        }
+
         /** Drops every entry in this namespace (CLEAR, issue #106) — see
          * {@link NanocachedClient#clearAll()} for the whole-store
          * counterpart. An empty {@link #namespace()} (this handle's own
@@ -1346,6 +1392,77 @@ public final class NanocachedClient implements AutoCloseable {
         beforeOperation();
         return withWrongNodeRetry(
                 () -> write(namespace, key, connection -> connection.delete(namespace, key)));
+    }
+
+    // INCR/DECR (issue #129): as volatile as set — LRU eviction and TTL
+    // expiry reclaim an incremented value exactly like any other entry,
+    // so this is for rate limiting/approximate counters, never durable
+    // counts. Unlike a missing key on get (an empty Optional carrying no
+    // further meaning), INCR's own "not found" is a real protocol answer
+    // (`N`, distinct from "not numeric" (`T`)), so it gets the same
+    // empty-on-miss convention getBytes' Optional already uses rather
+    // than throwing — OptionalLong is that convention's long-typed
+    // counterpart. `decr` is never a separate wire op — see {@link
+    // #decr(byte[], long)}.
+
+    public OptionalLong incr(String key, long delta) {
+        return incr(key.getBytes(StandardCharsets.UTF_8), delta);
+    }
+
+    /** As {@link #incr(String, long)} with a delta of 1. */
+    public OptionalLong incr(String key) {
+        return incr(key, 1L);
+    }
+
+    public OptionalLong incr(byte[] key, long delta) {
+        return incr(EMPTY_NAMESPACE, key, delta);
+    }
+
+    /** As {@link #incr(byte[], long)} with a delta of 1. */
+    public OptionalLong incr(byte[] key) {
+        return incr(key, 1L);
+    }
+
+    public OptionalLong decr(String key, long delta) {
+        return decr(key.getBytes(StandardCharsets.UTF_8), delta);
+    }
+
+    /** As {@link #decr(String, long)} with an amount of 1. */
+    public OptionalLong decr(String key) {
+        return decr(key, 1L);
+    }
+
+    /** Sends the exact same {@code i} op as {@link #incr(byte[], long)}
+     * with the delta negated — there is no separate decrement opcode on
+     * the wire (see {@link Connection#incr}). {@code delta} is the
+     * (non-negative in spirit, but unchecked beyond this) amount to
+     * subtract; {@code Long.MIN_VALUE} is rejected since two's complement
+     * has no positive value to negate it to. */
+    public OptionalLong decr(byte[] key, long delta) {
+        if (delta == Long.MIN_VALUE) {
+            throw new IllegalArgumentException(
+                    "nanocached: decr delta must not be Long.MIN_VALUE (has no positive negation)");
+        }
+        return incr(key, -delta);
+    }
+
+    /** As {@link #decr(byte[], long)} with an amount of 1. */
+    public OptionalLong decr(byte[] key) {
+        return decr(key, 1L);
+    }
+
+    /** The namespaced counterpart of every incr/decr overload above
+     * (issue #105-style scoping applied to issue #129) — see {@link
+     * #namespace}. {@code namespace} empty is exactly the un-namespaced
+     * form: INCR always carries an explicit namespace length on the wire
+     * (0 meaning default), so — unlike {@code get}/{@code set}/{@code
+     * delete} — there is no separate legacy frame to fall back to; this
+     * is simply the one and only frame shape. */
+    OptionalLong incr(byte[] namespace, byte[] key, long delta) {
+        validateKey(namespace, key);
+        beforeOperation();
+        Connection.IncrResult result = withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta));
+        return result == null ? OptionalLong.empty() : OptionalLong.of(result.value());
     }
 
     /**
@@ -1978,6 +2095,113 @@ public final class NanocachedClient implements AutoCloseable {
             throw replicaBug != null ? replicaBug : primaryError;
         }
         return value;
+    }
+
+    // ── INCR/DECR (issue #129) ───────────────────────────────────────
+    // Deliberately NOT write()'s same-op-to-every-owner fan-out: replaying
+    // the increment on a replica could let it drift from the primary
+    // (e.g. an earlier replica-leg write dropped after a transient
+    // failure, or the replica separately evicted/reset the key), so the
+    // `i` op goes to the primary owner only, and — only once that leg has
+    // actually succeeded — its literal resulting value (and TTL) is
+    // forwarded to the remaining owners as an ordinary `set`, keeping
+    // every replica byte-identical to the primary rather than merely
+    // aiming for the same arithmetic.
+
+    /**
+     * INCR's own write driver (issue #129). Sends {@code i} to the
+     * primary owner only and awaits it; a miss ({@code null}, mirroring
+     * {@link #getBytes(byte[], byte[])}'s own null-on-miss convention) or
+     * {@link NanocachedException.NotNumeric} is returned/thrown directly
+     * without touching any replica, since nothing was written. A hit's
+     * result is fanned out to the remaining owners via {@link
+     * #replicateIncrResult} before being returned. {@link
+     * #withWrongNodeRetry} already wraps a call to this whole method (see
+     * {@link #incr(byte[], byte[], long)}) and retries it on a {@code
+     * W}/dead primary — since replication only ever runs after the
+     * primary leg above has already returned successfully, that retry
+     * only ever re-runs the primary leg again (a second, freshly routed
+     * primary attempt), never a duplicate replica fan-out.
+     */
+    private Connection.IncrResult incrPrimaryThenReplicate(byte[] namespace, byte[] key, long delta) {
+        if (ring == null) {
+            return applyReconnecting(this::singleConnection, connection -> connection.incr(namespace, key, delta));
+        }
+
+        List<String> names = ownerNames(namespace, key);
+        if (names.isEmpty()) {
+            throw new NanocachedException("nanocached: no owner is reachable for this key");
+        }
+
+        Connection.IncrResult result = applyReconnecting(
+                () -> memberConnection(names.get(0)), connection -> connection.incr(namespace, key, delta));
+        if (result == null) return null;
+
+        replicateIncrResult(namespace, key, names, result);
+        return result;
+    }
+
+    /**
+     * Fans {@code result} — the primary's own literal INCR outcome, never
+     * replayed as another {@code i} — out to {@code names}' remaining
+     * owners as a {@code set} carrying that exact value and TTL. Mirrors
+     * {@link #write}'s own replica-leg scheduling ({@code
+     * fireAndForgetReplicas} runs up to the configured cap in the
+     * background; the rest run concurrently and are joined here), and the
+     * same expected-failure handling (swallowed, counted via {@link
+     * #replicaWriteFailures}). Unlike {@link #write}, there is no primary
+     * failure for a genuine replica-leg bug to attach to — the primary
+     * already succeeded by the time this runs — so any bug that escapes a
+     * leg is simply logged via {@link #reportBackgroundWriteBug}, exactly
+     * as a {@code fireAndForgetReplicas} leg's own bug already is.
+     */
+    private void replicateIncrResult(
+            byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
+        byte[] valueBytes = Long.toString(result.value()).getBytes(StandardCharsets.US_ASCII);
+        List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
+        for (int i = 1; i < names.size(); i++) {
+            String replica = names.get(i);
+            Runnable replicaWrite = () -> {
+                try {
+                    applyReconnecting(() -> memberConnection(replica), connection -> {
+                        connection.set(namespace, key, valueBytes, result.ttlSeconds());
+                        return null;
+                    });
+                } catch (NanocachedException ignored) {
+                    // Swallowed by design, exactly like write()'s own
+                    // replica leg — see that method's matching catch for
+                    // the full rationale (issue: audit finding covers
+                    // both identically).
+                    replicaWriteFailures.incrementAndGet();
+                }
+            };
+
+            if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
+                try {
+                    CompletableFuture.runAsync(replicaWrite, replicaWriters)
+                            .whenComplete((ignoredResult, error) -> {
+                                backgroundReplicaWritePermits.release();
+                                reportBackgroundWriteBug(error);
+                            });
+                } catch (RejectedExecutionException rejected) {
+                    // close() shut replicaWriters down concurrently — see
+                    // write()'s identical handling.
+                    backgroundReplicaWritePermits.release();
+                    replicaWrite.run();
+                }
+                continue;
+            }
+
+            replicaWrites.add(submitReplicaWrite(replicaWrite));
+        }
+
+        for (CompletableFuture<Void> pending : replicaWrites) {
+            try {
+                pending.join();
+            } catch (CompletionException wrapped) {
+                reportBackgroundWriteBug(unwrapReplicaBug(wrapped));
+            }
+        }
     }
 
     /** Unwraps a replica leg's {@link CompletionException} (from {@link

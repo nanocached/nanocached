@@ -163,6 +163,82 @@ class NanocachedClientTest {
         }
     }
 
+    // ── INCR/DECR (issue #129) ────────────────────────────────────
+
+    @Test
+    void incrOnAMissingKeyReturnsEmpty() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertEquals(java.util.OptionalLong.empty(), client.incr("missing", 1));
+                assertEquals(java.util.OptionalLong.empty(), client.decr("missing"));
+            }
+        }
+    }
+
+    @Test
+    void incrOnANonNumericStoredValueThrowsNotNumeric() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("word", "hello");
+                assertThrows(NanocachedException.NotNumeric.class, () -> client.incr("word", 1));
+                // The failed INCR must not have touched the stored value.
+                assertEquals(Optional.of("hello"), client.get("word"));
+            }
+        }
+    }
+
+    @Test
+    void aSuccessfulIncrReturnsTheNewValue() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("counter", "10");
+                assertEquals(java.util.OptionalLong.of(15), client.incr("counter", 5));
+                assertEquals(java.util.OptionalLong.of(12), client.incr("counter", -3));
+                assertEquals(java.util.OptionalLong.of(13), client.incr("counter")); // defaults to delta 1
+                assertEquals(Optional.of("13"), client.get("counter"));
+            }
+        }
+    }
+
+    @Test
+    void decrWithAPositiveAmountMatchesIncrWithTheNegatedDelta() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("counter", "20");
+                assertEquals(java.util.OptionalLong.of(15), client.decr("counter", 5));
+                assertEquals(java.util.OptionalLong.of(14), client.decr("counter")); // defaults to amount 1
+                assertEquals(Optional.of("14"), client.get("counter"));
+
+                assertThrows(IllegalArgumentException.class, () -> client.decr("counter", Long.MIN_VALUE));
+            }
+        }
+    }
+
+    @Test
+    void incrOverflowAnswersNotNumeric() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("huge", String.valueOf(Long.MAX_VALUE));
+                assertThrows(NanocachedException.NotNumeric.class, () -> client.incr("huge", 1));
+            }
+        }
+    }
+
+    @Test
+    void incrAndDecrAreScopedByNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace tenant = client.namespace("tenant-a");
+                tenant.set("counter", "1");
+                assertEquals(java.util.OptionalLong.of(2), tenant.incr("counter"));
+                // The default (un-namespaced) keyspace is untouched.
+                assertEquals(Optional.empty(), client.get("counter"));
+                assertEquals(java.util.OptionalLong.empty(), client.incr("counter"));
+                assertEquals(java.util.OptionalLong.of(1), tenant.decr("counter"));
+            }
+        }
+    }
+
     // Audit finding J2: an empty key, or a key+value pair large enough to
     // risk the server's MAX_REQUEST_SIZE (src/server.rs, 1 MiB), must be
     // rejected synchronously — before any bytes reach the connection —
@@ -1186,6 +1262,88 @@ class NanocachedClientTest {
         }
     }
 
+    // ── クラスタでの INCR/DECR (issue #129) ─────────────────────────
+    // The one thing that must never happen: a replica replaying the
+    // increment itself. Comparing final stored values between primary and
+    // replica would NOT prove this — a buggy implementation that mistakenly
+    // replays `i` on the replica would produce the same final bytes from
+    // the same seed value. incrCount is the actual proof.
+
+    @Test
+    void incrSendsIOnlyToThePrimaryAndReplicatesTheResultAsSet() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-counter";
+                client.set(key, "10"); // fans out to both owners, seeding them identically
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertEquals(java.util.OptionalLong.of(15), client.incr(key, 5));
+
+                assertEquals(1, primary.incrCount.get(), "primary must receive exactly one `i` frame");
+                assertEquals(0, replica.incrCount.get(), "a replica must never receive an `i` frame");
+                assertEquals("15", new String(replica.store.get(storedKey), StandardCharsets.UTF_8),
+                        "the replica must hold the primary's literal resulting value");
+                assertEquals("15", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
+    void incrDoesNotTouchReplicasOnAMissOrNonNumericValue() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String missing = "never-set";
+                List<String> missingOwners = new HashRing(NAMES).owners(missing.getBytes(StandardCharsets.UTF_8), 2);
+                assertEquals(java.util.OptionalLong.empty(), client.incr(missing, 1));
+                // Only the primary is ever asked; a miss touches no replica.
+                assertEquals(1, cluster.nodes().get(missingOwners.get(0)).incrCount.get());
+                assertEquals(0, cluster.nodes().get(missingOwners.get(1)).incrCount.get());
+                assertEquals(0, cluster.nodes().get(missingOwners.get(1)).store.size());
+
+                String word = "not-a-number";
+                client.set(word, "hello");
+                List<String> wordOwners = new HashRing(NAMES).owners(word.getBytes(StandardCharsets.UTF_8), 2);
+                // Owners are just a permutation of this 2-node cluster's
+                // two names, so the "word" primary may be the same
+                // physical node as the "missing" case's above — compare
+                // against its count just before this call, not an
+                // absolute value.
+                int wordPrimaryIncrCountBefore = cluster.nodes().get(wordOwners.get(0)).incrCount.get();
+                long replicaWriteFailuresBefore = client.stats().replicaWriteFailures();
+                assertThrows(NanocachedException.NotNumeric.class, () -> client.incr(word, 1));
+                assertEquals(wordPrimaryIncrCountBefore + 1, cluster.nodes().get(wordOwners.get(0)).incrCount.get());
+                // No replica `set` was triggered by the failed incr — the
+                // replica-write-failure counter (a completely separate
+                // mechanism) must not have moved either.
+                assertEquals(replicaWriteFailuresBefore, client.stats().replicaWriteFailures());
+            }
+        }
+    }
+
+    @Test
+    void incrReplicatesTheEntrysLiveTtlToTheReplica() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "counter-with-ttl";
+                client.set(key, "10", 60);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertEquals(java.util.OptionalLong.of(11), client.incr(key, 1));
+
+                assertEquals("11", new String(replica.store.get(storedKey), StandardCharsets.UTF_8));
+                assertEquals(Long.valueOf(60), replica.ttls.get(storedKey),
+                        "the replica's set leg must carry the entry's live TTL");
+                assertEquals(Long.valueOf(60), primary.ttls.get(storedKey));
+            }
+        }
+    }
+
     // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     private static NanocachedClient connectFireAndForget(int port) {
@@ -2136,6 +2294,124 @@ class NanocachedClientTest {
                     assertTrue(revived.store.containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
                     assertTrue(memberConnectionOf(client, dead) != null);
                 }
+            }
+        }
+    }
+
+    // ── INCR エンコード/デコード (issue #129) ────────────────────────
+    // Exercised directly against Connection (bypassing NanocachedClient)
+    // so the exact wire bytes and every response shape (with/without ttl,
+    // with/without tag) are observable in isolation.
+
+    @Test
+    void incrRequestFrameBytesAndUntaggedResponseDecoding() throws Exception {
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0);
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket serverSocket = server.accept()) {
+            Connection connection = new Connection(clientSocket, false, () -> {});
+            try {
+                java.io.InputStream serverIn = serverSocket.getInputStream();
+                java.io.OutputStream serverOut = serverSocket.getOutputStream();
+                ExecutorService pool = Executors.newSingleThreadExecutor();
+                try {
+                    // Namespaced, negative delta: `i <ns-len> <key-len>
+                    // <delta>\n<namespace><key>` — the exact wire bytes.
+                    Future<Connection.IncrResult> withTtl = pool.submit(() -> connection.incr(
+                            "ns".getBytes(StandardCharsets.UTF_8), "key".getBytes(StandardCharsets.UTF_8), -42));
+                    byte[] expectedFrame = "i 2 3 -42\nnskey".getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(expectedFrame, serverIn.readNBytes(expectedFrame.length));
+                    serverOut.write("I 2 100\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.write("42".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    Connection.IncrResult result = withTtl.get();
+                    assertEquals(42L, result.value());
+                    assertEquals(Long.valueOf(100), result.ttlSeconds());
+
+                    // Default namespace (namespace-length 0, still always
+                    // sent — INCR has no separate legacy frame), no ttl.
+                    byte[] frameNoTtl = "i 0 1 1\nk".getBytes(StandardCharsets.US_ASCII);
+
+                    Future<Connection.IncrResult> noTtl = pool.submit(
+                            () -> connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1));
+                    assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
+                    serverOut.write("I 1\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.write("9".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    Connection.IncrResult result2 = noTtl.get();
+                    assertEquals(9L, result2.value());
+                    assertNull(result2.ttlSeconds());
+
+                    // Miss.
+                    Future<Connection.IncrResult> missing = pool.submit(
+                            () -> connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1));
+                    assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
+                    serverOut.write("N\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertNull(missing.get());
+
+                    // Non-numeric stored value / overflow.
+                    Future<Object> notNumeric = pool.submit(() -> {
+                        try {
+                            return connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1);
+                        } catch (NanocachedException.NotNumeric caught) {
+                            return caught;
+                        }
+                    });
+                    assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
+                    serverOut.write("T\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertTrue(notNumeric.get() instanceof NanocachedException.NotNumeric);
+
+                    // Stale routing.
+                    Future<Object> wrongNode = pool.submit(() -> {
+                        try {
+                            return connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1);
+                        } catch (NanocachedException.WrongNode caught) {
+                            return caught;
+                        }
+                    });
+                    assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
+                    serverOut.write("W\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertTrue(wrongNode.get() instanceof NanocachedException.WrongNode);
+                } finally {
+                    pool.shutdown();
+                }
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    @Test
+    void incrRoundTripsOnATaggedConnectionWithAndWithoutTtl() throws Exception {
+        try (MockNode node = MockNode.withTagSupport()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            assertTrue(target.tagged());
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                // Missing key.
+                assertNull(connection.incr(new byte[0], "counter".getBytes(StandardCharsets.UTF_8), 5));
+
+                // Hit, no TTL.
+                connection.set("counter".getBytes(StandardCharsets.UTF_8), "10".getBytes(StandardCharsets.UTF_8), null);
+                Connection.IncrResult result = connection.incr(new byte[0], "counter".getBytes(StandardCharsets.UTF_8), 5);
+                assertEquals(15L, result.value());
+                assertNull(result.ttlSeconds());
+
+                // Hit, with a TTL.
+                connection.set("timed".getBytes(StandardCharsets.UTF_8), "100".getBytes(StandardCharsets.UTF_8), 30L);
+                Connection.IncrResult timed = connection.incr(new byte[0], "timed".getBytes(StandardCharsets.UTF_8), 1);
+                assertEquals(101L, timed.value());
+                assertEquals(Long.valueOf(30), timed.ttlSeconds());
+
+                // Non-numeric.
+                connection.set("word".getBytes(StandardCharsets.UTF_8), "hi".getBytes(StandardCharsets.UTF_8), null);
+                assertThrows(NanocachedException.NotNumeric.class,
+                        () -> connection.incr(new byte[0], "word".getBytes(StandardCharsets.UTF_8), 1));
+            } finally {
+                connection.close();
             }
         }
     }

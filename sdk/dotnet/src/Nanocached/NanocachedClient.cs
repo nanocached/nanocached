@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Security;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
@@ -997,6 +998,179 @@ public sealed class NanocachedClient : IDisposable
         return await WithClusterRetryAsync(
             () => WriteAsync(namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key)))
             .ConfigureAwait(false);
+    }
+
+    // ── incr / decr (issue #129) ─────────────────────────────────
+
+    public Task<long?> IncrAsync(string key, long delta) => IncrAsync(EmptyNamespace, key, delta);
+
+    /// <summary>issue #129: increments the counter stored at
+    /// <paramref name="key"/> by <paramref name="delta"/> (a negative
+    /// delta decrements — there is no separate decrement opcode; see
+    /// <see cref="DecrAsync(byte[], long)"/>) and returns its new value, or
+    /// <c>null</c> when the key is missing or expired — the same
+    /// not-found convention <see cref="GetAsync(byte[])"/> uses. Throws
+    /// <see cref="NotNumericException"/> when the stored value isn't an
+    /// integer INCR can operate on, or applying the delta would overflow a
+    /// signed 64-bit integer.
+    ///
+    /// <para><b>Exactly as volatile as <see cref="SetAsync(byte[], byte[], long)"/></b>:
+    /// LRU eviction and TTL expiry reclaim an incremented value like any
+    /// other entry. Good for rate limiting or approximate counters, not
+    /// for durable counts (billing, inventory).</para>
+    ///
+    /// <para>Cluster replication: unlike <see cref="SetAsync(byte[], byte[], long)"/>/
+    /// <see cref="DeleteAsync(byte[])"/>, which send the identical write to
+    /// every owner, only the primary owner ever runs the increment — a
+    /// successful result is forwarded to the replicas as an ordinary
+    /// <c>Set</c> of the literal new value instead of replaying the delta
+    /// on each of them, which would let a replica drift from the primary
+    /// (e.g. after an earlier dropped replica write, or an independent
+    /// eviction). See <see cref="IncrPrimaryThenReplicateAsync"/> for the
+    /// full mechanics.</para></summary>
+    public Task<long?> IncrAsync(byte[] key, long delta) => IncrAsync(EmptyNamespace, key, delta);
+
+    /// <summary>issue #129: as <see cref="IncrAsync(string, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<long?> IncrAsync(byte[] namespaceBytes, string key, long delta) =>
+        IncrAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), delta);
+
+    /// <summary>issue #129: as <see cref="IncrAsync(byte[], long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — this is the internal
+    /// method <see cref="NanocachedNamespace"/> forwards to, rather than
+    /// duplicating this client's networking.</summary>
+    internal async Task<long?> IncrAsync(byte[] namespaceBytes, byte[] key, long delta)
+    {
+        ValidateKey(namespaceBytes, key);
+        await BeforeOperationAsync().ConfigureAwait(false);
+        return await WithClusterRetryAsync(() => IncrPrimaryThenReplicateAsync(namespaceBytes, key, delta))
+            .ConfigureAwait(false);
+    }
+
+    public Task<long?> DecrAsync(string key, long delta) => IncrAsync(key, -delta);
+
+    /// <summary>issue #129: <see cref="IncrAsync(byte[], long)"/> with
+    /// <paramref name="delta"/> negated — never a different wire op;
+    /// <c>i</c>'s own signed delta already covers decrementing.</summary>
+    public Task<long?> DecrAsync(byte[] key, long delta) => IncrAsync(key, -delta);
+
+    internal Task<long?> DecrAsync(byte[] namespaceBytes, string key, long delta) =>
+        IncrAsync(namespaceBytes, key, -delta);
+
+    internal Task<long?> DecrAsync(byte[] namespaceBytes, byte[] key, long delta) =>
+        IncrAsync(namespaceBytes, key, -delta);
+
+    /// <summary>issue #129 — the part that's easy to get subtly wrong: runs
+    /// <c>i</c> against the key's PRIMARY owner only, awaits its reply,
+    /// then — only on success — fans that literal result out to the
+    /// remaining owners as an ordinary <c>Set</c> (the same wire op and
+    /// framing <see cref="WriteAsync{T}"/>'s replica legs use), never by
+    /// resending <c>i</c> to a replica. Forwarding the primary's absolute
+    /// result keeps every replica byte-identical to it; replaying the
+    /// increment on each replica independently could let a replica drift
+    /// (e.g. if an earlier replica-leg write was dropped after a transient
+    /// failure, or the replica separately evicted and reset the key) —
+    /// the same reasoning the node's own migration/decommission-handoff
+    /// logic uses server-side.
+    ///
+    /// <para>A miss (<c>N</c>) or not-numeric result (<c>T</c>) is
+    /// returned/thrown directly, without touching any replica — nothing
+    /// was written, so there is nothing to forward. A dead or
+    /// disagreeing replica leg is swallowed exactly like
+    /// <see cref="WriteAsync{T}"/>'s own replica legs — counted via
+    /// <see cref="Stats"/>'s <c>ReplicaWriteFailures</c>, the same
+    /// counter, not a new one — and, with <see cref="Options.FireAndForgetReplicas"/>,
+    /// drawn from the same bounded background pool
+    /// (<see cref="_backgroundReplicaPermits"/>) those legs already
+    /// share with read-repair. The primary leg's own <c>W</c> or
+    /// connection-level failure propagates up to
+    /// <see cref="WithClusterRetryAsync{T}"/>'s caller, which refreshes
+    /// the node list and retries this whole method once — since nothing
+    /// is replicated until AFTER the primary succeeds, that retry only
+    /// ever redoes the primary leg in practice, never a replay of an
+    /// already-forwarded replica write.</para></summary>
+    private async Task<long?> IncrPrimaryThenReplicateAsync(byte[] namespaceBytes, byte[] key, long delta)
+    {
+        if (_ring is null)
+        {
+            var single = await ApplyReconnectingAsync(
+                null, connection => connection.IncrAsync(namespaceBytes, key, delta)).ConfigureAwait(false);
+            return single?.Value;
+        }
+
+        IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
+        if (names.Count == 0)
+        {
+            throw new ConnectionLostException("nanocached: no owner is reachable for this key");
+        }
+
+        var primaryResult = await ApplyReconnectingAsync(
+            names[0], connection => connection.IncrAsync(namespaceBytes, key, delta)).ConfigureAwait(false);
+        if (primaryResult is null) return null;
+
+        (long value, long ttlSeconds) = primaryResult.Value;
+        byte[] valueBytes = Encoding.ASCII.GetBytes(value.ToString(CultureInfo.InvariantCulture));
+
+        // Best-effort forward of the primary's literal result — swallowed
+        // by design (client-side replication's convention), counted via
+        // Stats().ReplicaWriteFailures. Narrowed to the connection layer's
+        // own failure types, same as WriteAsync's ReplicaWriteAsync, so a
+        // programming bug here doesn't get treated like a dead replica.
+        async Task ReplicateResultAsync(string name)
+        {
+            try
+            {
+                await ApplyReconnectingAsync<object?>(name, async connection =>
+                {
+                    await connection.SetAsync(namespaceBytes, key, valueBytes, ttlSeconds).ConfigureAwait(false);
+                    return null;
+                }).ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException)
+            {
+                Interlocked.Increment(ref _replicaWriteFailures);
+            }
+        }
+
+        var replicaWrites = new List<Task>();
+        foreach (string name in names.Skip(1))
+        {
+            // Fire-and-forget replica writes: mirrors WriteAsync's own
+            // background-pool logic exactly, sharing the same permit pool
+            // — past the cap, or with the option off, a leg just runs on
+            // the synchronous path below instead.
+            if (_fireAndForgetReplicas && _backgroundReplicaPermits.Wait(0))
+            {
+                Task background = Task.Run(() => ReplicateResultAsync(name));
+                _ = background.ContinueWith(
+                    completed =>
+                    {
+                        if (completed.Exception is not null)
+                        {
+                            Interlocked.Increment(ref _replicaWriteFailures);
+                        }
+                        _backgroundReplicaPermits.Release();
+                    },
+                    TaskScheduler.Default);
+                continue;
+            }
+
+            replicaWrites.Add(ReplicateResultAsync(name));
+        }
+
+        // The primary already succeeded by this point, so — unlike
+        // WriteAsync, which must reconcile a possibly-failed primary
+        // against a replica-leg bug — there is nothing to reconcile here:
+        // every failure ReplicateResultAsync can produce is already
+        // swallowed and counted inside it.
+        foreach (Task replicaWrite in replicaWrites)
+        {
+            await replicaWrite.ConfigureAwait(false);
+        }
+
+        return value;
     }
 
     /// <summary>issue #106: drops every entry in <paramref name="namespaceBytes"/>

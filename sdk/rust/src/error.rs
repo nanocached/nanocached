@@ -21,6 +21,13 @@ pub enum Error {
     /// startup grace (discovery HA), re-learning membership after a restart.
     /// Try another address, or retry shortly.
     DiscoveryBusy,
+    /// `incr`/`decr` (issue #129) answered `T`: the key exists but its
+    /// stored value isn't INCR's counter grammar (a plain signed decimal
+    /// integer), or applying the delta would overflow `i64`. Never
+    /// transient — retrying the same delta against the same stored value
+    /// cannot succeed — unlike `ConnectionLost`, which a redial may
+    /// recover from.
+    NotNumeric,
     /// Retryable-error status `R` (issue #125): this one request failed
     /// transiently three times in a row (e.g. `nanocached-proxy`'s
     /// upstream node was briefly unreachable and survived its own
@@ -71,6 +78,10 @@ impl fmt::Display for Error {
             Error::DiscoveryBusy => write!(
                 f,
                 "nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's"
+            ),
+            Error::NotNumeric => write!(
+                f,
+                "nanocached: the stored value is not an integer INCR can operate on"
             ),
             Error::ConnectionLost(message)
             | Error::Protocol(message)

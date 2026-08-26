@@ -2,6 +2,7 @@
 speaking just enough of the wire protocol (``A``, ``G``/``S``/``D`` and
 their namespaced ``g``/``s``/``d`` counterparts — issue #105 —
 ``c``/``F`` to clear a namespace or flush everything — issue #106 —
+``i`` to atomically increment/decrement a counter — issue #129 —
 ``L`` and, for SDK proxy mode (issue #122), ``Q``) for the client tests
 to exercise NanocachedClient end-to-end over real TCP sockets without the
 Rust binaries. Mirrors the TypeScript SDK's mocks.
@@ -36,6 +37,16 @@ class MockNode:
         # tests that poke `node.store[...]` directly keep working
         # unchanged.
         self.ns_store: dict[tuple[bytes, bytes], bytes] = {}
+        # Counters (issue #129): the TTL (whole seconds, 0 = none) each
+        # stored entry currently has — set/refreshed on every `S`/`s`,
+        # dropped on `D`/`d` and `c`/`F`. `incr`/`decr` never change a
+        # key's TTL, but the `I` response must still echo the entry's
+        # *remaining* TTL, so this is tracked here the same way the real
+        # server tracks it, separately from `store`/`ns_store` which only
+        # holds the raw bytes. Keyed identically to those two (namespace
+        # b"" lands in the "default" bucket, matching _get_entry/
+        # _set_entry/_delete_entry below).
+        self.entry_ttl: dict[tuple[bytes, bytes], int] = {}
         self.required_secret = required_secret
         # Echoed response tags: acknowledge `A ... T` with `OnT\n` and echo tags on
         # that connection's replies. Off by default so the bulk of the
@@ -72,6 +83,13 @@ class MockNode:
         # every mock node.
         self.clear_count = 0
         self.flush_count = 0
+        # Counters (issue #129): counts every `i` frame this node
+        # receives, regardless of outcome — the key proof, alongside
+        # get_count/namespaced_command_count/clear_count above, that a
+        # replica leg of a cluster incr() really did receive a `set`
+        # (bumping the store, never this counter) and never an `i` of
+        # its own.
+        self.incr_count = 0
         self._fail_clear_replies = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
@@ -387,6 +405,12 @@ class MockNode:
                         # tag sits after it as the last field.
                         base_field_count = 4 if tagged else 3
                         self.last_set_ttl = int(parts[3]) if len(parts) > base_field_count else 0
+                    # Counters (issue #129): captured as a local right
+                    # after parsing, not read back off self.last_set_ttl
+                    # below — an intervening await (self._set_delay) could
+                    # otherwise race a concurrent connection's own S/s and
+                    # record the wrong TTL for this entry.
+                    ttl_for_entry = self.last_set_ttl
                     if self._silent:
                         continue
                     if self._retryable_replies > 0:
@@ -404,6 +428,7 @@ class MockNode:
                         writer.write(b"W" + tag_suffix + b"\n")
                     else:
                         self._set_entry(namespace, key, value)
+                        self.entry_ttl[(namespace, key)] = ttl_for_entry
                         writer.write(b"S" + tag_suffix + b"\n")
                     await writer.drain()
 
@@ -426,6 +451,7 @@ class MockNode:
                         writer.write(b"W" + tag_suffix + b"\n")
                     else:
                         deleted = self._delete_entry(namespace, key)
+                        self.entry_ttl.pop((namespace, key), None)
                         writer.write((b"D" if deleted else b"N") + tag_suffix + b"\n")
                     await writer.drain()
 
@@ -456,12 +482,62 @@ class MockNode:
                             for ns, ns_key in list(self.ns_store):
                                 if ns == namespace:
                                     del self.ns_store[(ns, ns_key)]
+                            for ns, ns_key in list(self.entry_ttl):
+                                if ns == namespace:
+                                    del self.entry_ttl[(ns, ns_key)]
                         else:
                             self.store.clear()
+                            for ns, ns_key in list(self.entry_ttl):
+                                if not ns:
+                                    del self.entry_ttl[(ns, ns_key)]
                     else:
                         self.store.clear()
                         self.ns_store.clear()
+                        self.entry_ttl.clear()
                     writer.write(b"C" + tag_suffix + b"\n")
+                    await writer.drain()
+
+                elif parts[0] == b"i":
+                    # Counters (issue #129): `i <ns-len> <key-len>
+                    # <delta> [<tag>]` — always namespaced (namespace-
+                    # length 0 for the default namespace), no legacy
+                    # uppercase form, mirroring `c` above.
+                    namespace = await reader.readexactly(int(parts[1]))
+                    key = await reader.readexactly(int(parts[2]))
+                    delta = int(parts[3])
+                    self.incr_count += 1
+                    if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if self._wrong_node_replies > 0:
+                        self._wrong_node_replies -= 1
+                        writer.write(b"W" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    current = self._get_entry(namespace, key)
+                    if current is None:
+                        writer.write(b"N" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    try:
+                        new_value = int(current) + delta
+                    except ValueError:
+                        writer.write(b"T" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if not (-(2**63) <= new_value <= 2**63 - 1):
+                        writer.write(b"T" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    new_bytes = str(new_value).encode()
+                    self._set_entry(namespace, key, new_bytes)
+                    ttl = self.entry_ttl.get((namespace, key), 0)
+                    ttl_field = b" %d" % ttl if ttl else b""
+                    writer.write(b"I %d%b%b\n%b" % (len(new_bytes), ttl_field, tag_suffix, new_bytes))
                     await writer.drain()
 
                 else:

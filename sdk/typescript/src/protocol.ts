@@ -5,7 +5,7 @@
  * these encoders/parser, identification is already done and the socket
  * only ever carries `G`/`S`/`D` (and their namespaced `g`/`s`/`d`
  * counterparts), `c`/`F` (clear a namespace / flush everything, issue
- * #106) requests, and their responses.
+ * #106), `i` (INCR/DECR, issue #129) requests, and their responses.
  */
 
 import { NanocachedError } from "./errors.js";
@@ -138,6 +138,27 @@ export function encodeDelete(key: Uint8Array, tag?: number, namespace: Uint8Arra
   return Buffer.concat([toAscii(`d ${namespace.length} ${key.length}${tagField(tag)}\n`), namespace, key]);
 }
 
+// Unlike G/S/D, INCR has no uppercase legacy form — it always carries a
+// namespace-length header field, with 0 addressing the default namespace
+// (issue #129). `delta` is a *signed* wire integer, unlike every other
+// integer field this module encodes; `String(delta)` already produces the
+// canonical form the wire wants (an optional leading `-`, no leading
+// zeros, no `+`).
+export function encodeIncr(key: Uint8Array, delta: number, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+  checkKey(key, namespace);
+  // JS `number` can't exactly represent the wire protocol's full i64
+  // range (it loses precision past 2^53) — `Number.isSafeInteger` is the
+  // practical range this SDK can validate and round-trip exactly. A delta
+  // outside it (or a non-integer, like ttlSeconds' own check in encodeSet
+  // above) would serialize into a frame carrying a value the caller didn't
+  // actually mean, so reject it here, synchronously, before anything is
+  // written.
+  if (!Number.isSafeInteger(delta)) {
+    throw new RangeError(`nanocached: delta must be a safe integer (got ${delta}) — see README's incr/decr section for the precision caveat`);
+  }
+  return Buffer.concat([toAscii(`i ${namespace.length} ${key.length} ${delta}${tagField(tag)}\n`), namespace, key]);
+}
+
 // Clear a namespace / flush everything (issue #106). Neither is
 // key-addressed — a namespace's keys are spread over every node by HRW —
 // so, unlike G/S/D, there's no separate uppercase/lowercase pair keyed on
@@ -163,11 +184,20 @@ export function encodeClearAll(tag?: number): Buffer {
 }
 
 export interface ParsedResponse {
-  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode" | "cleared" | "retryable";
+  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode" | "cleared" | "retryable" | "incremented" | "notNumeric";
   value?: Buffer;
   /** echoed response tags: the echoed request tag, present on every response parsed
    * in tagged mode except the unsolicited `busy`. */
   tag?: number;
+  /** INCR's optional remaining TTL (issue #129), present only on an
+   * `incremented` response when the entry has a TTL — the same
+   * optional-trailing-field idiom `S`'s own request-side TTL uses, just
+   * mirrored on the response: on an untagged connection 0 trailing header
+   * fields after `<value-length>` means no TTL, 1 means TTL present; on a
+   * tagged connection 1 trailing field means "just the tag", 2 means
+   * "ttl then tag" — disambiguated purely by whether the connection is
+   * tagged, never guessed frame by frame. */
+  ttlSeconds?: number;
 }
 
 // The server's own request cap is 1 MiB; this constant doubles that as
@@ -212,6 +242,15 @@ const MARKER_CLEARED = 0x43; // 'C' — answers both `c` and `F` (issue #106)
 // emits it today, but the SDK must handle it on any connection
 // regardless — see Connection.send's bounded retry.
 const MARKER_RETRYABLE = 0x52; // 'R'
+// INCR (issue #129): a successful increment/decrement — like `V`, carries
+// a length-prefixed body (the new counter value, decimal ASCII), plus an
+// optional trailing TTL field the request-side marker letters above never
+// need. See ParsedResponse.ttlSeconds.
+const MARKER_INCREMENTED = 0x49; // 'I'
+// INCR (issue #129): the key exists but its stored value isn't INCR's
+// counter grammar, or applying `<delta>` would overflow the representable
+// range — a new marker, not used by any other op.
+const MARKER_NOT_NUMERIC = 0x54; // 'T'
 const LF = 0x0a;
 
 // Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
@@ -231,6 +270,17 @@ function parseTag(field: string): number {
   return tag;
 }
 
+// INCR's optional response-side TTL field (issue #129) — remaining
+// whole seconds, same strict decimal-digits-only grammar as a tag (see
+// TAG_PATTERN's own doc comment); a desynced/corrupt field must not be
+// silently accepted the way bare `Number(field)` would.
+function parseTtlSeconds(field: string): number {
+  if (!TAG_PATTERN.test(field)) {
+    throw new NanocachedError("nanocached: invalid ttl in response");
+  }
+  return Number(field);
+}
+
 /** Parses one response frame from the front of `buf`, returning `null`
  * while more bytes are still needed. Matches `Response::encode` (and,
  * with `tagged`, `Response::encode_with_tag` — echoed response tags) on the Rust
@@ -245,7 +295,8 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
     case MARKER_NOT_FOUND:
     case MARKER_WRONG_NODE:
     case MARKER_CLEARED:
-    case MARKER_RETRYABLE: {
+    case MARKER_RETRYABLE:
+    case MARKER_NOT_NUMERIC: {
       const kind =
         buf[0] === MARKER_STORED
           ? "stored"
@@ -257,7 +308,9 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
                 ? "wrongNode"
                 : buf[0] === MARKER_CLEARED
                   ? "cleared"
-                  : "retryable";
+                  : buf[0] === MARKER_RETRYABLE
+                    ? "retryable"
+                    : "notNumeric";
 
       if (!tagged) {
         if (buf.length < 2) return null;
@@ -322,6 +375,53 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
 
       return {
         response: { kind: "value", value: Buffer.from(buf.subarray(valueStart, valueEnd)), tag },
+        consumed: valueEnd,
+      };
+    }
+
+    case MARKER_INCREMENTED: {
+      const headerEnd = buf.indexOf(LF);
+      if (headerEnd === -1) {
+        // Same backstop as MARKER_VALUE above, generously widened for the
+        // optional TTL field this response can also carry.
+        if (buf.length > MAX_VALUE_HEADER_LENGTH + 1 + String(MAX_TAG).length + (tagged ? 1 + String(MAX_TAG).length : 0)) {
+          throw new NanocachedError("nanocached: invalid value length in response (missing header terminator)");
+        }
+        return null;
+      }
+
+      // Untagged: `I <len>` (no TTL) or `I <len> <ttl>`. Tagged: `I <len>
+      // <tag>` (no TTL) or `I <len> <ttl> <tag>` — disambiguated purely by
+      // field count for the connection's mode (see ParsedResponse.ttlSeconds).
+      const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+      const minFields = tagged ? 2 : 1;
+      const maxFields = tagged ? 3 : 2;
+      if (fields.length < minFields || fields.length > maxFields) {
+        throw new NanocachedError("nanocached: invalid incremented-value header in response");
+      }
+
+      const length = Number(fields[0]);
+      if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
+        throw new NanocachedError("nanocached: invalid value length in response");
+      }
+
+      // A TTL, when present, always sits right after the length; the tag
+      // (tagged mode) is always the last field regardless.
+      const hasTtl = fields.length === maxFields;
+      const ttlSeconds = hasTtl ? parseTtlSeconds(fields[1]) : undefined;
+      const tag = tagged ? parseTag(fields[fields.length - 1]) : undefined;
+
+      const valueStart = headerEnd + 1;
+      const valueEnd = valueStart + length;
+      if (buf.length < valueEnd) return null;
+
+      return {
+        response: {
+          kind: "incremented",
+          value: Buffer.from(buf.subarray(valueStart, valueEnd)),
+          ttlSeconds,
+          tag,
+        },
         consumed: valueEnd,
       };
     }

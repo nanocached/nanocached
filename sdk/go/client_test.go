@@ -108,6 +108,18 @@ type mockNode struct {
 	// attempt sent), trailing '\n' stripped.
 	authHeadersMu sync.Mutex
 	authHeaders   []string
+	// ttls records the TTL field (in seconds) of the last S/s that stored
+	// each key, keyed the same way store is — storeKey{"", ...} for the
+	// default namespace. Absent means the entry has no TTL. Used to answer
+	// an `i` (INCR, issue #129) success with its own optional
+	// [ttl-seconds] header field, exactly like a real node's INCR reports
+	// the entry's remaining TTL.
+	ttls sync.Map // storeKey -> int64
+	// iCount counts every `i` (INCR) frame this node has received —
+	// issue #129's replication test uses it to assert a replica never
+	// receives one (only the primary ever runs the increment; replicas
+	// get the literal result via an ordinary Set).
+	iCount atomic.Int32
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -195,6 +207,11 @@ func (m *mockNode) failClearTimes(n int32) { m.failClearLeft.Add(n) }
 // clear actually fanned out to every node (issue #106).
 func (m *mockNode) clearCountReceived() int32 { return m.clearCount.Load() }
 
+// iRequestsReceived reports how many `i` (INCR) frames this node has
+// received so far — issue #129's replication test uses this to assert a
+// replica never received one.
+func (m *mockNode) iRequestsReceived() int32 { return m.iCount.Load() }
+
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
 	return startMockNodeOpts(t, requiredSecret, mockNodeOpts{})
 }
@@ -242,6 +259,30 @@ func (m *mockNode) hasKey(key string) bool {
 func (m *mockNode) hasNSKey(ns, key string) bool {
 	_, ok := m.store.Load(storeKey{ns, key})
 	return ok
+}
+
+// storedValue returns key's raw stored value as a string within the
+// default namespace, and whether it was present at all — issue #129's
+// Incr tests use this to confirm a replica's stored value is the
+// primary's literal result, not something the replica computed itself.
+func (m *mockNode) storedValue(key string) (string, bool) {
+	v, ok := m.store.Load(storeKey{"", key})
+	if !ok {
+		return "", false
+	}
+	return string(v.([]byte)), true
+}
+
+// storedTTL returns the TTL (seconds) recorded by the most recent S/s
+// that stored key within the default namespace, and whether one is
+// recorded at all — issue #129's Incr TTL round-trip test uses this to
+// confirm the replica leg's Set carried the primary's reported TTL.
+func (m *mockNode) storedTTL(key string) (int64, bool) {
+	v, ok := m.ttls.Load(storeKey{"", key})
+	if !ok {
+		return 0, false
+	}
+	return v.(int64), true
 }
 
 func (m *mockNode) dropConnections() {
@@ -448,7 +489,8 @@ func (m *mockNode) serve(conn net.Conn) {
 			if tagged {
 				ttlBase = 4
 			}
-			if len(parts) > ttlBase {
+			hasTTL := len(parts) > ttlBase
+			if hasTTL {
 				m.lastSetTTL.Store(parts[3])
 			} else {
 				m.lastSetTTL.Store("none")
@@ -466,7 +508,13 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
 			} else {
-				m.store.Store(storeKey{"", key}, value)
+				sk := storeKey{"", key}
+				m.store.Store(sk, value)
+				if hasTTL {
+					m.ttls.Store(sk, int64(atoiOrPanic(parts[3])))
+				} else {
+					m.ttls.Delete(sk)
+				}
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
 				return
@@ -491,7 +539,8 @@ func (m *mockNode) serve(conn net.Conn) {
 			if tagged {
 				ttlBase = 5
 			}
-			if len(parts) > ttlBase {
+			hasTTL := len(parts) > ttlBase
+			if hasTTL {
 				m.lastSetTTL.Store(parts[4])
 			} else {
 				m.lastSetTTL.Store("none")
@@ -509,9 +558,77 @@ func (m *mockNode) serve(conn net.Conn) {
 			if m.takeOne(&m.setWrongNodeLeft) || m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
 			} else {
-				m.store.Store(storeKey{namespace, key}, value)
+				sk := storeKey{namespace, key}
+				m.store.Store(sk, value)
+				if hasTTL {
+					m.ttls.Store(sk, int64(atoiOrPanic(parts[4])))
+				} else {
+					m.ttls.Delete(sk)
+				}
 			}
 			if _, err := conn.Write([]byte(reply)); err != nil {
+				return
+			}
+		// Incr/Decr (issue #129): `i <ns-len> <key-len> <delta>[ <tag>]
+		// \n<ns><key>` — always namespaced (ns-len 0 for the default
+		// namespace), no legacy uppercase form. Parses the stored value
+		// (if any) as a signed decimal int64, adds delta, and answers `N`
+		// on a miss, `T` on a non-numeric stored value or an overflowing
+		// add, or `I <value-length> [<ttl-seconds>][ <tag>]\n<value>` on
+		// success — the ttl field, when this key has one recorded (see
+		// ttls, set by S/s above), mirrors a real node reporting the
+		// entry's remaining TTL. iCount counts every `i` this node has
+		// seen, failed or not — issue #129's replication test asserts a
+		// replica never receives one.
+		case "i":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			deltaStr := parts[3]
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			if m.silent.Load() {
+				continue
+			}
+			m.iCount.Add(1)
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeWrongNode() {
+				if _, err := conn.Write([]byte("W" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			sk := storeKey{namespace, key}
+			stored, found := m.store.Load(sk)
+			if !found {
+				if _, err := conn.Write([]byte("N" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			current, currErr := strconv.ParseInt(string(stored.([]byte)), 10, 64)
+			delta, deltaErr := strconv.ParseInt(deltaStr, 10, 64)
+			next := current + delta
+			overflowed := (delta > 0 && next < current) || (delta < 0 && next > current)
+			if currErr != nil || deltaErr != nil || overflowed {
+				if _, err := conn.Write([]byte("T" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			nextBytes := []byte(strconv.FormatInt(next, 10))
+			m.store.Store(sk, nextBytes)
+			ttlField := ""
+			if ttl, ok := m.ttls.Load(sk); ok {
+				ttlField = fmt.Sprintf(" %d", ttl.(int64))
+			}
+			reply := append([]byte(fmt.Sprintf("I %d%s%s\n", len(nextBytes), ttlField, tagSuffix)), nextBytes...)
+			if _, err := conn.Write(reply); err != nil {
 				return
 			}
 		case "D":
@@ -3334,6 +3451,28 @@ func TestAppendClearAllFrameUntaggedAndTagged(t *testing.T) {
 	}
 }
 
+// TestAppendIncrFrameDefaultAndNamespacedUntaggedAndTagged covers
+// appendIncrFrame's exact wire bytes (issue #129): always namespaced, even
+// for the default namespace (ns-len 0), unlike appendGetFrame/
+// appendSetFrame/appendDeleteFrame's legacy-vs-namespaced split — there is
+// no separate uppercase form to also test.
+func TestAppendIncrFrameDefaultAndNamespacedUntaggedAndTagged(t *testing.T) {
+	for _, ns := range [][]byte{nil, []byte("")} {
+		if got, want := string(appendIncrFrame(ns, []byte("k"), 5, false, 0)), "i 0 1 5\nk"; got != want {
+			t.Fatalf("appendIncrFrame(%v, ...) = %q, want %q", ns, got, want)
+		}
+	}
+	if got, want := string(appendIncrFrame([]byte("ns"), []byte("k"), 5, false, 0)), "i 2 1 5\nnsk"; got != want {
+		t.Fatalf("appendIncrFrame (namespaced) = %q, want %q", got, want)
+	}
+	if got, want := string(appendIncrFrame([]byte("ns"), []byte("k"), -5, false, 0)), "i 2 1 -5\nnsk"; got != want {
+		t.Fatalf("appendIncrFrame (negative delta) = %q, want %q", got, want)
+	}
+	if got, want := string(appendIncrFrame([]byte("ns"), []byte("k"), 5, true, 9)), "i 2 1 5 9\nnsk"; got != want {
+		t.Fatalf("appendIncrFrame (tagged) = %q, want %q", got, want)
+	}
+}
+
 // ── clear/flush client round trips, single node (issue #106) ─────────
 
 // TestNamespaceClearRoundTrip covers the issue #106 spec's namespaced
@@ -3725,5 +3864,194 @@ func TestNamespacedRoutingCanDifferFromTheDefaultNamespace(t *testing.T) {
 	}
 	if !differed {
 		t.Fatal("every namespace routed the same key to the same primary as the default namespace")
+	}
+}
+
+// ── Incr/Decr (issue #129) ─────────────────────────────────────────
+
+func TestIncrRoundTripsAndReturnsTheNewValue(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("counter", "10", 0); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok, err := client.Incr("counter", 5); err != nil || !ok || value != 15 {
+		t.Fatalf("Incr(+5) = %d, %v, %v, want 15, true, nil", value, ok, err)
+	}
+	if value, ok, err := client.Incr("counter", -3); err != nil || !ok || value != 12 {
+		t.Fatalf("Incr(-3) = %d, %v, %v, want 12, true, nil", value, ok, err)
+	}
+	if got, _ := node.storedValue("counter"); got != "12" {
+		t.Fatalf("node's stored value = %q, want \"12\"", got)
+	}
+}
+
+// TestIncrRoundTripsOverATaggedConnection covers the `I` response's
+// tagged-mode decode (issue #47's echoed response tags plus issue #129's
+// INCR) alongside the untagged path TestIncrRoundTripsAndReturnsTheNewValue
+// already covers.
+func TestIncrRoundTripsOverATaggedConnection(t *testing.T) {
+	node := startMockNodeOpts(t, nil, mockNodeOpts{supportTags: true})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("counter", "100", 0); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok, err := client.Incr("counter", 23); err != nil || !ok || value != 123 {
+		t.Fatalf("Incr = %d, %v, %v, want 123, true, nil", value, ok, err)
+	}
+}
+
+func TestIncrOnAMissingKeyReturnsNotFound(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value, ok, err := client.Incr("never-set", 1)
+	if err != nil || ok || value != 0 {
+		t.Fatalf("Incr on a missing key = %d, %v, %v, want 0, false, nil", value, ok, err)
+	}
+}
+
+func TestIncrOnANonNumericStoredValueReturnsErrNotNumeric(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("not-a-number", "hello", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := client.Incr("not-a-number", 1); ok || !errors.Is(err, ErrNotNumeric) {
+		t.Fatalf("Incr on a non-numeric value: ok=%v err=%v, want ok=false err=ErrNotNumeric", ok, err)
+	}
+}
+
+// TestDecrSendsTheNegatedDelta confirms Decr is a thin wrapper: it must
+// never send a separate wire opcode, only Incr with delta negated (issue
+// #129's spec).
+func TestDecrSendsTheNegatedDelta(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("counter", "20", 0); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok, err := client.Decr("counter", 5); err != nil || !ok || value != 15 {
+		t.Fatalf("Decr(5) = %d, %v, %v, want 15, true, nil", value, ok, err)
+	}
+	// Decr must send the same `i` opcode as Incr, just with delta negated
+	// — never a separate wire command.
+	if node.iRequestsReceived() != 1 {
+		t.Fatalf("iRequestsReceived = %d, want 1 (Decr must reuse `i`, not a separate opcode)", node.iRequestsReceived())
+	}
+}
+
+func TestNamespaceIncrAndDecrScopeToTheirNamespace(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ns := client.Namespace("counters")
+	if err := ns.Set("hits", "1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok, err := ns.Incr("hits", 1); err != nil || !ok || value != 2 {
+		t.Fatalf("Namespace.Incr = %d, %v, %v, want 2, true, nil", value, ok, err)
+	}
+	if value, ok, err := ns.Decr("hits", 1); err != nil || !ok || value != 1 {
+		t.Fatalf("Namespace.Decr = %d, %v, %v, want 1, true, nil", value, ok, err)
+	}
+	// The default namespace never saw this key at all — Incr/Decr, like
+	// Get/Set/Delete, must stay scoped to the namespace handle they were
+	// called through.
+	if node.hasKey("hits") {
+		t.Fatal("Namespace.Incr/Decr leaked into the default namespace")
+	}
+	if !node.hasNSKey("counters", "hits") {
+		t.Fatal("Namespace.Incr/Decr did not write into its own namespace")
+	}
+}
+
+// TestClusterIncrRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult is the
+// single most important test for issue #129's replication rule: a
+// successful Incr must run `i` against the primary owner ONLY, then fan
+// the primary's literal resulting value (and TTL) out to the remaining
+// owners as an ordinary Set — never replay `i` on a replica (see
+// (*Client).incr's own doc comment for why: replaying would let a replica
+// drift from the primary instead of staying byte-identical to it).
+//
+// Both nodes start from the same seeded value (10, with a TTL) precisely
+// so that a buggy implementation which mistakenly replays `i` on the
+// replica would still land on the same final stored value (15) as a
+// correct one — comparing only final values would not catch that bug.
+// The frame-count assertions below are the actual proof: the replica must
+// have received zero `i` frames, and its TTL must match what the
+// primary's `I` response reported (proving the replica's new value
+// arrived via a Set that carried that TTL field, not independently).
+func TestClusterIncrRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const key = "shared-counter"
+	owners := ownersOf(key)
+	primary, replica := nodes[owners[0]], nodes[owners[1]]
+
+	// Seed both owners, via the ordinary replicated Set path, with a TTL —
+	// so the mock's per-key ttls state (see storedTTL) starts identical on
+	// both, and only a real replicate-the-result Set proves it stays that
+	// way through the Incr below.
+	if err := client.Set(key, "10", 60); err != nil {
+		t.Fatal(err)
+	}
+
+	value, ok, err := client.Incr(key, 5)
+	if err != nil || !ok || value != 15 {
+		t.Fatalf("Incr = %d, %v, %v, want 15, true, nil", value, ok, err)
+	}
+
+	if got := primary.iRequestsReceived(); got != 1 {
+		t.Fatalf("primary received %d `i` frames, want exactly 1", got)
+	}
+	if got := replica.iRequestsReceived(); got != 0 {
+		t.Fatalf("replica received %d `i` frames, want exactly 0 (it must never see `i`)", got)
+	}
+
+	if got, ok := replica.storedValue(key); !ok || got != "15" {
+		t.Fatalf("replica's stored value = %q, %v, want \"15\", true (must equal the primary's literal result)", got, ok)
+	}
+	if got, ok := primary.storedValue(key); !ok || got != "15" {
+		t.Fatalf("primary's stored value = %q, %v, want \"15\", true", got, ok)
+	}
+
+	// TTL round-trip: the replica's Set-leg must have carried the same TTL
+	// the primary's own `I` response reported.
+	if got, ok := replica.storedTTL(key); !ok || got != 60 {
+		t.Fatalf("replica's recorded TTL = %d, %v, want 60, true", got, ok)
 	}
 }

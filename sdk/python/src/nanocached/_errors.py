@@ -42,6 +42,20 @@ class DiscoveryBusyError(NanocachedError):
         super().__init__("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's")
 
 
+class NotNumericError(NanocachedError):
+    """Raised by incr/decr (issue #129) when the stored value isn't an
+    integer INCR can operate on (it wasn't written by a previous
+    incr/decr and isn't itself decimal-integer text), or applying
+    ``delta`` would overflow a signed 64-bit integer — the wire's ``T``
+    response. The key is left untouched; unlike a dead replica, this is
+    never swallowed or retried."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "nanocached: the stored value is not numeric (or the increment would overflow)"
+        )
+
+
 class RetryableError(NanocachedError):
     """A single request was answered ``R`` (issue #125) three times
     running — the connection's bounded transient-retry budget (2 retries,

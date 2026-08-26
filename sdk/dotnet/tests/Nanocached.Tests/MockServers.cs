@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -38,6 +39,21 @@ public sealed class MockNode : IDisposable
     /// <summary>issue #106: how many <c>F</c> (flush-everything)
     /// requests this server has received.</summary>
     public int ClearAllRequestCount => _clearAllRequestCount;
+
+    /// <summary>issue #129: how many <c>i</c> (incr) requests this server
+    /// has received — the critical assertion for cluster replication
+    /// tests: a replica must see this stay 0 while a Set frame carries the
+    /// primary's literal result, never replaying the increment itself.</summary>
+    public int IncrRequestCount => _incrRequestCount;
+
+    /// <summary>issue #129: the exact header line (everything up to, not
+    /// including, the trailing '\n') of the most recent <c>i</c> request
+    /// this server received — lets a test assert the wire frame's exact
+    /// shape (namespace length, key length, delta, and — on a tagged
+    /// connection — the tag), the same role <see cref="LastAuthHeader"/>
+    /// plays for <c>A</c>.</summary>
+    public string? LastIncrHeader => _lastIncrHeader;
+    private volatile string? _lastIncrHeader;
 
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
@@ -85,6 +101,13 @@ public sealed class MockNode : IDisposable
     private int _clearRequestCount;
     private int _clearAllRequestCount;
     private int _failClearReplies;
+    private int _incrRequestCount;
+    /// <summary>issue #129: the TTL (whole seconds; 0 if none) each stored
+    /// entry currently carries, keyed the same way <see cref="Store"/> is
+    /// — recorded on every S/s and consulted (never modified — INCR never
+    /// changes a key's TTL) by <c>i</c> so its <c>I</c> reply can report
+    /// the entry's remaining TTL, the same way a real node would.</summary>
+    private readonly ConcurrentDictionary<string, long> _ttls = new();
     /// <summary>issue #125: how many of the NEXT data requests (any of
     /// G/S/D/g/s/d/c/F) get answered `R` (tagged correctly for the
     /// connection they arrived on) instead of their normal reply — set via
@@ -394,6 +417,7 @@ public sealed class MockNode : IDisposable
                         else
                         {
                             Store[KeyOf(key)] = value;
+                            _ttls[KeyOf(key)] = _lastSetTtl;
                             await Wire.WriteAsync(stream, $"S{tag}\n");
                         }
                         break;
@@ -524,8 +548,68 @@ public sealed class MockNode : IDisposable
                         else
                         {
                             Store[KeyOf(namespaceBytes, key)] = value;
+                            _ttls[KeyOf(namespaceBytes, key)] = _lastSetTtl;
                             await Wire.WriteAsync(stream, $"S{tag}\n");
                         }
+                        break;
+                    }
+                    case "i":
+                    {
+                        // issue #129 — always namespaced (no legacy
+                        // uppercase form): `i <ns-len> <key-len> <delta>[ <tag>]\n`.
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        long delta = long.Parse(parts[3], CultureInfo.InvariantCulture);
+                        _lastIncrHeader = string.Join(' ', parts);
+                        Interlocked.Increment(ref _incrRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+                        if (TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                            break;
+                        }
+
+                        string storeKey = KeyOf(namespaceBytes, key);
+                        if (!Store.TryGetValue(storeKey, out byte[]? existing))
+                        {
+                            await Wire.WriteAsync(stream, $"N{tag}\n");
+                            break;
+                        }
+                        if (!long.TryParse(
+                                Encoding.ASCII.GetString(existing), NumberStyles.Integer,
+                                CultureInfo.InvariantCulture, out long current))
+                        {
+                            await Wire.WriteAsync(stream, $"T{tag}\n");
+                            break;
+                        }
+
+                        long updated;
+                        try
+                        {
+                            updated = checked(current + delta);
+                        }
+                        catch (OverflowException)
+                        {
+                            await Wire.WriteAsync(stream, $"T{tag}\n");
+                            break;
+                        }
+
+                        byte[] updatedBytes = Encoding.ASCII.GetBytes(
+                            updated.ToString(CultureInfo.InvariantCulture));
+                        Store[storeKey] = updatedBytes;
+                        // TTL is unaffected by an increment — only reported.
+                        long ttlSeconds = _ttls.TryGetValue(storeKey, out long ttl) ? ttl : 0;
+                        string ttlField = ttlSeconds > 0 ? $" {ttlSeconds}" : "";
+                        await Wire.WriteAsync(stream, $"I {updatedBytes.Length}{ttlField}{tag}\n");
+                        await stream.WriteAsync(updatedBytes);
                         break;
                     }
                     case "d":

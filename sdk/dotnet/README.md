@@ -151,6 +151,34 @@ SDK — a node still failing after that raises a `ConnectionLostException`
 naming it, never a silent partial clear. Both raise
 `AlreadyClosedException` after `Close()`, like every other operation.
 
+## Incr / Decr
+
+`IncrAsync`/`DecrAsync` atomically increment or decrement a counter stored
+as a decimal integer:
+
+```csharp
+await client.SetAsync("hits", "0");
+long? hits = await client.IncrAsync("hits", 1);   // 1
+hits = await client.DecrAsync("hits", 1);          // 0, back to 0
+```
+
+`DecrAsync` is `IncrAsync` with the delta negated — there is no separate
+decrement opcode on the wire. Both return `null` when the key is missing
+or expired (the same convention `GetAsync` uses for a miss — INCR never
+creates a counter from nothing) and throw `NotNumericException` when the
+stored value isn't an integer, or applying the delta would overflow a
+64-bit signed integer.
+
+**As volatile as `Set`** — LRU eviction and TTL expiry reclaim an
+incremented value like any other entry. Good for rate limiting or
+approximate counters, not for durable counts (billing, inventory).
+
+In a cluster, only the primary owner ever runs the increment; replicas
+receive the resulting value via an ordinary `Set` instead of replaying
+the delta, so a replica can never drift from the primary (e.g. after an
+earlier dropped replica write). `NanocachedNamespace` exposes the same
+`IncrAsync`/`DecrAsync` pair, scoped to its namespace.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so
@@ -354,8 +382,10 @@ that a false positive.
 ## Errors
 
 Every exception this SDK throws extends `NanocachedException` —
-including `AuthenticationFailedException` for a rejected secret — so one
-catch clause covers "an expected nanocached failure". Caller mistakes
+including `AuthenticationFailedException` for a rejected secret and
+`NotNumericException` for an `IncrAsync`/`DecrAsync` whose stored value
+isn't an integer — so one catch clause covers "an expected nanocached
+failure". Caller mistakes
 (an invalid TTL, an empty address list) throw `ArgumentException`
 instead: they indicate a bug in the calling code, not a nanocached
 failure, a convention shared across the SDKs (issue #47).

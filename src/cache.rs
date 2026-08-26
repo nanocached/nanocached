@@ -73,6 +73,10 @@ pub struct CacheStats {
     pub deletes: u64,
     pub evictions: u64,
     pub expirations: u64,
+    /// Issue #129: successful `INCR` operations (a stored value that
+    /// wasn't INCR's decimal-ASCII grammar, or an overflowing `delta`,
+    /// isn't counted here — see `Cache::incr`).
+    pub incrs: u64,
     /// Largest first; one row per live namespace.
     pub namespaces: Vec<NamespaceStats>,
 }
@@ -125,6 +129,8 @@ pub struct Cache {
     /// or proactively by the sweep. Migration-mark reclaims are internal
     /// bookkeeping and deliberately not counted here.
     expirations: u64,
+    /// Issue #129: successful `INCR` operations — see `CacheStats::incrs`.
+    incrs: u64,
     /// Keys handed off to another node during an staged node join migration this
     /// node was the source for, awaiting `sweep`'s next pass.
     migrated: HashSet<Key>,
@@ -139,6 +145,63 @@ pub struct Cache {
 impl Entry {
     fn is_expired_at(&self, now: Instant) -> bool {
         self.expires_at.is_some_and(|expires_at| expires_at <= now)
+    }
+}
+
+/// `Cache::incr`'s outcome. `Value` carries the entry's remaining TTL
+/// alongside the new value — never put on the wire (see
+/// `Response::Incremented`), but needed by `src/server.rs`'s `Incr`
+/// connection handler to forward the correct TTL to a migration/
+/// decommission target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrResult {
+    Value(i64, Option<Duration>),
+    /// The key doesn't exist — never created by `incr` (unlike some
+    /// memcached-alikes' optional "start from N"), and deliberately
+    /// indistinguishable from a key eviction or TTL reclaimed: both are
+    /// "no counter here right now" to the caller.
+    NotFound,
+    /// The key exists, but its stored value isn't INCR's canonical
+    /// decimal-ASCII `i64` (see `parse_decimal_i64`), or applying `delta`
+    /// would overflow `i64`. Distinct from `NotFound` so a caller (e.g.
+    /// the Django adapter) can tell "no such key" from "wrong type" apart.
+    NotNumeric,
+}
+
+/// Issue #129: INCR's canonical decimal-ASCII integer grammar — shared
+/// between the wire `<delta>` field (`command.rs`'s `i` parse arm) and a
+/// stored counter value (`Cache::incr_at`, above), so the form INCR
+/// itself writes back is always a form it accepts back: an optional
+/// leading `-`, then ASCII digits with no leading zero (other than a
+/// lone `0`). No `+`, no internal sign, no whitespace — an incremented
+/// value's canonical form is unambiguous across all six SDKs.
+pub(crate) fn parse_decimal_i64(bytes: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+
+    let magnitude: u64 = digits.parse().ok()?;
+    if negative {
+        // i64::MIN's magnitude (9223372036854775808) has no positive i64
+        // representation, so it can't go through `i64::try_from` and
+        // negate like every other value — handled as the one special
+        // case instead of losing it.
+        if magnitude == i64::MIN.unsigned_abs() {
+            Some(i64::MIN)
+        } else {
+            i64::try_from(magnitude).ok().map(|value| -value)
+        }
+    } else {
+        i64::try_from(magnitude).ok()
     }
 }
 
@@ -169,12 +232,14 @@ impl Cache {
             deletes: 0,
             evictions: 0,
             expirations: 0,
+            incrs: 0,
             migrated: HashSet::new(),
             pending_removal: VecDeque::new(),
         }
     }
 
     pub fn set(&mut self, key: Key, value: Bytes) {
+        self.sets += 1;
         self.insert(key, value, None);
     }
 
@@ -185,11 +250,63 @@ impl Cache {
         // client's cache operations. A TTL too far out to represent is treated
         // as "never expires" (no expiry), which is the closest honest meaning.
         let expires_at = Instant::now().checked_add(ttl);
+        self.sets += 1;
         self.insert(key, value, expires_at);
     }
 
     pub fn get(&mut self, key: &Key) -> Option<Bytes> {
         self.get_at(key, Instant::now())
+    }
+
+    /// Issue #129: `INCR` — reads the stored value as INCR's canonical
+    /// decimal-ASCII `i64` (`parse_decimal_i64`), adds `delta`, and writes
+    /// the result back through `insert` (the same accounting-safe
+    /// overwrite path `set`/`set_with_ttl` use), preserving the entry's
+    /// existing TTL rather than resetting it — an `S`/`s` always replaces
+    /// the TTL (or clears it); `INCR` never does.
+    ///
+    /// Not atomic across a cluster (see `src/server.rs`'s `Incr` connection
+    /// handler and the module docs on client-side replication for how a
+    /// cluster stays consistent) — only against every other command on
+    /// this node's single-threaded cache actor, which is where its
+    /// atomicity comes from for free: no per-key lock, no CAS loop.
+    ///
+    /// Deliberately does *not* create a missing key (memcached's own
+    /// `incr` doesn't either) — a key absent because it was never set and
+    /// a key absent because eviction or TTL reclaimed it must look the
+    /// same to the caller, so `IncrResult::NotFound` covers both.
+    pub fn incr(&mut self, key: &Key, delta: i64) -> IncrResult {
+        self.incr_at(key, delta, Instant::now())
+    }
+
+    fn incr_at(&mut self, key: &Key, delta: i64, now: Instant) -> IncrResult {
+        let Some(entry) = self.peek(key) else {
+            return IncrResult::NotFound;
+        };
+
+        if entry.is_expired_at(now) {
+            self.remove_entry(key);
+            self.expirations += 1;
+            return IncrResult::NotFound;
+        }
+
+        let Some(current) = parse_decimal_i64(&entry.value) else {
+            return IncrResult::NotNumeric;
+        };
+
+        let Some(new_value) = current.checked_add(delta) else {
+            return IncrResult::NotNumeric;
+        };
+
+        // Extracted before the mutable borrow below; `entry` isn't touched
+        // again after this point.
+        let expires_at = entry.expires_at;
+        let remaining_ttl = expires_at.map(|expires_at| expires_at.saturating_duration_since(now));
+
+        self.incrs += 1;
+        self.insert(key.clone(), Bytes::from(new_value.to_string()), expires_at);
+
+        IncrResult::Value(new_value, remaining_ttl)
     }
 
     pub fn delete(&mut self, key: &Key) -> bool {
@@ -207,8 +324,11 @@ impl Cache {
         self.clock
     }
 
+    /// The shared accounting-safe overwrite path for every write: `set`/
+    /// `set_with_ttl` (which bump `self.sets`) and `incr_at` (which bumps
+    /// `self.incrs` instead — see its own doc comment for why counting an
+    /// INCR as a `sets_total` GET/SET-shaped write would be misleading).
     fn insert(&mut self, key: Key, value: Bytes, expires_at: Option<Instant>) {
-        self.sets += 1;
         // Entries stored long-term must not keep a shared receive-buffer
         // chunk (which may span an entire pipelined batch) alive just to
         // retain a few bytes of it, so re-copy into right-sized allocations
@@ -538,6 +658,7 @@ impl Cache {
             deletes: self.deletes,
             evictions: self.evictions,
             expirations: self.expirations,
+            incrs: self.incrs,
             namespaces,
         }
     }
@@ -746,6 +867,137 @@ mod tests {
         );
 
         assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn incr_on_a_missing_key_returns_not_found() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotFound);
+    }
+
+    #[test]
+    fn incr_adds_delta_to_the_stored_value() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"counter"), Bytes::from_static(b"10"));
+
+        assert_eq!(cache.incr(&key(b"counter"), 5), IncrResult::Value(15, None));
+        assert_eq!(cache.get(&key(b"counter")), Some(Bytes::from_static(b"15")));
+    }
+
+    #[test]
+    fn incr_accepts_a_negative_delta() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"counter"), Bytes::from_static(b"10"));
+
+        assert_eq!(cache.incr(&key(b"counter"), -3), IncrResult::Value(7, None));
+    }
+
+    #[test]
+    fn incr_on_a_non_numeric_value_returns_not_numeric() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(cache.incr(&key(b"name"), 1), IncrResult::NotNumeric);
+        // The value is untouched — a failed INCR never writes.
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn incr_rejects_a_leading_plus_sign() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"counter"), Bytes::from_static(b"+10"));
+
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotNumeric);
+    }
+
+    #[test]
+    fn incr_rejects_a_leading_zero() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"counter"), Bytes::from_static(b"010"));
+
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotNumeric);
+    }
+
+    #[test]
+    fn incr_that_would_overflow_i64_returns_not_numeric() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"counter"), Bytes::from(i64::MAX.to_string()));
+
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotNumeric);
+    }
+
+    #[test]
+    fn incr_on_an_expired_key_returns_not_found_and_removes_it() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set_with_ttl(key(b"counter"), Bytes::from_static(b"10"), Duration::ZERO);
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotFound);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn incr_preserves_the_entrys_ttl() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set_with_ttl(
+            key(b"counter"),
+            Bytes::from_static(b"10"),
+            Duration::from_secs(60),
+        );
+
+        let IncrResult::Value(11, Some(remaining)) = cache.incr(&key(b"counter"), 1) else {
+            panic!("expected a value with a remaining TTL");
+        };
+        assert!(remaining <= Duration::from_secs(60) && remaining > Duration::from_secs(55));
+    }
+
+    #[test]
+    fn incr_does_not_reset_a_missing_ttl_to_one() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"counter"), Bytes::from_static(b"10"));
+
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::Value(11, None));
+    }
+
+    #[test]
+    fn incr_is_scoped_to_its_namespace() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(namespaced(b"ns", b"counter"), Bytes::from_static(b"10"));
+
+        assert_eq!(
+            cache.incr(&namespaced(b"ns", b"counter"), 1),
+            IncrResult::Value(11, None)
+        );
+        assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotFound);
+    }
+
+    #[test]
+    fn parse_decimal_i64_accepts_zero_and_negative_zero_shaped_input() {
+        assert_eq!(parse_decimal_i64(b"0"), Some(0));
+    }
+
+    #[test]
+    fn parse_decimal_i64_rejects_empty_input() {
+        assert_eq!(parse_decimal_i64(b""), None);
+        assert_eq!(parse_decimal_i64(b"-"), None);
+    }
+
+    #[test]
+    fn parse_decimal_i64_rejects_non_digit_bytes() {
+        assert_eq!(parse_decimal_i64(b"12a"), None);
+        assert_eq!(parse_decimal_i64(b"1.5"), None);
+        assert_eq!(parse_decimal_i64(b" 1"), None);
+    }
+
+    #[test]
+    fn parse_decimal_i64_handles_i64_min_specially() {
+        assert_eq!(parse_decimal_i64(b"-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(parse_decimal_i64(b"9223372036854775807"), Some(i64::MAX));
+        // One past either boundary doesn't fit.
+        assert_eq!(parse_decimal_i64(b"-9223372036854775809"), None);
+        assert_eq!(parse_decimal_i64(b"9223372036854775808"), None);
     }
 
     #[test]

@@ -39,8 +39,23 @@ final class MockServers {
          * namespace and the default keyspace) falls out of these simply
          * being different maps. */
         final Map<String, Map<String, byte[]>> namespacedStores = new ConcurrentHashMap<>();
+        /** Per-key TTL (whole seconds; absent = no expiry), default
+         * namespace — populated by `S`/`s` and read back by `i` (issue
+         * #129) so a mock node can answer INCR's own optional
+         * {@code <ttl-seconds>} trailing field truthfully. Nothing else
+         * (get/delete/clear included) needs a key's TTL, so this is the
+         * only place it's tracked. */
+        final Map<String, Long> ttls = new ConcurrentHashMap<>();
+        /** As {@link #ttls}, one map per non-empty namespace — mirrors
+         * {@link #namespacedStores}. */
+        final Map<String, Map<String, Long>> namespacedTtls = new ConcurrentHashMap<>();
         final AtomicInteger connectionCount = new AtomicInteger();
         final AtomicInteger getCount = new AtomicInteger();
+        /** Counts every `i` (INCR, issue #129) frame received — lets a
+         * test prove a replica never receives one (only the primary owner
+         * ever should; a replica gets the result forwarded as an ordinary
+         * `set` instead). */
+        final AtomicInteger incrCount = new AtomicInteger();
         /** Counts every `g`/`s`/`d` frame received — never incremented by
          * `G`/`S`/`D`. Lets a test prove the empty (default) namespace
          * really does send the legacy frame, not `g 0 ...`/etc (issue
@@ -509,6 +524,7 @@ final class MockServers {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 store.put(key, value);
+                                namespacedPutTtl("", key, lastSetTtl);
                                 out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
@@ -610,8 +626,59 @@ final class MockServers {
                                 out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 namespacedPut(ns, key, value);
+                                namespacedPutTtl(ns, key, lastSetTtl);
                                 out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
+                            out.flush();
+                        }
+                        // INCR/DECR (issue #129): always namespaced on the
+                        // wire (0-length namespace = default), unlike G/S/D
+                        // there is no separate uppercase form. A missing
+                        // key answers `N`; a non-numeric stored value or an
+                        // overflowing delta answers `T`; a hit answers `I
+                        // <value-length> [<ttl-seconds>] [<tag>]` — the ttl
+                        // field mirrors this entry's own live TTL (tracked
+                        // by S/s above), present only when one was set.
+                        case "i" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            long delta = Long.parseLong(parts[3]);
+                            incrCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            byte[] existing = namespacedGet(ns, key);
+                            if (existing == null) {
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            long updated;
+                            try {
+                                updated = Math.addExact(
+                                        Long.parseLong(new String(existing, StandardCharsets.US_ASCII)), delta);
+                            } catch (NumberFormatException | ArithmeticException notNumeric) {
+                                out.write(("T" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            byte[] updatedValue = Long.toString(updated).getBytes(StandardCharsets.US_ASCII);
+                            namespacedPut(ns, key, updatedValue);
+                            Long ttl = namespacedTtl(ns, key);
+                            String ttlField = ttl == null ? "" : " " + ttl;
+                            out.write(("I " + updatedValue.length + ttlField + tagSuffix + "\n")
+                                    .getBytes(StandardCharsets.US_ASCII));
+                            out.write(updatedValue);
                             out.flush();
                         }
                         case "d" -> {
@@ -656,8 +723,10 @@ final class MockServers {
                             }
                             if (ns.isEmpty()) {
                                 store.clear();
+                                ttls.clear();
                             } else {
                                 namespacedStores.remove(ns);
+                                namespacedTtls.remove(ns);
                             }
                             out.write(("C" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             out.flush();
@@ -677,6 +746,8 @@ final class MockServers {
                             }
                             store.clear();
                             namespacedStores.clear();
+                            ttls.clear();
+                            namespacedTtls.clear();
                             out.write(("C" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             out.flush();
                         }
@@ -727,9 +798,34 @@ final class MockServers {
         }
 
         private byte[] namespacedRemove(String ns, String key) {
-            if (ns.isEmpty()) return store.remove(key);
+            if (ns.isEmpty()) {
+                ttls.remove(key);
+                return store.remove(key);
+            }
             Map<String, byte[]> nsStore = namespacedStores.get(ns);
+            Map<String, Long> nsTtls = namespacedTtls.get(ns);
+            if (nsTtls != null) nsTtls.remove(key);
             return nsStore == null ? null : nsStore.remove(key);
+        }
+
+        /** As {@link #namespacedPut}, for a key's TTL (issue #129) —
+         * {@code ttlSeconds <= 0} means no expiry, matching the wire's own
+         * "omitted means no TTL" convention (see {@link #lastSetTtl}). */
+        private void namespacedPutTtl(String ns, String key, long ttlSeconds) {
+            if (ns.isEmpty()) {
+                if (ttlSeconds > 0) ttls.put(key, ttlSeconds); else ttls.remove(key);
+                return;
+            }
+            Map<String, Long> nsTtls = namespacedTtls.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>());
+            if (ttlSeconds > 0) nsTtls.put(key, ttlSeconds); else nsTtls.remove(key);
+        }
+
+        /** As {@link #namespacedGet}, for a key's TTL (issue #129) —
+         * {@code null} means no TTL. */
+        private Long namespacedTtl(String ns, String key) {
+            if (ns.isEmpty()) return ttls.get(key);
+            Map<String, Long> nsTtls = namespacedTtls.get(ns);
+            return nsTtls == null ? null : nsTtls.get(key);
         }
 
         static String keyOf(byte[] key) {

@@ -60,6 +60,15 @@ var (
 	// cannot succeed.
 	ErrInvalidArgument = errors.New("nanocached: invalid argument")
 
+	// ErrNotNumeric is returned by Incr/Decr when the key's stored value
+	// isn't INCR's counter grammar (a signed decimal int64), or applying
+	// the delta would overflow int64 — the server answers `T` (issue #129)
+	// either way, since it doesn't distinguish the two on the wire. Never
+	// transient: retrying the same Incr against the same stored value
+	// cannot succeed; the caller must first overwrite the key with a
+	// numeric value (or delete it).
+	ErrNotNumeric = errors.New("nanocached: the stored value is not an integer INCR can operate on")
+
 	// ErrRetryable is returned when a single request was answered `R`
 	// (issue #125) on every attempt of the bounded retry budget — the
 	// server (today, only nanocached-proxy) reported the request itself

@@ -1298,6 +1298,14 @@ fn render_node_metrics(
         "Entries removed because their TTL passed.",
         format!("nanocached_node_expirations_total {}\n", stats.expirations),
     );
+    metric(
+        "nanocached_node_incrs_total",
+        "counter",
+        "Successful INCR operations (issue #129) — a stored value that \
+         wasn't INCR's counter grammar, or an overflowing delta, isn't \
+         counted here.",
+        format!("nanocached_node_incrs_total {}\n", stats.incrs),
+    );
 
     let mut namespace_entries = String::new();
     let mut namespace_bytes = String::new();
@@ -1902,6 +1910,73 @@ async fn handle_connection(
                             OwnedForwardedWrite::HandoffDelete { key: key.clone() },
                         )))
                         .await;
+                }
+
+                continue;
+            }
+            Ok((Command::Incr { key, delta }, tag)) => {
+                if let Some(node_context) = &config.node_context
+                    && wrong_node(node_context, &key)
+                {
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
+                    continue;
+                }
+
+                let response = execute_command(
+                    &request_tx,
+                    Command::Incr {
+                        key: key.clone(),
+                        delta,
+                    },
+                )
+                .await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                // Issue #129: only a `Response::Incremented` — i.e. INCR
+                // actually wrote a new value — needs forwarding;
+                // `NotFound`/`NotNumeric` changed nothing. Forwarded as
+                // the resulting *absolute* value via a plain `Set`/
+                // `HandoffSet`, never as `Incr` itself: replaying the
+                // increment on a joining/entrant node that already has
+                // this key from an earlier transfer would double-apply
+                // it (see `Command::Incr`'s doc comment). The remaining
+                // TTL rides along so the receiving node's copy doesn't
+                // come back TTL-less.
+                if let Response::Incremented(ref value, ttl) = response {
+                    if let Some(node_context) = &config.node_context
+                        && let Some(target) = migration_target_for(node_context, &key)
+                    {
+                        let _ = config
+                            .migration_tx
+                            .send(Box::pin(forward_with_retries(
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::Set {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    ttl,
+                                },
+                            )))
+                            .await;
+                    }
+
+                    if let Some(node_context) = &config.node_context
+                        && let Some(target) = leave_target_for(node_context, &key)
+                    {
+                        let _ = config
+                            .migration_tx
+                            .send(Box::pin(forward_with_retries(
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::HandoffSet {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    ttl,
+                                },
+                            )))
+                            .await;
+                    }
                 }
 
                 continue;
@@ -5332,6 +5407,23 @@ mod tests {
             },
         )
         .await;
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"counter"),
+                value: Bytes::from_static(b"1"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(
+            &request_tx,
+            Command::Incr {
+                key: key(b"counter"),
+                delta: 1,
+            },
+        )
+        .await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -5347,20 +5439,21 @@ mod tests {
 
         let (status, body) = http_get(&addr, "/metrics").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
-        assert!(body.contains("nanocached_node_entries 2\n"), "{body}");
+        assert!(body.contains("nanocached_node_entries 3\n"), "{body}");
         assert!(
             body.contains("nanocached_node_namespace_budget_bytes{namespace=\"users\"} 4096\n"),
             "{body}"
         );
         assert!(body.contains("nanocached_node_hits_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_misses_total 1\n"), "{body}");
-        assert!(body.contains("nanocached_node_sets_total 2\n"), "{body}");
+        assert!(body.contains("nanocached_node_sets_total 3\n"), "{body}");
+        assert!(body.contains("nanocached_node_incrs_total 1\n"), "{body}");
         assert!(
             body.contains("nanocached_node_namespace_entries{namespace=\"users\"} 1\n"),
             "{body}"
         );
         assert!(
-            body.contains("nanocached_node_namespace_entries{namespace=\"\"} 1\n"),
+            body.contains("nanocached_node_namespace_entries{namespace=\"\"} 2\n"),
             "{body}"
         );
         assert!(
@@ -5756,6 +5849,50 @@ mod tests {
 
         assert_eq!(response, expected);
 
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_dispatches_incr_and_replies_with_the_new_value() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"i 0 3 5\nfoo").await.unwrap();
+
+        let request = request_rx.recv().await.unwrap();
+        assert_eq!(
+            request.command,
+            Command::Incr {
+                key: key(b"foo"),
+                delta: 5,
+            },
+        );
+        request
+            .response_tx
+            .send(Response::Incremented(Bytes::from_static(b"15"), None))
+            .unwrap();
+
+        let expected = b"I 2\n15";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        shutdown_tx.send_replace(true);
         connection_task.await.unwrap().unwrap();
     }
 

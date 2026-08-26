@@ -96,6 +96,19 @@ struct NodeState {
     /// protocol never sends one) — a dropped connection is the only
     /// failure shape worth simulating here.
     fail_clear_replies: AtomicUsize,
+    /// How many `i` requests this node has ever received (issue #129) —
+    /// the critical assertion for cluster replication: a replica must
+    /// receive a `set`/`s` carrying the incr's literal result, and never
+    /// an `i` of its own (which would let it replay the increment
+    /// instead of mirroring the primary's exact value).
+    incrs: AtomicUsize,
+    /// The TTL (seconds) this node's `i` handler answers with — `0` means
+    /// no `<ttl-seconds>` field on the wire at all, exactly like `set`'s
+    /// own `ttl_seconds == 0` convention. Test-only knob: this mock never
+    /// models real per-key expiry, so a test that wants to prove the TTL
+    /// on an `I` response gets forwarded verbatim to the replica leg sets
+    /// this directly rather than relying on genuine expiry bookkeeping.
+    incr_ttl_seconds: AtomicUsize,
 }
 
 struct MockNode {
@@ -417,6 +430,65 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     return;
                 }
             }
+            "i" => {
+                // INCR (issue #129): always namespaced — no legacy
+                // uppercase form, so unlike `G`/`S`/`D` there is no
+                // branch on `parts[0]`'s case; the namespace-length field
+                // is always present, exactly like `c`'s own frame.
+                let namespace = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                let key = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+                let delta: i64 = parts[3].parse().unwrap();
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                state.incrs.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let composite = store_key(&namespace, &key);
+                let reply = if take_wrong_node(&state) {
+                    format!("W{tag_suffix}\n").into_bytes()
+                } else {
+                    let mut store = state.store.lock().unwrap();
+                    match store.get(&composite) {
+                        None => format!("N{tag_suffix}\n").into_bytes(),
+                        Some(existing) => {
+                            let current = std::str::from_utf8(existing)
+                                .ok()
+                                .and_then(|text| text.parse::<i64>().ok());
+                            match current.and_then(|current| current.checked_add(delta)) {
+                                None => format!("T{tag_suffix}\n").into_bytes(),
+                                Some(new_value) => {
+                                    let new_bytes = new_value.to_string().into_bytes();
+                                    store.insert(composite.clone(), new_bytes.clone());
+                                    drop(store);
+                                    state
+                                        .store_namespaces
+                                        .lock()
+                                        .unwrap()
+                                        .insert(composite, namespace);
+                                    let ttl = state.incr_ttl_seconds.load(Ordering::SeqCst);
+                                    let mut frame = if ttl > 0 {
+                                        format!("I {} {ttl}{tag_suffix}\n", new_bytes.len())
+                                            .into_bytes()
+                                    } else {
+                                        format!("I {}{tag_suffix}\n", new_bytes.len()).into_bytes()
+                                    };
+                                    frame.extend_from_slice(&new_bytes);
+                                    frame
+                                }
+                            }
+                        }
+                    }
+                };
+                if stream.get_mut().write_all(&reply).await.is_err() {
+                    return;
+                }
+            }
             _ => return,
         }
     }
@@ -687,6 +759,114 @@ async fn round_trips_set_get_delete() {
     assert_eq!(client.get("greeting").await.unwrap(), None);
     assert!(!client.delete("greeting").await.unwrap());
     assert_eq!(client.replication().await, 1);
+
+    client.close().await;
+    node.stop();
+}
+
+// ── incr/decr (issue #129) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn incr_on_a_missing_key_returns_none() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert_eq!(client.incr("hits", 1).await.unwrap(), None);
+    assert_eq!(node.state.incrs.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn incr_on_a_non_numeric_stored_value_errors_not_numeric() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("hits", "not-a-number", 0).await.unwrap();
+    assert!(matches!(
+        client.incr("hits", 1).await,
+        Err(Error::NotNumeric)
+    ));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_successful_incr_returns_the_new_value() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("hits", "10", 0).await.unwrap();
+    assert_eq!(client.incr("hits", 5).await.unwrap(), Some(15));
+    assert_eq!(client.incr("hits", -3).await.unwrap(), Some(12));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn decr_sends_the_negated_delta() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("hits", "10", 0).await.unwrap();
+    assert_eq!(client.decr("hits", 3).await.unwrap(), Some(7));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn decr_of_i64_min_is_rejected_client_side() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert!(matches!(
+        client.decr("hits", i64::MIN).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    // Never reached the wire at all.
+    assert_eq!(node.state.incrs.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_namespaced_incr_uses_the_i_frame_with_a_namespace_length_field() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("tenant");
+
+    ns.set("hits", "10", 0).await.unwrap();
+    assert_eq!(ns.incr("hits", 1).await.unwrap(), Some(11));
+    // The default namespace's own entry (if any) must stay untouched —
+    // namespaced and unnamespaced "hits" are wholly independent keys.
+    assert_eq!(client.get("hits").await.unwrap(), None);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn incr_round_trips_on_a_tagged_connection() {
+    // Exercises the tagged-mode-aware "count trailing fields" decode path
+    // for `I` end to end — with a TTL present (ttl-then-tag) and without
+    // (tag only).
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("hits", "10", 0).await.unwrap();
+    assert_eq!(client.incr("hits", 1).await.unwrap(), Some(11));
+
+    node.state.incr_ttl_seconds.store(30, Ordering::SeqCst);
+    assert_eq!(client.incr("hits", 1).await.unwrap(), Some(12));
 
     client.close().await;
     node.stop();
@@ -1830,6 +2010,129 @@ async fn fans_writes_out_to_every_owner() {
             );
         }
     }
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── incr replication (issue #129) ───────────────────────────────────
+
+#[tokio::test]
+async fn incr_replicates_the_result_never_the_operation() {
+    // The single most important incr test: a successful incr must send
+    // `i` to the primary only, and forward its literal result to the
+    // replica as a `set` — never replay `i` there. Comparing final stored
+    // values alone would pass even for a buggy implementation that
+    // replayed `i` on the replica (same seed, same delta, same outcome),
+    // so this asserts frame counts instead: exactly one `i` on the
+    // primary, zero on the replica.
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("hits");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"hits".to_vec(), b"5".to_vec());
+    primary.state.incr_ttl_seconds.store(45, Ordering::SeqCst);
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    assert_eq!(client.incr("hits", 3).await.unwrap(), Some(8));
+
+    assert_eq!(
+        primary.state.incrs.load(Ordering::SeqCst),
+        1,
+        "the primary should have received exactly one i frame"
+    );
+    assert_eq!(
+        replica.state.incrs.load(Ordering::SeqCst),
+        0,
+        "the replica must never receive an i frame — only the primary ever runs INCR"
+    );
+
+    // The replica got the literal result via an ordinary set/s frame,
+    // TTL included (45s from the primary's own I response).
+    assert_eq!(
+        replica.state.store.lock().unwrap().get(b"hits".as_slice()),
+        Some(&b"8".to_vec())
+    );
+    assert_eq!(
+        replica.state.last_set_header.lock().unwrap().as_deref(),
+        Some("S 4 1 45"),
+        "the replica's set should carry the incr's own TTL (45s), key-len 4, value-len 1"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_not_found_incr_never_touches_the_replica() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("missing");
+    let replica = node_by_name(&nodes, &owners[1]);
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    assert_eq!(client.incr("missing", 1).await.unwrap(), None);
+
+    assert_eq!(replica.state.incrs.load(Ordering::SeqCst), 0);
+    assert!(!replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(b"missing".as_slice()));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_not_numeric_incr_never_touches_the_replica() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("hits");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"hits".to_vec(), b"not-a-number".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        client.incr("hits", 1).await,
+        Err(Error::NotNumeric)
+    ));
+
+    assert_eq!(replica.state.incrs.load(Ordering::SeqCst), 0);
+    assert!(!replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(b"hits".as_slice()));
 
     client.close().await;
     discovery.stop();

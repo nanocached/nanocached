@@ -367,6 +367,41 @@ Every retry (whether it eventually succeeds or exhausts into
 `RetryableError`) is counted in `client.stats().transientRetries` — see
 [`client.stats()`](#api) below.
 
+## `incr` / `decr`
+
+Atomically add to (or subtract from) a key's stored counter:
+
+```ts
+await client.set("hits", "0");
+await client.incr("hits"); // 1
+await client.incr("hits", 5); // 6
+await client.decr("hits", 2); // 4
+```
+
+`decr(key, delta)` is exactly `incr(key, -delta)` — there is no separate
+wire operation for decrement, the server only ever sees `i`. Both default
+`delta` to 1, and both work on a namespace handle too
+(`client.namespace(ns).incr(...)`). A missing or expired key resolves
+`null`, same as `get`'s own miss convention; a key whose stored value
+isn't an integer `incr` can operate on (or where applying `delta` would
+overflow) rejects with `NotNumericError`.
+
+**As volatile as `set`**: LRU eviction and TTL expiry reclaim an
+incremented value exactly like any other entry. Good for rate limiting and
+approximate counters; not for a durable count (billing, inventory) — use a
+real datastore for that.
+
+`delta` must be a safe integer (`Number.isInteger` and within
+`±(2^53 - 1)`) — unlike the wire protocol's own signed 64-bit range, a JS
+`number` can't exactly represent every value out that far, so this SDK
+validates and round-trips only the safe range and rejects the rest with a
+`RangeError`; the counter value returned is parsed back the same way and
+carries the same caveat for very large counts.
+
+In a cluster, only the primary owner ever runs the increment — replicas
+receive its literal result as an ordinary `set` instead, so a replica can
+never drift from the primary by re-deriving the increment on its own.
+
 ## API
 
 - `NanocachedClient.connect(options)` —
@@ -380,10 +415,14 @@ Every retry (whether it eventually succeeds or exhausts into
 - `client.set(key, value, ttlSeconds = 0)` — `ttlSeconds` must be a
   non-negative integer; 0 (the default) means no expiry
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
+- `client.incr(key, delta = 1)` / `client.decr(key, delta = 1)` — resolves
+  `number | null` (`null` on a miss); throws `NotNumericError` if the
+  stored value isn't an integer `incr` can operate on; see
+  [`incr`/`decr`](#incr--decr) above
 - `client.namespace(ns)` — returns a `NanocachedNamespace` handle scoped to
   `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/`set`/
-  `delete`/`clear` with the same signatures and semantics as above;
-  `handle.namespace` exposes the raw namespace bytes
+  `delete`/`clear`/`incr`/`decr` with the same signatures and semantics as
+  above; `handle.namespace` exposes the raw namespace bytes
 - `handle.clear()` — resolves (`Promise<void>`) once every node in the
   cluster (or the single node in standalone mode) has cleared that
   namespace; see [Namespaces](#namespaces)
@@ -404,7 +443,8 @@ Every retry (whether it eventually succeeds or exhausts into
 
 Every error the SDK itself raises — `AlreadyClosedError`,
 `WrongNodeError`, `ConnectionLostError`, `RetryableError`,
-`DecompressionError`, `DiscoveryBusyError`, and protocol/auth failures —
+`NotNumericError`, `DecompressionError`, `DiscoveryBusyError`, and
+protocol/auth failures —
 extends the exported `NanocachedError` base class, so `error instanceof
 NanocachedError` distinguishes an expected nanocached failure from
 everything else. Node system errors from the socket itself

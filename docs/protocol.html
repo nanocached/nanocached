@@ -128,13 +128,57 @@ own share. A node that is mid-handoff to a joining node replays the
 clear there too, in order with the keys it is still sending, so a clear
 racing a join can't leave stale entries on the joiner.</p>
 
+<h2 id="incr">i — increment/decrement a counter</h2>
+<pre><code>i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+<p>Adds <code>&lt;delta&gt;</code> — a signed decimal <code>i64</code>; a
+negative <code>&lt;delta&gt;</code> decrements, so there is no separate
+decrement command — to the key's stored value, in place, and returns the
+new value:</p>
+<pre><code>I &lt;value-length&gt; [&lt;ttl-seconds&gt;]\n&lt;value&gt;</code></pre>
+<p>or <code>N\n</code> if the key is missing or expired (<code>INCR</code>
+never creates a key), or <code>T\n</code> if the key exists but its
+stored value isn't a decimal-ASCII <code>i64</code> — or applying
+<code>&lt;delta&gt;</code> would overflow one. Values must match the same
+grammar <code>INCR</code> itself writes back: an optional leading
+<code>-</code>, then digits with no leading zero (other than a lone
+<code>0</code>) — no <code>+</code>, no internal sign, no whitespace.
+<code>&lt;namespace-length&gt;</code> is always present, unlike
+<code>G</code>/<code>S</code>/<code>D</code>: <code>INCR</code> has no
+pre-namespace legacy form, so a <code>&lt;namespace-length&gt;</code> of 0
+addresses the default namespace like everywhere else. The optional
+<code>&lt;ttl-seconds&gt;</code> field on a successful reply is the
+entry's <em>remaining</em> TTL, rounded down to whole seconds, present
+only when the entry has one — <code>INCR</code> never resets or clears an
+existing TTL, unlike <code>S</code>. The TTL isn't cosmetic: a client or
+<code>nanocached-proxy</code> replicating the result to a key's other
+owners (see below) needs it to avoid silently making a TTL'd counter
+immortal on every replica.</p>
+<p><strong>This is exactly as volatile as a plain <code>SET</code>.</strong>
+LRU eviction and TTL expiry reclaim an incremented value the same as any
+other entry — <code>INCR</code> makes an operation atomic against
+concurrent requests on the node that owns the key, not durable or
+resistant to memory pressure. It is a good fit for rate limiting and
+approximate counters; it is not a fit for billing or inventory counts,
+which need an update to survive.</p>
+<p>In a cluster, replication is client-side (see
+<a href="architecture.html">Architecture</a>) and <code>INCR</code> is
+not fanned out like a plain write: only the key's primary owner runs the
+increment. Once it succeeds, the SDK (or <code>nanocached-proxy</code> in
+proxy mode) writes the <em>result</em> — the new value and its TTL — to
+the remaining owners as an ordinary <code>S</code>/<code>s</code>, never
+by replaying <code>i</code> itself. Re-running the increment on a
+replica could drift it from the primary (an eviction, or a replica leg
+that missed an earlier write, leaves it starting from a different base),
+so every replica always ends up with the exact bytes the primary
+computed.</p>
+
 <h2 id="tags">Response tags (tagged mode)</h2>
 <p>Pipelined clients match responses to requests by order alone — the
 frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
 <code>G</code>/<code>S</code>/<code>D</code> (and
-<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>)
+<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>)
 header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
@@ -147,15 +191,20 @@ g &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;
 s &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
 d &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 c &lt;namespace-length&gt; &lt;tag&gt;\n&lt;namespace&gt;
-F &lt;tag&gt;\n</code></pre>
+F &lt;tag&gt;\n
+i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
 <p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
 <code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
 <code>N &lt;tag&gt;\n</code>, <code>W &lt;tag&gt;\n</code>, and
 <code>C &lt;tag&gt;\n</code>;
 <code>B\n</code> stays bare (it is unsolicited, sent before
 authentication); a retryable error is <code>R &lt;tag&gt;\n</code> (see
-below). Tagged mode is per connection and entirely opt-in — a
-plain <code>A</code> keeps every frame exactly as documented above. See
+below). <code>i</code>'s reply becomes
+<code>I &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n</code> or
+<code>T &lt;tag&gt;\n</code> — the tag is always the last header field,
+after the optional TTL. Tagged mode is per connection and entirely
+opt-in — a plain <code>A</code> keeps every frame exactly as documented
+above. See
 Echoed response tags
 for the design.</p>
 
@@ -183,6 +232,10 @@ for the design.</p>
     <code>R &lt;tag&gt;\n</code>. Today the proxy is the only emitter —
     nodes and discovery accept the capability token but have no
     transient per-request failure to report.</td></tr>
+    <tr><td><code>T\n</code></td><td>Not numeric (issue #129, <code>i</code>
+    only): the key exists but its stored value isn't a decimal-ASCII
+    <code>i64</code>, or applying <code>&lt;delta&gt;</code> would
+    overflow one.</td></tr>
     <tr><td><code>E\n</code></td><td>Error — authentication required or
     failed, or the request was malformed. Usually followed by the server
     closing the connection.</td></tr>

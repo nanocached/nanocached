@@ -20,7 +20,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from ._errors import NanocachedError, RetryableError, WrongNodeError
+from ._errors import NanocachedError, NotNumericError, RetryableError, WrongNodeError
 
 # The server's own request cap is 1 MiB; this constant doubles that as
 # headroom, so a claimed length beyond it is definitely a corrupt or
@@ -110,6 +110,15 @@ def _encode_clear_all(tag: int | None = None) -> bytes:
     return b"F%b\n" % _tag_field(tag)
 
 
+# Counters (issue #129): unlike g/s/d, INCR has no legacy uppercase
+# form — it always carries <namespace-length>, 0 for the default
+# namespace, exactly like c/F above. <delta> is signed decimal (Python's
+# str(int) already produces the wire's canonical form: an optional
+# leading '-', no leading zeros, no '+' — %d formats it identically).
+def _encode_incr(key: bytes, delta: int, tag: int | None = None, namespace: bytes = b"") -> bytes:
+    return b"i %d %d %d%b\n%b%b" % (len(namespace), len(key), delta, _tag_field(tag), namespace, key)
+
+
 class Connection:
     def __init__(
         self,
@@ -141,7 +150,9 @@ class Connection:
         # Each slot pairs the future with the tag its request was sent
         # under (None on an untagged connection) — the expected echo
         # _read_loop checks the response against before handing it out.
-        self._pending: deque[tuple[int | None, asyncio.Future[tuple[bytes, bytes | None]]]] = deque()
+        self._pending: deque[
+            tuple[int | None, asyncio.Future[tuple[bytes, bytes | tuple[bytes, int | None] | None]]]
+        ] = deque()
         self._closed = False
         self._last_used = time.monotonic()
         self._on_close = on_close
@@ -188,6 +199,31 @@ class Connection:
             return True
         if marker == b"N":
             return False
+        if marker == b"W":
+            raise WrongNodeError()
+        raise self._mismatch(marker)
+
+    async def incr(
+        self, key: bytes, delta: int, namespace: bytes = b""
+    ) -> tuple[bytes, int | None] | None:
+        """Sends one ``i`` request to *this* node only (issue #129) —
+        cluster fan-out to replicas is the client's job (see
+        NanocachedClient.incr's docstring: the primary's literal result
+        is forwarded as a ``set``, the increment itself is never replayed
+        on a replica), never this connection's. Returns ``(new_value,
+        ttl_seconds)`` on success (``ttl_seconds`` is ``None`` when the
+        entry has no expiry), ``None`` on a miss (matching get()'s own
+        miss convention), and raises ``NotNumericError`` when the stored
+        value isn't INCR's counter grammar or applying ``delta`` would
+        overflow."""
+        marker, payload = await self._request(lambda tag: _encode_incr(key, delta, tag, namespace))
+        if marker == b"I":
+            assert payload is not None
+            return payload  # type: ignore[return-value]
+        if marker == b"N":
+            return None
+        if marker == b"T":
+            raise NotNumericError()
         if marker == b"W":
             raise WrongNodeError()
         raise self._mismatch(marker)
@@ -279,7 +315,9 @@ class Connection:
         self._next_tag = (self._next_tag + 1) & _MAX_TAG  # wrap at u32, matching the wire's width
         return tag
 
-    async def _request(self, build: Callable[[int | None], bytes]) -> tuple[bytes, bytes | None]:
+    async def _request(
+        self, build: Callable[[int | None], bytes]
+    ) -> tuple[bytes, bytes | tuple[bytes, int | None] | None]:
         """Sends ``build``'s request and returns its (marker, value)
         answer. Retryable-error status `R` (issue #125): when the answer
         is `R`, this request is transparently retried on this SAME
@@ -309,14 +347,16 @@ class Connection:
 
     async def _send(
         self, build: Callable[[int | None], bytes]
-    ) -> asyncio.Future[tuple[bytes, bytes | None]]:
+    ) -> asyncio.Future[tuple[bytes, bytes | tuple[bytes, int | None] | None]]:
         """Enqueues one request frame and returns its pending future,
         unawaited — the raw "write one frame, get back a slot to await"
         primitive _request() calls once per attempt (including retries)."""
         if self.closed:
             raise ConnectionError("nanocached: connection is closed")
 
-        future: asyncio.Future[tuple[bytes, bytes | None]] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[
+            tuple[bytes, bytes | tuple[bytes, int | None] | None]
+        ] = asyncio.get_running_loop().create_future()
         async with self._write_lock:
             if self.closed:
                 raise ConnectionError("nanocached: connection is closed")
@@ -451,7 +491,9 @@ class Connection:
     # ConnectionLostError — see errors.ts's own doc comment on that
     # parity), even though both are equally poisoning and equally
     # swallowable by the retry layer (_SWALLOWABLE_ERRORS covers both).
-    async def _read_one_response(self) -> tuple[bytes, bytes | None, int | None]:
+    async def _read_one_response(
+        self,
+    ) -> tuple[bytes, bytes | tuple[bytes, int | None] | None, int | None]:
         marker = await self._reader.readexactly(1)
 
         if marker == b"V":
@@ -476,7 +518,42 @@ class Connection:
             value = await self._reader.readexactly(length)
             return marker, value, tag
 
-        if marker in (b"S", b"D", b"N", b"W", b"C", b"R"):
+        if marker == b"I":
+            # Counters (issue #129): `I <value-length> [<ttl-seconds>]\n
+            # <value>` untagged, `I <value-length> [<ttl-seconds>] <tag>\n
+            # <value>` tagged — the trailing TTL is optional (present only
+            # when the entry has one) exactly like `S`'s own optional
+            # [ttl] [tag] request-side fields (_encode_set): disambiguated
+            # purely by field count against whether this connection is
+            # tagged, never guessed frame by frame. The payload handed
+            # back up is (value, ttl_seconds) instead of plain bytes —
+            # the only marker whose "value" isn't just the raw stored
+            # bytes.
+            header = await self._reader.readuntil(b"\n")
+            fields = header[1:-1].split(b" ")
+            min_fields = 2 if self._tagged else 1
+            if len(fields) not in (min_fields, min_fields + 1):
+                raise NanocachedError("nanocached: invalid incr header in response")
+            try:
+                length = int(fields[0])
+            except ValueError:
+                length = -1
+            if length < 0 or length > _MAX_VALUE_LENGTH:
+                raise NanocachedError("nanocached: invalid value length in response")
+            has_ttl = len(fields) == min_fields + 1
+            ttl_seconds: int | None = None
+            if has_ttl:
+                try:
+                    ttl_seconds = int(fields[1])
+                except ValueError:
+                    raise NanocachedError("nanocached: invalid ttl in incr response") from None
+                if ttl_seconds < 0:
+                    raise NanocachedError("nanocached: invalid ttl in incr response")
+            tag = self._parse_tag(fields[2 if has_ttl else 1]) if self._tagged else None
+            value = await self._reader.readexactly(length)
+            return marker, (value, ttl_seconds), tag
+
+        if marker in (b"S", b"D", b"N", b"W", b"C", b"R", b"T"):
             if self._tagged:
                 # `<marker> <tag>\n` (echoed response tags).
                 header = await self._reader.readuntil(b"\n")

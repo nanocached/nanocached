@@ -1031,6 +1031,115 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 	return existed, err
 }
 
+// Incr atomically adds delta to key's stored counter value and returns
+// the result; ok is false when the key is missing or expired (the same
+// "not found" shape GetBytes returns). delta may be negative — Decr is
+// just Incr with delta negated, there is no separate wire opcode. Returns
+// ErrNotNumeric (matched with errors.Is) when the stored value isn't a
+// signed decimal int64, or applying delta would overflow one.
+//
+// INCR is exactly as volatile as Set: LRU eviction and TTL expiry reclaim
+// an incremented value like any other entry, so this is a fit for rate
+// limiting or approximate counters, not durable counts (billing,
+// inventory).
+//
+// In a cluster, only the key's primary owner actually runs the increment;
+// replicas receive the primary's literal resulting value (as an ordinary
+// Set) rather than replaying the increment themselves — see incr's own
+// doc comment for why.
+func (c *Client) Incr(key string, delta int64) (value int64, ok bool, err error) {
+	return c.incrNS(nil, key, delta)
+}
+
+// Decr is Incr with delta negated — a thin convenience wrapper; it sends
+// exactly the same `i` wire opcode as Incr, never a separate one.
+func (c *Client) Decr(key string, delta int64) (value int64, ok bool, err error) {
+	return c.incrNS(nil, key, -delta)
+}
+
+// incrNS is Incr scoped to namespace — the internal (namespace, key)
+// entry point a *Namespace handle's Incr/Decr forward to, mirroring
+// getBytesNS/setBytesNS/deleteNS.
+func (c *Client) incrNS(namespace []byte, key string, delta int64) (value int64, ok bool, err error) {
+	if err := validateKey(key); err != nil {
+		return 0, false, err
+	}
+	if err := c.beforeOperation(); err != nil {
+		return 0, false, err
+	}
+	keyBytes := []byte(key)
+	err = c.withClusterRetry(func() error {
+		v, o, incrErr := c.incr(namespace, keyBytes, delta)
+		value, ok = v, o
+		return incrErr
+	})
+	return value, ok, err
+}
+
+// incr drives Incr/Decr's routing (issue #129) — deliberately NOT
+// write()'s "run the same op against every owner" pattern. INCR runs
+// against the primary owner ONLY; only once that succeeds is the
+// primary's literal resulting value (+ TTL) fanned out to the remaining
+// owners as an ordinary Set (fanReplicas — the same best-effort,
+// fire-and-forget-aware machinery write() itself uses for its replica
+// legs). Replaying `i` on a replica instead would let it drift from the
+// primary — e.g. an earlier replica-leg write silently dropped (client-side
+// replication swallows replica failures by design), or the replica
+// separately evicting and resetting the key — whereas forwarding the
+// absolute result keeps every replica byte-identical to the primary
+// (server.rs's own migration/decommission-handoff logic follows the same
+// rule). A miss (`N`) or a not-numeric/overflow answer (`T`) is returned
+// as-is without touching any replica — nothing was written.
+func (c *Client) incr(namespace, key []byte, delta int64) (value int64, ok bool, err error) {
+	var raw []byte
+	var ttlSeconds int64
+	primaryOp := func(conn *connection) error {
+		r, t, o, incrErr := conn.incrNS(namespace, key, delta)
+		raw, ttlSeconds, ok = r, t, o
+		return incrErr
+	}
+
+	c.mu.Lock()
+	single := c.ring == nil
+	c.mu.Unlock()
+
+	var primaryErr error
+	if single {
+		primaryErr = c.applyReconnecting("", primaryOp)
+	} else {
+		names := c.ownerNames(namespace, key)
+		if len(names) == 0 {
+			return 0, false, connectionLost("no owner is reachable for this key", nil)
+		}
+		primaryErr = c.applyReconnecting(names[0], primaryOp)
+		if primaryErr == nil && ok {
+			wg := c.fanReplicas(names[1:], func(conn *connection) error {
+				return conn.setNS(namespace, key, raw, ttlSeconds)
+			})
+			wg.Wait()
+		}
+	}
+	if primaryErr != nil || !ok {
+		return 0, ok, primaryErr
+	}
+
+	value, err = parseIncrValue(raw)
+	return value, ok, err
+}
+
+// parseIncrValue parses an `I` response's <value> body — decimal ASCII
+// int64, the same grammar as the request's own <delta> (appendIncrFrame)
+// — into the value Incr/Decr return. A parse failure here means the
+// server's own response violated its own wire contract; wrapped as
+// ErrProtocol exactly like any other malformed frame.
+func parseIncrValue(raw []byte) (int64, error) {
+	value, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil {
+		return 0, protocolError(fmt.Sprintf("invalid incr value in response: %q", raw))
+	}
+	return value, nil
+}
+
 // clearNS drops every entry in namespace across every node — the same
 // internal entry point a *Namespace handle's Clear forwards to (issue
 // #106). A nil/empty namespace clears the default namespace; it is never
@@ -1199,6 +1308,18 @@ func (n *Namespace) SetBytes(key string, value []byte, ttlSeconds int64) error {
 // before this call. See Client.Delete.
 func (n *Namespace) Delete(key string) (existed bool, err error) {
 	return n.client.deleteNS(n.namespace, key)
+}
+
+// Incr atomically adds delta to key's stored counter value within this
+// namespace and returns the result; ok is false when the key is missing.
+// See Client.Incr.
+func (n *Namespace) Incr(key string, delta int64) (value int64, ok bool, err error) {
+	return n.client.incrNS(n.namespace, key, delta)
+}
+
+// Decr is Incr with delta negated, within this namespace. See Client.Decr.
+func (n *Namespace) Decr(key string, delta int64) (value int64, ok bool, err error) {
+	return n.client.incrNS(n.namespace, key, -delta)
 }
 
 // Clear drops every entry in this namespace across every node (issue
@@ -1522,24 +1643,46 @@ func (c *Client) write(namespace, key []byte, op func(conn *connection, primary 
 		return connectionLost("no owner is reachable for this key", nil)
 	}
 
-	// Fan out to the replicas concurrently with the primary write. The
-	// primary's outcome decides; replica failures are swallowed by design
-	// (client-side replication) — a dead or disagreeing replica leaves the key
-	// under-replicated until the next node-list refresh, never fails the
-	// write. Counted in Stats().ReplicaWriteFailures so operators can spot
-	// silently degrading replication.
+	// Fan out to the replicas concurrently with the primary write — see
+	// fanReplicas for the failure/fire-and-forget semantics both this and
+	// Incr's post-success result fan-out (issue #129) share.
+	wg := c.fanReplicas(names[1:], func(conn *connection) error { return op(conn, false) })
+	err := c.applyReconnecting(names[0], primaryOp)
+	wg.Wait()
+	return err
+}
+
+// fanReplicas runs op against every name in replicas (a key's non-primary
+// owners) concurrently, without waiting for them — the returned
+// *sync.WaitGroup lets the caller decide when (or whether) to wait. A
+// failing leg is swallowed by design (client-side replication) — a dead or
+// disagreeing replica leaves the key under-replicated until the next
+// node-list refresh, never fails the caller's operation — and counted in
+// Stats().ReplicaWriteFailures so operators can spot silently degrading
+// replication.
+//
+// With FireAndForgetReplicas, up to maxInFlightBackgroundReplicaWrites legs
+// run detached in the background instead — tracked on backgroundReplicaWG
+// so Close() still drains them, but never added to the returned WaitGroup,
+// so a caller that waits on it returns as soon as the legs it *is* waiting
+// for are done (fire-and-forget replica writes). Past that cap, a leg
+// falls back to the synchronous path below, exactly as with the option
+// off.
+//
+// Shared by write() (issue #105's replicated Set/Delete, which runs op
+// concurrently with the primary leg) and incr()'s post-success result
+// fan-out (issue #129's Incr/Decr, which calls this only after the primary
+// already succeeded — see incr's own doc comment for why it fans out the
+// literal result via Set instead of replaying `i`).
+func (c *Client) fanReplicas(replicas []string, op func(conn *connection) error) *sync.WaitGroup {
 	replicaWrite := func(replica string) {
-		if err := c.applyReconnecting(replica, func(conn *connection) error { return op(conn, false) }); err != nil {
+		if err := c.applyReconnecting(replica, op); err != nil {
 			c.stats.replicaWriteFailures.Add(1)
 		}
 	}
 
-	var replicas sync.WaitGroup
-	for _, name := range names[1:] {
-		// Fire-and-forget replica writes: with FireAndForgetReplicas, try to run this
-		// leg in the background instead of waiting for it — but only up
-		// to maxInFlightBackgroundReplicaWrites; past that cap, fall back
-		// to the synchronous path below exactly as with the option off.
+	var wg sync.WaitGroup
+	for _, name := range replicas {
 		if c.fireAndForgetReplicas {
 			select {
 			case c.backgroundReplicaSem <- struct{}{}:
@@ -1547,7 +1690,7 @@ func (c *Client) write(namespace, key []byte, op func(conn *connection, primary 
 				// c.closed: Close() sets c.closed under the same lock and
 				// only then calls backgroundReplicaWG.Wait(), so this
 				// ordering guarantees every Add happens-before that Wait.
-				// Without it, a Set racing Close can call Add(1) just as
+				// Without it, a leg racing Close can call Add(1) just as
 				// Wait() observes the counter at zero — which Go panics on
 				// ("Add called concurrently with Wait"), crashing the
 				// process. If Close already won, fall back to the
@@ -1569,16 +1712,13 @@ func (c *Client) write(namespace, key []byte, op func(conn *connection, primary 
 			}
 		}
 
-		replicas.Add(1)
+		wg.Add(1)
 		go func(replica string) {
-			defer replicas.Done()
+			defer wg.Done()
 			replicaWrite(replica)
 		}(name)
 	}
-
-	err := c.applyReconnecting(names[0], primaryOp)
-	replicas.Wait()
-	return err
+	return &wg
 }
 
 // ── 遅延再接続 ────────────────────────────────────────────────────
