@@ -1,0 +1,12 @@
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.10.0'
+}
+
+rootProject.name = 'nanocached-spring-boot-starter'
+
+// The starter builds against the sibling SDK and Spring adapter sources
+// (substituted for the published org.nanocached:nanocached / :nanocached-spring
+// coordinates), so a checkout needs no locally-installed artifacts and CI
+// always tests starter + adapter + SDK at the same commit.
+includeBuild('../../sdk/java')
+includeBuild('../spring')
