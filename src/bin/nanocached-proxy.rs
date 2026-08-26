@@ -913,6 +913,14 @@ enum Request {
         namespace: Bytes,
         key: Bytes,
     },
+    /// Issue #129: always namespaced on the wire (an empty `namespace`
+    /// addresses the default one) — `INCR` has no pre-namespace legacy
+    /// form, unlike `Get`/`Set`/`Delete`.
+    Incr {
+        namespace: Bytes,
+        key: Bytes,
+        delta: i64,
+    },
     Clear {
         namespace: Bytes,
     },
@@ -947,6 +955,43 @@ fn parse_length_field(field: &str) -> io::Result<usize> {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+}
+
+/// Issue #129: `INCR`'s canonical decimal-ASCII `i64` grammar for the
+/// wire `<delta>` field — mirrors the node's own `parse_decimal_i64`
+/// (`src/cache.rs`) rather than sharing it: this binary re-implements
+/// the node's parsing independently throughout (see `RingView`'s own
+/// hash functions below for the established precedent — no modules are
+/// shared between the node and proxy binaries), pinned against the same
+/// grammar by `incr_delta_matches_the_node_grammar`.
+fn parse_delta_field(field: &str) -> io::Result<i64> {
+    let (negative, digits) = match field.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, field),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid("bad delta field"));
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Err(invalid("bad delta field"));
+    }
+    let magnitude: u64 = digits
+        .parse()
+        .map_err(|_| invalid("delta field out of range"))?;
+    if negative {
+        // i64::MIN's magnitude has no positive i64 representation, so it
+        // can't go through `i64::try_from` and negate like every other
+        // value — same special case `parse_decimal_i64` handles.
+        if magnitude == i64::MIN.unsigned_abs() {
+            Ok(i64::MIN)
+        } else {
+            i64::try_from(magnitude)
+                .map(|value| -value)
+                .map_err(|_| invalid("delta field out of range"))
+        }
+    } else {
+        i64::try_from(magnitude).map_err(|_| invalid("delta field out of range"))
+    }
 }
 
 /// Parses one frame from the front of `input` (untouched on
@@ -1098,6 +1143,47 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
             ))
         }
 
+        // Issue #129: `i <ns-len> <key-len> <delta> [tag]` — `<delta>` is
+        // signed decimal, so it can't go through `split_tag`'s
+        // unsigned-only length parser; peeled off by hand first, mirroring
+        // `split_tag`'s own tag-then-lengths logic for the two fields that
+        // remain.
+        "i" => {
+            let (rest, tag) = if tagged {
+                let (tag_field, rest) =
+                    fields.split_last().ok_or_else(|| invalid("missing tag"))?;
+                let tag = u32::try_from(parse_length_field(tag_field)?)
+                    .map_err(|_| invalid("tag out of range"))?;
+                (rest, Some(tag))
+            } else {
+                (fields.as_slice(), None)
+            };
+            let [namespace_length, key_length, delta] = rest else {
+                return Err(invalid("bad incr header"));
+            };
+            let namespace_length = parse_length_field(namespace_length)?;
+            let key_length = parse_length_field(key_length)?;
+            if key_length == 0 {
+                return Err(invalid("empty key"));
+            }
+            let delta = parse_delta_field(delta)?;
+            let body = body!(
+                namespace_length
+                    .checked_add(key_length)
+                    .ok_or_else(|| invalid("frame length overflow"))?
+            );
+            let namespace = body.slice(..namespace_length);
+            let key = body.slice(namespace_length..);
+            Ok(ParseOutcome::Ready(
+                Request::Incr {
+                    namespace,
+                    key,
+                    delta,
+                },
+                tag,
+            ))
+        }
+
         "c" => {
             let (lengths, tag) = split_tag(&fields)?;
             let [namespace_length] = lengths.as_slice() else {
@@ -1134,12 +1220,22 @@ enum Expect {
     Deleted,
     /// `C`, or `E`.
     Cleared,
+    /// Issue #129: `I <len> [ttl] <tag>` + body, or `N`/`T`/`W`/`E`.
+    Incremented,
 }
 
 /// One reply from a node, already tag-verified.
 #[derive(Debug, PartialEq)]
 enum NodeReply {
     Value(Bytes),
+    /// Issue #129: `INCR`'s new value plus its entry's remaining TTL in
+    /// whole seconds, if it had one — carried through so a successful
+    /// primary INCR's *result* can be fanned out to replicas as a plain
+    /// `Set` without silently dropping the TTL (see `finish_incr`).
+    Incremented(Bytes, Option<u64>),
+    /// Issue #129: the key exists but its value isn't `INCR`'s counter
+    /// grammar, or `delta` would overflow — the wire's `T` status.
+    NotNumeric,
     NotFound,
     Stored,
     Deleted,
@@ -1330,9 +1426,22 @@ async fn read_reply<S: AsyncRead + Unpin>(
     }
 
     let fields: Vec<&str> = parts.collect();
-    let (echoed, value_length) = match (marker, fields.as_slice()) {
-        ("V", [length, tag_field]) => (*tag_field, Some(parse_length_field(length)?)),
-        ("S" | "D" | "N" | "W" | "C" | "E", [tag_field]) => (*tag_field, None),
+    // Issue #129: `I`'s header carries an extra optional `<ttl>` field
+    // ahead of the tag — same "present-but-unlabeled trailing field"
+    // shape `S`'s own optional TTL has, but backend connections are
+    // *always* tagged (`BackendHandle::connect` negotiates `T`), so there
+    // is no untagged case to disambiguate against here: `[length,
+    // tag_field]` is untimed, `[length, ttl_field, tag_field]` carries a
+    // TTL.
+    let (echoed, value_length, ttl) = match (marker, fields.as_slice()) {
+        ("V", [length, tag_field]) => (*tag_field, Some(parse_length_field(length)?), None),
+        ("I", [length, tag_field]) => (*tag_field, Some(parse_length_field(length)?), None),
+        ("I", [length, ttl_field, tag_field]) => (
+            *tag_field,
+            Some(parse_length_field(length)?),
+            Some(parse_length_field(ttl_field)? as u64),
+        ),
+        ("S" | "D" | "N" | "T" | "W" | "C" | "E", [tag_field]) => (*tag_field, None, None),
         _ => return Err(invalid(&format!("malformed backend reply: {line:?}"))),
     };
     if echoed != tag.to_string() {
@@ -1349,7 +1458,15 @@ async fn read_reply<S: AsyncRead + Unpin>(
             read_exact_into(stream, buf, length).await?;
             NodeReply::Value(buf.split_to(length).freeze())
         }
+        ("I", Some(length)) => {
+            if length > MAX_REQUEST_SIZE {
+                return Err(invalid("backend value exceeds the request-size limit"));
+            }
+            read_exact_into(stream, buf, length).await?;
+            NodeReply::Incremented(buf.split_to(length).freeze(), ttl)
+        }
         ("N", _) => NodeReply::NotFound,
+        ("T", _) => NodeReply::NotNumeric,
         ("S", _) => NodeReply::Stored,
         ("D", _) => NodeReply::Deleted,
         ("C", _) => NodeReply::Cleared,
@@ -1372,6 +1489,14 @@ async fn read_reply<S: AsyncRead + Unpin>(
             NodeReply::Deleted | NodeReply::NotFound | NodeReply::WrongNode | NodeReply::Error,
             Expect::Deleted
         ) | (NodeReply::Cleared | NodeReply::Error, Expect::Cleared)
+            | (
+                NodeReply::Incremented(..)
+                    | NodeReply::NotFound
+                    | NodeReply::NotNumeric
+                    | NodeReply::WrongNode
+                    | NodeReply::Error,
+                Expect::Incremented
+            )
     );
     if !shape_ok {
         return Err(invalid("backend reply does not fit the request"));
@@ -1423,6 +1548,20 @@ fn frame_delete(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     } else {
         format!("d {} {} {TAG_PLACEHOLDER}\n", namespace.len(), key.len()).into_bytes()
     };
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
+/// Issue #129: always the lowercase, namespaced `i` — `INCR` has no
+/// uppercase legacy form (see `Request::Incr`'s doc comment).
+fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Vec<u8> {
+    let mut frame = format!(
+        "i {} {} {delta} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        key.len()
+    )
+    .into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame
@@ -1620,6 +1759,20 @@ fn respond_value(value: &[u8], tag: Option<u32>) -> Vec<u8> {
     framed
 }
 
+/// Issue #129: `INCR`'s success reply — `I <len> [ttl] [tag]\n<value>`,
+/// mirroring `Response::Incremented`'s own wire form on the node side
+/// (`src/response.rs`).
+fn respond_incremented(value: &[u8], ttl: Option<u64>, tag: Option<u32>) -> Vec<u8> {
+    let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+    let header = match tag {
+        Some(tag) => format!("I {}{ttl_field} {tag}\n", value.len()),
+        None => format!("I {}{ttl_field}\n", value.len()),
+    };
+    let mut framed = header.into_bytes();
+    framed.extend_from_slice(value);
+    framed
+}
+
 /// Errors that end the client connection: encoded as `E` (+tag), the
 /// writer closes after sending. See the module docs' failure-surface
 /// note for why upstream failure is fatal to the connection.
@@ -1748,6 +1901,39 @@ async fn dispatch_request(
                     &namespace,
                     &key,
                     None,
+                    pending,
+                    tag,
+                    retry_capable,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
+        Request::Incr {
+            namespace,
+            key,
+            delta,
+        } => {
+            let owners = ring.owners(&namespace, &key);
+            let Some(primary) = owners.first() else {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            };
+            let pending = context
+                .backends
+                .enqueue(
+                    &context,
+                    primary,
+                    frame_incr(&namespace, &key, delta),
+                    Expect::Incremented,
+                )
+                .await;
+            tokio::spawn(async move {
+                let result = finish_incr(
+                    &context,
+                    (&namespace, &key),
+                    delta,
+                    owners,
                     pending,
                     tag,
                     retry_capable,
@@ -1946,6 +2132,117 @@ async fn refan_write(
         Ok(NodeReply::Stored) => Ok(respond("S", tag)),
         Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        _ => Err(Fatal),
+    }
+}
+
+/// `Incr`'s completion: the primary's ordered `i` reply drives the
+/// result. Unlike `finish_write`, replicas are never sent the increment
+/// itself up front — only once the primary's result is known is that
+/// *result* fanned out to the remaining owners as a plain `Set`,
+/// carrying the TTL the primary's `I` reply itself carried
+/// (`fan_out_incr_result`). Replaying `i` on a replica instead would let
+/// it drift from the primary (e.g. after an eviction or a replica leg
+/// that missed an earlier write) — the same reasoning
+/// `src/server.rs`'s `Incr` connection handler documents for the
+/// node-local migration/decommission case. A primary `W` or transport
+/// failure re-runs the whole thing (primary INCR + replica fan-out) on
+/// the refreshed ring (`refan_incr`), same as a write's own `W`/failure
+/// handling.
+async fn finish_incr(
+    context: &ProxyContext,
+    // `(namespace, key)`, grouped into one parameter purely to stay under
+    // clippy's argument-count lint — always used together.
+    address: (&[u8], &[u8]),
+    delta: i64,
+    owners: Vec<String>,
+    pending: PendingReply,
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    match pending.await {
+        Ok(NodeReply::Incremented(value, ttl)) => {
+            fan_out_incr_result(context, namespace, key, &value, ttl, &owners[1..]).await;
+            Ok(respond_incremented(&value, ttl, tag))
+        }
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        Ok(NodeReply::NotNumeric) => Ok(respond("T", tag)),
+        Ok(NodeReply::WrongNode) => {
+            force_refresh(context).await;
+            refan_incr(context, address, delta, tag, retry_capable).await
+        }
+        // Same "the shared connection may simply have been idle-closed"
+        // reasoning as `finish_write`'s own transport-failure arm.
+        Err(_) => refan_incr(context, address, delta, tag, retry_capable).await,
+        Ok(_) => Err(Fatal),
+    }
+}
+
+/// Fans a successful INCR's *result* out to `replicas` as a plain `Set`
+/// (never `Incr` — see `finish_incr`'s doc comment). Failures are logged
+/// and swallowed, the same stance `finish_write`'s replica legs take: an
+/// under-replicated counter is recovered by the next node-list refresh,
+/// never fails the client's already-successful INCR.
+async fn fan_out_incr_result(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    value: &[u8],
+    ttl: Option<u64>,
+    replicas: &[String],
+) {
+    for addr in replicas {
+        if let Err(error) = context
+            .backends
+            .call(
+                context,
+                addr,
+                frame_set(namespace, key, value, ttl),
+                Expect::Stored,
+            )
+            .await
+        {
+            eprintln!("WARN replica incr-result write to {addr} failed: {error}");
+        }
+    }
+}
+
+/// `finish_incr`'s retry path for both a primary `W` and a transport
+/// failure: re-fetches the current ring and runs the whole INCR (primary
+/// leg, then the replica fan-out) again via `call`, whose transparent
+/// redial recovers a dead shared connection.
+async fn refan_incr(
+    context: &ProxyContext,
+    address: (&[u8], &[u8]),
+    delta: i64,
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    let Some(ring) = current_ring(context) else {
+        return Err(Fatal);
+    };
+    let owners = ring.owners(namespace, key);
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Ok(transient_reply(retry_capable, tag));
+    };
+    match context
+        .backends
+        .call(
+            context,
+            primary,
+            frame_incr(namespace, key, delta),
+            Expect::Incremented,
+        )
+        .await
+    {
+        Ok(NodeReply::Incremented(value, ttl)) => {
+            fan_out_incr_result(context, namespace, key, &value, ttl, replicas).await;
+            Ok(respond_incremented(&value, ttl, tag))
+        }
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        Ok(NodeReply::NotNumeric) => Ok(respond("T", tag)),
         _ => Err(Fatal),
     }
 }
@@ -2637,6 +2934,11 @@ mod tests {
         /// the previous one was answered — only a genuinely pipelined
         /// sender (not #109's serial write-then-await loop) produces it.
         saw_pipelined: Arc<AtomicBool>,
+        /// Issue #129: how many `i` frames this node actually received —
+        /// proves a replica never gets the increment replayed on it (see
+        /// `an_incr_results_fan_out_never_replays_the_increment_on_a_replica`),
+        /// only the primary does.
+        incrs: Arc<AtomicUsize>,
     }
 
     impl MockNode {
@@ -2653,6 +2955,7 @@ mod tests {
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
+                incrs: Arc::new(AtomicUsize::new(0)),
             };
             let store = Arc::clone(&node.store);
             let cleared = Arc::clone(&node.cleared);
@@ -2662,6 +2965,7 @@ mod tests {
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
+            let incrs = Arc::clone(&node.incrs);
             tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -2678,11 +2982,16 @@ mod tests {
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
+                            incrs: Arc::clone(&incrs),
                         },
                     ));
                 }
             });
             node
+        }
+
+        fn incrs(&self) -> usize {
+            self.incrs.load(Ordering::SeqCst)
         }
 
         fn entry(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
@@ -2707,6 +3016,7 @@ mod tests {
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
+        incrs: Arc<AtomicUsize>,
     }
 
     async fn serve_mock_node(mut stream: TcpStream, state: MockNodeState) {
@@ -2719,6 +3029,7 @@ mod tests {
             delay,
             auth_count,
             saw_pipelined,
+            incrs,
         } = state;
         let mut buf = BytesMut::new();
         let result: io::Result<()> = async {
@@ -2813,6 +3124,64 @@ mod tests {
                         stream
                             .write_all(format!("S {}\n", tag(&fields)).as_bytes())
                             .await?;
+                    }
+                    // Issue #129: no TTL fidelity, same as this mock's
+                    // `S`/`s` arm above (which already ignores any TTL
+                    // field) — the mock store has no TTL concept at all.
+                    "i" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let key_length: usize = fields[1].parse().unwrap();
+                        let delta: i64 = fields[2].parse().unwrap();
+                        read_exact_into(&mut stream, &mut buf, ns_length + key_length).await?;
+                        let body = buf.split_to(ns_length + key_length);
+                        let namespace = body[..ns_length].to_vec();
+                        let key = body[ns_length..].to_vec();
+                        if wrong_once.swap(false, Ordering::SeqCst) {
+                            stream
+                                .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
+                        incrs.fetch_add(1, Ordering::SeqCst);
+                        let current = store
+                            .lock()
+                            .unwrap()
+                            .get(&(namespace.clone(), key.clone()))
+                            .cloned();
+                        match current {
+                            None => {
+                                stream
+                                    .write_all(format!("N {}\n", tag(&fields)).as_bytes())
+                                    .await?;
+                            }
+                            Some(current) => {
+                                let parsed = std::str::from_utf8(&current)
+                                    .ok()
+                                    .and_then(|text| text.parse::<i64>().ok());
+                                match parsed {
+                                    None => {
+                                        stream
+                                            .write_all(format!("T {}\n", tag(&fields)).as_bytes())
+                                            .await?;
+                                    }
+                                    Some(current_value) => {
+                                        let new_bytes =
+                                            (current_value + delta).to_string().into_bytes();
+                                        store
+                                            .lock()
+                                            .unwrap()
+                                            .insert((namespace, key), new_bytes.clone());
+                                        stream
+                                            .write_all(
+                                                format!("I {} {}\n", new_bytes.len(), tag(&fields))
+                                                    .as_bytes(),
+                                            )
+                                            .await?;
+                                        stream.write_all(&new_bytes).await?;
+                                    }
+                                }
+                            }
+                        }
                     }
                     "D" | "d" => {
                         let (namespace, key) = if command == "d" {
@@ -3692,5 +4061,76 @@ mod tests {
         // Both owners hold the value the moment the ack is read.
         assert_eq!(nodes[0].entry(b"", b"k"), Some(b"v".to_vec()));
         assert_eq!(nodes[1].entry(b"", b"k"), Some(b"v".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incr_through_the_proxy_returns_the_new_value() {
+        // Issue #129: `i` has no uppercase legacy form, so even an
+        // unnamespaced key carries an explicit `<ns-len>` of 0.
+        let (_nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 2\nk10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        stream.write_all(b"i 0 1 5\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"15");
+
+        // A missing key answers N, same status G/D would.
+        stream.write_all(b"i 0 7 1\nmissing").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_incr_results_fan_out_never_replays_the_increment_on_a_replica() {
+        // With R=2 over two nodes, a naive fan-out that resent the `i`
+        // frame itself would still land on the right *value* here (both
+        // owners start from the same seed) — the real proof is that the
+        // replica's `incrs` counter stays 0: only the primary ever
+        // receives an `i` frame, the replica only ever sees the result as
+        // a plain `Set` (see `finish_incr`/`fan_out_incr_result`).
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let primary_addr = ring.owners(b"", b"counter")[0].clone();
+        let (primary, replica) = if primary_addr == nodes[0].addr {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        };
+
+        stream.write_all(b"S 7 2\ncounter10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        stream.write_all(b"i 0 7 5\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"15");
+
+        assert_eq!(primary.incrs(), 1);
+        assert_eq!(replica.incrs(), 0);
+        assert_eq!(primary.entry(b"", b"counter"), Some(b"15".to_vec()));
+        assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incr_on_a_non_numeric_value_answers_t() {
+        let (_nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        stream.write_all(b"i 0 4 1\nname").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "T");
     }
 }

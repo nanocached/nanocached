@@ -97,6 +97,38 @@ exposes the factor in use. A write whose primary just died recovers
 automatically once discovery drops the node (bounded by its liveness
 timeout): the failed attempt forces a node-list refresh and one retry.
 
+## Counters (`incr`/`decr`)
+
+`incr` atomically adds a signed delta to an integer counter stored at a
+key, and returns its new value:
+
+```rust
+client.set("hits", "10", 0).await?;
+assert_eq!(client.incr("hits", 1).await?, Some(11));
+assert_eq!(client.decr("hits", 5).await?, Some(6));
+```
+
+`decr` is `incr` with the delta negated — there is no separate wire
+opcode, so `client.decr(key, 5).await` is exactly `client.incr(key,
+-5).await`. Both return `None` when the key is missing or expired,
+matching `get`/`get_bytes`'s own miss convention, and
+`Err(Error::NotNumeric)` when the key exists but its stored value isn't a
+plain signed-decimal integer (or the delta would overflow `i64`). Both
+are also available on a `Namespace` handle, scoped exactly like its
+`get`/`set`/`delete`.
+
+**`incr` is exactly as volatile as `set`**: LRU eviction and TTL expiry
+reclaim an incremented value like any other entry. It's a good fit for
+rate limiting or approximate counters, not a substitute for a durable
+counter (billing, inventory) — nothing here makes a counter survive
+eviction that a plain `set` value wouldn't.
+
+In a cluster, only the key's primary owner ever runs the increment;
+replicas instead receive its literal new value as an ordinary `set`, so a
+replica that missed an earlier write (or evicted the key on its own)
+converges to the primary's exact value instead of drifting from replaying
+the increment independently.
+
 ## Namespaces
 
 A namespace is a flat, opaque byte string that scopes a key: the same

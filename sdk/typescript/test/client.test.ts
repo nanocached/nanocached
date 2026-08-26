@@ -9,6 +9,7 @@ import {
   DiscoveryBusyError,
   NanocachedClient,
   NanocachedError,
+  NotNumericError,
   RetryableError,
   WrongNodeError,
 } from "../src/index.js";
@@ -1280,6 +1281,105 @@ describe("NanocachedClient request timeout (issue #42)", () => {
   });
 });
 
+describe("NanocachedClient incr/decr against a single node (issue #129)", () => {
+  it("returns null on a missing key", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        assert.equal(await client.incr("missing"), null);
+        assert.equal(await client.decr("missing"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("throws NotNumericError when the stored value isn't INCR's counter grammar", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("greeting", "hello");
+        await assert.rejects(client.incr("greeting"), NotNumericError);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("increments an existing counter and returns the new value", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("counter", "10");
+        assert.equal(await client.incr("counter"), 11);
+        assert.equal(await client.incr("counter", 5), 16);
+        assert.equal(await client.get("counter"), "16");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("decr with a positive amount is the same result as incr with the negated delta", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "100");
+        await client.set("b", "100");
+        assert.equal(await client.decr("a", 7), await client.incr("b", -7));
+        assert.equal(await client.get("a"), await client.get("b"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("negative deltas can drive the counter negative", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("counter", "3");
+        assert.equal(await client.incr("counter", -10), -7);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("works scoped to a namespace, same as get/set/delete", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const ns = client.namespace("counters");
+        await ns.set("hits", "1");
+        assert.equal(await ns.incr("hits"), 2);
+        assert.equal(await client.incr("hits"), null); // default namespace is untouched
+        assert.equal(node.namespacedStore("counters").get("hits")?.toString("ascii"), "2");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
 describe("NanocachedClient replication (client-side replication, R=2)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
@@ -1428,6 +1528,161 @@ describe("NanocachedClient replication (client-side replication, R=2)", () => {
       }
     } finally {
       await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient incr/decr cluster replication (issue #129) — primary computes, replicas get the result via set", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("sends `i` only to the primary; the replica gets a `set` of the literal result and never sees `i`", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-replicates-as-set";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "10");
+      assert.equal(await client.incr(key, 5), 15);
+
+      // The critical assertion (not just "same final value" — a buggy
+      // implementation that replayed `i` on the replica from the same
+      // seed would produce the same final byte value and this would pass
+      // despite being wrong): the replica must receive the primary's
+      // literal result as an ordinary `set`/`s`, and must NEVER itself
+      // receive an `i` frame.
+      assert.equal(primary.mock.incrCount(), 1, "primary must receive exactly one `i` frame");
+      assert.equal(replica.mock.incrCount(), 0, "replica must never receive an `i` frame");
+      assert.equal(replica.mock.lastCommand(), "S", "replica must receive the result as a set");
+      assert.equal(primary.mock.store.get(key)?.toString("ascii"), "15");
+      assert.equal(replica.mock.store.get(key)?.toString("ascii"), "15");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("forwards the primary's remaining TTL to the replica's set", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-replicates-ttl";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "10", 120);
+      assert.equal(await client.incr(key), 11);
+
+      assert.equal(primary.mock.incrCount(), 1);
+      assert.equal(replica.mock.incrCount(), 0);
+      assert.equal(replica.mock.lastCommand(), "S");
+      assert.equal(replica.mock.lastSetTtl(), 120, "the replica's set must carry the primary's remaining TTL");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("never touches the replica on a miss or a non-numeric value — nothing was written", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      // Deltas, not absolute counts: with only 2 nodes, the two keys below
+      // may well share the same primary/replica, so incrCount() must be
+      // compared against its own before-value for each key rather than
+      // asserted as an absolute total.
+      const missKey = "incr-miss";
+      const missOwners = cluster.ownerOf(missKey);
+      const missPrimaryBefore = missOwners.primary.mock.incrCount();
+      const missReplicaBefore = missOwners.replica.mock.incrCount();
+      assert.equal(await client.incr(missKey), null);
+      assert.equal(missOwners.primary.mock.incrCount(), missPrimaryBefore + 1);
+      assert.equal(missOwners.replica.mock.incrCount(), missReplicaBefore);
+
+      const nonNumericKey = "incr-non-numeric";
+      await client.set(nonNumericKey, "not-a-number");
+      const owners = cluster.ownerOf(nonNumericKey);
+      const primaryBefore = owners.primary.mock.incrCount();
+      const replicaBefore = owners.replica.mock.incrCount();
+      await assert.rejects(client.incr(nonNumericKey), NotNumericError);
+      assert.equal(owners.primary.mock.incrCount(), primaryBefore + 1);
+      assert.equal(owners.replica.mock.incrCount(), replicaBefore);
+      // The replica's copy must be untouched — no set was fanned out for
+      // a request nothing was actually written by.
+      assert.equal(owners.replica.mock.store.get(nonNumericKey)?.toString("ascii"), "not-a-number");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("decr replicates the same way: one `i` on the primary, a `set` on the replica", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "decr-replicates-as-set";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "10");
+      assert.equal(await client.decr(key, 3), 7);
+
+      assert.equal(primary.mock.incrCount(), 1);
+      assert.equal(replica.mock.incrCount(), 0);
+      assert.equal(replica.mock.lastCommand(), "S");
+      assert.equal(replica.mock.store.get(key)?.toString("ascii"), "7");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("counts a swallowed replica-write failure when the replica is dead, same counter as set/delete", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-dead-replica";
+      const { primary, replica } = cluster.ownerOf(key);
+      await client.set(key, "10");
+
+      await replica.mock.close();
+      await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
+
+      assert.equal(client.stats().replicaWriteFailures, 0);
+      // A dead replica must not fail the increment — the primary already
+      // applied it, so its result is what's returned regardless.
+      assert.equal(await client.incr(key), 11);
+      assert.equal(client.stats().replicaWriteFailures, 1);
+      assert.equal(primary.mock.store.get(key)?.toString("ascii"), "11");
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
     }
   });
 });

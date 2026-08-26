@@ -225,6 +225,39 @@ that retry also fails. Both operations are idempotent, so a caller can
 simply retry on error. `client.Namespace("").Clear()` clears the default
 namespace and is never rejected.
 
+## Incr and Decr
+
+`Incr`/`Decr` atomically add a signed delta to a key's stored counter
+value and return the result:
+
+```go
+err = client.Set("hits", "0", 0)
+value, ok, err := client.Incr("hits", 1)   // 1, true, nil
+value, ok, err = client.Decr("hits", 1)    // 0, true, nil — negates delta, same wire op
+value, ok, err = client.Incr("missing", 1) // 0, false, nil — no such key
+```
+
+`ok` is `false` on a missing or expired key, the same shape `Get`/`GetBytes`
+use. A stored value that isn't a signed decimal integer — or a delta that
+would overflow one — returns `ErrNotNumeric` (`errors.Is`-matchable). `Decr`
+is a thin wrapper that negates `delta` and calls `Incr`; there is no
+separate decrement opcode on the wire. Both are also namespace-scoped:
+`client.Namespace(ns).Incr(...)`/`.Decr(...)`, same as `Get`/`Set`/`Delete`.
+
+**`Incr`/`Decr` are exactly as volatile as `Set`**: LRU eviction and TTL
+expiry reclaim an incremented value like any other cache entry. Good for
+rate limiting or approximate counters, wrong for anything that needs a
+durable count — billing, inventory — since the counter can simply vanish
+under memory pressure or its own TTL.
+
+In a cluster, only the key's primary owner actually runs the increment;
+the primary's literal resulting value (and TTL) is then fanned out to the
+remaining owners as an ordinary `Set`, exactly like a normal write's
+replica legs, rather than each replica replaying the increment itself —
+replaying could let a replica drift from the primary (e.g. after a
+dropped earlier replica write), while forwarding the literal result keeps
+every replica byte-identical to it.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
@@ -352,9 +385,10 @@ unchanged rather than bloated.
   pipeline is pinned to cross-language test vectors that the server and
   the TypeScript/Python/Java/Rust/.NET SDKs also assert.
 - Errors: `ErrClosed`, `ErrWrongNode`, `ErrDiscoveryBusy`,
-  `ErrConnectionLost`, `ErrAuthenticationFailed`, `ErrDecompression`, and
-  `ErrRetryable` (see "Transient retries" above) are sentinels for
-  `errors.Is`. Caller mistakes (an invalid TTL, an empty address list)
+  `ErrConnectionLost`, `ErrAuthenticationFailed`, `ErrDecompression`,
+  `ErrNotNumeric` (see "Incr and Decr" above), and `ErrRetryable` (see
+  "Transient retries" above) are sentinels for `errors.Is`. Caller
+  mistakes (an invalid TTL, an empty address list)
   surface as ordinary errors outside the sentinel set — they indicate a
   bug in the calling code, not a nanocached failure; this convention is
   shared across the SDKs (issue #47).

@@ -8,6 +8,25 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Added
 
+- `incr`/`decr` (issue #129): `client.incr(key, delta)` atomically adds a
+  signed `i64` delta to an integer counter stored at `key` and returns its
+  new value (`None` on a missing/expired key, matching `get`'s own miss
+  convention; `Err(Error::NotNumeric)` when the stored value isn't a plain
+  signed-decimal integer or the delta would overflow `i64`). `decr` is a
+  thin wrapper that negates the delta — there is no separate wire opcode.
+  Both are also available on a `Namespace` handle. On the wire this is the
+  new `i` command (always namespaced, unlike `G`/`S`/`D`'s
+  uppercase/lowercase pair — there is no legacy uppercase form), answered
+  `I <value-length> [<ttl-seconds>]` on success, `N` on a missing key, or
+  the new `T` status for not-numeric/overflow. In cluster mode, `incr`
+  sends `i` to the key's primary owner only; once it succeeds, the literal
+  new value (and its TTL, if any) is forwarded to the remaining owners as
+  an ordinary `set`, never replayed as another `i` there, which is what
+  keeps replicas byte-identical to the primary instead of letting them
+  drift. `incr` is exactly as volatile as `set` — LRU eviction and TTL
+  expiry reclaim an incremented value like any other entry — so it suits
+  rate limiting or approximate counters, not a durable count.
+
 - Retryable-error status `R` (issue #125): the connect/identify handshake
   now probes with `A <len> T R` first — one more capability token in
   front of the existing `T` negotiation — declaring that this client

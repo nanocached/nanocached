@@ -89,6 +89,23 @@ public sealed class NanocachedNamespace
     /// <summary>Returns whether the key existed before this call.</summary>
     public Task<bool> DeleteAsync(byte[] key) => _client.DeleteAsync(_namespace, key);
 
+    /// <summary>issue #129: as <see cref="NanocachedClient.IncrAsync(byte[], long)"/>,
+    /// scoped to this handle's namespace. As volatile as
+    /// <see cref="SetAsync(byte[], byte[], long)"/> — not for durable
+    /// counts — and, in a cluster, only the primary owner runs the
+    /// increment; replicas receive the resulting value via <c>Set</c>. See
+    /// the client method's own doc comment for the full replication
+    /// design.</summary>
+    public Task<long?> IncrAsync(string key, long delta) => _client.IncrAsync(_namespace, key, delta);
+
+    public Task<long?> IncrAsync(byte[] key, long delta) => _client.IncrAsync(_namespace, key, delta);
+
+    /// <summary>issue #129: <see cref="IncrAsync(byte[], long)"/> with
+    /// <paramref name="delta"/> negated — never a different wire op.</summary>
+    public Task<long?> DecrAsync(string key, long delta) => _client.DecrAsync(_namespace, key, delta);
+
+    public Task<long?> DecrAsync(byte[] key, long delta) => _client.DecrAsync(_namespace, key, delta);
+
     /// <summary>issue #106: drops every entry in this handle's namespace —
     /// on the empty namespace (<c>client.Namespace("")</c>), clears the
     /// default namespace (<c>c 0\n</c>), not rejected. Fanned out to every

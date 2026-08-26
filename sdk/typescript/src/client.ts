@@ -8,7 +8,7 @@ import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
 import { checkKeyAndValue, EMPTY_NAMESPACE } from "./protocol.js";
 
-export { ConnectionLostError, RetryableError, WrongNodeError } from "./connection.js";
+export { ConnectionLostError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
 
@@ -371,6 +371,8 @@ interface NamespaceOps {
   set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void>;
   delete(key: string | Uint8Array): Promise<boolean>;
   clear(): Promise<void>;
+  incr(key: string | Uint8Array, delta: number): Promise<number | null>;
+  decr(key: string | Uint8Array, delta: number): Promise<number | null>;
 }
 
 /**
@@ -422,6 +424,16 @@ export class NanocachedNamespace {
    * fan-out/retry mechanics this forwards to. */
   clear(): Promise<void> {
     return this.ops.clear();
+  }
+
+  /** See `NanocachedClient.incr`. */
+  incr(key: string | Uint8Array, delta = 1): Promise<number | null> {
+    return this.ops.incr(key, delta);
+  }
+
+  /** See `NanocachedClient.decr`. */
+  decr(key: string | Uint8Array, delta = 1): Promise<number | null> {
+    return this.ops.decr(key, delta);
   }
 }
 
@@ -1008,6 +1020,28 @@ export class NanocachedClient {
     return this.deleteInNamespace(EMPTY_NAMESPACE, key);
   }
 
+  /** Atomically adds `delta` (signed, default 1) to `key`'s stored
+   * counter and returns the new value — `null` if the key is missing or
+   * expired, matching `get`'s own miss convention. Throws
+   * `NotNumericError` if the stored value isn't an integer INCR can
+   * operate on, or if applying `delta` would overflow.
+   *
+   * **As volatile as `set`**: LRU eviction and TTL expiry reclaim an
+   * incremented value exactly like any other entry, so this is for rate
+   * limiting / approximate counters, never for a durable count (billing,
+   * inventory). See README.md's "incr / decr" section for the cluster
+   * replication caveat: only the primary owner ever runs the increment,
+   * replicas just receive its literal result. */
+  async incr(key: string | Uint8Array, delta = 1): Promise<number | null> {
+    return this.incrInNamespace(EMPTY_NAMESPACE, key, delta);
+  }
+
+  /** `incr` with a negated delta — there is no separate wire operation for
+   * decrement, the server (and the wire protocol) only ever sees `i`. */
+  async decr(key: string | Uint8Array, delta = 1): Promise<number | null> {
+    return this.incrInNamespace(EMPTY_NAMESPACE, key, -delta);
+  }
+
   private async setInNamespace(namespace: Uint8Array, key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
@@ -1036,6 +1070,23 @@ export class NanocachedClient {
       this.target.kind === "cluster"
         ? this.writeToOwners(key, namespace, (connection) => connection.delete(key, namespace))
         : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
+    );
+  }
+
+  /** INCR/DECR (issue #129). Unlike `writeToOwners` (which sends the same
+   * write to every owner), a cluster incr only ever sends `i` to the
+   * primary — see `incrOnOwners` for why and how the result reaches
+   * replicas instead. In single/proxy mode there is nothing to replicate,
+   * so this is just the one connection's own `incr`. */
+  private async incrInNamespace(namespace: Uint8Array, key: string | Uint8Array, delta: number): Promise<number | null> {
+    if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
+    return this.withWrongNodeRetry(() =>
+      this.target.kind === "cluster"
+        ? this.incrOnOwners(key, namespace, delta)
+        : this.connectionForSingleTarget()
+            .then((connection) => connection.incr(key, delta, namespace))
+            .then((result) => (result === null ? null : result.value)),
     );
   }
 
@@ -1075,6 +1126,8 @@ export class NanocachedClient {
       set: (key, value, ttlSeconds) => this.setInNamespace(namespaceBytes, key, value, ttlSeconds),
       delete: (key) => this.deleteInNamespace(namespaceBytes, key),
       clear: () => this.clearInNamespace(namespaceBytes),
+      incr: (key, delta) => this.incrInNamespace(namespaceBytes, key, delta),
+      decr: (key, delta) => this.incrInNamespace(namespaceBytes, key, -delta),
     });
   }
 
@@ -1348,6 +1401,88 @@ export class NanocachedClient {
 
     const replicaBug = replicaResults.find((result): result is PromiseRejectedResult => result.status === "rejected");
     throw replicaBug ? replicaBug.reason : primary.error;
+  }
+
+  /** Cluster INCR/DECR (issue #129) — deliberately **not**
+   * `writeToOwners`'s same-op-to-every-owner pattern. `i` is sent to the
+   * primary owner only; if it succeeds, the *literal result* (the new
+   * value, and its TTL if any) is forwarded to the remaining owners as an
+   * ordinary `set` — never replayed as `i` there. Replaying the increment
+   * on a replica would let it drift from the primary (e.g. if an earlier
+   * replica-leg write was dropped, or the replica separately evicted and
+   * reset the key); forwarding the absolute result instead keeps every
+   * replica byte-identical to the primary, the same reasoning the node's
+   * own migration/decommission-handoff logic uses server-side.
+   *
+   * A miss or `NotNumericError` from the primary is returned/thrown
+   * directly, before any replica is touched — nothing was written, so
+   * there is nothing to fan out. A dead/wrong-node primary throws out to
+   * `withWrongNodeRetry`, which retries this whole call once against a
+   * freshly refreshed ranking — safe to retry in full, since a failure at
+   * this point (by construction) always precedes ever reaching a replica
+   * write, so no attempt can double-apply the increment. Replica-leg
+   * failures are swallowed exactly like `writeToOwners`'s own
+   * (stats().replicaWriteFailures, fireAndForgetReplicas-aware) — but
+   * because the primary's increment already succeeded and was (at least
+   * best-effort) forwarded, its result is always what's returned,
+   * regardless of what happens on replicas. */
+  private async incrOnOwners(key: string | Uint8Array, namespace: Uint8Array, delta: number): Promise<number | null> {
+    const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
+    if (primaryName === undefined) {
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+    }
+
+    const primaryConnection = await this.memberConnection(primaryName);
+    const result = await primaryConnection.incr(key, delta, namespace);
+    if (result === null || replicaNames.length === 0) {
+      return result === null ? null : result.value;
+    }
+
+    const valueBytes = Buffer.from(String(result.value), "ascii");
+    const ttlSeconds = result.ttlSeconds ?? 0;
+
+    const replicaWrite = async (name: string): Promise<void> => {
+      try {
+        const connection = await this.memberConnection(name);
+        await connection.set(key, valueBytes, ttlSeconds, namespace);
+      } catch (error) {
+        // Swallowed by design — see the doc comment above (and
+        // writeToOwners', which this mirrors). An actual programming bug
+        // (isSwallowable) still propagates.
+        if (!isSwallowable(error)) throw error;
+        this.replicaWriteFailures++;
+      }
+    };
+
+    // Fire-and-forget replica writes (same cap/fallback as writeToOwners):
+    // with fireAndForgetReplicas, up to FIRE_AND_FORGET_TUNING.maxInFlight
+    // replica legs run in the background instead of being waited for
+    // below — past that cap, further legs fall back to the synchronous
+    // path exactly as with the option off.
+    const replicaWrites = replicaNames.map((name) => {
+      if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        const background = replicaWrite(name);
+        const settled = background.catch(() => {});
+        this.backgroundReplicaWrites.add(background);
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        return Promise.resolve();
+      }
+      const write = replicaWrite(name);
+      // No-op catch attached synchronously, same reasoning as
+      // writeToOwners: a genuine programming bug surfacing here must not
+      // trip Node's unhandled-rejection detector before Promise.allSettled
+      // below gets a chance to observe it.
+      write.catch(() => {});
+      return write;
+    });
+
+    // Drained for close()'s tracking and so a genuine replica-leg bug
+    // doesn't linger as an unhandled rejection — but the primary's
+    // increment already happened, so its result is always what's
+    // returned; nothing here can turn it into a failure.
+    await Promise.allSettled(replicaWrites);
+
+    return result.value;
   }
 
   /** Shared fan-out for `clearAll()`/a namespace handle's `clear()`

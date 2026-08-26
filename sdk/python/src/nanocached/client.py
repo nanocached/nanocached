@@ -226,6 +226,26 @@ def _check_namespace(namespace: bytes) -> None:
         )
 
 
+# Counters (issue #129): the server treats <delta> as an i64 — validated
+# here, synchronously and before any I/O, the same way ttl_seconds and
+# an empty key already are; a delta outside this range would otherwise
+# either be rejected server-side with no reply (poisoning the shared,
+# pipelined connection, same consequence as an empty key or an oversized
+# frame) or silently truncated on the wire.
+_MIN_I64 = -(2**63)
+_MAX_I64 = 2**63 - 1
+
+
+def _check_delta(delta: int) -> None:
+    if not isinstance(delta, int) or isinstance(delta, bool):
+        raise ValueError(f"nanocached: delta must be an integer, got {delta!r}")
+    if not (_MIN_I64 <= delta <= _MAX_I64):
+        raise ValueError(
+            f"nanocached: delta must fit in a signed 64-bit integer "
+            f"({_MIN_I64}..{_MAX_I64}), got {delta}"
+        )
+
+
 def _build_ssl_context(tls: bool, ca: str | os.PathLike | None) -> ssl_module.SSLContext | None:
     """``ca`` is meaningful only when ``tls`` is true — silently ignored
     otherwise. An unreadable/unparseable CA file is a connect-time error
@@ -906,6 +926,104 @@ class NanocachedClient:
             )
         )
 
+    async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
+        """Atomically adds ``delta`` (may be negative) to the integer
+        counter stored at ``key`` and returns the new value — or
+        ``None`` if the key does not exist, matching get()'s own miss
+        convention (issue #129). Raises ``NotNumericError`` if the
+        stored value isn't an integer INCR can operate on, or applying
+        ``delta`` would overflow a signed 64-bit integer.
+
+        INCR is exactly as volatile as set(): LRU eviction and TTL
+        expiry reclaim an incremented value like any other entry, so
+        this suits rate limiting and approximate counters, never durable
+        counts (billing, inventory). See decr() for subtraction, and
+        README.md's "Counters" section for the cluster-replication
+        caveat: only the primary owner ever runs the increment, so a
+        replica can never drift onto a different counter value than the
+        one the primary actually holds."""
+        return await self._incr(b"", key, delta)
+
+    async def decr(self, key: str | bytes, delta: int = 1) -> int | None:
+        """``incr(key, -delta)`` (issue #129) — decr never sends a
+        separate wire op; see incr()."""
+        return await self.incr(key, -delta)
+
+    async def _incr(self, namespace: bytes, key: str | bytes, delta: int) -> int | None:
+        """The namespace-carrying implementation behind incr()/decr() and
+        Namespace.incr()/Namespace.decr() (issue #129) — see
+        _get_bytes()."""
+        key_bytes = _to_bytes(key)
+        _check_key(key_bytes, namespace)
+        _check_delta(delta)
+        await self._before_operation()
+        return await self._with_wrong_node_retry(
+            lambda: self._incr_write(namespace, key_bytes, delta)
+        )
+
+    async def _incr_write(self, namespace: bytes, key: bytes, delta: int) -> int | None:
+        """Sends ``i`` to the primary owner only, then — only once that
+        succeeds with a real value — forwards its literal result to the
+        remaining owners as an ordinary set() (issue #129): replaying the
+        increment on a replica instead would let it drift from the
+        primary (e.g. an earlier replica-leg write dropped after a
+        transient failure, or the replica separately evicting and
+        resetting the key), exactly the reasoning the node's own
+        migration/decommission-handoff logic uses server-side. A miss or
+        NotNumericError from the primary is returned/raised directly
+        without ever touching a replica — nothing was written. Wrapped by
+        _incr() in the same _with_wrong_node_retry every other write
+        uses, so an unreachable or `W`-answering primary gets one retry
+        against freshly refreshed owners — but that retry re-enters this
+        method from scratch, so it only ever redoes the primary leg
+        (nothing has been sent to any replica yet at that point)."""
+        if self._ring is None:
+            connection = await self._single_connection()
+            outcome = await connection.incr(key, delta, namespace)
+            return None if outcome is None else int(outcome[0])
+
+        names = self._owner_names(namespace, key)
+        if not names:
+            raise ConnectionError("nanocached: no owner is reachable for this key")
+        primary, replicas = names[0], names[1:]
+
+        connection = await self._member_connection(primary)
+        outcome = await connection.incr(key, delta, namespace)
+        if outcome is None:
+            return None
+        value_bytes, ttl_seconds = outcome
+        if replicas:
+            await self._replicate_incr_result(
+                replicas, namespace, key, value_bytes, ttl_seconds or 0
+            )
+        return int(value_bytes)
+
+    async def _replicate_incr_result(
+        self, names: list[str], namespace: bytes, key: bytes, value: bytes, ttl_seconds: int
+    ) -> None:
+        """Fans the primary incr's literal new value out to ``names``
+        (the remaining owners) as an ordinary set() — see
+        _incr_write()'s docstring for why the increment itself is never
+        replayed on a replica. Reuses _dispatch_replica_writes, the exact
+        same machinery _write()'s own replica legs use: honors
+        fire_and_forget_replicas, the shared
+        _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES cap and
+        _background_replica_writes pool, and counts a swallowed leg in
+        stats().replica_write_failures. Unlike _write(), there is no
+        primary leg here that could still fail alongside a replica bug —
+        the increment already succeeded — so a genuine programming error
+        escaping a synchronous leg is only ever warned about, never
+        raised; the caller's already-successful incr() must not be
+        reported as failed because of it."""
+        tasks = self._dispatch_replica_writes(
+            names, lambda connection: connection.set(key, value, ttl_seconds, namespace)
+        )
+        if not tasks:
+            return
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(outcome, BaseException):
+                _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+
     async def clear_all(self) -> None:
         """Drops every namespace on every node, the default namespace
         included (issue #106) — the whole-store flush counterpart to
@@ -1246,14 +1364,18 @@ class NanocachedClient:
             "nanocached: no owner is reachable for this key"
         )
 
-    async def _write(self, namespace: bytes, key: bytes, op):
-        if self._ring is None:
-            return await op(await self._single_connection())
-
-        names = self._owner_names(namespace, key)
-        if not names:
-            raise ConnectionError("nanocached: no owner is reachable for this key")
-        primary, replicas = names[0], names[1:]
+    def _dispatch_replica_writes(self, names: list[str], op) -> list[asyncio.Task[None]]:
+        """Admits each name in ``names`` as a replica leg running ``op`` —
+        the fan-out machinery shared by _write()'s own replica legs and
+        incr()'s result-forwarding replicate step (NanocachedClient.incr,
+        issue #129): a leg that fits under fire_and_forget_replicas' own
+        _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES cap (and close() hasn't
+        started) runs detached in self._background_replica_writes; every
+        other leg's task is returned here for the caller to await
+        synchronously. Every leg swallows _SWALLOWABLE_ERRORS internally
+        and counts it in stats().replica_write_failures (client-side
+        replication) — only a genuine programming error can still surface
+        in a returned task's result."""
 
         async def replica_write(name: str) -> None:
             try:
@@ -1266,22 +1388,24 @@ class NanocachedClient:
                 # synchronously or as a fire_and_forget_replicas
                 # background write — both paths share this function. A
                 # genuine programming error still escapes this except
-                # clause (see _write()'s finally for what happens to it).
+                # clause (see the callers' own handling of a returned
+                # task's outcome).
                 self._replica_write_failures += 1
 
-        replica_tasks = []
-        for name in replicas:
+        replica_tasks: list[asyncio.Task[None]] = []
+        for name in names:
             # Fire-and-forget replica writes: with fire_and_forget_replicas, up to
             # _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES legs — shared with
             # read-repair write-backs, see _background_replica_writes'
             # own comment in __init__ (issue #47 audit item 5) — run in
-            # the background instead of being waited for below. Past that
-            # cap, or once close() has started (self._closed, rechecked
-            # here immediately before registering the task — close() sets
-            # it before draining, so a write() still in flight when close()
-            # runs must not add an entry that drain has already, or is
-            # about to have, taken its snapshot of), further legs fall
-            # back to the synchronous path exactly as with the option off.
+            # the background instead of being returned for the caller to
+            # await. Past that cap, or once close() has started
+            # (self._closed, rechecked here immediately before
+            # registering the task — close() sets it before draining, so
+            # a write still in flight when close() runs must not add an
+            # entry that drain has already, or is about to have, taken
+            # its snapshot of), further legs fall back to the synchronous
+            # path exactly as with the option off.
             if (
                 self._fire_and_forget_replicas
                 and not self._closed
@@ -1292,6 +1416,18 @@ class NanocachedClient:
                 task.add_done_callback(self._background_replica_writes.discard)
                 continue
             replica_tasks.append(asyncio.ensure_future(replica_write(name)))
+        return replica_tasks
+
+    async def _write(self, namespace: bytes, key: bytes, op):
+        if self._ring is None:
+            return await op(await self._single_connection())
+
+        names = self._owner_names(namespace, key)
+        if not names:
+            raise ConnectionError("nanocached: no owner is reachable for this key")
+        primary, replicas = names[0], names[1:]
+
+        replica_tasks = self._dispatch_replica_writes(replicas, op)
 
         primary_error: BaseException | None = None
         try:
@@ -1629,6 +1765,16 @@ class Namespace:
     async def delete(self, key: str | bytes) -> bool:
         """Same as NanocachedClient.delete(), scoped to this namespace."""
         return await self._client._delete(self._namespace, key)
+
+    async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
+        """Same as NanocachedClient.incr(), scoped to this namespace
+        (issue #129)."""
+        return await self._client._incr(self._namespace, key, delta)
+
+    async def decr(self, key: str | bytes, delta: int = 1) -> int | None:
+        """Same as NanocachedClient.decr(), scoped to this namespace
+        (issue #129)."""
+        return await self._client._incr(self._namespace, key, -delta)
 
     async def clear(self) -> None:
         """Drops every entry in this namespace, on every node (issue

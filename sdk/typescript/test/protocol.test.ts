@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { encodeClear, encodeClearAll, encodeDelete, encodeGet, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
+import { encodeClear, encodeClearAll, encodeDelete, encodeGet, encodeIncr, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
 
 const NS = Buffer.from("users");
 
@@ -79,6 +79,49 @@ describe("encodeDelete", () => {
   });
 });
 
+describe("encodeIncr (issue #129)", () => {
+  it("always frames the namespace length, even for the default namespace", () => {
+    assert.deepEqual(encodeIncr(Buffer.from("key"), 1), Buffer.from("i 0 3 1\nkey"));
+  });
+
+  it("frames a signed positive delta in canonical decimal form", () => {
+    assert.deepEqual(encodeIncr(Buffer.from("key"), 5), Buffer.from("i 0 3 5\nkey"));
+  });
+
+  it("frames a signed negative delta with a leading minus, no other punctuation", () => {
+    assert.deepEqual(encodeIncr(Buffer.from("key"), -5), Buffer.from("i 0 3 -5\nkey"));
+  });
+
+  it("frames a named namespace ahead of the key, matching g/s/d's field order", () => {
+    assert.deepEqual(encodeIncr(Buffer.from("alpha"), 3, undefined, NS), Buffer.concat([Buffer.from("i 5 5 3\n"), NS, Buffer.from("alpha")]));
+  });
+
+  it("appends the tag as the last header field", () => {
+    assert.deepEqual(encodeIncr(Buffer.from("key"), 1, 7), Buffer.from("i 0 3 1 7\nkey"));
+    assert.deepEqual(encodeIncr(Buffer.from("key"), -1, 7, NS), Buffer.concat([Buffer.from("i 5 3 -1 7\n"), NS, Buffer.from("key")]));
+  });
+
+  it("rejects an empty key synchronously", () => {
+    assert.throws(() => encodeIncr(Buffer.alloc(0), 1), RangeError);
+  });
+
+  it("rejects a key beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeIncr(Buffer.alloc(MAX_REQUEST_BYTES + 1), 1), RangeError);
+  });
+
+  it("rejects a non-safe-integer delta synchronously", () => {
+    for (const delta of [3.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, -(Number.MAX_SAFE_INTEGER + 1)]) {
+      assert.throws(() => encodeIncr(Buffer.from("key"), delta), RangeError);
+    }
+  });
+
+  it("accepts the boundary safe-integer deltas", () => {
+    assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), Number.MAX_SAFE_INTEGER));
+    assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), -Number.MAX_SAFE_INTEGER));
+    assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), 0));
+  });
+});
+
 describe("encodeClear / encodeClearAll (issue #106)", () => {
   it("frames the default namespace as namespace-length 0, with no body", () => {
     assert.deepEqual(encodeClear(), Buffer.from("c 0\n"));
@@ -123,6 +166,9 @@ describe("tryParseResponse", () => {
       ["C\n", "cleared"],
       // Retryable-error status (issue #125): possible on any data command.
       ["R\n", "retryable"],
+      // INCR (issue #129): the stored value isn't INCR's counter grammar,
+      // or applying delta would overflow.
+      ["T\n", "notNumeric"],
     ] as const;
 
     for (const [wire, kind] of cases) {
@@ -139,7 +185,7 @@ describe("tryParseResponse", () => {
     // Issue: audit finding — the untagged form is always exactly
     // `<marker>\n`; a second byte other than LF means the streams are
     // desynced (this used to be accepted silently, with consumed: 2).
-    for (const wire of ["SX", "DX", "NX", "WX", "CX", "RX"]) {
+    for (const wire of ["SX", "DX", "NX", "WX", "CX", "RX", "TX"]) {
       assert.throws(() => tryParseResponse(Buffer.from(wire)), /connection desynced/);
     }
   });
@@ -208,6 +254,58 @@ describe("tryParseResponse", () => {
   });
 });
 
+describe("tryParseResponse — INCR's `I` response (issue #129)", () => {
+  it("parses a successful increment with no TTL", () => {
+    const parsed = tryParseResponse(Buffer.from("I 2\n42"));
+    assert.equal(parsed?.consumed, 6);
+    assert.deepEqual(parsed?.response, { kind: "incremented", value: Buffer.from("42"), ttlSeconds: undefined, tag: undefined });
+  });
+
+  it("parses a successful increment with a TTL", () => {
+    const parsed = tryParseResponse(Buffer.from("I 2 60\n42"));
+    assert.equal(parsed?.consumed, 9);
+    assert.deepEqual(parsed?.response, { kind: "incremented", value: Buffer.from("42"), ttlSeconds: 60, tag: undefined });
+  });
+
+  it("parses a negative counter value", () => {
+    const parsed = tryParseResponse(Buffer.from("I 3\n-42"));
+    assert.deepEqual(parsed?.response.value, Buffer.from("-42"));
+  });
+
+  it("returns null while the header or body is incomplete", () => {
+    assert.equal(tryParseResponse(Buffer.from("I 2")), null);
+    assert.equal(tryParseResponse(Buffer.from("I 2\n4")), null);
+  });
+
+  it("parses a tagged increment with no TTL — just the tag", () => {
+    const parsed = tryParseResponse(Buffer.from("I 2 9\n42"), true);
+    assert.equal(parsed?.consumed, 8);
+    assert.deepEqual(parsed?.response, { kind: "incremented", value: Buffer.from("42"), ttlSeconds: undefined, tag: 9 });
+  });
+
+  it("parses a tagged increment with a TTL — ttl then tag", () => {
+    const parsed = tryParseResponse(Buffer.from("I 2 60 9\n42"), true);
+    assert.equal(parsed?.consumed, 11);
+    assert.deepEqual(parsed?.response, { kind: "incremented", value: Buffer.from("42"), ttlSeconds: 60, tag: 9 });
+  });
+
+  it("throws on a tagged increment missing its tag entirely", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("I 2\n42"), true), /invalid incremented-value header/);
+  });
+
+  it("throws on an untagged increment with too many header fields", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("I 2 60 9\n42")), /invalid incremented-value header/);
+  });
+
+  it("throws on an invalid value length", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("I x\n")), /invalid value length/);
+  });
+
+  it("throws on a non-decimal ttl field", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("I 2 abc\n42")), /invalid ttl/);
+  });
+});
+
 describe("tagged frames (echoed response tags)", () => {
   it("appends the tag as the last request header field", () => {
     assert.deepEqual(encodeGet(Buffer.from("key"), 7), Buffer.from("G 3 7\nkey"));
@@ -233,6 +331,11 @@ describe("tagged frames (echoed response tags)", () => {
     // request-answering status above.
     assert.deepEqual(tryParseResponse(Buffer.from("R 7\n"), true), {
       response: { kind: "retryable", tag: 7 },
+      consumed: 4,
+    });
+    // INCR (issue #129): tagged like every other status marker above.
+    assert.deepEqual(tryParseResponse(Buffer.from("T 7\n"), true), {
+      response: { kind: "notNumeric", tag: 7 },
       consumed: 4,
     });
   });

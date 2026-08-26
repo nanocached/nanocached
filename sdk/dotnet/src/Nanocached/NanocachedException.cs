@@ -87,3 +87,17 @@ public sealed class RetryableException : NanocachedException
 {
     public RetryableException(string message) : base(message) { }
 }
+
+/// <summary>
+/// issue #129 — INCR/DECR: the target key exists but its stored value
+/// isn't INCR's counter grammar (a decimal ASCII signed 64-bit integer),
+/// or applying the delta would overflow one (<c>T</c>). Never transient:
+/// retrying the same INCR against the same stored value cannot succeed
+/// until something else (a Set, a Delete, or a differently-shaped Incr)
+/// changes it first.
+/// </summary>
+public sealed class NotNumericException : NanocachedException
+{
+    public NotNumericException()
+        : base("nanocached: the stored value is not an integer INCR can operate on") { }
+}

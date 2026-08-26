@@ -171,6 +171,22 @@ fn decode_utf8_value(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes).map_err(Error::InvalidUtf8)
 }
 
+/// `decr`'s delta negation (issue #129) — shared by
+/// [`NanocachedClient::decr`] and [`Namespace::decr`]. `i64::MIN` has no
+/// valid `i64` negation (`i64::MAX` is one short of `|i64::MIN|`), so
+/// rather than silently wrapping back to `i64::MIN` (which would send the
+/// same delta `decr` was asked to negate away from), this rejects it
+/// client-side before any I/O — mirrors `validate_key`'s own
+/// "reject what the wire could never represent correctly" rule.
+fn negate_delta(delta: i64) -> Result<i64> {
+    delta.checked_neg().ok_or_else(|| {
+        Error::InvalidArgument(
+            "nanocached: decr delta must not be i64::MIN, which has no valid i64 negation"
+                .to_string(),
+        )
+    })
+}
+
 /// `clear`'s own bound (issue #106): a clear frame carries no key or
 /// value, only the namespace, so unlike `validate_key`/
 /// `validate_key_and_value` there is nothing to sum it against — the
@@ -1433,6 +1449,115 @@ impl NanocachedClient {
         .await
     }
 
+    /// Atomically adds `delta` (negative decrements — there is no separate
+    /// wire opcode; see [`Self::decr`]) to the integer counter stored at
+    /// `key`, and returns its new value — or `None` if the key is missing
+    /// or expired, exactly like [`Self::get`]/[`Self::get_bytes`]'s own
+    /// miss convention (issue #129's `N`). [`Error::NotNumeric`] if the
+    /// key exists but its stored value isn't a plain signed-decimal
+    /// integer, or applying `delta` would overflow `i64` (issue #129's
+    /// `T`).
+    ///
+    /// **As volatile as [`Self::set`], not a durable counter**: LRU
+    /// eviction and TTL expiry reclaim an incremented value exactly like
+    /// any other entry. Good for rate limiting or approximate counters;
+    /// never for a count that must survive eviction (billing, inventory).
+    ///
+    /// In cluster mode, only the key's primary owner ever runs the
+    /// increment — replicas receive its literal new value as an ordinary
+    /// `set` instead of replaying the increment themselves, which is what
+    /// keeps every replica byte-identical to the primary rather than
+    /// letting them drift (see `incr_once`'s own doc comment for the full
+    /// reasoning).
+    pub async fn incr(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<Option<i64>> {
+        self.incr_in(DEFAULT_NAMESPACE, key, delta).await
+    }
+
+    /// `incr(key, -delta)` — decrementing is never a separate wire opcode
+    /// (issue #129's `i` is the only INCR frame), just a negated delta on
+    /// the same one. `Err(Error::InvalidArgument)` for `delta ==
+    /// i64::MIN`, which has no valid `i64` negation.
+    pub async fn decr(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<Option<i64>> {
+        self.incr(key, negate_delta(delta)?).await
+    }
+
+    /// The shared implementation behind [`Self::incr`] and
+    /// [`Namespace::incr`] (Namespaces, issue #105).
+    async fn incr_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+        delta: i64,
+    ) -> Result<Option<i64>> {
+        let key = key.as_ref();
+        validate_key(namespace, key)?;
+        self.before_operation().await?;
+        self.with_cluster_retry(|| self.incr_once(namespace, key, delta))
+            .await
+    }
+
+    /// The primary-then-replicate-result driver behind `incr_in` (issue
+    /// #129). Deliberately *not* `write`'s same-op-to-every-owner shape:
+    /// `i` goes to the primary only, and only once that succeeds does its
+    /// literal new value get forwarded to the remaining owners as a `set`
+    /// (`replicate_writes`, shared with `write`) — never replayed as
+    /// another `i` there. Replaying the increment on a replica instead of
+    /// forwarding the primary's result would let that replica drift from
+    /// the primary (e.g. an earlier replica-leg write dropped after a
+    /// transient failure, or the replica separately evicting and resetting
+    /// the key) — forwarding the absolute result keeps every replica
+    /// byte-identical to the primary, exactly like the node's own
+    /// migration/decommission-handoff logic does server-side.
+    ///
+    /// A `NotFound`/`NotNumeric` primary outcome is returned as-is without
+    /// touching any replica: nothing was written on the primary, so there
+    /// is nothing to forward. On `WrongNode`/`ConnectionLost` from the
+    /// primary leg, this propagates the error untouched — `with_cluster_retry`
+    /// (in `incr_in`) is what refreshes the node list and retries the
+    /// whole of this method once, which naturally retries only the
+    /// primary leg again (replicas are never touched until a primary
+    /// succeeds).
+    async fn incr_once(&self, namespace: &[u8], key: &[u8], delta: i64) -> Result<Option<i64>> {
+        let owners = {
+            let state = self.inner.state.lock().await;
+            if let Target::Single { .. } = state.target {
+                drop(state);
+                let op = |connection: Arc<Connection>| async move {
+                    connection.incr(namespace, key, delta).await
+                };
+                return Ok(self
+                    .apply_reconnecting(None, &op)
+                    .await?
+                    .map(|(value, _ttl_seconds)| value));
+            }
+            Self::owner_names(&state, namespace, key)
+        };
+
+        let Some((primary, replicas)) = owners.split_first() else {
+            return Err(Error::ConnectionLost(
+                "nanocached: no owner is reachable for this key".to_string(),
+            ));
+        };
+
+        let primary_op = |connection: Arc<Connection>| async move {
+            connection.incr(namespace, key, delta).await
+        };
+        let Some((value, ttl_seconds)) =
+            self.apply_reconnecting(Some(primary), &primary_op).await?
+        else {
+            return Ok(None);
+        };
+
+        let value_bytes = value.to_string().into_bytes();
+        let body = WriteBody::Set {
+            value: &value_bytes,
+            ttl_seconds: ttl_seconds.unwrap_or(0),
+        };
+        self.replicate_writes(namespace, key, replicas, body).await;
+
+        Ok(Some(value))
+    }
+
     /// Flushes every namespace, the default one included, across every
     /// node (issue #106's `F`) — the whole store starts empty again.
     /// Deliberately not named `flush*` (the issue's own naming
@@ -1781,92 +1906,126 @@ impl NanocachedClient {
             ));
         };
 
-        // Fan out to the replicas concurrently with the primary write. The
-        // primary's outcome decides; replica failures are swallowed by
-        // design (client-side replication) — a dead or disagreeing replica leaves the key
-        // under-replicated until the next node-list refresh, never fails
-        // the write. Counted in `stats().replica_write_failures` so
-        // operators can spot silently degrading replication.
-        // Fire-and-forget replica writes: with fire_and_forget_replicas, up to
-        // background_replica_cap legs run detached on their own tokio
-        // task instead of being awaited below — past that cap, further
-        // legs fall back to the synchronous path exactly as with the
-        // option off.
-        let replica_writes = async {
-            for name in replicas {
-                if self.inner.fire_and_forget_replicas {
-                    if let Ok(permit) =
-                        Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
-                    {
-                        // Re-check `closed` *after* taking the permit, the
-                        // same ordering Go's SDK gets from re-checking under
-                        // the lock `Close()` holds: `close()` sets `closed`
-                        // before draining permits, so if we still see it
-                        // clear here, `close()`'s drain is guaranteed to wait
-                        // for this permit; if it's already set, `close()` may
-                        // have passed its drain, so we must not spawn a
-                        // detached task it won't await — fall back to the
-                        // synchronous path (issue #47 item 3). SeqCst on both
-                        // sides makes the permit acquisition and this load
-                        // totally ordered against `close()`'s swap+drain.
-                        if self.inner.closed.load(Ordering::SeqCst) {
-                            drop(permit);
-                        } else {
-                            let client = self.clone();
-                            let name = name.clone();
-                            let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
-                            let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
-                            let owned_body = body.to_owned();
-                            tokio::spawn(async move {
-                                let _permit = permit; // held until this task finishes
-                                let failed = match owned_body {
-                                    OwnedWriteBody::Set { value, ttl_seconds } => {
-                                        let value: Arc<[u8]> = Arc::from(value);
-                                        let op = move |connection: Arc<Connection>| {
-                                            let namespace = Arc::clone(&owned_namespace);
-                                            let key = Arc::clone(&owned_key);
-                                            let value = Arc::clone(&value);
-                                            async move {
-                                                connection
-                                                    .set(&namespace, &key, &value, ttl_seconds)
-                                                    .await
-                                            }
-                                        };
-                                        client.apply_reconnecting(Some(&name), &op).await.is_err()
-                                    }
-                                    OwnedWriteBody::Delete => {
-                                        let op = move |connection: Arc<Connection>| {
-                                            let namespace = Arc::clone(&owned_namespace);
-                                            let key = Arc::clone(&owned_key);
-                                            async move { connection.delete(&namespace, &key).await }
-                                        };
-                                        client.apply_reconnecting(Some(&name), &op).await.is_err()
-                                    }
-                                };
-                                if failed {
-                                    client
-                                        .inner
-                                        .stats
-                                        .replica_write_failures
-                                        .fetch_add(1, Ordering::Relaxed);
-                                }
-                            });
-                            continue;
-                        }
-                    }
-                }
-                if self.apply_reconnecting(Some(name), &op).await.is_err() {
-                    self.inner
-                        .stats
-                        .replica_write_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        };
+        // Fan out to the replicas concurrently with the primary write —
+        // `set`/`delete` are idempotent, so replaying the same op on a
+        // replica regardless of how the primary leg turns out is safe.
+        // `replicate_writes` is shared with `incr_once` (issue #129),
+        // which instead awaits it only *after* its own primary leg has
+        // already succeeded — see that method's own doc comment for why
+        // incr can't reuse this concurrent-with-primary shape.
         let primary_write = self.apply_reconnecting(Some(primary), &op);
+        let replica_writes = self.replicate_writes(namespace, key, replicas, body);
 
         let (primary_result, ()) = tokio::join!(primary_write, replica_writes);
         primary_result
+    }
+
+    /// Fans `body` (a literal `set` or `delete`) out to `replicas`,
+    /// best-effort: every failure is swallowed and counted in
+    /// `stats().replica_write_failures` so operators can spot silently
+    /// degrading replication, never fails the caller (client-side
+    /// replication) — a dead or disagreeing replica just leaves the key
+    /// under-replicated until the next node-list refresh.
+    ///
+    /// Fire-and-forget replica writes: with `fire_and_forget_replicas`, up
+    /// to `background_replica_cap` legs run detached on their own tokio
+    /// task instead of being awaited below — past that cap, further legs
+    /// fall back to the synchronous path exactly as with the option off.
+    ///
+    /// Shared between `write` (called concurrently with the primary leg,
+    /// since `set`/`delete` are idempotent and safe to replay regardless
+    /// of the primary's own outcome) and `incr_once` (issue #129, called
+    /// only once the primary's `i` has already produced a value — an
+    /// `incr` replica leg is always a `set` of that literal value, never
+    /// another `i`, so this only ever sees `WriteBody::Set` from that
+    /// caller).
+    async fn replicate_writes(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        replicas: &[String],
+        body: WriteBody<'_>,
+    ) {
+        for name in replicas {
+            if self.inner.fire_and_forget_replicas {
+                if let Ok(permit) =
+                    Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
+                {
+                    // Re-check `closed` *after* taking the permit, the
+                    // same ordering Go's SDK gets from re-checking under
+                    // the lock `Close()` holds: `close()` sets `closed`
+                    // before draining permits, so if we still see it
+                    // clear here, `close()`'s drain is guaranteed to wait
+                    // for this permit; if it's already set, `close()` may
+                    // have passed its drain, so we must not spawn a
+                    // detached task it won't await — fall back to the
+                    // synchronous path (issue #47 item 3). SeqCst on both
+                    // sides makes the permit acquisition and this load
+                    // totally ordered against `close()`'s swap+drain.
+                    if self.inner.closed.load(Ordering::SeqCst) {
+                        drop(permit);
+                    } else {
+                        let client = self.clone();
+                        let name = name.clone();
+                        let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
+                        let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
+                        let owned_body = body.to_owned();
+                        tokio::spawn(async move {
+                            let _permit = permit; // held until this task finishes
+                            let failed = match owned_body {
+                                OwnedWriteBody::Set { value, ttl_seconds } => {
+                                    let value: Arc<[u8]> = Arc::from(value);
+                                    let op = move |connection: Arc<Connection>| {
+                                        let namespace = Arc::clone(&owned_namespace);
+                                        let key = Arc::clone(&owned_key);
+                                        let value = Arc::clone(&value);
+                                        async move {
+                                            connection
+                                                .set(&namespace, &key, &value, ttl_seconds)
+                                                .await
+                                        }
+                                    };
+                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
+                                }
+                                OwnedWriteBody::Delete => {
+                                    let op = move |connection: Arc<Connection>| {
+                                        let namespace = Arc::clone(&owned_namespace);
+                                        let key = Arc::clone(&owned_key);
+                                        async move { connection.delete(&namespace, &key).await }
+                                    };
+                                    client.apply_reconnecting(Some(&name), &op).await.is_err()
+                                }
+                            };
+                            if failed {
+                                client
+                                    .inner
+                                    .stats
+                                    .replica_write_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        });
+                        continue;
+                    }
+                }
+            }
+            let op = |connection: Arc<Connection>| {
+                let body = &body;
+                async move {
+                    match body {
+                        WriteBody::Set { value, ttl_seconds } => {
+                            connection.set(namespace, key, value, *ttl_seconds).await
+                        }
+                        WriteBody::Delete => connection.delete(namespace, key).await.map(|_| ()),
+                    }
+                }
+            };
+            if self.apply_reconnecting(Some(name), &op).await.is_err() {
+                self.inner
+                    .stats
+                    .replica_write_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Namespace clear / flush-everything fan-out (issue #106's `clear`/
@@ -2405,6 +2564,18 @@ impl Namespace {
     /// See [`NanocachedClient::delete`]; scoped to this namespace.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.client.delete_in(&self.namespace, key).await
+    }
+
+    /// See [`NanocachedClient::incr`]; scoped to this namespace.
+    pub async fn incr(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<Option<i64>> {
+        self.client.incr_in(&self.namespace, key, delta).await
+    }
+
+    /// See [`NanocachedClient::decr`]; scoped to this namespace.
+    pub async fn decr(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<Option<i64>> {
+        self.client
+            .incr_in(&self.namespace, key, negate_delta(delta)?)
+            .await
     }
 
     /// Drops every entry in this namespace, across every node (issue

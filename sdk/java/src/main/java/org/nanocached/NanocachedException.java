@@ -96,4 +96,18 @@ public class NanocachedException extends RuntimeException {
             super("nanocached: request failed transiently (R) after 3 attempts on this connection");
         }
     }
+
+    /**
+     * A node answered {@code T} to an {@code i} (INCR/DECR, issue #129)
+     * request: the key exists but its stored value isn't INCR's counter
+     * grammar (plain decimal ASCII), or applying the delta would overflow
+     * a 64-bit counter. Never transient — retrying the same request
+     * answers the same way until the key is overwritten with a numeric
+     * value (or deleted).
+     */
+    public static final class NotNumeric extends NanocachedException {
+        public NotNumeric() {
+            super("nanocached: the stored value is not an integer INCR can operate on");
+        }
+    }
 }

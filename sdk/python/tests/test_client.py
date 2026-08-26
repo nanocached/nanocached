@@ -17,6 +17,7 @@ from nanocached import (
     HashRing,
     NanocachedClient,
     NanocachedError,
+    NotNumericError,
     RetryableError,
     WrongNodeError,
 )
@@ -1156,6 +1157,278 @@ class ClearEncodingTests(unittest.TestCase):
         from nanocached._connection import _encode_clear
 
         self.assertEqual(_encode_clear(b"\xff\x00"), b"c 2\n\xff\x00")
+
+
+class IncrEncodingTests(unittest.TestCase):
+    # Counters (issue #129): docs/protocol.html "i" is the authoritative
+    # wire spec these pin — INCR has no legacy uppercase form, so even
+    # the default namespace still carries <namespace-length> 0.
+
+    def test_encodes_untagged_incr(self):
+        from nanocached._connection import _encode_incr
+
+        self.assertEqual(_encode_incr(b"k", 5), b"i 0 1 5\nk")
+
+    def test_encodes_negative_delta(self):
+        from nanocached._connection import _encode_incr
+
+        self.assertEqual(_encode_incr(b"k", -5), b"i 0 1 -5\nk")
+
+    def test_encodes_namespaced_incr(self):
+        from nanocached._connection import _encode_incr
+
+        self.assertEqual(_encode_incr(b"k", 5, namespace=b"users"), b"i 5 1 5\nusersk")
+
+    def test_encodes_tagged_incr(self):
+        from nanocached._connection import _encode_incr
+
+        self.assertEqual(_encode_incr(b"k", 5, tag=7), b"i 0 1 5 7\nk")
+
+    def test_encodes_tagged_namespaced_incr(self):
+        from nanocached._connection import _encode_incr
+
+        self.assertEqual(
+            _encode_incr(b"k", 5, tag=7, namespace=b"users"), b"i 5 1 5 7\nusersk"
+        )
+
+    def test_namespace_may_contain_arbitrary_bytes(self):
+        from nanocached._connection import _encode_incr
+
+        self.assertEqual(_encode_incr(b"beta", -1, namespace=b"\xff\x00"), b"i 2 4 -1\n\xff\x00beta")
+
+
+class IncrTests(unittest.IsolatedAsyncioTestCase):
+    # Counters (issue #129): single-node coverage of incr()/decr() and
+    # the I/T/N response decode — see IncrReplicationTests below for the
+    # cluster fan-out contract (primary-only i, replica gets a set).
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_incr_on_a_missing_key_returns_none(self):
+        # Matches get()'s own miss convention — no exception.
+        client = await self.connect()
+        try:
+            self.assertIsNone(await client.incr("missing"))
+            self.assertEqual(self.node.incr_count, 1)
+        finally:
+            await client.close()
+
+    async def test_incr_on_a_non_numeric_value_raises_not_numeric_error(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "not-a-number")
+            with self.assertRaises(NotNumericError):
+                await client.incr("k")
+        finally:
+            await client.close()
+
+    async def test_successful_incr_returns_the_new_value(self):
+        client = await self.connect()
+        try:
+            await client.set("counter", "10")
+            self.assertEqual(await client.incr("counter"), 11)  # delta defaults to 1
+            self.assertEqual(await client.incr("counter", 5), 16)
+            self.assertEqual(await client.incr("counter", -20), -4)
+        finally:
+            await client.close()
+
+    async def test_decr_sends_the_same_wire_op_with_a_negated_delta(self):
+        client = await self.connect()
+        try:
+            await client.set("counter", "10")
+            self.assertEqual(await client.decr("counter", 3), 7)
+            # decr() never sends a separate wire op — just `i` with -3.
+            self.assertEqual(self.node.incr_count, 1)
+        finally:
+            await client.close()
+
+    async def test_decr_default_amount_matches_incr_with_negative_one(self):
+        client = await self.connect()
+        try:
+            await client.set("a", "5")
+            await client.set("b", "5")
+            self.assertEqual(await client.decr("a"), await client.incr("b", -1))
+        finally:
+            await client.close()
+
+    async def test_delta_out_of_i64_range_is_rejected_before_touching_the_connection(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.incr("k", 2**63)
+            with self.assertRaises(ValueError):
+                await client.incr("k", -(2**63) - 1)
+            self.assertEqual(self.node.incr_count, 0)
+        finally:
+            await client.close()
+
+    async def test_empty_key_is_rejected_before_touching_the_connection(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.incr("")
+            self.assertEqual(self.node.incr_count, 0)
+        finally:
+            await client.close()
+
+
+class IncrTaggedTests(unittest.IsolatedAsyncioTestCase):
+    # Counters (issue #129): the I/T/N decode path on a tagged connection
+    # (echoed response tags) — see IncrTests above for the untagged path.
+
+    async def test_incr_round_trips_over_a_tagged_connection(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("counter", "1")
+                self.assertEqual(await client.incr("counter", 4), 5)
+                self.assertIsNone(await client.incr("missing"))
+                await client.set("bad", "nope")
+                with self.assertRaises(NotNumericError):
+                    await client.incr("bad")
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+
+class IncrReplicationTests(unittest.IsolatedAsyncioTestCase):
+    # Counters (issue #129): the cluster contract this feature exists
+    # for — the primary alone runs `i`, and forwards its literal result
+    # to the remaining owners as a `set`, never replaying the increment.
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_the_primary_runs_incr_and_the_replica_only_ever_gets_a_set(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "counter"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            await client.set(key, "10")
+            # set() itself fans out to both owners — reset the counters
+            # so only the incr() call below is being measured.
+            primary.incr_count = 0
+            replica.incr_count = 0
+
+            self.assertEqual(await client.incr(key, 5), 15)
+
+            # The critical assertion: not just that both stores agree on
+            # the final value (a buggy replay-on-replica implementation
+            # would produce that too, starting from the same seed), but
+            # that the replica never received an `i` frame at all.
+            self.assertEqual(primary.incr_count, 1)
+            self.assertEqual(replica.incr_count, 0)
+            self.assertEqual(primary.store[key.encode()], b"15")
+            self.assertEqual(replica.store[key.encode()], b"15")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_the_replicated_set_carries_the_entrys_ttl(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "counter-with-ttl"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            await client.set(key, "10", ttl_seconds=120)
+            self.assertEqual(await client.incr(key, 1), 11)
+
+            # Proves the optional TTL field in the `I` response was
+            # actually decoded — a decode bug that dropped it would
+            # forward TTL 0 (no expiry) to the replica instead.
+            self.assertEqual(replica.last_set_ttl, 120)
+            self.assertEqual(replica.entry_ttl[(b"", key.encode())], 120)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_missing_key_on_the_primary_never_touches_the_replica(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "missing-counter"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            self.assertIsNone(await client.incr(key))
+            self.assertEqual(primary.incr_count, 1)
+            self.assertEqual(replica.incr_count, 0)
+            self.assertNotIn(key.encode(), replica.store)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_non_numeric_value_on_the_primary_never_touches_the_replica(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "not-a-counter"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            await client.set(key, "not-numeric")
+            primary.incr_count = 0
+            replica.incr_count = 0
+            with self.assertRaises(NotNumericError):
+                await client.incr(key)
+            self.assertEqual(primary.incr_count, 1)
+            self.assertEqual(replica.incr_count, 0)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_wrong_node_triggers_refresh_and_one_retry(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "some-counter"
+            await client.set(key, "1")
+            primary_name, _ = self.owners_of(key)
+            primary = nodes[primary_name]
+
+            primary.answer_wrong_node_once()
+            self.assertEqual(await client.incr(key), 2)
+
+            primary.answer_wrong_node_once()
+            primary.answer_wrong_node_once()
+            with self.assertRaises(WrongNodeError):
+                await client.incr(key)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
 
 
 class ClusterTests(unittest.IsolatedAsyncioTestCase):
@@ -2418,6 +2691,20 @@ class NamespaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await users.delete("greeting"))
             self.assertIsNone(await users.get("greeting"))
             self.assertFalse(await users.delete("greeting"))
+        finally:
+            await client.close()
+
+    async def test_round_trips_incr_decr_within_a_namespace(self):
+        # Counters (issue #129): Namespace.incr()/decr() scope to the
+        # namespace the same way get/set/delete already do.
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            await users.set("counter", "10")
+            self.assertEqual(await users.incr("counter"), 11)
+            self.assertEqual(await users.decr("counter", 3), 8)
+            # The default namespace's own "counter" is a separate entry.
+            self.assertIsNone(await client.incr("counter"))
         finally:
             await client.close()
 

@@ -9,6 +9,7 @@ from ._errors import (
     AuthenticationError,
     DiscoveryBusyError,
     NanocachedError,
+    NotNumericError,
     RetryableError,
     WrongNodeError,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "Namespace",
     "NanocachedClient",
     "NanocachedError",
+    "NotNumericError",
     "RetryableError",
     "WrongNodeError",
 ]

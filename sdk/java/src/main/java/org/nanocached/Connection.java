@@ -275,6 +275,56 @@ final class Connection {
         if (response.marker != 'C') throw mismatch(response.marker);
     }
 
+    // INCR (issue #129): `i` — unlike G/S/D there is no separate
+    // uppercase/legacy form; it always carries an explicit
+    // <namespace-length> (0 = default namespace). `<delta>` is a signed
+    // decimal long (a negative delta decrements — see
+    // NanocachedClient.decr, which sends this same `i` op with a negated
+    // delta rather than a separate wire opcode). A hit answers `I
+    // <value-length> [<ttl-seconds>] [<tag>]` — the ttl field is optional
+    // exactly like `S`'s own trailing TTL is on the request side,
+    // disambiguated purely by whether this connection is tagged (see
+    // readResponse's 'I' case); a miss answers `N` (mirroring get's own
+    // null-on-miss convention below); a non-numeric stored value or an
+    // overflowing delta answers `T`, a marker no other op uses.
+
+    /** The outcome of a successful INCR: the new counter value, and —
+     * only when the entry carries a TTL — its remaining seconds. {@code
+     * null} on a miss (see {@link #incr}), never on a hit. */
+    record IncrResult(long value, Long ttlSeconds) {}
+
+    IncrResult incr(byte[] namespace, byte[] key, long delta) {
+        Response response = request(tag -> frame(
+                "i " + namespace.length + " " + key.length + " " + delta + tagSuffix(tag) + "\n",
+                namespace, key, null));
+        return switch (response.marker) {
+            case 'I' -> new IncrResult(parseCounterValue(response.value), response.ttlSeconds);
+            case 'N' -> null;
+            case 'T' -> throw new NanocachedException.NotNumeric();
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
+    /** Parses an {@code I} response's value body — decimal ASCII, the
+     * same grammar as {@code delta} (see {@link #incr}) — back to a
+     * {@code long}. A non-canonical body is protocol garbage: the
+     * connection is desynced mid-frame and must be poisoned, exactly like
+     * {@link #readResponse}'s own malformed-length checks (this one runs
+     * on the caller's thread rather than the reader thread, so — unlike
+     * those — it must poison explicitly rather than rely on {@link
+     * #readLoop}'s catch). */
+    private long parseCounterValue(byte[] value) {
+        try {
+            return Long.parseLong(new String(value, StandardCharsets.US_ASCII));
+        } catch (NumberFormatException malformed) {
+            NanocachedException error = new NanocachedException.ConnectionFailed(
+                    "nanocached: invalid INCR value in response (connection desynced)", null);
+            poison(error);
+            throw error;
+        }
+    }
+
     // Echoed response tags: on a tagged-mode connection every request header carries
     // the client's tag as its last field, and the server echoes it in the
     // response — `tag == null` is the untagged (pre-0019) form, which
@@ -372,7 +422,10 @@ final class Connection {
         return frame;
     }
 
-    private record Response(int marker, byte[] value, int tag) {}
+    /** {@code ttlSeconds} is only ever non-null for an {@code I} response
+     * that carried one (issue #129) — every other marker leaves it {@code
+     * null}. */
+    private record Response(int marker, byte[] value, int tag, Long ttlSeconds) {}
 
     /** A pending request's future paired with the tag its response must
      * echo (echoed response tags) — meaningless (and never compared) on an untagged
@@ -624,13 +677,53 @@ final class Connection {
                             "nanocached: invalid value length in response", null);
                 }
                 int tag = tagged ? parseTag(fields[1]) : -1;
-                return new Response(marker, readExactly(length), tag);
+                return new Response(marker, readExactly(length), tag, null);
+            }
+            // 'I' is INCR's (issue #129) hit reply: `I <value-length>
+            // [<ttl-seconds>] [<tag>]`. The ttl field is optional exactly
+            // like S's own trailing TTL is on the request side —
+            // disambiguated purely by whether this connection is tagged,
+            // never guessed frame by frame: untagged, 1 field means no
+            // ttl and 2 means ttl present; tagged, 1 means just the tag
+            // and 2 means ttl-then-tag.
+            case 'I' -> {
+                String[] fields = readLine().split(" ");
+                int fieldsWithoutTtl = tagged ? 2 : 1;
+                int fieldsWithTtl = tagged ? 3 : 2;
+                if (fields.length != fieldsWithoutTtl && fields.length != fieldsWithTtl) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid incr value header in response", null);
+                }
+                int length;
+                try {
+                    length = Integer.parseInt(fields[0]);
+                } catch (NumberFormatException malformed) {
+                    length = -1;
+                }
+                if (length < 0 || length > MAX_VALUE_LENGTH) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid value length in response", null);
+                }
+                Long ttlSeconds = null;
+                if (fields.length == fieldsWithTtl) {
+                    try {
+                        ttlSeconds = Long.parseLong(fields[1]);
+                    } catch (NumberFormatException malformed) {
+                        ttlSeconds = null;
+                    }
+                    if (ttlSeconds == null || ttlSeconds < 0) {
+                        throw new NanocachedException.ConnectionFailed(
+                                "nanocached: invalid ttl in response", null);
+                    }
+                }
+                int tag = tagged ? parseTag(fields[fields.length - 1]) : -1;
+                return new Response(marker, readExactly(length), tag, ttlSeconds);
             }
             // Busy is always bare (echoed response tags): it's an unsolicited
             // pre-auth response, never an answer to a tagged request.
             case 'B' -> {
                 expectLf(); // the trailing '\n'
-                return new Response(marker, null, -1);
+                return new Response(marker, null, -1, null);
             }
             // 'C' is CLEAR namespace / flush everything's (issue #106) only
             // reply — same bare-or-tagged shape as S/D/N/W. 'R' (issue
@@ -638,13 +731,14 @@ final class Connection {
             // command (G/S/D/g/s/d/c/F this connection sends) and shares
             // that exact bare-or-tagged shape too: `R\n` untagged, `R
             // <tag>\n` tagged — request() intercepts it before any caller
-            // ever sees it.
-            case 'S', 'D', 'N', 'W', 'C', 'R' -> {
+            // ever sees it. 'T' is INCR's (issue #129) non-numeric-value
+            // reply — same bare-or-tagged shape too.
+            case 'S', 'D', 'N', 'W', 'C', 'R', 'T' -> {
                 if (!tagged) {
                     expectLf(); // the trailing '\n'
-                    return new Response(marker, null, -1);
+                    return new Response(marker, null, -1, null);
                 }
-                return new Response(marker, null, parseTag(readLine()));
+                return new Response(marker, null, parseTag(readLine()), null);
             }
             default -> throw new NanocachedException.ConnectionFailed(
                     "nanocached: unexpected response from server: " + (char) marker, null);

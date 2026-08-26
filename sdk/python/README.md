@@ -147,6 +147,35 @@ naming the node that still failed. Both are idempotent, so a caller can
 simply retry a raised error, and both raise `AlreadyClosedError` after
 `close()` like every other operation.
 
+## Counters (incr/decr)
+
+`incr`/`decr` atomically add (or subtract) an integer delta to a key and
+return the new value:
+
+```python
+await client.set("visits", "0")
+await client.incr("visits")        # 1
+await client.incr("visits", 5)     # 6
+await client.decr("visits", 2)     # 4 — decr(key, n) is just incr(key, -n);
+                                    # it never sends a separate wire op
+print(await client.incr("missing"))         # None — same miss convention as get()
+```
+
+`Namespace` has the same pair, scoped like its other operations. A miss
+returns `None`, matching `get()`; a key whose stored value isn't an
+integer INCR can operate on (or where applying the delta would overflow a
+signed 64-bit integer) raises `NotNumericError`.
+
+A counter is exactly as volatile as any other entry: LRU eviction and TTL
+expiry reclaim it like a plain `set`, so this is a fit for rate limiting
+and approximate counters, not durable counts (billing, inventory).
+
+In a cluster, only the primary owner actually runs the increment; its
+result is then forwarded to the remaining owners as an ordinary `set`
+rather than replaying the increment on them, so a replica can never drift
+onto a value the primary doesn't itself hold (e.g. from an earlier
+dropped replica write, or the replica separately evicting the key).
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to
@@ -256,6 +285,9 @@ subclass — catch that one class when you don't care which:
   single-node mode, where there is no discovery to refresh from.
 - `DiscoveryBusyError` — a discovery server is warming up after a
   restart. Try another address, or retry shortly.
+- `NotNumericError` — `incr`/`decr` found a stored value that isn't an
+  integer INCR can operate on, or applying the delta would overflow a
+  signed 64-bit integer (see Counters (incr/decr)).
 - `RetryableError` — a request was answered the retryable-error status
   `R` three times running. `R` means the request itself failed
   transiently — today, `nanocached-proxy` sends it when its upstream

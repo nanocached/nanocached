@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 
 namespace Nanocached;
@@ -7,9 +8,10 @@ namespace Nanocached;
 /// <summary>
 /// One already-identified connection to a single nanocached-node, speaking
 /// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c>, their namespaced
-/// counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — and the
+/// counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — the
 /// namespace-clear/flush-everything commands <c>c</c>/<c>F</c> — issue
-/// #106 — the <c>A</c> identify exchange happens in <see cref="Identify"/>
+/// #106 — and the always-namespaced counter op <c>i</c> — issue #129 —
+/// the <c>A</c> identify exchange happens in <see cref="Identify"/>
 /// before a Connection exists).
 /// Requests are pipelined onto the socket and matched to responses in send
 /// order (request pipelining): a dedicated read loop, started in the
@@ -87,7 +89,7 @@ internal sealed class Connection
     // _writeGate critical section — never touched concurrently, so no
     // Interlocked ceremony is needed here the way _closedFlag needs one.
     private uint _nextTag;
-    private readonly ConcurrentQueue<(TaskCompletionSource<(byte Marker, byte[]? Value)> Tcs, uint? Tag)> _pending = new();
+    private readonly ConcurrentQueue<(TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds)> Tcs, uint? Tag)> _pending = new();
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
     private readonly Action? _onClosed;
     // 0 = open, 1 = closed. An int (not a bool) so Close() can gate on it
@@ -244,7 +246,7 @@ internal sealed class Connection
     /// namespace bytes ahead of the key.</summary>
     internal async Task<byte[]?> GetAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, value) = await RequestAsync(tag =>
+        var (marker, value, _) = await RequestAsync(tag =>
             Frame(GetHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
@@ -266,7 +268,7 @@ internal sealed class Connection
     /// doc comment for the legacy-vs-namespaced frame rule.</summary>
     internal async Task SetAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds)
     {
-        var (marker, _) = await RequestAsync(tag =>
+        var (marker, _, _) = await RequestAsync(tag =>
             Frame(SetHeader(namespaceBytes, key.Length, value.Length, ttlSeconds, tag), namespaceBytes, key, value))
             .ConfigureAwait(false);
         if (marker == (byte)'W') throw new WrongNodeException();
@@ -280,7 +282,7 @@ internal sealed class Connection
     /// doc comment for the legacy-vs-namespaced frame rule.</summary>
     internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, _) = await RequestAsync(tag =>
+        var (marker, _, _) = await RequestAsync(tag =>
             Frame(DeleteHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
@@ -306,7 +308,7 @@ internal sealed class Connection
     /// to.</summary>
     internal async Task ClearAsync(byte[] namespaceBytes)
     {
-        var (marker, _) = await RequestAsync(tag =>
+        var (marker, _, _) = await RequestAsync(tag =>
             Frame(ClearHeader(namespaceBytes, tag), namespaceBytes, EmptyNamespace, null))
             .ConfigureAwait(false);
         if (marker != (byte)'C') throw Mismatch(marker);
@@ -317,10 +319,55 @@ internal sealed class Connection
     /// doc comment for the shared <c>C</c>-ack/no-<c>W</c> rules.</summary>
     internal async Task ClearAllAsync()
     {
-        var (marker, _) = await RequestAsync(tag =>
+        var (marker, _, _) = await RequestAsync(tag =>
             Encoding.ASCII.GetBytes($"F{TagField(tag)}\n"))
             .ConfigureAwait(false);
         if (marker != (byte)'C') throw Mismatch(marker);
+    }
+
+    /// <summary>issue #129 — the always-namespaced counter op: increments
+    /// (a negative <paramref name="delta"/> decrements — there is no
+    /// separate decrement opcode) the counter stored at (<paramref
+    /// name="namespaceBytes"/>, <paramref name="key"/>) and returns its new
+    /// value plus, when the entry carries a TTL, its remaining seconds —
+    /// or <c>null</c> when the key is missing or expired, the same
+    /// not-found convention <see cref="GetAsync(byte[], byte[])"/> uses.
+    /// Throws <see cref="NotNumericException"/> when the stored value isn't
+    /// INCR's counter grammar or applying the delta would overflow a
+    /// signed 64-bit integer (<c>T</c>). Unlike <c>G</c>/<c>S</c>/<c>D</c>,
+    /// <c>i</c> has no legacy uppercase form — every request always carries
+    /// an explicit (possibly zero) namespace length.
+    ///
+    /// <para>Cluster replication (issue #129's design note): this method
+    /// only ever talks to the ONE node this connection is dialed to — it
+    /// has no notion of owners or replicas. It is <see cref="NanocachedClient"/>'s
+    /// job to call this against the primary owner only, and — on success —
+    /// forward the literal resulting value to the replicas via this same
+    /// connection's <see cref="SetAsync(byte[], byte[], byte[], long)"/>,
+    /// never by sending <c>i</c> to a replica (which could let a replica's
+    /// counter drift from the primary's).</para></summary>
+    internal async Task<(long Value, long TtlSeconds)?> IncrAsync(byte[] namespaceBytes, byte[] key, long delta)
+    {
+        var (marker, value, ttlSeconds) = await RequestAsync(tag =>
+            Frame(IncrHeader(namespaceBytes, key.Length, delta, tag), namespaceBytes, key, null))
+            .ConfigureAwait(false);
+        switch (marker)
+        {
+            case (byte)'I':
+                if (!long.TryParse(Encoding.ASCII.GetString(value!), out long newValue))
+                {
+                    throw new ConnectionLostException("nanocached: invalid incr value in response");
+                }
+                return (newValue, ttlSeconds);
+            case (byte)'N':
+                return null;
+            case (byte)'T':
+                throw new NotNumericException();
+            case (byte)'W':
+                throw new WrongNodeException();
+            default:
+                throw Mismatch(marker);
+        }
     }
 
     /// <summary>issue #105: <c>g &lt;ns-len&gt; &lt;key-len&gt;[ &lt;tag&gt;]\n</c>
@@ -357,6 +404,17 @@ internal sealed class Connection
     /// namespaces).</summary>
     private static string ClearHeader(byte[] namespaceBytes, uint? tag) =>
         $"c {namespaceBytes.Length}{TagField(tag)}\n";
+
+    /// <summary>issue #129: <c>i &lt;ns-len&gt; &lt;key-len&gt; &lt;delta&gt;[ &lt;tag&gt;]\n</c> —
+    /// always lowercase and always namespaced (0 addresses the default
+    /// namespace), since <c>i</c> postdates namespaces and has no legacy
+    /// uppercase form. <paramref name="delta"/> is emitted via
+    /// <see cref="CultureInfo.InvariantCulture"/> so its wire form is
+    /// always the canonical signed-decimal grammar the server expects
+    /// (optional leading <c>-</c>, no leading zeros, no <c>+</c>), never a
+    /// locale-dependent one.</summary>
+    private static string IncrHeader(byte[] namespaceBytes, int keyLength, long delta, uint? tag) =>
+        $"i {namespaceBytes.Length} {keyLength} {delta.ToString(CultureInfo.InvariantCulture)}{TagField(tag)}\n";
 
     /// <summary>issue #105: <paramref name="namespaceBytes"/> leads the
     /// body, ahead of the key (and, for a Set, the value) — empty for
@@ -436,11 +494,11 @@ internal sealed class Connection
     /// attempt, so a tagged connection claims a fresh tag per attempt —
     /// see <see cref="SendOnceAsync"/>'s own doc comment for what it does
     /// with it.</summary>
-    private async Task<(byte Marker, byte[]? Value)> RequestAsync(Func<uint?, byte[]> buildFrame)
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds)> RequestAsync(Func<uint?, byte[]> buildFrame)
     {
         for (int attempt = 1; ; attempt++)
         {
-            (byte Marker, byte[]? Value) response = await SendOnceAsync(buildFrame).ConfigureAwait(false);
+            (byte Marker, byte[]? Value, long TtlSeconds) response = await SendOnceAsync(buildFrame).ConfigureAwait(false);
             if (response.Marker != (byte)'R')
             {
                 return response;
@@ -479,14 +537,14 @@ internal sealed class Connection
     /// before anything is enqueued — an encoder that rejects its input
     /// must fail with nothing queued, or the next response would resolve
     /// an orphaned waiter and desync the stream (echoed response tags).</param>
-    private async Task<(byte Marker, byte[]? Value)> SendOnceAsync(Func<uint?, byte[]> buildFrame)
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds)> SendOnceAsync(Func<uint?, byte[]> buildFrame)
     {
         if (IsClosed)
         {
             throw new ConnectionLostException("nanocached: connection is closed");
         }
 
-        var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value)>(
+        var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds)>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         await _writeGate.WaitAsync().ConfigureAwait(false);
@@ -549,7 +607,7 @@ internal sealed class Connection
     {
         while (true)
         {
-            (byte Marker, byte[]? Value, uint? Tag) response;
+            (byte Marker, byte[]? Value, long TtlSeconds, uint? Tag) response;
             try
             {
                 response = await ReadResponseAsync().ConfigureAwait(false);
@@ -659,11 +717,11 @@ internal sealed class Connection
                 return;
             }
 
-            pending.Tcs.TrySetResult((response.Marker, response.Value));
+            pending.Tcs.TrySetResult((response.Marker, response.Value, response.TtlSeconds));
         }
     }
 
-    private async Task<(byte Marker, byte[]? Value, uint? Tag)> ReadResponseAsync()
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, uint? Tag)> ReadResponseAsync()
     {
         byte marker = await ReadByteAsync().ConfigureAwait(false);
         switch (marker)
@@ -690,7 +748,44 @@ internal sealed class Connection
 
                 var value = new byte[length];
                 await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
-                return (marker, value, tag);
+                return (marker, value, 0, tag);
+            }
+            case (byte)'I':
+            {
+                // issue #129: untagged `I <len>` or `I <len> <ttl>`;
+                // tagged `I <len> <tag>` (no ttl) or `I <len> <ttl> <tag>`
+                // — disambiguated purely by whether this connection is
+                // tagged, exactly like S's own optional trailing ttl field
+                // on the request side: on an untagged connection 0 fields
+                // past <len> means no ttl, 1 means ttl present; on a
+                // tagged connection 1 field past <len> means "just the
+                // tag", 2 means "ttl then tag".
+                string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
+                int bareFields = _tagged ? 2 : 1;
+                int ttlFields = bareFields + 1;
+                if (fields.Length != bareFields && fields.Length != ttlFields)
+                {
+                    throw new ConnectionLostException("nanocached: invalid incr header in response");
+                }
+
+                if (!int.TryParse(fields[0], out int length) || length < 0 || length > MaxValueLength)
+                {
+                    throw new ConnectionLostException("nanocached: invalid value length in response");
+                }
+
+                long ttlSeconds = 0;
+                if (fields.Length == ttlFields)
+                {
+                    if (!long.TryParse(fields[1], out ttlSeconds) || ttlSeconds < 0)
+                    {
+                        throw new ConnectionLostException("nanocached: invalid ttl in incr response");
+                    }
+                }
+                uint? tag = _tagged ? ParseTag(fields[^1]) : null;
+
+                var value = new byte[length];
+                await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
+                return (marker, value, ttlSeconds, tag);
             }
             case (byte)'S':
             case (byte)'D':
@@ -698,11 +793,12 @@ internal sealed class Connection
             case (byte)'W':
             case (byte)'C': // issue #106: same fixed shape as S/D/N/W.
             case (byte)'R': // issue #125: same fixed shape — retryable-error status; RequestAsync retries this transparently before it can ever reach a caller.
+            case (byte)'T': // issue #129: same fixed shape — INCR's stored value isn't its counter grammar, or the delta would overflow.
             {
                 if (!_tagged)
                 {
                     await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
-                    return (marker, null, null);
+                    return (marker, null, 0, null);
                 }
 
                 // Tagged: `<marker> <tag>\n` — a byte other than the
@@ -718,13 +814,13 @@ internal sealed class Connection
                         "nanocached: response is missing its tag (connection desynced)");
                 }
                 uint tag = ParseTag(await ReadLineAsync().ConfigureAwait(false));
-                return (marker, null, tag);
+                return (marker, null, 0, tag);
             }
             case (byte)'B':
                 // Busy is unsolicited and always bare (echoed response tags) — never
                 // tagged, even on a tagged connection.
                 await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
-                return (marker, null, null);
+                return (marker, null, 0, null);
             default:
                 // A garbage marker means the stream is desynced; poison
                 // and classify as connection-level (issue #8) so the

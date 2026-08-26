@@ -116,6 +116,37 @@ tenant.clear();      // just "tenant-a"
 client.clearAll();   // every namespace, including the default one
 ```
 
+## Counters (`incr`/`decr`)
+
+`client.incr(key, delta)` atomically adds `delta` (a signed `long` — a
+negative delta decrements) to the numeric value stored at `key`,
+returning the new value; `client.decr(key, amount)` is the same op with
+the amount negated — there is no separate decrement opcode on the wire.
+Both default to `1` when called with no delta/amount. A missing key
+returns `OptionalLong.empty()` (this INCR never auto-vivifies a counter
+the way some other systems' does); a key whose stored value isn't a
+plain decimal integer, or whose result would overflow a 64-bit counter,
+throws `NanocachedException.NotNumeric`. Both exist on
+`client.namespace(ns)` handles too, scoped exactly like `get`/`set`.
+
+```java
+client.set("hits", "0");
+client.incr("hits");         // 1
+client.incr("hits", 9);      // 10
+client.decr("hits", 4);      // 6
+```
+
+**A counter is exactly as volatile as `set`** — LRU eviction and TTL
+expiry reclaim it like any other entry. Good for rate limiting and
+approximate counters; not for durable counts (billing, inventory, or
+anything you can't afford to silently lose to eviction).
+
+In a cluster, only the primary owner runs the increment; the replicas
+receive the primary's literal resulting value (and TTL) as an ordinary
+`set` rather than replaying the increment themselves, so a replica that
+missed an earlier write or independently evicted the key still converges
+to the exact same bytes as the primary instead of drifting from it.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

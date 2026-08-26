@@ -7,6 +7,7 @@ import {
   encodeClearAll,
   encodeDelete,
   encodeGet,
+  encodeIncr,
   encodeSet,
   MAX_RESPONSE_FRAME_LENGTH,
   tryParseResponse,
@@ -89,6 +90,18 @@ export class RetryableError extends NanocachedError {
   constructor() {
     super("nanocached: request failed transiently and was not accepted after retrying (connection is still usable)");
     this.name = "RetryableError";
+  }
+}
+
+/** Thrown by incr/decr (issue #129) when the key exists but its stored
+ * value isn't INCR's counter grammar, or applying `<delta>` would overflow
+ * the representable range — the server answers `T` for either case, since
+ * the client has no way to tell which apart without the raw stored value
+ * itself. */
+export class NotNumericError extends NanocachedError {
+  constructor() {
+    super("nanocached: the stored value is not an integer INCR can operate on");
+    this.name = "NotNumericError";
   }
 }
 
@@ -178,6 +191,30 @@ export class Connection {
     const response = await this.send((tag) => encodeDelete(toBytes(key), tag, namespace));
     if (response.kind === "deleted") return true;
     if (response.kind === "notFound") return false;
+    if (response.kind === "wrongNode") throw new WrongNodeError();
+    throw this.mismatch(response);
+  }
+
+  /** INCR/DECR (issue #129): applies `delta` (signed) to `key`'s stored
+   * counter, always namespaced on the wire (unlike get/set/delete, `i` has
+   * no separate uppercase legacy form — namespace-length 0 addresses the
+   * default namespace, matching `namespace`'s own default here). Returns
+   * `null` on a miss, matching `get`'s own miss convention; throws
+   * `NotNumericError` when the stored value isn't INCR's counter grammar
+   * (or applying `delta` would overflow). The returned `value` is the new
+   * counter, decimal-parsed; `ttlSeconds` is the entry's remaining TTL,
+   * present only when it has one. This is the single-node primitive only —
+   * `NanocachedClient` is what turns a successful primary increment into a
+   * cluster-wide, drift-free write by forwarding the literal result to
+   * replicas as an ordinary `set`, never replaying `i` there (see its own
+   * doc comment). */
+  async incr(key: string | Uint8Array, delta: number, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<{ value: number; ttlSeconds?: number } | null> {
+    const response = await this.send((tag) => encodeIncr(toBytes(key), delta, tag, namespace));
+    if (response.kind === "incremented") {
+      return { value: Number((response.value ?? Buffer.alloc(0)).toString("ascii")), ttlSeconds: response.ttlSeconds };
+    }
+    if (response.kind === "notFound") return null;
+    if (response.kind === "notNumeric") throw new NotNumericError();
     if (response.kind === "wrongNode") throw new WrongNodeError();
     throw this.mismatch(response);
   }

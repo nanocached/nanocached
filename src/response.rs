@@ -3,6 +3,17 @@ use crate::key::Key;
 use bytes::Bytes;
 use std::time::Duration;
 
+/// Issue #129: `Response::Incremented`'s optional `<ttl-seconds>` header
+/// field — a leading space plus the whole-seconds count when `ttl` is
+/// `Some`, or nothing at all when it's `None` (same "present field or no
+/// field" shape `S`'s own optional TTL field uses on the request side).
+/// Whole seconds, rounded down — matches every other TTL this protocol
+/// forwards (see `set_message`'s own rounding in `src/server.rs`).
+fn ttl_field(ttl: Option<Duration>) -> String {
+    ttl.map(|ttl| format!(" {}", ttl.as_secs()))
+        .unwrap_or_default()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     Value(Bytes),
@@ -50,6 +61,28 @@ pub enum Response {
     /// In answer to `c`/`F` (issue #106): how many entries were dropped
     /// — informational, the wire form is a bare `C`.
     Cleared(usize),
+    /// In answer to `Incr` (issue #129): the counter's new value plus its
+    /// entry's remaining TTL, if it has one. Wire form:
+    /// `I <value-length> [ttl-seconds] [tag]\n<value>` — a dedicated
+    /// marker (not `V`) because, unlike `Value`, the TTL genuinely has to
+    /// be on the wire: an SDK or the proxy fanning the *result* of a
+    /// successful INCR out to replicas (client-side replication — see
+    /// `src/server.rs`'s `Incr` connection handler for the node-local
+    /// mirror of the same "forward the result, never the op itself"
+    /// rule) only ever sees wire bytes, and would otherwise silently
+    /// strip the counter's TTL on every replica. The optional TTL field
+    /// follows `S`'s own `[ttl] [tag]` idiom: a present-but-unlabeled
+    /// trailing field, disambiguated only by the connection's
+    /// already-known tagged-or-not mode, never guessed frame by frame.
+    /// TTL rounds down to whole seconds, same as every other TTL this
+    /// protocol forwards.
+    Incremented(Bytes, Option<Duration>),
+    /// In answer to `Incr` (issue #129) when the key exists but its
+    /// stored value isn't INCR's decimal-ASCII `i64` grammar, or applying
+    /// `delta` would overflow `i64`. Deliberately distinct from
+    /// `NotFound`, so a caller (e.g. the Django adapter's `incr`/`decr`)
+    /// can tell "no such key" from "wrong type" apart.
+    NotNumeric,
     /// Internal-only (staged node join), in answer to `Command::PeekEntry` — zero
     /// or one entry, each with its remaining TTL. Never encoded for a wire
     /// client, see `encode`.
@@ -86,6 +119,7 @@ impl Response {
             Self::MigrationCancelled => b"A\n".to_vec(),
             Self::WrongNode => b"W\n".to_vec(),
             Self::Cleared(_) => b"C\n".to_vec(),
+            Self::NotNumeric => b"T\n".to_vec(),
 
             Self::Value(value) => {
                 let length = value.len().to_string();
@@ -95,6 +129,16 @@ impl Response {
                 encoded.extend_from_slice(b"V ");
                 encoded.extend_from_slice(length.as_bytes());
                 encoded.push(b'\n');
+                encoded.extend_from_slice(value);
+
+                encoded
+            }
+
+            Self::Incremented(value, ttl) => {
+                let header = format!("I {}{}\n", value.len(), ttl_field(*ttl));
+
+                let mut encoded = Vec::with_capacity(header.len() + value.len());
+                encoded.extend_from_slice(header.as_bytes());
                 encoded.extend_from_slice(value);
 
                 encoded
@@ -126,6 +170,7 @@ impl Response {
             Self::NotFound => format!("N {tag}\n").into_bytes(),
             Self::WrongNode => format!("W {tag}\n").into_bytes(),
             Self::Cleared(_) => format!("C {tag}\n").into_bytes(),
+            Self::NotNumeric => format!("T {tag}\n").into_bytes(),
 
             Self::Value(value) => {
                 let header = format!("V {} {tag}\n", value.len());
@@ -137,7 +182,17 @@ impl Response {
                 encoded
             }
 
-            _ => unreachable!("only G/S/D responses have a tagged form (echoed response tags)"),
+            Self::Incremented(value, ttl) => {
+                let header = format!("I {}{} {tag}\n", value.len(), ttl_field(*ttl));
+
+                let mut encoded = Vec::with_capacity(header.len() + value.len());
+                encoded.extend_from_slice(header.as_bytes());
+                encoded.extend_from_slice(value);
+
+                encoded
+            }
+
+            _ => unreachable!("only G/S/D/i responses have a tagged form (echoed response tags)"),
         }
     }
 
@@ -224,6 +279,37 @@ mod tests {
         let response = Response::Value(Bytes::from(vec![0xff, 0x00, b'\r', b'\n']));
 
         assert_eq!(response.encode(), b"V 4\n\xff\x00\r\n",);
+    }
+
+    #[test]
+    fn encodes_incremented_response_without_a_ttl() {
+        let response = Response::Incremented(Bytes::from_static(b"11"), None);
+
+        assert_eq!(response.encode(), b"I 2\n11");
+        assert_eq!(response.encode_with_tag(4), b"I 2 4\n11");
+    }
+
+    #[test]
+    fn encodes_incremented_response_with_a_ttl() {
+        let response =
+            Response::Incremented(Bytes::from_static(b"11"), Some(Duration::from_secs(60)));
+
+        assert_eq!(response.encode(), b"I 2 60\n11");
+        assert_eq!(response.encode_with_tag(4), b"I 2 60 4\n11");
+    }
+
+    #[test]
+    fn encodes_incremented_response_rounds_a_sub_second_ttl_down() {
+        let response =
+            Response::Incremented(Bytes::from_static(b"11"), Some(Duration::from_millis(1500)));
+
+        assert_eq!(response.encode(), b"I 2 1\n11");
+    }
+
+    #[test]
+    fn encodes_not_numeric_response() {
+        assert_eq!(Response::NotNumeric.encode(), b"T\n");
+        assert_eq!(Response::NotNumeric.encode_with_tag(2), b"T 2\n");
     }
 
     #[test]

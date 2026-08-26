@@ -58,6 +58,11 @@ export interface MockNode extends MockServerBase {
   connectionCount(): number;
   /** How many `G` requests this server has ever received. */
   getCount(): number;
+  /** How many `i` (INCR, issue #129) requests this server has ever
+   * received — the critical assertion for cluster-replication tests: a
+   * replica must receive a `set`/`s` carrying the primary's literal
+   * result, and must NEVER receive an `i` frame at all. */
+  incrCount(): number;
   /** How many `c`/`F` (clear/flush, issue #106) requests this server has
    * ever received — lets a test assert a clear fanned out to every node,
    * even one holding no keys in the cleared namespace. */
@@ -231,6 +236,24 @@ export async function startMockNode(
     }
     return existing;
   }
+  // INCR (issue #129): the TTL a key was last `S`/`s`'d (or successfully
+  // `i`'d) with, so a later `i` response can carry a real "remaining TTL"
+  // field — needed for the SDK's client-side replication driver, which
+  // forwards INCR's literal result to replicas as a `set` carrying this
+  // same TTL (never replays `i` there). Mirrors `store`/`namespaceStores`'
+  // own default-vs-named-namespace split; absence (or 0) means no TTL.
+  const ttls = new Map<string, number>();
+  const namespaceTtls = new Map<string, Map<string, number>>();
+  function ttlsFor(namespace: Buffer): Map<string, number> {
+    if (namespace.length === 0) return ttls;
+    const key = namespace.toString("base64");
+    let existing = namespaceTtls.get(key);
+    if (existing === undefined) {
+      existing = new Map();
+      namespaceTtls.set(key, existing);
+    }
+    return existing;
+  }
   let wrongNodeReplies = 0;
   let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
@@ -241,6 +264,7 @@ export async function startMockNode(
   let storedToGetReplies = 0;
   let connections = 0;
   let gets = 0;
+  let incrs = 0;
   let clears = 0;
   let failClearReplies = 0;
   let setDelayMs = 0;
@@ -451,6 +475,10 @@ export async function startMockNode(
             }
 
             storeFor(namespace).set(key, value);
+            // INCR (issue #129): remember this key's TTL so a later `i`
+            // response can report a real "remaining TTL" — see ttlsFor.
+            if (lastSetTtl > 0) ttlsFor(namespace).set(key, lastSetTtl);
+            else ttlsFor(namespace).delete(key);
             if (setDelayMs > 0) {
               setTimeout(() => socket.write(`S${tag}\n`), setDelayMs);
             } else {
@@ -484,7 +512,60 @@ export async function startMockNode(
               break;
             }
 
-            socket.write(storeFor(namespace).delete(key) ? `D${tag}\n` : `N${tag}\n`);
+            const deleted = storeFor(namespace).delete(key);
+            ttlsFor(namespace).delete(key);
+            socket.write(deleted ? `D${tag}\n` : `N${tag}\n`);
+            break;
+          }
+
+          case "i": {
+            // INCR/DECR (issue #129): `i <namespace-length> <key-length>
+            // <delta> [tag]\n<namespace><key>` — always namespaced, unlike
+            // G/S/D, so there's no offset/namespaced branch here (see
+            // encodeIncr).
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const keyLength = Number(parts[2]);
+            const delta = Number(parts[3]);
+            if (buffer.length < bodyStart + namespaceLength + keyLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
+            incrs++;
+
+            if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            if (wrongNodeReplies > 0) {
+              wrongNodeReplies--;
+              socket.write(`W${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            const existing = targetStore.get(key);
+            if (existing === undefined) {
+              socket.write(`N${tag}\n`);
+              break;
+            }
+
+            const existingText = existing.toString("ascii");
+            if (!/^-?\d+$/.test(existingText)) {
+              socket.write(`T${tag}\n`);
+              break;
+            }
+
+            const newValueBytes = Buffer.from(String(Number(existingText) + delta), "ascii");
+            targetStore.set(key, newValueBytes);
+
+            const ttlSeconds = ttlsFor(namespace).get(key) ?? 0;
+            const ttlField = ttlSeconds > 0 ? ` ${ttlSeconds}` : "";
+            socket.write(Buffer.concat([Buffer.from(`I ${newValueBytes.length}${ttlField}${tag}\n`), newValueBytes]));
             break;
           }
 
@@ -515,6 +596,7 @@ export async function startMockNode(
             }
 
             storeFor(namespace).clear();
+            ttlsFor(namespace).clear();
             socket.write(`C${tag}\n`);
             break;
           }
@@ -542,6 +624,8 @@ export async function startMockNode(
 
             store.clear();
             namespaceStores.clear();
+            ttls.clear();
+            namespaceTtls.clear();
             socket.write(`C${tag}\n`);
             break;
           }
@@ -590,6 +674,7 @@ export async function startMockNode(
     },
     connectionCount: () => connections,
     getCount: () => gets,
+    incrCount: () => incrs,
     clearCount: () => clears,
     failClearOnce: () => {
       failClearReplies++;

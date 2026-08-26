@@ -67,13 +67,15 @@ const MAX_HEADER_LINE_LENGTH: usize = 4 * 1024;
 #[doc(hidden)]
 pub static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 
-/// A raw response marker byte plus its value bytes (`V` only) — what the
-/// read task parses off the wire, before `get`/`set`/`delete` convert it
-/// into a [`ResponseKind`] or a `WrongNode`/protocol error. The echoed
-/// tag (echoed response tags), when present, is verified against the pending slot's
+/// A raw response marker byte, its value bytes (`V`/`I` only), and —
+/// `I` only (issue #129) — the entry's remaining TTL in seconds, if the
+/// response carried one. What the read task parses off the wire, before
+/// `get`/`set`/`delete`/`incr` convert it into a [`ResponseKind`] or a
+/// `WrongNode`/`NotNumeric`/protocol error. The echoed tag (echoed
+/// response tags), when present, is verified against the pending slot's
 /// expected tag by the read loop itself and never reaches this type — see
 /// `WireResponse`.
-type RawResponse = (u8, Option<Vec<u8>>);
+type RawResponse = (u8, Option<Vec<u8>>, Option<u64>);
 type RawResponseSender = oneshot::Sender<Result<RawResponse>>;
 
 /// A pending request's queue slot: the sender its response ultimately
@@ -160,6 +162,13 @@ pub(crate) enum ResponseKind {
     /// is no `NotFound`/`W` counterpart to distinguish (clearing an
     /// already-empty namespace still acks `C`).
     Cleared,
+    /// `I` — issue #129's `incr`/`decr` ack: the entry's new counter
+    /// value, plus its remaining TTL in seconds when it has one (mirrors
+    /// `S`'s own optional TTL field, just on the response side). The
+    /// key-missing (`N`) and not-numeric (`T`) outcomes are surfaced as
+    /// [`ResponseKind::NotFound`] and [`Error::NotNumeric`] respectively,
+    /// not as variants here — see `Connection::incr`.
+    Incr(i64, Option<u64>),
 }
 
 /// RAII guard around the write half of a round trip: if the enclosing
@@ -348,6 +357,37 @@ impl Connection {
         }
     }
 
+    /// Sends `i` (issue #129) to this one node only, and returns the new
+    /// counter value plus its remaining TTL (if any) — `None` on a
+    /// key-missing `N`, or `Err(Error::NotNumeric)` (propagated by `?` off
+    /// `request`) on a not-numeric/overflow `T`. `namespace` empty means
+    /// the default namespace, exactly like `get`/`set`/`delete` — but
+    /// unlike those, `i` has no legacy uppercase form; even the default
+    /// namespace goes out namespaced (see `encode_incr`).
+    ///
+    /// Deliberately dumb: this alone never fans anything out to replicas.
+    /// Cluster replication of the result — forwarding the literal new
+    /// value to the remaining owners as an ordinary `set`, never replaying
+    /// `i` on them — is [`crate::client::NanocachedClient`]'s job (see its
+    /// `incr_in`), precisely because replaying the increment on a replica
+    /// could let it drift from the primary (a dropped earlier replica
+    /// write, an independent eviction) instead of staying byte-identical.
+    pub(crate) async fn incr(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        delta: i64,
+    ) -> Result<Option<(i64, Option<u64>)>> {
+        match self
+            .request(|tag| encode_incr(namespace, key, delta, tag))
+            .await?
+        {
+            ResponseKind::Incr(value, ttl_seconds) => Ok(Some((value, ttl_seconds))),
+            ResponseKind::NotFound => Ok(None),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
     /// Wraps `request_uncapped` in `REQUEST_TIMEOUT_MS`: if the whole
     /// round trip hasn't completed by then, the server is presumed dead
     /// (a half-open server that accepts but never answers looks
@@ -513,6 +553,7 @@ impl Connection {
             ResponseKind::Stored => "stored",
             ResponseKind::Deleted => "deleted",
             ResponseKind::Cleared => "cleared",
+            ResponseKind::Incr(_, _) => "incr",
         };
         self.close();
         Error::ConnectionLost(format!(
@@ -644,6 +685,26 @@ fn encode_clear_all(tag: Option<u32>) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Builds an `i` frame (issue #129): `i <namespace-length> <key-length>
+/// <delta>[ <tag>]\n<namespace><key>`. Unlike `encode_get`/`encode_set`/
+/// `encode_delete`, there is no legacy uppercase form to preserve — `incr`
+/// is new as of #129, so even the default (empty) namespace goes out
+/// namespaced rather than switching command letters (mirrors
+/// `encode_clear`'s own no-legacy-form rule, issue #106). `delta` is
+/// always emitted in its canonical signed-decimal form — `i64::to_string()`
+/// (which `{delta}` uses via `Display`) already produces exactly that: an
+/// optional leading `-`, no leading zeros, no `+`.
+fn encode_incr(namespace: &[u8], key: &[u8], delta: i64, tag: Option<u32>) -> Vec<u8> {
+    let mut frame = match tag {
+        Some(tag) => format!("i {} {} {delta} {tag}\n", namespace.len(), key.len()),
+        None => format!("i {} {} {delta}\n", namespace.len(), key.len()),
+    }
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
 /// This connection's only reader, for its whole lifetime — nothing else
 /// may read from `read_half`. Consumes responses off the wire and
 /// dispatches each to the oldest pending request (FIFO —
@@ -665,7 +726,7 @@ async fn read_loop(
             result = read_one_response(&mut read_half, shared.tagged) => result,
         };
 
-        let (marker, value, tag) = match response {
+        let (marker, value, ttl_seconds, tag) = match response {
             Ok(response) => response,
             Err(error) => {
                 // error belongs to whichever request has been waiting
@@ -736,7 +797,10 @@ async fn read_loop(
         // plain `Protocol` error would leave the connection open and
         // permanently off by one — poison it here instead, the same way
         // as a tag mismatch (mirrors Go's `default: mismatch`).
-        if !matches!(marker, b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R') {
+        if !matches!(
+            marker,
+            b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R' | b'I' | b'T'
+        ) {
             let message = format!(
                 "nanocached: unexpected response from server: {} (connection desynced)",
                 marker as char
@@ -750,7 +814,7 @@ async fn read_loop(
         // An Err here just means the caller abandoned this request after
         // its write completed (see `Connection::request`) — nothing to
         // do, the queue position was already correctly consumed above.
-        let _ = slot.tx.send(Ok((marker, value)));
+        let _ = slot.tx.send(Ok((marker, value, ttl_seconds)));
     }
 }
 
@@ -790,13 +854,14 @@ async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
     }
 }
 
-/// A marker byte, its value bytes (`V` only), and — on a tagged
+/// A marker byte, its value bytes (`V`/`I` only), its TTL in seconds
+/// (`I` only, issue #129, when the entry has one), and — on a tagged
 /// connection (echoed response tags) — the tag it echoed, straight off the wire
 /// before the read loop has verified that tag against anything. Only
-/// `read_one_response`/`read_loop` ever see this third field; once
+/// `read_one_response`/`read_loop` ever see this fourth field; once
 /// verified it's stripped down to a plain [`RawResponse`] before being
 /// handed to a waiting caller.
-type WireResponse = (u8, Option<Vec<u8>>, Option<u32>);
+type WireResponse = (u8, Option<Vec<u8>>, Option<u64>, Option<u32>);
 
 async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Result<WireResponse> {
     let marker = read_half.read_u8().await?;
@@ -832,25 +897,82 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
                 })?;
             let mut value = vec![0u8; length];
             read_half.read_exact(&mut value).await?;
-            Ok((marker, Some(value), tag))
+            Ok((marker, Some(value), None, tag))
+        }
+        b'I' => {
+            // INCR success (issue #129): `<value-length> [<ttl-seconds>]
+            // [<tag>]`. Disambiguating whether a trailing field is the ttl
+            // or the tag is the *decoding* side of the exact same
+            // "count trailing fields, tagged-mode-aware" idiom
+            // `encode_set` already uses to *build* `S`'s own optional
+            // `[ttl] [tag]` header fields: untagged, 0 trailing fields
+            // after the length means no ttl, 1 means ttl; tagged, 1
+            // trailing field means "just the tag", 2 means "ttl then tag"
+            // — decided purely by whether this connection is tagged, never
+            // guessed frame by frame.
+            let header = read_line(read_half).await?;
+            let header = header.trim();
+            let mut fields = header.split(' ').filter(|field| !field.is_empty());
+            let length_field = fields.next().ok_or_else(|| {
+                Error::Protocol("nanocached: invalid incr response header".to_string())
+            })?;
+            let rest: Vec<&str> = fields.collect();
+            let (ttl_field, tag) = if tagged {
+                match rest.as_slice() {
+                    [tag] => (None, Some(parse_tag(tag)?)),
+                    [ttl, tag] => (Some(*ttl), Some(parse_tag(tag)?)),
+                    _ => {
+                        return Err(Error::Protocol(
+                            "nanocached: invalid incr response header".to_string(),
+                        ))
+                    }
+                }
+            } else {
+                match rest.as_slice() {
+                    [] => (None, None),
+                    [ttl] => (Some(*ttl), None),
+                    _ => {
+                        return Err(Error::Protocol(
+                            "nanocached: invalid incr response header".to_string(),
+                        ))
+                    }
+                }
+            };
+            let length: usize = length_field
+                .parse()
+                .ok()
+                .filter(|length| *length <= MAX_VALUE_LENGTH)
+                .ok_or_else(|| {
+                    Error::Protocol("nanocached: invalid value length in response".to_string())
+                })?;
+            let ttl_seconds = match ttl_field {
+                Some(field) => Some(field.parse::<u64>().map_err(|_| {
+                    Error::Protocol("nanocached: invalid ttl in incr response".to_string())
+                })?),
+                None => None,
+            };
+            let mut value = vec![0u8; length];
+            read_half.read_exact(&mut value).await?;
+            Ok((marker, Some(value), ttl_seconds, tag))
         }
         b'B' => {
             // `B` (busy) is always untagged — unsolicited, sent before
             // auth (and so before tagging) even completes (echoed response tags).
             read_half.read_u8().await?; // the trailing '\n'
-            Ok((marker, None, None))
+            Ok((marker, None, None, None))
         }
-        b'S' | b'D' | b'N' | b'W' | b'C' | b'R' => {
+        b'S' | b'D' | b'N' | b'W' | b'C' | b'R' | b'T' => {
             if tagged {
                 // `S <tag>\n` / `D <tag>\n` / `N <tag>\n` / `W <tag>\n` /
                 // `C <tag>\n` (issue #106) / `R <tag>\n` (retryable-error
-                // status, issue #125) — every no-value marker's tag rides
-                // as its header line's sole field.
+                // status, issue #125) / `T <tag>\n` (not-numeric, issue
+                // #129) — every no-value marker's tag rides as its header
+                // line's sole field.
                 let line = read_line(read_half).await?;
-                Ok((marker, None, Some(parse_tag(line.trim())?)))
+                Ok((marker, None, None, Some(parse_tag(line.trim())?)))
             } else {
                 read_half.read_u8().await?; // the trailing '\n'
-                Ok((marker, None, None))
+                Ok((marker, None, None, None))
             }
         }
         other => Err(Error::Protocol(format!(
@@ -873,13 +995,29 @@ fn parse_tag(field: &str) -> Result<u32> {
 impl TryFrom<RawResponse> for ResponseKind {
     type Error = Error;
 
-    fn try_from((marker, value): RawResponse) -> Result<Self> {
+    fn try_from((marker, value, ttl_seconds): RawResponse) -> Result<Self> {
         match marker {
             b'V' => Ok(ResponseKind::Value(value.unwrap_or_default())),
             b'N' => Ok(ResponseKind::NotFound),
             b'S' => Ok(ResponseKind::Stored),
             b'D' => Ok(ResponseKind::Deleted),
             b'C' => Ok(ResponseKind::Cleared),
+            b'I' => {
+                let text = value.unwrap_or_default();
+                let counter = std::str::from_utf8(&text)
+                    .ok()
+                    .and_then(|text| text.parse::<i64>().ok())
+                    .ok_or_else(|| {
+                        Error::Protocol("nanocached: invalid incr value in response".to_string())
+                    })?;
+                Ok(ResponseKind::Incr(counter, ttl_seconds))
+            }
+            // Not-numeric (issue #129): the key exists but its stored
+            // value isn't INCR's counter grammar, or the delta would
+            // overflow `i64` — never a `ResponseKind`, just like `W`
+            // is never one, since every caller must handle it as an
+            // error rather than a value to switch on.
+            b'T' => Err(Error::NotNumeric),
             b'W' => Err(Error::WrongNode),
             other => Err(Error::Protocol(format!(
                 "nanocached: unexpected response from server: {}",
@@ -1042,8 +1180,94 @@ mod tests {
     #[test]
     fn cleared_response_converts_from_the_c_marker() {
         assert!(matches!(
-            ResponseKind::try_from((b'C', None)),
+            ResponseKind::try_from((b'C', None, None)),
             Ok(ResponseKind::Cleared)
+        ));
+    }
+
+    // ── incr (issue #129) ────────────────────────────────────────────
+
+    #[test]
+    fn encode_incr_emits_the_namespaced_frame_for_the_default_namespace() {
+        // Unlike get/set/delete, incr has no legacy uppercase frame to
+        // preserve — even the empty (default) namespace goes out as
+        // `i 0 ...` rather than switching command letters (issue #129,
+        // mirrors encode_clear's own no-legacy-form rule).
+        assert_eq!(
+            encode_incr(b"", b"hits", 5, None),
+            [b"i 0 4 5\n".as_slice(), b"hits"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_incr_emits_a_negative_delta_in_canonical_form() {
+        assert_eq!(
+            encode_incr(b"", b"hits", -5, None),
+            [b"i 0 4 -5\n".as_slice(), b"hits"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_incr_emits_the_tagged_frame() {
+        assert_eq!(
+            encode_incr(b"", b"hits", 5, Some(7)),
+            [b"i 0 4 5 7\n".as_slice(), b"hits"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_incr_emits_the_namespaced_frame() {
+        assert_eq!(
+            encode_incr(b"users", b"hits", 5, None),
+            [b"i 5 4 5\n".as_slice(), b"users", b"hits"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_incr_emits_the_tagged_namespaced_frame() {
+        assert_eq!(
+            encode_incr(b"users", b"hits", -3, Some(9)),
+            [b"i 5 4 -3 9\n".as_slice(), b"users", b"hits"].concat()
+        );
+    }
+
+    #[test]
+    fn incr_response_converts_from_the_i_marker_without_a_ttl() {
+        assert!(matches!(
+            ResponseKind::try_from((b'I', Some(b"42".to_vec()), None)),
+            Ok(ResponseKind::Incr(42, None))
+        ));
+    }
+
+    #[test]
+    fn incr_response_converts_from_the_i_marker_with_a_ttl() {
+        assert!(matches!(
+            ResponseKind::try_from((b'I', Some(b"42".to_vec()), Some(60))),
+            Ok(ResponseKind::Incr(42, Some(60)))
+        ));
+    }
+
+    #[test]
+    fn incr_response_converts_a_negative_value_from_the_i_marker() {
+        assert!(matches!(
+            ResponseKind::try_from((b'I', Some(b"-7".to_vec()), None)),
+            Ok(ResponseKind::Incr(-7, None))
+        ));
+    }
+
+    #[test]
+    fn not_found_response_converts_from_the_n_marker() {
+        assert!(matches!(
+            ResponseKind::try_from((b'N', None, None)),
+            Ok(ResponseKind::NotFound)
+        ));
+    }
+
+    #[test]
+    fn not_numeric_response_converts_from_the_t_marker_to_an_error() {
+        assert!(matches!(
+            ResponseKind::try_from((b'T', None, None)),
+            Err(Error::NotNumeric)
         ));
     }
 }
