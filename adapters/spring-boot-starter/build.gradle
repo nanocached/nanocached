@@ -1,0 +1,83 @@
+plugins {
+    id 'java-library'
+    id 'com.vanniktech.maven.publish' version '0.34.0'
+}
+
+group = 'org.nanocached'
+version = '0.1.0'
+
+mavenPublishing {
+    publishToMavenCentral(true)
+    signAllPublications()
+    coordinates('org.nanocached', 'nanocached-spring-boot-starter', version.toString())
+    pom {
+        name = 'nanocached-spring-boot-starter'
+        description = 'Spring Boot autoconfiguration for the nanocached-spring Cache adapter'
+        url = 'https://nanocached.org'
+        licenses {
+            license {
+                name = 'MIT License'
+                url = 'https://github.com/nanocached/nanocached/blob/main/LICENSE'
+            }
+        }
+        developers {
+            developer {
+                id = 't0k0sh1'
+                name = 'Takashi Yamashina'
+            }
+        }
+        scm {
+            url = 'https://github.com/nanocached/nanocached'
+            connection = 'scm:git:git://github.com/nanocached/nanocached.git'
+            developerConnection = 'scm:git:ssh://git@github.com/nanocached/nanocached.git'
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // A starter is a dependency aggregator: pulling this in is meant to be
+    // the only nanocached-related dependency a Boot app needs, so both the
+    // adapter and Boot's own autoconfigure/base starter are `api`.
+    api 'org.nanocached:nanocached-spring:0.1.0'
+    api platform('org.springframework.boot:spring-boot-dependencies:3.5.3')
+    api 'org.springframework.boot:spring-boot-starter'
+    implementation 'org.springframework.boot:spring-boot-autoconfigure'
+
+    annotationProcessor platform('org.springframework.boot:spring-boot-dependencies:3.5.3')
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+
+    // The Boot-interaction tests boot a real ApplicationContext (yaml-only
+    // and Java-config back-off cases) plus a Redis starter as the
+    // competing autoconfigured backend, same as nanocached-spring's own
+    // BootAutoConfigurationInteractionTest.
+    testImplementation 'org.springframework.boot:spring-boot-starter-cache'
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-redis'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// SpEL keys that name method parameters need parameter names in the class
+// files, same as nanocached-spring's own build.
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += '-parameters'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed'
+        exceptionFormat 'full'
+    }
+}

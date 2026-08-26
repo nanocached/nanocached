@@ -88,10 +88,11 @@ explicit `CacheManager` bean takes precedence over those — Boot's
 so with the two beans above nanocached wins even with the Redis starter on
 the classpath and even with a stray `spring.cache.type=redis` left in the
 yaml (`BootAutoConfigurationInteractionTest` pins all of this against real
-Boot autoconfiguration). A
-`nanocached-spring-boot-starter` that binds a `nanocached.*` namespace and
-autoconfigures both beans is a planned follow-up — it will remove the Java
-config above, not change what the adapter does.
+Boot autoconfiguration). Boot users who would rather skip the two `@Bean`
+methods above can instead add
+[`nanocached-spring-boot-starter`](../spring-boot-starter), which
+autoconfigures both beans from `nanocached.*` properties — same adapter,
+zero Java config.
 
 ## Usage
 
@@ -151,8 +152,7 @@ possible as described above.
 ## Requirements
 
 Java 17+, Spring Framework 6.x, nanocached server ≥ the release that ships
-namespaces and CLEAR (issues #105/#106). A Spring Boot starter
-(autoconfiguration) is a planned follow-up.
+namespaces and CLEAR (issues #105/#106).
 
 ## Policy note
 
