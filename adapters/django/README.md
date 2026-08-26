@@ -18,13 +18,20 @@ and friends run against a nanocached cluster.
   `putIfAbsent` documents.
 - **`get_many`/`set_many`/`delete_many`** are client-side loops — the wire
   has no multi-key command.
-- **`incr`/`decr` raise `NotImplementedError`.** The wire has no atomic
-  counter, and `BaseCache`'s default get-then-set emulation would race
-  silently under concurrent access; this backend refuses instead of
-  pretending to be atomic.
+- **`incr`/`decr`** use the wire's own atomic counter (`INCR`, issue
+  #129): atomic on the node that owns the key, unlike `add()`/`touch()`
+  above. Matches `BaseCache`'s own contract — raises `ValueError` if the
+  key doesn't exist — and is exactly as volatile as `set()`: LRU
+  eviction or this alias's `TIMEOUT` reclaim a counter the same as any
+  other entry, so it suits rate limiting and approximate counts, never a
+  count that must survive (billing, inventory). See "Counter storage"
+  below for how this changes what's on the wire.
 - **Values are pickled** (`pickle.dumps(..., HIGHEST_PROTOCOL)`), the
   Django convention — anything picklable round-trips, `None` included
-  (distinguished from a cache miss, which is nanocached's own "no value").
+  (distinguished from a cache miss, which is nanocached's own "no value")
+  — **except a plain `int`** (`bool` excluded), which is stored as
+  `INCR`'s own decimal-ASCII counter grammar instead, so `incr`/`decr`
+  can operate on it server-side. See "Counter storage" below.
 
 ## Setup
 
@@ -129,6 +136,40 @@ The wire has single-key get/set/delete and no compare-and-set, so `add()`
 and `touch()` are get-then-set (see above); `get_many`/`set_many`/
 `delete_many` are client-side loops, so a failure partway through leaves
 whichever keys were already processed changed rather than rolling back.
+`incr`/`decr` (issue #129) are the one exception: atomic on the node
+that owns the key, since the wire has a real `INCR`.
+
+## Counter storage
+
+To make `incr`/`decr` possible, this backend changed what a plain `int`
+value looks like on the wire: instead of the usual pickle round trip, an
+`int` (excluding `bool`) is stored as `INCR`'s own decimal-ASCII grammar
+— the same bytes the wire's atomic counter reads and writes directly.
+Everything else — `str`, `dict`, model instances, `None`, `bool`, ... —
+is still pickled exactly as before. `get()` tells the two apart by the
+bytes themselves: a pickle stream always begins with the `0x80` PROTO
+opcode (Python's pickle protocol 2+, which `HIGHEST_PROTOCOL` always is),
+a byte that can never start an ASCII decimal integer, so there is no
+ambiguity and no extra marker byte on the wire.
+
+**This is a compatibility break for a rolling deploy that shares a cache
+across old and new `nanocached-django` code**, not a nanocached-server
+concern at all — the node just stores whatever opaque bytes it's given,
+on any version. The risk is entirely between Django app instances:
+
+- An **old** worker's `get()` unconditionally calls `pickle.loads(raw)`.
+  If a **new** worker already wrote an `int` under that key (as raw
+  decimal-ASCII, not pickled), the old worker's `get()`/`get_many()`
+  **raises** (an unpickling error), not just returns a wrong value.
+- A **new** worker's `get()` handles both encodings fine, including an
+  `int` an old worker pickled — that direction round-trips correctly.
+
+So the break is one-directional (old code choking on new-written ints)
+and only matters while old and new code run concurrently against the
+same shared keys — a normal rolling deploy window. It resolves itself
+once the rollout finishes; nothing needs a manual fix-up. If a rolling
+deploy of this adapter's version must never error on an `int` key, drain
+or version-bump that key's namespace instead of upgrading it in place.
 
 ## Requirements
 
