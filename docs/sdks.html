@@ -115,7 +115,13 @@ Spring Boot users can instead add
 <code>org.nanocached:nanocached-spring-boot-starter</code>, which
 autoconfigures both beans from <code>nanocached.*</code> properties — no
 Java config. See
-<a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring-boot-starter">adapters/spring-boot-starter</a>.</p>
+<a href="https://github.com/nanocached/nanocached/tree/main/adapters/spring-boot-starter">adapters/spring-boot-starter</a>.
+JSR-107 (<code>javax.cache</code>) users can instead add
+<code>org.nanocached:nanocached-jcache</code>, an honest-subset
+<code>CachingProvider</code>/<code>CacheManager</code>/<code>Cache</code>
+implementation discoverable via <code>Caching.getCachingProvider()</code>.
+See
+<a href="https://github.com/nanocached/nanocached/tree/main/adapters/jcache">adapters/jcache</a>.</p>
 
 <h2 id="rust">Rust</h2>
 <pre><code>cargo add nanocached</code></pre>
@@ -168,8 +174,10 @@ existed, err := client.Delete("greeting")</code></pre>
   (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/dotnet">adapters/dotnet</a>),
   a Django cache backend
   (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/django">adapters/django</a>),
-  and a cache-manager store for Node
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager">adapters/cache-manager</a>).</li>
+  a cache-manager store for Node
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager">adapters/cache-manager</a>),
+  and a JSR-107 (<code>javax.cache</code>) provider
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/jcache">adapters/jcache</a>).</li>
   <li><b>Addresses</b> — one list-shaped option in every SDK; list every
   discovery replica, and connect and refresh try them in order, skipping
   busy or unreachable replicas.</li>

@@ -140,7 +140,7 @@ Framework adapters are ecosystem-specific and live **outside** the
 six-language SDK parity policy ([#25]): parity applies to the SDK core
 only. This module exists for `IDistributedCache`; other ecosystems get
 their own idiomatic adapters (Spring `CacheManager`, Django cache backend,
-cache-manager store, JCache) rather than mirrors of this one.
+cache-manager store, [JCache](../jcache)) rather than mirrors of this one.
 
 [#25]: https://github.com/nanocached/nanocached/issues/25
 
