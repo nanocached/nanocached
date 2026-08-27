@@ -1,0 +1,67 @@
+plugins {
+    id 'java-library'
+    id 'com.vanniktech.maven.publish' version '0.34.0'
+}
+
+group = 'org.nanocached'
+version = '0.1.0'
+
+mavenPublishing {
+    publishToMavenCentral(true)
+    signAllPublications()
+    coordinates('org.nanocached', 'nanocached-jcache', version.toString())
+    pom {
+        name = 'nanocached-jcache'
+        description = 'JCache (JSR-107) provider for the nanocached Java SDK'
+        url = 'https://nanocached.org'
+        licenses {
+            license {
+                name = 'MIT License'
+                url = 'https://github.com/nanocached/nanocached/blob/main/LICENSE'
+            }
+        }
+        developers {
+            developer {
+                id = 't0k0sh1'
+                name = 'Takashi Yamashina'
+            }
+        }
+        scm {
+            url = 'https://github.com/nanocached/nanocached'
+            connection = 'scm:git:git://github.com/nanocached/nanocached.git'
+            developerConnection = 'scm:git:ssh://git@github.com/nanocached/nanocached.git'
+        }
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // The SDK the adapter is built on. `api`: NanocachedClient appears in
+    // the adapter's public construction API.
+    api 'org.nanocached:nanocached:0.3.0'
+    // The JCache SPI this module implements. `api`: javax.cache types
+    // (Cache, CacheManager, Configuration, ...) appear throughout this
+    // module's own public API.
+    api 'javax.cache:cache-api:1.1.1'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed'
+        exceptionFormat 'full'
+    }
+}
