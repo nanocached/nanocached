@@ -174,10 +174,12 @@ existed, err := client.Delete("greeting")</code></pre>
   (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/dotnet">adapters/dotnet</a>),
   a Django cache backend
   (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/django">adapters/django</a>),
-  a cache-manager store for Node
+  a cache-manager v5 store for Node
   (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/cache-manager">adapters/cache-manager</a>),
-  and a JSR-107 (<code>javax.cache</code>) provider
-  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/jcache">adapters/jcache</a>).</li>
+  a JSR-107 (<code>javax.cache</code>) provider
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/jcache">adapters/jcache</a>),
+  and a Keyv storage adapter for cache-manager v6+/NestJS 11
+  (<a href="https://github.com/nanocached/nanocached/tree/main/adapters/keyv">adapters/keyv</a>).</li>
   <li><b>Addresses</b> — one list-shaped option in every SDK; list every
   discovery replica, and connect and refresh try them in order, skipping
   busy or unreachable replicas.</li>

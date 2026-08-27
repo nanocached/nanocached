@@ -113,17 +113,18 @@ client directly, for anything this store doesn't itself surface —
 ## Requirements
 
 Node.js 20+, `cache-manager` ^5 (the `get`/`set`/`del`/`reset`/`mget`/`mset`
-shape this targets — its `Keyv`-based v6+/NestJS 11 successor is a
-follow-up, not this package), nanocached server ≥ the release that ships
-namespaces and `CLEAR` (issues #105/#106).
+shape this targets — its `Keyv`-based v6+/NestJS 11 successor is
+[`nanocached-keyv`](../keyv), a separate package), nanocached server ≥ the
+release that ships namespaces and `CLEAR` (issues #105/#106).
 
 ## Policy note
 
 Framework adapters are ecosystem-specific and live **outside** the
 six-language SDK parity policy ([#25]): parity applies to the SDK core
-only. This module exists for `cache-manager`; other ecosystems get their
-own idiomatic adapters (Spring `CacheManager`, `IDistributedCache`, Django
-cache backend, [JCache](../jcache)) rather than mirrors of this one.
+only. This module exists for `cache-manager` v5; other ecosystems get
+their own idiomatic adapters (Spring `CacheManager`, `IDistributedCache`,
+Django cache backend, [JCache](../jcache), [Keyv](../keyv) for
+`cache-manager` v6+/NestJS 11) rather than mirrors of this one.
 
 [#25]: https://github.com/nanocached/nanocached/issues/25
 
