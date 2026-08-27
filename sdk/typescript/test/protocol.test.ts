@@ -1,6 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { encodeClear, encodeClearAll, encodeDelete, encodeGet, encodeIncr, encodeSet, MAX_REQUEST_BYTES, tryParseResponse } from "../src/protocol.js";
+import {
+  contentDigest,
+  encodeCas,
+  encodeCasDelete,
+  encodeClear,
+  encodeClearAll,
+  encodeDelete,
+  encodeGet,
+  encodeIncr,
+  encodeSet,
+  MAX_REQUEST_BYTES,
+  tryParseResponse,
+} from "../src/protocol.js";
 
 const NS = Buffer.from("users");
 
@@ -119,6 +131,140 @@ describe("encodeIncr (issue #129)", () => {
     assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), Number.MAX_SAFE_INTEGER));
     assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), -Number.MAX_SAFE_INTEGER));
     assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), 0));
+  });
+});
+
+describe("contentDigest (issue #141)", () => {
+  it("matches the pinned cross-language test vector", () => {
+    // SHA-256 of the UTF-8 bytes "nanocached-cas-vector", truncated to the
+    // first 16 bytes, lowercase hex — pinned identically into the Rust
+    // server and every SDK (docs/protocol.html#cas). A mismatch here means
+    // CAS silently breaks across languages.
+    assert.equal(contentDigest(Buffer.from("nanocached-cas-vector", "utf8")), "36287141940ca57acbd7695ccdde9d43");
+  });
+
+  it("produces a 32-character lowercase hex string", () => {
+    const digest = contentDigest(Buffer.from("some arbitrary value", "utf8"));
+    assert.match(digest, /^[0-9a-f]{32}$/);
+  });
+
+  it("is a pure function of the exact bytes — differs for different content", () => {
+    assert.notEqual(contentDigest(Buffer.from("a")), contentDigest(Buffer.from("b")));
+  });
+
+  it("is deterministic", () => {
+    const value = Buffer.from("deterministic", "utf8");
+    assert.equal(contentDigest(value), contentDigest(value));
+  });
+});
+
+describe("encodeCas (issue #141)", () => {
+  it("frames an absent condition with the bare `A` token", () => {
+    assert.deepEqual(encodeCas(Buffer.from("key"), Buffer.from("value"), { kind: "absent" }), Buffer.from("k 0 3 5 A\nkeyvalue"));
+  });
+
+  it("frames a present condition with the bare `P` token", () => {
+    assert.deepEqual(encodeCas(Buffer.from("key"), Buffer.from("value"), { kind: "present" }), Buffer.from("k 0 3 5 P\nkeyvalue"));
+  });
+
+  it("frames a digest condition with the raw digest string, not length-prefixed", () => {
+    const digest = "0123456789abcdef0123456789abcdef";
+    assert.deepEqual(
+      encodeCas(Buffer.from("key"), Buffer.from("value"), { kind: "digest", digest: digest.slice(0, 32) }),
+      Buffer.from(`k 0 3 5 ${digest.slice(0, 32)}\nkeyvalue`),
+    );
+  });
+
+  it("always frames the namespace length, even for the default namespace", () => {
+    assert.deepEqual(encodeCas(Buffer.from("key"), Buffer.from("v"), { kind: "absent" }), Buffer.from("k 0 3 1 A\nkeyv"));
+  });
+
+  it("frames a named namespace ahead of the key, matching i's field order", () => {
+    assert.deepEqual(
+      encodeCas(Buffer.from("alpha"), Buffer.from("v"), { kind: "present" }, undefined, undefined, NS),
+      Buffer.concat([Buffer.from("k 5 5 1 P\n"), NS, Buffer.from("alpha"), Buffer.from("v")]),
+    );
+  });
+
+  it("omits the TTL field when zero (the default), same as encodeSet", () => {
+    assert.deepEqual(encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "absent" }, 0), Buffer.from("k 0 1 1 A\nkv"));
+  });
+
+  it("appends the TTL after the cond token when given", () => {
+    assert.deepEqual(encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "absent" }, 60), Buffer.from("k 0 1 1 A 60\nkv"));
+  });
+
+  it("appends the tag as the last header field, after the TTL when both are present", () => {
+    assert.deepEqual(encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "present" }, 0, 7), Buffer.from("k 0 1 1 P 7\nkv"));
+    assert.deepEqual(encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "present" }, 60, 7), Buffer.from("k 0 1 1 P 60 7\nkv"));
+  });
+
+  it("rejects an empty key synchronously", () => {
+    assert.throws(() => encodeCas(Buffer.alloc(0), Buffer.from("v"), { kind: "absent" }), RangeError);
+  });
+
+  it("rejects a key+value combination beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeCas(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("x"), { kind: "absent" }), RangeError);
+  });
+
+  it("rejects non-integer and negative TTLs synchronously", () => {
+    for (const ttl of [3.5, -1, NaN, Infinity]) {
+      assert.throws(() => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "absent" }, ttl), RangeError);
+    }
+  });
+
+  it("rejects a digest condition that isn't a 32-character lowercase hex string", () => {
+    for (const bad of ["", "A", "P", "not-hex-at-all-not-hex-at-all!!", "0".repeat(31), "0".repeat(33), "0123456789abcdef0123456789abcdef".toUpperCase(), "abc def0123456789abcdef012345 "]) {
+      assert.throws(() => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "digest", digest: bad }), RangeError);
+    }
+  });
+
+  it("rejects a digest condition containing a space or newline (frame-corruption guard)", () => {
+    assert.throws(
+      () => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "digest", digest: "0123456789abcdef 123456789abcdef" }),
+      RangeError,
+    );
+    assert.throws(
+      () => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "digest", digest: "0123456789abcdef\n123456789abcde" }),
+      RangeError,
+    );
+  });
+});
+
+describe("encodeCasDelete (issue #141)", () => {
+  const digest = "36287141940ca57acbd7695ccdde9d43";
+
+  it("frames the digest as a bare token, not length-prefixed", () => {
+    assert.deepEqual(encodeCasDelete(Buffer.from("key"), digest), Buffer.from(`x 0 3 ${digest}\nkey`));
+  });
+
+  it("always frames the namespace length, even for the default namespace", () => {
+    assert.deepEqual(encodeCasDelete(Buffer.from("key"), digest), Buffer.from(`x 0 3 ${digest}\nkey`));
+  });
+
+  it("frames a named namespace ahead of the key", () => {
+    assert.deepEqual(
+      encodeCasDelete(Buffer.from("alpha"), digest, undefined, NS),
+      Buffer.concat([Buffer.from(`x 5 5 ${digest}\n`), NS, Buffer.from("alpha")]),
+    );
+  });
+
+  it("appends the tag as the last header field", () => {
+    assert.deepEqual(encodeCasDelete(Buffer.from("key"), digest, 7), Buffer.from(`x 0 3 ${digest} 7\nkey`));
+  });
+
+  it("rejects an empty key synchronously", () => {
+    assert.throws(() => encodeCasDelete(Buffer.alloc(0), digest), RangeError);
+  });
+
+  it("rejects a key beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeCasDelete(Buffer.alloc(MAX_REQUEST_BYTES + 1), digest), RangeError);
+  });
+
+  it("rejects a digest that isn't a 32-character lowercase hex string", () => {
+    for (const bad of ["", "A", "P", digest.slice(0, 31), digest + "0", digest.toUpperCase()]) {
+      assert.throws(() => encodeCasDelete(Buffer.from("key"), bad), RangeError);
+    }
   });
 });
 

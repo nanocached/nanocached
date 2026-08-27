@@ -106,6 +106,55 @@ public sealed class NanocachedNamespace
 
     public Task<long?> DecrAsync(byte[] key, long delta) => _client.DecrAsync(_namespace, key, delta);
 
+    /// <summary>issue #141 — compare-and-set: as
+    /// <see cref="NanocachedClient.GetWithTokenAsync(string)"/>, scoped to
+    /// this handle's namespace.</summary>
+    public Task<(string Value, string Token)?> GetWithTokenAsync(string key) => _client.GetWithTokenAsync(_namespace, key);
+
+    public Task<(string Value, string Token)?> GetWithTokenAsync(byte[] key) => _client.GetWithTokenAsync(_namespace, key);
+
+    /// <summary>issue #141: as
+    /// <see cref="NanocachedClient.GetBytesWithTokenAsync(string)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(string key) => _client.GetBytesWithTokenAsync(_namespace, key);
+
+    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] key) => _client.GetBytesWithTokenAsync(_namespace, key);
+
+    /// <summary>issue #141 — <c>add</c>/<c>putIfAbsent</c>: as
+    /// <see cref="NanocachedClient.PutIfAbsentAsync(string, string, long)"/>,
+    /// scoped to this handle's namespace. See the client method's own doc
+    /// comment for the not-a-lock caveat and cluster replication rule.</summary>
+    public Task<bool> PutIfAbsentAsync(string key, string value, long ttlSeconds = 0) =>
+        _client.PutIfAbsentAsync(_namespace, key, value, ttlSeconds);
+
+    public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
+        _client.PutIfAbsentAsync(_namespace, key, value, ttlSeconds);
+
+    /// <summary>issue #141 — the two-argument <c>replace(key, value)</c>:
+    /// as <see cref="NanocachedClient.ReplaceIfPresentAsync(string, string, long)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<bool> ReplaceIfPresentAsync(string key, string value, long ttlSeconds = 0) =>
+        _client.ReplaceIfPresentAsync(_namespace, key, value, ttlSeconds);
+
+    public Task<bool> ReplaceIfPresentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
+        _client.ReplaceIfPresentAsync(_namespace, key, value, ttlSeconds);
+
+    /// <summary>issue #141 — the three-argument <c>replace(key, old, new)</c>:
+    /// as <see cref="NanocachedClient.ReplaceAsync(string, string, string, long)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<bool> ReplaceAsync(string key, string token, string newValue, long ttlSeconds = 0) =>
+        _client.ReplaceAsync(_namespace, key, token, newValue, ttlSeconds);
+
+    public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0) =>
+        _client.ReplaceAsync(_namespace, key, token, newValue, ttlSeconds);
+
+    /// <summary>issue #141 — the two-argument <c>remove(key, old)</c>: as
+    /// <see cref="NanocachedClient.DeleteIfMatchesAsync(string, string)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<bool> DeleteIfMatchesAsync(string key, string token) => _client.DeleteIfMatchesAsync(_namespace, key, token);
+
+    public Task<bool> DeleteIfMatchesAsync(byte[] key, string token) => _client.DeleteIfMatchesAsync(_namespace, key, token);
+
     /// <summary>issue #106: drops every entry in this handle's namespace —
     /// on the empty namespace (<c>client.Namespace("")</c>), clears the
     /// default namespace (<c>c 0\n</c>), not rejected. Fanned out to every

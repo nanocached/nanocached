@@ -31,6 +31,13 @@ rustls-native-certs = { version = "0.8", optional = true }
 # rustls's `ring` backend was chosen for `tls` (TLS support) — keeps the
 # cross-compiled build story intact.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+# Compare-and-set (CAS, issue #141): computes the content digest `k`/`x`'s
+# `<cond>` field compares against — same crate the server itself just
+# added, for cross-language agreement (see `src/cas.rs`). Always on, not
+# feature-gated: unlike `tls`/`compression`, CAS has no alternative
+# backend or opt-out story worth threading through the rest of this
+# crate.
+sha2 = "0.10"
 
 [features]
 default = ["tls", "compression"]

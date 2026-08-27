@@ -4,6 +4,7 @@ See https://github.com/nanocached/nanocached for the server and protocol.
 """
 
 from ._compression import DecompressionError
+from ._digest import content_digest
 from ._errors import (
     AlreadyClosedError,
     AuthenticationError,
@@ -31,6 +32,7 @@ __all__ = [
     "NotNumericError",
     "RetryableError",
     "WrongNodeError",
+    "content_digest",
 ]
 
 # Must match sdk/python/pyproject.toml's `version` — tools/release-all.sh

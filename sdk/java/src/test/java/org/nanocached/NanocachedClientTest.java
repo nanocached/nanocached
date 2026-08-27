@@ -239,6 +239,201 @@ class NanocachedClientTest {
         }
     }
 
+    // ── Compare-and-set (issue #141) ───────────────────────────────
+
+    // The pinned cross-language digest vector (docs/protocol.html#cas):
+    // SHA-256 of the UTF-8 bytes "nanocached-cas-vector", truncated to its
+    // first 16 bytes, lowercase hex. Independently pinned into the Rust
+    // server and every other SDK too — a mismatch here means CAS silently
+    // breaks across languages.
+    @Test
+    void contentDigestMatchesThePinnedCrossLanguageVector() {
+        assertEquals("36287141940ca57acbd7695ccdde9d43",
+                NanocachedClient.contentDigest("nanocached-cas-vector".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void putIfAbsentStoresOnlyWhenTheKeyIsAbsent() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertTrue(client.putIfAbsent("k", "first"));
+                assertEquals(Optional.of("first"), client.get("k"));
+
+                // The key now exists: a second putIfAbsent is a no-op.
+                assertFalse(client.putIfAbsent("k", "second"));
+                assertEquals(Optional.of("first"), client.get("k"));
+
+                assertTrue(client.delete("k"));
+                // Lazily expired/absent again: putIfAbsent succeeds.
+                assertTrue(client.putIfAbsent("k", "third"));
+                assertEquals(Optional.of("third"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void replaceIfPresentStoresOnlyWhenTheKeyExists() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertFalse(client.replaceIfPresent("k", "v"));
+                assertEquals(Optional.empty(), client.get("k"));
+
+                client.set("k", "original");
+                assertTrue(client.replaceIfPresent("k", "replaced"));
+                assertEquals(Optional.of("replaced"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void replaceSucceedsOnlyWhenTheTokenMatchesTheCurrentContent() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v1");
+                NanocachedClient.CasEntry entry = client.getWithToken("k").orElseThrow();
+                assertEquals("v1", new String(entry.value(), StandardCharsets.UTF_8));
+                assertEquals(NanocachedClient.contentDigest("v1".getBytes(StandardCharsets.UTF_8)), entry.token());
+
+                // A stale token (from before someone else's concurrent
+                // write) is rejected.
+                client.set("k", "v2");
+                assertFalse(client.replace("k", entry.token(), "v3"));
+                assertEquals(Optional.of("v2"), client.get("k"));
+
+                // The current token succeeds.
+                String currentToken = client.getWithToken("k").orElseThrow().token();
+                assertTrue(client.replace("k", currentToken, "v3"));
+                assertEquals(Optional.of("v3"), client.get("k"));
+
+                // A missing key never matches any digest.
+                assertTrue(client.delete("k"));
+                assertFalse(client.replace("k", currentToken, "v4"));
+            }
+        }
+    }
+
+    @Test
+    void replaceRejectsAMalformedToken() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                assertThrows(IllegalArgumentException.class, () -> client.replace("k", "not-a-digest", "v2"));
+                assertThrows(IllegalArgumentException.class, () -> client.replace("k", "A", "v2"));
+                assertThrows(IllegalArgumentException.class, () -> client.deleteIfMatches("k", "P"));
+                assertThrows(IllegalArgumentException.class, () -> client.deleteIfMatches("k", null));
+                // Rejected client-side: the value must be untouched.
+                assertEquals(Optional.of("v"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void deleteIfMatchesRemovesOnlyOnAMatchingToken() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v");
+                String staleToken = NanocachedClient.contentDigest("wrong".getBytes(StandardCharsets.UTF_8));
+                assertFalse(client.deleteIfMatches("k", staleToken));
+                assertEquals(Optional.of("v"), client.get("k"));
+
+                String token = client.getWithToken("k").orElseThrow().token();
+                assertTrue(client.deleteIfMatches("k", token));
+                assertEquals(Optional.empty(), client.get("k"));
+
+                // Already gone: the same token no longer matches anything.
+                assertFalse(client.deleteIfMatches("k", token));
+            }
+        }
+    }
+
+    @Test
+    void getWithTokenReturnsEmptyOnAMissingKey() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertEquals(Optional.empty(), client.getWithToken("missing"));
+            }
+        }
+    }
+
+    @Test
+    void casTtlZeroMeansNoExpiryAndNegativeIsRejected() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertTrue(client.putIfAbsent("k", "v", 60));
+                assertEquals(Long.valueOf(60), node.ttls.get("k"));
+
+                assertThrows(IllegalArgumentException.class, () -> client.putIfAbsent("k2", "v", -1L));
+                assertThrows(IllegalArgumentException.class, () -> client.replaceIfPresent("k", "v2", -1L));
+                String token = client.getWithToken("k").orElseThrow().token();
+                assertThrows(IllegalArgumentException.class, () -> client.replace("k", token, "v3", -1L));
+            }
+        }
+    }
+
+    @Test
+    void casOperationsAreScopedByNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace tenant = client.namespace("tenant-a");
+                assertTrue(tenant.putIfAbsent("k", "tenant-value"));
+                // The default (un-namespaced) keyspace is untouched.
+                assertEquals(Optional.empty(), client.get("k"));
+                assertTrue(client.putIfAbsent("k", "default-value"));
+
+                String tenantToken = tenant.getWithToken("k").orElseThrow().token();
+                assertTrue(tenant.replace("k", tenantToken, "tenant-value-2"));
+                assertEquals(Optional.of("default-value"), client.get("k"));
+                assertEquals(Optional.of("tenant-value-2"), tenant.get("k"));
+
+                assertTrue(tenant.deleteIfMatches("k",
+                        tenant.getWithToken("k").orElseThrow().token()));
+                assertEquals(Optional.empty(), tenant.get("k"));
+                assertEquals(Optional.of("default-value"), client.get("k"));
+            }
+        }
+    }
+
+    @Test
+    void getWithTokenComputesTheDigestFromRawWireBytesUnderCompression() throws Exception {
+        // Correctness note (issue #141): with compress enabled, the value
+        // on the wire carries a marker byte and the server never
+        // decompresses — so the digest must be computed over those raw,
+        // marker-prefixed bytes, never over the decompressed value this
+        // same call also returns, or a subsequent k/x conditioned on this
+        // token would never match what the server actually stores.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(single("127.0.0.1", node.port())
+                    .compress(true)
+                    .compressionThreshold(4))) {
+                String value = "x".repeat(1000);
+                client.set("k", value);
+
+                byte[] rawWireBytes = node.store.get("k");
+                assertEquals(0x01, rawWireBytes[0]); // actually compressed
+
+                NanocachedClient.CasEntry entry = client.getWithToken("k").orElseThrow();
+                assertEquals(value, new String(entry.value(), StandardCharsets.UTF_8));
+                assertEquals(NanocachedClient.contentDigest(rawWireBytes), entry.token());
+                assertNotEquals(NanocachedClient.contentDigest(value.getBytes(StandardCharsets.UTF_8)), entry.token());
+
+                // The token from getWithToken must actually work against
+                // the real server-side condition check.
+                String replacement = "y".repeat(1000);
+                assertTrue(client.replace("k".getBytes(StandardCharsets.UTF_8), entry.token(),
+                        replacement.getBytes(StandardCharsets.UTF_8)));
+                assertEquals(Optional.of(replacement), client.get("k"));
+                // The replacement value must itself go through the same
+                // compression pipeline set() uses, so a later get (from
+                // this or any other compress-enabled client) still
+                // decompresses correctly rather than reading raw
+                // uncompressed bytes as if they were marker-prefixed.
+                byte[] newRaw = node.store.get("k");
+                assertEquals(0x01, newRaw[0]);
+                assertTrue(newRaw.length < replacement.length());
+            }
+        }
+    }
+
     // Audit finding J2: an empty key, or a key+value pair large enough to
     // risk the server's MAX_REQUEST_SIZE (src/server.rs, 1 MiB), must be
     // rejected synchronously — before any bytes reach the connection —
@@ -1344,6 +1539,106 @@ class NanocachedClientTest {
         }
     }
 
+    // ── クラスタでの Compare-and-set (issue #141) ────────────────────
+    // The one thing that must never happen: a replica evaluating <cond>
+    // itself. Comparing final stored values between primary and replica
+    // would NOT prove this — a buggy implementation that mistakenly
+    // replayed k/x on the replica could still land on the same bytes from
+    // the same seed. casSetCount/casDeleteCount are the actual proof.
+
+    @Test
+    void casSendsKOnlyToThePrimaryAndReplicatesTheResultAsSet() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-cas-key";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertTrue(client.putIfAbsent(key, "v1"));
+
+                assertEquals(1, primary.casSetCount.get(), "primary must receive exactly one `k` frame");
+                assertEquals(0, replica.casSetCount.get(), "a replica must never receive a `k` frame");
+                assertEquals("v1", new String(replica.store.get(storedKey), StandardCharsets.UTF_8),
+                        "the replica must hold the primary's literal resulting value");
+                assertEquals("v1", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
+
+                // A mismatch (key already present) never touches any
+                // replica, and the primary's own casSetCount still moves —
+                // only the fan-out is skipped.
+                assertFalse(client.putIfAbsent(key, "v2"));
+                assertEquals(2, primary.casSetCount.get());
+                assertEquals(0, replica.casSetCount.get());
+                assertEquals("v1", new String(replica.store.get(storedKey), StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
+    void casReplicatesTheLiteralTtlNeverRecomputingIt() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "cas-with-ttl";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                assertTrue(client.putIfAbsent(key, "v1", 60));
+
+                assertEquals(Long.valueOf(60), primary.ttls.get(storedKey));
+                assertEquals(Long.valueOf(60), replica.ttls.get(storedKey),
+                        "the replica's set leg must carry the exact ttl the caller supplied");
+            }
+        }
+    }
+
+    @Test
+    void deleteIfMatchesSendsXOnlyToThePrimaryAndReplicatesTheResultAsDelete() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-cas-delete-key";
+                client.set(key, "v1"); // fans out to both owners, seeding them identically
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+                String token = client.getWithToken(key).orElseThrow().token();
+
+                assertTrue(client.deleteIfMatches(key, token));
+
+                assertEquals(1, primary.casDeleteCount.get(), "primary must receive exactly one `x` frame");
+                assertEquals(0, replica.casDeleteCount.get(), "a replica must never receive an `x` frame");
+                assertFalse(primary.store.containsKey(storedKey));
+                assertFalse(replica.store.containsKey(storedKey),
+                        "the replica must have the key removed as an ordinary delete");
+            }
+        }
+    }
+
+    @Test
+    void casDoesNotTouchReplicasOnAMismatch() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "cas-mismatch-key";
+                client.set(key, "v1");
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                MockNode replica = cluster.nodes().get(owners.get(1));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+                String staleToken = NanocachedClient.contentDigest("stale".getBytes(StandardCharsets.UTF_8));
+
+                assertFalse(client.deleteIfMatches(key, staleToken));
+
+                assertEquals(1, primary.casDeleteCount.get());
+                assertEquals(0, replica.casDeleteCount.get());
+                assertTrue(primary.store.containsKey(storedKey));
+                assertTrue(replica.store.containsKey(storedKey));
+            }
+        }
+    }
+
     // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     private static NanocachedClient connectFireAndForget(int port) {
@@ -2410,6 +2705,141 @@ class NanocachedClientTest {
                 connection.set("word".getBytes(StandardCharsets.UTF_8), "hi".getBytes(StandardCharsets.UTF_8), null);
                 assertThrows(NanocachedException.NotNumeric.class,
                         () -> connection.incr(new byte[0], "word".getBytes(StandardCharsets.UTF_8), 1));
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    // ── Compare-and-set エンコード/デコード (issue #141) ─────────────
+    // Exercised directly against Connection (bypassing NanocachedClient)
+    // so the exact wire bytes and every response shape are observable in
+    // isolation, mirroring the INCR tests immediately above.
+
+    @Test
+    void casRequestFrameBytesAndUntaggedResponseDecoding() throws Exception {
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0);
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket serverSocket = server.accept()) {
+            Connection connection = new Connection(clientSocket, false, () -> {});
+            try {
+                java.io.InputStream serverIn = serverSocket.getInputStream();
+                java.io.OutputStream serverOut = serverSocket.getOutputStream();
+                ExecutorService pool = Executors.newSingleThreadExecutor();
+                try {
+                    // `k <ns-len> <key-len> <value-len> <cond> [<ttl>]\n
+                    // <namespace><key><value>` — cond A, namespaced, with a
+                    // ttl: the exact wire bytes.
+                    Future<Boolean> absent = pool.submit(() -> connection.casSet(
+                            "ns".getBytes(StandardCharsets.UTF_8), "key".getBytes(StandardCharsets.UTF_8),
+                            "val".getBytes(StandardCharsets.UTF_8), 60L, "A"));
+                    byte[] absentFrame = "k 2 3 3 A 60\nnskeyval".getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(absentFrame, serverIn.readNBytes(absentFrame.length));
+                    serverOut.write("S\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertTrue(absent.get());
+
+                    // cond P, default namespace (namespace-length 0, still
+                    // always sent), no ttl; mismatch (N).
+                    Future<Boolean> present = pool.submit(() -> connection.casSet(
+                            new byte[0], "k".getBytes(StandardCharsets.UTF_8),
+                            "v".getBytes(StandardCharsets.UTF_8), null, "P"));
+                    byte[] presentFrame = "k 0 1 1 P\nkv".getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(presentFrame, serverIn.readNBytes(presentFrame.length));
+                    serverOut.write("N\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertFalse(present.get());
+
+                    // cond is a 32-character digest, not length-prefixed —
+                    // its own shape identifies it, exactly like A/P.
+                    String digest = "d41d8cd98f00b204e9800998ecf8427e";
+                    Future<Boolean> digestMatch = pool.submit(() -> connection.casSet(
+                            new byte[0], "k".getBytes(StandardCharsets.UTF_8),
+                            "v2".getBytes(StandardCharsets.UTF_8), null, digest));
+                    byte[] digestFrame = ("k 0 1 2 " + digest + "\nkv2").getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(digestFrame, serverIn.readNBytes(digestFrame.length));
+                    serverOut.write("S\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertTrue(digestMatch.get());
+
+                    // Stale routing.
+                    Future<Object> wrongNode = pool.submit(() -> {
+                        try {
+                            return connection.casSet(new byte[0], "k".getBytes(StandardCharsets.UTF_8),
+                                    "v".getBytes(StandardCharsets.UTF_8), null, "A");
+                        } catch (NanocachedException.WrongNode caught) {
+                            return caught;
+                        }
+                    });
+                    byte[] wrongNodeFrame = "k 0 1 1 A\nkv".getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(wrongNodeFrame, serverIn.readNBytes(wrongNodeFrame.length));
+                    serverOut.write("W\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertTrue(wrongNode.get() instanceof NanocachedException.WrongNode);
+
+                    // `x <ns-len> <key-len> <cond>\n<namespace><key>` —
+                    // cond is always a digest here.
+                    Future<Boolean> deleted = pool.submit(() -> connection.casDelete(
+                            new byte[0], "k".getBytes(StandardCharsets.UTF_8), digest));
+                    byte[] deleteFrame = ("x 0 1 " + digest + "\nk").getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(deleteFrame, serverIn.readNBytes(deleteFrame.length));
+                    serverOut.write("D\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertTrue(deleted.get());
+
+                    // Mismatch or missing key: N, exactly like a plain D's
+                    // own miss.
+                    Future<Boolean> notDeleted = pool.submit(() -> connection.casDelete(
+                            new byte[0], "k".getBytes(StandardCharsets.UTF_8), digest));
+                    assertArrayEquals(deleteFrame, serverIn.readNBytes(deleteFrame.length));
+                    serverOut.write("N\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+                    assertFalse(notDeleted.get());
+                } finally {
+                    pool.shutdown();
+                }
+            } finally {
+                connection.close();
+            }
+        }
+    }
+
+    @Test
+    void casRoundTripsOnATaggedConnectionForEveryConditionKind() throws Exception {
+        try (MockNode node = MockNode.withTagSupport()) {
+            Identify.NodeTarget target =
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+            assertTrue(target.tagged());
+            Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
+            try {
+                byte[] key = "k".getBytes(StandardCharsets.UTF_8);
+
+                // A: absent succeeds, then mismatches once present.
+                assertTrue(connection.casSet(new byte[0], key, "v1".getBytes(StandardCharsets.UTF_8), null, "A"));
+                assertFalse(connection.casSet(new byte[0], key, "v2".getBytes(StandardCharsets.UTF_8), null, "A"));
+
+                // P: present succeeds, carrying a ttl through untouched.
+                assertTrue(connection.casSet(new byte[0], key, "v3".getBytes(StandardCharsets.UTF_8), 30L, "P"));
+
+                // Digest: matches the real current content (cross-checked
+                // against this SDK's own independent digest implementation
+                // via the mock's own — see MockNode.digestOf).
+                String currentDigest = NanocachedClient.contentDigest(connection.get(new byte[0], key));
+                assertTrue(connection.casSet(
+                        new byte[0], key, "v4".getBytes(StandardCharsets.UTF_8), null, currentDigest));
+                assertArrayEquals("v4".getBytes(StandardCharsets.UTF_8), connection.get(new byte[0], key));
+
+                // The same (now stale) digest mismatches.
+                assertFalse(connection.casSet(
+                        new byte[0], key, "v5".getBytes(StandardCharsets.UTF_8), null, currentDigest));
+
+                // x: digest-conditioned delete.
+                String latestDigest = NanocachedClient.contentDigest(connection.get(new byte[0], key));
+                assertTrue(connection.casDelete(new byte[0], key, latestDigest));
+                assertNull(connection.get(new byte[0], key));
+
+                // A missing key never matches any digest.
+                assertFalse(connection.casDelete(new byte[0], key, latestDigest));
             } finally {
                 connection.close();
             }

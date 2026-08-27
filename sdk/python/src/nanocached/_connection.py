@@ -1,8 +1,9 @@
 """One already-identified connection to a single nanocached-node, speaking
 the cache protocol (``G``/``S``/``D``, and their namespaced counterparts
 ``g``/``s``/``d`` — issue #105 — plus ``c``/``F`` to clear a namespace or
-flush every namespace, issue #106 — the ``A`` identify exchange happens
-in ``_identify`` before a Connection exists).
+flush every namespace, issue #106, ``i`` to increment/decrement a counter,
+issue #129, and ``k``/``x`` for compare-and-set, issue #141 — the ``A``
+identify exchange happens in ``_identify`` before a Connection exists).
 
 Requests are pipelined onto the socket and matched to responses in send
 order (request pipelining): a dedicated read loop task consumes responses
@@ -119,6 +120,44 @@ def _encode_incr(key: bytes, delta: int, tag: int | None = None, namespace: byte
     return b"i %d %d %d%b\n%b%b" % (len(namespace), len(key), delta, _tag_field(tag), namespace, key)
 
 
+# Compare-and-set (issue #141): like i above, k/x always carry
+# <namespace-length> (0 for the default namespace) — neither op has a
+# pre-namespace legacy uppercase form. <cond> is a bare, un-length-
+# prefixed token: CAS_ABSENT/CAS_PRESENT below, or a 32-character
+# lowercase hex digest bytes object (see _digest.content_digest) callers
+# build themselves — its own shape identifies which kind it is, so it
+# rides in the header exactly where <cond> is documented
+# (docs/protocol.html "k / x"), never length-prefixed or in the body.
+CAS_ABSENT = b"A"
+CAS_PRESENT = b"P"
+
+
+def _encode_cas_set(
+    key: bytes,
+    value: bytes,
+    cond: bytes,
+    ttl_seconds: int = 0,
+    tag: int | None = None,
+    namespace: bytes = b"",
+) -> bytes:
+    # 0 means no expiry — omitted from the wire, exactly like _encode_set's
+    # own ttl_seconds field.
+    if ttl_seconds == 0:
+        return b"k %d %d %d %b%b\n%b%b%b" % (
+            len(namespace), len(key), len(value), cond, _tag_field(tag), namespace, key, value
+        )
+    return b"k %d %d %d %b %d%b\n%b%b%b" % (
+        len(namespace), len(key), len(value), cond, ttl_seconds, _tag_field(tag), namespace, key, value
+    )
+
+
+def _encode_cas_delete(key: bytes, cond: bytes, tag: int | None = None, namespace: bytes = b"") -> bytes:
+    # <cond> here is always a digest (never CAS_ABSENT/CAS_PRESENT) — an
+    # absent- or present-only conditioned delete is already the plain,
+    # unconditional D/d (docs/protocol.html "k / x").
+    return b"x %d %d %b%b\n%b%b" % (len(namespace), len(key), cond, _tag_field(tag), namespace, key)
+
+
 class Connection:
     def __init__(
         self,
@@ -224,6 +263,40 @@ class Connection:
             return None
         if marker == b"T":
             raise NotNumericError()
+        if marker == b"W":
+            raise WrongNodeError()
+        raise self._mismatch(marker)
+
+    async def cas_set(
+        self, key: bytes, value: bytes, cond: bytes, ttl_seconds: int = 0, namespace: bytes = b""
+    ) -> bool:
+        """Sends one ``k`` request to *this* node only (issue #141) —
+        exactly like incr(), cluster fan-out to replicas is the client's
+        job (see NanocachedClient's own CAS docstrings: the primary's
+        literal result is forwarded as a ``set``, ``k`` is never replayed
+        on a replica). Returns ``True`` on success (``S``), ``False`` on
+        a condition mismatch (``N`` — reused as-is, no new response
+        marker exists for this)."""
+        marker, _ = await self._request(
+            lambda tag: _encode_cas_set(key, value, cond, ttl_seconds, tag, namespace)
+        )
+        if marker == b"S":
+            return True
+        if marker == b"N":
+            return False
+        if marker == b"W":
+            raise WrongNodeError()
+        raise self._mismatch(marker)
+
+    async def cas_delete(self, key: bytes, cond: bytes, namespace: bytes = b"") -> bool:
+        """Sends one ``x`` request to *this* node only (issue #141) — see
+        cas_set(). Returns ``True`` on success (``D``), ``False`` on a
+        mismatch or missing key (``N``)."""
+        marker, _ = await self._request(lambda tag: _encode_cas_delete(key, cond, tag, namespace))
+        if marker == b"D":
+            return True
+        if marker == b"N":
+            return False
         if marker == b"W":
             raise WrongNodeError()
         raise self._mismatch(marker)

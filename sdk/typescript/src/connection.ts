@@ -3,6 +3,8 @@ import type { TLSSocket } from "node:tls";
 import { NanocachedError } from "./errors.js";
 import {
   EMPTY_NAMESPACE,
+  encodeCas,
+  encodeCasDelete,
   encodeClear,
   encodeClearAll,
   encodeDelete,
@@ -11,6 +13,7 @@ import {
   encodeSet,
   MAX_RESPONSE_FRAME_LENGTH,
   tryParseResponse,
+  type CasCondition,
   type ParsedResponse,
 } from "./protocol.js";
 
@@ -215,6 +218,40 @@ export class Connection {
     }
     if (response.kind === "notFound") return null;
     if (response.kind === "notNumeric") throw new NotNumericError();
+    if (response.kind === "wrongNode") throw new WrongNodeError();
+    throw this.mismatch(response);
+  }
+
+  /** `k` — compare-and-set (issue #141): stores `value` for `key` only if
+   * `cond` holds against the key's current stored bytes — see
+   * `CasCondition`. Returns `true` on success (the wire's `S`), `false` on
+   * a condition mismatch (the wire's `N`, the same status a miss already
+   * uses — a mismatch is a normal outcome here, never an exception).
+   * Always namespaced on the wire, matching `incr`'s own default here.
+   * This is the single-node primitive only — `NanocachedClient` is what
+   * turns a successful primary CAS into a cluster-wide, drift-free write
+   * by forwarding the literal new value to replicas as an ordinary `set`,
+   * never replaying `k` there (see its own doc comment, mirroring
+   * `incr`'s). */
+  async cas(key: string | Uint8Array, value: Uint8Array, cond: CasCondition, ttlSeconds = 0, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<boolean> {
+    const response = await this.send((tag) => encodeCas(toBytes(key), value, cond, ttlSeconds, tag, namespace));
+    if (response.kind === "stored") return true;
+    if (response.kind === "notFound") return false;
+    if (response.kind === "wrongNode") throw new WrongNodeError();
+    throw this.mismatch(response);
+  }
+
+  /** `x` — compare-and-delete (issue #141): removes `key` only if its
+   * current stored bytes hash to exactly `digest` (see `contentDigest`).
+   * Returns `true` on success (the wire's `D`), `false` on a mismatch or a
+   * missing key (the wire's `N`) — never an exception for either. Always
+   * namespaced on the wire. Like `cas` above, this is the single-node
+   * primitive; `NanocachedClient` forwards a successful primary delete to
+   * replicas as an ordinary `delete`, never replaying `x` there. */
+  async casDelete(key: string | Uint8Array, digest: string, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<boolean> {
+    const response = await this.send((tag) => encodeCasDelete(toBytes(key), digest, tag, namespace));
+    if (response.kind === "deleted") return true;
+    if (response.kind === "notFound") return false;
     if (response.kind === "wrongNode") throw new WrongNodeError();
     throw this.mismatch(response);
   }

@@ -56,6 +56,14 @@ final class MockServers {
          * ever should; a replica gets the result forwarded as an ordinary
          * `set` instead). */
         final AtomicInteger incrCount = new AtomicInteger();
+        /** Counts every `k` (compare-and-set store, issue #141) frame
+         * received — lets a test prove a replica never receives one (only
+         * the primary owner ever should; a replica gets the result
+         * forwarded as an ordinary `set` instead). */
+        final AtomicInteger casSetCount = new AtomicInteger();
+        /** As {@link #casSetCount}, for `x` (compare-and-set delete, issue
+         * #141) frames. */
+        final AtomicInteger casDeleteCount = new AtomicInteger();
         /** Counts every `g`/`s`/`d` frame received — never incremented by
          * `G`/`S`/`D`. Lets a test prove the empty (default) namespace
          * really does send the legacy frame, not `g 0 ...`/etc (issue
@@ -681,6 +689,82 @@ final class MockServers {
                             out.write(updatedValue);
                             out.flush();
                         }
+                        // Compare-and-set (issue #141): always namespaced on
+                        // the wire (0-length namespace = default), like
+                        // INCR. <cond> is a bare, non-length-prefixed token
+                        // — "A" (absent), "P" (present), or a 32-character
+                        // lowercase hex digest (exact content match,
+                        // computed the same way NanocachedClient.contentDigest
+                        // does, independently here so a bug in one isn't
+                        // masked by the other). `k` reuses S/N (no new
+                        // marker); `x` reuses D/N.
+                        case "k" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            byte[] value = in.readNBytes(Integer.parseInt(parts[3]));
+                            String cond = parts[4];
+                            // <ttl-seconds>, when present, is the field
+                            // after <cond>; the tag (on a tagged
+                            // connection) sits after that as the last
+                            // field — mirrors the "s" case's own layout.
+                            int ttlFieldCount = parts.length - (tagged ? 6 : 5);
+                            long ttlSeconds = ttlFieldCount > 0 ? Long.parseLong(parts[5]) : 0;
+                            casSetCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            byte[] existing = namespacedGet(ns, key);
+                            boolean matches = switch (cond) {
+                                case "A" -> existing == null;
+                                case "P" -> existing != null;
+                                default -> existing != null && digestOf(existing).equals(cond);
+                            };
+                            if (matches) {
+                                namespacedPut(ns, key, value);
+                                namespacedPutTtl(ns, key, ttlSeconds);
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            } else {
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            }
+                            out.flush();
+                        }
+                        case "x" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
+                            String cond = parts[3];
+                            casDeleteCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            if (takeWrongNode()) {
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            byte[] existing = namespacedGet(ns, key);
+                            if (existing != null && digestOf(existing).equals(cond)) {
+                                namespacedRemove(ns, key);
+                                out.write(("D" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            } else {
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                            }
+                            out.flush();
+                        }
                         case "d" -> {
                             String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
@@ -830,6 +914,29 @@ final class MockServers {
 
         static String keyOf(byte[] key) {
             return new String(key, StandardCharsets.ISO_8859_1);
+        }
+
+        /** The CAS digest (issue #141): SHA-256 of {@code value}, truncated
+         * to its first 16 bytes, lowercase hex-encoded. Deliberately its
+         * own independent implementation rather than a call to {@link
+         * NanocachedClient#contentDigest} — this mock stands in for the
+         * server, and a real server implementation is independent of this
+         * SDK's own, so a bug shared between the SDK and this mock
+         * wouldn't be caught by any test that only compares the two
+         * against each other. */
+        private static String digestOf(byte[] value) {
+            try {
+                java.security.MessageDigest sha256 = java.security.MessageDigest.getInstance("SHA-256");
+                byte[] digest = sha256.digest(value);
+                StringBuilder hex = new StringBuilder(32);
+                for (int i = 0; i < 16; i++) {
+                    hex.append(Character.forDigit((digest[i] >> 4) & 0xF, 16));
+                    hex.append(Character.forDigit(digest[i] & 0xF, 16));
+                }
+                return hex.toString();
+            } catch (java.security.NoSuchAlgorithmException impossible) {
+                throw new AssertionError(impossible);
+            }
         }
     }
 

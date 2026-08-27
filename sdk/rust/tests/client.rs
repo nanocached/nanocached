@@ -109,6 +109,16 @@ struct NodeState {
     /// on an `I` response gets forwarded verbatim to the replica leg sets
     /// this directly rather than relying on genuine expiry bookkeeping.
     incr_ttl_seconds: AtomicUsize,
+    /// How many `k` (compare-and-set store, issue #141) requests this node
+    /// has ever received — the critical assertion for cluster replication:
+    /// a replica must receive a `set`/`s` carrying the CAS success's
+    /// literal result, and never a `k` of its own (which would let it
+    /// re-evaluate `<cond>` against its own possibly-different copy).
+    cas_sets: AtomicUsize,
+    /// How many `x` (compare-and-set delete, issue #141) requests this
+    /// node has ever received — a replica must never receive one either;
+    /// see `cas_sets`'s own doc comment.
+    cas_deletes: AtomicUsize,
 }
 
 struct MockNode {
@@ -489,8 +499,105 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     return;
                 }
             }
+            "k" => {
+                // Compare-and-set store (issue #141): always namespaced,
+                // exactly like `i` — no branch on `parts[0]`'s case. Field
+                // positions for namespace/key/value lengths are fixed
+                // regardless of whether the optional ttl/tag trail the
+                // `<cond>` field.
+                let namespace = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                let key = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+                let value = read_exact(&mut stream, parts[3].parse().unwrap()).await;
+                let cond = parts[4].to_string();
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                state.cas_sets.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let composite = store_key(&namespace, &key);
+                let reply = if take_wrong_node(&state) {
+                    format!("W{tag_suffix}\n")
+                } else {
+                    let mut store = state.store.lock().unwrap();
+                    let holds = cas_condition_holds(&cond, store.get(&composite));
+                    if holds {
+                        store.insert(composite.clone(), value);
+                        drop(store);
+                        state
+                            .store_namespaces
+                            .lock()
+                            .unwrap()
+                            .insert(composite, namespace);
+                        format!("S{tag_suffix}\n")
+                    } else {
+                        format!("N{tag_suffix}\n")
+                    }
+                };
+                if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            "x" => {
+                // Compare-and-set delete (issue #141): `<cond>` is always
+                // a digest here.
+                let namespace = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                let key = read_exact(&mut stream, parts[2].parse().unwrap()).await;
+                let cond = parts[3].to_string();
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                state.cas_deletes.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let composite = store_key(&namespace, &key);
+                let reply = if take_wrong_node(&state) {
+                    format!("W{tag_suffix}\n")
+                } else {
+                    let mut store = state.store.lock().unwrap();
+                    let holds = cas_condition_holds(&cond, store.get(&composite));
+                    if holds {
+                        store.remove(&composite);
+                        drop(store);
+                        state.store_namespaces.lock().unwrap().remove(&composite);
+                        format!("D{tag_suffix}\n")
+                    } else {
+                        format!("N{tag_suffix}\n")
+                    }
+                };
+                if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
             _ => return,
         }
+    }
+}
+
+/// Evaluates one of `k`/`x`'s `<cond>` tokens against the mock's current
+/// stored value (`None` meaning absent), mirroring the real server's own
+/// three-way `A`/`P`/digest semantics (docs/protocol.html#cas) closely
+/// enough for these tests: `A` holds only when absent, `P` holds only
+/// when present, and anything else is treated as a digest — matched via
+/// this crate's own public `content_digest`/`CasToken`, so the mock is
+/// exercising the exact same digest computation the SDK's callers would.
+fn cas_condition_holds(cond: &str, existing: Option<&Vec<u8>>) -> bool {
+    match cond {
+        "A" => existing.is_none(),
+        "P" => existing.is_some(),
+        digest_hex => existing.is_some_and(|value| {
+            nanocached::CasToken::from(nanocached::content_digest(value)).to_string() == digest_hex
+        }),
     }
 }
 
@@ -869,6 +976,216 @@ async fn incr_round_trips_on_a_tagged_connection() {
     assert_eq!(client.incr("hits", 1).await.unwrap(), Some(12));
 
     client.close().await;
+    node.stop();
+}
+
+// ── compare-and-set (issue #141) ──────────────────────────────────────
+
+#[tokio::test]
+async fn put_if_absent_stores_only_when_the_key_is_absent() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert!(client.put_if_absent("name", "Alice", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Alice".to_string()));
+    assert_eq!(node.state.cas_sets.load(Ordering::SeqCst), 1);
+
+    // The key now exists — a second put_if_absent is a plain mismatch,
+    // never an error, and leaves the stored value untouched.
+    assert!(!client.put_if_absent("name", "Bob", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Alice".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn replace_if_present_stores_only_when_the_key_already_exists() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    // Absent key: a mismatch, not an error.
+    assert!(!client.replace_if_present("name", "Alice", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), None);
+
+    client.set("name", "Alice", 0).await.unwrap();
+    assert!(client.replace_if_present("name", "Bob", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Bob".to_string()));
+    assert_eq!(node.state.cas_sets.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn replace_stores_only_when_the_digest_matches() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("name", "Alice", 0).await.unwrap();
+    let (value, token) = client.get_with_token("name").await.unwrap().unwrap();
+    assert_eq!(value, b"Alice");
+
+    // A stale digest (the value changed underneath since it was read)
+    // mismatches without touching the stored value.
+    let stale = nanocached::CasToken::from(nanocached::content_digest(b"someone-else"));
+    assert!(!client.replace("name", stale, "Mallory", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Alice".to_string()));
+
+    // The real token from the read above matches and replaces.
+    assert!(client.replace("name", token, "Bob", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Bob".to_string()));
+
+    // A bare [u8; 16] digest (from `content_digest` directly, not a
+    // `CasToken`) is accepted too via `impl Into<CasToken>`.
+    let bob_digest = nanocached::content_digest(b"Bob");
+    assert!(client
+        .replace("name", bob_digest, "Carol", 0)
+        .await
+        .unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Carol".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn replace_against_a_missing_key_mismatches() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let digest = nanocached::content_digest(b"Alice");
+    assert!(!client.replace("name", digest, "Bob", 0).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), None);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn delete_if_matches_removes_only_when_the_digest_matches() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("name", "Alice", 0).await.unwrap();
+
+    let stale = nanocached::content_digest(b"someone-else");
+    assert!(!client.delete_if_matches("name", stale).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), Some("Alice".to_string()));
+    assert_eq!(node.state.cas_deletes.load(Ordering::SeqCst), 1);
+
+    let current = nanocached::content_digest(b"Alice");
+    assert!(client.delete_if_matches("name", current).await.unwrap());
+    assert_eq!(client.get("name").await.unwrap(), None);
+
+    // Deleted already — the same digest now mismatches against the
+    // (missing) key rather than erroring.
+    assert!(!client.delete_if_matches("name", current).await.unwrap());
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_with_token_returns_none_on_a_missing_key() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert_eq!(client.get_with_token("missing").await.unwrap(), None);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn a_namespaced_cas_scopes_to_that_namespace() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("tenant");
+
+    assert!(ns.put_if_absent("name", "Alice", 0).await.unwrap());
+    // The default namespace's own "name" key is untouched — namespaced
+    // and unnamespaced CAS keys are wholly independent entries.
+    assert_eq!(client.get("name").await.unwrap(), None);
+
+    let (_, token) = ns.get_with_token("name").await.unwrap().unwrap();
+    assert!(ns.replace("name", token, "Bob", 0).await.unwrap());
+    assert_eq!(ns.get("name").await.unwrap(), Some("Bob".to_string()));
+
+    let digest = nanocached::content_digest(b"Bob");
+    assert!(ns.delete_if_matches("name", digest).await.unwrap());
+    assert_eq!(ns.get("name").await.unwrap(), None);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn cas_round_trips_on_a_tagged_connection() {
+    let node = MockNode::start_with(NodeState {
+        support_tags: true,
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert!(client.put_if_absent("name", "Alice", 60).await.unwrap());
+    let (_, token) = client.get_with_token("name").await.unwrap().unwrap();
+    assert!(client.replace("name", token, "Bob", 0).await.unwrap());
+    let digest = nanocached::content_digest(b"Bob");
+    assert!(client.delete_if_matches("name", digest).await.unwrap());
+
+    client.close().await;
+    node.stop();
+}
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn get_with_token_hashes_the_raw_wire_bytes_not_the_decompressed_value() {
+    // The critical compression correctness point (docs/protocol.html#cas
+    // and cas.rs's own module doc comment): the digest must match what
+    // the server itself would compute — SHA-256 of the exact bytes on the
+    // wire, marker byte included — never the decompressed value `get`
+    // returns. A second, non-compressing client fetches the same key's
+    // raw bytes (with `compress` off, `get_bytes` returns them completely
+    // untouched) as an independent check on what's actually stored.
+    let node = MockNode::start().await;
+    let writer =
+        NanocachedClient::connect(options(node.port).compress(true).compression_threshold(16))
+            .await
+            .unwrap();
+
+    let value = "x".repeat(1000);
+    writer.set("k", value.as_str(), 0).await.unwrap();
+    let (decompressed, token) = writer.get_with_token("k").await.unwrap().unwrap();
+    assert_eq!(decompressed, value.as_bytes());
+
+    let raw_reader = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let raw = raw_reader.get_bytes("k").await.unwrap().unwrap();
+    assert_eq!(
+        raw[0], 0x01,
+        "the stored bytes should carry the DEFLATE marker"
+    );
+    assert_ne!(
+        raw, decompressed,
+        "the raw wire bytes and the decompressed value must differ for this test to mean anything"
+    );
+
+    assert_eq!(
+        token,
+        nanocached::CasToken::from(nanocached::content_digest(&raw)),
+        "the token must hash the raw (marker-prefixed) wire bytes, not the decompressed value"
+    );
+
+    // And using that token for a CAS replace actually works end to end —
+    // the server-side mock's own condition check also hashes the raw
+    // stored bytes (see `cas_condition_holds`), so this would fail if the
+    // client and mock ever disagreed on which bytes to hash.
+    assert!(writer.replace("k", token, "short", 0).await.unwrap());
+    assert_eq!(writer.get("k").await.unwrap(), Some("short".to_string()));
+
+    writer.close().await;
+    raw_reader.close().await;
     node.stop();
 }
 
@@ -2232,6 +2549,148 @@ async fn writes_route_around_a_dead_primary_once_discovery_drops_it() {
 
     client.set(key, "v", 0).await.unwrap();
     assert_eq!(client.get(key).await.unwrap(), Some("v".to_string()));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── compare-and-set replication (issue #141) ───────────────────────────
+
+#[tokio::test]
+async fn cas_set_replicates_the_result_never_the_operation() {
+    // The single most important CAS test, mirroring incr's own: a
+    // successful `k` must go to the primary only, and its literal result
+    // forwarded to the replica as a `set` — never replayed as another `k`
+    // there (a replica evaluating the same condition against its own
+    // possibly-different copy could reach a different outcome). Asserting
+    // frame counts, not just final stored values, is what actually catches
+    // a buggy implementation that replayed `k` on the replica and merely
+    // happened to reach the same value.
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("name");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"name".to_vec(), b"Alice".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let digest = nanocached::content_digest(b"Alice");
+    assert!(client.replace("name", digest, "Bob", 0).await.unwrap());
+
+    assert_eq!(
+        primary.state.cas_sets.load(Ordering::SeqCst),
+        1,
+        "the primary should have received exactly one k frame"
+    );
+    assert_eq!(
+        replica.state.cas_sets.load(Ordering::SeqCst),
+        0,
+        "the replica must never receive a k frame — only the primary ever evaluates <cond>"
+    );
+
+    assert_eq!(
+        replica.state.store.lock().unwrap().get(b"name".as_slice()),
+        Some(&b"Bob".to_vec()),
+        "the replica should hold the CAS success's literal result via an ordinary set"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_mismatched_cas_set_never_touches_the_replica() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("name");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"name".to_vec(), b"Alice".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let stale = nanocached::content_digest(b"someone-else");
+    assert!(!client.replace("name", stale, "Bob", 0).await.unwrap());
+
+    assert_eq!(primary.state.cas_sets.load(Ordering::SeqCst), 1);
+    assert_eq!(replica.state.cas_sets.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        replica.state.store.lock().unwrap().get(b"name".as_slice()),
+        None,
+        "nothing changed on the primary, so nothing should have been forwarded"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn cas_delete_replicates_the_result_never_the_operation() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("name");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"name".to_vec(), b"Alice".to_vec());
+    replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"name".to_vec(), b"Alice".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let digest = nanocached::content_digest(b"Alice");
+    assert!(client.delete_if_matches("name", digest).await.unwrap());
+
+    assert_eq!(
+        primary.state.cas_deletes.load(Ordering::SeqCst),
+        1,
+        "the primary should have received exactly one x frame"
+    );
+    assert_eq!(
+        replica.state.cas_deletes.load(Ordering::SeqCst),
+        0,
+        "the replica must never receive an x frame — only the primary ever evaluates <cond>"
+    );
+    assert!(
+        !replica
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .contains_key(b"name".as_slice()),
+        "the replica should have received the deletion as an ordinary delete"
+    );
 
     client.close().await;
     discovery.stop();

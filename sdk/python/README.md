@@ -176,6 +176,63 @@ rather than replaying the increment on them, so a replica can never drift
 onto a value the primary doesn't itself hold (e.g. from an earlier
 dropped replica write, or the replica separately evicting the key).
 
+## Compare-and-set
+
+`put_if_absent`, `replace_if_present`, `replace`, and `delete_if_matches`
+condition a write or delete on the key's *current* stored bytes, atomic on
+the node that owns the key:
+
+```python
+# add()/putIfAbsent(): succeeds only if the key is absent.
+await client.put_if_absent("lock:job-1", "worker-a")   # True — stored
+await client.put_if_absent("lock:job-1", "worker-b")   # False — already held
+
+# replace(key, value): succeeds only if the key currently holds *any* value.
+await client.replace_if_present("lock:job-1", "worker-a-retry")  # True
+
+# replace(key, old, new): succeeds only if the key's current bytes match
+# a token from a prior read exactly.
+value, token = await client.get_with_token("lock:job-1")
+await client.set("lock:job-1", "someone-else")           # changed out from under us
+await client.replace("lock:job-1", token, "worker-a")     # False — stale token
+
+# remove(key, old): a digest-conditioned delete.
+value, token = await client.get_with_token("lock:job-1")
+await client.delete_if_matches("lock:job-1", token)        # True
+```
+
+`token` is not the value itself — it's `content_digest()`'s 32-character
+hex digest of the value's exact stored bytes, normally obtained from
+`get_with_token()` (the `get`/`get_bytes` companion that returns a token
+alongside the value). Reconstructing a token from a value you already
+hold, instead of one from a real prior read, is only correct if your
+reconstruction is byte-identical to what the server actually stores —
+exactly as sensitive to encoding as memcached's own value-based CAS, and
+not guaranteed at all if `compress` differs between whoever wrote the
+value and whoever built the token. The read-then-write-back path shown
+above is always correct.
+
+Every one of these returns a plain `bool` — a condition mismatch is
+`False`, not an exception, the same idiom `delete()` already uses for
+"nothing here to act on". Available on `Namespace` too.
+
+**Not a distributed lock.** LRU eviction reclaims a key exactly as it
+would after a plain `set`, CAS or not: a "lock" built from
+`put_if_absent` plus a TTL can be silently double-acquired if the key is
+evicted under memory pressure between the two callers' attempts.
+`put_if_absent`/`replace`/`delete_if_matches` are atomic against
+concurrent requests on the node that currently owns the key, the same
+guarantee `incr`/`decr` make and no stronger.
+
+In a cluster, only the primary owner evaluates the condition; its result
+is then forwarded to the remaining owners as an ordinary `set`/`delete`
+rather than replaying the conditioned op on them — the same rule
+`incr`/`decr` follow, and for the same reason: a replica evaluating the
+same condition against its own possibly-different copy could reach a
+different outcome than the primary just did. See
+[`docs/protocol.html#cas`](../../docs/protocol.html#cas) for the wire
+format and the digest algorithm.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

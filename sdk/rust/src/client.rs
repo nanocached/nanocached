@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
+use crate::cas::{content_digest, CasToken};
 use crate::compression::resolve_compression;
-use crate::connection::Connection;
+use crate::connection::{CasCondition, Connection};
 use crate::error::{Error, Result};
 use crate::hash_ring::HashRing;
 use crate::identify::{
@@ -1287,6 +1288,25 @@ impl NanocachedClient {
         let key = key.as_ref();
         validate_key(namespace, key)?;
         self.before_operation().await?;
+        let value = self.read_raw_with_repair(namespace, key).await?;
+        match value {
+            Some(bytes) if self.inner.compress => {
+                Ok(Some(crate::compression::decompress_value(&bytes)?))
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// The raw-wire-bytes read shared by [`Self::get_bytes_in`] and
+    /// [`Self::get_with_token_in`] (compare-and-set, issue #141): the
+    /// cluster-retried primary read, falling back to read repair on a
+    /// clean miss exactly as `get_bytes_in` always has. Returns the bytes
+    /// exactly as they came off the wire — the compression marker byte
+    /// still attached when `compress` is enabled — since that is what
+    /// `get_with_token_in` must hash (see `cas.rs`'s module doc comment
+    /// for why hashing the *decompressed* value would never match the
+    /// server's own digest).
+    async fn read_raw_with_repair(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut value = self
             .with_cluster_retry(|| self.read(namespace, key))
             .await?;
@@ -1296,11 +1316,48 @@ impl NanocachedClient {
                 value = self.try_read_repair(namespace, key).await;
             }
         }
-        match value {
-            Some(bytes) if self.inner.compress => {
-                Ok(Some(crate::compression::decompress_value(&bytes)?))
+        Ok(value)
+    }
+
+    /// Compare-and-set (CAS, issue #141): like [`Self::get_bytes`], but
+    /// also returns a [`CasToken`] — the digest of the value's exact wire
+    /// bytes — for use with [`Self::replace`]/[`Self::delete_if_matches`].
+    /// Computed from the raw bytes *before* this client's own
+    /// decompression step when `compress` is enabled, so the token always
+    /// matches what the server itself would compute (the server never
+    /// decompresses); hashing the decompressed value instead would
+    /// silently never match. There is no extra wire round trip — the
+    /// digest is derived client-side from the same `get` response
+    /// [`Self::get_bytes`] already reads.
+    pub async fn get_with_token(
+        &self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<(Vec<u8>, CasToken)>> {
+        self.get_with_token_in(DEFAULT_NAMESPACE, key).await
+    }
+
+    /// The shared implementation behind [`Self::get_with_token`] and
+    /// [`Namespace::get_with_token`] (Namespaces, issue #105).
+    async fn get_with_token_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<(Vec<u8>, CasToken)>> {
+        let key = key.as_ref();
+        validate_key(namespace, key)?;
+        self.before_operation().await?;
+        let raw = self.read_raw_with_repair(namespace, key).await?;
+        match raw {
+            Some(raw) => {
+                let token = CasToken::from(content_digest(&raw));
+                let value = if self.inner.compress {
+                    crate::compression::decompress_value(&raw)?
+                } else {
+                    raw
+                };
+                Ok(Some((value, token)))
             }
-            other => Ok(other),
+            None => Ok(None),
         }
     }
 
@@ -1556,6 +1613,257 @@ impl NanocachedClient {
         self.replicate_writes(namespace, key, replicas, body).await;
 
         Ok(Some(value))
+    }
+
+    /// Compare-and-set (CAS, issue #141): stores `value` only if `key` is
+    /// currently absent (including lazily expired) — `add`/`putIfAbsent`.
+    /// Returns `true` if it was stored, `false` if the key already
+    /// existed and nothing changed — a mismatch is a plain boolean
+    /// outcome here, exactly like [`Self::delete`] returning `false`
+    /// rather than erroring when there was nothing to delete, never an
+    /// [`Error`]. `ttl_seconds == 0` means no expiry, exactly like
+    /// [`Self::set`]. Transparently compresses `value` exactly like
+    /// [`Self::set`] when `compress` is enabled.
+    ///
+    /// **This is not a distributed lock.** LRU eviction reclaims a key
+    /// exactly as it would after a plain `set`, CAS or not: a key used as
+    /// a lock (`put_if_absent` to acquire, a TTL to eventually release)
+    /// that gets evicted under memory pressure lets a second caller's
+    /// `put_if_absent` succeed while the first still believes it holds
+    /// the lock — a silent double-acquisition CAS cannot detect. See
+    /// docs/protocol.html#cas.
+    pub async fn put_if_absent(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        self.cas_set_in(
+            DEFAULT_NAMESPACE,
+            key,
+            value,
+            ttl_seconds,
+            CasCondition::Absent,
+        )
+        .await
+    }
+
+    /// Compare-and-set (CAS, issue #141): stores `value` only if `key`
+    /// currently holds any (unexpired) value, whatever it is — the
+    /// two-argument `replace(key, value)`. Returns `true` if it was
+    /// stored, `false` if the key was absent and nothing changed. See
+    /// [`Self::put_if_absent`] for the shared mismatch-is-a-bool and
+    /// not-a-distributed-lock notes, which apply here identically.
+    pub async fn replace_if_present(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        self.cas_set_in(
+            DEFAULT_NAMESPACE,
+            key,
+            value,
+            ttl_seconds,
+            CasCondition::Present,
+        )
+        .await
+    }
+
+    /// Compare-and-set (CAS, issue #141): stores `new_value` only if
+    /// `key` currently holds an unexpired value whose content digest
+    /// equals `expected` exactly — the three-argument `replace(key, old,
+    /// new)`. Returns `true` if it was stored, `false` if the key's
+    /// current value (or its absence) didn't match and nothing changed.
+    /// See [`Self::put_if_absent`] for the shared mismatch-is-a-bool and
+    /// not-a-distributed-lock notes, which apply here identically.
+    ///
+    /// `expected` accepts a [`CasToken`] from a prior
+    /// [`Self::get_with_token`] — always correct, since it hashes the
+    /// same wire bytes the server itself compares against — or a bare
+    /// `[u8; 16]` digest computed directly via [`content_digest`] from a
+    /// value this caller already holds. That second path is exactly as
+    /// sensitive to encoding as memcached's own value-based CAS: it is
+    /// only correct if re-serializing (and, with `compress` enabled,
+    /// re-compressing) that value reproduces byte-identical output to
+    /// what the server actually stores — true within one client sharing
+    /// one serializer/compressor, not guaranteed across languages with
+    /// client-side compression enabled. Prefer reading the token back via
+    /// `get_with_token` whenever the caller has one available.
+    pub async fn replace(
+        &self,
+        key: impl AsRef<[u8]>,
+        expected: impl Into<CasToken>,
+        new_value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        self.cas_set_in(
+            DEFAULT_NAMESPACE,
+            key,
+            new_value,
+            ttl_seconds,
+            CasCondition::Digest(expected.into().digest()),
+        )
+        .await
+    }
+
+    /// The shared implementation behind [`Self::put_if_absent`]/
+    /// [`Self::replace_if_present`]/[`Self::replace`] and their
+    /// [`Namespace`] counterparts (Namespaces, issue #105).
+    async fn cas_set_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+        condition: CasCondition,
+    ) -> Result<bool> {
+        let key = key.as_ref();
+        let owned_compressed;
+        let value: &[u8] = if self.inner.compress {
+            owned_compressed = crate::compression::compress_value(
+                value.as_ref(),
+                self.inner.compression_threshold,
+            );
+            &owned_compressed
+        } else {
+            value.as_ref()
+        };
+        validate_key_and_value(namespace, key, value)?;
+        self.before_operation().await?;
+        self.with_cluster_retry(|| self.cas_set_once(namespace, key, value, ttl_seconds, condition))
+            .await
+    }
+
+    /// The primary-then-replicate-result driver behind `cas_set_in`
+    /// (compare-and-set, issue #141) — mirrors `incr_once`'s shape
+    /// exactly (see its own doc comment for the full reasoning): `k`
+    /// goes to the primary only, and only once it succeeds does the
+    /// literal value it just stored get forwarded to the remaining
+    /// owners as a `set` (`replicate_writes`, shared with `write` and
+    /// `incr_once`) — never replayed as another `k` there, since a
+    /// replica evaluating `condition` against its own possibly-different
+    /// copy could reach a different outcome than the primary just did. A
+    /// mismatch (`Ok(false)`) touches no replica at all: nothing was
+    /// written on the primary, so there is nothing to forward.
+    async fn cas_set_once(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+        ttl_seconds: u64,
+        condition: CasCondition,
+    ) -> Result<bool> {
+        let owners = {
+            let state = self.inner.state.lock().await;
+            if let Target::Single { .. } = state.target {
+                drop(state);
+                let op = |connection: Arc<Connection>| async move {
+                    connection
+                        .cas_set(namespace, key, value, condition, ttl_seconds)
+                        .await
+                };
+                return self.apply_reconnecting(None, &op).await;
+            }
+            Self::owner_names(&state, namespace, key)
+        };
+
+        let Some((primary, replicas)) = owners.split_first() else {
+            return Err(Error::ConnectionLost(
+                "nanocached: no owner is reachable for this key".to_string(),
+            ));
+        };
+
+        let primary_op = |connection: Arc<Connection>| async move {
+            connection
+                .cas_set(namespace, key, value, condition, ttl_seconds)
+                .await
+        };
+        let stored = self.apply_reconnecting(Some(primary), &primary_op).await?;
+        if !stored {
+            return Ok(false);
+        }
+
+        let body = WriteBody::Set { value, ttl_seconds };
+        self.replicate_writes(namespace, key, replicas, body).await;
+
+        Ok(true)
+    }
+
+    /// Compare-and-set (CAS, issue #141): removes `key` only if it
+    /// currently holds an unexpired value whose content digest equals
+    /// `expected` exactly — the two-argument `remove(key, old)`. Returns
+    /// `true` if it was removed, `false` on a digest mismatch or a
+    /// missing key — a mismatch is a plain boolean outcome, never an
+    /// [`Error`], exactly like [`Self::delete`]'s own hit/miss
+    /// convention. See [`Self::replace`]'s doc comment for `expected`'s
+    /// [`CasToken`]-or-raw-digest acceptance and its encoding caveat, and
+    /// [`Self::put_if_absent`]'s for the not-a-distributed-lock note —
+    /// both apply here identically.
+    pub async fn delete_if_matches(
+        &self,
+        key: impl AsRef<[u8]>,
+        expected: impl Into<CasToken>,
+    ) -> Result<bool> {
+        self.cas_delete_in(DEFAULT_NAMESPACE, key, expected.into().digest())
+            .await
+    }
+
+    /// The shared implementation behind [`Self::delete_if_matches`] and
+    /// [`Namespace::delete_if_matches`] (Namespaces, issue #105).
+    async fn cas_delete_in(
+        &self,
+        namespace: &[u8],
+        key: impl AsRef<[u8]>,
+        digest: [u8; 16],
+    ) -> Result<bool> {
+        let key = key.as_ref();
+        validate_key(namespace, key)?;
+        self.before_operation().await?;
+        self.with_cluster_retry(|| self.cas_delete_once(namespace, key, digest))
+            .await
+    }
+
+    /// The primary-then-replicate-result driver behind `cas_delete_in`
+    /// (compare-and-set, issue #141) — see `cas_set_once`'s doc comment
+    /// for the shared reasoning; a success here replicates as a plain
+    /// `delete` instead of a `set`.
+    async fn cas_delete_once(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        digest: [u8; 16],
+    ) -> Result<bool> {
+        let owners = {
+            let state = self.inner.state.lock().await;
+            if let Target::Single { .. } = state.target {
+                drop(state);
+                let op = |connection: Arc<Connection>| async move {
+                    connection.cas_delete(namespace, key, digest).await
+                };
+                return self.apply_reconnecting(None, &op).await;
+            }
+            Self::owner_names(&state, namespace, key)
+        };
+
+        let Some((primary, replicas)) = owners.split_first() else {
+            return Err(Error::ConnectionLost(
+                "nanocached: no owner is reachable for this key".to_string(),
+            ));
+        };
+
+        let primary_op = |connection: Arc<Connection>| async move {
+            connection.cas_delete(namespace, key, digest).await
+        };
+        let deleted = self.apply_reconnecting(Some(primary), &primary_op).await?;
+        if !deleted {
+            return Ok(false);
+        }
+
+        self.replicate_writes(namespace, key, replicas, WriteBody::Delete)
+            .await;
+
+        Ok(true)
     }
 
     /// Flushes every namespace, the default one included, across every
@@ -2575,6 +2883,82 @@ impl Namespace {
     pub async fn decr(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<Option<i64>> {
         self.client
             .incr_in(&self.namespace, key, negate_delta(delta)?)
+            .await
+    }
+
+    /// See [`NanocachedClient::get_with_token`]; scoped to this namespace.
+    pub async fn get_with_token(
+        &self,
+        key: impl AsRef<[u8]>,
+    ) -> Result<Option<(Vec<u8>, CasToken)>> {
+        self.client.get_with_token_in(&self.namespace, key).await
+    }
+
+    /// See [`NanocachedClient::put_if_absent`]; scoped to this namespace.
+    pub async fn put_if_absent(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        self.client
+            .cas_set_in(
+                &self.namespace,
+                key,
+                value,
+                ttl_seconds,
+                CasCondition::Absent,
+            )
+            .await
+    }
+
+    /// See [`NanocachedClient::replace_if_present`]; scoped to this
+    /// namespace.
+    pub async fn replace_if_present(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        self.client
+            .cas_set_in(
+                &self.namespace,
+                key,
+                value,
+                ttl_seconds,
+                CasCondition::Present,
+            )
+            .await
+    }
+
+    /// See [`NanocachedClient::replace`]; scoped to this namespace.
+    pub async fn replace(
+        &self,
+        key: impl AsRef<[u8]>,
+        expected: impl Into<CasToken>,
+        new_value: impl AsRef<[u8]>,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        self.client
+            .cas_set_in(
+                &self.namespace,
+                key,
+                new_value,
+                ttl_seconds,
+                CasCondition::Digest(expected.into().digest()),
+            )
+            .await
+    }
+
+    /// See [`NanocachedClient::delete_if_matches`]; scoped to this
+    /// namespace.
+    pub async fn delete_if_matches(
+        &self,
+        key: impl AsRef<[u8]>,
+        expected: impl Into<CasToken>,
+    ) -> Result<bool> {
+        self.client
+            .cas_delete_in(&self.namespace, key, expected.into().digest())
             .await
     }
 

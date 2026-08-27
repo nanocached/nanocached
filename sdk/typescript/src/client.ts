@@ -6,11 +6,12 @@ import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
-import { checkKeyAndValue, EMPTY_NAMESPACE } from "./protocol.js";
+import { checkKeyAndValue, contentDigest, EMPTY_NAMESPACE, type CasCondition } from "./protocol.js";
 
 export { ConnectionLostError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
+export { contentDigest } from "./protocol.js";
 
 // A value decoded by get() must be exactly what set() would have encoded —
 // no silent U+FFFD replacement for bytes that aren't valid UTF-8. A single
@@ -368,11 +369,16 @@ async function dialClusterNode(
 interface NamespaceOps {
   get(key: string | Uint8Array): Promise<string | null>;
   getBytes(key: string | Uint8Array): Promise<Buffer | null>;
+  getWithToken(key: string | Uint8Array): Promise<{ value: Buffer; token: string } | null>;
   set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void>;
   delete(key: string | Uint8Array): Promise<boolean>;
   clear(): Promise<void>;
   incr(key: string | Uint8Array, delta: number): Promise<number | null>;
   decr(key: string | Uint8Array, delta: number): Promise<number | null>;
+  putIfAbsent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<boolean>;
+  replaceIfPresent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<boolean>;
+  replace(key: string | Uint8Array, token: string, newValue: string | Uint8Array, ttlSeconds: number): Promise<boolean>;
+  deleteIfMatches(key: string | Uint8Array, token: string): Promise<boolean>;
 }
 
 /**
@@ -434,6 +440,31 @@ export class NanocachedNamespace {
   /** See `NanocachedClient.decr`. */
   decr(key: string | Uint8Array, delta = 1): Promise<number | null> {
     return this.ops.decr(key, delta);
+  }
+
+  /** See `NanocachedClient.getWithToken`. */
+  getWithToken(key: string | Uint8Array): Promise<{ value: Buffer; token: string } | null> {
+    return this.ops.getWithToken(key);
+  }
+
+  /** See `NanocachedClient.putIfAbsent`. */
+  putIfAbsent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
+    return this.ops.putIfAbsent(key, value, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.replaceIfPresent`. */
+  replaceIfPresent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
+    return this.ops.replaceIfPresent(key, value, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.replace`. */
+  replace(key: string | Uint8Array, token: string, newValue: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
+    return this.ops.replace(key, token, newValue, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.deleteIfMatches`. */
+  deleteIfMatches(key: string | Uint8Array, token: string): Promise<boolean> {
+    return this.ops.deleteIfMatches(key, token);
   }
 }
 
@@ -909,12 +940,37 @@ export class NanocachedClient {
     return this.getBytesInNamespace(EMPTY_NAMESPACE, key);
   }
 
+  /** Compare-and-set (issue #141): reads `key` like `getBytes`, but also
+   * returns a `token` — a content digest of the value's exact stored
+   * bytes — that `replace`/`deleteIfMatches` accept as their expected
+   * value, so a caller can act on a value only if nothing else changed it
+   * since this read. `null` on a miss, matching `get`'s own convention.
+   * See README.md's "Compare-and-set" section and docs/protocol.html#cas. */
+  async getWithToken(key: string | Uint8Array): Promise<{ value: Buffer; token: string } | null> {
+    return this.getWithTokenInNamespace(EMPTY_NAMESPACE, key);
+  }
+
   private async getInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<string | null> {
     const value = await this.getBytesInNamespace(namespace, key);
     return value === null ? null : UTF8_DECODER.decode(value);
   }
 
   private async getBytesInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<Buffer | null> {
+    const value = await this.getRawInNamespace(namespace, key);
+    if (value === null || !this.compress) return value;
+    return decompressValue(value);
+  }
+
+  /** The raw-wire-bytes fetch `getBytes`/`getWithToken` both build on:
+   * routing, `W` refresh-and-retry, and read repair, but no decompression
+   * — for a compression-enabled client this is exactly the marker-
+   * prefixed bytes the server itself stores, never the decompressed
+   * value. Factored out so `getWithToken` (issue #141) can compute
+   * `contentDigest` over these same bytes: the digest MUST match what the
+   * server would compute, and the server never decompresses, so hashing
+   * anything else would silently break every CAS call once compression is
+   * on. */
+  private async getRawInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     let value = await this.withWrongNodeRetry(() =>
@@ -925,8 +981,23 @@ export class NanocachedClient {
     if (value === null && this.readRepair && this.target.kind === "cluster") {
       value = await this.tryReadRepair(key, namespace);
     }
-    if (value === null || !this.compress) return value;
-    return decompressValue(value);
+    return value;
+  }
+
+  /** Compare-and-set (issue #141): the low-level "get with a CAS token"
+   * primitive — `null` on a miss, matching `get`'s own convention.
+   * `token` is `contentDigest` of the exact raw wire bytes (marker byte
+   * included, for a compression-enabled client), computed *before*
+   * decompression — the same bytes the server itself hashes — so it can
+   * be handed straight to `replace`/`deleteIfMatches` to condition on
+   * exactly the value just read, regardless of `compress`. `value` is the
+   * ordinary, decompressed result `getBytes` would return. */
+  private async getWithTokenInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<{ value: Buffer; token: string } | null> {
+    const raw = await this.getRawInNamespace(namespace, key);
+    if (raw === null) return null;
+    const token = contentDigest(raw);
+    const value = this.compress ? decompressValue(raw) : raw;
+    return { value, token };
   }
 
   /** read repair: probes every owner of `key`, in rank order, for a
@@ -1042,6 +1113,56 @@ export class NanocachedClient {
     return this.incrInNamespace(EMPTY_NAMESPACE, key, -delta);
   }
 
+  /** Compare-and-set (issue #141): `add`/`k` with an `absent` condition —
+   * stores `value` only if `key` doesn't currently hold an unexpired
+   * value. Resolves `true` if stored, `false` if the key already existed
+   * — a condition mismatch is a normal boolean outcome, never an
+   * exception, the same idiom `delete()` already uses for "nothing to
+   * act on". See README.md's "Compare-and-set" section for the
+   * not-a-distributed-lock caveat: LRU eviction can still reclaim `key`
+   * exactly as it would after a plain `set`. */
+  async putIfAbsent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
+    return this.casInNamespace(EMPTY_NAMESPACE, key, value, { kind: "absent" }, ttlSeconds);
+  }
+
+  /** Compare-and-set (issue #141): the two-argument `replace(key, value)`
+   * — `k` with a `present` condition — stores `value` only if `key`
+   * currently holds any (unexpired) value, whatever it is. Resolves
+   * `true` if replaced, `false` if the key was absent — a mismatch is a
+   * normal boolean outcome, never an exception. */
+  async replaceIfPresent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
+    return this.casInNamespace(EMPTY_NAMESPACE, key, value, { kind: "present" }, ttlSeconds);
+  }
+
+  /** Compare-and-set (issue #141): the three-argument
+   * `replace(key, old, new)` — `k` with a digest condition — stores
+   * `newValue` only if `key`'s current stored bytes hash to exactly
+   * `token` (see `contentDigest`/`getWithToken`). Resolves `true` if
+   * replaced, `false` on a mismatch (the key changed, or is missing) —
+   * never an exception for a mismatch.
+   *
+   * `token` accepts the hex-digest string `contentDigest`/`getWithToken`
+   * produce directly. A token taken from a real prior read (via
+   * `getWithToken`) is always correct. A token *reconstructed* by
+   * re-serializing/re-compressing a value the caller already holds,
+   * rather than one taken from an actual read, is only correct if that
+   * reconstruction produces byte-identical output to what the server
+   * actually stores — exactly as sensitive to encoding as memcached's own
+   * value-based CAS, and not guaranteed across languages or compression
+   * settings the way the read-then-write-back path always is. */
+  async replace(key: string | Uint8Array, token: string, newValue: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
+    return this.casInNamespace(EMPTY_NAMESPACE, key, newValue, { kind: "digest", digest: token }, ttlSeconds);
+  }
+
+  /** Compare-and-set (issue #141): the two-argument `remove(key, old)` —
+   * `x` — deletes `key` only if its current stored bytes hash to exactly
+   * `token` (see `contentDigest`/`getWithToken`). Resolves `true` if
+   * deleted, `false` on a mismatch or a missing key — never an exception
+   * for either. */
+  async deleteIfMatches(key: string | Uint8Array, token: string): Promise<boolean> {
+    return this.casDeleteInNamespace(EMPTY_NAMESPACE, key, token);
+  }
+
   private async setInNamespace(namespace: Uint8Array, key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
@@ -1090,6 +1211,49 @@ export class NanocachedClient {
     );
   }
 
+  /** Compare-and-set (issue #141). Encodes/validates/compresses `value`
+   * exactly like `setInNamespace` — a new value written by CAS must go
+   * through the same compression pipeline `set` uses, or a later plain
+   * `get` from any compress-enabled client would fail to decompress it —
+   * then dispatches to the primary only (`casOnOwners`), mirroring
+   * `incrInNamespace`'s own split between single/proxy mode (one
+   * connection's own `cas`) and cluster mode. */
+  private async casInNamespace(
+    namespace: Uint8Array,
+    key: string | Uint8Array,
+    value: string | Uint8Array,
+    cond: CasCondition,
+    ttlSeconds: number,
+  ): Promise<boolean> {
+    if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
+    const keyBytes = typeof key === "string" ? Buffer.from(key, "utf8") : Buffer.from(key);
+    const valueBytes = typeof value === "string" ? Buffer.from(value, "utf8") : Buffer.from(value);
+    // Same two-layer size check setInNamespace uses: the *original* value
+    // must fit MAX_REQUEST_BYTES, not just its compressed form (issue #47
+    // audit item 3).
+    checkKeyAndValue(keyBytes, valueBytes, namespace);
+    const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
+    return this.withWrongNodeRetry(() =>
+      this.target.kind === "cluster"
+        ? this.casOnOwners(key, namespace, outgoing, cond, ttlSeconds)
+        : this.connectionForSingleTarget().then((connection) => connection.cas(key, outgoing, cond, ttlSeconds, namespace)),
+    );
+  }
+
+  /** Compare-and-delete (issue #141): the `x` op's client-side driver,
+   * mirroring `casInNamespace` above for the delete case — dispatches to
+   * the primary only (`casDeleteOnOwners`). */
+  private async casDeleteInNamespace(namespace: Uint8Array, key: string | Uint8Array, token: string): Promise<boolean> {
+    if (this.closed) throw new AlreadyClosedError();
+    await this.maybeRefreshNodeList();
+    return this.withWrongNodeRetry(() =>
+      this.target.kind === "cluster"
+        ? this.casDeleteOnOwners(key, namespace, token)
+        : this.connectionForSingleTarget().then((connection) => connection.casDelete(key, token, namespace)),
+    );
+  }
+
   /** Clears one namespace (issue #106): every entry in it, on every node.
    * `namespace` defaults to the default (empty) namespace — see `clearAll`
    * for the client's own `clear_all`-style flush of every namespace at
@@ -1123,11 +1287,16 @@ export class NanocachedClient {
     return new NanocachedNamespace(namespaceBytes, {
       get: (key) => this.getInNamespace(namespaceBytes, key),
       getBytes: (key) => this.getBytesInNamespace(namespaceBytes, key),
+      getWithToken: (key) => this.getWithTokenInNamespace(namespaceBytes, key),
       set: (key, value, ttlSeconds) => this.setInNamespace(namespaceBytes, key, value, ttlSeconds),
       delete: (key) => this.deleteInNamespace(namespaceBytes, key),
       clear: () => this.clearInNamespace(namespaceBytes),
       incr: (key, delta) => this.incrInNamespace(namespaceBytes, key, delta),
       decr: (key, delta) => this.incrInNamespace(namespaceBytes, key, -delta),
+      putIfAbsent: (key, value, ttlSeconds) => this.casInNamespace(namespaceBytes, key, value, { kind: "absent" }, ttlSeconds),
+      replaceIfPresent: (key, value, ttlSeconds) => this.casInNamespace(namespaceBytes, key, value, { kind: "present" }, ttlSeconds),
+      replace: (key, token, newValue, ttlSeconds) => this.casInNamespace(namespaceBytes, key, newValue, { kind: "digest", digest: token }, ttlSeconds),
+      deleteIfMatches: (key, token) => this.casDeleteInNamespace(namespaceBytes, key, token),
     });
   }
 
@@ -1483,6 +1652,129 @@ export class NanocachedClient {
     await Promise.allSettled(replicaWrites);
 
     return result.value;
+  }
+
+  /** Cluster compare-and-set (issue #141) — deliberately **not**
+   * `writeToOwners`'s same-op-to-every-owner pattern, mirroring
+   * `incrOnOwners` exactly: `k` is sent to the primary owner only. On a
+   * condition mismatch, nothing was written, so nothing is replicated —
+   * `false` is returned directly, before any replica is touched. On
+   * success, the *literal new value* (and its TTL) is forwarded to the
+   * remaining owners as an ordinary `set` — never replayed as `k` there.
+   * A replica evaluating the same condition against its own possibly-
+   * different copy could reach a different outcome than the primary just
+   * did, so every replica always ends up with the exact bytes the primary
+   * just stored, regardless of what its own prior copy held.
+   *
+   * A dead/wrong-node primary throws out to `withWrongNodeRetry`, which
+   * retries this whole call once against a freshly refreshed ranking —
+   * safe to retry in full, since a failure at this point (by construction)
+   * always precedes ever reaching a replica write. Replica-leg failures
+   * are swallowed exactly like `incrOnOwners`'s own
+   * (stats().replicaWriteFailures, fireAndForgetReplicas-aware) — the
+   * primary's write already succeeded, so its result is always what's
+   * returned. */
+  private async casOnOwners(key: string | Uint8Array, namespace: Uint8Array, value: Buffer, cond: CasCondition, ttlSeconds: number): Promise<boolean> {
+    const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
+    if (primaryName === undefined) {
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+    }
+
+    const primaryConnection = await this.memberConnection(primaryName);
+    const stored = await primaryConnection.cas(key, value, cond, ttlSeconds, namespace);
+    if (!stored || replicaNames.length === 0) {
+      return stored;
+    }
+
+    const replicaWrite = async (name: string): Promise<void> => {
+      try {
+        const connection = await this.memberConnection(name);
+        await connection.set(key, value, ttlSeconds, namespace);
+      } catch (error) {
+        // Swallowed by design — see the doc comment above (and
+        // incrOnOwners'/writeToOwners', which this mirrors). An actual
+        // programming bug (isSwallowable) still propagates.
+        if (!isSwallowable(error)) throw error;
+        this.replicaWriteFailures++;
+      }
+    };
+
+    // Fire-and-forget replica writes (same cap/fallback as
+    // writeToOwners/incrOnOwners): with fireAndForgetReplicas, up to
+    // FIRE_AND_FORGET_TUNING.maxInFlight replica legs run in the
+    // background instead of being waited for below — past that cap,
+    // further legs fall back to the synchronous path exactly as with the
+    // option off.
+    const replicaWrites = replicaNames.map((name) => {
+      if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        const background = replicaWrite(name);
+        const settled = background.catch(() => {});
+        this.backgroundReplicaWrites.add(background);
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        return Promise.resolve();
+      }
+      const write = replicaWrite(name);
+      // No-op catch attached synchronously, same reasoning as
+      // writeToOwners/incrOnOwners: a genuine programming bug surfacing
+      // here must not trip Node's unhandled-rejection detector before
+      // Promise.allSettled below gets a chance to observe it.
+      write.catch(() => {});
+      return write;
+    });
+
+    // Drained for close()'s tracking and so a genuine replica-leg bug
+    // doesn't linger as an unhandled rejection — but the primary's write
+    // already happened, so its result is always what's returned; nothing
+    // here can turn it into a failure.
+    await Promise.allSettled(replicaWrites);
+
+    return true;
+  }
+
+  /** Cluster compare-and-delete (issue #141) — the `x` counterpart to
+   * `casOnOwners`, mirroring it exactly: only the primary evaluates the
+   * digest; on success the deletion (not a replayed `x`) is forwarded to
+   * the remaining owners as an ordinary `delete`, since a replica
+   * evaluating the same digest against its own possibly-different copy
+   * could reach a different outcome. */
+  private async casDeleteOnOwners(key: string | Uint8Array, namespace: Uint8Array, token: string): Promise<boolean> {
+    const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
+    if (primaryName === undefined) {
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+    }
+
+    const primaryConnection = await this.memberConnection(primaryName);
+    const deleted = await primaryConnection.casDelete(key, token, namespace);
+    if (!deleted || replicaNames.length === 0) {
+      return deleted;
+    }
+
+    const replicaWrite = async (name: string): Promise<void> => {
+      try {
+        const connection = await this.memberConnection(name);
+        await connection.delete(key, namespace);
+      } catch (error) {
+        if (!isSwallowable(error)) throw error;
+        this.replicaWriteFailures++;
+      }
+    };
+
+    const replicaWrites = replicaNames.map((name) => {
+      if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        const background = replicaWrite(name);
+        const settled = background.catch(() => {});
+        this.backgroundReplicaWrites.add(background);
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        return Promise.resolve();
+      }
+      const write = replicaWrite(name);
+      write.catch(() => {});
+      return write;
+    });
+
+    await Promise.allSettled(replicaWrites);
+
+    return true;
   }
 
   /** Shared fan-out for `clearAll()`/a namespace handle's `clear()`

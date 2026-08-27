@@ -179,6 +179,63 @@ the delta, so a replica can never drift from the primary (e.g. after an
 earlier dropped replica write). `NanocachedNamespace` exposes the same
 `IncrAsync`/`DecrAsync` pair, scoped to its namespace.
 
+## Compare-and-set
+
+`PutIfAbsentAsync`, `ReplaceIfPresentAsync`, `ReplaceAsync`, and
+`DeleteIfMatchesAsync` are content-based compare-and-set: each stores or
+removes a key only if a condition holds against its *current* stored
+bytes, and each returns a plain `bool` — `true` when the operation ran,
+`false` on a condition mismatch. A mismatch is a normal outcome, never an
+exception (the same idiom `DeleteAsync` uses for "nothing here to act
+on").
+
+```csharp
+// add / putIfAbsent: succeeds only if the key is absent.
+bool stored = await client.PutIfAbsentAsync("lock:job-42", "worker-1", ttlSeconds: 30);
+
+// replace(key, value): succeeds only if the key currently holds any value.
+bool replaced = await client.ReplaceIfPresentAsync("session:abc", "new-token");
+
+// replace(key, old, new): succeeds only if the stored value's digest
+// matches exactly — obtain the digest ("token") from a real prior read.
+var current = await client.GetWithTokenAsync("counter-config");
+if (current is { } value)
+{
+    bool updated = await client.ReplaceAsync("counter-config", value.Token, "new-config");
+}
+
+// remove(key, old): succeeds only if the stored value's digest matches.
+bool removed = await client.DeleteIfMatchesAsync("counter-config", current!.Value.Token);
+```
+
+`ReplaceAsync`/`DeleteIfMatchesAsync`'s expected value is a **digest
+("token"), not a literal value** — a 32-character lowercase hex string,
+obtained from `GetWithTokenAsync`/`GetBytesWithTokenAsync` (the
+compare-and-set counterparts of `GetAsync`/`GetBytesAsync`, also
+returning `null` on a miss) or computed directly from a value you already
+hold via the static `NanocachedClient.ContentDigest(byte[])`. The latter
+shortcut is only correct if your own serialization reproduces the stored
+bytes byte-for-byte — true within one client using one
+serializer/compressor consistently, not guaranteed across languages or a
+`Compress` mismatch (the same caveat memcached's own value-based CAS
+has); reading the token from a real prior `GetWithTokenAsync` is always
+correct.
+
+**Not a distributed lock** — LRU eviction reclaims a key exactly as it
+would after a plain `Set`, CAS or not: a key used as a lock (`add` to
+acquire, a TTL to eventually release) can be evicted under memory
+pressure, letting a second caller's `PutIfAbsentAsync` succeed while the
+first caller still believes it holds the lock.
+
+In a cluster, only the primary owner ever evaluates the condition;
+replicas receive the literal resulting value (or removal) via an
+ordinary `Set`/`Delete` instead of replaying the condition themselves, so
+a replica can never reach a different outcome than the primary just did
+— the same rule `IncrAsync`/`DecrAsync` follow. `NanocachedNamespace`
+exposes the same methods, scoped to its namespace. See
+[docs/protocol.html#cas](../../docs/protocol.html#cas) for the wire
+format.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so

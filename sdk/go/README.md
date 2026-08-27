@@ -258,6 +258,66 @@ replaying could let a replica drift from the primary (e.g. after a
 dropped earlier replica write), while forwarding the literal result keeps
 every replica byte-identical to it.
 
+## Compare-and-set
+
+`PutIfAbsent`/`ReplaceIfPresent`/`Replace` (the `k` frame) and
+`DeleteIfMatches` (the `x` frame) condition a write on the key's current
+content instead of writing unconditionally:
+
+```go
+// add: store only if the key doesn't already exist.
+stored, err := client.PutIfAbsent("lock:job-1", []byte("worker-a"), 30)
+
+// two-argument replace: store only if the key currently holds any value.
+stored, err = client.ReplaceIfPresent("session:42", []byte("refreshed"), 300)
+
+// three-argument replace: store only if the key's content matches a
+// prior read exactly.
+value, token, ok, err := client.GetWithToken("counter-config")
+stored, err = client.Replace("counter-config", token, []byte("new-config"), 0)
+
+// two-argument remove: delete only if the key's content matches.
+deleted, err := client.DeleteIfMatches("counter-config", token)
+```
+
+`Replace`/`DeleteIfMatches` are conditioned on a `CasToken`, not a literal
+value — a small wrapper around a content digest (the first 16 bytes of
+the key's SHA-256, lowercase hex on the wire), obtained from
+`GetWithToken` (or `Namespace.GetWithToken`), the `CasToken`-returning
+sibling of `GetBytes`. Every one of these four calls returns a plain
+`(bool, error)`: a condition mismatch — the key already existed, didn't
+exist, or its content digest didn't match — is `false, nil`, never an
+error, the same idiom `Delete`'s `existed` return already uses; a non-nil
+error means a genuine failure (connection lost, wrong-node retries
+exhausted, invalid arguments), not a mismatch.
+
+`ContentDigest(value []byte) [16]byte` and `TokenFromDigest` let a caller
+that already holds a value (not from a real `GetWithToken`) build a token
+by hand — but that reconstruction is only correct if it reproduces the
+exact bytes the server stores (compression's marker byte included, if
+`Compress` is enabled), the same caveat memcached's own value-based CAS
+has. The read-then-write-back path (`GetWithToken` -> `Replace`) has no
+such caveat: the digest always came from the server's own bytes. All four
+methods are also namespace-scoped: `client.Namespace(ns).PutIfAbsent(...)`
+etc., same as `Get`/`Set`/`Delete`/`Incr`.
+
+**This is not a distributed lock.** LRU eviction reclaims a key exactly as
+it would after a plain `Set`, CAS or not: a key used as a lock
+(`PutIfAbsent` to acquire, a TTL to eventually release) that gets evicted
+under memory pressure leaves a second caller's `PutIfAbsent` free to
+succeed while the first caller still believes it holds the lock — a
+silent double-acquisition CAS cannot detect.
+
+In a cluster, only the key's primary owner evaluates the condition; on
+success, the primary's literal result is fanned out to the remaining
+owners as an ordinary `Set`/`Delete`, exactly like `Incr`/`Decr` — never
+by replaying `k`/`x` on a replica, which could otherwise evaluate the
+same condition against its own possibly-different copy and reach a
+different outcome.
+
+See [`docs/protocol.html#cas`](../../docs/protocol.html#cas) for the wire
+protocol.
+
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps

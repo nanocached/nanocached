@@ -5,6 +5,7 @@ import {
   AlreadyClosedError,
   AuthenticationError,
   ConnectionLostError,
+  contentDigest,
   DecompressionError,
   DiscoveryBusyError,
   NanocachedClient,
@@ -327,6 +328,77 @@ describe("NanocachedClient value compression (value compression)", () => {
 
         assert.equal(await client.get("k"), value);
         assert.deepEqual(await client.getBytes("k"), Buffer.from(value, "utf8"));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getWithToken's digest is computed from the raw (marker-prefixed) wire bytes, not the decompressed value (issue #141)", async () => {
+    // The critical CAS/compression correctness point: the server never
+    // decompresses, so the digest it would compute for a `k`/`x`
+    // `<cond>` is over the marker-prefixed wire bytes — computing it from
+    // the decompressed value instead would silently produce a digest that
+    // never matches the server's, breaking every CAS call under
+    // compression.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 64,
+      });
+      try {
+        const value = "x".repeat(1000);
+        await client.set("k", value);
+
+        const stored = node.store.get("k")!;
+        assert.equal(stored[0], 0x01, "expected the DEFLATE marker byte on the wire");
+
+        const result = await client.getWithToken("k");
+        assert.ok(result !== null);
+        // The returned value is the ordinary decompressed one...
+        assert.deepEqual(result!.value, Buffer.from(value, "utf8"));
+        // ...but the token must hash the raw wire bytes (marker included),
+        // exactly what the mock server's own `k`/`x` digest evaluation
+        // hashes — never the decompressed value.
+        assert.equal(result!.token, contentDigest(stored));
+        assert.notEqual(result!.token, contentDigest(Buffer.from(value, "utf8")), "must not hash the decompressed value");
+
+        // And a replace() using that token must actually succeed against
+        // the (compression-aware) mock server, proving the two agree.
+        assert.equal(await client.replace("k", result!.token, "replacement"), true);
+        assert.equal(await client.get("k"), "replacement");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a CAS write goes through the same compression pipeline as set (issue #141)", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 64,
+      });
+      try {
+        const value = "y".repeat(1000);
+        assert.equal(await client.putIfAbsent("k", value), true);
+
+        const stored = node.store.get("k")!;
+        assert.equal(stored[0], 0x01, "a new CAS-written value must be compressed exactly like set's own");
+        assert.ok(stored.length < Buffer.from(value, "utf8").length);
+
+        // A plain get (no CAS involved) must be able to decompress it —
+        // proving the wire bytes are a well-formed compressed value, not
+        // raw uncompressed bytes with a stray marker.
+        assert.equal(await client.get("k"), value);
       } finally {
         client.close();
       }
@@ -1380,6 +1452,221 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
   });
 });
 
+describe("NanocachedClient compare-and-set against a single node (issue #141)", () => {
+  it("putIfAbsent stores and returns true when the key is missing", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        assert.equal(await client.putIfAbsent("k", "v1"), true);
+        assert.equal(await client.get("k"), "v1");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("putIfAbsent returns false and leaves the value untouched when the key already exists", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "original");
+        assert.equal(await client.putIfAbsent("k", "v2"), false);
+        assert.equal(await client.get("k"), "original");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("replaceIfPresent replaces and returns true when the key exists, regardless of its value", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "original");
+        assert.equal(await client.replaceIfPresent("k", "updated"), true);
+        assert.equal(await client.get("k"), "updated");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("replaceIfPresent returns false and stores nothing when the key is missing", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        assert.equal(await client.replaceIfPresent("missing", "v"), false);
+        assert.equal(await client.get("missing"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("replace succeeds when the token matches the current stored bytes, and fails when it doesn't", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v1");
+        const token = contentDigest(Buffer.from("v1", "utf8"));
+
+        // Stale token (value changed underneath since the digest was taken).
+        await client.set("k", "v-changed");
+        assert.equal(await client.replace("k", token, "v2"), false);
+        assert.equal(await client.get("k"), "v-changed");
+
+        // Fresh token from an actual read.
+        const fresh = await client.getWithToken("k");
+        assert.ok(fresh !== null);
+        assert.equal(await client.replace("k", fresh!.token, "v2"), true);
+        assert.equal(await client.get("k"), "v2");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("replace fails against a missing key", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const token = contentDigest(Buffer.from("anything", "utf8"));
+        assert.equal(await client.replace("missing", token, "v"), false);
+        assert.equal(await client.get("missing"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("deleteIfMatches deletes and returns true when the token matches", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v1");
+        const { token } = (await client.getWithToken("k"))!;
+        assert.equal(await client.deleteIfMatches("k", token), true);
+        assert.equal(await client.get("k"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("deleteIfMatches returns false on a stale token or a missing key, without deleting", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "v1");
+        const staleToken = contentDigest(Buffer.from("not the stored value", "utf8"));
+        assert.equal(await client.deleteIfMatches("k", staleToken), false);
+        assert.equal(await client.get("k"), "v1");
+
+        const missingToken = contentDigest(Buffer.from("anything", "utf8"));
+        assert.equal(await client.deleteIfMatches("missing", missingToken), false);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getWithToken returns null on a miss, matching get's own convention", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        assert.equal(await client.getWithToken("missing"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getWithToken's token equals contentDigest of the raw stored bytes", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("k", "hello world");
+        const result = await client.getWithToken("k");
+        assert.ok(result !== null);
+        assert.deepEqual(result!.value, Buffer.from("hello world", "utf8"));
+        assert.equal(result!.token, contentDigest(Buffer.from("hello world", "utf8")));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("works scoped to a namespace, same as get/set/delete/incr", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const ns = client.namespace("things");
+        assert.equal(await ns.putIfAbsent("k", "v1"), true);
+        assert.equal(await client.get("k"), null); // default namespace untouched
+        assert.equal(node.namespacedStore("things").get("k")?.toString("utf8"), "v1");
+
+        const { token } = (await ns.getWithToken("k"))!;
+        assert.equal(await ns.replace("k", token, "v2"), true);
+        assert.equal(await ns.deleteIfMatches("k", contentDigest(Buffer.from("v2", "utf8"))), true);
+        assert.equal(await ns.getBytes("k"), null);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("applies the TTL given to putIfAbsent/replaceIfPresent/replace", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.putIfAbsent("k", "v1", 120);
+        assert.equal(node.lastSetTtl(), 120);
+
+        await client.replaceIfPresent("k", "v2", 60);
+        assert.equal(node.lastSetTtl(), 60);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
 describe("NanocachedClient replication (client-side replication, R=2)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
@@ -1680,6 +1967,159 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(await client.incr(key), 11);
       assert.equal(client.stats().replicaWriteFailures, 1);
       assert.equal(primary.mock.store.get(key)?.toString("ascii"), "11");
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+});
+
+describe("NanocachedClient compare-and-set cluster replication (issue #141) — primary evaluates, replicas get the result via set/delete", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("putIfAbsent: sends `k` only to the primary; the replica gets a `set` of the literal result and never sees `k`", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "cas-putifabsent-replicates-as-set";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      assert.equal(await client.putIfAbsent(key, "v1"), true);
+
+      // The critical assertion — not just "same final value" (a buggy
+      // implementation replaying `k` on the replica could coincidentally
+      // agree): the replica must receive the primary's literal result as
+      // an ordinary `set`/`s`, and must NEVER itself receive a `k` frame.
+      assert.equal(primary.mock.casCount(), 1, "primary must receive exactly one `k` frame");
+      assert.equal(replica.mock.casCount(), 0, "replica must never receive a `k` frame");
+      assert.equal(replica.mock.lastCommand(), "S", "replica must receive the result as a set");
+      assert.equal(primary.mock.store.get(key)?.toString("utf8"), "v1");
+      assert.equal(replica.mock.store.get(key)?.toString("utf8"), "v1");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("replace: sends `k` only to the primary; the replica gets a `set` of the literal new value and never sees `k`", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "cas-replace-replicates-as-set";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "v1", 120);
+      const { token } = (await client.getWithToken(key))!;
+
+      assert.equal(await client.replace(key, token, "v2", 120), true);
+
+      assert.equal(primary.mock.casCount(), 1, "primary must receive exactly one `k` frame");
+      assert.equal(replica.mock.casCount(), 0, "replica must never receive a `k` frame");
+      assert.equal(replica.mock.lastCommand(), "S", "replica must receive the result as a set");
+      assert.equal(replica.mock.lastSetTtl(), 120, "the replica's set must carry the same TTL");
+      assert.equal(primary.mock.store.get(key)?.toString("utf8"), "v2");
+      assert.equal(replica.mock.store.get(key)?.toString("utf8"), "v2");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("deleteIfMatches: sends `x` only to the primary; the replica gets a plain `delete` and never sees `x`", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "cas-delete-replicates-as-delete";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "v1");
+      const { token } = (await client.getWithToken(key))!;
+
+      assert.equal(await client.deleteIfMatches(key, token), true);
+
+      assert.equal(primary.mock.casDeleteCount(), 1, "primary must receive exactly one `x` frame");
+      assert.equal(replica.mock.casDeleteCount(), 0, "replica must never receive an `x` frame");
+      assert.equal(replica.mock.lastCommand(), "D", "replica must receive the result as a plain delete");
+      assert.ok(!primary.mock.store.has(key));
+      assert.ok(!replica.mock.store.has(key));
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("never touches the replica on a condition mismatch — nothing was written", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      // Deltas, not absolute counts: with only 2 nodes, keys below may
+      // well share the same primary/replica, so cas(Delete)Count() must
+      // be compared against its own before-value per key.
+      const key = "cas-mismatch";
+      await client.set(key, "original");
+      const owners = cluster.ownerOf(key);
+      const primaryBefore = owners.primary.mock.casCount();
+      const replicaBefore = owners.replica.mock.casCount();
+
+      const staleToken = contentDigest(Buffer.from("not the stored value", "utf8"));
+      assert.equal(await client.replace(key, staleToken, "v2"), false);
+
+      assert.equal(owners.primary.mock.casCount(), primaryBefore + 1);
+      assert.equal(owners.replica.mock.casCount(), replicaBefore);
+      // The replica's copy must be untouched — no set was fanned out for
+      // a request nothing was actually written by.
+      assert.equal(owners.replica.mock.store.get(key)?.toString("utf8"), "original");
+      assert.equal(owners.primary.mock.store.get(key)?.toString("utf8"), "original");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("counts a swallowed replica-write failure when the replica is dead, same counter as set/delete/incr", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "cas-dead-replica";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await replica.mock.close();
+      await waitFor(() => memberConnectionClosed(client, replica.name), "the client to see the FIN");
+
+      assert.equal(client.stats().replicaWriteFailures, 0);
+      // A dead replica must not fail the CAS — the primary already
+      // applied it, so its result is what's returned regardless.
+      assert.equal(await client.putIfAbsent(key, "v1"), true);
+      assert.equal(client.stats().replicaWriteFailures, 1);
+      assert.equal(primary.mock.store.get(key)?.toString("utf8"), "v1");
     } finally {
       client.close();
       await cluster.close().catch(() => {});

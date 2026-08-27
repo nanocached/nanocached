@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -120,6 +121,13 @@ type mockNode struct {
 	// receives one (only the primary ever runs the increment; replicas
 	// get the literal result via an ordinary Set).
 	iCount atomic.Int32
+	// kCount/xCount count every `k`/`x` (compare-and-set, issue #141)
+	// frame this node has received — the CAS replication test uses these
+	// to assert a replica never receives either (only the primary ever
+	// evaluates <cond>; replicas get the literal result via an ordinary
+	// Set/Delete).
+	kCount atomic.Int32
+	xCount atomic.Int32
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -211,6 +219,22 @@ func (m *mockNode) clearCountReceived() int32 { return m.clearCount.Load() }
 // received so far — issue #129's replication test uses this to assert a
 // replica never received one.
 func (m *mockNode) iRequestsReceived() int32 { return m.iCount.Load() }
+
+// kRequestsReceived/xRequestsReceived report how many `k`/`x`
+// (compare-and-set, issue #141) frames this node has received so far —
+// the CAS replication test uses these to assert a replica never received
+// either.
+func (m *mockNode) kRequestsReceived() int32 { return m.kCount.Load() }
+func (m *mockNode) xRequestsReceived() int32 { return m.xCount.Load() }
+
+// mockDigestHex computes the same content digest hex a real
+// nanocached-node evaluates a `k`/`x` <cond> digest against
+// (docs/protocol.html#cas) — reusing this SDK's own ContentDigest/
+// CasToken (same package) so the mock server's evaluation stays
+// byte-for-byte aligned with what GetWithToken's caller computes.
+func mockDigestHex(value []byte) string {
+	return CasToken{digest: ContentDigest(value)}.Hex()
+}
 
 func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
 	return startMockNodeOpts(t, requiredSecret, mockNodeOpts{})
@@ -629,6 +653,111 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			reply := append([]byte(fmt.Sprintf("I %d%s%s\n", len(nextBytes), ttlField, tagSuffix)), nextBytes...)
 			if _, err := conn.Write(reply); err != nil {
+				return
+			}
+		// Compare-and-set store (issue #141): `k <ns-len> <key-len>
+		// <val-len> <cond> [<ttl-seconds>] [<tag>]\n<ns><key><value>` —
+		// always namespaced, no legacy uppercase form, mirroring `i`.
+		// <cond> is a bare token: "A" (absent expected), "P" (present
+		// expected), or a 32-char lowercase hex content digest (exact
+		// match expected) — see mockDigestHex. Success stores value and
+		// answers `S`; a mismatch answers `N`, reusing the same markers a
+		// plain Set/miss already use (no new response marker). kCount
+		// counts every `k` this node has seen, matched or not — the CAS
+		// replication test asserts a replica never receives one.
+		case "k":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			valLen := atoiOrPanic(parts[3])
+			cond := parts[4]
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			value := mustRead(reader, valLen)
+			if m.silent.Load() {
+				continue
+			}
+			m.kCount.Add(1)
+			m.dataRequestCount.Add(1)
+			ttlBase := 5
+			if tagged {
+				ttlBase = 6
+			}
+			hasTTL := len(parts) > ttlBase
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeWrongNode() {
+				if _, err := conn.Write([]byte("W" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			sk := storeKey{namespace, key}
+			existing, found := m.store.Load(sk)
+			condOK := false
+			switch cond {
+			case "A":
+				condOK = !found
+			case "P":
+				condOK = found
+			default:
+				condOK = found && mockDigestHex(existing.([]byte)) == cond
+			}
+			if !condOK {
+				if _, err := conn.Write([]byte("N" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			m.store.Store(sk, value)
+			if hasTTL {
+				m.ttls.Store(sk, int64(atoiOrPanic(parts[5])))
+			} else {
+				m.ttls.Delete(sk)
+			}
+			if _, err := conn.Write([]byte("S" + tagSuffix + "\n")); err != nil {
+				return
+			}
+		// Compare-and-set remove (issue #141): `x <ns-len> <key-len>
+		// <cond> [<tag>]\n<ns><key>` — <cond> here is always a digest
+		// (never A/P). Success deletes the key and answers `D`; a
+		// mismatch or missing key answers `N`, the same markers a plain
+		// Delete already uses. xCount mirrors kCount.
+		case "x":
+			nsLen := atoiOrPanic(parts[1])
+			keyLen := atoiOrPanic(parts[2])
+			cond := parts[3]
+			namespace := string(mustRead(reader, nsLen))
+			key := string(mustRead(reader, keyLen))
+			if m.silent.Load() {
+				continue
+			}
+			m.xCount.Add(1)
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			if m.takeWrongNode() {
+				if _, err := conn.Write([]byte("W" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			sk := storeKey{namespace, key}
+			existing, found := m.store.Load(sk)
+			reply := "N" + tagSuffix + "\n"
+			if found && mockDigestHex(existing.([]byte)) == cond {
+				m.store.Delete(sk)
+				m.ttls.Delete(sk)
+				reply = "D" + tagSuffix + "\n"
+			}
+			if _, err := conn.Write([]byte(reply)); err != nil {
 				return
 			}
 		case "D":
@@ -4053,5 +4182,385 @@ func TestClusterIncrRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult(t *testing
 	// the primary's own `I` response reported.
 	if got, ok := replica.storedTTL(key); !ok || got != 60 {
 		t.Fatalf("replica's recorded TTL = %d, %v, want 60, true", got, ok)
+	}
+}
+
+// ── Compare-and-set (issue #141) ─────────────────────────────────────
+
+// TestAppendCasFrameAllConditionFormsUntaggedAndTagged covers appendCasFrame's
+// exact wire bytes: always namespaced, even the default namespace (like
+// appendIncrFrame), all three <cond> shapes (A, P, a digest), with and
+// without a TTL, untagged and tagged.
+func TestAppendCasFrameAllConditionFormsUntaggedAndTagged(t *testing.T) {
+	if got, want := string(appendCasFrame(nil, []byte("k"), []byte("v"), casCondAbsent, -1, false, 0)),
+		"k 0 1 1 A\nkv"; got != want {
+		t.Fatalf("appendCasFrame (absent, no ttl) = %q, want %q", got, want)
+	}
+	if got, want := string(appendCasFrame([]byte("ns"), []byte("k"), []byte("v"), casCondPresent, -1, false, 0)),
+		"k 2 1 1 P\nnskv"; got != want {
+		t.Fatalf("appendCasFrame (present, namespaced) = %q, want %q", got, want)
+	}
+	digest := "36287141940ca57acbd7695ccdde9d43"
+	if got, want := string(appendCasFrame([]byte("ns"), []byte("k"), []byte("v"), digest, -1, false, 0)),
+		"k 2 1 1 "+digest+"\nnskv"; got != want {
+		t.Fatalf("appendCasFrame (digest) = %q, want %q", got, want)
+	}
+	if got, want := string(appendCasFrame(nil, []byte("k"), []byte("v"), casCondAbsent, 60, false, 0)),
+		"k 0 1 1 A 60\nkv"; got != want {
+		t.Fatalf("appendCasFrame (ttl) = %q, want %q", got, want)
+	}
+	if got, want := string(appendCasFrame([]byte("ns"), []byte("k"), []byte("v"), casCondPresent, 60, true, 9)),
+		"k 2 1 1 P 60 9\nnskv"; got != want {
+		t.Fatalf("appendCasFrame (ttl+tag) = %q, want %q", got, want)
+	}
+	if got, want := string(appendCasFrame(nil, []byte("k"), []byte("v"), digest, -1, true, 5)),
+		"k 0 1 1 "+digest+" 5\nkv"; got != want {
+		t.Fatalf("appendCasFrame (digest, tag only) = %q, want %q", got, want)
+	}
+}
+
+// TestAppendDeleteIfMatchesFrameUntaggedAndTagged covers
+// appendDeleteIfMatchesFrame's exact wire bytes: always namespaced, cond
+// is always a digest, untagged and tagged.
+func TestAppendDeleteIfMatchesFrameUntaggedAndTagged(t *testing.T) {
+	digest := "36287141940ca57acbd7695ccdde9d43"
+	if got, want := string(appendDeleteIfMatchesFrame(nil, []byte("k"), digest, false, 0)),
+		"x 0 1 "+digest+"\nk"; got != want {
+		t.Fatalf("appendDeleteIfMatchesFrame = %q, want %q", got, want)
+	}
+	if got, want := string(appendDeleteIfMatchesFrame([]byte("ns"), []byte("k"), digest, true, 3)),
+		"x 2 1 "+digest+" 3\nnsk"; got != want {
+		t.Fatalf("appendDeleteIfMatchesFrame (namespaced, tagged) = %q, want %q", got, want)
+	}
+}
+
+// TestContentDigestMatchesTheCrossLanguagePinnedVector pins ContentDigest
+// against the fixed test vector docs/protocol.html#cas specifies — the
+// same vector every other nanocached SDK and the Rust server pin, so a
+// mismatch here means CAS silently breaks across languages.
+func TestContentDigestMatchesTheCrossLanguagePinnedVector(t *testing.T) {
+	const wantHex = "36287141940ca57acbd7695ccdde9d43"
+	digest := ContentDigest([]byte("nanocached-cas-vector"))
+	if got := hex.EncodeToString(digest[:]); got != wantHex {
+		t.Fatalf("ContentDigest(%q) = %s, want %s", "nanocached-cas-vector", got, wantHex)
+	}
+	if got := (CasToken{digest: digest}).Hex(); got != wantHex {
+		t.Fatalf("CasToken.Hex() = %s, want %s", got, wantHex)
+	}
+}
+
+func TestPutIfAbsentStoresOnlyWhenTheKeyIsAbsent(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	stored, err := client.PutIfAbsent("k", []byte("first"), 0)
+	if err != nil || !stored {
+		t.Fatalf("PutIfAbsent (absent) = %v, %v, want true, nil", stored, err)
+	}
+	if got, ok := node.storedValue("k"); !ok || got != "first" {
+		t.Fatalf("stored value = %q, %v, want \"first\", true", got, ok)
+	}
+
+	stored, err = client.PutIfAbsent("k", []byte("second"), 0)
+	if err != nil || stored {
+		t.Fatalf("PutIfAbsent (present) = %v, %v, want false, nil", stored, err)
+	}
+	if got, _ := node.storedValue("k"); got != "first" {
+		t.Fatalf("stored value changed to %q, want unchanged %q", got, "first")
+	}
+}
+
+func TestReplaceIfPresentStoresOnlyWhenTheKeyIsPresent(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	stored, err := client.ReplaceIfPresent("k", []byte("v1"), 0)
+	if err != nil || stored {
+		t.Fatalf("ReplaceIfPresent (absent) = %v, %v, want false, nil", stored, err)
+	}
+
+	if err := client.Set("k", "v0", 0); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = client.ReplaceIfPresent("k", []byte("v1"), 0)
+	if err != nil || !stored {
+		t.Fatalf("ReplaceIfPresent (present) = %v, %v, want true, nil", stored, err)
+	}
+	if got, _ := node.storedValue("k"); got != "v1" {
+		t.Fatalf("stored value = %q, want %q", got, "v1")
+	}
+}
+
+func TestReplaceStoresOnlyWhenTheDigestMatches(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v0", 0); err != nil {
+		t.Fatal(err)
+	}
+	_, token, ok, err := client.GetWithToken("k")
+	if err != nil || !ok {
+		t.Fatalf("GetWithToken = ok=%v err=%v, want ok", ok, err)
+	}
+
+	stored, err := client.Replace("k", token, []byte("v1"), 0)
+	if err != nil || !stored {
+		t.Fatalf("Replace (matching digest) = %v, %v, want true, nil", stored, err)
+	}
+	if got, _ := node.storedValue("k"); got != "v1" {
+		t.Fatalf("stored value = %q, want %q", got, "v1")
+	}
+
+	// token digests "v0"; the key now holds "v1", so this must mismatch.
+	stored, err = client.Replace("k", token, []byte("v2"), 0)
+	if err != nil || stored {
+		t.Fatalf("Replace (stale digest) = %v, %v, want false, nil", stored, err)
+	}
+	if got, _ := node.storedValue("k"); got != "v1" {
+		t.Fatalf("stored value changed to %q, want unchanged %q", got, "v1")
+	}
+}
+
+func TestReplaceOnAMissingKeyIsAMismatch(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	token := TokenFromDigest(ContentDigest([]byte("whatever")))
+	stored, err := client.Replace("missing", token, []byte("v"), 0)
+	if err != nil || stored {
+		t.Fatalf("Replace on a missing key = %v, %v, want false, nil", stored, err)
+	}
+}
+
+func TestDeleteIfMatchesRemovesOnlyWhenTheDigestMatches(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v0", 0); err != nil {
+		t.Fatal(err)
+	}
+	_, token, ok, err := client.GetWithToken("k")
+	if err != nil || !ok {
+		t.Fatalf("GetWithToken = ok=%v err=%v, want ok", ok, err)
+	}
+
+	wrongToken := TokenFromDigest(ContentDigest([]byte("not-the-stored-value")))
+	deleted, err := client.DeleteIfMatches("k", wrongToken)
+	if err != nil || deleted {
+		t.Fatalf("DeleteIfMatches (mismatch) = %v, %v, want false, nil", deleted, err)
+	}
+	if !node.hasKey("k") {
+		t.Fatal("DeleteIfMatches deleted the key on a digest mismatch")
+	}
+
+	deleted, err = client.DeleteIfMatches("k", token)
+	if err != nil || !deleted {
+		t.Fatalf("DeleteIfMatches (match) = %v, %v, want true, nil", deleted, err)
+	}
+	if node.hasKey("k") {
+		t.Fatal("DeleteIfMatches did not delete the key on a digest match")
+	}
+}
+
+func TestDeleteIfMatchesOnAMissingKeyIsAMismatch(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	token := TokenFromDigest(ContentDigest([]byte("whatever")))
+	deleted, err := client.DeleteIfMatches("missing", token)
+	if err != nil || deleted {
+		t.Fatalf("DeleteIfMatches on a missing key = %v, %v, want false, nil", deleted, err)
+	}
+}
+
+func TestNamespaceCasScopesToItsNamespace(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ns := client.Namespace("cas-ns")
+	stored, err := ns.PutIfAbsent("k", []byte("v0"), 0)
+	if err != nil || !stored {
+		t.Fatalf("Namespace.PutIfAbsent = %v, %v, want true, nil", stored, err)
+	}
+	if node.hasKey("k") {
+		t.Fatal("Namespace.PutIfAbsent leaked into the default namespace")
+	}
+	if !node.hasNSKey("cas-ns", "k") {
+		t.Fatal("Namespace.PutIfAbsent did not write into its own namespace")
+	}
+
+	_, token, ok, err := ns.GetWithToken("k")
+	if err != nil || !ok {
+		t.Fatalf("Namespace.GetWithToken = ok=%v err=%v, want ok", ok, err)
+	}
+	stored, err = ns.Replace("k", token, []byte("v1"), 0)
+	if err != nil || !stored {
+		t.Fatalf("Namespace.Replace = %v, %v, want true, nil", stored, err)
+	}
+
+	// token still digests v0; k now holds v1, so this must mismatch.
+	deleted, err := ns.DeleteIfMatches("k", token)
+	if err != nil || deleted {
+		t.Fatalf("Namespace.DeleteIfMatches (stale token) = %v, %v, want false, nil", deleted, err)
+	}
+}
+
+// TestGetWithTokenDigestIsComputedFromRawWireBytesNotDecompressedValue is
+// the critical compression-correctness check (issue #141): with
+// Config.Compress enabled, GetWithToken's token must be the digest of the
+// raw, marker-prefixed wire bytes the server actually stores — never the
+// decompressed value this SDK hands back to the caller, since the server
+// itself never decompresses and so could never produce a matching digest
+// from decompressed bytes.
+func TestGetWithTokenDigestIsComputedFromRawWireBytesNotDecompressedValue(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{
+		Addresses:            []Address{addr(node.address())},
+		Compress:             true,
+		CompressionThreshold: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	value := strings.Repeat("y", 500)
+	if err := client.Set("k", value, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	storedAny, ok := node.store.Load(storeKey{"", "k"})
+	if !ok {
+		t.Fatal("value not stored")
+	}
+	raw := storedAny.([]byte)
+	if raw[0] != compressionMarkerDeflate {
+		t.Fatalf("marker = %d, want %d (test assumes this value compresses)", raw[0], compressionMarkerDeflate)
+	}
+
+	got, token, ok, err := client.GetWithToken("k")
+	if err != nil || !ok || string(got) != value {
+		t.Fatalf("GetWithToken = %q, %v, %v, want %q, true, nil", got, ok, err, value)
+	}
+
+	wantDigest := ContentDigest(raw)
+	if token.Digest() != wantDigest {
+		t.Fatalf("token digest = %x, want %x (must be computed from the raw wire bytes, marker included)",
+			token.Digest(), wantDigest)
+	}
+	// Sanity check that this test would actually catch the bug it's aimed
+	// at: the digest of the decompressed value must differ from the raw
+	// one, or a wrong implementation computing it from the wrong bytes
+	// would slip through undetected.
+	if wrongDigest := ContentDigest([]byte(value)); token.Digest() == wrongDigest {
+		t.Fatal("token digest equals the decompressed value's digest — computed from the wrong bytes")
+	}
+
+	// The value Replace writes back must go through the same compression
+	// pipeline Set uses, so a later plain Get still decompresses cleanly.
+	stored, err := client.Replace("k", token, []byte("a-new-value-thats-long-enough-to-maybe-compress"), 0)
+	if err != nil || !stored {
+		t.Fatalf("Replace = %v, %v, want true, nil", stored, err)
+	}
+	got2, ok, err := client.Get("k")
+	if err != nil || !ok || got2 != "a-new-value-thats-long-enough-to-maybe-compress" {
+		t.Fatalf("Get after Replace = %q, %v, %v", got2, ok, err)
+	}
+}
+
+// TestClusterCasRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult is the
+// CAS equivalent of TestClusterIncrRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult
+// (issue #141, following #129's replication rule exactly): a successful
+// Replace/DeleteIfMatches must run `k`/`x` against the primary owner
+// ONLY, then fan the primary's literal result out to the remaining
+// owners as an ordinary Set/Delete — never replay `k`/`x` on a replica (a
+// replica evaluating the same condition against its own possibly
+// different copy could reach a different outcome than the primary).
+func TestClusterCasRunsOnlyOnThePrimaryAndReplicatesTheLiteralResult(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const key = "shared-cas-key"
+	owners := ownersOf(key)
+	primary, replica := nodes[owners[0]], nodes[owners[1]]
+
+	if err := client.Set(key, "v0", 0); err != nil {
+		t.Fatal(err)
+	}
+	_, token, ok, err := client.GetWithToken(key)
+	if err != nil || !ok {
+		t.Fatalf("GetWithToken = ok=%v err=%v, want ok", ok, err)
+	}
+
+	stored, err := client.Replace(key, token, []byte("v1"), 0)
+	if err != nil || !stored {
+		t.Fatalf("Replace = %v, %v, want true, nil", stored, err)
+	}
+
+	if got := primary.kRequestsReceived(); got != 1 {
+		t.Fatalf("primary received %d `k` frames, want exactly 1", got)
+	}
+	if got := replica.kRequestsReceived(); got != 0 {
+		t.Fatalf("replica received %d `k` frames, want exactly 0 (it must never see `k`)", got)
+	}
+	if got, ok := replica.storedValue(key); !ok || got != "v1" {
+		t.Fatalf("replica's stored value = %q, %v, want \"v1\", true (must equal the primary's literal result)", got, ok)
+	}
+	if got, ok := primary.storedValue(key); !ok || got != "v1" {
+		t.Fatalf("primary's stored value = %q, %v, want \"v1\", true", got, ok)
+	}
+
+	// DeleteIfMatches follows the exact same rule for `x`.
+	_, token2, ok, err := client.GetWithToken(key)
+	if err != nil || !ok {
+		t.Fatalf("GetWithToken (2) = ok=%v err=%v, want ok", ok, err)
+	}
+	deleted, err := client.DeleteIfMatches(key, token2)
+	if err != nil || !deleted {
+		t.Fatalf("DeleteIfMatches = %v, %v, want true, nil", deleted, err)
+	}
+	if got := primary.xRequestsReceived(); got != 1 {
+		t.Fatalf("primary received %d `x` frames, want exactly 1", got)
+	}
+	if got := replica.xRequestsReceived(); got != 0 {
+		t.Fatalf("replica received %d `x` frames, want exactly 0 (it must never see `x`)", got)
+	}
+	if primary.hasKey(key) {
+		t.Fatal("primary still has the key after DeleteIfMatches succeeded")
+	}
+	if replica.hasKey(key) {
+		t.Fatal("replica still has the key — the delete result must have been fanned out as an ordinary Delete")
 	}
 }

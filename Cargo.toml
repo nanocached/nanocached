@@ -15,6 +15,7 @@ lru = "0.18"
 rustc-hash = "2"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2.0"
+sha2 = "0.10"
 tokio = {
   version = "1",
   features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"]

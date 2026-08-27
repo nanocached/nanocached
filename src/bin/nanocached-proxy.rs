@@ -921,10 +921,40 @@ enum Request {
         key: Bytes,
         delta: i64,
     },
+    /// Issue #141: `k` (compare-and-set). Always namespaced, same
+    /// reasoning as `Incr` — this op has no pre-namespace legacy form.
+    CasSet {
+        namespace: Bytes,
+        key: Bytes,
+        condition: CasCondition,
+        value: Bytes,
+        ttl: Option<u64>,
+    },
+    /// Issue #141: `x` (compare-and-delete). `condition` is always a
+    /// digest here — the node rejects `A`/`P` for `x` as a fatal parse
+    /// error (an absent- or present-only conditioned delete is already
+    /// the plain, unconditional `d`), and this parser holds `x` to the
+    /// same rule.
+    CasDelete {
+        namespace: Bytes,
+        key: Bytes,
+        expected_digest: [u8; 16],
+    },
     Clear {
         namespace: Bytes,
     },
     ClearAll,
+}
+
+/// Issue #141: `k`'s (and `x`'s) `<cond>` field, decoded. Independent
+/// reimplementation of the node's `crate::cache::CasCondition` — this
+/// binary shares no modules with the node (see `parse_delta_field`'s doc
+/// comment for the established policy).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CasCondition {
+    Absent,
+    Present,
+    Digest([u8; 16]),
 }
 
 #[derive(Debug, PartialEq)]
@@ -991,6 +1021,39 @@ fn parse_delta_field(field: &str) -> io::Result<i64> {
         }
     } else {
         i64::try_from(magnitude).map_err(|_| invalid("delta field out of range"))
+    }
+}
+
+/// Issue #141: `k`'s (and `x`'s) `<cond>` field — a fixed-shape bare
+/// token, not a length field: exactly `A`, exactly `P` (only when
+/// `allow_absent_present`, which `x`'s parse arm sets false — see
+/// `Request::CasDelete`'s doc comment), or exactly 32 lowercase hex
+/// digits. Independent reimplementation of the node's
+/// `command::parse_cas_condition`, same "no shared modules" policy as
+/// `parse_delta_field`.
+fn parse_cas_condition_field(field: &str, allow_absent_present: bool) -> io::Result<CasCondition> {
+    if allow_absent_present && field == "A" {
+        return Ok(CasCondition::Absent);
+    }
+    if allow_absent_present && field == "P" {
+        return Ok(CasCondition::Present);
+    }
+    let bytes = field.as_bytes();
+    if bytes.len() == 32 {
+        let mut digest = [0u8; 16];
+        for (byte, chunk) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+            *byte = (hex_nibble_field(chunk[0])? << 4) | hex_nibble_field(chunk[1])?;
+        }
+        return Ok(CasCondition::Digest(digest));
+    }
+    Err(invalid("bad cas condition field"))
+}
+
+fn hex_nibble_field(byte: u8) -> io::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(invalid("bad cas condition field")),
     }
 }
 
@@ -1184,6 +1247,105 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
             ))
         }
 
+        // Issue #141: `k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]`
+        // — `<cond>` is a bare token, so it's peeled off by hand like
+        // `i`'s `<delta>`, with `s`'s own optional trailing `[ttl] [tag]`
+        // layered on top of the fields that remain.
+        "k" => {
+            let (rest, tag) = if tagged {
+                let (tag_field, rest) =
+                    fields.split_last().ok_or_else(|| invalid("missing tag"))?;
+                let tag = u32::try_from(parse_length_field(tag_field)?)
+                    .map_err(|_| invalid("tag out of range"))?;
+                (rest, Some(tag))
+            } else {
+                (fields.as_slice(), None)
+            };
+            let (namespace_length, key_length, value_length, cond, ttl) = match rest {
+                [namespace_length, key_length, value_length, cond] => {
+                    (namespace_length, key_length, value_length, cond, None)
+                }
+                [namespace_length, key_length, value_length, cond, ttl] => {
+                    (namespace_length, key_length, value_length, cond, Some(*ttl))
+                }
+                _ => return Err(invalid("bad cas-set header")),
+            };
+            let namespace_length = parse_length_field(namespace_length)?;
+            let key_length = parse_length_field(key_length)?;
+            let value_length = parse_length_field(value_length)?;
+            if key_length == 0 {
+                return Err(invalid("empty key"));
+            }
+            let condition = parse_cas_condition_field(cond, true)?;
+            let ttl = ttl
+                .map(parse_length_field)
+                .transpose()?
+                .map(|ttl| ttl as u64);
+
+            let body_length = namespace_length
+                .checked_add(key_length)
+                .and_then(|length| length.checked_add(value_length))
+                .ok_or_else(|| invalid("frame length overflow"))?;
+            let body = body!(body_length);
+            let namespace = body.slice(..namespace_length);
+            let key = body.slice(namespace_length..namespace_length + key_length);
+            let value = body.slice(namespace_length + key_length..);
+            Ok(ParseOutcome::Ready(
+                Request::CasSet {
+                    namespace,
+                    key,
+                    condition,
+                    value,
+                    ttl,
+                },
+                tag,
+            ))
+        }
+
+        // Issue #141: `x <ns-len> <key-len> <cond> [tag]` — `<cond>` must
+        // be a digest (`allow_absent_present: false` — see
+        // `Request::CasDelete`'s doc comment).
+        "x" => {
+            let (rest, tag) = if tagged {
+                let (tag_field, rest) =
+                    fields.split_last().ok_or_else(|| invalid("missing tag"))?;
+                let tag = u32::try_from(parse_length_field(tag_field)?)
+                    .map_err(|_| invalid("tag out of range"))?;
+                (rest, Some(tag))
+            } else {
+                (fields.as_slice(), None)
+            };
+            let [namespace_length, key_length, cond] = rest else {
+                return Err(invalid("bad cas-delete header"));
+            };
+            let namespace_length = parse_length_field(namespace_length)?;
+            let key_length = parse_length_field(key_length)?;
+            if key_length == 0 {
+                return Err(invalid("empty key"));
+            }
+            let expected_digest = match parse_cas_condition_field(cond, false)? {
+                CasCondition::Digest(digest) => digest,
+                CasCondition::Absent | CasCondition::Present => {
+                    unreachable!("parse_cas_condition_field(cond, false) never returns those")
+                }
+            };
+            let body = body!(
+                namespace_length
+                    .checked_add(key_length)
+                    .ok_or_else(|| invalid("frame length overflow"))?
+            );
+            let namespace = body.slice(..namespace_length);
+            let key = body.slice(namespace_length..);
+            Ok(ParseOutcome::Ready(
+                Request::CasDelete {
+                    namespace,
+                    key,
+                    expected_digest,
+                },
+                tag,
+            ))
+        }
+
         "c" => {
             let (lengths, tag) = split_tag(&fields)?;
             let [namespace_length] = lengths.as_slice() else {
@@ -1222,6 +1384,10 @@ enum Expect {
     Cleared,
     /// Issue #129: `I <len> [ttl] <tag>` + body, or `N`/`T`/`W`/`E`.
     Incremented,
+    /// Issue #141: `k`'s reply — `S` (condition held) or `N` (mismatch),
+    /// or `W`/`E`. `x`'s reply reuses `Expect::Deleted` unchanged (`D`/`N`
+    /// is already exactly that shape).
+    CasSet,
 }
 
 /// One reply from a node, already tag-verified.
@@ -1497,6 +1663,10 @@ async fn read_reply<S: AsyncRead + Unpin>(
                     | NodeReply::Error,
                 Expect::Incremented
             )
+            | (
+                NodeReply::Stored | NodeReply::NotFound | NodeReply::WrongNode | NodeReply::Error,
+                Expect::CasSet
+            )
     );
     if !shape_ok {
         return Err(invalid("backend reply does not fit the request"));
@@ -1558,6 +1728,54 @@ fn frame_delete(namespace: &[u8], key: &[u8]) -> Vec<u8> {
 fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Vec<u8> {
     let mut frame = format!(
         "i {} {} {delta} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        key.len()
+    )
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
+/// Issue #141: `<cond>`'s wire form for the outgoing `k`/`x` frame — the
+/// exact inverse of `parse_cas_condition_field`.
+fn cas_condition_field(condition: CasCondition) -> String {
+    match condition {
+        CasCondition::Absent => "A".to_string(),
+        CasCondition::Present => "P".to_string(),
+        CasCondition::Digest(digest) => digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+    }
+}
+
+/// Issue #141: always the lowercase, namespaced `k` — like `INCR`, this
+/// op has no uppercase legacy form.
+fn frame_cas_set(
+    namespace: &[u8],
+    key: &[u8],
+    condition: CasCondition,
+    value: &[u8],
+    ttl: Option<u64>,
+) -> Vec<u8> {
+    let cond = cas_condition_field(condition);
+    let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+    let mut frame = format!(
+        "k {} {} {} {cond}{ttl_field} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        key.len(),
+        value.len()
+    )
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame.extend_from_slice(value);
+    frame
+}
+
+/// Issue #141: always the lowercase, namespaced `x`.
+fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> Vec<u8> {
+    let cond = cas_condition_field(CasCondition::Digest(expected_digest));
+    let mut frame = format!(
+        "x {} {} {cond} {TAG_PLACEHOLDER}\n",
         namespace.len(),
         key.len()
     )
@@ -1942,6 +2160,74 @@ async fn dispatch_request(
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
+        Request::CasSet {
+            namespace,
+            key,
+            condition,
+            value,
+            ttl,
+        } => {
+            let owners = ring.owners(&namespace, &key);
+            let Some(primary) = owners.first() else {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            };
+            let pending = context
+                .backends
+                .enqueue(
+                    &context,
+                    primary,
+                    frame_cas_set(&namespace, &key, condition, &value, ttl),
+                    Expect::CasSet,
+                )
+                .await;
+            tokio::spawn(async move {
+                let result = finish_cas_set(
+                    &context,
+                    (&namespace, &key),
+                    (condition, &value, ttl),
+                    owners,
+                    pending,
+                    tag,
+                    retry_capable,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
+        Request::CasDelete {
+            namespace,
+            key,
+            expected_digest,
+        } => {
+            let owners = ring.owners(&namespace, &key);
+            let Some(primary) = owners.first() else {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            };
+            let pending = context
+                .backends
+                .enqueue(
+                    &context,
+                    primary,
+                    frame_cas_delete(&namespace, &key, expected_digest),
+                    Expect::Deleted,
+                )
+                .await;
+            tokio::spawn(async move {
+                let result = finish_cas_delete(
+                    &context,
+                    (&namespace, &key),
+                    expected_digest,
+                    owners,
+                    pending,
+                    tag,
+                    retry_capable,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
         Request::Clear { namespace } => {
             let pending = enqueue_clear(&context, &ring, Some(&namespace)).await;
             tokio::spawn(async move {
@@ -2141,7 +2427,7 @@ async fn refan_write(
 /// itself up front — only once the primary's result is known is that
 /// *result* fanned out to the remaining owners as a plain `Set`,
 /// carrying the TTL the primary's `I` reply itself carried
-/// (`fan_out_incr_result`). Replaying `i` on a replica instead would let
+/// (`fan_out_write_result`). Replaying `i` on a replica instead would let
 /// it drift from the primary (e.g. after an eviction or a replica leg
 /// that missed an earlier write) — the same reasoning
 /// `src/server.rs`'s `Incr` connection handler documents for the
@@ -2163,7 +2449,7 @@ async fn finish_incr(
     let (namespace, key) = address;
     match pending.await {
         Ok(NodeReply::Incremented(value, ttl)) => {
-            fan_out_incr_result(context, namespace, key, &value, ttl, &owners[1..]).await;
+            fan_out_write_result(context, namespace, key, &value, ttl, &owners[1..]).await;
             Ok(respond_incremented(&value, ttl, tag))
         }
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
@@ -2179,12 +2465,16 @@ async fn finish_incr(
     }
 }
 
-/// Fans a successful INCR's *result* out to `replicas` as a plain `Set`
-/// (never `Incr` — see `finish_incr`'s doc comment). Failures are logged
-/// and swallowed, the same stance `finish_write`'s replica legs take: an
-/// under-replicated counter is recovered by the next node-list refresh,
-/// never fails the client's already-successful INCR.
-async fn fan_out_incr_result(
+/// Fans a successful primary write's *result* out to `replicas` as a
+/// plain `Set` — shared by `INCR` (never replaying `i` itself, see
+/// `finish_incr`'s doc comment) and `k`/compare-and-set (never replaying
+/// `k` itself, see `finish_cas_set`'s doc comment); both compute or
+/// accept a value on the primary that a replica must not be left to
+/// (re)derive on its own. Failures are logged and swallowed, the same
+/// stance `finish_write`'s replica legs take: an under-replicated entry
+/// is recovered by the next node-list refresh, never fails the client's
+/// already-successful write.
+async fn fan_out_write_result(
     context: &ProxyContext,
     namespace: &[u8],
     key: &[u8],
@@ -2238,11 +2528,171 @@ async fn refan_incr(
         .await
     {
         Ok(NodeReply::Incremented(value, ttl)) => {
-            fan_out_incr_result(context, namespace, key, &value, ttl, replicas).await;
+            fan_out_write_result(context, namespace, key, &value, ttl, replicas).await;
             Ok(respond_incremented(&value, ttl, tag))
         }
         Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
         Ok(NodeReply::NotNumeric) => Ok(respond("T", tag)),
+        _ => Err(Fatal),
+    }
+}
+
+/// `k`'s completion: the primary's ordered reply drives the result.
+/// Unlike `finish_write`, replicas are never sent the compare-and-set
+/// itself up front — a replica evaluating the same condition against its
+/// own (possibly different) copy could reach a different outcome than
+/// the primary just did. Only once the primary's condition holds is the
+/// resulting *value* fanned out to the remaining owners as a plain `Set`
+/// (`fan_out_write_result`, shared with `INCR` — see its own doc
+/// comment). A primary `W` or transport failure re-runs the whole thing
+/// on the refreshed ring (`refan_cas_set`), same as `finish_incr`.
+async fn finish_cas_set(
+    context: &ProxyContext,
+    // `(namespace, key)`, grouped to stay under clippy's argument-count
+    // lint — always used together.
+    address: (&[u8], &[u8]),
+    write: (CasCondition, &[u8], Option<u64>),
+    owners: Vec<String>,
+    pending: PendingReply,
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    let (_, value, ttl) = write;
+    match pending.await {
+        Ok(NodeReply::Stored) => {
+            fan_out_write_result(context, namespace, key, value, ttl, &owners[1..]).await;
+            Ok(respond("S", tag))
+        }
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        Ok(NodeReply::WrongNode) => {
+            force_refresh(context).await;
+            refan_cas_set(context, address, write, tag, retry_capable).await
+        }
+        Err(_) => refan_cas_set(context, address, write, tag, retry_capable).await,
+        Ok(_) => Err(Fatal),
+    }
+}
+
+/// `finish_cas_set`'s retry path for both a primary `W` and a transport
+/// failure: re-fetches the current ring and runs the whole compare-and-set
+/// (primary leg, then the replica fan-out) again via `call`.
+async fn refan_cas_set(
+    context: &ProxyContext,
+    address: (&[u8], &[u8]),
+    write: (CasCondition, &[u8], Option<u64>),
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    let (condition, value, ttl) = write;
+    let Some(ring) = current_ring(context) else {
+        return Err(Fatal);
+    };
+    let owners = ring.owners(namespace, key);
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Ok(transient_reply(retry_capable, tag));
+    };
+    match context
+        .backends
+        .call(
+            context,
+            primary,
+            frame_cas_set(namespace, key, condition, value, ttl),
+            Expect::CasSet,
+        )
+        .await
+    {
+        Ok(NodeReply::Stored) => {
+            fan_out_write_result(context, namespace, key, value, ttl, replicas).await;
+            Ok(respond("S", tag))
+        }
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        _ => Err(Fatal),
+    }
+}
+
+/// `x`'s completion — same shape as `finish_cas_set`, but the successful
+/// result is a deletion: fanned out to replicas as a plain `Delete`,
+/// never `x` itself, for the same reason `k`'s result is fanned out as a
+/// plain `Set`.
+async fn finish_cas_delete(
+    context: &ProxyContext,
+    address: (&[u8], &[u8]),
+    expected_digest: [u8; 16],
+    owners: Vec<String>,
+    pending: PendingReply,
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    match pending.await {
+        Ok(NodeReply::Deleted) => {
+            fan_out_delete_result(context, namespace, key, &owners[1..]).await;
+            Ok(respond("D", tag))
+        }
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
+        Ok(NodeReply::WrongNode) => {
+            force_refresh(context).await;
+            refan_cas_delete(context, address, expected_digest, tag, retry_capable).await
+        }
+        Err(_) => refan_cas_delete(context, address, expected_digest, tag, retry_capable).await,
+        Ok(_) => Err(Fatal),
+    }
+}
+
+/// Fans a successful compare-and-delete's *result* out to `replicas` as a
+/// plain `Delete` — never `x` itself, same "primary decides, forward the
+/// literal result" rule `fan_out_write_result` documents for `k`/`INCR`.
+async fn fan_out_delete_result(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    replicas: &[String],
+) {
+    for addr in replicas {
+        if let Err(error) = context
+            .backends
+            .call(context, addr, frame_delete(namespace, key), Expect::Deleted)
+            .await
+        {
+            eprintln!("WARN replica cas-delete-result write to {addr} failed: {error}");
+        }
+    }
+}
+
+/// `finish_cas_delete`'s retry path for both a primary `W` and a
+/// transport failure.
+async fn refan_cas_delete(
+    context: &ProxyContext,
+    address: (&[u8], &[u8]),
+    expected_digest: [u8; 16],
+    tag: Option<u32>,
+    retry_capable: bool,
+) -> DriverResult {
+    let (namespace, key) = address;
+    let Some(ring) = current_ring(context) else {
+        return Err(Fatal);
+    };
+    let owners = ring.owners(namespace, key);
+    let Some((primary, replicas)) = owners.split_first() else {
+        return Ok(transient_reply(retry_capable, tag));
+    };
+    match context
+        .backends
+        .call(
+            context,
+            primary,
+            frame_cas_delete(namespace, key, expected_digest),
+            Expect::Deleted,
+        )
+        .await
+    {
+        Ok(NodeReply::Deleted) => {
+            fan_out_delete_result(context, namespace, key, replicas).await;
+            Ok(respond("D", tag))
+        }
+        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
         _ => Err(Fatal),
     }
 }
@@ -2939,6 +3389,12 @@ mod tests {
         /// `an_incr_results_fan_out_never_replays_the_increment_on_a_replica`),
         /// only the primary does.
         incrs: Arc<AtomicUsize>,
+        /// Issue #141: how many `k`/`x` frames this node actually
+        /// received — same "only the primary does" proof as `incrs`, for
+        /// compare-and-set (see
+        /// `a_cas_results_fan_out_never_replays_the_operation_on_a_replica`).
+        cas_sets: Arc<AtomicUsize>,
+        cas_deletes: Arc<AtomicUsize>,
     }
 
     impl MockNode {
@@ -2956,6 +3412,8 @@ mod tests {
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
                 incrs: Arc::new(AtomicUsize::new(0)),
+                cas_sets: Arc::new(AtomicUsize::new(0)),
+                cas_deletes: Arc::new(AtomicUsize::new(0)),
             };
             let store = Arc::clone(&node.store);
             let cleared = Arc::clone(&node.cleared);
@@ -2966,6 +3424,8 @@ mod tests {
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
             let incrs = Arc::clone(&node.incrs);
+            let cas_sets = Arc::clone(&node.cas_sets);
+            let cas_deletes = Arc::clone(&node.cas_deletes);
             tokio::spawn(async move {
                 loop {
                     let Ok((stream, _)) = listener.accept().await else {
@@ -2983,6 +3443,8 @@ mod tests {
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
                             incrs: Arc::clone(&incrs),
+                            cas_sets: Arc::clone(&cas_sets),
+                            cas_deletes: Arc::clone(&cas_deletes),
                         },
                     ));
                 }
@@ -2992,6 +3454,14 @@ mod tests {
 
         fn incrs(&self) -> usize {
             self.incrs.load(Ordering::SeqCst)
+        }
+
+        fn cas_sets(&self) -> usize {
+            self.cas_sets.load(Ordering::SeqCst)
+        }
+
+        fn cas_deletes(&self) -> usize {
+            self.cas_deletes.load(Ordering::SeqCst)
         }
 
         fn entry(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
@@ -3017,6 +3487,21 @@ mod tests {
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
         incrs: Arc<AtomicUsize>,
+        cas_sets: Arc<AtomicUsize>,
+        cas_deletes: Arc<AtomicUsize>,
+    }
+
+    /// Issue #141: same content-digest algorithm as the real node's
+    /// `crate::cache::content_digest` — SHA-256 truncated to the first 16
+    /// bytes, lowercase hex. An independent reimplementation for this
+    /// mock, same "no shared modules" policy as the rest of this binary.
+    fn mock_content_digest(value: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(value);
+        hash[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     async fn serve_mock_node(mut stream: TcpStream, state: MockNodeState) {
@@ -3030,6 +3515,8 @@ mod tests {
             auth_count,
             saw_pipelined,
             incrs,
+            cas_sets,
+            cas_deletes,
         } = state;
         let mut buf = BytesMut::new();
         let result: io::Result<()> = async {
@@ -3181,6 +3668,90 @@ mod tests {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Issue #141: no TTL fidelity, same as `S`/`s`/`i`
+                    // above. `<cond>` is always `fields[3]` regardless of
+                    // whether the optional `<ttl>` field follows it — the
+                    // proxy always tags, so `fields.last()` is the tag
+                    // either way.
+                    "k" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let key_length: usize = fields[1].parse().unwrap();
+                        let value_length: usize = fields[2].parse().unwrap();
+                        let cond = fields[3].clone();
+                        read_exact_into(
+                            &mut stream,
+                            &mut buf,
+                            ns_length + key_length + value_length,
+                        )
+                        .await?;
+                        let body = buf.split_to(ns_length + key_length + value_length);
+                        let namespace = body[..ns_length].to_vec();
+                        let key = body[ns_length..ns_length + key_length].to_vec();
+                        let value = body[ns_length + key_length..].to_vec();
+                        if wrong_once.swap(false, Ordering::SeqCst) {
+                            stream
+                                .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
+                        cas_sets.fetch_add(1, Ordering::SeqCst);
+                        let current = store
+                            .lock()
+                            .unwrap()
+                            .get(&(namespace.clone(), key.clone()))
+                            .cloned();
+                        let condition_holds = match cond.as_str() {
+                            "A" => current.is_none(),
+                            "P" => current.is_some(),
+                            digest => current
+                                .as_deref()
+                                .is_some_and(|value| mock_content_digest(value) == digest),
+                        };
+                        if condition_holds {
+                            store.lock().unwrap().insert((namespace, key), value);
+                            stream
+                                .write_all(format!("S {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                        } else {
+                            stream
+                                .write_all(format!("N {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                        }
+                    }
+                    "x" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let key_length: usize = fields[1].parse().unwrap();
+                        let cond = fields[2].clone();
+                        read_exact_into(&mut stream, &mut buf, ns_length + key_length).await?;
+                        let body = buf.split_to(ns_length + key_length);
+                        let namespace = body[..ns_length].to_vec();
+                        let key = body[ns_length..].to_vec();
+                        if wrong_once.swap(false, Ordering::SeqCst) {
+                            stream
+                                .write_all(format!("W {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                            continue;
+                        }
+                        cas_deletes.fetch_add(1, Ordering::SeqCst);
+                        let current = store
+                            .lock()
+                            .unwrap()
+                            .get(&(namespace.clone(), key.clone()))
+                            .cloned();
+                        let condition_holds = current
+                            .as_deref()
+                            .is_some_and(|value| mock_content_digest(value) == cond);
+                        if condition_holds {
+                            store.lock().unwrap().remove(&(namespace, key));
+                            stream
+                                .write_all(format!("D {}\n", tag(&fields)).as_bytes())
+                                .await?;
+                        } else {
+                            stream
+                                .write_all(format!("N {}\n", tag(&fields)).as_bytes())
+                                .await?;
                         }
                     }
                     "D" | "d" => {
@@ -4090,7 +4661,7 @@ mod tests {
         // owners start from the same seed) — the real proof is that the
         // replica's `incrs` counter stays 0: only the primary ever
         // receives an `i` frame, the replica only ever sees the result as
-        // a plain `Set` (see `finish_incr`/`fan_out_incr_result`).
+        // a plain `Set` (see `finish_incr`/`fan_out_write_result`).
         let (nodes, proxy) = cluster(2).await;
         let (mut stream, mut buf) = connect_and_auth(&proxy).await;
 
@@ -4132,5 +4703,130 @@ mod tests {
 
         stream.write_all(b"i 0 4 1\nname").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "T");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_set_through_the_proxy_succeeds_on_absent_and_fails_on_present() {
+        // R=2 over the two-node roster so *both* nodes always own the
+        // key, regardless of which one the ring's hash picks as primary
+        // for "k" — same reasoning as `a_write_reaches_all_replicas_before_the_ack`.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        // Absent-conditioned set succeeds on a missing key.
+        stream.write_all(b"k 0 1 5 A\nkAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        // The same condition now fails — the key exists.
+        stream.write_all(b"k 0 1 3 A\nkBob").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert_eq!(nodes[0].entry(b"", b"k"), Some(b"Alice".to_vec()));
+
+        // Present-conditioned set succeeds now that the key exists.
+        stream.write_all(b"k 0 1 3 P\nkBob").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(nodes[0].entry(b"", b"k"), Some(b"Bob".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_set_with_a_digest_condition_replaces_only_on_an_exact_match() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        let stale = mock_content_digest(b"someone-else");
+        stream
+            .write_all(format!("k 0 4 3 {stale}\nnameBob").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert_eq!(nodes[0].entry(b"", b"name"), Some(b"Alice".to_vec()));
+
+        let current = mock_content_digest(b"Alice");
+        stream
+            .write_all(format!("k 0 4 3 {current}\nnameBob").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(nodes[0].entry(b"", b"name"), Some(b"Bob".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_delete_through_the_proxy_removes_only_on_a_matching_digest() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        let stale = mock_content_digest(b"someone-else");
+        stream
+            .write_all(format!("x 0 4 {stale}\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert_eq!(nodes[0].entry(b"", b"name"), Some(b"Alice".to_vec()));
+
+        let current = mock_content_digest(b"Alice");
+        stream
+            .write_all(format!("x 0 4 {current}\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+        assert_eq!(nodes[0].entry(b"", b"name"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cas_results_fan_out_never_replays_the_operation_on_a_replica() {
+        // Same proof as `an_incr_results_fan_out_never_replays_the_increment_on_a_replica`,
+        // for `k`/`x`: a naive fan-out that resent the operation itself
+        // would still land on the right value here (both owners start
+        // from the same seed) — the real proof is that the replica's
+        // `cas_sets`/`cas_deletes` counters stay 0.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let primary_addr = ring.owners(b"", b"name")[0].clone();
+        let (primary, replica) = if primary_addr == nodes[0].addr {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        };
+
+        stream.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        let alice_digest = mock_content_digest(b"Alice");
+        stream
+            .write_all(format!("k 0 4 3 {alice_digest}\nnameBob").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        assert_eq!(primary.cas_sets(), 1);
+        assert_eq!(replica.cas_sets(), 0);
+        assert_eq!(primary.entry(b"", b"name"), Some(b"Bob".to_vec()));
+        assert_eq!(replica.entry(b"", b"name"), Some(b"Bob".to_vec()));
+
+        let bob_digest = mock_content_digest(b"Bob");
+        stream
+            .write_all(format!("x 0 4 {bob_digest}\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+
+        assert_eq!(primary.cas_deletes(), 1);
+        assert_eq!(replica.cas_deletes(), 0);
+        assert_eq!(primary.entry(b"", b"name"), None);
+        assert_eq!(replica.entry(b"", b"name"), None);
     }
 }
