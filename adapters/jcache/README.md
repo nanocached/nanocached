@@ -149,7 +149,9 @@ Framework adapters are ecosystem-specific and live **outside** the
 six-language SDK parity policy ([#25]): parity applies to the SDK core
 only. This module exists for JSR-107; other ecosystems get their own
 idiomatic adapters (Spring `CacheManager`, `IDistributedCache`, Django
-cache backend, cache-manager store) rather than mirrors of this one.
+cache backend, [cache-manager](../cache-manager) v5,
+[Keyv](../keyv) for cache-manager v6+/NestJS 11) rather than mirrors of
+this one.
 
 [#25]: https://github.com/nanocached/nanocached/issues/25
 

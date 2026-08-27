@@ -1,0 +1,7 @@
+node_modules
+dist
+dist-test
+# pnpm auto-generates this locally to record "too new to gate" exclusions
+# (minimumReleaseAgeExclude) picked up during `pnpm install` — not
+# something this package intentionally configures.
+pnpm-workspace.yaml

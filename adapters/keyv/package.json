@@ -1,0 +1,68 @@
+{
+  "name": "nanocached-keyv",
+  "version": "0.1.0",
+  "description": "Keyv storage adapter for nanocached, a tiny distributed cache with client-side replication — for cache-manager v6+ and NestJS 11's CacheModule",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nanocached/nanocached.git",
+    "directory": "adapters/keyv"
+  },
+  "homepage": "https://github.com/nanocached/nanocached/tree/main/adapters/keyv#readme",
+  "bugs": {
+    "url": "https://github.com/nanocached/nanocached/issues"
+  },
+  "keywords": [
+    "nanocached",
+    "keyv",
+    "cache-manager",
+    "nestjs",
+    "cache",
+    "distributed-cache",
+    "storage-adapter"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.15.1",
+  "scripts": {
+    "build:sdk": "pnpm --dir ../../sdk/typescript install --frozen-lockfile && pnpm --dir ../../sdk/typescript run build",
+    "build": "pnpm run build:sdk && tsc",
+    "pretypecheck": "pnpm run build:sdk",
+    "typecheck": "tsc --noEmit",
+    "pretest": "pnpm run build:sdk",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
+    "prepublishOnly": "npm run test && npm run build"
+  },
+  "dependencies": {
+    "nanocached": "link:../../sdk/typescript"
+  },
+  "devDependencies": {
+    "@nestjs/cache-manager": "^3.1.3",
+    "@nestjs/common": "^11.2.0",
+    "@nestjs/core": "^11.2.0",
+    "@nestjs/testing": "^11.2.0",
+    "@types/node": "^24.0.0",
+    "cache-manager": "^7.2.0",
+    "keyv": "^5.6.0",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.8.0",
+    "typescript": "^5.9.0"
+  },
+  "peerDependencies": {
+    "keyv": "^5.0.0"
+  }
+}
