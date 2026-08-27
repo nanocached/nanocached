@@ -3,6 +3,7 @@
 //! See <https://github.com/nanocached/nanocached> for the server and
 //! protocol, and this crate's README for usage.
 
+mod cas;
 mod client;
 mod compression;
 mod connection;
@@ -11,6 +12,7 @@ mod hash_ring;
 mod identify;
 mod open_targets;
 
+pub use cas::{content_digest, CasToken};
 #[doc(hidden)]
 pub use client::KEEPALIVE_INTERVAL_MS;
 #[doc(hidden)]

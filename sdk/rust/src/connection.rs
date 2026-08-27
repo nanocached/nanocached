@@ -171,6 +171,40 @@ pub(crate) enum ResponseKind {
     Incr(i64, Option<u64>),
 }
 
+/// The three `<cond>` shapes `k`/`x` accept (compare-and-set, issue
+/// #141) — see `cas_condition_token`, `Connection::cas_set`, and
+/// `Connection::cas_delete`. `x` only ever uses `Digest` (an
+/// absent/present-only conditioned delete is already the plain,
+/// unconditional `D`/`d` — see `Connection::cas_delete`'s doc comment),
+/// but the type is shared with `k` rather than split in two, since
+/// `Digest` is identical either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CasCondition {
+    /// Wire `A`: succeeds only if the key is absent (including lazily
+    /// expired) — `add`/`putIfAbsent`.
+    Absent,
+    /// Wire `P`: succeeds only if the key currently holds any (unexpired)
+    /// value, whatever it is — the two-argument `replace(key, value)`.
+    Present,
+    /// Wire: the 32-character lowercase hex encoding of this digest —
+    /// succeeds only if the key holds an unexpired value whose
+    /// [`crate::cas::content_digest`] equals it exactly.
+    Digest([u8; 16]),
+}
+
+/// The literal wire token for one of [`CasCondition`]'s three shapes:
+/// `A`/`P` bare, or the digest's 32-character lowercase hex encoding
+/// (reusing [`crate::cas::CasToken`]'s `Display` so the hex-encoding
+/// logic isn't duplicated between the wire-writing and the public-API
+/// sides of CAS).
+fn cas_condition_token(condition: CasCondition) -> String {
+    match condition {
+        CasCondition::Absent => "A".to_string(),
+        CasCondition::Present => "P".to_string(),
+        CasCondition::Digest(digest) => crate::cas::CasToken::from(digest).to_string(),
+    }
+}
+
 /// RAII guard around the write half of a round trip: if the enclosing
 /// future is dropped while `write_all` is still pending (a caller
 /// abandoning the request, e.g. via `tokio::time::timeout`), the frame
@@ -384,6 +418,65 @@ impl Connection {
         {
             ResponseKind::Incr(value, ttl_seconds) => Ok(Some((value, ttl_seconds))),
             ResponseKind::NotFound => Ok(None),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Sends `k` (compare-and-set, issue #141) to this one node only, and
+    /// returns whether `condition` held: `true` (wire `S`, the same
+    /// acknowledgement a plain `set` gives) means `value` is now stored;
+    /// `false` (wire `N`, the same "nothing to act on" status a miss
+    /// already uses) means the condition didn't hold and nothing changed
+    /// — a mismatch is a plain boolean outcome here, never an error.
+    /// `namespace` empty means the default namespace, exactly like
+    /// `incr` — `k` has no legacy uppercase form either.
+    ///
+    /// Deliberately dumb, exactly like `incr`: never fans anything out to
+    /// replicas on its own. Cluster replication of a success — forwarding
+    /// the literal new value to the remaining owners as an ordinary
+    /// `set`, never replaying `k` on them — is
+    /// [`crate::client::NanocachedClient`]'s job (see its `cas_set_once`),
+    /// for exactly the reason `incr`'s replication is: a replica
+    /// evaluating `condition` against its own possibly-different copy
+    /// could reach a different outcome than the primary just did.
+    pub(crate) async fn cas_set(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        value: &[u8],
+        condition: CasCondition,
+        ttl_seconds: u64,
+    ) -> Result<bool> {
+        match self
+            .request(|tag| encode_cas_set(namespace, key, value, condition, ttl_seconds, tag))
+            .await?
+        {
+            ResponseKind::Stored => Ok(true),
+            ResponseKind::NotFound => Ok(false),
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Sends `x` (compare-and-set, issue #141) to this one node only —
+    /// the two-argument `remove(key, old)`. `condition` here is always a
+    /// digest: an absent- or present-only conditioned delete is already
+    /// the plain, unconditional `delete`. See `cas_set`'s doc comment for
+    /// the boolean-not-error mismatch convention (wire `D`/`N`, same as a
+    /// plain `delete`'s own hit/miss) and the "replicate the result,
+    /// never the op" replication rule, both of which apply here
+    /// identically — a success replicates as a plain `delete`.
+    pub(crate) async fn cas_delete(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        digest: [u8; 16],
+    ) -> Result<bool> {
+        match self
+            .request(|tag| encode_cas_delete(namespace, key, digest, tag))
+            .await?
+        {
+            ResponseKind::Deleted => Ok(true),
+            ResponseKind::NotFound => Ok(false),
             other => Err(self.mismatch(&other)),
         }
     }
@@ -698,6 +791,70 @@ fn encode_incr(namespace: &[u8], key: &[u8], delta: i64, tag: Option<u32>) -> Ve
     let mut frame = match tag {
         Some(tag) => format!("i {} {} {delta} {tag}\n", namespace.len(), key.len()),
         None => format!("i {} {} {delta}\n", namespace.len(), key.len()),
+    }
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame
+}
+
+/// Builds a `k` frame (compare-and-set, issue #141): `k <namespace-length>
+/// <key-length> <value-length> <cond> [<ttl-seconds>] [<tag>]\n<namespace><key><value>`
+/// — always namespaced, no legacy uppercase form, exactly like
+/// `encode_incr`. `<cond>` is a mandatory bare token ahead of `encode_set`'s
+/// own optional trailing `[ttl] [tag]` pair, which this reuses verbatim
+/// (same tagged-mode-aware trailing-field-count idiom).
+fn encode_cas_set(
+    namespace: &[u8],
+    key: &[u8],
+    value: &[u8],
+    condition: CasCondition,
+    ttl_seconds: u64,
+    tag: Option<u32>,
+) -> Vec<u8> {
+    let cond = cas_condition_token(condition);
+    let mut frame = match (ttl_seconds, tag) {
+        (0, None) => format!(
+            "k {} {} {} {cond}\n",
+            namespace.len(),
+            key.len(),
+            value.len()
+        ),
+        (0, Some(tag)) => format!(
+            "k {} {} {} {cond} {tag}\n",
+            namespace.len(),
+            key.len(),
+            value.len()
+        ),
+        (ttl, None) => format!(
+            "k {} {} {} {cond} {ttl}\n",
+            namespace.len(),
+            key.len(),
+            value.len()
+        ),
+        (ttl, Some(tag)) => format!(
+            "k {} {} {} {cond} {ttl} {tag}\n",
+            namespace.len(),
+            key.len(),
+            value.len()
+        ),
+    }
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    frame.extend_from_slice(key);
+    frame.extend_from_slice(value);
+    frame
+}
+
+/// Builds an `x` frame (compare-and-set, issue #141): `x <namespace-length>
+/// <key-length> <cond> [<tag>]\n<namespace><key>` — `<cond>` is always a
+/// digest here (never `A`/`P`, which are already the plain, unconditional
+/// `D`/`d` — see `Connection::cas_delete`'s doc comment).
+fn encode_cas_delete(namespace: &[u8], key: &[u8], digest: [u8; 16], tag: Option<u32>) -> Vec<u8> {
+    let cond = cas_condition_token(CasCondition::Digest(digest));
+    let mut frame = match tag {
+        Some(tag) => format!("x {} {} {cond} {tag}\n", namespace.len(), key.len()),
+        None => format!("x {} {} {cond}\n", namespace.len(), key.len()),
     }
     .into_bytes();
     frame.extend_from_slice(namespace);
@@ -1253,6 +1410,109 @@ mod tests {
             ResponseKind::try_from((b'I', Some(b"-7".to_vec()), None)),
             Ok(ResponseKind::Incr(-7, None))
         ));
+    }
+
+    // ── compare-and-set (issue #141) ────────────────────────────────
+
+    #[test]
+    fn encode_cas_set_emits_the_absent_condition_for_the_default_namespace() {
+        // Like incr, k has no legacy uppercase frame — even the empty
+        // (default) namespace goes out as `k 0 ...`.
+        assert_eq!(
+            encode_cas_set(b"", b"name", b"Alice", CasCondition::Absent, 0, None),
+            [b"k 0 4 5 A\n".as_slice(), b"name", b"Alice"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_set_emits_the_present_condition() {
+        assert_eq!(
+            encode_cas_set(b"", b"name", b"Bob", CasCondition::Present, 0, None),
+            [b"k 0 4 3 P\n".as_slice(), b"name", b"Bob"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_set_emits_the_digest_condition_as_lowercase_hex() {
+        let digest = crate::cas::content_digest(b"Alice");
+        let expected_header = format!("k 0 4 3 {}\n", crate::cas::CasToken::from(digest));
+        assert_eq!(
+            encode_cas_set(b"", b"name", b"Bob", CasCondition::Digest(digest), 0, None),
+            [expected_header.as_bytes(), b"name", b"Bob"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_set_emits_the_ttl_field_when_present() {
+        assert_eq!(
+            encode_cas_set(b"", b"name", b"Alice", CasCondition::Absent, 60, None),
+            [b"k 0 4 5 A 60\n".as_slice(), b"name", b"Alice"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_set_emits_the_tagged_frame_without_a_ttl() {
+        assert_eq!(
+            encode_cas_set(b"", b"name", b"Alice", CasCondition::Absent, 0, Some(7)),
+            [b"k 0 4 5 A 7\n".as_slice(), b"name", b"Alice"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_set_emits_the_tagged_frame_with_a_ttl() {
+        assert_eq!(
+            encode_cas_set(b"", b"name", b"Alice", CasCondition::Absent, 60, Some(7)),
+            [b"k 0 4 5 A 60 7\n".as_slice(), b"name", b"Alice"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_set_emits_the_namespaced_frame() {
+        assert_eq!(
+            encode_cas_set(b"users", b"name", b"Alice", CasCondition::Present, 0, None),
+            [b"k 5 4 5 P\n".as_slice(), b"users", b"name", b"Alice"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_delete_emits_the_digest_condition() {
+        let digest = crate::cas::content_digest(b"Alice");
+        let expected_header = format!("x 0 4 {}\n", crate::cas::CasToken::from(digest));
+        assert_eq!(
+            encode_cas_delete(b"", b"name", digest, None),
+            [expected_header.as_bytes(), b"name"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_delete_emits_the_tagged_frame() {
+        let digest = crate::cas::content_digest(b"Alice");
+        let expected_header = format!("x 0 4 {} 9\n", crate::cas::CasToken::from(digest));
+        assert_eq!(
+            encode_cas_delete(b"", b"name", digest, Some(9)),
+            [expected_header.as_bytes(), b"name"].concat()
+        );
+    }
+
+    #[test]
+    fn encode_cas_delete_emits_the_namespaced_frame() {
+        let digest = crate::cas::content_digest(b"Alice");
+        let expected_header = format!("x 5 4 {}\n", crate::cas::CasToken::from(digest));
+        assert_eq!(
+            encode_cas_delete(b"users", b"name", digest, None),
+            [expected_header.as_bytes(), b"users", b"name"].concat()
+        );
+    }
+
+    #[test]
+    fn cas_condition_token_matches_the_pinned_cross_language_vector() {
+        // Same vector docs/protocol.html#cas pins, exercised through the
+        // wire-token path this module actually sends.
+        let digest = crate::cas::content_digest(b"nanocached-cas-vector");
+        assert_eq!(
+            cas_condition_token(CasCondition::Digest(digest)),
+            "36287141940ca57acbd7695ccdde9d43"
+        );
     }
 
     #[test]

@@ -5,9 +5,11 @@
  * these encoders/parser, identification is already done and the socket
  * only ever carries `G`/`S`/`D` (and their namespaced `g`/`s`/`d`
  * counterparts), `c`/`F` (clear a namespace / flush everything, issue
- * #106), `i` (INCR/DECR, issue #129) requests, and their responses.
+ * #106), `i` (INCR/DECR, issue #129), `k`/`x` (compare-and-set/-delete,
+ * issue #141) requests, and their responses.
  */
 
+import { createHash } from "node:crypto";
 import { NanocachedError } from "./errors.js";
 
 /** The default namespace — what the un-namespaced `G`/`S`/`D` commands
@@ -157,6 +159,112 @@ export function encodeIncr(key: Uint8Array, delta: number, tag?: number, namespa
     throw new RangeError(`nanocached: delta must be a safe integer (got ${delta}) — see README's incr/decr section for the precision caveat`);
   }
   return Buffer.concat([toAscii(`i ${namespace.length} ${key.length} ${delta}${tagField(tag)}\n`), namespace, key]);
+}
+
+/** The CAS content digest (issue #141): SHA-256 of `value`'s exact bytes,
+ * truncated to the first 16 bytes (128 bits), lowercase hex-encoded (32
+ * characters) — computed identically by the server and every SDK (see
+ * docs/protocol.html#cas). For a compression-enabled client this must be
+ * computed over the raw wire bytes exactly as received (the marker byte
+ * included, since the server never decompresses), never the decompressed
+ * value the public API returns — see `NanocachedClient.getWithToken`,
+ * which taps the raw bytes at the same point `getBytes` does, before this
+ * SDK's own decompression step. Exported standalone so a caller that
+ * already holds a value in memory can reconstruct its expected digest
+ * without a prior GET — see `NanocachedClient.replace`'s own doc comment
+ * for when that reconstruction is (and isn't) safe.
+ *
+ * Pinned cross-language: SHA-256 of the UTF-8 bytes `nanocached-cas-vector`
+ * truncates to exactly `36287141940ca57acbd7695ccdde9d43` — every SDK and
+ * the server itself are pinned to this same vector (see
+ * protocol.test.ts). */
+export function contentDigest(value: Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
+
+// A digest is 16 bytes hex-encoded, always lowercase (contentDigest never
+// produces anything else) — the shape a `<cond>`/`x`'s own `<cond>` digest
+// token must match.
+const DIGEST_PATTERN = /^[0-9a-f]{32}$/;
+
+// The digest is a bare wire token, not length-prefixed like everything
+// else this module encodes (see docs/protocol.html#cas) — its own fixed
+// shape is what lets the server tell it apart from `A`/`P` without a
+// length. A caller-supplied string that doesn't match this shape exactly
+// (wrong length, uppercase, non-hex, or — critically — anything containing
+// a space or newline) would corrupt the frame itself rather than just fail
+// the condition, so this is checked eagerly, synchronously, before
+// anything is written — same rationale as checkKey/the ttlSeconds checks
+// above.
+function validateDigest(digest: string): void {
+  if (!DIGEST_PATTERN.test(digest)) {
+    throw new RangeError(`nanocached: token must be a 32-character lowercase hex digest, got ${JSON.stringify(digest)}`);
+  }
+}
+
+/** Compare-and-set conditions (issue #141): `k`'s bare, non-length-prefixed
+ * `<cond>` token identifies its own shape — `absent` succeeds only if the
+ * key doesn't currently hold an unexpired value (`add`/`putIfAbsent`),
+ * `present` succeeds if it holds any (unexpired) value at all
+ * (two-argument `replace(key, value)`), and `digest` succeeds only if the
+ * key's current value hashes (see `contentDigest`) to exactly this
+ * 32-character lowercase hex string (three-argument
+ * `replace(key, old, new)`). `x`'s own `<cond>` (two-argument
+ * `remove(key, old)`) only ever uses `digest` — see `encodeCasDelete`. */
+export type CasCondition = { readonly kind: "absent" } | { readonly kind: "present" } | { readonly kind: "digest"; readonly digest: string };
+
+function condToken(cond: CasCondition): string {
+  switch (cond.kind) {
+    case "absent":
+      return "A";
+    case "present":
+      return "P";
+    case "digest":
+      validateDigest(cond.digest);
+      return cond.digest;
+  }
+}
+
+// `k` — compare-and-set (issue #141): stores `value` only if `cond` holds
+// against the key's current stored bytes (see `CasCondition`). On success:
+// `S\n`, the same acknowledgement a plain `S` gives. On a condition
+// mismatch: `N\n`, reusing the same "nothing here to act on" status
+// `G`/`D` already use for a miss — `k` introduces no new response marker,
+// so tryParseResponse below needs no changes for it (nor for `x`).
+// Always namespaced, like `i` — no pre-namespace legacy form, so
+// `<namespace-length>` is unconditionally present. `ttlSeconds` means
+// exactly what it means for `S` (omitted/0 = no expiry); unlike `i`, the
+// new value is supplied whole by the caller, so there's no old TTL to
+// preserve.
+export function encodeCas(key: Uint8Array, value: Uint8Array, cond: CasCondition, ttlSeconds = 0, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
+    // Same rationale as encodeSet's own check: a bad TTL would serialize
+    // into a frame the server rejects with no reply, closing the shared,
+    // pipelined connection and taking every other in-flight request on it
+    // down too.
+    throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+  }
+  checkKeyAndValue(key, value, namespace);
+  const token = condToken(cond);
+
+  const header =
+    ttlSeconds === 0
+      ? `k ${namespace.length} ${key.length} ${value.length} ${token}${tagField(tag)}\n`
+      : `k ${namespace.length} ${key.length} ${value.length} ${token} ${ttlSeconds}${tagField(tag)}\n`;
+  return Buffer.concat([toAscii(header), namespace, key, value]);
+}
+
+// `x` — compare-and-delete (issue #141): removes the key only if `cond`
+// holds — the two-argument `remove(key, old)`. Unlike `k`, `<cond>` here
+// is always a digest: an absent/present-only conditioned delete is
+// already the plain, unconditional `D`. On success: `D\n`, the same
+// acknowledgement a plain `D` gives for a key that existed. On a mismatch
+// or a missing key: `N\n`, the same status `D` already gives when there
+// was nothing to delete. Always namespaced, same as `k`/`i`.
+export function encodeCasDelete(key: Uint8Array, digest: string, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+  checkKey(key, namespace);
+  validateDigest(digest);
+  return Buffer.concat([toAscii(`x ${namespace.length} ${key.length} ${digest}${tagField(tag)}\n`), namespace, key]);
 }
 
 // Clear a namespace / flush everything (issue #106). Neither is

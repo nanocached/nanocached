@@ -55,6 +55,29 @@ public sealed class MockNode : IDisposable
     public string? LastIncrHeader => _lastIncrHeader;
     private volatile string? _lastIncrHeader;
 
+    /// <summary>issue #141 — compare-and-set: how many <c>k</c> requests
+    /// this server has received — the critical assertion for cluster
+    /// replication tests, mirroring <see cref="IncrRequestCount"/>: a
+    /// replica must see this stay 0 while a Set frame carries the
+    /// primary's literal result, never replaying the CAS itself.</summary>
+    public int CasRequestCount => _casRequestCount;
+
+    /// <summary>issue #141: how many <c>x</c> (CAS delete) requests this
+    /// server has received — the <see cref="CasRequestCount"/> counterpart
+    /// for the digest-conditioned remove.</summary>
+    public int CasDeleteRequestCount => _casDeleteRequestCount;
+
+    /// <summary>issue #141: the exact header line (everything up to, not
+    /// including, the trailing '\n') of the most recent <c>k</c> request
+    /// this server received.</summary>
+    public string? LastCasHeader => _lastCasHeader;
+    private volatile string? _lastCasHeader;
+
+    /// <summary>issue #141: the exact header line of the most recent
+    /// <c>x</c> request this server received.</summary>
+    public string? LastCasDeleteHeader => _lastCasDeleteHeader;
+    private volatile string? _lastCasDeleteHeader;
+
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
@@ -102,6 +125,8 @@ public sealed class MockNode : IDisposable
     private int _clearAllRequestCount;
     private int _failClearReplies;
     private int _incrRequestCount;
+    private int _casRequestCount;
+    private int _casDeleteRequestCount;
     /// <summary>issue #129: the TTL (whole seconds; 0 if none) each stored
     /// entry currently carries, keyed the same way <see cref="Store"/> is
     /// — recorded on every S/s and consulted (never modified — INCR never
@@ -232,6 +257,20 @@ public sealed class MockNode : IDisposable
     }
 
     internal static string KeyOf(byte[] key) => Convert.ToBase64String(key);
+
+    /// <summary>issue #141 — compare-and-set: this mock's own
+    /// implementation of the digest algorithm docs/protocol.html#cas
+    /// specifies — SHA-256 truncated to the first 16 bytes, lowercase hex
+    /// — so it can evaluate a 32-character-hex <c>&lt;cond&gt;</c> exactly
+    /// as a real node would. Deliberately a second, independent
+    /// implementation from <see cref="NanocachedClient.ContentDigest"/>
+    /// (not shared code) — the cluster CAS tests below only prove anything
+    /// if the mock and the SDK could disagree.</summary>
+    internal static string ComputeDigest(byte[] value)
+    {
+        byte[] hash = SHA256.HashData(value);
+        return Convert.ToHexString(hash, 0, 16).ToLowerInvariant();
+    }
 
     /// <summary>issue #105 — first-class namespaces: the store key for a
     /// namespaced entry, distinct from every unnamespaced <see cref="KeyOf(byte[])"/>
@@ -610,6 +649,93 @@ public sealed class MockNode : IDisposable
                         string ttlField = ttlSeconds > 0 ? $" {ttlSeconds}" : "";
                         await Wire.WriteAsync(stream, $"I {updatedBytes.Length}{ttlField}{tag}\n");
                         await stream.WriteAsync(updatedBytes);
+                        break;
+                    }
+                    case "k":
+                    {
+                        // issue #141 — compare-and-set: always namespaced
+                        // (no legacy uppercase form): `k <ns-len> <key-len>
+                        // <val-len> <cond> [<ttl-seconds>][ <tag>]\n<ns><key><value>`.
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        byte[] value = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3]));
+                        string cond = parts[4];
+                        // Field layout mirrors "s": baseline (no ttl) is 5
+                        // fields (k, ns-len, key-len, val-len, cond), 6
+                        // with a tag.
+                        int ttlFieldCount = parts.Length - (tagged ? 6 : 5);
+                        long ttlSeconds = ttlFieldCount > 0
+                            ? long.Parse(parts[5], CultureInfo.InvariantCulture)
+                            : 0;
+                        _lastCasHeader = string.Join(' ', parts);
+                        Interlocked.Increment(ref _casRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+                        if (TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                            break;
+                        }
+
+                        string storeKey = KeyOf(namespaceBytes, key);
+                        bool matches = cond switch
+                        {
+                            "A" => !Store.ContainsKey(storeKey),
+                            "P" => Store.ContainsKey(storeKey),
+                            _ => Store.TryGetValue(storeKey, out byte[]? existing)
+                                && ComputeDigest(existing) == cond,
+                        };
+                        if (!matches)
+                        {
+                            await Wire.WriteAsync(stream, $"N{tag}\n");
+                            break;
+                        }
+                        Store[storeKey] = value;
+                        _ttls[storeKey] = ttlSeconds;
+                        await Wire.WriteAsync(stream, $"S{tag}\n");
+                        break;
+                    }
+                    case "x":
+                    {
+                        // issue #141: `x <ns-len> <key-len> <cond>[ <tag>]\n<ns><key>`
+                        // — <cond> here is always a digest.
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        string digest = parts[3];
+                        _lastCasDeleteHeader = string.Join(' ', parts);
+                        Interlocked.Increment(ref _casDeleteRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+                        if (TakeWrongNode())
+                        {
+                            await Wire.WriteAsync(stream, $"W{tag}\n");
+                            break;
+                        }
+
+                        string storeKey = KeyOf(namespaceBytes, key);
+                        bool matches = Store.TryGetValue(storeKey, out byte[]? existing)
+                            && ComputeDigest(existing) == digest;
+                        if (!matches)
+                        {
+                            await Wire.WriteAsync(stream, $"N{tag}\n");
+                            break;
+                        }
+                        Store.TryRemove(storeKey, out _);
+                        await Wire.WriteAsync(stream, $"D{tag}\n");
                         break;
                     }
                     case "d":

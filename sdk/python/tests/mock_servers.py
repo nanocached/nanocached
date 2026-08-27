@@ -3,9 +3,10 @@ speaking just enough of the wire protocol (``A``, ``G``/``S``/``D`` and
 their namespaced ``g``/``s``/``d`` counterparts — issue #105 —
 ``c``/``F`` to clear a namespace or flush everything — issue #106 —
 ``i`` to atomically increment/decrement a counter — issue #129 —
-``L`` and, for SDK proxy mode (issue #122), ``Q``) for the client tests
-to exercise NanocachedClient end-to-end over real TCP sockets without the
-Rust binaries. Mirrors the TypeScript SDK's mocks.
+``k``/``x`` for compare-and-set — issue #141 — ``L`` and, for SDK proxy
+mode (issue #122), ``Q``) for the client tests to exercise
+NanocachedClient end-to-end over real TCP sockets without the Rust
+binaries. Mirrors the TypeScript SDK's mocks.
 
 SDK proxy mode (issue #122): a mock "proxy" needs no dedicated class — a
 proxy looks exactly like a single node that owns every key, and that is
@@ -16,6 +17,16 @@ roster (``proxies``, served by ``Q``) alongside its existing node roster
 from __future__ import annotations
 
 import asyncio
+import hashlib
+
+
+def _digest(value: bytes) -> str:
+    """Compare-and-set (issue #141): the same digest algorithm
+    docs/protocol.html "k / x" and nanocached._digest.content_digest()
+    specify — reimplemented independently here (rather than imported)
+    so a k/x test genuinely exercises wire-level agreement between the
+    client's encoder and this mock's decoder, not just shared code."""
+    return hashlib.sha256(value).digest()[:16].hex()
 
 
 class MockNode:
@@ -90,6 +101,14 @@ class MockNode:
         # (bumping the store, never this counter) and never an `i` of
         # its own.
         self.incr_count = 0
+        # Compare-and-set (issue #141): counts every `k`/`x` frame this
+        # node receives, regardless of outcome — the key proof, alongside
+        # incr_count above, that a replica leg of a cluster
+        # put_if_absent()/replace()/delete_if_matches() call really did
+        # receive a plain `set`/`delete` (bumping the store, never these
+        # counters) and never a `k`/`x` of its own.
+        self.cas_set_count = 0
+        self.cas_delete_count = 0
         self._fail_clear_replies = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
@@ -538,6 +557,76 @@ class MockNode:
                     ttl = self.entry_ttl.get((namespace, key), 0)
                     ttl_field = b" %d" % ttl if ttl else b""
                     writer.write(b"I %d%b%b\n%b" % (len(new_bytes), ttl_field, tag_suffix, new_bytes))
+                    await writer.drain()
+
+                elif parts[0] == b"k":
+                    # Compare-and-set (issue #141): `k <ns-len> <key-len>
+                    # <val-len> <cond> [<ttl-seconds>] [<tag>]` — like `i`
+                    # above, always namespaced, no legacy uppercase form.
+                    # <cond> is a bare token: `A`/`P`, or a 32-character
+                    # lowercase hex digest.
+                    namespace = await reader.readexactly(int(parts[1]))
+                    key = await reader.readexactly(int(parts[2]))
+                    value = await reader.readexactly(int(parts[3]))
+                    cond = parts[4]
+                    base_field_count = 6 if tagged else 5
+                    ttl_for_entry = int(parts[5]) if len(parts) > base_field_count else 0
+                    self.cas_set_count += 1
+                    if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if self._wrong_node_replies > 0:
+                        self._wrong_node_replies -= 1
+                        writer.write(b"W" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    current = self._get_entry(namespace, key)
+                    if cond == b"A":
+                        matches = current is None
+                    elif cond == b"P":
+                        matches = current is not None
+                    else:
+                        matches = current is not None and _digest(current) == cond.decode()
+                    if matches:
+                        self._set_entry(namespace, key, value)
+                        self.entry_ttl[(namespace, key)] = ttl_for_entry
+                        writer.write(b"S" + tag_suffix + b"\n")
+                    else:
+                        writer.write(b"N" + tag_suffix + b"\n")
+                    await writer.drain()
+
+                elif parts[0] == b"x":
+                    # Compare-and-set (issue #141): `x <ns-len> <key-len>
+                    # <cond> [<tag>]` — <cond> here is always a digest,
+                    # never `A`/`P` (an absent- or present-only
+                    # conditioned delete is already the plain `D`/`d`).
+                    namespace = await reader.readexactly(int(parts[1]))
+                    key = await reader.readexactly(int(parts[2]))
+                    cond = parts[3]
+                    self.cas_delete_count += 1
+                    if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    if self._wrong_node_replies > 0:
+                        self._wrong_node_replies -= 1
+                        writer.write(b"W" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    current = self._get_entry(namespace, key)
+                    if current is not None and _digest(current) == cond.decode():
+                        self._delete_entry(namespace, key)
+                        self.entry_ttl.pop((namespace, key), None)
+                        writer.write(b"D" + tag_suffix + b"\n")
+                    else:
+                        writer.write(b"N" + tag_suffix + b"\n")
                     await writer.drain()
 
                 else:

@@ -1,12 +1,24 @@
 /**
  * In-process stand-ins for nanocached-node and nanocached-discovery,
  * speaking just enough of the wire protocol (`A`, `G`/`S`/`D` and their
- * namespaced `g`/`s`/`d` counterparts (issue #105), `L`) for the client
- * tests to exercise NanocachedClient end-to-end over real TCP sockets
- * without the Rust binaries.
+ * namespaced `g`/`s`/`d` counterparts (issue #105), `L`, `i` (INCR/DECR,
+ * issue #129), `k`/`x` (compare-and-set/-delete, issue #141)) for the
+ * client tests to exercise NanocachedClient end-to-end over real TCP
+ * sockets without the Rust binaries.
  */
 
 import { createServer, type Server, type Socket } from "node:net";
+import { createHash } from "node:crypto";
+
+// Compare-and-set (issue #141): the same digest this mock uses to evaluate
+// a `k`/`x` `<cond>` — SHA-256 of the value's exact bytes, truncated to the
+// first 16 bytes, lowercase hex — independently implemented here (not
+// imported from src/protocol.ts's own `contentDigest`) so a bug in that
+// implementation can't also hide identically in the test double that's
+// supposed to catch it.
+function digestOf(value: Buffer): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 32);
+}
 
 interface MockServerBase {
   port: number;
@@ -63,6 +75,16 @@ export interface MockNode extends MockServerBase {
    * replica must receive a `set`/`s` carrying the primary's literal
    * result, and must NEVER receive an `i` frame at all. */
   incrCount(): number;
+  /** How many `k` (compare-and-set, issue #141) requests this server has
+   * ever received — the critical assertion for cluster-replication tests:
+   * a replica must receive a `set`/`s` carrying the primary's literal
+   * result, and must NEVER receive a `k` frame at all. */
+  casCount(): number;
+  /** How many `x` (compare-and-delete, issue #141) requests this server
+   * has ever received — same critical-assertion role as `casCount` above,
+   * for the delete side: a replica must receive a plain `delete`/`d`, and
+   * must NEVER receive an `x` frame. */
+  casDeleteCount(): number;
   /** How many `c`/`F` (clear/flush, issue #106) requests this server has
    * ever received — lets a test assert a clear fanned out to every node,
    * even one holding no keys in the cleared namespace. */
@@ -265,6 +287,8 @@ export async function startMockNode(
   let connections = 0;
   let gets = 0;
   let incrs = 0;
+  let casRequests = 0;
+  let casDeleteRequests = 0;
   let clears = 0;
   let failClearReplies = 0;
   let setDelayMs = 0;
@@ -569,6 +593,116 @@ export async function startMockNode(
             break;
           }
 
+          case "k": {
+            // Compare-and-set (issue #141): `k <namespace-length>
+            // <key-length> <value-length> <cond> [<ttl-seconds>]
+            // [<tag>]\n<namespace><key><value>` — always namespaced, like
+            // `i`. `<cond>` is a bare token: `A` (absent), `P` (present),
+            // or a 32-character lowercase hex digest — never
+            // length-prefixed, so it's identified purely by its own shape
+            // (see encodeCas).
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const keyLength = Number(parts[2]);
+            const valueLength = Number(parts[3]);
+            const cond = parts[4];
+            if (buffer.length < bodyStart + namespaceLength + keyLength + valueLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer
+              .subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength)
+              .toString("utf8");
+            const value = Buffer.from(
+              buffer.subarray(
+                bodyStart + namespaceLength + keyLength,
+                bodyStart + namespaceLength + keyLength + valueLength,
+              ),
+            );
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength + valueLength);
+            // The TTL, when present, is the field after `<cond>`; on a
+            // tagged connection the tag sits after it as the last field —
+            // same field-counting idiom `S`'s own TTL parsing above uses.
+            const ttlFieldCount = parts.length - (tagged ? 6 : 5);
+            const ttlSeconds = ttlFieldCount > 0 ? Number(parts[5]) : 0;
+            casRequests++;
+
+            if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            if (wrongNodeReplies > 0) {
+              wrongNodeReplies--;
+              socket.write(`W${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            const existing = targetStore.get(key);
+            const conditionHolds =
+              cond === "A" ? existing === undefined : cond === "P" ? existing !== undefined : existing !== undefined && digestOf(existing) === cond;
+
+            if (!conditionHolds) {
+              socket.write(`N${tag}\n`);
+              break;
+            }
+
+            targetStore.set(key, value);
+            if (ttlSeconds > 0) ttlsFor(namespace).set(key, ttlSeconds);
+            else ttlsFor(namespace).delete(key);
+            lastSetTtl = ttlSeconds;
+            socket.write(`S${tag}\n`);
+            break;
+          }
+
+          case "x": {
+            // Compare-and-delete (issue #141): `x <namespace-length>
+            // <key-length> <cond> [<tag>]\n<namespace><key>` — `<cond>` is
+            // always a digest here (an absent/present-only conditioned
+            // delete is already the plain `D`).
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const keyLength = Number(parts[2]);
+            const cond = parts[3];
+            if (buffer.length < bodyStart + namespaceLength + keyLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const key = buffer
+              .subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength)
+              .toString("utf8");
+            buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
+            casDeleteRequests++;
+
+            if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            if (wrongNodeReplies > 0) {
+              wrongNodeReplies--;
+              socket.write(`W${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            const existing = targetStore.get(key);
+            const matches = existing !== undefined && digestOf(existing) === cond;
+
+            if (!matches) {
+              socket.write(`N${tag}\n`);
+              break;
+            }
+
+            targetStore.delete(key);
+            ttlsFor(namespace).delete(key);
+            socket.write(`D${tag}\n`);
+            break;
+          }
+
           case "c": {
             // Clear one namespace (issue #106): `c <namespace-length>
             // [tag]\n<namespace>` — namespace-length 0 clears the default
@@ -675,6 +809,8 @@ export async function startMockNode(
     connectionCount: () => connections,
     getCount: () => gets,
     incrCount: () => incrs,
+    casCount: () => casRequests,
+    casDeleteCount: () => casDeleteRequests,
     clearCount: () => clears,
     failClearOnce: () => {
       failClearReplies++;

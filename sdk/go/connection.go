@@ -355,6 +355,104 @@ func appendIncrFrame(namespace, key []byte, delta int64, tagged bool, tag uint32
 	return append(frame, key...)
 }
 
+// casNS sends the `k` frame (issue #141: compare-and-set) — like INCR
+// (see incrNS), `k` has no legacy/uppercase form: it is always
+// namespaced, even for the default namespace. cond is one of
+// casCondAbsent ("A"), casCondPresent ("P"), or a 32-character lowercase
+// hex content digest (see ContentDigest) — a bare token, never
+// length-prefixed; its own shape identifies it
+// (docs/protocol.html#cas). Success answers `S` (true, the same
+// acknowledgement a plain Set gives); a condition mismatch answers `N`
+// (false) — the very same "nothing here to act on" shape a miss already
+// uses elsewhere, so `k` introduces no new response marker. ttlSeconds
+// mirrors setNS's own wire convention (-1 means no expiry, N > 0 sets
+// one); unlike incrNS there is no old TTL to preserve, since the caller
+// supplies the whole new value.
+func (c *connection) casNS(namespace, key, value []byte, cond string, ttlSeconds int64) (bool, error) {
+	marker, _, _, err := c.request(func(tag uint32) []byte {
+		return appendCasFrame(namespace, key, value, cond, ttlSeconds, c.tagged, tag)
+	})
+	if err != nil {
+		return false, err
+	}
+	switch marker {
+	case 'S':
+		return true, nil
+	case 'N':
+		return false, nil
+	case 'W':
+		return false, ErrWrongNode
+	default:
+		return false, c.mismatch(marker)
+	}
+}
+
+// appendCasFrame builds a `k` request frame: `k <ns-len> <key-len>
+// <val-len> <cond> [<ttl>][ <tag>]\n<ns><key><value>` (docs/protocol.html#cas).
+// cond is a bare token (A, P, or a digest) appended as-is — the one field
+// in this frame that isn't length-prefixed, since its own shape (a single
+// letter versus 32 hex characters) identifies which kind it is.
+func appendCasFrame(namespace, key, value []byte, cond string, ttlSeconds int64, tagged bool, tag uint32) []byte {
+	frame := append([]byte("k "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(value)), 10)
+	frame = append(frame, ' ')
+	frame = append(frame, cond...)
+	if ttlSeconds >= 0 {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, ttlSeconds, 10)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	frame = append(frame, key...)
+	return append(frame, value...)
+}
+
+// deleteIfMatchesNS sends the `x` frame (issue #141): the two-argument
+// remove(key, old). digest is always a 32-character lowercase hex content
+// digest here — never A/P, since an absent- or present-only conditioned
+// delete is already the plain, unconditional D/d
+// (docs/protocol.html#cas). Success answers `D` (true, the same
+// acknowledgement a plain delete gives for a key that existed); a
+// mismatch or missing key answers `N` (false) — the same status a plain
+// delete already gives when there was nothing to delete.
+func (c *connection) deleteIfMatchesNS(namespace, key []byte, digest string) (bool, error) {
+	marker, _, _, err := c.request(func(tag uint32) []byte {
+		return appendDeleteIfMatchesFrame(namespace, key, digest, c.tagged, tag)
+	})
+	if err != nil {
+		return false, err
+	}
+	switch marker {
+	case 'D':
+		return true, nil
+	case 'N':
+		return false, nil
+	case 'W':
+		return false, ErrWrongNode
+	default:
+		return false, c.mismatch(marker)
+	}
+}
+
+// appendDeleteIfMatchesFrame builds an `x` request frame: `x <ns-len>
+// <key-len> <cond>[ <tag>]\n<ns><key>` — cond is always a digest here, the
+// one non-length-prefixed field, exactly like appendCasFrame's own cond.
+func appendDeleteIfMatchesFrame(namespace, key []byte, digest string, tagged bool, tag uint32) []byte {
+	frame := append([]byte("x "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	frame = append(frame, ' ')
+	frame = append(frame, digest...)
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	return append(frame, key...)
+}
+
 // clear drops every entry in namespace (issue #106) — an empty namespace
 // clears the default namespace (`c 0\n`), never rejected: see
 // appendClearFrame. Unlike get/set/delete there is no key involved and

@@ -202,6 +202,16 @@ existed, err := client.Delete("greeting")</code></pre>
   as an ordinary <code>set</code>, never by replaying the increment
   itself (replaying it could drift a replica from the primary). See
   <a href="protocol.html#incr">i</a>.</li>
+  <li><b>Compare-and-set</b> — <code>putIfAbsent</code>,
+  <code>replace</code> (present-only and exact-match forms), and a
+  digest-conditioned delete, all atomic on the node that owns the key. An
+  expected value comes from a prior read (its content digest, an opaque
+  token the SDK computes for you) rather than being resent whole. Same
+  cluster rule as counters: only the primary evaluates the condition, and
+  the SDK writes the <em>result</em> to the remaining owners as an
+  ordinary <code>set</code>/<code>delete</code>. Not a distributed lock —
+  LRU eviction can still silently break a lock built on it. See
+  <a href="protocol.html#cas">k / x</a>.</li>
   <li><b>Failure recovery</b> — a stale routing table (a node answers
   <code>W</code>) or a dead primary both trigger one node-list refresh
   and one retry; recovery is bounded by discovery's liveness timeout.</li>

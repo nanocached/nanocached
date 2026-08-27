@@ -325,6 +325,60 @@ final class Connection {
         }
     }
 
+    // Compare-and-set (issue #141): `k`/`x` — same always-namespaced
+    // shape as INCR (an explicit <namespace-length>, 0 = default
+    // namespace; no legacy pre-namespace form). <cond> is a bare,
+    // non-length-prefixed token: "A" (absent), "P" (present), or a
+    // 32-character lowercase hex digest (exact content match) — see
+    // NanocachedClient.contentDigest. Both reuse existing response
+    // markers rather than introducing new ones: `k` answers `S`
+    // (stored) or `N` (condition mismatch), exactly S/N's own
+    // bare-or-tagged shape; `x` answers `D` (deleted) or `N`
+    // (mismatch/missing), exactly D/N's shape. Replication is the
+    // caller's job (NanocachedClient): only the primary evaluates
+    // <cond>, and a success's literal result is forwarded to the
+    // remaining owners as an ordinary set/delete, never by replaying
+    // k/x itself.
+
+    /** Sends {@code k} — stores {@code value} at {@code key} only if
+     * {@code cond} holds against the key's current stored bytes.
+     * Returns {@code true} on success ({@code S}), {@code false} on a
+     * condition mismatch ({@code N}) — a normal outcome, not an
+     * exception. */
+    boolean casSet(byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
+        Response response = request(tag -> {
+            String header = ttlSeconds == null
+                    ? "k " + namespace.length + " " + key.length + " " + value.length + " " + cond
+                            + tagSuffix(tag) + "\n"
+                    : "k " + namespace.length + " " + key.length + " " + value.length + " " + cond + " "
+                            + ttlSeconds + tagSuffix(tag) + "\n";
+            return frame(header, namespace, key, value);
+        });
+        return switch (response.marker) {
+            case 'S' -> true;
+            case 'N' -> false;
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
+    /** Sends {@code x} — removes {@code key} only if {@code cond} (always
+     * a digest — an absent/present-only conditioned delete is already the
+     * plain, unconditional {@code D}) holds. Returns {@code true} on
+     * success ({@code D}), {@code false} on a mismatch or missing key
+     * ({@code N}). */
+    boolean casDelete(byte[] namespace, byte[] key, String cond) {
+        Response response = request(tag -> frame(
+                "x " + namespace.length + " " + key.length + " " + cond + tagSuffix(tag) + "\n",
+                namespace, key, null));
+        return switch (response.marker) {
+            case 'D' -> true;
+            case 'N' -> false;
+            case 'W' -> throw new NanocachedException.WrongNode();
+            default -> throw mismatch(response.marker);
+        };
+    }
+
     // Echoed response tags: on a tagged-mode connection every request header carries
     // the client's tag as its last field, and the server echoes it in the
     // response — `tag == null` is the untagged (pre-0019) form, which

@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
@@ -35,6 +36,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
@@ -57,6 +59,16 @@ import javax.net.ssl.TrustManagerFactory;
 public final class NanocachedClient implements AutoCloseable {
 
     public record Address(String host, int port) {}
+
+    /** A value read alongside its CAS token (issue #141) — returned by
+     * {@link #getWithToken}/{@link Namespace#getWithToken}. {@code value}
+     * is the same decompressed bytes {@link #getBytes} would return;
+     * {@code token} is {@link #contentDigest} of the raw wire bytes
+     * (before decompression, when {@code compress} is enabled — the
+     * server never decompresses either), ready to pass straight to
+     * {@link #replace(byte[], String, byte[], long)}/{@link
+     * #deleteIfMatches(byte[], String)}. */
+    public record CasEntry(byte[] value, String token) {}
 
     /** Options for {@link #connect(Options)}; build with {@link #builder()}. */
     public static final class Options {
@@ -1007,6 +1019,59 @@ public final class NanocachedClient implements AutoCloseable {
         return closed;
     }
 
+    // Compare-and-set (issue #141): "A"/"P" are the two bare, non-digest
+    // <cond> tokens k understands — see cas()/casSet below. A digest is
+    // always exactly 32 lowercase hex characters (CAS_TOKEN_PATTERN),
+    // never confusable with either.
+    private static final String CAS_ABSENT = "A";
+    private static final String CAS_PRESENT = "P";
+    private static final Pattern CAS_TOKEN_PATTERN = Pattern.compile("[0-9a-f]{32}");
+
+    /** SHA-256 of {@code value}, truncated to its first 16 bytes (128
+     * bits), lowercase hex-encoded (32 characters) — the CAS content
+     * digest (issue #141), computed identically by the server and every
+     * SDK; see docs/protocol.html#cas for the pinned cross-language test
+     * vector. Public and static so code that already holds a value (a
+     * future JCache adapter, issue #118, computing an expected token
+     * without a prior GET) can compute one directly — see {@link
+     * #replace(byte[], String, byte[], long)}'s doc for why that path is
+     * only safe when the reconstruction is byte-identical to what the
+     * server actually stores, unlike a token taken from {@link
+     * #getWithToken}, which always is. */
+    public static String contentDigest(byte[] value) {
+        MessageDigest sha256;
+        try {
+            sha256 = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException impossible) {
+            // Every JDK ships SHA-256 (a JLS-mandated MessageDigest algorithm).
+            throw new AssertionError(impossible);
+        }
+        byte[] digest = sha256.digest(value);
+        StringBuilder hex = new StringBuilder(32);
+        for (int i = 0; i < 16; i++) {
+            hex.append(Character.forDigit((digest[i] >> 4) & 0xF, 16));
+            hex.append(Character.forDigit(digest[i] & 0xF, 16));
+        }
+        return hex.toString();
+    }
+
+    /** Rejects a {@code token} that isn't a well-formed CAS digest (issue
+     * #141) — exactly 32 lowercase hex characters, the only shape {@link
+     * #contentDigest}/{@link #getWithToken} ever produce. Catches an
+     * obviously wrong value (a stale/truncated copy-paste, or accidentally
+     * passing something other than a digest) before it reaches the wire,
+     * where — unlike a length-prefixed field — a malformed {@code <cond>}
+     * has no way to be distinguished from a bare token like the digest's
+     * own {@code "a"}-prefixed hex happening to collide with neither
+     * {@code "A"} nor {@code "P"}. */
+    private static void validateToken(String token) {
+        if (token == null || !CAS_TOKEN_PATTERN.matcher(token).matches()) {
+            throw new IllegalArgumentException(
+                    "nanocached: token must be a 32-character lowercase hex digest "
+                            + "(from contentDigest/getWithToken), got: " + token);
+        }
+    }
+
     /** A namespace-scoped handle (namespaces, issue #105) — see {@link
      * Namespace}. {@code namespace} is UTF-8 encoded, matching every other
      * key-ish {@code String} overload in this class. */
@@ -1086,6 +1151,17 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.getBytes(namespace, key);
         }
 
+        /** As {@link #getWithToken(byte[])}. */
+        public Optional<CasEntry> getWithToken(String key) {
+            return getWithToken(key.getBytes(StandardCharsets.UTF_8));
+        }
+
+        /** As {@link NanocachedClient#getWithToken(byte[])}, scoped to
+         * {@link #namespace()} (issue #141). */
+        public Optional<CasEntry> getWithToken(byte[] key) {
+            return NanocachedClient.this.getWithToken(namespace, key);
+        }
+
         public void set(String key, String value) {
             set(key, value, 0L);
         }
@@ -1157,6 +1233,77 @@ public final class NanocachedClient implements AutoCloseable {
         /** As {@link #decr(byte[], long)} with an amount of 1. */
         public OptionalLong decr(byte[] key) {
             return decr(key, 1L);
+        }
+
+        // Compare-and-set (issue #141): see NanocachedClient's own
+        // putIfAbsent/replaceIfPresent/replace/deleteIfMatches for the
+        // full doc — these simply scope every call to namespace().
+
+        public boolean putIfAbsent(String key, String value) {
+            return putIfAbsent(key, value, 0L);
+        }
+
+        public boolean putIfAbsent(String key, String value, long ttlSeconds) {
+            return putIfAbsent(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8),
+                    ttlSeconds);
+        }
+
+        public boolean putIfAbsent(byte[] key, byte[] value) {
+            return putIfAbsent(key, value, 0L);
+        }
+
+        /** As {@link NanocachedClient#putIfAbsent(byte[], byte[], long)},
+         * scoped to {@link #namespace()}. */
+        public boolean putIfAbsent(byte[] key, byte[] value, long ttlSeconds) {
+            return NanocachedClient.this.putIfAbsent(namespace, key, value, ttlSeconds);
+        }
+
+        public boolean replaceIfPresent(String key, String value) {
+            return replaceIfPresent(key, value, 0L);
+        }
+
+        public boolean replaceIfPresent(String key, String value, long ttlSeconds) {
+            return replaceIfPresent(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8),
+                    ttlSeconds);
+        }
+
+        public boolean replaceIfPresent(byte[] key, byte[] value) {
+            return replaceIfPresent(key, value, 0L);
+        }
+
+        /** As {@link NanocachedClient#replaceIfPresent(byte[], byte[],
+         * long)}, scoped to {@link #namespace()}. */
+        public boolean replaceIfPresent(byte[] key, byte[] value, long ttlSeconds) {
+            return NanocachedClient.this.replaceIfPresent(namespace, key, value, ttlSeconds);
+        }
+
+        public boolean replace(String key, String token, String newValue) {
+            return replace(key, token, newValue, 0L);
+        }
+
+        public boolean replace(String key, String token, String newValue, long ttlSeconds) {
+            return replace(key.getBytes(StandardCharsets.UTF_8), token, newValue.getBytes(StandardCharsets.UTF_8),
+                    ttlSeconds);
+        }
+
+        public boolean replace(byte[] key, String token, byte[] newValue) {
+            return replace(key, token, newValue, 0L);
+        }
+
+        /** As {@link NanocachedClient#replace(byte[], String, byte[],
+         * long)}, scoped to {@link #namespace()}. */
+        public boolean replace(byte[] key, String token, byte[] newValue, long ttlSeconds) {
+            return NanocachedClient.this.replace(namespace, key, token, newValue, ttlSeconds);
+        }
+
+        public boolean deleteIfMatches(String key, String token) {
+            return deleteIfMatches(key.getBytes(StandardCharsets.UTF_8), token);
+        }
+
+        /** As {@link NanocachedClient#deleteIfMatches(byte[], String)},
+         * scoped to {@link #namespace()}. */
+        public boolean deleteIfMatches(byte[] key, String token) {
+            return NanocachedClient.this.deleteIfMatches(namespace, key, token);
         }
 
         /** Drops every entry in this namespace (CLEAR, issue #106) — see
@@ -1241,6 +1388,48 @@ public final class NanocachedClient implements AutoCloseable {
      * namespace} empty is exactly the un-namespaced form: same routing,
      * same legacy wire frame. */
     Optional<byte[]> getBytes(byte[] namespace, byte[] key) {
+        byte[] raw = readRawBytes(namespace, key);
+        if (raw == null) return Optional.empty();
+        return Optional.of(compress ? Compression.decompressValue(raw) : raw);
+    }
+
+    /** As {@link #get(String)}, but returning a {@link CasEntry} carrying
+     * a token ({@link #contentDigest}) alongside the value — the low-level
+     * read half of compare-and-set (issue #141); see {@link
+     * #putIfAbsent}/{@link #replaceIfPresent}/{@link #replace}/{@link
+     * #deleteIfMatches}. */
+    public Optional<CasEntry> getWithToken(String key) {
+        return getWithToken(key.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** As {@link #getWithToken(String)}. <b>Correctness note</b>: the
+     * token is computed from the exact raw wire bytes this connection
+     * received — the same bytes a compression-enabled client's marker
+     * byte is part of, since the server never decompresses — never from
+     * the decompressed value this method also returns, so it always
+     * matches what a subsequent {@code k}/{@code x} on the same key would
+     * see server-side, compression or not. */
+    public Optional<CasEntry> getWithToken(byte[] key) {
+        return getWithToken(EMPTY_NAMESPACE, key);
+    }
+
+    /** The namespaced counterpart of {@link #getWithToken(byte[])} (issue
+     * #141) — see {@link #namespace}. */
+    Optional<CasEntry> getWithToken(byte[] namespace, byte[] key) {
+        byte[] raw = readRawBytes(namespace, key);
+        if (raw == null) return Optional.empty();
+        byte[] value = compress ? Compression.decompressValue(raw) : raw;
+        return Optional.of(new CasEntry(value, contentDigest(raw)));
+    }
+
+    /** Shared by {@link #getBytes(byte[], byte[])} and {@link
+     * #getWithToken(byte[], byte[])}: the raw wire bytes for {@code key}
+     * (including a compression-enabled client's marker byte — decompressed
+     * by neither caller, which each do at the point that matches their own
+     * contract), or {@code null} on a miss. Routing, {@code W}
+     * refresh-and-retry, and read repair all happen here exactly once, so
+     * the two callers can't drift on any of it. */
+    private byte[] readRawBytes(byte[] namespace, byte[] key) {
         validateKey(namespace, key);
         beforeOperation();
         byte[] value = withWrongNodeRetry(
@@ -1248,8 +1437,7 @@ public final class NanocachedClient implements AutoCloseable {
         if (value == null && readRepair && ring != null) {
             value = tryReadRepair(namespace, key);
         }
-        if (value == null) return Optional.empty();
-        return Optional.of(compress ? Compression.decompressValue(value) : value);
+        return value;
     }
 
     /** read repair: probes the remaining owners of {@code key} —
@@ -1463,6 +1651,170 @@ public final class NanocachedClient implements AutoCloseable {
         beforeOperation();
         Connection.IncrResult result = withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta));
         return result == null ? OptionalLong.empty() : OptionalLong.of(result.value());
+    }
+
+    // ── Compare-and-set (issue #141) ─────────────────────────────────
+    // k/x — see docs/protocol.html#cas. A condition mismatch is a normal
+    // `false` return, never an exception, exactly like delete() returning
+    // false for a miss; genuine errors (connection failure, exhausted
+    // W-retries, etc.) still throw NanocachedException as usual.
+    //
+    // NOT A DISTRIBUTED LOCK: LRU eviction reclaims a CAS-written key
+    // exactly as it would after a plain set, CAS or not — a key used as a
+    // lock (putIfAbsent to acquire, a TTL to release) can be silently
+    // double-acquired if it's evicted under memory pressure between one
+    // caller's acquire and its release. k/x are atomic against concurrent
+    // requests on the node that owns the key, the same guarantee INCR
+    // makes and no stronger.
+
+    public boolean putIfAbsent(String key, String value) {
+        return putIfAbsent(key, value, 0L);
+    }
+
+    public boolean putIfAbsent(String key, String value, long ttlSeconds) {
+        return putIfAbsent(key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+    }
+
+    public boolean putIfAbsent(byte[] key, byte[] value) {
+        return putIfAbsent(key, value, 0L);
+    }
+
+    /** Stores {@code value} at {@code key} only if the key is currently
+     * absent — including lazily expired — the {@code A}-conditioned
+     * {@code k} ({@code add}/{@code putIfAbsent}). Returns whether it was
+     * stored: {@code false} means the key already existed and nothing
+     * changed. {@code ttlSeconds == 0} means no expiry, same as {@link
+     * #set(byte[], byte[], long)}. See this section's own doc comment for
+     * why this is not a distributed lock. */
+    public boolean putIfAbsent(byte[] key, byte[] value, long ttlSeconds) {
+        return putIfAbsent(EMPTY_NAMESPACE, key, value, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #putIfAbsent(byte[], byte[],
+     * long)} (issue #105-style scoping applied to issue #141) — see
+     * {@link #namespace}. */
+    boolean putIfAbsent(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
+        return cas(namespace, key, value, ttlSeconds, CAS_ABSENT);
+    }
+
+    public boolean replaceIfPresent(String key, String value) {
+        return replaceIfPresent(key, value, 0L);
+    }
+
+    public boolean replaceIfPresent(String key, String value, long ttlSeconds) {
+        return replaceIfPresent(
+                key.getBytes(StandardCharsets.UTF_8), value.getBytes(StandardCharsets.UTF_8), ttlSeconds);
+    }
+
+    public boolean replaceIfPresent(byte[] key, byte[] value) {
+        return replaceIfPresent(key, value, 0L);
+    }
+
+    /** Stores {@code value} at {@code key} only if the key currently holds
+     * any (unexpired) value, whatever it is — the {@code P}-conditioned
+     * {@code k}, the two-argument {@code replace(key, value)}. Returns
+     * whether it was stored: {@code false} means the key was absent and
+     * nothing changed. {@code ttlSeconds == 0} means no expiry. */
+    public boolean replaceIfPresent(byte[] key, byte[] value, long ttlSeconds) {
+        return replaceIfPresent(EMPTY_NAMESPACE, key, value, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #replaceIfPresent(byte[],
+     * byte[], long)} (issue #141) — see {@link #namespace}. */
+    boolean replaceIfPresent(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
+        return cas(namespace, key, value, ttlSeconds, CAS_PRESENT);
+    }
+
+    public boolean replace(String key, String token, String newValue) {
+        return replace(key, token, newValue, 0L);
+    }
+
+    public boolean replace(String key, String token, String newValue, long ttlSeconds) {
+        return replace(key.getBytes(StandardCharsets.UTF_8), token, newValue.getBytes(StandardCharsets.UTF_8),
+                ttlSeconds);
+    }
+
+    public boolean replace(byte[] key, String token, byte[] newValue) {
+        return replace(key, token, newValue, 0L);
+    }
+
+    /** Stores {@code newValue} at {@code key} only if the key currently
+     * holds an unexpired value whose {@link #contentDigest} equals {@code
+     * token} exactly — the digest-conditioned {@code k}, the
+     * three-argument {@code replace(key, old, new)}. Returns whether it
+     * was stored: {@code false} means the stored value's digest didn't
+     * match (including if the key was absent) and nothing changed.
+     * {@code ttlSeconds == 0} means no expiry.
+     *
+     * <p>{@code token} is normally taken from a real prior read ({@link
+     * #getWithToken}) — that path is always correct. A token instead
+     * reconstructed by re-serializing/re-compressing a value the caller
+     * already holds is <em>content</em>-based CAS's version of memcached's
+     * own value-based CAS hazard: it's only correct if that reconstruction
+     * produces byte-identical output to what the server actually stores —
+     * true within one client sharing one serializer/compressor, not
+     * guaranteed across languages with client-side compression enabled.
+     *
+     * @throws IllegalArgumentException if {@code token} isn't a
+     * well-formed 32-character lowercase hex digest */
+    public boolean replace(byte[] key, String token, byte[] newValue, long ttlSeconds) {
+        return replace(EMPTY_NAMESPACE, key, token, newValue, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #replace(byte[], String,
+     * byte[], long)} (issue #141) — see {@link #namespace}. */
+    boolean replace(byte[] namespace, byte[] key, String token, byte[] newValue, long ttlSeconds) {
+        validateToken(token);
+        return cas(namespace, key, newValue, ttlSeconds, token);
+    }
+
+    /** Shared validation/dispatch for {@link #putIfAbsent}/{@link
+     * #replaceIfPresent}/{@link #replace} — {@code cond} is {@link
+     * #CAS_ABSENT}, {@link #CAS_PRESENT}, or (already validated by {@link
+     * #replace}) a digest. Mirrors {@link #set(byte[], byte[], byte[],
+     * long)}'s own ttl/size validation and {@code withWrongNodeRetry}
+     * wrapping. */
+    private boolean cas(byte[] namespace, byte[] key, byte[] value, long ttlSeconds, String cond) {
+        if (ttlSeconds < 0) {
+            throw new IllegalArgumentException(
+                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+        }
+        validateKeyAndValue(namespace, key, value);
+        beforeOperation();
+        // Correctness (issue #141): a new value written via `k` must go
+        // through the exact same compression pipeline set() already uses
+        // — writing raw uncompressed bytes here would make a subsequent
+        // plain get() from any compress-enabled client fail to
+        // decompress it.
+        byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
+        Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
+        return withWrongNodeRetry(() -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond));
+    }
+
+    public boolean deleteIfMatches(String key, String token) {
+        return deleteIfMatches(key.getBytes(StandardCharsets.UTF_8), token);
+    }
+
+    /** Removes {@code key} only if its current stored value's {@link
+     * #contentDigest} equals {@code token} exactly — the two-argument
+     * {@code remove(key, old)}. Returns whether it was removed: {@code
+     * false} means a mismatch or a missing key, not an exception. See
+     * {@link #replace(byte[], String, byte[], long)}'s doc for the same
+     * token-reconstruction caveat.
+     *
+     * @throws IllegalArgumentException if {@code token} isn't a
+     * well-formed 32-character lowercase hex digest */
+    public boolean deleteIfMatches(byte[] key, String token) {
+        return deleteIfMatches(EMPTY_NAMESPACE, key, token);
+    }
+
+    /** The namespaced counterpart of {@link #deleteIfMatches(byte[],
+     * String)} (issue #141) — see {@link #namespace}. */
+    boolean deleteIfMatches(byte[] namespace, byte[] key, String token) {
+        validateToken(token);
+        validateKey(namespace, key);
+        beforeOperation();
+        return withWrongNodeRetry(() -> casDeletePrimaryThenReplicate(namespace, key, token));
     }
 
     /**
@@ -2158,15 +2510,38 @@ public final class NanocachedClient implements AutoCloseable {
     private void replicateIncrResult(
             byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
         byte[] valueBytes = Long.toString(result.value()).getBytes(StandardCharsets.US_ASCII);
+        replicateResultToReplicas(names, connection -> {
+            connection.set(namespace, key, valueBytes, result.ttlSeconds());
+            return null;
+        });
+    }
+
+    /**
+     * Fans {@code op} — an already-decided result, never a condition or
+     * computation to redo — out to {@code names}' remaining owners (index
+     * 1 onward). Shared by {@link #replicateIncrResult} (issue #129) and
+     * compare-and-set's {@link #casPrimaryThenReplicate}/{@link
+     * #casDeletePrimaryThenReplicate} (issue #141): all three run this
+     * only after a primary op has already succeeded, so — unlike {@link
+     * #write}, which fans out concurrently with a still-pending primary —
+     * there is never a primary failure for a replica-leg bug to attach to
+     * here; one that escapes {@code op}'s own {@link
+     * NanocachedException}-only catch is simply logged via {@link
+     * #reportBackgroundWriteBug}, exactly as a {@code
+     * fireAndForgetReplicas} leg's own bug already is. Mirrors {@link
+     * #write}'s replica-leg scheduling otherwise: {@code
+     * fireAndForgetReplicas} runs up to the configured cap in the
+     * background; the rest run concurrently and are joined here, with
+     * every expected failure swallowed and counted via {@link
+     * #replicaWriteFailures}.
+     */
+    private void replicateResultToReplicas(List<String> names, ConnectionOp<Void> op) {
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (int i = 1; i < names.size(); i++) {
             String replica = names.get(i);
             Runnable replicaWrite = () -> {
                 try {
-                    applyReconnecting(() -> memberConnection(replica), connection -> {
-                        connection.set(namespace, key, valueBytes, result.ttlSeconds());
-                        return null;
-                    });
+                    applyReconnecting(() -> memberConnection(replica), op);
                 } catch (NanocachedException ignored) {
                     // Swallowed by design, exactly like write()'s own
                     // replica leg — see that method's matching catch for
@@ -2202,6 +2577,76 @@ public final class NanocachedClient implements AutoCloseable {
                 reportBackgroundWriteBug(unwrapReplicaBug(wrapped));
             }
         }
+    }
+
+    // ── Compare-and-set (issue #141) ──────────────────────────────────
+    // Same driver shape as INCR immediately above: only the key's primary
+    // owner ever evaluates <cond>, and only once that leg has actually
+    // succeeded is its result forwarded to the remaining owners — as an
+    // ordinary set/delete, via replicateResultToReplicas — never by
+    // replaying k/x itself. A replica evaluating the same condition
+    // against its own possibly-different copy could reach a different
+    // outcome than the primary just did.
+
+    /** putIfAbsent/replaceIfPresent/replace's write driver (issue #141).
+     * Sends {@code k} to the primary owner only; a condition mismatch
+     * ({@code false}) is returned directly without touching any replica,
+     * since nothing was written. A success is fanned out to the remaining
+     * owners via {@link #replicateResultToReplicas}, carrying the exact
+     * same {@code value}/{@code ttlSeconds} just written to the primary,
+     * before returning {@code true}. {@link #withWrongNodeRetry} already
+     * wraps a call to this whole method (see {@link #cas}) and retries it
+     * on a {@code W}/dead primary — since replication only ever runs
+     * after the primary leg above has already returned successfully, that
+     * retry only ever re-runs the primary leg again, never a duplicate
+     * replica fan-out. */
+    private boolean casPrimaryThenReplicate(
+            byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
+        if (ring == null) {
+            return applyReconnecting(
+                    this::singleConnection, connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
+        }
+
+        List<String> names = ownerNames(namespace, key);
+        if (names.isEmpty()) {
+            throw new NanocachedException("nanocached: no owner is reachable for this key");
+        }
+
+        boolean stored = applyReconnecting(() -> memberConnection(names.get(0)),
+                connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
+        if (!stored) return false;
+
+        replicateResultToReplicas(names, connection -> {
+            connection.set(namespace, key, value, ttlSeconds);
+            return null;
+        });
+        return true;
+    }
+
+    /** deleteIfMatches's write driver (issue #141) — as {@link
+     * #casPrimaryThenReplicate}, but for {@code x}/{@code remove(key,
+     * old)}: a success's replica leg is an ordinary (unconditional)
+     * delete, since the primary's own successful digest match already
+     * proved the key existed. */
+    private boolean casDeletePrimaryThenReplicate(byte[] namespace, byte[] key, String cond) {
+        if (ring == null) {
+            return applyReconnecting(this::singleConnection, connection -> connection.casDelete(namespace, key, cond));
+        }
+
+        List<String> names = ownerNames(namespace, key);
+        if (names.isEmpty()) {
+            throw new NanocachedException("nanocached: no owner is reachable for this key");
+        }
+
+        boolean deleted = applyReconnecting(
+                () -> memberConnection(names.get(0)), connection -> connection.casDelete(namespace, key, cond));
+        if (!deleted) return false;
+
+        replicateResultToReplicas(names, connection -> {
+            connection.delete(namespace, key);
+            return null;
+        });
+        return true;
     }
 
     /** Unwraps a replica leg's {@link CompletionException} (from {@link

@@ -402,6 +402,58 @@ In a cluster, only the primary owner ever runs the increment — replicas
 receive its literal result as an ordinary `set` instead, so a replica can
 never drift from the primary by re-deriving the increment on its own.
 
+## Compare-and-set
+
+Conditional writes and deletes — `add`, `replace`, and a value-checked
+`remove`:
+
+```ts
+await client.putIfAbsent("lock", "held", 30); // true: stored, key was absent
+await client.putIfAbsent("lock", "held", 30); // false: already there, untouched
+
+await client.replaceIfPresent("config", "v2"); // true only if a value already exists
+
+const current = await client.getWithToken("config"); // { value, token } | null
+if (current !== null) {
+  await client.replace("config", current.token, "v3"); // true only if unchanged since the read
+  await client.deleteIfMatches("config", current.token); // true only if unchanged since the read
+}
+```
+
+`replace`'s (three-argument) and `deleteIfMatches`'s expected value is a
+**token, not a literal** — a content digest (`contentDigest`) of the
+key's exact stored bytes, obtained from `getWithToken` (or computed
+directly from a value already in hand via the exported `contentDigest`
+function). A condition mismatch is a normal `false`, never an exception —
+the same idiom `delete()` already uses for "nothing to act on". All four
+operations, plus `getWithToken`, are also available on a namespace handle
+(`client.namespace(ns).putIfAbsent(...)`, etc.), with the same signatures
+and semantics as above.
+
+A token taken from a real `getWithToken` read is always correct. A token
+*reconstructed* by re-serializing/re-compressing a value the caller
+already holds — rather than one taken from an actual read — is only
+correct if that reconstruction produces byte-identical output to what the
+server actually stores: exactly as sensitive to encoding as memcached's
+own value-based CAS, and not guaranteed across languages or compression
+settings the way the read-then-write-back path always is.
+
+**Not a distributed lock.** LRU eviction reclaims a key exactly as it
+would after a plain `set`, CAS or not — a key used as a lock (`add` to
+acquire, a TTL to eventually release) that gets evicted under memory
+pressure lets a second caller's `putIfAbsent` succeed while the first
+still believes it holds the lock. `putIfAbsent`/`replace`/
+`deleteIfMatches` are atomic against concurrent requests on the node that
+currently owns the key — the same guarantee `incr`/`decr` make, and no
+stronger.
+
+In a cluster, only the primary owner ever evaluates the condition —
+replicas receive the literal result (the new value, or the deletion) as
+an ordinary `set`/`delete` instead, so a replica can never reach a
+different outcome by re-evaluating the same condition against its own
+possibly-different copy. See docs/protocol.html#cas for the wire-level
+spec.
+
 ## API
 
 - `NanocachedClient.connect(options)` —
@@ -419,10 +471,26 @@ never drift from the primary by re-deriving the increment on its own.
   `number | null` (`null` on a miss); throws `NotNumericError` if the
   stored value isn't an integer `incr` can operate on; see
   [`incr`/`decr`](#incr--decr) above
+- `client.getWithToken(key)` — resolves `{ value: Buffer; token: string } |
+  null`; see [Compare-and-set](#compare-and-set) above
+- `client.putIfAbsent(key, value, ttlSeconds = 0)` — resolves `boolean`
+  (`add`); see [Compare-and-set](#compare-and-set)
+- `client.replaceIfPresent(key, value, ttlSeconds = 0)` — resolves
+  `boolean` (two-argument `replace`); see [Compare-and-set](#compare-and-set)
+- `client.replace(key, token, newValue, ttlSeconds = 0)` — resolves
+  `boolean` (three-argument, token-conditioned `replace`); see
+  [Compare-and-set](#compare-and-set)
+- `client.deleteIfMatches(key, token)` — resolves `boolean`
+  (token-conditioned `remove`); see [Compare-and-set](#compare-and-set)
+- `contentDigest(value)` — pure function, resolves the 32-character
+  lowercase hex content digest of `value`'s exact bytes; see
+  [Compare-and-set](#compare-and-set)
 - `client.namespace(ns)` — returns a `NanocachedNamespace` handle scoped to
-  `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/`set`/
-  `delete`/`clear`/`incr`/`decr` with the same signatures and semantics as
-  above; `handle.namespace` exposes the raw namespace bytes
+  `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/
+  `getWithToken`/`set`/`delete`/`clear`/`incr`/`decr`/`putIfAbsent`/
+  `replaceIfPresent`/`replace`/`deleteIfMatches` with the same signatures
+  and semantics as above; `handle.namespace` exposes the raw namespace
+  bytes
 - `handle.clear()` — resolves (`Promise<void>`) once every node in the
   cluster (or the single node in standalone mode) has cleared that
   namespace; see [Namespaces](#namespaces)

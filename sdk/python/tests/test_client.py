@@ -20,6 +20,7 @@ from nanocached import (
     NotNumericError,
     RetryableError,
     WrongNodeError,
+    content_digest,
 )
 
 from mock_servers import MockDiscovery, MockNode, unused_port
@@ -1429,6 +1430,551 @@ class IncrReplicationTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             for node in nodes.values():
                 await node.close()
+
+
+class ContentDigestTests(unittest.TestCase):
+    # Compare-and-set (issue #141): docs/protocol.html "k / x" is the
+    # authoritative wire spec content_digest() implements against.
+
+    def test_pinned_cross_language_vector(self):
+        # SHA-256 of the UTF-8 bytes "nanocached-cas-vector", truncated to
+        # the first 16 bytes, lowercase hex — the same fixed input/output
+        # pair pinned into the Rust server and every other SDK. A
+        # mismatch here means CAS silently breaks across languages.
+        self.assertEqual(
+            content_digest(b"nanocached-cas-vector"), "36287141940ca57acbd7695ccdde9d43"
+        )
+
+    def test_produces_a_32_character_lowercase_hex_string(self):
+        digest = content_digest(b"some value")
+        self.assertEqual(len(digest), 32)
+        self.assertEqual(digest, digest.lower())
+        int(digest, 16)  # raises ValueError if it isn't hex
+
+    def test_is_deterministic_and_content_sensitive(self):
+        self.assertEqual(content_digest(b"same"), content_digest(b"same"))
+        self.assertNotEqual(content_digest(b"a"), content_digest(b"b"))
+
+    def test_empty_value_has_a_digest_too(self):
+        digest = content_digest(b"")
+        self.assertEqual(len(digest), 32)
+
+
+class CasEncodingTests(unittest.TestCase):
+    # Compare-and-set (issue #141): docs/protocol.html "k / x" is the
+    # authoritative wire spec these pin — like `i`, neither op has a
+    # legacy uppercase form, so even the default namespace still carries
+    # <namespace-length> 0.
+
+    def test_encodes_absent_conditioned_set_without_ttl(self):
+        from nanocached._connection import CAS_ABSENT, _encode_cas_set
+
+        self.assertEqual(_encode_cas_set(b"k", b"v", CAS_ABSENT), b"k 0 1 1 A\nkv")
+
+    def test_encodes_present_conditioned_set_without_ttl(self):
+        from nanocached._connection import CAS_PRESENT, _encode_cas_set
+
+        self.assertEqual(_encode_cas_set(b"k", b"v", CAS_PRESENT), b"k 0 1 1 P\nkv")
+
+    def test_encodes_digest_conditioned_set_without_ttl(self):
+        from nanocached._connection import _encode_cas_set
+
+        digest = content_digest(b"old").encode()
+        self.assertEqual(
+            _encode_cas_set(b"k", b"v", digest), b"k 0 1 1 %b\nkv" % digest
+        )
+
+    def test_encodes_set_with_ttl(self):
+        from nanocached._connection import CAS_ABSENT, _encode_cas_set
+
+        self.assertEqual(
+            _encode_cas_set(b"k", b"v", CAS_ABSENT, ttl_seconds=60), b"k 0 1 1 A 60\nkv"
+        )
+
+    def test_encodes_namespaced_set(self):
+        from nanocached._connection import CAS_ABSENT, _encode_cas_set
+
+        self.assertEqual(
+            _encode_cas_set(b"k", b"v", CAS_ABSENT, namespace=b"users"),
+            b"k 5 1 1 A\nusers" + b"kv",
+        )
+
+    def test_encodes_tagged_set(self):
+        from nanocached._connection import CAS_ABSENT, _encode_cas_set
+
+        self.assertEqual(
+            _encode_cas_set(b"k", b"v", CAS_ABSENT, tag=7), b"k 0 1 1 A 7\nkv"
+        )
+
+    def test_encodes_tagged_set_with_ttl(self):
+        from nanocached._connection import CAS_ABSENT, _encode_cas_set
+
+        self.assertEqual(
+            _encode_cas_set(b"k", b"v", CAS_ABSENT, ttl_seconds=60, tag=7),
+            b"k 0 1 1 A 60 7\nkv",
+        )
+
+    def test_encodes_digest_conditioned_delete(self):
+        from nanocached._connection import _encode_cas_delete
+
+        digest = content_digest(b"old").encode()
+        self.assertEqual(_encode_cas_delete(b"k", digest), b"x 0 1 %b\nk" % digest)
+
+    def test_encodes_tagged_delete(self):
+        from nanocached._connection import _encode_cas_delete
+
+        digest = content_digest(b"old").encode()
+        self.assertEqual(
+            _encode_cas_delete(b"k", digest, tag=3), b"x 0 1 %b 3\nk" % digest
+        )
+
+    def test_encodes_namespaced_delete(self):
+        from nanocached._connection import _encode_cas_delete
+
+        digest = content_digest(b"old").encode()
+        self.assertEqual(
+            _encode_cas_delete(b"k", digest, namespace=b"users"),
+            b"x 5 1 %b\nusers" % digest + b"k",
+        )
+
+
+class CasTests(unittest.IsolatedAsyncioTestCase):
+    # Compare-and-set (issue #141): single-node coverage of
+    # put_if_absent()/replace_if_present()/replace()/delete_if_matches()
+    # and get_with_token() — see CasReplicationTests below for the
+    # cluster fan-out contract (primary-only k/x, replica gets a plain
+    # set/delete).
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_put_if_absent_succeeds_on_a_missing_key(self):
+        client = await self.connect()
+        try:
+            self.assertTrue(await client.put_if_absent("k", "v"))
+            self.assertEqual(await client.get("k"), "v")
+            self.assertEqual(self.node.cas_set_count, 1)
+        finally:
+            await client.close()
+
+    async def test_put_if_absent_fails_when_the_key_already_exists(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "original")
+            self.assertFalse(await client.put_if_absent("k", "new"))
+            self.assertEqual(await client.get("k"), "original")
+        finally:
+            await client.close()
+
+    async def test_put_if_absent_honors_ttl(self):
+        client = await self.connect()
+        try:
+            self.assertTrue(await client.put_if_absent("k", "v", ttl_seconds=60))
+            self.assertEqual(self.node.entry_ttl[(b"", b"k")], 60)
+        finally:
+            await client.close()
+
+    async def test_replace_if_present_succeeds_when_the_key_exists(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "original")
+            self.assertTrue(await client.replace_if_present("k", "new"))
+            self.assertEqual(await client.get("k"), "new")
+        finally:
+            await client.close()
+
+    async def test_replace_if_present_fails_on_a_missing_key(self):
+        client = await self.connect()
+        try:
+            self.assertFalse(await client.replace_if_present("missing", "new"))
+            self.assertIsNone(await client.get("missing"))
+        finally:
+            await client.close()
+
+    async def test_replace_succeeds_when_the_token_matches(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "original")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, token = result
+            self.assertTrue(await client.replace("k", token, "new"))
+            self.assertEqual(await client.get("k"), "new")
+        finally:
+            await client.close()
+
+    async def test_replace_fails_when_the_token_is_stale(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "original")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, stale_token = result
+            await client.set("k", "changed-out-from-under-us")
+            self.assertFalse(await client.replace("k", stale_token, "new"))
+            self.assertEqual(await client.get("k"), "changed-out-from-under-us")
+        finally:
+            await client.close()
+
+    async def test_replace_fails_on_a_missing_key(self):
+        client = await self.connect()
+        try:
+            token = content_digest(b"anything")
+            self.assertFalse(await client.replace("missing", token, "new"))
+        finally:
+            await client.close()
+
+    async def test_delete_if_matches_succeeds_when_the_token_matches(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, token = result
+            self.assertTrue(await client.delete_if_matches("k", token))
+            self.assertIsNone(await client.get("k"))
+        finally:
+            await client.close()
+
+    async def test_delete_if_matches_fails_when_the_token_is_stale(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "v")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, stale_token = result
+            await client.set("k", "changed")
+            self.assertFalse(await client.delete_if_matches("k", stale_token))
+            self.assertEqual(await client.get("k"), "changed")
+        finally:
+            await client.close()
+
+    async def test_delete_if_matches_fails_on_a_missing_key(self):
+        client = await self.connect()
+        try:
+            token = content_digest(b"anything")
+            self.assertFalse(await client.delete_if_matches("missing", token))
+        finally:
+            await client.close()
+
+    async def test_get_with_token_returns_none_on_a_miss(self):
+        client = await self.connect()
+        try:
+            self.assertIsNone(await client.get_with_token("missing"))
+        finally:
+            await client.close()
+
+    async def test_get_with_token_matches_content_digest_of_the_value(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "hello")
+            result = await client.get_with_token("k")
+            assert result is not None
+            value, token = result
+            self.assertEqual(value, b"hello")
+            self.assertEqual(token, content_digest(b"hello"))
+        finally:
+            await client.close()
+
+    async def test_malformed_token_is_rejected_before_touching_the_connection(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.replace("k", "not-a-digest", "new")
+            with self.assertRaises(ValueError):
+                await client.replace("k", "ABCDEF0123456789ABCDEF0123456789", "new")  # uppercase
+            with self.assertRaises(ValueError):
+                await client.delete_if_matches("k", "short")
+            self.assertEqual(self.node.cas_set_count, 0)
+            self.assertEqual(self.node.cas_delete_count, 0)
+        finally:
+            await client.close()
+
+    async def test_empty_key_is_rejected_before_touching_the_connection(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.put_if_absent("", "v")
+            self.assertEqual(self.node.cas_set_count, 0)
+        finally:
+            await client.close()
+
+
+class CasTaggedTests(unittest.IsolatedAsyncioTestCase):
+    # Compare-and-set (issue #141): the S/N/D decode path on a tagged
+    # connection (echoed response tags) — see CasTests above for the
+    # untagged path.
+
+    async def test_cas_round_trips_over_a_tagged_connection(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                self.assertTrue(await client.put_if_absent("k", "v"))
+                self.assertFalse(await client.put_if_absent("k", "v2"))
+                result = await client.get_with_token("k")
+                assert result is not None
+                _, token = result
+                self.assertTrue(await client.replace("k", token, "v3"))
+                self.assertTrue(await client.delete_if_matches("k", content_digest(b"v3")))
+                self.assertFalse(await client.delete_if_matches("k", content_digest(b"v3")))
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+
+class CasCompressionTests(unittest.IsolatedAsyncioTestCase):
+    # Compare-and-set (issue #141) x value compression: the digest MUST be
+    # computed over the raw, marker-prefixed wire bytes get_bytes() taps
+    # before decompression — never the decompressed value get()/get_bytes()
+    # return — since the server never decompresses and so could never
+    # match a digest computed over bytes it never saw.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def test_token_is_computed_from_the_raw_marker_prefixed_wire_bytes(self):
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", self.node.port)], compress=True, compression_threshold=1
+        )
+        try:
+            await client.set("k", "value")
+            raw_wire_bytes = self.node.store[b"k"]
+            self.assertEqual(raw_wire_bytes[0], 0x00)  # too small to shrink under DEFLATE
+
+            result = await client.get_with_token("k")
+            assert result is not None
+            value, token = result
+            self.assertEqual(value, b"value")  # decompressed
+            # The token must match a digest of the raw wire bytes, not of
+            # the decompressed value it's returned alongside.
+            self.assertEqual(token, content_digest(raw_wire_bytes))
+            self.assertNotEqual(token, content_digest(b"value"))
+        finally:
+            await client.close()
+
+    async def test_replace_writes_a_compressed_value_a_plain_client_can_still_read(self):
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", self.node.port)], compress=True, compression_threshold=1
+        )
+        try:
+            await client.set("k", "original")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, token = result
+            new_value = "y" * 1000  # comfortably above the threshold
+            self.assertTrue(await client.replace("k", token, new_value))
+
+            stored = self.node.store[b"k"]
+            self.assertEqual(stored[0], 0x01)  # DEFLATE-marked, not raw bytes
+            self.assertEqual(await client.get("k"), new_value)
+        finally:
+            await client.close()
+
+
+class CasReplicationTests(unittest.IsolatedAsyncioTestCase):
+    # Compare-and-set (issue #141): the cluster contract this feature
+    # exists for — the primary alone evaluates <cond> via `k`/`x`, and
+    # forwards its literal result to the remaining owners as an ordinary
+    # set()/delete(), never replaying `k`/`x`.
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_the_primary_runs_k_and_the_replica_only_ever_gets_a_set(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "cas-key"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            self.assertTrue(await client.put_if_absent(key, "v1"))
+
+            # The critical assertion: not just that both stores agree on
+            # the final value (a buggy replay-on-replica implementation
+            # would produce that too), but that the replica never
+            # received a `k` frame at all.
+            self.assertEqual(primary.cas_set_count, 1)
+            self.assertEqual(replica.cas_set_count, 0)
+            self.assertEqual(primary.store[key.encode()], b"v1")
+            self.assertEqual(replica.store[key.encode()], b"v1")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_condition_mismatch_on_the_primary_never_touches_the_replica(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "already-there"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            await client.set(key, "original")
+            primary.cas_set_count = 0
+            replica.cas_set_count = 0
+
+            self.assertFalse(await client.put_if_absent(key, "new"))
+
+            self.assertEqual(primary.cas_set_count, 1)
+            self.assertEqual(replica.cas_set_count, 0)
+            self.assertEqual(primary.store[key.encode()], b"original")
+            self.assertEqual(replica.store[key.encode()], b"original")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_the_replicated_set_carries_the_new_ttl(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "cas-key-with-ttl"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            self.assertTrue(await client.put_if_absent(key, "v1", ttl_seconds=120))
+
+            self.assertEqual(replica.last_set_ttl, 120)
+            self.assertEqual(replica.entry_ttl[(b"", key.encode())], 120)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_the_primary_runs_x_and_the_replica_only_ever_gets_a_delete(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "cas-delete-key"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            self.assertTrue(await client.put_if_absent(key, "v1"))
+            result = await client.get_with_token(key)
+            assert result is not None
+            _, token = result
+            primary.cas_set_count = 0
+            replica.cas_set_count = 0
+
+            self.assertTrue(await client.delete_if_matches(key, token))
+
+            self.assertEqual(primary.cas_delete_count, 1)
+            self.assertEqual(replica.cas_delete_count, 0)
+            self.assertNotIn(key.encode(), primary.store)
+            self.assertNotIn(key.encode(), replica.store)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_delete_mismatch_on_the_primary_never_touches_the_replica(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "stale-delete-key"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            self.assertTrue(await client.put_if_absent(key, "v1"))
+            stale_token = content_digest(b"not-the-real-value")
+            primary.cas_delete_count = 0
+            replica.cas_delete_count = 0
+
+            self.assertFalse(await client.delete_if_matches(key, stale_token))
+
+            self.assertEqual(primary.cas_delete_count, 1)
+            self.assertEqual(replica.cas_delete_count, 0)
+            self.assertEqual(primary.store[key.encode()], b"v1")
+            self.assertEqual(replica.store[key.encode()], b"v1")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_wrong_node_triggers_refresh_and_one_retry(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "some-cas-key"
+            primary_name, _ = self.owners_of(key)
+            primary = nodes[primary_name]
+
+            primary.answer_wrong_node_once()
+            self.assertTrue(await client.put_if_absent(key, "v1"))
+
+            primary.answer_wrong_node_once()
+            primary.answer_wrong_node_once()
+            with self.assertRaises(WrongNodeError):
+                await client.put_if_absent(key, "v2")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
+class CasNamespaceTests(unittest.IsolatedAsyncioTestCase):
+    # Compare-and-set (issue #141): Namespace.put_if_absent()/
+    # replace_if_present()/replace()/delete_if_matches()/get_with_token()
+    # scope to the namespace the same way get/set/delete already do.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_round_trips_cas_operations_within_a_namespace(self):
+        client = await self.connect()
+        try:
+            users = client.namespace("users")
+            self.assertTrue(await users.put_if_absent("k", "v1"))
+            # The default namespace's own "k" is a separate entry.
+            self.assertIsNone(await client.get("k"))
+
+            self.assertTrue(await users.replace_if_present("k", "v2"))
+            result = await users.get_with_token("k")
+            assert result is not None
+            value, token = result
+            self.assertEqual(value, b"v2")
+
+            self.assertTrue(await users.replace("k", token, "v3"))
+            self.assertEqual(await users.get("k"), "v3")
+
+            self.assertTrue(await users.delete_if_matches("k", content_digest(b"v3")))
+            self.assertIsNone(await users.get("k"))
+        finally:
+            await client.close()
 
 
 class ClusterTests(unittest.IsolatedAsyncioTestCase):

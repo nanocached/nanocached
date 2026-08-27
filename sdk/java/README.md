@@ -147,6 +147,51 @@ receive the primary's literal resulting value (and TTL) as an ordinary
 missed an earlier write or independently evicted the key still converges
 to the exact same bytes as the primary instead of drifting from it.
 
+## Compare-and-set
+
+`putIfAbsent`/`replaceIfPresent`/`replace`/`deleteIfMatches` are
+content-based compare-and-set: each returns a plain `boolean` — `true`
+means the condition held and the write/delete happened, `false` means it
+didn't and nothing changed. A mismatch is a normal outcome, not an
+exception, exactly like `delete` returning `false` for a miss.
+
+```java
+client.putIfAbsent("lock:job-1", "worker-a");       // true: acquired
+client.putIfAbsent("lock:job-1", "worker-b");       // false: already held
+
+client.replaceIfPresent("config", "v2");            // only if some value exists
+
+NanocachedClient.CasEntry current = client.getWithToken("counter").orElseThrow();
+client.replace("counter", current.token(), "42");   // only if unchanged since the read
+client.deleteIfMatches("counter", current.token()); // only if unchanged since the read
+```
+
+`replace`/`deleteIfMatches` take a **token**, not a literal expected
+value — a 32-character digest of the key's exact stored bytes, obtained
+from `getWithToken` (or computed directly from a value already in hand via
+the static `NanocachedClient.contentDigest(byte[])`, e.g. for a future
+adapter that never needs to GET first). Reconstructing a token from a
+value the caller already holds, rather than one taken from a real prior
+read, is only correct if that reconstruction is byte-identical to what
+the server actually stores — the same hazard memcached's own value-based
+CAS has; `getWithToken` is always correct since it hashes the exact bytes
+just read. All four exist on `client.namespace(ns)` handles too, scoped
+exactly like `get`/`set`.
+
+**Not a distributed lock.** LRU eviction reclaims a CAS-written key
+exactly as it would after a plain `set` — a key used as a lock
+(`putIfAbsent` to acquire, a TTL to eventually release) can be silently
+double-acquired if it's evicted under memory pressure between one
+caller's acquire and its release. `putIfAbsent`/`replace`/etc. are atomic
+against concurrent requests on the node that owns the key, the same
+guarantee `incr` makes and no stronger.
+
+In a cluster, only the primary owner evaluates the condition; a success's
+literal result is forwarded to the replicas as an ordinary `set`/`delete`,
+never by replaying the conditioned op — the same rule `incr` follows and
+for the same reason. See [`docs/protocol.html#cas`](../../docs/protocol.html#cas)
+for the wire-level details.
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to

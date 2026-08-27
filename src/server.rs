@@ -1306,6 +1306,20 @@ fn render_node_metrics(
          counted here.",
         format!("nanocached_node_incrs_total {}\n", stats.incrs),
     );
+    metric(
+        "nanocached_node_cas_sets_total",
+        "counter",
+        "Successful k (compare-and-set) writes (issue #141) — a mismatched \
+         condition isn't counted here.",
+        format!("nanocached_node_cas_sets_total {}\n", stats.cas_sets),
+    );
+    metric(
+        "nanocached_node_cas_deletes_total",
+        "counter",
+        "Successful x (compare-and-delete) removals (issue #141) — a \
+         mismatched condition or missing key isn't counted here.",
+        format!("nanocached_node_cas_deletes_total {}\n", stats.cas_deletes),
+    );
 
     let mut namespace_entries = String::new();
     let mut namespace_bytes = String::new();
@@ -1974,6 +1988,135 @@ async fn handle_connection(
                                     value: value.clone(),
                                     ttl,
                                 },
+                            )))
+                            .await;
+                    }
+                }
+
+                continue;
+            }
+            Ok((
+                Command::CasSet {
+                    key,
+                    condition,
+                    value,
+                    ttl,
+                },
+                tag,
+            )) => {
+                if let Some(node_context) = &config.node_context
+                    && wrong_node(node_context, &key)
+                {
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
+                    continue;
+                }
+
+                let response = execute_command(
+                    &request_tx,
+                    Command::CasSet {
+                        key: key.clone(),
+                        condition,
+                        value: value.clone(),
+                        ttl,
+                    },
+                )
+                .await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                // Issue #141: only `Response::Stored` — i.e. the condition
+                // held and CAS actually wrote — needs forwarding; a
+                // `NotFound` (mismatch) changed nothing. Forwarded as an
+                // ordinary `Set`/`HandoffSet` carrying the literal new
+                // value, never as `k` itself: a joining/entrant node
+                // re-evaluating the same condition against its own
+                // (possibly different) copy could reach a different
+                // outcome than the primary just did (see `Cache::cas_set`'s
+                // doc comment).
+                if matches!(response, Response::Stored) {
+                    if let Some(node_context) = &config.node_context
+                        && let Some(target) = migration_target_for(node_context, &key)
+                    {
+                        let _ = config
+                            .migration_tx
+                            .send(Box::pin(forward_with_retries(
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::Set {
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                    ttl,
+                                },
+                            )))
+                            .await;
+                    }
+
+                    if let Some(node_context) = &config.node_context
+                        && let Some(target) = leave_target_for(node_context, &key)
+                    {
+                        let _ = config
+                            .migration_tx
+                            .send(Box::pin(forward_with_retries(
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::HandoffSet { key, value, ttl },
+                            )))
+                            .await;
+                    }
+                }
+
+                continue;
+            }
+            Ok((
+                Command::CasDelete {
+                    key,
+                    expected_digest,
+                },
+                tag,
+            )) => {
+                if let Some(node_context) = &config.node_context
+                    && wrong_node(node_context, &key)
+                {
+                    write_response(&mut stream, &encode_response(&Response::WrongNode, tag))
+                        .await?;
+                    continue;
+                }
+
+                let response = execute_command(
+                    &request_tx,
+                    Command::CasDelete {
+                        key: key.clone(),
+                        expected_digest,
+                    },
+                )
+                .await?;
+                write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                // Same "forward the literal result, never `x` itself"
+                // rule as `CasSet`.
+                if matches!(response, Response::Deleted) {
+                    if let Some(node_context) = &config.node_context
+                        && let Some(target) = migration_target_for(node_context, &key)
+                    {
+                        let _ = config
+                            .migration_tx
+                            .send(Box::pin(forward_with_retries(
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::Delete { key: key.clone() },
+                            )))
+                            .await;
+                    }
+
+                    if let Some(node_context) = &config.node_context
+                        && let Some(target) = leave_target_for(node_context, &key)
+                    {
+                        let _ = config
+                            .migration_tx
+                            .send(Box::pin(forward_with_retries(
+                                node_context.clone(),
+                                target,
+                                OwnedForwardedWrite::HandoffDelete { key: key.clone() },
                             )))
                             .await;
                     }
@@ -5424,6 +5567,24 @@ mod tests {
             },
         )
         .await;
+        send_command(
+            &request_tx,
+            Command::CasSet {
+                key: key(b"flag"),
+                condition: crate::cache::CasCondition::Absent,
+                value: Bytes::from_static(b"on"),
+                ttl: None,
+            },
+        )
+        .await;
+        send_command(
+            &request_tx,
+            Command::CasDelete {
+                key: key(b"flag"),
+                expected_digest: crate::cache::content_digest(b"on"),
+            },
+        )
+        .await;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -5448,6 +5609,14 @@ mod tests {
         assert!(body.contains("nanocached_node_misses_total 1\n"), "{body}");
         assert!(body.contains("nanocached_node_sets_total 3\n"), "{body}");
         assert!(body.contains("nanocached_node_incrs_total 1\n"), "{body}");
+        assert!(
+            body.contains("nanocached_node_cas_sets_total 1\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("nanocached_node_cas_deletes_total 1\n"),
+            "{body}"
+        );
         assert!(
             body.contains("nanocached_node_namespace_entries{namespace=\"users\"} 1\n"),
             "{body}"
@@ -5888,6 +6057,96 @@ mod tests {
             .unwrap();
 
         let expected = b"I 2\n15";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_dispatches_cas_set_and_replies_with_stored() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client.write_all(b"k 0 3 5 A\nfooAlice").await.unwrap();
+
+        let request = request_rx.recv().await.unwrap();
+        assert_eq!(
+            request.command,
+            Command::CasSet {
+                key: key(b"foo"),
+                condition: crate::cache::CasCondition::Absent,
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        );
+        request.response_tx.send(Response::Stored).unwrap();
+
+        let expected = b"S\n";
+        let mut response = vec![0_u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        shutdown_tx.send_replace(true);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_dispatches_cas_delete_and_replies_with_deleted() {
+        let (mut client, server) = tcp_pair().await;
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx,
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: None,
+                migration_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(b"x 0 3 3bc51062973c458d5a6f2d8d64a02324\nfoo")
+            .await
+            .unwrap();
+
+        let request = request_rx.recv().await.unwrap();
+        assert_eq!(
+            request.command,
+            Command::CasDelete {
+                key: key(b"foo"),
+                expected_digest: [
+                    0x3b, 0xc5, 0x10, 0x62, 0x97, 0x3c, 0x45, 0x8d, 0x5a, 0x6f, 0x2d, 0x8d, 0x64,
+                    0xa0, 0x23, 0x24,
+                ],
+            },
+        );
+        request.response_tx.send(Response::Deleted).unwrap();
+
+        let expected = b"D\n";
         let mut response = vec![0_u8; expected.len()];
         client.read_exact(&mut response).await.unwrap();
         assert_eq!(response, expected);

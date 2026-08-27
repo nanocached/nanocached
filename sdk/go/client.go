@@ -859,6 +859,23 @@ func (c *Client) GetBytes(key string) (value []byte, ok bool, err error) {
 // of which namespace a caller is in. A nil/empty namespace is the
 // default namespace, byte-identical on the wire to a pre-#105 client.
 func (c *Client) getBytesNS(namespace []byte, key string) (value []byte, ok bool, err error) {
+	raw, ok, err := c.getRawNS(namespace, key)
+	if err != nil || !ok || !c.compress {
+		return raw, ok, err
+	}
+	value, err = decompressValue(raw)
+	return value, ok, err
+}
+
+// getRawNS fetches (namespace, key)'s raw wire bytes — exactly what
+// getBytesNS itself used to do before this helper existed, still applying
+// the same cluster retry and read repair policy, but stopping short of
+// this SDK's own client-side decompression. Shared by getBytesNS and
+// getBytesWithTokenNS/GetWithToken (issue #141: compare-and-set), whose
+// CasToken must be computed from these exact bytes — the ones the server
+// itself hashes, since the server never decompresses (value compression)
+// — never from the decompressed value getBytesNS goes on to return.
+func (c *Client) getRawNS(namespace []byte, key string) (raw []byte, ok bool, err error) {
 	if err := validateKey(key); err != nil {
 		return nil, false, err
 	}
@@ -870,17 +887,13 @@ func (c *Client) getBytesNS(namespace []byte, key string) (value []byte, ok bool
 		v, o, readErr := c.read(namespace, keyBytes, func(conn *connection) ([]byte, bool, error) {
 			return conn.getNS(namespace, keyBytes)
 		})
-		value, ok = v, o
+		raw, ok = v, o
 		return readErr
 	})
 	if err == nil && !ok && c.readRepair {
-		value, ok = c.tryReadRepair(namespace, keyBytes)
+		raw, ok = c.tryReadRepair(namespace, keyBytes)
 	}
-	if err != nil || !ok || !c.compress {
-		return value, ok, err
-	}
-	value, err = decompressValue(value)
-	return value, ok, err
+	return raw, ok, err
 }
 
 // tryReadRepair probes the remaining owners of key — every owner but the
@@ -1292,6 +1305,12 @@ func (n *Namespace) GetBytes(key string) (value []byte, ok bool, err error) {
 	return n.client.getBytesNS(n.namespace, key)
 }
 
+// GetWithToken returns key's raw value together with a CasToken, within
+// this namespace. See Client.GetWithToken.
+func (n *Namespace) GetWithToken(key string) (value []byte, token CasToken, ok bool, err error) {
+	return n.client.getBytesWithTokenNS(n.namespace, key)
+}
+
 // Set stores the string value under key within this namespace. See
 // Client.Set.
 func (n *Namespace) Set(key, value string, ttlSeconds int64) error {
@@ -1328,6 +1347,30 @@ func (n *Namespace) Decr(key string, delta int64) (value int64, ok bool, err err
 // never rejected.
 func (n *Namespace) Clear() error {
 	return n.client.clearNS(n.namespace)
+}
+
+// PutIfAbsent stores value under key within this namespace only if the
+// key is currently absent. See Client.PutIfAbsent.
+func (n *Namespace) PutIfAbsent(key string, value []byte, ttlSeconds int64) (bool, error) {
+	return n.client.putIfAbsentNS(n.namespace, key, value, ttlSeconds)
+}
+
+// ReplaceIfPresent stores value under key within this namespace only if
+// the key currently holds any value. See Client.ReplaceIfPresent.
+func (n *Namespace) ReplaceIfPresent(key string, value []byte, ttlSeconds int64) (bool, error) {
+	return n.client.replaceIfPresentNS(n.namespace, key, value, ttlSeconds)
+}
+
+// Replace stores newValue under key within this namespace only if the
+// key's current content digest matches token. See Client.Replace.
+func (n *Namespace) Replace(key string, token CasToken, newValue []byte, ttlSeconds int64) (bool, error) {
+	return n.client.replaceNS(n.namespace, key, token, newValue, ttlSeconds)
+}
+
+// DeleteIfMatches removes key within this namespace only if its current
+// content digest matches token. See Client.DeleteIfMatches.
+func (n *Namespace) DeleteIfMatches(key string, token CasToken) (bool, error) {
+	return n.client.deleteIfMatchesNS(n.namespace, key, token)
 }
 
 // Close is idempotent; later Get/Set/Delete return ErrClosed. Calling

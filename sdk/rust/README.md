@@ -129,6 +129,46 @@ replica that missed an earlier write (or evicted the key on its own)
 converges to the primary's exact value instead of drifting from replaying
 the increment independently.
 
+## Compare-and-set
+
+`put_if_absent`, `replace_if_present`, `replace`, and `delete_if_matches`
+condition a write or delete on the key's current state instead of just
+overwriting it unconditionally:
+
+```rust
+assert!(client.put_if_absent("name", "Alice", 0).await?); // stored — was absent
+assert!(!client.put_if_absent("name", "Bob", 0).await?);  // mismatch — already exists
+
+let (value, token) = client.get_with_token("name").await?.unwrap();
+assert!(client.replace("name", token, "Bob", 0).await?); // stored — digest matched
+assert!(client.delete_if_matches("name", nanocached::content_digest(b"Bob")).await?);
+```
+
+`replace`/`delete_if_matches`'s expected value is a **digest**, not the
+literal value: `get_with_token` returns one alongside the value it read
+(a `CasToken`, wrapping a 16-byte SHA-256-derived digest of the value's
+exact stored bytes), and a bare `[u8; 16]` from `nanocached::content_digest`
+works too via `impl Into<CasToken>`. The `get_with_token`-then-`replace`
+path is always correct; reconstructing a digest from a value you already
+hold (rather than one just read back) is only correct if your
+re-serialization is byte-identical to what the server actually stores —
+the same caveat memcached's own value-based CAS has. All four are also
+available on a `Namespace` handle, scoped exactly like its
+`get`/`set`/`delete`. Every mismatch is a plain `false`, never an error —
+the same idiom `delete` already uses for "nothing here to act on".
+
+**This is not a distributed lock.** LRU eviction reclaims a key exactly
+as it would after a plain `set`, CAS or not — a key used as a lock
+(`put_if_absent` to acquire, a TTL to eventually release) that gets
+evicted under memory pressure lets a second caller's `put_if_absent`
+succeed while the first still believes it holds the lock, and CAS alone
+cannot detect that silent double-acquisition.
+
+In a cluster, only the key's primary owner ever evaluates the condition;
+on success, replicas receive the literal result as an ordinary `set`/
+`delete`, mirroring `incr`'s own replication rule above. See
+`docs/protocol.html#cas` for the full wire spec.
+
 ## Namespaces
 
 A namespace is a flat, opaque byte string that scopes a key: the same

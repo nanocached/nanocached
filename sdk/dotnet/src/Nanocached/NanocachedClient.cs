@@ -828,6 +828,19 @@ public sealed class NanocachedClient : IDisposable
     /// duplicating this client's networking.</summary>
     internal async Task<byte[]?> GetBytesAsync(byte[] namespaceBytes, byte[] key)
     {
+        byte[]? value = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
+        return value is null || !_compress ? value : Compression.DecompressValue(value);
+    }
+
+    /// <summary>The shared read path behind <see cref="GetBytesAsync(byte[], byte[])"/>
+    /// and <see cref="GetWithTokenAsync(byte[], byte[])"/> (issue #141): the
+    /// value's EXACT WIRE BYTES, before this client's own decompression
+    /// step — a compression-enabled client never decompresses server-side,
+    /// so these are the same bytes a <c>k</c>/<c>x</c>'s condition is
+    /// evaluated against, and hashing anything else would silently
+    /// produce a digest the server can never match.</summary>
+    private async Task<byte[]?> GetRawBytesAsync(byte[] namespaceBytes, byte[] key)
+    {
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
         byte[]? value = await WithClusterRetryAsync(
@@ -837,7 +850,66 @@ public sealed class NanocachedClient : IDisposable
         {
             value = await TryReadRepairAsync(namespaceBytes, key).ConfigureAwait(false);
         }
-        return value is null || !_compress ? value : Compression.DecompressValue(value);
+        return value;
+    }
+
+    public Task<(string Value, string Token)?> GetWithTokenAsync(string key) =>
+        GetWithTokenAsync(EmptyNamespace, key);
+
+    /// <summary>issue #141 — compare-and-set: as <see cref="GetAsync(string)"/>,
+    /// but also returns a content digest ("CAS token") for the value, for
+    /// use with <see cref="ReplaceAsync(string, string, string, long)"/> or
+    /// <see cref="DeleteIfMatchesAsync(string, string)"/> — the same
+    /// not-found convention (<c>null</c>) as a plain <c>GetAsync</c> miss.
+    /// The digest is computed from the exact wire bytes (see
+    /// <see cref="ContentDigest"/>'s doc comment), so it is always the one
+    /// the server itself would compute, even with <c>Compress</c>
+    /// enabled.</summary>
+    public Task<(string Value, string Token)?> GetWithTokenAsync(byte[] key) =>
+        GetWithTokenAsync(EmptyNamespace, key);
+
+    /// <summary>issue #141: as <see cref="GetWithTokenAsync(string)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<(string Value, string Token)?> GetWithTokenAsync(byte[] namespaceBytes, string key) =>
+        GetWithTokenAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+
+    /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[])"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<(string Value, string Token)?> GetWithTokenAsync(byte[] namespaceBytes, byte[] key)
+    {
+        byte[]? raw = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
+        if (raw is null) return null;
+        string token = ContentDigest(raw);
+        byte[] value = _compress ? Compression.DecompressValue(raw) : raw;
+        return (StrictUtf8.GetString(value), token);
+    }
+
+    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(string key) =>
+        GetBytesWithTokenAsync(EmptyNamespace, key);
+
+    /// <summary>issue #141: as <see cref="GetWithTokenAsync(byte[])"/>, but
+    /// returns the raw (decompressed) value instead of decoding it as
+    /// UTF-8 — the <see cref="GetBytesAsync(byte[])"/> counterpart to
+    /// <see cref="GetWithTokenAsync(byte[])"/>.</summary>
+    public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] key) =>
+        GetBytesWithTokenAsync(EmptyNamespace, key);
+
+    /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(string)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] namespaceBytes, string key) =>
+        GetBytesWithTokenAsync(namespaceBytes, Encoding.UTF8.GetBytes(key));
+
+    /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(byte[])"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] namespaceBytes, byte[] key)
+    {
+        byte[]? raw = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
+        if (raw is null) return null;
+        string token = ContentDigest(raw);
+        byte[] value = _compress ? Compression.DecompressValue(raw) : raw;
+        return (value, token);
     }
 
     /// <summary>read repair: probes the remaining owners of
@@ -1112,18 +1184,44 @@ public sealed class NanocachedClient : IDisposable
         (long value, long ttlSeconds) = primaryResult.Value;
         byte[] valueBytes = Encoding.ASCII.GetBytes(value.ToString(CultureInfo.InvariantCulture));
 
-        // Best-effort forward of the primary's literal result — swallowed
-        // by design (client-side replication's convention), counted via
-        // Stats().ReplicaWriteFailures. Narrowed to the connection layer's
-        // own failure types, same as WriteAsync's ReplicaWriteAsync, so a
-        // programming bug here doesn't get treated like a dead replica.
-        async Task ReplicateResultAsync(string name)
+        // The primary already succeeded by this point, so — unlike
+        // WriteAsync, which must reconcile a possibly-failed primary
+        // against a replica-leg bug — there is nothing to reconcile here:
+        // every failure ReplicateToOwnersAsync can produce is already
+        // swallowed and counted inside it.
+        await ReplicateToOwnersAsync(
+            names.Skip(1), connection => connection.SetAsync(namespaceBytes, key, valueBytes, ttlSeconds))
+            .ConfigureAwait(false);
+
+        return value;
+    }
+
+    /// <summary>Shared replica fan-out for the "primary evaluates, then
+    /// forwards the literal result" pattern used by <see cref="IncrPrimaryThenReplicateAsync"/>
+    /// (issue #129) and <see cref="CasPrimaryThenReplicateAsync"/>/
+    /// <see cref="RemoveIfMatchesPrimaryThenReplicateAsync"/> (issue #141):
+    /// runs <paramref name="replicate"/> against each of <paramref
+    /// name="names"/> (already excluding the primary, which the caller ran
+    /// separately and successfully). Every expected failure (a dead
+    /// replica, a lost socket) is swallowed and counted via
+    /// <see cref="Stats"/>'s <c>ReplicaWriteFailures</c> — the same
+    /// counter <see cref="WriteAsync{T}"/>'s own replica legs use, not a
+    /// new one — since the primary already succeeded and a replica gap is
+    /// healed by the next node-list refresh, not by failing an already-
+    /// completed write. With <see cref="Options.FireAndForgetReplicas"/>,
+    /// up to <see cref="MaxInFlightBackgroundReplicaWrites"/> legs run in
+    /// the background instead of being awaited here, sharing the one pool
+    /// <see cref="WriteAsync{T}"/>'s own replica legs and read-repair
+    /// draw from.</summary>
+    private async Task ReplicateToOwnersAsync(IEnumerable<string> names, Func<Connection, Task> replicate)
+    {
+        async Task RunOneAsync(string name)
         {
             try
             {
                 await ApplyReconnectingAsync<object?>(name, async connection =>
                 {
-                    await connection.SetAsync(namespaceBytes, key, valueBytes, ttlSeconds).ConfigureAwait(false);
+                    await replicate(connection).ConfigureAwait(false);
                     return null;
                 }).ConfigureAwait(false);
             }
@@ -1135,7 +1233,7 @@ public sealed class NanocachedClient : IDisposable
         }
 
         var replicaWrites = new List<Task>();
-        foreach (string name in names.Skip(1))
+        foreach (string name in names)
         {
             // Fire-and-forget replica writes: mirrors WriteAsync's own
             // background-pool logic exactly, sharing the same permit pool
@@ -1143,7 +1241,7 @@ public sealed class NanocachedClient : IDisposable
             // the synchronous path below instead.
             if (_fireAndForgetReplicas && _backgroundReplicaPermits.Wait(0))
             {
-                Task background = Task.Run(() => ReplicateResultAsync(name));
+                Task background = Task.Run(() => RunOneAsync(name));
                 _ = background.ContinueWith(
                     completed =>
                     {
@@ -1157,20 +1255,253 @@ public sealed class NanocachedClient : IDisposable
                 continue;
             }
 
-            replicaWrites.Add(ReplicateResultAsync(name));
+            replicaWrites.Add(RunOneAsync(name));
         }
 
-        // The primary already succeeded by this point, so — unlike
-        // WriteAsync, which must reconcile a possibly-failed primary
-        // against a replica-leg bug — there is nothing to reconcile here:
-        // every failure ReplicateResultAsync can produce is already
-        // swallowed and counted inside it.
         foreach (Task replicaWrite in replicaWrites)
         {
             await replicaWrite.ConfigureAwait(false);
         }
+    }
 
-        return value;
+    // ── compare-and-set (issue #141) ─────────────────────────────
+
+    /// <summary>issue #141 — compare-and-set: SHA-256 of <paramref
+    /// name="value"/>, truncated to the first 16 bytes (128 bits),
+    /// lowercase-hex-encoded (32 characters) — the digest ("CAS token")
+    /// the server computes over a key's exact stored bytes. Public and
+    /// pure so a caller that already holds a value can compute its
+    /// expected digest without a prior read — see
+    /// <see cref="ReplaceAsync(byte[], string, byte[], long)"/>'s doc
+    /// comment for why that shortcut is only safe when the caller's own
+    /// serialization reproduces the stored bytes exactly, unlike the
+    /// always-correct read-then-write-back path via
+    /// <see cref="GetWithTokenAsync(byte[])"/>. Computed identically by
+    /// the server and every SDK; pinned by a fixed cross-language test
+    /// vector (see NanocachedClientTests).</summary>
+    public static string ContentDigest(byte[] value)
+    {
+        byte[] hash = SHA256.HashData(value);
+        return Convert.ToHexString(hash, 0, 16).ToLowerInvariant();
+    }
+
+    private const string CondAbsent = "A";
+    private const string CondPresent = "P";
+
+    public Task<bool> PutIfAbsentAsync(string key, string value, long ttlSeconds = 0) =>
+        PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds);
+
+    /// <summary>issue #141 — <c>add</c>/<c>putIfAbsent</c>: stores
+    /// <paramref name="value"/> only if <paramref name="key"/> is
+    /// currently absent (including lazily expired). Returns <c>true</c>
+    /// when stored, <c>false</c> when the key already existed — a
+    /// condition mismatch is a normal boolean outcome, never an
+    /// exception, the same idiom <see cref="DeleteAsync(byte[])"/> uses.
+    ///
+    /// <para><b>Not a distributed lock</b>: LRU eviction can still reclaim
+    /// the key exactly as it would after a plain <see cref="SetAsync(byte[], byte[], long)"/>
+    /// — if a key used as a lock is evicted under memory pressure, a
+    /// second caller's <c>PutIfAbsentAsync</c> succeeds while the first
+    /// caller still believes it holds the lock. See
+    /// docs/protocol.html#cas.</para>
+    ///
+    /// <para>Cluster replication: only the key's primary owner evaluates
+    /// the condition; on success the SDK forwards the literal value to the
+    /// remaining owners as an ordinary <see cref="SetAsync(byte[], byte[], long)"/>,
+    /// never by replaying <c>k</c> on a replica — see
+    /// <see cref="IncrAsync(byte[], long)"/>'s doc comment for why that
+    /// matters.</para></summary>
+    public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
+        PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds);
+
+    /// <summary>issue #141: as <see cref="PutIfAbsentAsync(string, string, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<bool> PutIfAbsentAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
+        PutIfAbsentAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+
+    /// <summary>issue #141: as <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal Task<bool> PutIfAbsentAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds = 0) =>
+        CasAsync(namespaceBytes, key, value, CondAbsent, ttlSeconds);
+
+    public Task<bool> ReplaceIfPresentAsync(string key, string value, long ttlSeconds = 0) =>
+        ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds);
+
+    /// <summary>issue #141 — the two-argument <c>replace(key, value)</c>:
+    /// stores <paramref name="value"/> only if <paramref name="key"/>
+    /// currently holds any (unexpired) value, whatever it is. Returns
+    /// <c>true</c> when replaced, <c>false</c> when the key was absent —
+    /// see <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s doc
+    /// comment for the shared not-a-lock caveat and replication
+    /// rule.</summary>
+    public Task<bool> ReplaceIfPresentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
+        ReplaceIfPresentAsync(EmptyNamespace, key, value, ttlSeconds);
+
+    /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(string, string, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<bool> ReplaceIfPresentAsync(byte[] namespaceBytes, string key, string value, long ttlSeconds = 0) =>
+        ReplaceIfPresentAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(value), ttlSeconds);
+
+    /// <summary>issue #141: as <see cref="ReplaceIfPresentAsync(byte[], byte[], long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal Task<bool> ReplaceIfPresentAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds = 0) =>
+        CasAsync(namespaceBytes, key, value, CondPresent, ttlSeconds);
+
+    public Task<bool> ReplaceAsync(string key, string token, string newValue, long ttlSeconds = 0) =>
+        ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds);
+
+    /// <summary>issue #141 — the three-argument <c>replace(key, old, new)</c>:
+    /// stores <paramref name="newValue"/> only if <paramref name="key"/>
+    /// holds an unexpired value whose content digest equals <paramref
+    /// name="token"/> exactly (32-character lowercase hex — see
+    /// <see cref="ContentDigest"/>). Returns <c>true</c> when replaced,
+    /// <c>false</c> on a digest mismatch (including a since-deleted key).
+    ///
+    /// <para><paramref name="token"/> is ordinarily obtained from a real
+    /// prior <see cref="GetWithTokenAsync(byte[])"/> — that path is always
+    /// correct. Reconstructing a digest via <see cref="ContentDigest"/>
+    /// from a value the caller already holds (skipping the read) is only
+    /// correct if that reconstruction produces byte-identical bytes to
+    /// what the server actually stores — true within one client sharing
+    /// one serializer/compressor, not guaranteed across languages or
+    /// mismatched <c>Compress</c> settings (the same caveat memcached's
+    /// own value-based CAS has).</para>
+    ///
+    /// <para>See <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s
+    /// doc comment for the shared not-a-lock caveat and replication
+    /// rule.</para></summary>
+    public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0) =>
+        ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds);
+
+    /// <summary>issue #141: as <see cref="ReplaceAsync(string, string, string, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<bool> ReplaceAsync(byte[] namespaceBytes, string key, string token, string newValue, long ttlSeconds = 0) =>
+        ReplaceAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), token, Encoding.UTF8.GetBytes(newValue), ttlSeconds);
+
+    /// <summary>issue #141: as <see cref="ReplaceAsync(byte[], string, byte[], long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal Task<bool> ReplaceAsync(byte[] namespaceBytes, byte[] key, string token, byte[] newValue, long ttlSeconds = 0) =>
+        CasAsync(namespaceBytes, key, newValue, token, ttlSeconds);
+
+    public Task<bool> DeleteIfMatchesAsync(string key, string token) => DeleteIfMatchesAsync(EmptyNamespace, key, token);
+
+    /// <summary>issue #141 — the two-argument <c>remove(key, old)</c>:
+    /// removes <paramref name="key"/> only if its current stored value's
+    /// content digest equals <paramref name="token"/> exactly. Returns
+    /// <c>true</c> when removed, <c>false</c> on a digest mismatch or a
+    /// missing key — see <see cref="ReplaceAsync(byte[], string, byte[], long)"/>'s
+    /// doc comment for how to obtain <paramref name="token"/>.
+    ///
+    /// <para>Cluster replication: only the primary owner evaluates the
+    /// digest; on success the SDK forwards the removal to the remaining
+    /// owners as an ordinary <see cref="DeleteAsync(byte[])"/>, never by
+    /// replaying <c>x</c> on a replica.</para></summary>
+    public Task<bool> DeleteIfMatchesAsync(byte[] key, string token) => DeleteIfMatchesAsync(EmptyNamespace, key, token);
+
+    /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(string, string)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task<bool> DeleteIfMatchesAsync(byte[] namespaceBytes, string key, string token) =>
+        DeleteIfMatchesAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), token);
+
+    /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(byte[], string)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<bool> DeleteIfMatchesAsync(byte[] namespaceBytes, byte[] key, string token)
+    {
+        ValidateKey(namespaceBytes, key);
+        await BeforeOperationAsync().ConfigureAwait(false);
+        return await WithClusterRetryAsync(
+            () => RemoveIfMatchesPrimaryThenReplicateAsync(namespaceBytes, key, token))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>issue #141: as <see cref="IncrAsync(byte[], byte[], long)"/>
+    /// but for <c>k</c> — validates, compresses (reusing
+    /// <see cref="SetAsync(byte[], byte[], byte[], long)"/>'s exact
+    /// encode step, so a subsequent plain <see cref="GetAsync(byte[])"/>
+    /// from any client can always decompress it), and runs the
+    /// primary-evaluates-then-replicates driver.</summary>
+    private async Task<bool> CasAsync(byte[] namespaceBytes, byte[] key, byte[] value, string cond, long ttlSeconds)
+    {
+        if (ttlSeconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ttlSeconds), $"nanocached: ttlSeconds must be non-negative, got {ttlSeconds}");
+        }
+        ValidateKeyAndValue(namespaceBytes, key, value);
+        byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
+        await BeforeOperationAsync().ConfigureAwait(false);
+        return await WithClusterRetryAsync(
+            () => CasPrimaryThenReplicateAsync(namespaceBytes, key, outgoing, cond, ttlSeconds))
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>issue #141 — mirrors <see cref="IncrPrimaryThenReplicateAsync"/>
+    /// exactly: runs <c>k</c> against the key's PRIMARY owner only —
+    /// <paramref name="value"/> here is already the outgoing (possibly
+    /// compressed) wire bytes — then, only on success, forwards that same
+    /// literal value to the remaining owners as an ordinary <c>Set</c>,
+    /// never by replaying <c>k</c> on a replica (which could evaluate
+    /// <paramref name="cond"/> against a possibly-different copy and reach
+    /// a different outcome).</summary>
+    private async Task<bool> CasPrimaryThenReplicateAsync(
+        byte[] namespaceBytes, byte[] key, byte[] value, string cond, long ttlSeconds)
+    {
+        if (_ring is null)
+        {
+            return await ApplyReconnectingAsync(
+                null, connection => connection.CasAsync(namespaceBytes, key, value, cond, ttlSeconds))
+                .ConfigureAwait(false);
+        }
+
+        IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
+        if (names.Count == 0)
+        {
+            throw new ConnectionLostException("nanocached: no owner is reachable for this key");
+        }
+
+        bool stored = await ApplyReconnectingAsync(
+            names[0], connection => connection.CasAsync(namespaceBytes, key, value, cond, ttlSeconds))
+            .ConfigureAwait(false);
+        if (!stored) return false;
+
+        await ReplicateToOwnersAsync(
+            names.Skip(1), connection => connection.SetAsync(namespaceBytes, key, value, ttlSeconds))
+            .ConfigureAwait(false);
+        return true;
+    }
+
+    /// <summary>issue #141 — mirrors <see cref="CasPrimaryThenReplicateAsync"/>
+    /// for <c>x</c>: runs the digest-conditioned remove against the
+    /// primary owner only, then — only on success — forwards the removal
+    /// to the remaining owners as an ordinary <c>Delete</c>, never by
+    /// replaying <c>x</c> on a replica.</summary>
+    private async Task<bool> RemoveIfMatchesPrimaryThenReplicateAsync(byte[] namespaceBytes, byte[] key, string digest)
+    {
+        if (_ring is null)
+        {
+            return await ApplyReconnectingAsync(
+                null, connection => connection.RemoveIfMatchesAsync(namespaceBytes, key, digest))
+                .ConfigureAwait(false);
+        }
+
+        IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
+        if (names.Count == 0)
+        {
+            throw new ConnectionLostException("nanocached: no owner is reachable for this key");
+        }
+
+        bool removed = await ApplyReconnectingAsync(
+            names[0], connection => connection.RemoveIfMatchesAsync(namespaceBytes, key, digest))
+            .ConfigureAwait(false);
+        if (!removed) return false;
+
+        await ReplicateToOwnersAsync(names.Skip(1), connection => connection.DeleteAsync(namespaceBytes, key))
+            .ConfigureAwait(false);
+        return true;
     }
 
     /// <summary>issue #106: drops every entry in <paramref name="namespaceBytes"/>

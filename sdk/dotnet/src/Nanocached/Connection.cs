@@ -10,8 +10,9 @@ namespace Nanocached;
 /// the cache protocol (<c>G</c>/<c>S</c>/<c>D</c>, their namespaced
 /// counterparts <c>g</c>/<c>s</c>/<c>d</c> — issue #105 — the
 /// namespace-clear/flush-everything commands <c>c</c>/<c>F</c> — issue
-/// #106 — and the always-namespaced counter op <c>i</c> — issue #129 —
-/// the <c>A</c> identify exchange happens in <see cref="Identify"/>
+/// #106 — the always-namespaced counter op <c>i</c> — issue #129 — and
+/// the always-namespaced compare-and-set ops <c>k</c>/<c>x</c> — issue
+/// #141 — the <c>A</c> identify exchange happens in <see cref="Identify"/>
 /// before a Connection exists).
 /// Requests are pipelined onto the socket and matched to responses in send
 /// order (request pipelining): a dedicated read loop, started in the
@@ -415,6 +416,89 @@ internal sealed class Connection
     /// locale-dependent one.</summary>
     private static string IncrHeader(byte[] namespaceBytes, int keyLength, long delta, uint? tag) =>
         $"i {namespaceBytes.Length} {keyLength} {delta.ToString(CultureInfo.InvariantCulture)}{TagField(tag)}\n";
+
+    /// <summary>issue #141: <c>k &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;][ &lt;tag&gt;]\n</c> —
+    /// always lowercase and always namespaced, like <see cref="IncrHeader"/>.
+    /// <paramref name="cond"/> is emitted as a bare token, never
+    /// length-prefixed — its own shape (<c>A</c>, <c>P</c>, or a
+    /// 32-character hex digest) identifies it.</summary>
+    private static string CasHeader(byte[] namespaceBytes, int keyLength, int valueLength, string cond, long ttlSeconds, uint? tag)
+    {
+        string ttlField = ttlSeconds == 0 ? "" : $" {ttlSeconds}";
+        return $"k {namespaceBytes.Length} {keyLength} {valueLength} {cond}{ttlField}{TagField(tag)}\n";
+    }
+
+    /// <summary>issue #141: <c>x &lt;ns-len&gt; &lt;key-len&gt; &lt;cond&gt; [&lt;tag&gt;]\n</c> —
+    /// <paramref name="digest"/> here is always a content digest, never
+    /// <c>A</c>/<c>P</c> (see <see cref="RemoveIfMatchesAsync"/>'s doc
+    /// comment).</summary>
+    private static string RemoveIfMatchesHeader(byte[] namespaceBytes, int keyLength, string digest, uint? tag) =>
+        $"x {namespaceBytes.Length} {keyLength} {digest}{TagField(tag)}\n";
+
+    /// <summary>issue #141 — compare-and-set: stores <paramref name="value"/>
+    /// at (<paramref name="namespaceBytes"/>, <paramref name="key"/>) only
+    /// if <paramref name="cond"/> holds against the key's current stored
+    /// bytes — <c>"A"</c> (absent), <c>"P"</c> (present, any value), or a
+    /// 32-character lowercase hex digest (exact content match). Returns
+    /// <c>true</c> on success (<c>S</c>), <c>false</c> on a condition
+    /// mismatch (<c>N</c> — a normal outcome, not an exception, the same
+    /// idiom <see cref="DeleteAsync(byte[], byte[])"/> uses for "nothing to
+    /// act on"). <paramref name="ttlSeconds"/> means exactly what it means
+    /// for <see cref="SetAsync(byte[], byte[], byte[], long)"/> (0 = no
+    /// expiry). Always namespaced, like <see cref="IncrAsync"/> — no legacy
+    /// uppercase form.
+    ///
+    /// <para>Not a distributed lock: LRU eviction can still reclaim the key
+    /// exactly as it would after a plain <c>Set</c>.</para>
+    ///
+    /// <para>Cluster replication (same rule as <see cref="IncrAsync"/>):
+    /// this method only ever talks to the ONE node this connection is
+    /// dialed to. It is <see cref="NanocachedClient"/>'s job to call this
+    /// against the primary owner only, and — on success — forward the
+    /// literal resulting value to the replicas via this same connection's
+    /// <see cref="SetAsync(byte[], byte[], byte[], long)"/>, never by
+    /// sending <c>k</c> to a replica (which could let a replica evaluate
+    /// <paramref name="cond"/> against its own possibly-different copy and
+    /// reach a different outcome than the primary just did).</para></summary>
+    internal async Task<bool> CasAsync(byte[] namespaceBytes, byte[] key, byte[] value, string cond, long ttlSeconds)
+    {
+        var (marker, _, _) = await RequestAsync(tag =>
+            Frame(CasHeader(namespaceBytes, key.Length, value.Length, cond, ttlSeconds, tag), namespaceBytes, key, value))
+            .ConfigureAwait(false);
+        return marker switch
+        {
+            (byte)'S' => true,
+            (byte)'N' => false,
+            (byte)'W' => throw new WrongNodeException(),
+            _ => throw Mismatch(marker),
+        };
+    }
+
+    /// <summary>issue #141 — compare-and-set: removes the key at
+    /// (<paramref name="namespaceBytes"/>, <paramref name="key"/>) only if
+    /// <paramref name="digest"/> — always a content digest here; an
+    /// absent/present-only conditioned delete is already the plain
+    /// unconditional <see cref="DeleteAsync(byte[], byte[])"/> — matches its
+    /// current stored bytes. Returns <c>true</c> on success (<c>D</c>),
+    /// <c>false</c> on a mismatch or a missing key (<c>N</c>). See
+    /// <see cref="CasAsync"/>'s doc comment for the shared not-a-lock
+    /// caveat and cluster-replication rule (a successful removal is
+    /// forwarded to replicas as an ordinary
+    /// <see cref="DeleteAsync(byte[], byte[])"/>, never by replaying
+    /// <c>x</c>).</summary>
+    internal async Task<bool> RemoveIfMatchesAsync(byte[] namespaceBytes, byte[] key, string digest)
+    {
+        var (marker, _, _) = await RequestAsync(tag =>
+            Frame(RemoveIfMatchesHeader(namespaceBytes, key.Length, digest, tag), namespaceBytes, key, null))
+            .ConfigureAwait(false);
+        return marker switch
+        {
+            (byte)'D' => true,
+            (byte)'N' => false,
+            (byte)'W' => throw new WrongNodeException(),
+            _ => throw Mismatch(marker),
+        };
+    }
 
     /// <summary>issue #105: <paramref name="namespaceBytes"/> leads the
     /// body, ahead of the key (and, for a Set, the value) — empty for

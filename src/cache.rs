@@ -77,6 +77,13 @@ pub struct CacheStats {
     /// wasn't INCR's decimal-ASCII grammar, or an overflowing `delta`,
     /// isn't counted here — see `Cache::incr`).
     pub incrs: u64,
+    /// Issue #141: successful `k` (compare-and-set) writes. A mismatched
+    /// condition isn't counted here — see `Cache::cas_set`.
+    pub cas_sets: u64,
+    /// Issue #141: successful `x` (compare-and-delete) removals. A
+    /// mismatched or absent key isn't counted here — see
+    /// `Cache::cas_delete`.
+    pub cas_deletes: u64,
     /// Largest first; one row per live namespace.
     pub namespaces: Vec<NamespaceStats>,
 }
@@ -131,6 +138,10 @@ pub struct Cache {
     expirations: u64,
     /// Issue #129: successful `INCR` operations — see `CacheStats::incrs`.
     incrs: u64,
+    /// Issue #141: successful `k` writes — see `CacheStats::cas_sets`.
+    cas_sets: u64,
+    /// Issue #141: successful `x` removals — see `CacheStats::cas_deletes`.
+    cas_deletes: u64,
     /// Keys handed off to another node during an staged node join migration this
     /// node was the source for, awaiting `sweep`'s next pass.
     migrated: HashSet<Key>,
@@ -166,6 +177,49 @@ pub enum IncrResult {
     /// would overflow `i64`. Distinct from `NotFound` so a caller (e.g.
     /// the Django adapter) can tell "no such key" from "wrong type" apart.
     NotNumeric,
+}
+
+/// Issue #141: `k`'s (and `x`'s) `<cond>` field, already decoded by
+/// `command.rs`'s parser — `cache.rs` never sees the wire token, only the
+/// decoded condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasCondition {
+    /// Wire `A`: succeeds only if the key is absent — including lazily
+    /// expired, indistinguishable from never having been set (same
+    /// "eviction and never-existed look the same" rule `IncrResult::NotFound`
+    /// follows).
+    Absent,
+    /// Wire `P`: succeeds only if the key currently holds any
+    /// (unexpired) value, regardless of what it is.
+    Present,
+    /// Wire: a 32-hex-digit digest. Succeeds only if the key holds an
+    /// unexpired value whose `content_digest` equals this exactly.
+    Digest([u8; 16]),
+}
+
+/// `Cache::cas_set`'s outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CasResult {
+    /// The condition held; the new value is now stored.
+    Stored,
+    /// The condition did not hold; nothing changed.
+    Mismatch,
+}
+
+/// Issue #141: CAS's content digest — SHA-256 of the exact bytes a key's
+/// entry stores (the same bytes a `V`/`I` response body would carry: for a
+/// compression-enabled client, that includes its marker byte, since the
+/// server never decompresses), truncated to the first 16 bytes (128 bits).
+/// Computed identically here and by every SDK — a fixed cross-language
+/// test vector pins the agreement (see `docs/protocol.html#cas`); a
+/// mismatch here would silently break CAS between languages sharing a
+/// keyspace.
+pub(crate) fn content_digest(value: &[u8]) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(value);
+    let mut digest = [0u8; 16];
+    digest.copy_from_slice(&hash[..16]);
+    digest
 }
 
 /// Issue #129: INCR's canonical decimal-ASCII integer grammar — shared
@@ -233,6 +287,8 @@ impl Cache {
             evictions: 0,
             expirations: 0,
             incrs: 0,
+            cas_sets: 0,
+            cas_deletes: 0,
             migrated: HashSet::new(),
             pending_removal: VecDeque::new(),
         }
@@ -307,6 +363,91 @@ impl Cache {
         self.insert(key.clone(), Bytes::from(new_value.to_string()), expires_at);
 
         IncrResult::Value(new_value, remaining_ttl)
+    }
+
+    /// Issue #141: `k` — compare-and-set. Evaluates `condition` against
+    /// the key's current (lazily-expired-first) value and, only on a
+    /// match, overwrites it through `insert` (the same accounting-safe
+    /// path `set`/`set_with_ttl`/`incr_at` share). `ttl` follows `Set`'s
+    /// own convention exactly (`None` = no expiry) — unlike `incr_at`,
+    /// the new value is supplied whole by the caller, so there is no old
+    /// TTL to preserve.
+    ///
+    /// Not atomic across a cluster on its own — see `src/server.rs`'s
+    /// `CasSet` connection handler for how a cluster stays consistent
+    /// (the same "primary decides, forward the literal result" rule
+    /// `Cache::incr`'s doc comment describes), and `docs/protocol.html#cas`
+    /// for why LRU eviction still means CAS is not a distributed lock.
+    pub fn cas_set(
+        &mut self,
+        key: &Key,
+        condition: CasCondition,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> CasResult {
+        self.cas_set_at(key, condition, value, ttl, Instant::now())
+    }
+
+    fn cas_set_at(
+        &mut self,
+        key: &Key,
+        condition: CasCondition,
+        value: Bytes,
+        ttl: Option<Duration>,
+        now: Instant,
+    ) -> CasResult {
+        if !self.condition_holds_at(key, condition, now) {
+            return CasResult::Mismatch;
+        }
+
+        // Same overflow handling as `set_with_ttl`: a TTL too far out to
+        // represent as an `Instant` is treated as "never expires" rather
+        // than panicking the single cache actor.
+        let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
+        self.cas_sets += 1;
+        self.insert(key.clone(), value, expires_at);
+        CasResult::Stored
+    }
+
+    /// Issue #141: `x` — compare-and-delete. `command.rs`'s parser only
+    /// ever produces `CasCondition::Digest` for `x` (`A`/`P` are rejected
+    /// as a fatal parse error there — deleting on "absent" or "any
+    /// present value" is already the plain, unconditional `d`), but this
+    /// takes the decoded digest directly rather than re-asserting that
+    /// here.
+    pub fn cas_delete(&mut self, key: &Key, expected: [u8; 16]) -> bool {
+        self.cas_delete_at(key, expected, Instant::now())
+    }
+
+    fn cas_delete_at(&mut self, key: &Key, expected: [u8; 16], now: Instant) -> bool {
+        if !self.condition_holds_at(key, CasCondition::Digest(expected), now) {
+            return false;
+        }
+        self.cas_deletes += 1;
+        self.remove_entry(key);
+        true
+    }
+
+    /// Shared by `cas_set_at`/`cas_delete_at`: lazily expires the entry
+    /// first (an expired entry is "absent" to every condition, same as
+    /// `get_at`/`incr_at`), then checks `condition` against whatever is
+    /// left.
+    fn condition_holds_at(&mut self, key: &Key, condition: CasCondition, now: Instant) -> bool {
+        if self.peek(key).is_some_and(|entry| entry.is_expired_at(now)) {
+            self.remove_entry(key);
+            self.expirations += 1;
+        }
+
+        match (condition, self.peek(key)) {
+            (CasCondition::Absent, None) => true,
+            (CasCondition::Absent, Some(_)) => false,
+            (CasCondition::Present, Some(_)) => true,
+            (CasCondition::Present, None) => false,
+            (CasCondition::Digest(expected), Some(entry)) => {
+                content_digest(&entry.value) == expected
+            }
+            (CasCondition::Digest(_), None) => false,
+        }
     }
 
     pub fn delete(&mut self, key: &Key) -> bool {
@@ -659,6 +800,8 @@ impl Cache {
             evictions: self.evictions,
             expirations: self.expirations,
             incrs: self.incrs,
+            cas_sets: self.cas_sets,
+            cas_deletes: self.cas_deletes,
             namespaces,
         }
     }
@@ -971,6 +1114,240 @@ mod tests {
             IncrResult::Value(11, None)
         );
         assert_eq!(cache.incr(&key(b"counter"), 1), IncrResult::NotFound);
+    }
+
+    #[test]
+    fn cas_set_with_absent_condition_succeeds_on_a_missing_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Absent,
+                Bytes::from_static(b"Alice"),
+                None
+            ),
+            CasResult::Stored
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn cas_set_with_absent_condition_fails_when_the_key_exists() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Absent,
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Mismatch
+        );
+        // A failed CAS never writes.
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn cas_set_with_present_condition_succeeds_when_the_key_exists() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Present,
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Stored
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn cas_set_with_present_condition_fails_on_a_missing_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Present,
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Mismatch
+        );
+        assert_eq!(cache.get(&key(b"name")), None);
+    }
+
+    #[test]
+    fn cas_set_with_a_matching_digest_succeeds_and_replaces_the_value() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        let digest = content_digest(b"Alice");
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Digest(digest),
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Stored
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn cas_set_with_a_stale_digest_fails_and_leaves_the_value_untouched() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+        let stale_digest = content_digest(b"someone-else");
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Digest(stale_digest),
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Mismatch
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn cas_set_with_a_digest_condition_fails_on_a_missing_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Digest(content_digest(b"Alice")),
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Mismatch
+        );
+    }
+
+    #[test]
+    fn cas_set_on_an_expired_key_treats_it_as_absent() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set_with_ttl(key(b"name"), Bytes::from_static(b"Alice"), Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Absent,
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Stored
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Bob")));
+    }
+
+    #[test]
+    fn cas_set_applies_the_given_ttl() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Absent,
+                Bytes::from_static(b"Alice"),
+                Some(Duration::from_secs(60))
+            ),
+            CasResult::Stored
+        );
+        let (_, _, remaining) = cache.peek_entry(&key(b"name")).expect("entry must exist");
+        let remaining = remaining.expect("a TTL was given");
+        assert!(remaining <= Duration::from_secs(60) && remaining > Duration::from_secs(55));
+    }
+
+    #[test]
+    fn cas_set_with_no_ttl_means_no_expiry() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        cache.cas_set(
+            &key(b"name"),
+            CasCondition::Absent,
+            Bytes::from_static(b"Alice"),
+            None,
+        );
+
+        let (_, _, remaining) = cache.peek_entry(&key(b"name")).expect("entry must exist");
+        assert_eq!(remaining, None);
+    }
+
+    #[test]
+    fn cas_set_is_scoped_to_its_namespace() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(namespaced(b"ns", b"name"), Bytes::from_static(b"Alice"));
+
+        // The default-namespace key is absent, so `Absent` succeeds there
+        // even though the same name exists under "ns".
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Absent,
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Stored
+        );
+        assert_eq!(
+            cache.get(&namespaced(b"ns", b"name")),
+            Some(Bytes::from_static(b"Alice"))
+        );
+    }
+
+    #[test]
+    fn cas_delete_with_a_matching_digest_removes_the_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        assert!(cache.cas_delete(&key(b"name"), content_digest(b"Alice")));
+        assert_eq!(cache.get(&key(b"name")), None);
+    }
+
+    #[test]
+    fn cas_delete_with_a_stale_digest_fails_and_leaves_the_key() {
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        assert!(!cache.cas_delete(&key(b"name"), content_digest(b"someone-else")));
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
+    }
+
+    #[test]
+    fn cas_delete_on_a_missing_key_fails() {
+        let mut cache = Cache::new(UNBOUNDED);
+
+        assert!(!cache.cas_delete(&key(b"name"), content_digest(b"Alice")));
+    }
+
+    #[test]
+    fn content_digest_is_deterministic_and_sensitive_to_every_byte() {
+        assert_eq!(content_digest(b"Alice"), content_digest(b"Alice"));
+        assert_ne!(content_digest(b"Alice"), content_digest(b"alice"));
+    }
+
+    /// Issue #141: the cross-language pinned test vector — the same input
+    /// and expected 32-hex-digit digest is duplicated into every SDK's
+    /// test suite (same pattern as the DEFLATE and HRW FNV-1a vectors). A
+    /// mismatch anywhere means CAS has silently stopped agreeing across
+    /// languages.
+    #[test]
+    fn content_digest_matches_the_pinned_cross_language_vector() {
+        let digest = content_digest(b"nanocached-cas-vector");
+        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(hex, "36287141940ca57acbd7695ccdde9d43");
     }
 
     #[test]

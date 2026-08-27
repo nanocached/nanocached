@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import re
 from typing import Any
 import ssl as ssl_module
 import sys
@@ -38,7 +39,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ._compression import compress_value, decompress_value
-from ._connection import Connection
+from ._connection import CAS_ABSENT, CAS_PRESENT, Connection
+from ._digest import content_digest
 from ._errors import AlreadyClosedError, NanocachedError, WrongNodeError
 from ._hashring import HashRing
 from ._identify import (
@@ -244,6 +246,23 @@ def _check_delta(delta: int) -> None:
             f"nanocached: delta must fit in a signed 64-bit integer "
             f"({_MIN_I64}..{_MAX_I64}), got {delta}"
         )
+
+
+# Compare-and-set (issue #141): a token must be exactly the 32-character
+# lowercase hex shape content_digest() produces and k/x's digest <cond>
+# form requires — anything else would be sent as raw bytes the server
+# can't parse as a digest, triggering the same no-reply,
+# poisoned-connection rejection an empty key or an oversized frame does
+# (_check_key). Checked eagerly, before any I/O, mirroring _check_delta.
+_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _check_token(token: str) -> bytes:
+    if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+        raise ValueError(
+            f"nanocached: token must be a 32-character lowercase hex digest, got {token!r}"
+        )
+    return token.encode("ascii")
 
 
 def _build_ssl_context(tls: bool, ca: str | os.PathLike | None) -> ssl_module.SSLContext | None:
@@ -796,6 +815,42 @@ class NanocachedClient:
             return value
         return decompress_value(value)
 
+    async def get_with_token(self, key: str | bytes) -> tuple[bytes, str] | None:
+        """Like get_bytes(), but also returns a CAS token (issue #141):
+        content_digest() of the *exact wire bytes* the server holds for
+        this key — for a compress-enabled client, that's the
+        marker-byte-prefixed compressed bytes (_compression.py), NOT the
+        decompressed value this method's own return also carries,
+        because the server never decompresses and so can never match a
+        digest computed over bytes it never saw. Pass the token straight
+        to replace()/delete_if_matches() to condition on this exact read.
+        Returns ``None`` on a miss, matching get_bytes()'s own
+        convention. See README.md's "Compare-and-set" section and
+        docs/protocol.html "k / x"."""
+        return await self._get_with_token(b"", key)
+
+    async def _get_with_token(self, namespace: bytes, key: str | bytes) -> tuple[bytes, str] | None:
+        """The namespace-carrying implementation behind get_with_token()
+        and Namespace.get_with_token() (issue #141) — see _get_bytes(),
+        whose raw-read-then-decompress shape this mirrors exactly (read
+        repair included), except the digest is taken from the raw value
+        *before* decompress_value() ever runs, per get_with_token()'s own
+        docstring."""
+        key_bytes = _to_bytes(key)
+        _check_key(key_bytes, namespace)
+        await self._before_operation()
+        raw = await self._with_wrong_node_retry(
+            lambda: self._read(
+                namespace, key_bytes, lambda connection: connection.get(key_bytes, namespace)
+            )
+        )
+        if raw is None and self._read_repair and self._ring is not None:
+            raw = await self._try_read_repair(namespace, key_bytes)
+        if raw is None:
+            return None
+        token = content_digest(raw)
+        return (decompress_value(raw) if self._compress else raw), token
+
     async def _try_read_repair(self, namespace: bytes, key: bytes) -> bytes | None:
         """read repair: probes the remaining owners of ``key`` —
         every owner but the primary, which the normal read path already
@@ -1017,6 +1072,176 @@ class NanocachedClient:
         reported as failed because of it."""
         tasks = self._dispatch_replica_writes(
             names, lambda connection: connection.set(key, value, ttl_seconds, namespace)
+        )
+        if not tasks:
+            return
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(outcome, BaseException):
+                _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+
+    # ── Compare-and-set (issue #141) ──────────────────────────────────
+    #
+    # k/x are conditioned writes: only the key's primary owner ever
+    # evaluates <cond> (docs/protocol.html "k / x"), exactly incr()'s own
+    # replication rule above — on success, the SDK forwards the primary's
+    # literal result to the remaining owners as an ordinary set()/delete(),
+    # never by replaying k/x itself (a replica evaluating the same
+    # condition against its own possibly-different copy could reach a
+    # different outcome). A condition mismatch is a plain ``False``
+    # return, never an exception — the same idiom delete() already uses
+    # for "nothing here to act on". Not a distributed lock: LRU eviction
+    # reclaims a key exactly as it would after a plain set(), CAS or not
+    # — see README.md's "Compare-and-set" section.
+
+    async def put_if_absent(
+        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
+    ) -> bool:
+        """Stores ``value`` only if ``key`` is currently absent (including
+        lazily expired) — the ``A``-conditioned ``k``, aka
+        ``add``/``putIfAbsent``. Returns ``True`` if stored, ``False`` if
+        the key already existed. ``ttl_seconds`` means exactly what it
+        means for set() (0 = no expiry)."""
+        return await self._cas_set(b"", key, value, CAS_ABSENT, ttl_seconds)
+
+    async def replace_if_present(
+        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
+    ) -> bool:
+        """Stores ``value`` only if ``key`` currently holds any (unexpired)
+        value, whatever it is — the ``P``-conditioned ``k``, the
+        two-argument ``replace(key, value)``. Returns ``True`` if
+        replaced, ``False`` if the key was absent."""
+        return await self._cas_set(b"", key, value, CAS_PRESENT, ttl_seconds)
+
+    async def replace(
+        self, key: str | bytes, token: str, new_value: str | bytes, *, ttl_seconds: int = 0
+    ) -> bool:
+        """Stores ``new_value`` only if ``key``'s current stored bytes
+        match ``token`` exactly — the digest-conditioned ``k``, the
+        three-argument ``replace(key, old, new)``. ``token`` is the
+        32-character hex digest content_digest() produces, normally
+        obtained from a prior get_with_token() call on this same key —
+        that read-then-write-back path is always correct. Reconstructing
+        a token from a value the caller already holds instead (skipping
+        the read) is only correct if that reconstruction reproduces
+        byte-identical wire content to what the server actually stores —
+        exactly as sensitive to encoding as memcached's own value-based
+        CAS, and not guaranteed at all once client-side compression
+        differs between the writer and whoever built the token. Returns
+        ``True`` if replaced, ``False`` on any mismatch (key absent, or
+        its current value doesn't match ``token``)."""
+        return await self._cas_set(b"", key, new_value, _check_token(token), ttl_seconds)
+
+    async def delete_if_matches(self, key: str | bytes, token: str) -> bool:
+        """Removes ``key`` only if its current stored bytes match
+        ``token`` exactly — the digest-conditioned ``x``, the
+        two-argument ``remove(key, old)``. Returns ``True`` if deleted,
+        ``False`` on any mismatch (key absent, or its current value
+        doesn't match ``token``) — see replace()'s docstring for where
+        ``token`` comes from."""
+        return await self._cas_delete(b"", key, token)
+
+    async def _cas_set(
+        self, namespace: bytes, key: str | bytes, value: str | bytes, cond: bytes, ttl_seconds: int
+    ) -> bool:
+        """The namespace-carrying implementation behind
+        put_if_absent()/replace_if_present()/replace() and their
+        Namespace counterparts (issue #141) — see _get_bytes(). Validates
+        and compresses exactly like _set() (the new value written by a
+        successful ``k`` must go through this client's own compression
+        pipeline, or a later plain get() would fail to decompress it)."""
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
+            raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
+        key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
+        _check_key_and_value(key_bytes, value_bytes, namespace)
+        if self._compress:
+            value_bytes = compress_value(value_bytes, self._compression_threshold)
+            _check_key_and_value(key_bytes, value_bytes, namespace)
+        await self._before_operation()
+        return await self._with_wrong_node_retry(
+            lambda: self._cas_set_write(namespace, key_bytes, value_bytes, cond, ttl_seconds)
+        )
+
+    async def _cas_set_write(
+        self, namespace: bytes, key: bytes, value: bytes, cond: bytes, ttl_seconds: int
+    ) -> bool:
+        """Sends ``k`` to the primary owner only, then — only on success —
+        forwards its literal new value to the remaining owners as an
+        ordinary set() (issue #141): mirrors _incr_write()'s docstring
+        for why the write is never replayed on a replica. A mismatch
+        (``False``) from the primary is returned directly without ever
+        touching a replica — nothing was written. Wrapped by _cas_set()
+        in the same _with_wrong_node_retry every other write uses."""
+        if self._ring is None:
+            connection = await self._single_connection()
+            return await connection.cas_set(key, value, cond, ttl_seconds, namespace)
+
+        names = self._owner_names(namespace, key)
+        if not names:
+            raise ConnectionError("nanocached: no owner is reachable for this key")
+        primary, replicas = names[0], names[1:]
+
+        connection = await self._member_connection(primary)
+        stored = await connection.cas_set(key, value, cond, ttl_seconds, namespace)
+        if not stored:
+            return False
+        if replicas:
+            await self._replicate_cas_set_result(replicas, namespace, key, value, ttl_seconds)
+        return True
+
+    async def _replicate_cas_set_result(
+        self, names: list[str], namespace: bytes, key: bytes, value: bytes, ttl_seconds: int
+    ) -> None:
+        """See _replicate_incr_result() — identical fan-out machinery,
+        just forwarding ``k``'s literal result instead of ``i``'s."""
+        tasks = self._dispatch_replica_writes(
+            names, lambda connection: connection.set(key, value, ttl_seconds, namespace)
+        )
+        if not tasks:
+            return
+        for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(outcome, BaseException):
+                _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+
+    async def _cas_delete(self, namespace: bytes, key: str | bytes, token: str) -> bool:
+        """The namespace-carrying implementation behind
+        delete_if_matches() and Namespace.delete_if_matches() (issue
+        #141) — see _get_bytes()."""
+        key_bytes = _to_bytes(key)
+        _check_key(key_bytes, namespace)
+        cond = _check_token(token)
+        await self._before_operation()
+        return await self._with_wrong_node_retry(
+            lambda: self._cas_delete_write(namespace, key_bytes, cond)
+        )
+
+    async def _cas_delete_write(self, namespace: bytes, key: bytes, cond: bytes) -> bool:
+        """Sends ``x`` to the primary owner only, then — only on success —
+        forwards a plain delete() to the remaining owners (issue #141) —
+        see _cas_set_write()."""
+        if self._ring is None:
+            connection = await self._single_connection()
+            return await connection.cas_delete(key, cond, namespace)
+
+        names = self._owner_names(namespace, key)
+        if not names:
+            raise ConnectionError("nanocached: no owner is reachable for this key")
+        primary, replicas = names[0], names[1:]
+
+        connection = await self._member_connection(primary)
+        deleted = await connection.cas_delete(key, cond, namespace)
+        if not deleted:
+            return False
+        if replicas:
+            await self._replicate_cas_delete_result(replicas, namespace, key)
+        return True
+
+    async def _replicate_cas_delete_result(
+        self, names: list[str], namespace: bytes, key: bytes
+    ) -> None:
+        """See _replicate_incr_result() — identical fan-out machinery,
+        forwarding an ordinary delete() instead of a set()."""
+        tasks = self._dispatch_replica_writes(
+            names, lambda connection: connection.delete(key, namespace)
         )
         if not tasks:
             return
@@ -1754,6 +1979,11 @@ class Namespace:
         """Same as NanocachedClient.get_bytes(), scoped to this namespace."""
         return await self._client._get_bytes(self._namespace, key)
 
+    async def get_with_token(self, key: str | bytes) -> tuple[bytes, str] | None:
+        """Same as NanocachedClient.get_with_token(), scoped to this
+        namespace (issue #141)."""
+        return await self._client._get_with_token(self._namespace, key)
+
     async def get(self, key: str | bytes) -> str | None:
         """Same as NanocachedClient.get(), scoped to this namespace."""
         return await self._client._get(self._namespace, key)
@@ -1775,6 +2005,34 @@ class Namespace:
         """Same as NanocachedClient.decr(), scoped to this namespace
         (issue #129)."""
         return await self._client._incr(self._namespace, key, -delta)
+
+    async def put_if_absent(
+        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
+    ) -> bool:
+        """Same as NanocachedClient.put_if_absent(), scoped to this
+        namespace (issue #141)."""
+        return await self._client._cas_set(self._namespace, key, value, CAS_ABSENT, ttl_seconds)
+
+    async def replace_if_present(
+        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
+    ) -> bool:
+        """Same as NanocachedClient.replace_if_present(), scoped to this
+        namespace (issue #141)."""
+        return await self._client._cas_set(self._namespace, key, value, CAS_PRESENT, ttl_seconds)
+
+    async def replace(
+        self, key: str | bytes, token: str, new_value: str | bytes, *, ttl_seconds: int = 0
+    ) -> bool:
+        """Same as NanocachedClient.replace(), scoped to this namespace
+        (issue #141)."""
+        return await self._client._cas_set(
+            self._namespace, key, new_value, _check_token(token), ttl_seconds
+        )
+
+    async def delete_if_matches(self, key: str | bytes, token: str) -> bool:
+        """Same as NanocachedClient.delete_if_matches(), scoped to this
+        namespace (issue #141)."""
+        return await self._client._cas_delete(self._namespace, key, token)
 
     async def clear(self) -> None:
         """Drops every entry in this namespace, on every node (issue

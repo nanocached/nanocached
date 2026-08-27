@@ -172,13 +172,87 @@ that missed an earlier write, leaves it starting from a different base),
 so every replica always ends up with the exact bytes the primary
 computed.</p>
 
+<h2 id="cas">k / x — compare-and-set</h2>
+<pre><code>k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;]\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;</code></pre>
+<p>Stores <code>&lt;value&gt;</code> only if <code>&lt;cond&gt;</code> holds
+against the key's current stored bytes; otherwise nothing changes.
+<code>&lt;cond&gt;</code> is one of three bare tokens (not
+length-prefixed — its own shape identifies it):</p>
+<ul>
+  <li><code>A</code> — succeeds only if the key is absent (including
+  lazily expired). This is <code>add</code>/<code>putIfAbsent</code>.</li>
+  <li><code>P</code> — succeeds only if the key currently holds any
+  (unexpired) value, whatever it is. This is the two-argument
+  <code>replace(key, value)</code>.</li>
+  <li>a 32-character lowercase hex digest — succeeds only if the key
+  holds an unexpired value whose digest (below) equals this exactly.
+  This is the three-argument <code>replace(key, old, new)</code>.</li>
+</ul>
+<p>On success: <code>S\n</code>, the same acknowledgement a plain
+<code>S</code> gives. On a condition mismatch: <code>N\n</code>, reusing
+the same "nothing here to act on" status <code>G</code>/<code>D</code>
+already use for a miss — <code>k</code> introduces no new response
+marker. <code>&lt;ttl-seconds&gt;</code> means exactly what it means for
+<code>S</code> (omitted/0 = no expiry); unlike <code>INCR</code>, the new
+value is supplied whole by the caller, so there is no old TTL to
+preserve.</p>
+<pre><code>x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; [&lt;tag&gt;]\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+<p>Removes the key only if <code>&lt;cond&gt;</code> holds — this is the
+two-argument <code>remove(key, old)</code>. <code>&lt;cond&gt;</code> here
+is always a digest: an absent- or present-only conditioned delete is
+already the plain, unconditional <code>D</code>. On success:
+<code>D\n</code>, the same acknowledgement a plain <code>D</code> gives
+for a key that existed. On a mismatch or a missing key: <code>N\n</code>,
+the same status <code>D</code> already gives when there was nothing to
+delete.</p>
+<p>Both are always namespaced, same as <code>INCR</code>: neither op has
+a pre-namespace legacy form, so <code>&lt;namespace-length&gt;</code> is
+unconditionally present (0 = the default namespace).</p>
+<p><strong>The digest.</strong> SHA-256 of the key's exact stored bytes —
+the same bytes a <code>V</code>/<code>I</code> response body would carry
+(for a compression-enabled client, that includes its marker byte, since
+the server never decompresses) — truncated to the first 16 bytes (128
+bits), lowercase hex-encoded (32 characters). Computed identically by the
+server and every SDK; a fixed cross-language test vector pins the
+agreement (SHA-256 of the UTF-8 bytes <code>nanocached-cas-vector</code>
+truncates to <code>36287141940ca57acbd7695ccdde9d43</code>).</p>
+<p>A client obtains an expected digest from an ordinary <code>GET</code>
+by hashing the response body itself — there is no separate wire
+round-trip to fetch one, and <code>GET</code>'s response shape is
+unchanged. This is <em>content</em>-based CAS, so it is exactly as
+sensitive to encoding as memcached's own value-based CAS: an expected
+digest reconstructed by re-serializing/re-compressing a value a caller
+already holds (rather than one taken from a real prior read) is only
+correct if that reconstruction produces byte-identical output to what
+the server actually stores — true within one client sharing one
+serializer/compressor, not guaranteed across languages with client-side
+compression enabled.</p>
+<p><strong>This is not a distributed lock.</strong> LRU eviction reclaims
+a key exactly as it would after a plain <code>SET</code>, CAS or not: if
+a key used as a lock (<code>add</code> to acquire, a TTL to eventually
+release) is evicted under memory pressure, a second caller's
+<code>A</code>-conditioned <code>k</code> succeeds while the first caller
+still believes it holds the lock — a silent double-acquisition CAS
+cannot detect. <code>k</code>/<code>x</code> are atomic against
+concurrent requests on the node that currently owns the key, the same
+guarantee <code>INCR</code> makes and no stronger.</p>
+<p>Replication follows <code>INCR</code>'s rule exactly: only the key's
+primary owner evaluates <code>&lt;cond&gt;</code>. Once it succeeds, the
+SDK (or <code>nanocached-proxy</code> in proxy mode) writes the
+<em>result</em> to the remaining owners as an ordinary
+<code>S</code>/<code>s</code> (for <code>k</code>) or
+<code>D</code>/<code>d</code> (for <code>x</code>) — never by replaying
+<code>k</code>/<code>x</code> itself. A replica evaluating the same
+condition against its own possibly-different copy could reach a
+different outcome than the primary just did.</p>
+
 <h2 id="tags">Response tags (tagged mode)</h2>
 <p>Pipelined clients match responses to requests by order alone — the
 frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
 <code>G</code>/<code>S</code>/<code>D</code> (and
-<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>)
+<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>k</code>/<code>x</code>)
 header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
@@ -192,7 +266,9 @@ s &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; [&lt;ttl-seco
 d &lt;namespace-length&gt; &lt;key-length&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 c &lt;namespace-length&gt; &lt;tag&gt;\n&lt;namespace&gt;
 F &lt;tag&gt;\n
-i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
+k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
+x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
 <p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
 <code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
 <code>N &lt;tag&gt;\n</code>, <code>W &lt;tag&gt;\n</code>, and
@@ -202,9 +278,12 @@ authentication); a retryable error is <code>R &lt;tag&gt;\n</code> (see
 below). <code>i</code>'s reply becomes
 <code>I &lt;value-length&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n</code> or
 <code>T &lt;tag&gt;\n</code> — the tag is always the last header field,
-after the optional TTL. Tagged mode is per connection and entirely
-opt-in — a plain <code>A</code> keeps every frame exactly as documented
-above. See
+after the optional TTL. <code>k</code>'s reply is <code>S &lt;tag&gt;\n</code>
+or <code>N &lt;tag&gt;\n</code>; <code>x</code>'s is <code>D &lt;tag&gt;\n</code>
+or <code>N &lt;tag&gt;\n</code> — both reuse the markers above, so
+tagging them needs no new shape. Tagged mode is per connection and
+entirely opt-in — a plain <code>A</code> keeps every frame exactly as
+documented above. See
 Echoed response tags
 for the design.</p>
 

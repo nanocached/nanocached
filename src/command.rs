@@ -1,4 +1,4 @@
-use crate::cache::{Cache, IncrResult, parse_decimal_i64};
+use crate::cache::{Cache, CasCondition, CasResult, IncrResult, parse_decimal_i64};
 use crate::key::Key;
 use crate::response::Response;
 use bytes::{Buf, Bytes, BytesMut};
@@ -54,6 +54,39 @@ pub enum Command {
     Incr {
         key: Key,
         delta: i64,
+    },
+    /// `k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]\n<ns><key><value>`
+    /// (issue #141): compare-and-set. `condition` is decoded from the
+    /// wire's `A` (absent expected)/`P` (present expected)/32-hex-digit
+    /// digest (exact content expected) token — see `CasCondition`. Stores
+    /// `value` only if `condition` holds; otherwise nothing changes.
+    /// Always namespaced, same reasoning as `Incr`: this op has no
+    /// pre-namespace legacy form.
+    ///
+    /// Atomic against every other command on *this node* (the
+    /// single-threaded cache actor), same as `Incr` — but not across a
+    /// cluster on its own: see `Cache::cas_set`'s doc comment and
+    /// `src/server.rs`'s `CasSet` connection-handler arm for how
+    /// replication forwards only the literal result, never `k` itself.
+    /// And not a distributed lock: LRU eviction reclaims the key exactly
+    /// as it would after a plain `S`, which can silently let two
+    /// `condition: Absent` callers both believe they "won" — see
+    /// `docs/protocol.html`'s CAS section.
+    CasSet {
+        key: Key,
+        condition: CasCondition,
+        value: Bytes,
+        ttl: Option<Duration>,
+    },
+    /// `x <ns-len> <key-len> <cond> [tag]\n<ns><key>` (issue #141):
+    /// compare-and-delete. `<cond>` is always a 32-hex-digit digest here
+    /// — `parse_with_mode` rejects `A`/`P` for `x` as a fatal parse error,
+    /// since an absent- or present-only conditioned delete is already the
+    /// plain, unconditional `d`. Same atomicity/replication/eviction
+    /// caveats as `CasSet`.
+    CasDelete {
+        key: Key,
+        expected_digest: [u8; 16],
     },
     /// `c <namespace-length> [tag]\n<namespace>` (issue #106): drops one
     /// namespace's every entry. A zero-length namespace clears the
@@ -216,6 +249,27 @@ impl Command {
                 IncrResult::NotFound => Response::NotFound,
                 IncrResult::NotNumeric => Response::NotNumeric,
             },
+
+            Self::CasSet {
+                key,
+                condition,
+                value,
+                ttl,
+            } => match cache.cas_set(&key, condition, value, ttl) {
+                CasResult::Stored => Response::Stored,
+                CasResult::Mismatch => Response::NotFound,
+            },
+
+            Self::CasDelete {
+                key,
+                expected_digest,
+            } => {
+                if cache.cas_delete(&key, expected_digest) {
+                    Response::Deleted
+                } else {
+                    Response::NotFound
+                }
+            }
 
             Self::Clear { namespace } => Response::Cleared(cache.clear(&namespace)),
             Self::ClearAll => Response::Cleared(cache.clear_all()),
@@ -495,6 +549,135 @@ fn parse_with_mode(
             );
 
             Ok((Command::Incr { key, delta }, tag))
+        }
+
+        // Issue #141: `k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]
+        // \n<ns><key><value>` — always namespaced, same reasoning as `i`.
+        // `<cond>` is a mandatory field ahead of `s`'s own optional
+        // trailing `[ttl] [tag]` pair, which this reuses verbatim (the
+        // connection's tagged-or-not mode disambiguates a 1-vs-2 trailing
+        // field count, never a frame-by-frame guess).
+        b"k" => {
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let cond = parts.next().ok_or(ParseError::InvalidLength)?;
+            let condition = parse_cas_condition(cond, true)?;
+
+            let (ttl, tag) = if tagged {
+                let first = parts.next().ok_or(ParseError::InvalidLength)?;
+                match parts.next() {
+                    Some(second) => (Some(first), Some(parse_tag(second)?)),
+                    None => (None, Some(parse_tag(first)?)),
+                }
+            } else {
+                (parts.next(), None)
+            };
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let key_length = parse_length(key_length)?;
+            let value_length = parse_length(value_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
+
+            let ttl = match ttl {
+                Some(ttl) => {
+                    let seconds = parse_length(ttl)?;
+                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
+                    Some(Duration::from_secs(seconds))
+                }
+                None => None,
+            };
+
+            let namespace_start = header_end + 1;
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let value_end = key_end
+                .checked_add(value_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < value_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(value_end).freeze();
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
+            let value = frame.slice(key_end..value_end);
+
+            Ok((
+                Command::CasSet {
+                    key,
+                    condition,
+                    value,
+                    ttl,
+                },
+                tag,
+            ))
+        }
+
+        // Issue #141: `x <ns-len> <key-len> <cond> [tag]\n<ns><key>` —
+        // `<cond>` must be a digest (`allow_absent_present: false`): an
+        // absent- or present-only conditioned delete is already the
+        // plain, unconditional `d`.
+        b"x" => {
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let cond = parts.next().ok_or(ParseError::InvalidLength)?;
+            let expected_digest = match parse_cas_condition(cond, false)? {
+                CasCondition::Digest(digest) => digest,
+                CasCondition::Absent | CasCondition::Present => {
+                    unreachable!("parse_cas_condition(cond, false) never returns Absent/Present")
+                }
+            };
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let key_length = parse_length(key_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
+
+            let namespace_start = header_end + 1;
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < key_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(key_end).freeze();
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
+
+            Ok((
+                Command::CasDelete {
+                    key,
+                    expected_digest,
+                },
+                tag,
+            ))
         }
 
         b"c" => {
@@ -889,6 +1072,40 @@ fn parse_trailing_tag<'a>(
 /// length field.
 fn parse_tag(input: &[u8]) -> Result<u32, ParseError> {
     u32::try_from(parse_length(input)?).map_err(|_| ParseError::InvalidLength)
+}
+
+/// Issue #141: `k`'s (and `x`'s) `<cond>` field — a fixed-shape bare
+/// token, not a length-prefixed body field (same "content, not a length,
+/// disambiguates it" idiom as the `A` frame's `[T] [R]` capability
+/// tokens): exactly `A`, exactly `P` (only when `allow_absent_present`,
+/// which `x` sets false — see `Command::CasDelete`'s doc comment), or
+/// exactly 32 lowercase hex digits.
+fn parse_cas_condition(
+    field: &[u8],
+    allow_absent_present: bool,
+) -> Result<CasCondition, ParseError> {
+    if allow_absent_present && field == b"A" {
+        return Ok(CasCondition::Absent);
+    }
+    if allow_absent_present && field == b"P" {
+        return Ok(CasCondition::Present);
+    }
+    if field.len() == 32 {
+        let mut digest = [0u8; 16];
+        for (byte, chunk) in digest.iter_mut().zip(field.chunks_exact(2)) {
+            *byte = (hex_nibble(chunk[0])? << 4) | hex_nibble(chunk[1])?;
+        }
+        return Ok(CasCondition::Digest(digest));
+    }
+    Err(ParseError::InvalidCommand)
+}
+
+fn hex_nibble(byte: u8) -> Result<u8, ParseError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(ParseError::InvalidCommand),
+    }
 }
 
 fn find_lf(input: &[u8]) -> Option<usize> {
@@ -1704,6 +1921,258 @@ mod tests {
             }
             .execute(&mut cache),
             Response::NotNumeric
+        );
+    }
+
+    #[test]
+    fn parses_cas_set_with_absent_condition() {
+        let mut input = buf(b"k 5 4 5 A\nusersnameAlice");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::CasSet {
+                key: namespaced(b"users", b"name"),
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_cas_set_with_present_condition() {
+        let mut input = buf(b"k 0 4 3 P\nnameBob");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::CasSet {
+                key: key(b"name"),
+                condition: CasCondition::Present,
+                value: Bytes::from_static(b"Bob"),
+                ttl: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_cas_set_with_a_digest_condition_and_a_ttl() {
+        let mut input = buf(b"k 0 4 3 3bc51062973c458d5a6f2d8d64a02324 30\nnameBob");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::CasSet {
+                key: key(b"name"),
+                condition: CasCondition::Digest([
+                    0x3b, 0xc5, 0x10, 0x62, 0x97, 0x3c, 0x45, 0x8d, 0x5a, 0x6f, 0x2d, 0x8d, 0x64,
+                    0xa0, 0x23, 0x24,
+                ]),
+                value: Bytes::from_static(b"Bob"),
+                ttl: Some(Duration::from_secs(30)),
+            })
+        );
+    }
+
+    #[test]
+    fn cas_set_carries_the_tag_last_in_tagged_mode() {
+        let mut input = buf(b"k 0 4 3 A 7\nnameBob");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::CasSet {
+                    key: key(b"name"),
+                    condition: CasCondition::Absent,
+                    value: Bytes::from_static(b"Bob"),
+                    ttl: None,
+                },
+                Some(7),
+            ))
+        );
+
+        let mut input = buf(b"k 0 4 3 A 30 7\nnameBob");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::CasSet {
+                    key: key(b"name"),
+                    condition: CasCondition::Absent,
+                    value: Bytes::from_static(b"Bob"),
+                    ttl: Some(Duration::from_secs(30)),
+                },
+                Some(7),
+            ))
+        );
+    }
+
+    #[test]
+    fn cas_set_rejects_a_malformed_condition_as_a_fatal_parse_error() {
+        // Wrong length (neither 1 nor 32).
+        let mut input = buf(b"k 0 4 3 AB\nnameBob");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
+
+        // Uppercase hex is rejected — the digest's canonical form is
+        // lowercase only, same rigor as INCR's decimal grammar.
+        let mut input = buf(b"k 0 4 3 3BC51062973C458D5A6F2D8D64A02324\nnameBob");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
+
+        // A non-hex 32-byte token.
+        let mut input = buf(b"k 0 4 3 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nnameBob");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
+    }
+
+    #[test]
+    fn cas_set_requires_the_namespace_length_field() {
+        let mut input = buf(b"k 4 3 A\nnameBob");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn cas_set_rejects_an_empty_key() {
+        let mut input = buf(b"k 0 0 3 A\nBob");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn parse_leaves_a_cas_set_command_untouched_when_incomplete() {
+        let original = b"k 0 4 5 A\nnameAli".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn cas_set_executes_against_the_cache_and_maps_every_outcome() {
+        let mut cache = Cache::new(usize::MAX);
+
+        assert_eq!(
+            Command::CasSet {
+                key: key(b"name"),
+                condition: CasCondition::Present,
+                value: Bytes::from_static(b"Bob"),
+                ttl: None,
+            }
+            .execute(&mut cache),
+            Response::NotFound
+        );
+
+        assert_eq!(
+            Command::CasSet {
+                key: key(b"name"),
+                condition: CasCondition::Absent,
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            }
+            .execute(&mut cache),
+            Response::Stored
+        );
+
+        assert_eq!(
+            Command::CasSet {
+                key: key(b"name"),
+                condition: CasCondition::Digest(crate::cache::content_digest(b"Alice")),
+                value: Bytes::from_static(b"Bob"),
+                ttl: None,
+            }
+            .execute(&mut cache),
+            Response::Stored
+        );
+    }
+
+    #[test]
+    fn parses_cas_delete() {
+        let mut input = buf(b"x 5 4 3bc51062973c458d5a6f2d8d64a02324\nusersname");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::CasDelete {
+                key: namespaced(b"users", b"name"),
+                expected_digest: [
+                    0x3b, 0xc5, 0x10, 0x62, 0x97, 0x3c, 0x45, 0x8d, 0x5a, 0x6f, 0x2d, 0x8d, 0x64,
+                    0xa0, 0x23, 0x24,
+                ],
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn cas_delete_carries_the_tag_in_tagged_mode() {
+        let mut input = buf(b"x 0 4 3bc51062973c458d5a6f2d8d64a02324 7\nname");
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::CasDelete {
+                    key: key(b"name"),
+                    expected_digest: [
+                        0x3b, 0xc5, 0x10, 0x62, 0x97, 0x3c, 0x45, 0x8d, 0x5a, 0x6f, 0x2d, 0x8d,
+                        0x64, 0xa0, 0x23, 0x24,
+                    ],
+                },
+                Some(7),
+            ))
+        );
+    }
+
+    #[test]
+    fn cas_delete_rejects_absent_or_present_tokens_as_a_fatal_parse_error() {
+        // `A`/`P` are meaningless for delete — an absent- or
+        // present-only conditioned delete is already the plain,
+        // unconditional `d`.
+        let mut input = buf(b"x 0 4 A\nname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
+
+        let mut input = buf(b"x 0 4 P\nname");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidCommand));
+    }
+
+    #[test]
+    fn cas_delete_rejects_an_empty_key() {
+        let mut input = buf(b"x 5 0 3bc51062973c458d5a6f2d8d64a02324\nusers");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn parse_leaves_a_cas_delete_command_untouched_when_incomplete() {
+        let original = b"x 5 4 3bc51062973c458d5a6f2d8d64a02324\nusersnam".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn cas_delete_executes_against_the_cache_and_maps_every_outcome() {
+        let mut cache = Cache::new(usize::MAX);
+
+        assert_eq!(
+            Command::CasDelete {
+                key: key(b"name"),
+                expected_digest: crate::cache::content_digest(b"Alice"),
+            }
+            .execute(&mut cache),
+            Response::NotFound
+        );
+
+        Command::Set {
+            key: key(b"name"),
+            value: Bytes::from_static(b"Alice"),
+            ttl: None,
+        }
+        .execute(&mut cache);
+
+        assert_eq!(
+            Command::CasDelete {
+                key: key(b"name"),
+                expected_digest: crate::cache::content_digest(b"someone-else"),
+            }
+            .execute(&mut cache),
+            Response::NotFound
+        );
+
+        assert_eq!(
+            Command::CasDelete {
+                key: key(b"name"),
+                expected_digest: crate::cache::content_digest(b"Alice"),
+            }
+            .execute(&mut cache),
+            Response::Deleted
         );
     }
 

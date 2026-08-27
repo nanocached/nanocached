@@ -1291,6 +1291,354 @@ public class NanocachedClientTests
         Assert.Equal(Bytes("2"), replica.Store[MockNode.KeyOf(namespaceBytes, Bytes("counter"))]);
     }
 
+    // ── compare-and-set (issue #141) ─────────────────────────────
+
+    [Fact]
+    public void ContentDigestMatchesThePinnedCrossLanguageVector()
+    {
+        // SHA-256 of the UTF-8 bytes "nanocached-cas-vector" truncated to
+        // the first 16 bytes, lowercase hex — pinned identically into the
+        // Rust server and every SDK. A mismatch here means CAS silently
+        // breaks across languages.
+        Assert.Equal(
+            "36287141940ca57acbd7695ccdde9d43",
+            NanocachedClient.ContentDigest(Bytes("nanocached-cas-vector")));
+    }
+
+    [Fact]
+    public async Task PutIfAbsentSucceedsOnlyWhenTheKeyIsMissing()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        Assert.True(await client.PutIfAbsentAsync("k", "v1"));
+        Assert.Equal("v1", await client.GetAsync("k"));
+
+        // Already present — a condition mismatch is a normal boolean
+        // outcome, never an exception, and must not overwrite the
+        // existing value.
+        Assert.False(await client.PutIfAbsentAsync("k", "v2"));
+        Assert.Equal("v1", await client.GetAsync("k"));
+        Assert.Equal(2, node.CasRequestCount);
+    }
+
+    [Fact]
+    public async Task ReplaceIfPresentSucceedsOnlyWhenTheKeyExists()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        Assert.False(await client.ReplaceIfPresentAsync("k", "v1"));
+        Assert.Null(await client.GetAsync("k"));
+
+        await client.SetAsync("k", "v1");
+        Assert.True(await client.ReplaceIfPresentAsync("k", "v2"));
+        Assert.Equal("v2", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task ReplaceSucceedsOnlyWhenTheDigestMatchesExactly()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v1");
+        var got = await client.GetWithTokenAsync("k");
+        Assert.NotNull(got);
+        Assert.Equal("v1", got!.Value.Value);
+
+        // A stale/reconstructed digest that doesn't match the current
+        // stored bytes is a mismatch, not an exception.
+        Assert.False(await client.ReplaceAsync("k", NanocachedClient.ContentDigest(Bytes("not-v1")), "v2"));
+        Assert.Equal("v1", await client.GetAsync("k"));
+
+        Assert.True(await client.ReplaceAsync("k", got.Value.Token, "v2"));
+        Assert.Equal("v2", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task DeleteIfMatchesSucceedsOnlyWhenTheDigestMatchesExactly()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v1");
+        string wrongToken = NanocachedClient.ContentDigest(Bytes("not-v1"));
+        Assert.False(await client.DeleteIfMatchesAsync("k", wrongToken));
+        Assert.Equal("v1", await client.GetAsync("k"));
+
+        var got = await client.GetWithTokenAsync("k");
+        Assert.NotNull(got);
+        Assert.True(await client.DeleteIfMatchesAsync("k", got!.Value.Token));
+        Assert.Null(await client.GetAsync("k"));
+
+        // A missing key is also a mismatch, never an exception.
+        Assert.False(await client.DeleteIfMatchesAsync("k", got.Value.Token));
+    }
+
+    [Fact]
+    public async Task GetWithTokenOnAMissingKeyReturnsNull()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        Assert.Null(await client.GetWithTokenAsync("missing"));
+        Assert.Null(await client.GetBytesWithTokenAsync("missing"));
+    }
+
+    [Fact]
+    public async Task CasFrameIsExactlyTheWireGrammarForEachConditionForm()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        // A — putIfAbsent, no ttl.
+        await client.PutIfAbsentAsync("k1", "v1");
+        Assert.Equal("k 0 2 2 A", node.LastCasHeader);
+
+        // P — the two-argument replace(key, value), with a ttl.
+        await client.SetAsync("k2", "v1");
+        await client.ReplaceIfPresentAsync("k2", "v2", ttlSeconds: 30);
+        Assert.Equal("k 0 2 2 P 30", node.LastCasHeader);
+
+        // A 32-character hex digest — the three-argument replace(key, old, new).
+        await client.SetAsync("k3", "v1");
+        string token = NanocachedClient.ContentDigest(Bytes("v1"));
+        await client.ReplaceAsync("k3", token, "v2");
+        Assert.Equal($"k 0 2 2 {token}", node.LastCasHeader);
+
+        // x — the two-argument remove(key, old); <cond> here is always a digest.
+        await client.SetAsync("k4", "v1");
+        string token4 = NanocachedClient.ContentDigest(Bytes("v1"));
+        await client.DeleteIfMatchesAsync("k4", token4);
+        Assert.Equal($"x 0 2 {token4}", node.LastCasDeleteHeader);
+    }
+
+    [Fact]
+    public async Task CasFrameIsAlwaysNamespaced()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.PutIfAbsentAsync("k", "v");
+        // Default (empty) namespace still carries an explicit namespace
+        // length of 0 on the wire — "k"/"x" have no legacy uppercase form
+        // to fall back to, like "i".
+        Assert.Equal("k 0 1 1 A", node.LastCasHeader);
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.PutIfAbsentAsync("k", "v");
+        Assert.Equal("k 5 1 1 A", node.LastCasHeader);
+    }
+
+    [Fact]
+    public async Task CasFrameCarriesTheTagOnATaggedConnection()
+    {
+        using var node = new MockNode(supportTags: true);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.PutIfAbsentAsync("k", "v");
+        string[] fields = node.LastCasHeader!.Split(' ');
+        Assert.Equal(6, fields.Length);
+        Assert.Equal(new[] { "k", "0", "1", "1", "A" }, fields[..5]);
+        Assert.True(uint.TryParse(fields[5], out _));
+
+        await client.SetAsync("k2", "v");
+        string token = NanocachedClient.ContentDigest(Bytes("v"));
+        await client.DeleteIfMatchesAsync("k2", token);
+        fields = node.LastCasDeleteHeader!.Split(' ');
+        Assert.Equal(5, fields.Length);
+        Assert.Equal(new[] { "x", "0", "2", token }, fields[..4]);
+        Assert.True(uint.TryParse(fields[4], out _));
+    }
+
+    [Fact]
+    public async Task WrongNodeOnCasPropagatesInSingleMode()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        node.AnswerWrongNodeOnce();
+        // No discovery/ring to refresh from in single mode, same as
+        // WrongNodeOnIncrPropagatesInSingleMode.
+        await Assert.ThrowsAsync<WrongNodeException>(() => client.PutIfAbsentAsync("k", "v"));
+    }
+
+    [Fact]
+    public async Task WrongNodeOnCasDeletePropagatesInSingleMode()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        node.AnswerWrongNodeOnce();
+        await Assert.ThrowsAsync<WrongNodeException>(
+            () => client.DeleteIfMatchesAsync("k", NanocachedClient.ContentDigest(Bytes("v"))));
+    }
+
+    [Fact]
+    public async Task GetWithTokenComputesTheDigestFromTheRawWireBytesNotTheDecompressedValue()
+    {
+        // The critical compression correctness point: with Compress
+        // enabled, the server never decompresses — it only ever sees the
+        // marker-prefixed wire bytes — so the digest MUST be computed over
+        // those exact bytes, not the plaintext GetAsync ultimately
+        // returns, or a real server could never match it.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port, 64));
+
+        string value = new string('x', 1000);
+        await client.SetAsync("k", value);
+
+        byte[] raw = node.Store[MockNode.KeyOf(Bytes("k"))];
+        Assert.Equal(0x01, raw[0]); // actually stored compressed
+
+        var got = await client.GetWithTokenAsync("k");
+        Assert.NotNull(got);
+        Assert.Equal(value, got!.Value.Value);
+        Assert.Equal(NanocachedClient.ContentDigest(raw), got.Value.Token);
+
+        // End-to-end: a k frame conditioned on this token must succeed
+        // against the mock's own from-scratch digest computation over the
+        // same raw bytes — proof the two sides actually agree, not just
+        // that this SDK's own math is self-consistent.
+        Assert.True(await client.ReplaceAsync("k", got.Value.Token, "new-value"));
+        Assert.Equal("new-value", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task OnlyThePrimaryEverRunsCasReplicasReceiveTheResultAsAnOrdinarySet()
+    {
+        // The single most important test for issue #141's `k` op:
+        // replaying the CAS on a replica (instead of forwarding the
+        // primary's literal result) could let that replica evaluate the
+        // digest condition against its own, independently-diverged copy
+        // and reach a DIFFERENT outcome than the primary just did. Seeding
+        // the two owners with DIFFERENT existing values makes this
+        // concrete: a buggy replay-based implementation would find the
+        // replica's own value doesn't match the digest and leave it
+        // untouched — only forwarding the primary's literal result forces
+        // both copies identical, and CasRequestCount proves the replica
+        // was never asked to evaluate anything at all.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key";
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        string storeKey = MockNode.KeyOf(Bytes(key));
+        primary.Store[storeKey] = Bytes("old-primary");
+        replica.Store[storeKey] = Bytes("old-replica"); // deliberately different
+
+        string token = NanocachedClient.ContentDigest(Bytes("old-primary"));
+        Assert.True(await client.ReplaceAsync(key, token, "new-value"));
+
+        Assert.Equal(1, primary.CasRequestCount);
+        Assert.Equal(0, replica.CasRequestCount);
+
+        Assert.Equal(Bytes("new-value"), primary.Store[storeKey]);
+        Assert.Equal(Bytes("new-value"), replica.Store[storeKey]);
+    }
+
+    [Fact]
+    public async Task AMismatchedCasTouchesNoReplicaAtAll()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "already-there";
+        await client.SetAsync(key, "v1");
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        // putIfAbsent against an existing key is a mismatch — nothing was
+        // written, so there is nothing to forward.
+        Assert.False(await client.PutIfAbsentAsync(key, "v2"));
+
+        Assert.Equal(1, primary.CasRequestCount);
+        Assert.Equal(0, replica.CasRequestCount);
+        Assert.Equal(Bytes("v1"), replica.Store[MockNode.KeyOf(Bytes(key))]);
+    }
+
+    [Fact]
+    public async Task OnlyThePrimaryEverRunsCasDeleteReplicasReceiveAnOrdinaryDelete()
+    {
+        // As above, for `x`: seeding the replica with a value that would
+        // NOT match the digest condition proves the replica is never
+        // asked to evaluate it — only the primary's success is ever
+        // forwarded, as an ordinary Delete.
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "shared-key-2";
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        string storeKey = MockNode.KeyOf(Bytes(key));
+        primary.Store[storeKey] = Bytes("old-primary");
+        replica.Store[storeKey] = Bytes("old-replica"); // deliberately different
+
+        string token = NanocachedClient.ContentDigest(Bytes("old-primary"));
+        Assert.True(await client.DeleteIfMatchesAsync(key, token));
+
+        Assert.Equal(1, primary.CasDeleteRequestCount);
+        Assert.Equal(0, replica.CasDeleteRequestCount);
+
+        Assert.False(primary.Store.ContainsKey(storeKey));
+        Assert.False(replica.Store.ContainsKey(storeKey));
+    }
+
+    [Fact]
+    public async Task AMissedCasDeleteTouchesNoReplicaAtAll()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "never-set";
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.False(await client.DeleteIfMatchesAsync(key, NanocachedClient.ContentDigest(Bytes("v"))));
+
+        Assert.Equal(1, primary.CasDeleteRequestCount);
+        Assert.Equal(0, replica.CasDeleteRequestCount);
+    }
+
+    [Fact]
+    public async Task NamespacedCasRoutesByNamespaceAndKeyAndReplicatesTheResultOnly()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        byte[] namespaceBytes = Bytes("users");
+        NanocachedNamespace ns = client.Namespace("users");
+
+        IReadOnlyList<string> owners = new HashRing(Names).Owners(namespaceBytes, Bytes("k"), 2);
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+
+        Assert.True(await ns.PutIfAbsentAsync("k", "v1"));
+        Assert.Equal(1, primary.CasRequestCount);
+        Assert.Equal(0, replica.CasRequestCount);
+        Assert.Equal(Bytes("v1"), replica.Store[MockNode.KeyOf(namespaceBytes, Bytes("k"))]);
+
+        var got = await ns.GetWithTokenAsync("k");
+        Assert.NotNull(got);
+        Assert.True(await ns.DeleteIfMatchesAsync("k", got!.Value.Token));
+        Assert.Equal(1, primary.CasDeleteRequestCount);
+        Assert.Equal(0, replica.CasDeleteRequestCount);
+        Assert.False(replica.Store.ContainsKey(MockNode.KeyOf(namespaceBytes, Bytes("k"))));
+    }
+
     // ── namespaces (issue #105) ──────────────────────────────────
 
     [Fact]
