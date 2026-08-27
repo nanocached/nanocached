@@ -67,7 +67,7 @@ function wireTtlSeconds(ttlMs: number | null | undefined): number {
 
 /**
  * A Keyv `KeyvStoreAdapter` (keyv ^5, the version real `cache-manager` v6+
- * and `@nestjs/cache-manager` 12.x currently depend on) backed by one
+ * and `@nestjs/cache-manager` 3.x currently depend on) backed by one
  * nanocached namespace — issue #120's follow-up to `nanocached-cache-manager`
  * (issue #108/#118's sibling), which targets cache-manager v5's older
  * `Store` API instead.

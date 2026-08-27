@@ -91,7 +91,7 @@ export class AppModule {}
 `@nestjs/cache-manager`'s `CacheModule.register` *will* accept a bare
 `KeyvStoreAdapter` in `stores` and wrap it in a `Keyv` for you, but that
 internal wrapping path (`cache.providers.js`, verified against
-`@nestjs/cache-manager` 12.x) never forwards `useKeyPrefix` — there is no
+`@nestjs/cache-manager` 3.x) never forwards `useKeyPrefix` — there is no
 way to disable Keyv's own key prefixing through it. Wrapping the store
 yourself, as shown above, is the only way to control it under Nest, and
 `CacheModule.register` accepts an already-built `Keyv` instance
@@ -129,7 +129,7 @@ examples above pass `useKeyPrefix: false`.
 ## Honest subset — what's omitted, and why each is the more correct choice
 
 Probed directly against `keyv@5.6.0` (the version real `cache-manager` v6+
-and `@nestjs/cache-manager` 12.x currently depend on) while building this
+and `@nestjs/cache-manager` 3.x currently depend on) while building this
 adapter:
 
 - **`has`/`hasMany`**: a naive presence check on this wire would misreport
