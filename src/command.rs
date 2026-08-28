@@ -1,6 +1,6 @@
 use crate::cache::{Cache, CasCondition, CasResult, IncrResult, parse_decimal_i64};
 use crate::key::Key;
-use crate::response::{MultiEntry, Response};
+use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Buf, Bytes, BytesMut};
 use std::time::Duration;
 
@@ -25,9 +25,9 @@ pub enum Command {
         key: Key,
     },
     /// `m <ns-len> <n> <key-len-1> ... <key-len-n> [tag]\n<ns><key-1>...<key-n>`
-    /// (issue #128 measurement prototype): batches `n` gets under one
-    /// wire frame and one cache-actor round trip, instead of `n`
-    /// independent `g` frames. Always namespaced — one namespace per
+    /// (issue #128 measured, issue #150 production): batches `n` gets
+    /// under one wire frame and one cache-actor round trip, instead of
+    /// `n` independent `g` frames. Always namespaced — one namespace per
     /// frame, since routing keys on `(namespace, key)` means a
     /// multi-namespace frame couldn't route as a single unit anyway, and
     /// every real many-op consumer (Django's prefix, Keyv's namespace, a
@@ -38,12 +38,34 @@ pub enum Command {
     /// the cache actor — see its `Command::MultiGet` arm. `execute` here
     /// only ever answers `Value`/`Miss` per key, in `keys`' order.
     ///
-    /// Prototype only: no retry/hedge/read-repair. Benchmarks the
-    /// question this issue exists to answer; not shipped as a stable
-    /// wire op unless the measurement says so.
+    /// This node has no retry/hedge of its own — every command here is a
+    /// single node's local answer. Retry-on-`WrongNode` and refresh are
+    /// the proxy's/SDK's job, exactly as for `Get`; see
+    /// `src/bin/nanocached-proxy.rs`'s `finish_multi_get`/
+    /// `retry_multi_get`.
     MultiGet {
         namespace: Bytes,
         keys: Vec<Bytes>,
+    },
+    /// `o <ns-len> <n> <key-len-1> <value-len-1> ... <key-len-n>
+    /// <value-len-n> [ttl] [tag]\n<ns><key-1><value-1>...<key-n><value-n>`
+    /// (issue #150): batches `n` sets under one wire frame and one
+    /// cache-actor round trip. Always namespaced, same reasoning as
+    /// `MultiGet`. **One shared TTL for the whole batch, not per-key** —
+    /// every real many-set consumer (Django's `set_many`,
+    /// cache-manager's `mset`) already passes one TTL per call; per-key
+    /// TTLs would meaningfully complicate the frame for no real
+    /// consumer, the same simplification `Clear`'s whole-namespace scope
+    /// makes over a fine-grained one.
+    ///
+    /// Per-key wrong-node filtering happens in the connection handler,
+    /// same as `MultiGet` — `execute` only ever answers `Stored` per key,
+    /// in `keys`' order, via `Response::MultiStored`.
+    MultiSet {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
+        values: Vec<Bytes>,
+        ttl: Option<Duration>,
     },
     Set {
         key: Key,
@@ -261,6 +283,24 @@ impl Command {
                     .collect();
                 Response::Multi(entries)
             }
+            Self::MultiSet {
+                namespace,
+                keys,
+                values,
+                ttl,
+            } => {
+                let mut entries = Vec::with_capacity(keys.len());
+                for (name, value) in keys.into_iter().zip(values) {
+                    let key = Key::new(namespace.clone(), name);
+                    match ttl {
+                        Some(ttl) => cache.set_with_ttl(key, value, ttl),
+                        None => cache.set(key, value),
+                    }
+                    entries.push(MultiAckEntry::Stored);
+                }
+                Response::MultiAck(entries)
+            }
+
             Self::Set { key, value, ttl } | Self::HandoffSet { key, value, ttl } => {
                 match ttl {
                     Some(ttl) => cache.set_with_ttl(key, value, ttl),
@@ -590,6 +630,98 @@ fn parse_with_mode(
                 .collect();
 
             Ok((Command::MultiGet { namespace, keys }, tag))
+        }
+
+        // Issue #150: `o <ns-len> <n> <key-len-1> <value-len-1>...
+        // <key-len-n> <value-len-n> [ttl] [tag]\n<ns><key-1><value-1>...
+        // <key-n><value-n>` — see `Command::MultiSet`'s doc comment. Same
+        // "claimed `n` can't outrun the header" defense as `m`'s loop.
+        b"o" => {
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+
+            if count == 0 {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let mut lengths = Vec::new();
+            for _ in 0..count {
+                let key_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+                let value_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+
+                if key_length == 0 {
+                    return Err(ParseError::EmptyKey);
+                }
+
+                lengths.push((key_length, value_length));
+            }
+
+            // Same "[ttl] [tag]" disambiguation `S`/`s` uses: the
+            // connection's negotiated mode says whether one trailing
+            // field is the tag alone or TTL-then-tag.
+            let (ttl, tag) = if tagged {
+                let first = parts.next().ok_or(ParseError::InvalidLength)?;
+                match parts.next() {
+                    Some(second) => (Some(first), Some(parse_tag(second)?)),
+                    None => (None, Some(parse_tag(first)?)),
+                }
+            } else {
+                (parts.next(), None)
+            };
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let ttl = match ttl {
+                Some(ttl) => {
+                    let seconds = parse_length(ttl)?;
+                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
+                    Some(Duration::from_secs(seconds))
+                }
+                None => None,
+            };
+
+            let namespace_start = header_end + 1;
+            let mut cursor = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let mut spans = Vec::with_capacity(lengths.len());
+
+            for (key_length, value_length) in lengths {
+                let key_start = cursor;
+                let value_start = key_start
+                    .checked_add(key_length)
+                    .ok_or(ParseError::InvalidLength)?;
+                cursor = value_start
+                    .checked_add(value_length)
+                    .ok_or(ParseError::InvalidLength)?;
+                spans.push((key_start, value_start, cursor));
+            }
+
+            if input.len() < cursor {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(cursor).freeze();
+            let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
+            let mut keys = Vec::with_capacity(spans.len());
+            let mut values = Vec::with_capacity(spans.len());
+
+            for (key_start, value_start, value_end) in spans {
+                keys.push(frame.slice(key_start..value_start));
+                values.push(frame.slice(value_start..value_end));
+            }
+
+            Ok((
+                Command::MultiSet {
+                    namespace,
+                    keys,
+                    values,
+                    ttl,
+                },
+                tag,
+            ))
         }
 
         // Issue #129: `i <ns-len> <key-len> <delta> [tag]\n<ns><key>` —
@@ -2662,5 +2794,96 @@ mod tests {
 
         assert_eq!(response.encode(), b"M 3 2 - W\nab");
         assert_eq!(response.encode_with_tag(9), b"M 3 2 - W 9\nab");
+    }
+
+    // Issue #150: `o` (multi-set).
+
+    #[test]
+    fn parses_an_untagged_multi_set_command() {
+        let mut input = buf(b"o 0 2 1 1 1 2\nabcde");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::MultiSet {
+                namespace: Bytes::new(),
+                keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"c")],
+                values: vec![Bytes::from_static(b"b"), Bytes::from_static(b"de")],
+                ttl: None,
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_a_namespaced_tagged_multi_set_command_with_a_ttl() {
+        let mut input = buf(b"o 2 1 1 1 30 9\nnsab");
+
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::MultiSet {
+                    namespace: Bytes::from_static(b"ns"),
+                    keys: vec![Bytes::from_static(b"a")],
+                    values: vec![Bytes::from_static(b"b")],
+                    ttl: Some(Duration::from_secs(30)),
+                },
+                Some(9),
+            ))
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_tagged_rejects_a_multi_set_without_a_tag() {
+        let mut input = buf(b"o 0 1 1 1\na");
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn multi_set_leaves_input_untouched_when_the_body_is_incomplete() {
+        let original = b"o 0 1 3 3\nab".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn rejects_a_multi_set_with_zero_keys() {
+        let mut input = buf(b"o 0 0\n");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn rejects_a_multi_set_with_an_empty_key_length() {
+        let mut input = buf(b"o 0 1 0 1\na");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn multi_set_stores_every_key_and_answers_multi_ack() {
+        let mut cache = Cache::new(1024);
+
+        let command = Command::MultiSet {
+            namespace: Bytes::new(),
+            keys: vec![Bytes::from_static(b"a"), Bytes::from_static(b"c")],
+            values: vec![Bytes::from_static(b"1"), Bytes::from_static(b"3")],
+            ttl: None,
+        };
+
+        assert_eq!(
+            command.execute(&mut cache),
+            Response::MultiAck(vec![MultiAckEntry::Stored, MultiAckEntry::Stored])
+        );
+        assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
+        assert_eq!(cache.get(&key(b"c")), Some(Bytes::from_static(b"3")));
+    }
+
+    #[test]
+    fn multi_ack_encodes_stored_and_wrong_node_entries() {
+        let response = Response::MultiAck(vec![MultiAckEntry::Stored, MultiAckEntry::WrongNode]);
+
+        assert_eq!(response.encode(), b"O 2 S W\n");
+        assert_eq!(response.encode_with_tag(9), b"O 2 S W 9\n");
     }
 }

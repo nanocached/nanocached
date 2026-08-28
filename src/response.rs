@@ -14,12 +14,12 @@ fn ttl_field(ttl: Option<Duration>) -> String {
         .unwrap_or_default()
 }
 
-/// One key's outcome inside a `Response::Multi` (issue #128 measurement
-/// prototype) — the per-key partial-result states a batched `m` request
-/// can answer with. `WrongNode` is never produced by `Command::MultiGet`'s
-/// own `execute` (which only ever sees keys the connection handler has
-/// already confirmed this node owns); the handler splices it in per-key
-/// for the ones it doesn't, mirroring the single-key `G`/`Response::WrongNode`
+/// One key's outcome inside a `Response::Multi` (issues #128/#150) — the
+/// per-key partial-result states a batched `m` request can answer with.
+/// `WrongNode` is never produced by `Command::MultiGet`'s own `execute`
+/// (which only ever sees keys the connection handler has already
+/// confirmed this node owns); the handler splices it in per-key for the
+/// ones it doesn't, mirroring the single-key `G`/`Response::WrongNode`
 /// path instead of failing the whole frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultiEntry {
@@ -28,15 +28,34 @@ pub enum MultiEntry {
     WrongNode,
 }
 
+/// One key's outcome inside a `Response::MultiAck` (issue #150) — `o`'s
+/// per-key roster. No `Miss` counterpart: a set can't miss. `WrongNode`
+/// is spliced in by the connection handler exactly like `MultiEntry`'s —
+/// `Command::MultiSet::execute` only ever produces `Stored`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiAckEntry {
+    Stored,
+    WrongNode,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     Value(Bytes),
-    /// Issue #128 measurement prototype: reply to `m` (`Command::MultiGet`)
-    /// — one `MultiEntry` per requested key, in request order. Wire form:
+    /// Issues #128/#150: reply to `m` (`Command::MultiGet`) — one
+    /// `MultiEntry` per requested key, in request order. Wire form:
     /// `M <n> <r-1>...<r-n> [tag]\n<values of the hits, concatenated in
     /// order>`, where each `<r-i>` is a decimal byte length (hit), `-`
     /// (miss), or `W` (wrong node) — see `encode`.
     Multi(Vec<MultiEntry>),
+    /// Issue #150: reply to `o` (`Command::MultiSet`) — one
+    /// `MultiAckEntry` per requested key, in request order. Wire form:
+    /// `O <n> <r-1>...<r-n> [tag]\n` (no body — nothing to echo back for
+    /// a write, unlike `M`'s hit values), where each `<r-i>` is `S`
+    /// (stored) or `W` (wrong node). Never confused with the `On`/`OnT`
+    /// AuthOk identity reply: that only ever appears as the very first
+    /// reply on a connection, right after its `A` frame — no other
+    /// request produces an `O`-leading reply.
+    MultiAck(Vec<MultiAckEntry>),
     Stored,
     Deleted,
     NotFound,
@@ -162,6 +181,29 @@ fn encode_multi(entries: &[MultiEntry], tag: Option<u32>) -> Vec<u8> {
     encoded
 }
 
+/// `Response::MultiAck`'s shared wire encoding for both `encode` and
+/// `encode_with_tag` — see `Response::MultiAck`'s doc comment for the
+/// frame grammar. No body: unlike `encode_multi`, a set has no value to
+/// echo back.
+fn encode_multi_ack(entries: &[MultiAckEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("O {}", entries.len());
+
+    for entry in entries {
+        match entry {
+            MultiAckEntry::Stored => header.push_str(" S"),
+            MultiAckEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+
+    if let Some(tag) = tag {
+        header.push(' ');
+        header.push_str(&tag.to_string());
+    }
+    header.push('\n');
+
+    header.into_bytes()
+}
+
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -202,6 +244,7 @@ impl Response {
             }
 
             Self::Multi(entries) => encode_multi(entries, None),
+            Self::MultiAck(entries) => encode_multi_ack(entries, None),
 
             Self::Entries(_)
             | Self::Keys(_)
@@ -252,6 +295,7 @@ impl Response {
             }
 
             Self::Multi(entries) => encode_multi(entries, Some(tag)),
+            Self::MultiAck(entries) => encode_multi_ack(entries, Some(tag)),
 
             _ => unreachable!("only G/S/D/i responses have a tagged form (echoed response tags)"),
         }
