@@ -246,6 +246,65 @@ SDK (or <code>nanocached-proxy</code> in proxy mode) writes the
 condition against its own possibly-different copy could reach a
 different outcome than the primary just did.</p>
 
+<h2 id="multi">m / o — batched get and set</h2>
+<pre><code>m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;</code></pre>
+<p>Gets <code>n</code> keys under one frame and, on the node that owns
+them, one round trip through the cache — instead of <code>n</code>
+independent <code>g</code> frames. Replies:</p>
+<pre><code>M &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt;\n&lt;values of the hits, concatenated in request order&gt;</code></pre>
+<p>Each <code>&lt;result-i&gt;</code> is one of three tokens, in the same
+order as the request's keys: a decimal byte length (a hit — that many
+bytes of the trailing body belong to this key, in order), <code>-</code>
+(a miss), or <code>W</code> (this node doesn't own this particular key).
+Issue #125's <code>R</code> and the fatal <code>E</code> still apply to
+the whole frame, but <code>W</code> never does — a <code>&lt;key-length&gt;</code>
+being wrong for one key out of a thousand doesn't invalidate the other
+999.</p>
+<pre><code>o &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; &lt;value-length-1&gt; ... &lt;key-length-n&gt; &lt;value-length-n&gt; [&lt;ttl-seconds&gt;]\n&lt;namespace&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</code></pre>
+<p>Sets <code>n</code> keys the same way. <strong>One
+<code>&lt;ttl-seconds&gt;</code> for the whole batch, not per key</strong> —
+every real caller of a batched set (Django's <code>set_many</code>,
+cache-manager's <code>mset</code>) already passes one TTL per call, so a
+per-key TTL field would complicate the frame for no consumer that
+exists. Replies:</p>
+<pre><code>O &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt;\n</code></pre>
+<p>No body — a set has no value to echo back, unlike <code>m</code>'s
+hits. Each <code>&lt;result-i&gt;</code> is <code>S</code> (stored) or
+<code>W</code> (wrong node), same per-key independence as <code>m</code>.
+<code>O</code> is never confused with the <code>On</code>/<code>OnT</code>
+identity reply <a href="#a"><code>A</code></a> gives: that only ever
+appears as the very first reply on a connection, right after its
+<code>A</code> frame, so no other request's reply is ever mistaken for
+it.</p>
+<p>Both are always namespaced, same reasoning as <code>INCR</code>/
+<code>k</code>/<code>x</code>: neither has a pre-namespace legacy form,
+so <code>&lt;namespace-length&gt;</code> is unconditionally present (0 =
+the default namespace). Both are also restricted to <em>one</em>
+namespace per frame — rendezvous hashing routes on
+<code>(namespace, key)</code>, so a frame mixing namespaces couldn't
+route as a single unit anyway, and every real many-key caller already
+works within one namespace at a time (a cache-manager store, a Django
+key prefix, a Spring cache name).</p>
+<p><strong>A batch never fails as a whole.</strong> Every key's outcome
+— hit/miss/wrong-node for <code>m</code>, stored/wrong-node for
+<code>o</code> — is independent of every other key's. A client (or
+<code>nanocached-proxy</code> in proxy mode) that sees a <code>W</code>
+for some subset of a batch refreshes its routing table and re-issues
+just those keys, exactly as it would for a single-key <code>G</code>/
+<code>S</code>'s own <code>W</code> — the rest of the batch's answers
+stand.</p>
+<p>Through <code>nanocached-proxy</code>, a batch spanning multiple
+owners is split into one sub-frame per node and reassembled before
+answering the client — the one dispatch shape that turns a single
+client frame into more than one key's worth of backend traffic. A
+<code>m</code> sub-frame targets each key's primary only, same as a
+plain <code>G</code>; a <code>o</code> sub-frame reaches every owner a
+sub-batch's keys have (primary or replica — the same node can be primary
+for one key and a replica for another within one batch), and only the
+primary's outcome decides a key's client-facing status, replica outcomes
+being logged and swallowed exactly like a plain <code>S</code>'s
+replication already is.</p>
+
 <h2 id="tags">Response tags (tagged mode)</h2>
 <p>Pipelined clients match responses to requests by order alone — the
 frames above carry nothing to verify against. A connection whose
