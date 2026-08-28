@@ -2404,16 +2404,14 @@ async fn dispatch_request(
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
-        // Issue #128 measurement prototype: group keys by primary owner
-        // — this is the one dispatch shape that splits a single client
-        // frame across multiple backend sub-frames (every other op
-        // resolves to exactly one key's worth of backend traffic).
-        // Deliberately crude, per the module's #128 section: primary
-        // only (no replica reads — matches `Request::Get`'s own
-        // primary-first reads), no refan on a failed or `W` sub-batch
-        // (a failure there answers its whole group `WrongNode`, same
-        // signal a stale single-key `W` gives — "refresh and re-issue
-        // just these").
+        // Issue #150: group keys by primary owner — this is the one
+        // dispatch shape that splits a single client frame across
+        // multiple backend sub-frames (every other op resolves to
+        // exactly one key's worth of backend traffic). Primary only, no
+        // replica reads — matches `Request::Get`'s own primary-first
+        // reads. A failed or `W` sub-batch gets one bounded
+        // refresh-and-retry in `finish_multi_get`/`retry_multi_get`,
+        // mirroring `finish_get`/`retry_get_on`'s existing shape.
         Request::MultiGet { namespace, keys } => {
             let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
             let mut missing = Vec::new();
@@ -2458,7 +2456,10 @@ async fn dispatch_request(
                 .collect();
 
             tokio::spawn(async move {
-                let result = finish_multi_get(keys.len(), missing, positions, pending, tag).await;
+                let result = finish_multi_get(
+                    &context, &namespace, &keys, missing, positions, pending, tag,
+                )
+                .await;
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
@@ -2537,21 +2538,28 @@ async fn retry_get_on(
     Err(Fatal)
 }
 
-/// Issue #128 measurement prototype: awaits every owner group's `M`
-/// sub-reply concurrently and splices the per-key results back into the
-/// client's original request order. `missing` (no roster entry at all)
-/// and any group whose sub-request failed or came back malformed are
-/// answered `WrongNode` for their keys — the prototype's stand-in for a
-/// real refresh-and-retry, since a caller already knows how to react to
-/// a per-key `W`.
+/// Issue #150: awaits every owner group's `M` sub-reply and splices the
+/// per-key results back into the client's original request order.
+/// `missing` (no roster entry at all — only possible together with an
+/// empty ring, which the dispatch arm already answers `transient_reply`
+/// for before this is ever called) is answered `WrongNode` immediately.
+/// A group whose reply is malformed, transport-failed, or carries a
+/// per-key `WrongNode` gets exactly one bounded refresh-and-retry via
+/// `retry_multi_get` — never a second one, and never a whole-frame
+/// failure: partial-result semantics mean a key that's still wrong after
+/// the retry degrades to its own `WrongNode` entry, same as every other
+/// key's independent outcome.
 async fn finish_multi_get(
-    total: usize,
+    context: &ProxyContext,
+    namespace: &[u8],
+    keys: &[Bytes],
     missing: Vec<usize>,
     positions: Vec<Vec<usize>>,
     pending: Vec<PendingReply>,
     tag: Option<u32>,
 ) -> DriverResult {
-    let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; total];
+    let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; keys.len()];
+    let mut retry_positions = Vec::new();
 
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
@@ -2559,6 +2567,79 @@ async fn finish_multi_get(
 
     for (group_positions, reply) in positions.into_iter().zip(pending) {
         match reply.await {
+            Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
+                for (position, entry) in group_positions.into_iter().zip(results) {
+                    if matches!(entry, ProxyMultiEntry::WrongNode) {
+                        retry_positions.push(position);
+                    } else {
+                        entries[position] = Some(entry);
+                    }
+                }
+            }
+            _ => retry_positions.extend(group_positions),
+        }
+    }
+
+    if !retry_positions.is_empty() {
+        retry_multi_get(context, namespace, keys, &retry_positions, &mut entries).await;
+    }
+
+    let entries: Vec<ProxyMultiEntry> = entries
+        .into_iter()
+        .map(|entry| entry.unwrap_or(ProxyMultiEntry::WrongNode))
+        .collect();
+    Ok(respond_multi(&entries, tag))
+}
+
+/// Issue #150: the one bounded refresh-and-retry pass for keys the first
+/// pass left inconclusive — mirrors `finish_get`'s "a single
+/// refresh-and-reroute, not a loop." Retried keys are regrouped by their
+/// *fresh* top owner (which can differ per key even though they shared a
+/// primary before the refresh — a stale ring can be wrong about more
+/// than one key's placement at once) and dispatched via `.call`, same
+/// transparent-redial reasoning as `retry_get_on`/`refan_write`. Fills
+/// every position in `retry_positions` — with a real result or a final
+/// `WrongNode` — so the caller never sees a gap.
+async fn retry_multi_get(
+    context: &ProxyContext,
+    namespace: &[u8],
+    keys: &[Bytes],
+    retry_positions: &[usize],
+    entries: &mut [Option<ProxyMultiEntry>],
+) {
+    force_refresh(context).await;
+
+    let Some(ring) = current_ring(context) else {
+        for &position in retry_positions {
+            entries[position] = Some(ProxyMultiEntry::WrongNode);
+        }
+        return;
+    };
+
+    let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+    for &position in retry_positions {
+        let key = &keys[position];
+        let mut owners = ring.owners(namespace, key).into_iter();
+        let Some(primary) = owners.next() else {
+            entries[position] = Some(ProxyMultiEntry::WrongNode);
+            continue;
+        };
+
+        if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
+            group.1.push(position);
+            group.2.push(key.clone());
+        } else {
+            groups.push((primary, vec![position], vec![key.clone()]));
+        }
+    }
+
+    for (owner, group_positions, group_keys) in groups {
+        let reply = context
+            .backends
+            .call(context, &owner, frame_multi_get(namespace, &group_keys), Expect::Multi)
+            .await;
+
+        match reply {
             Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
                 for (position, entry) in group_positions.into_iter().zip(results) {
                     entries[position] = Some(entry);
@@ -2571,12 +2652,6 @@ async fn finish_multi_get(
             }
         }
     }
-
-    let entries: Vec<ProxyMultiEntry> = entries
-        .into_iter()
-        .map(|entry| entry.expect("every position filled by one of the two loops above"))
-        .collect();
-    Ok(respond_multi(&entries, tag))
 }
 
 /// Enqueues a write/delete on every owner, primary first, in one ordered
@@ -3894,8 +3969,20 @@ mod tests {
                                 .collect()
                         };
 
+                        // Issue #150: simulates the real node's own
+                        // per-key wrong-node check catching a stale
+                        // slice of an otherwise-valid roster — the
+                        // proxy's `retry_multi_get` path only ever sees
+                        // this shape (a `W` token inside a well-formed
+                        // `M` roster), never a whole-frame `W`.
+                        let first_wrong = wrong_once.swap(false, Ordering::SeqCst);
+
                         let mut header = format!("M {count}");
-                        for value in &values {
+                        for (index, value) in values.iter().enumerate() {
+                            if first_wrong && index == 0 {
+                                header.push_str(" W");
+                                continue;
+                            }
                             match value {
                                 Some(value) => header.push_str(&format!(" {}", value.len())),
                                 None => header.push_str(" -"),
@@ -3903,8 +3990,13 @@ mod tests {
                         }
                         header.push_str(&format!(" {}\n", tag(&fields)));
                         stream.write_all(header.as_bytes()).await?;
-                        for value in values.into_iter().flatten() {
-                            stream.write_all(&value).await?;
+                        for (index, value) in values.into_iter().enumerate() {
+                            if first_wrong && index == 0 {
+                                continue;
+                            }
+                            if let Some(value) = value {
+                                stream.write_all(&value).await?;
+                            }
                         }
                     }
                     "S" | "s" => {
@@ -4490,6 +4582,92 @@ mod tests {
             read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
             assert_eq!(&buf.split_to(2)[..], b"vv");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_retries_a_per_key_wrong_node_after_a_refresh() {
+        // Issue #150: the node's own per-key check catches a stale
+        // slice of the roster (`wrong_once` makes the mock answer the
+        // batch's first key `W` once, exactly like a real node would) —
+        // the retry lands on the same node (the ring didn't actually
+        // change) and this time it answers for real, so the client
+        // still sees every key correctly.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\na1S 1 1\nb2").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        nodes[0].wrong_node_once.store(true, Ordering::SeqCst);
+        nodes[1].wrong_node_once.store(true, Ordering::SeqCst);
+
+        stream.write_all(b"m 0 2 1 1\nab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"12");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_degrades_only_the_unreachable_keys_to_wrong_node() {
+        // Issue #150: partial-result semantics — a batch spanning a
+        // live owner and a permanently unreachable one must still
+        // answer the live owner's keys correctly, and only degrade the
+        // unreachable owner's keys to `WrongNode` (never fail the whole
+        // frame, and never let one bad group cost the others their
+        // answer).
+        let live = MockNode::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let discovery = start_mock_discovery(
+            vec![
+                ("node-live".to_string(), live.addr.clone()),
+                ("node-dead".to_string(), dead_addr.clone()),
+            ],
+            1,
+        )
+        .await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+
+        let ring = RingView::new(
+            vec![
+                ("node-live".to_string(), live.addr.clone()),
+                ("node-dead".to_string(), dead_addr.clone()),
+            ],
+            1,
+        );
+        let mut on_live = None;
+        let mut on_dead = None;
+        for index in 0..32u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == live.addr && on_live.is_none() {
+                on_live = Some(key);
+            } else if owner == dead_addr && on_dead.is_none() {
+                on_dead = Some(key);
+            }
+        }
+        let (key_live, key_dead) = (
+            on_live.expect("no key hashed to the live node"),
+            on_dead.expect("no key hashed to the dead node"),
+        );
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let frame = format!("S {} 1\n{key_live}v", key_live.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        let frame = format!(
+            "m 0 2 {} {}\n{key_live}{key_dead}",
+            key_live.len(),
+            key_dead.len()
+        );
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 W");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
     }
 
     #[tokio::test(flavor = "current_thread")]
