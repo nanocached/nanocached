@@ -128,6 +128,19 @@ type mockNode struct {
 	// Set/Delete).
 	kCount atomic.Int32
 	xCount atomic.Int32
+	// mCount/oCount count every `m`/`o` (batched get/set, issues
+	// #128/#150/#151) frame this node has received.
+	mCount atomic.Int32
+	oCount atomic.Int32
+	// multiWrongNodeKey/multiWrongNodeLeft (issues #128/#150/#151):
+	// when multiWrongNodeKey is set, every `m`/`o` roster containing
+	// that exact key answers just that key `W` for as long as
+	// multiWrongNodeLeft has budget left (consumed one per match,
+	// exactly like wrongNodeLeft's own count) — the batched analogue of
+	// wrongNodeLeft/setWrongNodeLeft, which answer a whole G/S `W`
+	// instead of naming a single key inside a batch.
+	multiWrongNodeKey  atomic.Value // string
+	multiWrongNodeLeft atomic.Int32
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -593,6 +606,114 @@ func (m *mockNode) serve(conn net.Conn) {
 			if _, err := conn.Write([]byte(reply)); err != nil {
 				return
 			}
+		// Batched get (issues #128/#150/#151): `m <ns-len> <n>
+		// <key-len-1> ... <key-len-n>[ <tag>]\n<ns><key-1>...<key-n>` —
+		// always namespaced, no legacy uppercase form. Answers `M <n>
+		// <result-1> ... <result-n>[ <tag>]\n<hit values, concatenated
+		// in request order>` (docs/protocol.html#multi): a decimal byte
+		// length for a hit, "-" for a clean miss, "W" for a per-key
+		// wrong-node (multiWrongNodeKey — the batched analogue of
+		// wrongNodeLeft). mCount counts every `m` this node has
+		// received.
+		case "m":
+			nsLen := atoiOrPanic(parts[1])
+			count := atoiOrPanic(parts[2])
+			namespace := string(mustRead(reader, nsLen))
+			keys := make([]string, count)
+			for i := 0; i < count; i++ {
+				keys[i] = string(mustRead(reader, atoiOrPanic(parts[3+i])))
+			}
+			if m.silent.Load() {
+				continue
+			}
+			m.mCount.Add(1)
+			m.dataRequestCount.Add(1)
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			header := "M " + strconv.Itoa(count)
+			var body []byte
+			for _, key := range keys {
+				if m.takeMultiWrongNode(key) {
+					header += " W"
+					continue
+				}
+				if value, ok := m.store.Load(storeKey{namespace, key}); ok {
+					stored := value.([]byte)
+					header += " " + strconv.Itoa(len(stored))
+					body = append(body, stored...)
+				} else {
+					header += " -"
+				}
+			}
+			if _, err := conn.Write(append([]byte(header+tagSuffix+"\n"), body...)); err != nil {
+				return
+			}
+		// Batched set (issues #150/#151): `o <ns-len> <n> <key-len-1>
+		// <value-len-1> ... <key-len-n> <value-len-n> [<ttl>][ <tag>]
+		// \n<ns><key-1><value-1>...<key-n><value-n>` — one shared TTL
+		// for the whole batch, not per key. Answers `O <n> <result-1>
+		// ... <result-n>[ <tag>]\n` (no body): "S" (stored) or "W"
+		// (per-key wrong-node, same multiWrongNodeKey knob `m` uses).
+		// oCount counts every `o` this node has received. The
+		// ttl-vs-tag field disambiguation mirrors `s`'s own (see its
+		// case above): the ttl field, when present, always sits
+		// immediately after the last length field, regardless of
+		// whether the connection is tagged.
+		case "o":
+			nsLen := atoiOrPanic(parts[1])
+			count := atoiOrPanic(parts[2])
+			namespace := string(mustRead(reader, nsLen))
+			keys := make([]string, count)
+			values := make([][]byte, count)
+			ttlIndex := 3 + 2*count
+			ttlBase := ttlIndex
+			if tagged {
+				ttlBase++
+			}
+			hasTTL := len(parts) > ttlBase
+			for i := 0; i < count; i++ {
+				keyLen := atoiOrPanic(parts[3+2*i])
+				valLen := atoiOrPanic(parts[3+2*i+1])
+				keys[i] = string(mustRead(reader, keyLen))
+				values[i] = mustRead(reader, valLen)
+			}
+			if m.silent.Load() {
+				continue
+			}
+			m.oCount.Add(1)
+			m.dataRequestCount.Add(1)
+			var ttlValue int64
+			if hasTTL {
+				ttlValue = int64(atoiOrPanic(parts[ttlIndex]))
+			}
+			if m.takeOne(&m.retryableLeft) { // issue #125
+				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
+					return
+				}
+				continue
+			}
+			header := "O " + strconv.Itoa(count)
+			for i, key := range keys {
+				if m.takeMultiWrongNode(key) {
+					header += " W"
+					continue
+				}
+				sk := storeKey{namespace, key}
+				m.store.Store(sk, values[i])
+				if hasTTL {
+					m.ttls.Store(sk, ttlValue)
+				} else {
+					m.ttls.Delete(sk)
+				}
+				header += " S"
+			}
+			if _, err := conn.Write([]byte(header + tagSuffix + "\n")); err != nil {
+				return
+			}
 		// Incr/Decr (issue #129): `i <ns-len> <key-len> <delta>[ <tag>]
 		// \n<ns><key>` — always namespaced (ns-len 0 for the default
 		// namespace), no legacy uppercase form. Parses the stored value
@@ -865,6 +986,19 @@ func (m *mockNode) serve(conn net.Conn) {
 
 func (m *mockNode) takeWrongNode() bool {
 	return m.takeOne(&m.wrongNodeLeft)
+}
+
+// takeMultiWrongNode reports whether key matches multiWrongNodeKey and
+// multiWrongNodeLeft still has budget (issues #128/#150/#151) — a test
+// sets multiWrongNodeKey once and controls how many consecutive `m`/`o`
+// requests answer that key `W` via multiWrongNodeLeft's count, exactly
+// like wrongNodeLeft governs a whole G/S's own `W` count.
+func (m *mockNode) takeMultiWrongNode(key string) bool {
+	target, _ := m.multiWrongNodeKey.Load().(string)
+	if target == "" || target != key {
+		return false
+	}
+	return m.takeOne(&m.multiWrongNodeLeft)
 }
 
 func (m *mockNode) takeOne(counter *atomic.Int32) bool {
@@ -2800,6 +2934,334 @@ func TestFansDeletesOutToEveryOwner(t *testing.T) {
 	}
 }
 
+// ── batched get/set, single node (issues #128/#150/#151) ─────────────
+
+func TestGetManyReturnsHitsAndMissesInOneCall(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("a", "1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set("c", "3", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	values, err := client.GetMany([]string{"a", "b", "c"})
+	if err != nil {
+		t.Fatalf("GetMany err = %v", err)
+	}
+	want := map[string]string{"a": "1", "c": "3"}
+	if len(values) != len(want) || values["a"] != "1" || values["c"] != "3" {
+		t.Fatalf("GetMany = %v, want %v (with \"b\" absent)", values, want)
+	}
+	if _, missing := values["b"]; missing {
+		t.Fatal("expected \"b\" to be absent from the map, not present with a zero value")
+	}
+	if got := node.mCount.Load(); got != 1 {
+		t.Fatalf("mCount = %d, want 1", got)
+	}
+}
+
+func TestSetManyThenGetManyRoundTripWithTTL(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 60); err != nil {
+		t.Fatalf("SetMany err = %v", err)
+	}
+	if ttl, ok := node.storedTTL("a"); !ok || ttl != 60 {
+		t.Fatalf("storedTTL(a) = %d, %v, want 60, true", ttl, ok)
+	}
+	if got := node.oCount.Load(); got != 1 {
+		t.Fatalf("oCount = %d, want 1", got)
+	}
+
+	values, err := client.GetMany([]string{"a", "b"})
+	if err != nil {
+		t.Fatalf("GetMany err = %v", err)
+	}
+	if values["a"] != "1" || values["b"] != "2" {
+		t.Fatalf("GetMany = %v, want {a:1 b:2}", values)
+	}
+}
+
+func TestGetManyBytesRequiresAtLeastOneKey(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	values, err := client.GetMany(nil)
+	if values != nil || !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("GetMany(nil) = %v, %v, want nil, ErrInvalidArgument", values, err)
+	}
+}
+
+func TestSetManyBytesRequiresAtLeastOneKey(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.SetMany(map[string]string{}, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("SetMany({}) err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+// TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames covers
+// batch chunking (maxBatchKeys, issues #128/#150/#151): a call with
+// more keys than fit in one `m`/`o` sub-frame transparently becomes
+// more than one, invisible to the caller beyond the extra sub-frames on
+// the wire.
+func TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const total = maxBatchKeys + 50
+	values := make(map[string]string, total)
+	keys := make([]string, total)
+	for i := 0; i < total; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keys[i] = key
+		values[key] = fmt.Sprintf("value-%d", i)
+	}
+
+	if err := client.SetMany(values, 0); err != nil {
+		t.Fatalf("SetMany err = %v", err)
+	}
+	if got := node.oCount.Load(); got != 2 {
+		t.Fatalf("oCount = %d, want 2 (%d keys split at maxBatchKeys=%d)", got, total, maxBatchKeys)
+	}
+
+	got, err := client.GetMany(keys)
+	if err != nil {
+		t.Fatalf("GetMany err = %v", err)
+	}
+	if got2 := node.mCount.Load(); got2 != 2 {
+		t.Fatalf("mCount = %d, want 2", got2)
+	}
+	if len(got) != total {
+		t.Fatalf("GetMany returned %d keys, want %d", len(got), total)
+	}
+	for key, want := range values {
+		if got[key] != want {
+			t.Fatalf("GetMany[%q] = %q, want %q", key, got[key], want)
+		}
+	}
+}
+
+// ── batched get/set, cluster (issues #128/#150/#151) ─────────────────
+
+func TestClusterGetManySplitsAcrossOwnersAndReassembles(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	values := make(map[string]string, 20)
+	keys := make([]string, 20)
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keys[i] = key
+		values[key] = fmt.Sprintf("value-%d", i)
+	}
+	if err := client.SetMany(values, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client.GetMany(keys)
+	if err != nil {
+		t.Fatalf("GetMany err = %v", err)
+	}
+	for key, want := range values {
+		if got[key] != want {
+			t.Fatalf("GetMany[%q] = %q, want %q", key, got[key], want)
+		}
+	}
+
+	// With 20 keys spread over 2 owners by HRW, both nodes should have
+	// answered at least one `m` — proving the batch really was split by
+	// owner rather than all sent to a single node.
+	for name, node := range nodes {
+		if node.mCount.Load() == 0 {
+			t.Errorf("%s received no m frames at all", name)
+		}
+	}
+}
+
+func TestClusterSetManyStoresOnEveryOwnerWithReplication2(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	values := make(map[string]string, 10)
+	keys := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keys[i] = key
+		values[key] = fmt.Sprintf("value-%d", i)
+	}
+	if err := client.SetMany(values, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, key := range keys {
+		for name, node := range nodes {
+			if !node.hasKey(key) {
+				t.Errorf("%s missing %s", name, key)
+			}
+		}
+	}
+}
+
+// TestClusterSetManySendsExactlyOneSubFrameToANodeThatIsPrimaryForOneKeyAndReplicaForAnother
+// exercises SetManyBytes' owner-address grouping (docs/protocol.html#multi):
+// within one batch the same node can be primary for one key and a
+// replica for another, and it must receive exactly one `o` sub-frame
+// covering both roles, not two. Two nodes with replication 2 is enough
+// to force this (every key's owners are both nodes, in an order that
+// differs per key) — mirroring the Rust proxy's own equivalent test.
+func TestClusterSetManySendsExactlyOneSubFrameToANodeThatIsPrimaryForOneKeyAndReplicaForAnother(t *testing.T) {
+	nodes, discovery := startCluster(t, 2)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	keyA := keyWithPrimary(t, testNames[0])
+	keyB := keyWithPrimary(t, testNames[1])
+
+	if err := client.SetMany(map[string]string{keyA: "va", keyB: "vb"}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, node := range nodes {
+		if got := node.oCount.Load(); got != 1 {
+			t.Fatalf("%s oCount = %d, want 1 (one sub-frame covering both its primary and replica key)", name, got)
+		}
+		if !node.hasKey(keyA) || !node.hasKey(keyB) {
+			t.Fatalf("%s missing one of keyA/keyB", name)
+		}
+	}
+}
+
+func TestClusterGetManyRecoversAPerKeyWrongNodeAfterARefresh(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const wrongKey, okKey = "wrong-key", "ok-key"
+	if err := client.Set(wrongKey, "w", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(okKey, "ok", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	primary, err := NewHashRing(testNames).Route([]byte(wrongKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := nodes[primary]
+	owner.multiWrongNodeKey.Store(wrongKey)
+	owner.multiWrongNodeLeft.Add(1)
+
+	values, err := client.GetMany([]string{wrongKey, okKey})
+	if err != nil {
+		t.Fatalf("GetMany after one per-key W = %v, %v, want success", values, err)
+	}
+	if values[wrongKey] != "w" || values[okKey] != "ok" {
+		t.Fatalf("GetMany = %v, want both keys resolved", values)
+	}
+}
+
+func TestClusterGetManyDegradesToAPartialMapWithErrWrongNodeWhenWrongNodePersists(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const wrongKey, okKey = "wrong-key", "ok-key"
+	if err := client.Set(wrongKey, "w", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(okKey, "ok", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	primary, err := NewHashRing(testNames).Route([]byte(wrongKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := nodes[primary]
+	owner.multiWrongNodeKey.Store(wrongKey)
+	owner.multiWrongNodeLeft.Add(2) // survives the initial pass AND the one retry
+
+	values, err := client.GetMany([]string{wrongKey, okKey})
+	if !errors.Is(err, ErrWrongNode) {
+		t.Fatalf("GetMany err = %v, want ErrWrongNode", err)
+	}
+	if values[okKey] != "ok" {
+		t.Fatalf("GetMany = %v, want okKey still resolved despite wrongKey's persistent W", values)
+	}
+	if _, present := values[wrongKey]; present {
+		t.Fatalf("GetMany = %v, want wrongKey absent (never resolved)", values)
+	}
+}
+
+func TestClusterSetManyRecoversAPerKeyWrongNodeAfterARefresh(t *testing.T) {
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const wrongKey, okKey = "wrong-key", "ok-key"
+	primary, err := NewHashRing(testNames).Route([]byte(wrongKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := nodes[primary]
+	owner.multiWrongNodeKey.Store(wrongKey)
+	owner.multiWrongNodeLeft.Add(1)
+
+	if err := client.SetMany(map[string]string{wrongKey: "w", okKey: "ok"}, 0); err != nil {
+		t.Fatalf("SetMany after one per-key W = %v, want success", err)
+	}
+	if !owner.hasKey(wrongKey) || !owner.hasKey(okKey) {
+		t.Fatal("expected both keys stored after the retry recovered from the per-key W")
+	}
+}
+
 // ── issue #67: connect() bootstrap tolerates an unreachable node ──
 
 // keyWithPrimary finds a key whose primary owner is name, against
@@ -3599,6 +4061,78 @@ func TestAppendIncrFrameDefaultAndNamespacedUntaggedAndTagged(t *testing.T) {
 	}
 	if got, want := string(appendIncrFrame([]byte("ns"), []byte("k"), 5, true, 9)), "i 2 1 5 9\nnsk"; got != want {
 		t.Fatalf("appendIncrFrame (tagged) = %q, want %q", got, want)
+	}
+}
+
+// ── batched get/set frame encoders (issues #128/#150/#151) ───────────
+
+// TestAppendMultiGetFrameIsAlwaysNamespacedUntaggedAndTagged covers
+// appendMultiGetFrame's exact wire bytes: always namespaced, even for
+// the default namespace (ns-len 0), same class as appendIncrFrame —
+// there is no separate uppercase form to also test.
+func TestAppendMultiGetFrameIsAlwaysNamespacedUntaggedAndTagged(t *testing.T) {
+	for _, ns := range [][]byte{nil, []byte("")} {
+		got := string(appendMultiGetFrame(ns, [][]byte{[]byte("a"), []byte("bb")}, false, 0))
+		if want := "m 0 2 1 2\nabb"; got != want {
+			t.Fatalf("appendMultiGetFrame(%v, ...) = %q, want %q", ns, got, want)
+		}
+	}
+	got := string(appendMultiGetFrame([]byte("ns"), [][]byte{[]byte("a"), []byte("bb")}, false, 0))
+	if want := "m 2 2 1 2\nnsabb"; got != want {
+		t.Fatalf("appendMultiGetFrame (namespaced) = %q, want %q", got, want)
+	}
+	got = string(appendMultiGetFrame([]byte("ns"), [][]byte{[]byte("a")}, true, 9))
+	if want := "m 2 1 1 9\nnsa"; got != want {
+		t.Fatalf("appendMultiGetFrame (tagged) = %q, want %q", got, want)
+	}
+}
+
+// TestAppendMultiSetFrameWithAndWithoutTTLUntaggedAndTagged covers
+// appendMultiSetFrame's exact wire bytes, including the [ttl] field's
+// position ahead of the tag — the same convention appendSetFrame's own
+// [ttl] uses.
+func TestAppendMultiSetFrameWithAndWithoutTTLUntaggedAndTagged(t *testing.T) {
+	keys := [][]byte{[]byte("a"), []byte("bb")}
+	values := [][]byte{[]byte("x"), []byte("yy")}
+
+	got := string(appendMultiSetFrame(nil, keys, values, -1, false, 0))
+	if want := "o 0 2 1 1 2 2\naxbbyy"; got != want {
+		t.Fatalf("appendMultiSetFrame (no ttl) = %q, want %q", got, want)
+	}
+
+	got = string(appendMultiSetFrame([]byte("ns"), keys, values, 60, false, 0))
+	if want := "o 2 2 1 1 2 2 60\nnsaxbbyy"; got != want {
+		t.Fatalf("appendMultiSetFrame (with ttl) = %q, want %q", got, want)
+	}
+
+	got = string(appendMultiSetFrame([]byte("ns"), keys, values, -1, true, 9))
+	if want := "o 2 2 1 1 2 2 9\nnsaxbbyy"; got != want {
+		t.Fatalf("appendMultiSetFrame (tagged, no ttl) = %q, want %q", got, want)
+	}
+
+	got = string(appendMultiSetFrame([]byte("ns"), keys, values, 60, true, 9))
+	if want := "o 2 2 1 1 2 2 60 9\nnsaxbbyy"; got != want {
+		t.Fatalf("appendMultiSetFrame (tagged, with ttl) = %q, want %q", got, want)
+	}
+}
+
+// TestAppendMultiFramesAcceptBinaryNamespaces mirrors
+// TestAppendFramesAcceptBinaryNamespaces for the batched encoders.
+func TestAppendMultiFramesAcceptBinaryNamespaces(t *testing.T) {
+	ns := []byte{0xff, 0x00}
+	keys := [][]byte{[]byte("a")}
+
+	gotM := appendMultiGetFrame(ns, keys, false, 0)
+	wantM := append([]byte("m 2 1 1\n"), append(append([]byte{}, ns...), keys[0]...)...)
+	if !bytes.Equal(gotM, wantM) {
+		t.Fatalf("appendMultiGetFrame with binary namespace = %v, want %v", gotM, wantM)
+	}
+
+	values := [][]byte{[]byte("v")}
+	gotO := appendMultiSetFrame(ns, keys, values, -1, false, 0)
+	wantO := append([]byte("o 2 1 1 1\n"), append(append(append([]byte{}, ns...), keys[0]...), values[0]...)...)
+	if !bytes.Equal(gotO, wantO) {
+		t.Fatalf("appendMultiSetFrame with binary namespace = %v, want %v", gotO, wantO)
 	}
 }
 

@@ -215,6 +215,19 @@ const DefaultReconnectCooldown = time.Second
 // G1).
 const maxRequestBytes = 1024*1024 - 256
 
+// maxBatchKeys bounds how many keys GetMany/GetManyBytes/SetMany/
+// SetManyBytes send in one `m`/`o` sub-frame before splitting into more
+// than one (batch chunking, issues #128/#150/#151) — purely a
+// client-side concern, invisible to callers: a call with more keys than
+// this simply becomes more than one sub-frame per owner, transparently
+// reassembled. Derived from connection.go's maxHeaderLineLength (4 KiB):
+// an `M` response's roster carries one token per key, at worst a decimal
+// byte length up to maxValueLength's own digit count plus its
+// separating space (len("2097152")+1 = 8 bytes). 400*8 = 3200 bytes
+// leaves comfortable headroom under 4 KiB even with a trailing tag
+// field, well before this constant would ever need revisiting.
+const maxBatchKeys = 400
+
 // validateKey rejects an empty key, or one that alone already exceeds
 // maxRequestBytes, before any network I/O: the server has no way to
 // answer either shape except by closing the connection outright, silently
@@ -1044,6 +1057,518 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 	return existed, err
 }
 
+// ── バッチ操作 (issues #128/#150/#151) ───────────────────────────────
+
+// GetMany returns every requested key's value as a string in one round
+// trip per owner (batched get) instead of one round trip per key — see
+// GetManyBytes for the raw-bytes form this wraps, including its
+// wrong-node and partial-result contract, which applies here unchanged.
+func (c *Client) GetMany(keys []string) (map[string]string, error) {
+	raw, err := c.GetManyBytes(keys)
+	if raw == nil {
+		return nil, err
+	}
+	values := make(map[string]string, len(raw))
+	for key, value := range raw {
+		values[key] = string(value)
+	}
+	return values, err
+}
+
+// GetManyBytes returns every requested key's raw value in one round
+// trip per owner (batched get, docs/protocol.html#multi) — a missing
+// key is simply absent from the returned map, never an error, the same
+// "a miss is not an error" contract GetBytes itself has. keys must be
+// non-empty.
+//
+// A batch never fails as a whole: if some keys are still wrong-node
+// after one bounded refresh-and-retry (the same policy GetBytes' own
+// withClusterRetry applies, generalized to a per-key roster instead of
+// an all-or-nothing retry — see multiGetPass), the returned map holds
+// every key that DID resolve, paired with ErrWrongNode, rather than
+// discarding a mostly-successful batch over a handful of stale
+// placements. In single-node/proxy mode a `W` propagates immediately,
+// exactly as GetBytes' own single-mode behavior does — there is no ring
+// to refresh against.
+//
+// Larger batches are transparently split into more than one `m`
+// sub-frame per owner (batch chunking, see maxBatchKeys) — callers
+// never need to think about this.
+func (c *Client) GetManyBytes(keys []string) (map[string][]byte, error) {
+	return c.getManyNS(nil, keys)
+}
+
+// getManyNS is GetManyBytes scoped to namespace — the internal entry
+// point a *Namespace handle's GetMany/GetManyBytes forward to, mirroring
+// getBytesNS.
+func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, error) {
+	if len(keys) == 0 {
+		return nil, invalidArgument("nanocached: GetMany/GetManyBytes requires at least one key")
+	}
+	keyBytes := make([][]byte, len(keys))
+	for i, key := range keys {
+		if err := validateKey(key); err != nil {
+			return nil, err
+		}
+		keyBytes[i] = []byte(key)
+	}
+	if err := c.beforeOperation(); err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	single := c.ring == nil
+	c.mu.Unlock()
+
+	values := make(map[string][]byte, len(keys))
+
+	if single {
+		entries, chunkErr := c.multiGetChunked("", namespace, keyBytes)
+		for i, entry := range entries {
+			if !entry.ok {
+				continue
+			}
+			value, decErr := c.maybeDecompress(entry.value)
+			if decErr != nil {
+				return values, decErr
+			}
+			values[keys[i]] = value
+		}
+		if chunkErr != nil {
+			return values, chunkErr
+		}
+		if multiAnyWrongNode(entries) {
+			return values, ErrWrongNode
+		}
+		return values, nil
+	}
+
+	retry, err := c.multiGetPass(namespace, keys, keyBytes, values, nil)
+	if err != nil {
+		return values, err
+	}
+	if len(retry) == 0 {
+		return values, nil
+	}
+	c.maybeRefresh(true)
+	retry, err = c.multiGetPass(namespace, keys, keyBytes, values, retry)
+	if err != nil {
+		return values, err
+	}
+	if len(retry) > 0 {
+		return values, ErrWrongNode
+	}
+	return values, nil
+}
+
+// multiGetChunked issues one or more `m` sub-frames against slot for
+// keys — already grouped to one owner (or the single/proxy target) by
+// the caller — splitting into maxBatchKeys-sized chunks (batch
+// chunking) so no reply header risks exceeding maxHeaderLineLength.
+// Always returns len(keys) entries: a chunk that fails outright (a
+// connection-level failure, not a per-key `W`) leaves its keys' entries
+// at the zero value (a clean miss) and that chunk's error is returned
+// alongside — the caller treats that gap as "still needs a retry",
+// exactly like a per-key WrongNode.
+func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) ([]multiEntry, error) {
+	entries := make([]multiEntry, len(keys))
+	for start := 0; start < len(keys); start += maxBatchKeys {
+		end := start + maxBatchKeys
+		if end > len(keys) {
+			end = len(keys)
+		}
+		var chunkEntries []multiEntry
+		err := c.applyReconnecting(slot, func(conn *connection) error {
+			var opErr error
+			chunkEntries, opErr = conn.multiGetNS(namespace, keys[start:end])
+			return opErr
+		})
+		if err != nil {
+			return entries, err
+		}
+		copy(entries[start:end], chunkEntries)
+	}
+	return entries, nil
+}
+
+// multiGetPass runs one pass of GetManyBytes' cluster routing: group
+// the given indices (every key, when retryIndices is nil — the initial
+// pass — or just the keys a previous pass left unresolved) by their
+// current primary owner (matching plain Get's own primary-first
+// stance), dispatch one (possibly chunked) `m` exchange per owner
+// concurrently, splice hits into values, and return the indices still
+// unresolved: a per-key `W`, or a whole owner group whose call failed
+// outright (indistinguishable from a possibly-idle-closed connection,
+// same stance applyReconnecting's own callers take elsewhere). Called
+// once for the initial pass and once more, if needed, after a single
+// force refresh — see getManyNS. The returned error is a client-side
+// decompression failure only (Config.Compress mismatch) — never a
+// routing outcome, so it aborts the batch immediately rather than
+// feeding into the retry pass.
+func (c *Client) multiGetPass(
+	namespace []byte, keys []string, keyBytes [][]byte,
+	values map[string][]byte, retryIndices []int,
+) ([]int, error) {
+	indices := retryIndices
+	if indices == nil {
+		indices = make([]int, len(keys))
+		for i := range keys {
+			indices[i] = i
+		}
+	}
+
+	groups := make(map[string][]int)
+	var retry []int
+	for _, idx := range indices {
+		owners := c.ownerNames(namespace, keyBytes[idx])
+		if len(owners) == 0 {
+			retry = append(retry, idx)
+			continue
+		}
+		groups[owners[0]] = append(groups[owners[0]], idx)
+	}
+
+	var mu sync.Mutex
+	var spliceErr error
+	var wg sync.WaitGroup
+	wg.Add(len(groups))
+	for owner, groupIndices := range groups {
+		go func(owner string, groupIndices []int) {
+			defer wg.Done()
+			groupKeys := make([][]byte, len(groupIndices))
+			for i, idx := range groupIndices {
+				groupKeys[i] = keyBytes[idx]
+			}
+			entries, err := c.multiGetChunked(owner, namespace, groupKeys)
+
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				retry = append(retry, groupIndices...)
+				return
+			}
+			for i, idx := range groupIndices {
+				entry := entries[i]
+				switch {
+				case entry.wrongNode:
+					retry = append(retry, idx)
+				case entry.ok:
+					value, decErr := c.maybeDecompress(entry.value)
+					if decErr != nil {
+						if spliceErr == nil {
+							spliceErr = decErr
+						}
+						continue
+					}
+					values[keys[idx]] = value
+				}
+			}
+		}(owner, groupIndices)
+	}
+	wg.Wait()
+	return retry, spliceErr
+}
+
+// maybeDecompress is GetBytes' own decompression step (see getBytesNS),
+// generalized so GetManyBytes' per-entry splicing can share it: a no-op
+// when Config.Compress is off.
+func (c *Client) maybeDecompress(value []byte) ([]byte, error) {
+	if !c.compress {
+		return value, nil
+	}
+	return decompressValue(value)
+}
+
+// multiAnyWrongNode reports whether any entry carries a per-key `W` —
+// shared by GetManyBytes' and SetManyBytes' single-mode paths, which
+// (like GetBytes/SetBytes) have no ring to refresh against, so a
+// wrong-node answer propagates immediately rather than feeding a retry
+// pass.
+func multiAnyWrongNode(entries []multiEntry) bool {
+	for _, entry := range entries {
+		if entry.wrongNode {
+			return true
+		}
+	}
+	return false
+}
+
+// SetMany stores every value in values in one round trip per involved
+// node (batched set) instead of one round trip per key — see
+// SetManyBytes for the raw-bytes form this wraps, including its
+// wrong-node and replication contract, which applies here unchanged.
+// ttlSeconds is shared by the whole batch, not per key (one real caller
+// of a batched set — Django's set_many, cache-manager's mset — already
+// passes one TTL per call).
+func (c *Client) SetMany(values map[string]string, ttlSeconds int64) error {
+	raw := make(map[string][]byte, len(values))
+	for key, value := range values {
+		raw[key] = []byte(value)
+	}
+	return c.SetManyBytes(raw, ttlSeconds)
+}
+
+// SetManyBytes stores every raw value in values in one round trip per
+// involved node (batched set, docs/protocol.html#multi). ttlSeconds is
+// a whole number of seconds shared by the whole batch; 0 means no
+// expiry, negative is rejected. values must be non-empty. Transparently
+// compresses values at or above Config.CompressionThreshold when
+// Config.Compress is enabled, exactly like SetBytes.
+//
+// Within one batch, the same node can be a key's primary and another
+// key's replica at once — it receives exactly one `o` sub-frame either
+// way, and only its answer for the keys it is primary for decides that
+// key's outcome; a replica-held key's failure or `W` is
+// logged-and-swallowed into Stats().ReplicaWriteFailures, exactly like
+// SetBytes' own replica legs (write/fanReplicas). A batch never fails
+// as a whole: if some keys' primaries are still wrong-node after one
+// bounded refresh-and-retry, SetManyBytes returns ErrWrongNode — every
+// other key in the batch was still stored. In single-node/proxy mode a
+// `W` propagates immediately, exactly as SetBytes' own single-mode
+// behavior does.
+//
+// Larger batches are transparently split into more than one `o`
+// sub-frame per node (batch chunking, see maxBatchKeys).
+func (c *Client) SetManyBytes(values map[string][]byte, ttlSeconds int64) error {
+	return c.setManyNS(nil, values, ttlSeconds)
+}
+
+// setManyNS is SetManyBytes scoped to namespace — the internal entry
+// point a *Namespace handle's SetMany/SetManyBytes forward to, mirroring
+// setBytesNS.
+func (c *Client) setManyNS(namespace []byte, values map[string][]byte, ttlSeconds int64) error {
+	if len(values) == 0 {
+		return invalidArgument("nanocached: SetMany/SetManyBytes requires at least one key")
+	}
+	if ttlSeconds < 0 {
+		return invalidArgument(fmt.Sprintf("nanocached: ttlSeconds must not be negative, got %d", ttlSeconds))
+	}
+
+	keys := make([]string, 0, len(values))
+	keyBytes := make([][]byte, 0, len(values))
+	valueBytes := make([][]byte, 0, len(values))
+	for key, value := range values {
+		if err := validateKeyAndValue(key, len(value)); err != nil {
+			return err
+		}
+		keys = append(keys, key)
+		keyBytes = append(keyBytes, []byte(key))
+		outgoing := value
+		if c.compress {
+			outgoing = compressValue(value, c.compressionThreshold)
+		}
+		valueBytes = append(valueBytes, outgoing)
+	}
+	if err := c.beforeOperation(); err != nil {
+		return err
+	}
+
+	wireTTL := int64(-1) // no expiry
+	if ttlSeconds > 0 {
+		wireTTL = ttlSeconds
+	}
+
+	c.mu.Lock()
+	single := c.ring == nil
+	c.mu.Unlock()
+
+	if single {
+		entries, err := c.multiSetChunked("", namespace, keyBytes, valueBytes, wireTTL)
+		if err != nil {
+			return err
+		}
+		if multiAnyWrongNode(entries) {
+			return ErrWrongNode
+		}
+		return nil
+	}
+
+	retry := c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, nil)
+	if len(retry) == 0 {
+		return nil
+	}
+	c.maybeRefresh(true)
+	retry = c.multiSetPass(namespace, keys, keyBytes, valueBytes, wireTTL, retry)
+	if len(retry) > 0 {
+		return ErrWrongNode
+	}
+	return nil
+}
+
+// multiSetChunked is multiGetChunked's write-side twin: one or more `o`
+// sub-frames against slot for keys/values (already grouped to one
+// owner, or the single/proxy target), split into maxBatchKeys-sized
+// chunks. Always returns len(keys) entries; a chunk that fails outright
+// leaves its keys' entries at the zero value and that chunk's error is
+// returned alongside.
+func (c *Client) multiSetChunked(slot string, namespace []byte, keys, values [][]byte, ttlSeconds int64) ([]multiEntry, error) {
+	entries := make([]multiEntry, len(keys))
+	for start := 0; start < len(keys); start += maxBatchKeys {
+		end := start + maxBatchKeys
+		if end > len(keys) {
+			end = len(keys)
+		}
+		var chunkEntries []multiEntry
+		err := c.applyReconnecting(slot, func(conn *connection) error {
+			var opErr error
+			chunkEntries, opErr = conn.multiSetNS(namespace, keys[start:end], values[start:end], ttlSeconds)
+			return opErr
+		})
+		if err != nil {
+			return entries, err
+		}
+		copy(entries[start:end], chunkEntries)
+	}
+	return entries, nil
+}
+
+// multiSetPass runs one pass of SetManyBytes' cluster routing: for
+// every key still needing resolution (every key, when retryIndices is
+// nil, or just what a previous pass left unresolved), build one
+// sub-batch per **owner name across every rank** — not just primaries,
+// unlike multiGetPass — because within one batch the same node can be
+// primary for one key and a replica for another (see SetManyBytes' own
+// doc comment); each owner therefore gets exactly one `o` sub-frame
+// covering every key it holds in any role. Only a leg's *primary* keys
+// can end up in the returned retry list; a leg's replica-held keys are
+// logged-and-swallowed into Stats().ReplicaWriteFailures instead,
+// mirroring fanReplicas' stance for single-key Set. A leg that is a
+// pure replica for every key it holds is eligible for
+// Config.FireAndForgetReplicas, exactly like a single-key replica
+// write — see runMultiSetLeg.
+func (c *Client) multiSetPass(
+	namespace []byte, keys []string, keyBytes, valueBytes [][]byte, ttlSeconds int64,
+	retryIndices []int,
+) []int {
+	indices := retryIndices
+	if indices == nil {
+		indices = make([]int, len(keys))
+		for i := range keys {
+			indices[i] = i
+		}
+	}
+
+	type ownerBatch struct {
+		indices   []int
+		isPrimary []bool
+	}
+	owners := make(map[string]*ownerBatch)
+	var retry []int
+	for _, idx := range indices {
+		names := c.ownerNames(namespace, keyBytes[idx])
+		if len(names) == 0 {
+			retry = append(retry, idx)
+			continue
+		}
+		for rank, name := range names {
+			batch := owners[name]
+			if batch == nil {
+				batch = &ownerBatch{}
+				owners[name] = batch
+			}
+			batch.indices = append(batch.indices, idx)
+			batch.isPrimary = append(batch.isPrimary, rank == 0)
+		}
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for name, batch := range owners {
+		pureReplica := true
+		for _, isPrimary := range batch.isPrimary {
+			if isPrimary {
+				pureReplica = false
+				break
+			}
+		}
+
+		if c.fireAndForgetReplicas && pureReplica {
+			select {
+			case c.backgroundReplicaSem <- struct{}{}:
+				// Same Add-under-c.mu-with-a-closed-recheck ordering
+				// fanReplicas itself uses, guaranteeing every Add
+				// happens-before Close()'s Wait.
+				c.mu.Lock()
+				if !c.closed {
+					c.backgroundReplicaWG.Add(1)
+					c.mu.Unlock()
+					go func(name string, batch *ownerBatch) {
+						defer c.backgroundReplicaWG.Done()
+						defer func() { <-c.backgroundReplicaSem }()
+						c.runMultiSetLeg(namespace, name, batch.indices, batch.isPrimary,
+							keyBytes, valueBytes, ttlSeconds, &mu, nil)
+					}(name, batch)
+					continue
+				}
+				c.mu.Unlock()
+				<-c.backgroundReplicaSem
+			default:
+			}
+		}
+
+		wg.Add(1)
+		go func(name string, batch *ownerBatch) {
+			defer wg.Done()
+			c.runMultiSetLeg(namespace, name, batch.indices, batch.isPrimary,
+				keyBytes, valueBytes, ttlSeconds, &mu, &retry)
+		}(name, batch)
+	}
+	wg.Wait()
+	return retry
+}
+
+// runMultiSetLeg dispatches one owner's `o` sub-batch and applies its
+// result under mu: only primary-held keys can end up appended to
+// *retry (retry is nil for a detached fire-and-forget replica leg,
+// which by construction — see multiSetPass's pureReplica check — holds
+// no primary key at all, so there is nothing for it to retry). Every
+// replica-held key's failure or `W` is counted in
+// Stats().ReplicaWriteFailures instead of affecting the caller's
+// result, mirroring fanReplicas' own stance for single-key Set. A
+// connection-level failure for the whole leg is treated the same way,
+// key by key, since the SAME sub-frame can carry both primary- and
+// replica-held keys and a transport failure doesn't distinguish between
+// them.
+func (c *Client) runMultiSetLeg(
+	namespace []byte, name string, indices []int, isPrimary []bool,
+	keyBytes, valueBytes [][]byte, ttlSeconds int64,
+	mu *sync.Mutex, retry *[]int,
+) {
+	groupKeys := make([][]byte, len(indices))
+	groupValues := make([][]byte, len(indices))
+	for i, idx := range indices {
+		groupKeys[i] = keyBytes[idx]
+		groupValues[i] = valueBytes[idx]
+	}
+	entries, err := c.multiSetChunked(name, namespace, groupKeys, groupValues, ttlSeconds)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if err != nil {
+		for i, idx := range indices {
+			if isPrimary[i] {
+				if retry != nil {
+					*retry = append(*retry, idx)
+				}
+			} else {
+				c.stats.replicaWriteFailures.Add(1)
+			}
+		}
+		return
+	}
+	for i, idx := range indices {
+		if !isPrimary[i] {
+			if entries[i].wrongNode {
+				c.stats.replicaWriteFailures.Add(1)
+			}
+			continue
+		}
+		if entries[i].wrongNode && retry != nil {
+			*retry = append(*retry, idx)
+		}
+	}
+}
+
 // Incr atomically adds delta to key's stored counter value and returns
 // the result; ok is false when the key is missing or expired (the same
 // "not found" shape GetBytes returns). delta may be negative — Decr is
@@ -1327,6 +1852,42 @@ func (n *Namespace) SetBytes(key string, value []byte, ttlSeconds int64) error {
 // before this call. See Client.Delete.
 func (n *Namespace) Delete(key string) (existed bool, err error) {
 	return n.client.deleteNS(n.namespace, key)
+}
+
+// GetMany returns every requested key's value, within this namespace,
+// as a string. See Client.GetMany.
+func (n *Namespace) GetMany(keys []string) (map[string]string, error) {
+	raw, err := n.GetManyBytes(keys)
+	if raw == nil {
+		return nil, err
+	}
+	values := make(map[string]string, len(raw))
+	for key, value := range raw {
+		values[key] = string(value)
+	}
+	return values, err
+}
+
+// GetManyBytes returns every requested key's raw value within this
+// namespace. See Client.GetManyBytes.
+func (n *Namespace) GetManyBytes(keys []string) (map[string][]byte, error) {
+	return n.client.getManyNS(n.namespace, keys)
+}
+
+// SetMany stores every value under its key within this namespace. See
+// Client.SetMany.
+func (n *Namespace) SetMany(values map[string]string, ttlSeconds int64) error {
+	raw := make(map[string][]byte, len(values))
+	for key, value := range values {
+		raw[key] = []byte(value)
+	}
+	return n.SetManyBytes(raw, ttlSeconds)
+}
+
+// SetManyBytes stores every raw value under its key within this
+// namespace. See Client.SetManyBytes.
+func (n *Namespace) SetManyBytes(values map[string][]byte, ttlSeconds int64) error {
+	return n.client.setManyNS(n.namespace, values, ttlSeconds)
 }
 
 // Incr atomically adds delta to key's stored counter value within this

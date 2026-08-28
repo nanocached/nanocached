@@ -311,7 +311,7 @@ frames above carry nothing to verify against. A connection whose
 <code>A</code> carried the <code>T</code> flag and was answered
 <code>OnT</code> runs in <em>tagged mode</em>: every
 <code>G</code>/<code>S</code>/<code>D</code> (and
-<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>k</code>/<code>x</code>)
+<code>g</code>/<code>s</code>/<code>d</code>/<code>c</code>/<code>F</code>/<code>i</code>/<code>k</code>/<code>x</code>/<code>m</code>/<code>o</code>)
 header must end with a
 client-chosen tag (a u32 in decimal), and the response echoes it as its
 own last field, so a client can verify the pairing before trusting the
@@ -327,7 +327,9 @@ c &lt;namespace-length&gt; &lt;tag&gt;\n&lt;namespace&gt;
 F &lt;tag&gt;\n
 i &lt;namespace-length&gt; &lt;key-length&gt; &lt;delta&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
 k &lt;namespace-length&gt; &lt;key-length&gt; &lt;value-length&gt; &lt;cond&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;&lt;value&gt;
-x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;</code></pre>
+x &lt;namespace-length&gt; &lt;key-length&gt; &lt;cond&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key&gt;
+m &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; ... &lt;key-length-n&gt; &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;...&lt;key-n&gt;
+o &lt;namespace-length&gt; &lt;n&gt; &lt;key-length-1&gt; &lt;value-length-1&gt; ... &lt;key-length-n&gt; &lt;value-length-n&gt; [&lt;ttl-seconds&gt;] &lt;tag&gt;\n&lt;namespace&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</code></pre>
 <p>Responses become <code>V &lt;value-length&gt; &lt;tag&gt;\n</code>,
 <code>S &lt;tag&gt;\n</code>, <code>D &lt;tag&gt;\n</code>,
 <code>N &lt;tag&gt;\n</code>, <code>W &lt;tag&gt;\n</code>, and
@@ -340,7 +342,11 @@ below). <code>i</code>'s reply becomes
 after the optional TTL. <code>k</code>'s reply is <code>S &lt;tag&gt;\n</code>
 or <code>N &lt;tag&gt;\n</code>; <code>x</code>'s is <code>D &lt;tag&gt;\n</code>
 or <code>N &lt;tag&gt;\n</code> — both reuse the markers above, so
-tagging them needs no new shape. Tagged mode is per connection and
+tagging them needs no new shape. <code>m</code>'s reply is
+<code>M &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n&lt;hit values&gt;</code>,
+<code>o</code>'s is <code>O &lt;n&gt; &lt;result-1&gt; ... &lt;result-n&gt; &lt;tag&gt;\n</code> —
+same roster shape as the untagged form, with the tag appended as the
+header's own last field. Tagged mode is per connection and
 entirely opt-in — a plain <code>A</code> keeps every frame exactly as
 documented above. See
 Echoed response tags

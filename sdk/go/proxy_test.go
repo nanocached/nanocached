@@ -230,6 +230,44 @@ func TestViaProxyTransientRetryStatusWorksAgainstAProxy(t *testing.T) {
 	}
 }
 
+// TestViaProxyGetManyAndSetManyRideTheSingleConnection covers
+// GetMany/SetMany (issues #128/#150/#151) in ViaProxy mode: a single
+// connection has no owners to group by, so both ops fall straight
+// through to the proxy on one `m`/`o` sub-frame each, exactly like
+// Get/Set's own single-connection behavior.
+func TestViaProxyGetManyAndSetManyRideTheSingleConnection(t *testing.T) {
+	proxy := startMockNode(t, nil)
+	discovery := startMockDiscovery(t, nil, 2)
+	discovery.setProxies([]discoveredNode{{Name: "proxy-a", Address: proxy.address()}})
+
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ViaProxy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 0); err != nil {
+		t.Fatalf("SetMany via proxy = %v", err)
+	}
+	if got := proxy.oCount.Load(); got != 1 {
+		t.Fatalf("oCount = %d, want 1", got)
+	}
+
+	values, err := client.GetMany([]string{"a", "b", "missing"})
+	if err != nil {
+		t.Fatalf("GetMany via proxy = %v", err)
+	}
+	if values["a"] != "1" || values["b"] != "2" {
+		t.Fatalf("GetMany = %v, want {a:1 b:2}", values)
+	}
+	if _, present := values["missing"]; present {
+		t.Fatal("expected \"missing\" to be absent")
+	}
+	if got := proxy.mCount.Load(); got != 1 {
+		t.Fatalf("mCount = %d, want 1", got)
+	}
+}
+
 func TestViaProxyHedgedReadOptionIsInert(t *testing.T) {
 	proxy := startMockNode(t, nil)
 	discovery := startMockDiscovery(t, nil, 2)

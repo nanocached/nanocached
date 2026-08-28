@@ -67,7 +67,27 @@ type roundTripResult struct {
 	// -1 means the entry has no TTL, N >= 0 is its remaining TTL in whole
 	// seconds. Unused (zero value) for every other marker.
 	ttlSeconds int64
-	err        error
+	// entries is only meaningful for an `M` (multi-get) or `O` (multi-set)
+	// response (issues #128/#150/#151) — see multiEntry's own doc comment.
+	// nil for every other marker.
+	entries []multiEntry
+	err     error
+}
+
+// multiEntry is one key's outcome inside an `M` (multi-get) or `O`
+// (multi-set) response (issues #128/#150/#151,
+// docs/protocol.html#multi) — a batch never fails as a whole, so each
+// key's result is independent of every other key's, same as the
+// server's own Response::Multi/Response::MultiAck. Reused for both
+// response kinds rather than two near-identical types:
+//   - `M`: ok+value is a hit (value holds the bytes, possibly empty);
+//     wrongNode is a per-key `W`; neither set is a clean miss (`-`).
+//   - `O`: ok is `S` (stored), wrongNode is `W`; value is always nil —
+//     a set has nothing to echo back.
+type multiEntry struct {
+	value     []byte
+	ok        bool
+	wrongNode bool
 }
 
 // pendingRequest is one still-outstanding request: the channel its result
@@ -174,7 +194,7 @@ func (c *connection) get(key []byte) ([]byte, bool, error) {
 // The response markers (V/N/W) are identical either way — namespaced
 // commands answer exactly like their uppercase counterparts.
 func (c *connection) getNS(namespace, key []byte) ([]byte, bool, error) {
-	marker, value, _, err := c.request(func(tag uint32) []byte {
+	marker, value, _, _, err := c.request(func(tag uint32) []byte {
 		return appendGetFrame(namespace, key, c.tagged, tag)
 	})
 	if err != nil {
@@ -221,7 +241,7 @@ func (c *connection) set(key, value []byte, ttlSeconds int64) error {
 
 // setNS is set scoped to namespace (issue #105) — see getNS.
 func (c *connection) setNS(namespace, key, value []byte, ttlSeconds int64) error {
-	marker, _, _, err := c.request(func(tag uint32) []byte {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendSetFrame(namespace, key, value, ttlSeconds, c.tagged, tag)
 	})
 	if err != nil {
@@ -270,7 +290,7 @@ func (c *connection) delete(key []byte) (bool, error) {
 
 // deleteNS is delete scoped to namespace (issue #105) — see getNS.
 func (c *connection) deleteNS(namespace, key []byte) (bool, error) {
-	marker, _, _, err := c.request(func(tag uint32) []byte {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendDeleteFrame(namespace, key, c.tagged, tag)
 	})
 	if err != nil {
@@ -316,7 +336,7 @@ func appendDeleteFrame(namespace, key []byte, tagged bool, tag uint32) []byte {
 // straight to a replica's setNS call to forward the literal result
 // (client.go's Incr — replicas never replay `i`, see its doc comment).
 func (c *connection) incrNS(namespace, key []byte, delta int64) (value []byte, ttlSeconds int64, ok bool, err error) {
-	marker, raw, ttl, err := c.request(func(tag uint32) []byte {
+	marker, raw, ttl, _, err := c.request(func(tag uint32) []byte {
 		return appendIncrFrame(namespace, key, delta, c.tagged, tag)
 	})
 	if err != nil {
@@ -369,7 +389,7 @@ func appendIncrFrame(namespace, key []byte, delta int64, tagged bool, tag uint32
 // one); unlike incrNS there is no old TTL to preserve, since the caller
 // supplies the whole new value.
 func (c *connection) casNS(namespace, key, value []byte, cond string, ttlSeconds int64) (bool, error) {
-	marker, _, _, err := c.request(func(tag uint32) []byte {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendCasFrame(namespace, key, value, cond, ttlSeconds, c.tagged, tag)
 	})
 	if err != nil {
@@ -420,7 +440,7 @@ func appendCasFrame(namespace, key, value []byte, cond string, ttlSeconds int64,
 // mismatch or missing key answers `N` (false) — the same status a plain
 // delete already gives when there was nothing to delete.
 func (c *connection) deleteIfMatchesNS(namespace, key []byte, digest string) (bool, error) {
-	marker, _, _, err := c.request(func(tag uint32) []byte {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendDeleteIfMatchesFrame(namespace, key, digest, c.tagged, tag)
 	})
 	if err != nil {
@@ -460,7 +480,7 @@ func appendDeleteIfMatchesFrame(namespace, key []byte, digest string, tagged boo
 // flush everything": neither command is key-addressed), so the only
 // well-formed reply is `C`; anything else is a mismatch.
 func (c *connection) clear(namespace []byte) error {
-	marker, _, _, err := c.request(func(tag uint32) []byte {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendClearFrame(namespace, c.tagged, tag)
 	})
 	if err != nil {
@@ -475,7 +495,7 @@ func (c *connection) clear(namespace []byte) error {
 // clearAll drops every namespace, the default one included (issue #106's
 // `F` — see clear).
 func (c *connection) clearAll() error {
-	marker, _, _, err := c.request(func(tag uint32) []byte {
+	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendClearAllFrame(c.tagged, tag)
 	})
 	if err != nil {
@@ -504,6 +524,109 @@ func appendClearFrame(namespace []byte, tagged bool, tag uint32) []byte {
 func appendClearAllFrame(tagged bool, tag uint32) []byte {
 	frame := appendTagField([]byte("F"), tagged, tag)
 	return append(frame, '\n')
+}
+
+// multiGetNS sends the `m` frame — batched get (issues #128/#150/#151):
+// n keys under one round trip through the cache, instead of n
+// independent g/G frames. entries[i] answers keys[i], in request order
+// (docs/protocol.html#multi) — a batch never fails as a whole, so a
+// per-key `W` never turns into an error here; only a malformed reply or
+// a roster whose length disagrees with the request does (the streams
+// are desynced at that point, same as mismatch()).
+func (c *connection) multiGetNS(namespace []byte, keys [][]byte) ([]multiEntry, error) {
+	marker, _, _, entries, err := c.request(func(tag uint32) []byte {
+		return appendMultiGetFrame(namespace, keys, c.tagged, tag)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if marker != 'M' {
+		return nil, c.mismatch(marker)
+	}
+	if len(entries) != len(keys) {
+		desyncErr := connectionLost(fmt.Sprintf(
+			"multi-get response roster length %d does not match request key count %d (connection desynced)",
+			len(entries), len(keys)), nil)
+		c.poison(desyncErr)
+		return nil, desyncErr
+	}
+	return entries, nil
+}
+
+// appendMultiGetFrame builds an `m` request frame: `m <ns-len> <n>
+// <key-len-1> ... <key-len-n>[ <tag>]\n<ns><key-1>...<key-n>`
+// (docs/protocol.html#multi) — always namespaced, like appendIncrFrame,
+// never appendGetFrame's legacy-vs-namespaced split: `m` has no
+// pre-batching wire form to stay compatible with.
+func appendMultiGetFrame(namespace []byte, keys [][]byte, tagged bool, tag uint32) []byte {
+	frame := append([]byte("m "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(keys)), 10)
+	for _, key := range keys {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(key)), 10)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	for _, key := range keys {
+		frame = append(frame, key...)
+	}
+	return frame
+}
+
+// multiSetNS sends the `o` frame — batched set (issues #150/#151): n
+// keys stored under one round trip, one shared ttlSeconds for the whole
+// batch rather than per key (docs/protocol.html#multi). entries[i]
+// answers keys[i]/values[i], in request order; see multiGetNS for the
+// same "only a desynced roster is an error" stance.
+func (c *connection) multiSetNS(namespace []byte, keys, values [][]byte, ttlSeconds int64) ([]multiEntry, error) {
+	marker, _, _, entries, err := c.request(func(tag uint32) []byte {
+		return appendMultiSetFrame(namespace, keys, values, ttlSeconds, c.tagged, tag)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if marker != 'O' {
+		return nil, c.mismatch(marker)
+	}
+	if len(entries) != len(keys) {
+		desyncErr := connectionLost(fmt.Sprintf(
+			"multi-set response roster length %d does not match request key count %d (connection desynced)",
+			len(entries), len(keys)), nil)
+		c.poison(desyncErr)
+		return nil, desyncErr
+	}
+	return entries, nil
+}
+
+// appendMultiSetFrame builds an `o` request frame: `o <ns-len> <n>
+// <key-len-1> <value-len-1> ... <key-len-n> <value-len-n> [<ttl>][ <tag>]
+// \n<ns><key-1><value-1>...<key-n><value-n>` (docs/protocol.html#multi).
+// Always namespaced, same class as appendMultiGetFrame. The optional TTL
+// sits ahead of the tag, same convention as appendSetFrame's own [ttl].
+func appendMultiSetFrame(namespace []byte, keys, values [][]byte, ttlSeconds int64, tagged bool, tag uint32) []byte {
+	frame := append([]byte("o "), strconv.AppendInt(nil, int64(len(namespace)), 10)...)
+	frame = append(frame, ' ')
+	frame = strconv.AppendInt(frame, int64(len(keys)), 10)
+	for i, key := range keys {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(key)), 10)
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, int64(len(values[i])), 10)
+	}
+	if ttlSeconds >= 0 {
+		frame = append(frame, ' ')
+		frame = strconv.AppendInt(frame, ttlSeconds, 10)
+	}
+	frame = appendTagField(frame, tagged, tag)
+	frame = append(frame, '\n')
+	frame = append(frame, namespace...)
+	for i, key := range keys {
+		frame = append(frame, key...)
+		frame = append(frame, values[i]...)
+	}
+	return frame
 }
 
 // mismatch handles a well-formed response of the wrong kind (a `S`
@@ -566,20 +689,20 @@ func (c *connection) poison(err error) {
 // retry that follows it succeeds or not — bumps transientRetries. If the
 // budget is exhausted (every attempt answered `R`), returns ErrRetryable
 // without touching the connection's open/closed state.
-func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, int64, error) {
+func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, int64, []multiEntry, error) {
 	for attempt := 0; ; attempt++ {
-		marker, value, ttlSeconds, err := c.attemptRequest(build)
+		marker, value, ttlSeconds, entries, err := c.attemptRequest(build)
 		if err != nil {
-			return 0, nil, 0, err
+			return 0, nil, 0, nil, err
 		}
 		if marker != 'R' {
-			return marker, value, ttlSeconds, nil
+			return marker, value, ttlSeconds, entries, nil
 		}
 		if c.transientRetries != nil {
 			c.transientRetries.Add(1)
 		}
 		if attempt >= len(transientRetryDelays) {
-			return 0, nil, 0, retryableFailed(fmt.Sprintf(
+			return 0, nil, 0, nil, retryableFailed(fmt.Sprintf(
 				"request failed transiently (server answered R) %d times in a row", attempt+1))
 		}
 		time.Sleep(transientRetryDelays[attempt])
@@ -589,7 +712,7 @@ func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, int64
 // attemptRequest is a single request/response round trip — request's
 // retry-on-`R` loop body. See request for the retry semantics built on
 // top of this.
-func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte, int64, error) {
+func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte, int64, []multiEntry, error) {
 	resultCh := make(chan roundTripResult, 1)
 
 	c.mu.Lock()
@@ -599,7 +722,7 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 		if err == nil {
 			err = connectionLost("connection is closed", nil)
 		}
-		return 0, nil, 0, err
+		return 0, nil, 0, nil, err
 	}
 	c.lastUsed = time.Now()
 	tag := c.nextTag
@@ -623,14 +746,14 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 	if writeErr != nil {
 		err := connectionLost("connection failed", writeErr)
 		c.poison(err)
-		return 0, nil, 0, err
+		return 0, nil, 0, nil, err
 	}
 
 	result := <-resultCh
 	if result.err != nil {
-		return 0, nil, 0, result.err
+		return 0, nil, 0, nil, result.err
 	}
-	return result.marker, result.value, result.ttlSeconds, nil
+	return result.marker, result.value, result.ttlSeconds, result.entries, nil
 }
 
 // readLoop consumes responses off the wire for as long as the connection
@@ -639,7 +762,7 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 // may read from conn.
 func (c *connection) readLoop() {
 	for {
-		marker, value, tag, ttlSeconds, err := c.readOneResponse()
+		marker, value, tag, ttlSeconds, entries, err := c.readOneResponse()
 		if err != nil {
 			// A malformed/unexpected frame is already classified as
 			// ErrProtocol by readOneResponse — pass it through as-is
@@ -712,7 +835,7 @@ func (c *connection) readLoop() {
 			return
 		}
 
-		req.ch <- roundTripResult{marker: marker, value: value, ttlSeconds: ttlSeconds}
+		req.ch <- roundTripResult{marker: marker, value: value, ttlSeconds: ttlSeconds, entries: entries}
 	}
 }
 
@@ -721,16 +844,16 @@ func (c *connection) readLoop() {
 // non-busy responses on a tagged connection; callers gate on c.tagged the
 // same way readOneResponse itself does. ttlSeconds is only meaningful for
 // an `I` response (issue #129's INCR) — see roundTripResult's doc comment.
-func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, ttlSeconds int64, err error) {
+func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, ttlSeconds int64, entries []multiEntry, err error) {
 	marker, err = c.reader.ReadByte()
 	if err != nil {
-		return 0, nil, 0, 0, err
+		return 0, nil, 0, 0, nil, err
 	}
 	switch marker {
 	case 'V':
 		header, err := readLine(c.reader)
 		if err != nil {
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
 		// Untagged wire: `V <len>\n`. Tagged: `V <len> <seq>\n`
 		// (echoed response tags). After the marker byte the header still
@@ -741,26 +864,26 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 			wantFields = 2
 		}
 		if len(fields) != wantFields {
-			return 0, nil, 0, 0, protocolError("invalid value header in response")
+			return 0, nil, 0, 0, nil, protocolError("invalid value header in response")
 		}
 		// Lengths beyond the server's own 1 MiB request cap are protocol
 		// garbage — reject before allocating.
 		length, err := strconv.Atoi(fields[0])
 		if err != nil || length < 0 || length > maxValueLength {
-			return 0, nil, 0, 0, protocolError("invalid value length in response")
+			return 0, nil, 0, 0, nil, protocolError("invalid value length in response")
 		}
 		var responseTag uint32
 		if c.tagged {
 			responseTag, err = parseTag(fields[1])
 			if err != nil {
-				return 0, nil, 0, 0, err
+				return 0, nil, 0, 0, nil, err
 			}
 		}
 		value := make([]byte, length)
 		if _, err := readFull(c.reader, value); err != nil {
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
-		return marker, value, responseTag, 0, nil
+		return marker, value, responseTag, 0, nil, nil
 	// `I` is INCR's success response (issue #129): `I <value-length>
 	// [<ttl-seconds>] [<tag>]\n<value>` — the same "trailing optional
 	// field(s), tagged-mode-aware" shape S's own request-side [ttl] [tag]
@@ -773,7 +896,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	case 'I':
 		header, err := readLine(c.reader)
 		if err != nil {
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
 		fields := strings.Fields(header)
 		minFields, maxFields := 1, 2
@@ -781,11 +904,11 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 			minFields, maxFields = 2, 3
 		}
 		if len(fields) < minFields || len(fields) > maxFields {
-			return 0, nil, 0, 0, protocolError("invalid incr header in response")
+			return 0, nil, 0, 0, nil, protocolError("invalid incr header in response")
 		}
 		length, err := strconv.Atoi(fields[0])
 		if err != nil || length < 0 || length > maxValueLength {
-			return 0, nil, 0, 0, protocolError("invalid incr value length in response")
+			return 0, nil, 0, 0, nil, protocolError("invalid incr value length in response")
 		}
 		trailing := fields[1:]
 		hasTTL := len(trailing) == maxFields-1
@@ -793,7 +916,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if hasTTL {
 			responseTTL, err = strconv.ParseInt(trailing[0], 10, 64)
 			if err != nil || responseTTL < 0 {
-				return 0, nil, 0, 0, protocolError("invalid incr ttl in response")
+				return 0, nil, 0, 0, nil, protocolError("invalid incr ttl in response")
 			}
 			trailing = trailing[1:]
 		}
@@ -801,28 +924,134 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if c.tagged {
 			responseTag, err = parseTag(trailing[0])
 			if err != nil {
-				return 0, nil, 0, 0, err
+				return 0, nil, 0, 0, nil, err
 			}
 		}
 		value := make([]byte, length)
 		if _, err := readFull(c.reader, value); err != nil {
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
-		return marker, value, responseTag, responseTTL, nil
+		return marker, value, responseTag, responseTTL, nil, nil
+	// `M` is multi-get's response (issues #128/#150/#151): `M <n>
+	// <result-1> ... <result-n>[ <tag>]\n<hit values, concatenated in
+	// request order>` (docs/protocol.html#multi). Unlike V/I this has a
+	// variable number of header fields (n of them), so it can't reuse
+	// those cases' fixed wantFields shape: n is read first, then exactly
+	// n roster tokens are expected, then (tagged mode) one more for the
+	// tag — anything else is a malformed header. Each token is a decimal
+	// byte length (a hit — read that many body bytes next, in order),
+	// "-" (a clean miss), or "W" (this key's own wrong-node). The header
+	// line is read whole before any body byte, so a lying n can never
+	// cause an out-of-bounds read — it only ever fails the wantFields
+	// check against the fields readLine's bounded read actually
+	// delivered.
+	case 'M':
+		header, err := readLine(c.reader)
+		if err != nil {
+			return 0, nil, 0, 0, nil, err
+		}
+		fields := strings.Fields(header)
+		if len(fields) < 1 {
+			return 0, nil, 0, 0, nil, protocolError("invalid multi-get header in response")
+		}
+		count, err := strconv.Atoi(fields[0])
+		if err != nil || count < 0 {
+			return 0, nil, 0, 0, nil, protocolError("invalid multi-get count in response")
+		}
+		wantFields := 1 + count
+		if c.tagged {
+			wantFields++
+		}
+		if len(fields) != wantFields {
+			return 0, nil, 0, 0, nil, protocolError("invalid multi-get header in response")
+		}
+		var responseTag uint32
+		if c.tagged {
+			responseTag, err = parseTag(fields[1+count])
+			if err != nil {
+				return 0, nil, 0, 0, nil, err
+			}
+		}
+		results := make([]multiEntry, count)
+		for i, token := range fields[1 : 1+count] {
+			switch token {
+			case "-":
+				results[i] = multiEntry{}
+			case "W":
+				results[i] = multiEntry{wrongNode: true}
+			default:
+				length, err := strconv.Atoi(token)
+				if err != nil || length < 0 || length > maxValueLength {
+					return 0, nil, 0, 0, nil, protocolError("invalid multi-get result length in response")
+				}
+				hit := make([]byte, length)
+				if _, err := readFull(c.reader, hit); err != nil {
+					return 0, nil, 0, 0, nil, err
+				}
+				results[i] = multiEntry{value: hit, ok: true}
+			}
+		}
+		return marker, nil, responseTag, 0, results, nil
+	// `O` is multi-set's response (issues #150/#151): `O <n> <result-1>
+	// ... <result-n>[ <tag>]\n` — no body, unlike `M`'s hit values (a set
+	// has nothing to echo back). Each token is "S" (stored) or "W"
+	// (wrong node); parsing otherwise mirrors `M` above. Never confused
+	// with the `On`/`OnT` identify reply: identify.go handles that before
+	// a connection exists, and no other request ever answers with a
+	// leading 'O'.
+	case 'O':
+		header, err := readLine(c.reader)
+		if err != nil {
+			return 0, nil, 0, 0, nil, err
+		}
+		fields := strings.Fields(header)
+		if len(fields) < 1 {
+			return 0, nil, 0, 0, nil, protocolError("invalid multi-set header in response")
+		}
+		count, err := strconv.Atoi(fields[0])
+		if err != nil || count < 0 {
+			return 0, nil, 0, 0, nil, protocolError("invalid multi-set count in response")
+		}
+		wantFields := 1 + count
+		if c.tagged {
+			wantFields++
+		}
+		if len(fields) != wantFields {
+			return 0, nil, 0, 0, nil, protocolError("invalid multi-set header in response")
+		}
+		var responseTag uint32
+		if c.tagged {
+			responseTag, err = parseTag(fields[1+count])
+			if err != nil {
+				return 0, nil, 0, 0, nil, err
+			}
+		}
+		results := make([]multiEntry, count)
+		for i, token := range fields[1 : 1+count] {
+			switch token {
+			case "S":
+				results[i] = multiEntry{ok: true}
+			case "W":
+				results[i] = multiEntry{wrongNode: true}
+			default:
+				return 0, nil, 0, 0, nil, protocolError("invalid multi-set result token in response")
+			}
+		}
+		return marker, nil, responseTag, 0, results, nil
 	case 'B':
 		// Busy is always untagged (echoed response tags) — it's an
 		// unsolicited response sent whether or not this connection
 		// negotiated tags.
 		if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
-		return marker, nil, 0, 0, nil
+		return marker, nil, 0, 0, nil, nil
 	case 'S', 'D', 'N', 'W', 'C', 'R', 'T':
 		if !c.tagged {
 			if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
-				return 0, nil, 0, 0, err
+				return 0, nil, 0, 0, nil, err
 			}
-			return marker, nil, 0, 0, nil
+			return marker, nil, 0, 0, nil, nil
 		}
 		// Tagged wire: `S <seq>\n` etc. (echoed response tags) — `C`
 		// (issue #106's clear/flush ack), `R` (issue #125's retryable-error
@@ -831,20 +1060,20 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		// not-numeric/overflow status) included.
 		header, err := readLine(c.reader)
 		if err != nil {
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
 		header = strings.TrimSuffix(header, "\n")
 		field, ok := strings.CutPrefix(header, " ")
 		if !ok {
-			return 0, nil, 0, 0, protocolError("response is missing its tag (connection desynced)")
+			return 0, nil, 0, 0, nil, protocolError("response is missing its tag (connection desynced)")
 		}
 		responseTag, err := parseTag(field)
 		if err != nil {
-			return 0, nil, 0, 0, err
+			return 0, nil, 0, 0, nil, err
 		}
-		return marker, nil, responseTag, 0, nil
+		return marker, nil, responseTag, 0, nil, nil
 	default:
-		return 0, nil, 0, 0, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
+		return 0, nil, 0, 0, nil, protocolError(fmt.Sprintf("unexpected response from server: %c", marker))
 	}
 }
 
