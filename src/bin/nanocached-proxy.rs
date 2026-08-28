@@ -701,6 +701,7 @@ async fn connect_upstream(
     tls_connector: &Option<TlsConnector>,
 ) -> io::Result<UpstreamStream> {
     let stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
     match tls_connector {
         None => Ok(MaybeTls::Plain(stream)),
         Some(connector) => {
@@ -3220,6 +3221,7 @@ async fn serve(
             Ok(accepted) => accepted,
             Err(error) => return Err(error),
         };
+        let _ = stream.set_nodelay(true);
 
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             // Over the connection budget: answer busy and move on, the
