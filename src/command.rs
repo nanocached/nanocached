@@ -1,6 +1,6 @@
 use crate::cache::{Cache, CasCondition, CasResult, IncrResult, parse_decimal_i64};
 use crate::key::Key;
-use crate::response::Response;
+use crate::response::{MultiEntry, Response};
 use bytes::{Buf, Bytes, BytesMut};
 use std::time::Duration;
 
@@ -23,6 +23,27 @@ pub enum Command {
     },
     Get {
         key: Key,
+    },
+    /// `m <ns-len> <n> <key-len-1> ... <key-len-n> [tag]\n<ns><key-1>...<key-n>`
+    /// (issue #128 measurement prototype): batches `n` gets under one
+    /// wire frame and one cache-actor round trip, instead of `n`
+    /// independent `g` frames. Always namespaced — one namespace per
+    /// frame, since routing keys on `(namespace, key)` means a
+    /// multi-namespace frame couldn't route as a single unit anyway, and
+    /// every real many-op consumer (Django's prefix, Keyv's namespace, a
+    /// Spring cache name) is already single-namespace.
+    ///
+    /// The connection handler (`src/server.rs`), not `execute`, is
+    /// responsible for per-key wrong-node filtering before this reaches
+    /// the cache actor — see its `Command::MultiGet` arm. `execute` here
+    /// only ever answers `Value`/`Miss` per key, in `keys`' order.
+    ///
+    /// Prototype only: no retry/hedge/read-repair. Benchmarks the
+    /// question this issue exists to answer; not shipped as a stable
+    /// wire op unless the measurement says so.
+    MultiGet {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
     },
     Set {
         key: Key,
@@ -226,6 +247,20 @@ impl Command {
                 Some(value) => Response::Value(value),
                 None => Response::NotFound,
             },
+
+            Self::MultiGet { namespace, keys } => {
+                let entries = keys
+                    .into_iter()
+                    .map(|name| {
+                        let key = Key::new(namespace.clone(), name);
+                        match cache.get(&key) {
+                            Some(value) => MultiEntry::Value(value),
+                            None => MultiEntry::Miss,
+                        }
+                    })
+                    .collect();
+                Response::Multi(entries)
+            }
             Self::Set { key, value, ttl } | Self::HandoffSet { key, value, ttl } => {
                 match ttl {
                     Some(ttl) => cache.set_with_ttl(key, value, ttl),
@@ -496,6 +531,65 @@ fn parse_with_mode(
                 },
                 tag,
             ))
+        }
+
+        // Issue #128 measurement prototype: `m <ns-len> <n>
+        // <key-len-1>...<key-len-n> [tag]\n<ns><key-1>...<key-n>` — see
+        // `Command::MultiGet`'s doc comment. `n` and every `<key-len-i>`
+        // are read via `parts.next()`, which fails fast (`?`) the moment
+        // a claimed count outruns the actual header fields, so a header
+        // lying about a huge `n` never drives a matching-size allocation
+        // — `key_lengths` only ever grows to as many fields as are
+        // genuinely present in the (already length-bounded) header.
+        b"m" => {
+            let namespace_length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+            let count = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+
+            if count == 0 {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let mut key_lengths = Vec::new();
+            for _ in 0..count {
+                let length = parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?;
+
+                if length == 0 {
+                    return Err(ParseError::EmptyKey);
+                }
+
+                key_lengths.push(length);
+            }
+
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let namespace_start = header_end + 1;
+            let mut cursor = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let mut key_spans = Vec::with_capacity(key_lengths.len());
+
+            for length in key_lengths {
+                let start = cursor;
+                cursor = start.checked_add(length).ok_or(ParseError::InvalidLength)?;
+                key_spans.push((start, cursor));
+            }
+
+            if input.len() < cursor {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(cursor).freeze();
+            let namespace = frame.slice(namespace_start..namespace_start + namespace_length);
+            let keys = key_spans
+                .into_iter()
+                .map(|(start, end)| frame.slice(start..end))
+                .collect();
+
+            Ok((Command::MultiGet { namespace, keys }, tag))
         }
 
         // Issue #129: `i <ns-len> <key-len> <delta> [tag]\n<ns><key>` —
@@ -2459,5 +2553,114 @@ mod tests {
         let mut input = buf(b"X 6 0\nnode-b");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    // Issue #128 measurement prototype: `m` (multi-get).
+
+    #[test]
+    fn parses_an_untagged_multi_get_command() {
+        let mut input = buf(b"m 0 3 1 2 2\nabcde");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::MultiGet {
+                namespace: Bytes::new(),
+                keys: vec![
+                    Bytes::from_static(b"a"),
+                    Bytes::from_static(b"bc"),
+                    Bytes::from_static(b"de"),
+                ],
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_a_namespaced_tagged_multi_get_command() {
+        let mut input = buf(b"m 2 2 1 2 9\nnsxyz");
+
+        assert_eq!(
+            parse_tagged(&mut input),
+            Ok((
+                Command::MultiGet {
+                    namespace: Bytes::from_static(b"ns"),
+                    keys: vec![Bytes::from_static(b"x"), Bytes::from_static(b"yz")],
+                },
+                Some(9),
+            ))
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parse_tagged_rejects_a_multi_get_without_a_tag() {
+        let mut input = buf(b"m 0 1 1\na");
+        assert_eq!(parse_tagged(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn multi_get_leaves_input_untouched_when_the_body_is_incomplete() {
+        let original = b"m 0 2 3 3\nabc".to_vec();
+        let mut input = buf(&original);
+
+        assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
+        assert_eq!(&input[..], &original[..]);
+    }
+
+    #[test]
+    fn rejects_a_multi_get_with_zero_keys() {
+        let mut input = buf(b"m 0 0\n");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn rejects_a_multi_get_with_an_empty_key_length() {
+        let mut input = buf(b"m 0 2 1 0\na");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyKey));
+    }
+
+    #[test]
+    fn rejects_a_multi_get_whose_claimed_count_outruns_the_header() {
+        // A header lying about `n` fails on the first missing field,
+        // never on an oversized allocation for the claimed count.
+        let mut input = buf(b"m 0 999999999 1\na");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn multi_get_executes_as_a_value_or_miss_per_key_in_request_order() {
+        let mut cache = Cache::new(1024);
+        cache.set(key(b"a"), Bytes::from_static(b"1"));
+        cache.set(key(b"c"), Bytes::from_static(b"3"));
+
+        let command = Command::MultiGet {
+            namespace: Bytes::new(),
+            keys: vec![
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c"),
+            ],
+        };
+
+        assert_eq!(
+            command.execute(&mut cache),
+            Response::Multi(vec![
+                MultiEntry::Value(Bytes::from_static(b"1")),
+                MultiEntry::Miss,
+                MultiEntry::Value(Bytes::from_static(b"3")),
+            ])
+        );
+    }
+
+    #[test]
+    fn multi_value_encodes_hits_misses_and_wrong_node_entries() {
+        let response = Response::Multi(vec![
+            MultiEntry::Value(Bytes::from_static(b"ab")),
+            MultiEntry::Miss,
+            MultiEntry::WrongNode,
+        ]);
+
+        assert_eq!(response.encode(), b"M 3 2 - W\nab");
+        assert_eq!(response.encode_with_tag(9), b"M 3 2 - W 9\nab");
     }
 }

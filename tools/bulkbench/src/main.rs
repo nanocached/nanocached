@@ -1,0 +1,285 @@
+// Issue #128 measurement prototype: throwaway benchmark comparing a
+// client-side loop of single-key `G` frames against a batched `m`
+// (multi-get) frame, direct-to-node and via the proxy. Not a shipped
+// tool — its only job is producing the numbers #128's decision rests on.
+// Speaks the wire directly (no SDK): the loop arm needs no ownership
+// routing at all when pointed at a single node, and the proxy's own
+// owner-grouping is exactly the fan-out path this issue's "does bulk pay
+// through the proxy" question is about, so nothing here needs to
+// re-derive HRW placement — see the plan's "why loopback is a sufficient
+// screen" section for why a single node (zero routing) and the proxy
+// (realistic routing) are the two cells worth measuring, without a
+// third "raw multi-node" cell in between.
+use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+fn usage() -> ! {
+    eprintln!(
+        "usage:\n  \
+         bulkbench preload <addr> <keyspace> <value-size>\n  \
+         bulkbench run <addr> <loop|bulk> <keyspace> <batch> <concurrency> <duration-secs>\n\n\
+         Optional env: BULKBENCH_SECRET (sent as an untagged `A` before either subcommand)."
+    );
+    std::process::exit(2);
+}
+
+fn key_bytes(index: u64) -> Vec<u8> {
+    format!("bk:{index}").into_bytes()
+}
+
+/// xorshift64* — good enough for picking benchmark keys, and avoids
+/// pulling in the `rand` crate for a throwaway tool. Deterministic given
+/// the same seed, which is what makes a re-run's numbers comparable
+/// (see the plan's verification step 4).
+struct Lcg(u64);
+
+impl Lcg {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+async fn authenticate(stream: &mut TcpStream) {
+    let Ok(secret) = env::var("BULKBENCH_SECRET") else {
+        return;
+    };
+    let mut frame = format!("A {}\n", secret.len()).into_bytes();
+    frame.extend_from_slice(secret.as_bytes());
+    stream.write_all(&frame).await.expect("write auth frame");
+
+    let mut reader = BufReader::new(&mut *stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read auth reply");
+    assert!(
+        line.starts_with("On"),
+        "auth rejected: {}",
+        line.trim_end()
+    );
+}
+
+fn encode_get(key: &[u8]) -> Vec<u8> {
+    let mut frame = format!("G {}\n", key.len()).into_bytes();
+    frame.extend_from_slice(key);
+    frame
+}
+
+fn encode_set(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut frame = format!("S {} {}\n", key.len(), value.len()).into_bytes();
+    frame.extend_from_slice(key);
+    frame.extend_from_slice(value);
+    frame
+}
+
+fn encode_multi_get(keys: &[Vec<u8>]) -> Vec<u8> {
+    let mut header = format!("m 0 {}", keys.len());
+    for key in keys {
+        header.push_str(&format!(" {}", key.len()));
+    }
+    header.push('\n');
+    let mut frame = header.into_bytes();
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
+    frame
+}
+
+/// Reads one `G` reply (`V <len>\n<value>` or `N\n`) and discards the
+/// value bytes — the benchmark only needs the round trip's timing and a
+/// byte count, not the payload itself.
+async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut R) -> bool {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read reply header");
+    let line = line.trim_end();
+
+    if let Some(length) = line.strip_prefix("V ") {
+        let length: usize = length.parse().expect("bad value length");
+        let mut value = vec![0u8; length];
+        reader.read_exact(&mut value).await.expect("read value");
+        true
+    } else if line == "N" {
+        false
+    } else {
+        panic!("unexpected reply to G: {line:?}");
+    }
+}
+
+/// Reads one `m` reply (`M <n> <r-1>...<r-n>\n<hit values>`), discards
+/// every value, and returns how many of the `n` entries were hits — used
+/// only to sanity-check the batch against what was requested.
+async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut R) -> (usize, usize) {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read reply header");
+    let line = line.trim_end();
+    let mut fields = line.split(' ');
+    assert_eq!(fields.next(), Some("M"), "unexpected reply to m: {line:?}");
+    let count: usize = fields
+        .next()
+        .expect("missing M count field")
+        .parse()
+        .expect("bad M count field");
+
+    let mut total_bytes = 0usize;
+    let mut hits = 0usize;
+    for _ in 0..count {
+        match fields.next().expect("missing M roster token") {
+            "-" | "W" => {}
+            length => {
+                let length: usize = length.parse().expect("bad M roster length");
+                total_bytes += length;
+                hits += 1;
+            }
+        }
+    }
+
+    let mut body = vec![0u8; total_bytes];
+    reader.read_exact(&mut body).await.expect("read M values");
+    (count, hits)
+}
+
+fn percentile(sorted_ms: &[f64], p: f64) -> f64 {
+    if sorted_ms.is_empty() {
+        return 0.0;
+    }
+    let index = ((sorted_ms.len() - 1) as f64 * p).round() as usize;
+    sorted_ms[index]
+}
+
+async fn preload(args: &[String]) {
+    let [addr, keyspace, value_size] = args else {
+        usage()
+    };
+    let keyspace: u64 = keyspace.parse().expect("bad keyspace");
+    let value_size: usize = value_size.parse().expect("bad value-size");
+    let value = vec![b'x'; value_size];
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    authenticate(&mut stream).await;
+    let mut reader = BufReader::new(stream);
+
+    for index in 0..keyspace {
+        let frame = encode_set(&key_bytes(index), &value);
+        reader.get_mut().write_all(&frame).await.expect("write set");
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read set reply");
+        assert_eq!(line.trim_end(), "S", "set failed for key {index}");
+    }
+
+    println!("{{\"preloaded\":{keyspace},\"value_size\":{value_size}}}");
+}
+
+async fn run(args: &[String]) {
+    let [addr, arm, keyspace, batch, concurrency, duration] = args else {
+        usage()
+    };
+    let keyspace: u64 = keyspace.parse().expect("bad keyspace");
+    let batch: usize = batch.parse().expect("bad batch");
+    let concurrency: usize = concurrency.parse().expect("bad concurrency");
+    let duration = Duration::from_secs_f64(duration.parse().expect("bad duration"));
+    let bulk = match arm.as_str() {
+        "loop" => false,
+        "bulk" => true,
+        _ => usage(),
+    };
+
+    let deadline = Instant::now() + duration;
+    let batches = Arc::new(AtomicU64::new(0));
+    let keys_done = Arc::new(AtomicU64::new(0));
+    let hits_done = Arc::new(AtomicU64::new(0));
+    let latencies_ms = Arc::new(StdMutex::new(Vec::<f64>::new()));
+
+    let mut workers = Vec::with_capacity(concurrency);
+    for worker in 0..concurrency {
+        let addr = addr.clone();
+        let batches = Arc::clone(&batches);
+        let keys_done = Arc::clone(&keys_done);
+        let hits_done = Arc::clone(&hits_done);
+        let latencies_ms = Arc::clone(&latencies_ms);
+
+        workers.push(tokio::spawn(async move {
+            let mut stream = TcpStream::connect(&addr).await.expect("connect");
+            authenticate(&mut stream).await;
+            let mut reader = BufReader::new(stream);
+            let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15 ^ (worker as u64 + 1));
+            let mut local_latencies = Vec::new();
+            let mut local_hits = 0u64;
+
+            while Instant::now() < deadline {
+                let keys: Vec<Vec<u8>> = (0..batch)
+                    .map(|_| key_bytes(rng.next() % keyspace))
+                    .collect();
+
+                let start = Instant::now();
+                if bulk {
+                    let frame = encode_multi_get(&keys);
+                    reader.get_mut().write_all(&frame).await.expect("write m");
+                    let (count, hits) = read_multi_reply(&mut reader).await;
+                    assert_eq!(count, keys.len(), "M roster size mismatch");
+                    local_hits += hits as u64;
+                } else {
+                    let mut frame = Vec::new();
+                    for key in &keys {
+                        frame.extend_from_slice(&encode_get(key));
+                    }
+                    reader.get_mut().write_all(&frame).await.expect("write g");
+                    for _ in &keys {
+                        if read_get_reply(&mut reader).await {
+                            local_hits += 1;
+                        }
+                    }
+                }
+                local_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
+
+                batches.fetch_add(1, Ordering::Relaxed);
+                keys_done.fetch_add(batch as u64, Ordering::Relaxed);
+            }
+
+            hits_done.fetch_add(local_hits, Ordering::Relaxed);
+            latencies_ms.lock().unwrap().extend(local_latencies);
+        }));
+    }
+
+    for worker in workers {
+        worker.await.expect("worker task panicked");
+    }
+
+    let mut latencies_ms = Arc::try_unwrap(latencies_ms)
+        .expect("all workers finished")
+        .into_inner()
+        .expect("mutex not poisoned");
+    latencies_ms.sort_by(|a, b| a.partial_cmp(b).expect("no NaN latencies"));
+
+    let total_keys = keys_done.load(Ordering::Relaxed);
+    let total_hits = hits_done.load(Ordering::Relaxed);
+    println!(
+        "{{\"arm\":\"{arm}\",\"batch\":{batch},\"concurrency\":{concurrency},\
+         \"batches\":{},\"keys\":{total_keys},\"keys_per_sec\":{:.0},\
+         \"hit_rate\":{:.4},\
+         \"batch_p50_ms\":{:.3},\"batch_p99_ms\":{:.3}}}",
+        batches.load(Ordering::Relaxed),
+        total_keys as f64 / duration.as_secs_f64(),
+        total_hits as f64 / total_keys.max(1) as f64,
+        percentile(&latencies_ms, 0.50),
+        percentile(&latencies_ms, 0.99),
+    );
+}
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("preload") => preload(&args[2..]).await,
+        Some("run") => run(&args[2..]).await,
+        _ => usage(),
+    }
+}

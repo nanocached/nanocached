@@ -945,6 +945,13 @@ enum Request {
         namespace: Bytes,
     },
     ClearAll,
+    /// Issue #128 measurement prototype: `m` (batched get). Always
+    /// namespaced, same reasoning as `Incr`/CAS — no pre-namespace legacy
+    /// form. See `dispatch_request`'s arm for the owner-grouping fan-out.
+    MultiGet {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
+    },
 }
 
 /// Issue #141: `k`'s (and `x`'s) `<cond>` field, decoded. Independent
@@ -1163,6 +1170,37 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
                 Request::Delete { namespace, key }
             };
             Ok(ParseOutcome::Ready(request, tag))
+        }
+
+        // Issue #128 measurement prototype: `m <ns-len> <n>
+        // <key-len-1>...<key-len-n> [tag]` — every field up to the
+        // optional tag is a plain length, so `split_tag` (which parses
+        // every field as one) handles the whole header in one call,
+        // unlike `i`/`k`'s hand-peeled non-length fields.
+        "m" => {
+            let (lengths, tag) = split_tag(&fields)?;
+            let [namespace_length, count, key_lengths @ ..] = lengths.as_slice() else {
+                return Err(invalid("bad multi-get header"));
+            };
+            if *count == 0 || key_lengths.len() != *count {
+                return Err(invalid("bad multi-get header"));
+            }
+            if key_lengths.contains(&0) {
+                return Err(invalid("empty key in multi-get"));
+            }
+            let body_length = key_lengths
+                .iter()
+                .try_fold(*namespace_length, |sum, &length| sum.checked_add(length))
+                .ok_or_else(|| invalid("frame length overflow"))?;
+            let body = body!(body_length);
+            let namespace = body.slice(..*namespace_length);
+            let mut cursor = *namespace_length;
+            let mut keys = Vec::with_capacity(key_lengths.len());
+            for &length in key_lengths {
+                keys.push(body.slice(cursor..cursor + length));
+                cursor += length;
+            }
+            Ok(ParseOutcome::Ready(Request::MultiGet { namespace, keys }, tag))
         }
 
         "S" | "s" => {
@@ -1389,6 +1427,22 @@ enum Expect {
     /// or `W`/`E`. `x`'s reply reuses `Expect::Deleted` unchanged (`D`/`N`
     /// is already exactly that shape).
     CasSet,
+    /// Issue #128 measurement prototype: `M <n> <r-1>...<r-n> <tag>` +
+    /// concatenated hit values, or `E`. Parsed specially in `read_reply`
+    /// (a variable roster, unlike every other reply's fixed field count),
+    /// never reaches the generic `(marker, fields)` match there.
+    Multi,
+}
+
+/// One key's outcome inside a backend's `M` reply (issue #128 measurement
+/// prototype) — independent reimplementation of the node's
+/// `crate::response::MultiEntry` (this binary shares no modules with the
+/// node, see `CasCondition`'s doc comment for the established policy).
+#[derive(Debug, Clone, PartialEq)]
+enum ProxyMultiEntry {
+    Value(Bytes),
+    Miss,
+    WrongNode,
 }
 
 /// One reply from a node, already tag-verified.
@@ -1408,6 +1462,9 @@ enum NodeReply {
     Deleted,
     Cleared,
     WrongNode,
+    /// Issue #128 measurement prototype: `M`'s per-key roster, already
+    /// decoded — see `Expect::Multi`.
+    Multi(Vec<ProxyMultiEntry>),
     /// `E`, or a reply that doesn't fit `Expect` — the connection is
     /// dropped by the reader either way.
     Error,
@@ -1593,6 +1650,70 @@ async fn read_reply<S: AsyncRead + Unpin>(
     }
 
     let fields: Vec<&str> = parts.collect();
+
+    // Issue #128 measurement prototype: `M`'s roster is variable-length
+    // (`n` per-key tokens, not `V`/`I`'s fixed field count), so it's
+    // decoded here rather than joining the generic `(marker, fields)`
+    // match below.
+    if marker == "M" {
+        let (tag_field, rest) = fields.split_last().ok_or_else(|| invalid("malformed M reply"))?;
+        if *tag_field != tag.to_string() {
+            return Err(invalid(&format!(
+                "backend reply tag mismatch: expected {tag}, got {tag_field}"
+            )));
+        }
+
+        let (count_field, roster) = rest.split_first().ok_or_else(|| invalid("malformed M reply"))?;
+        let count = parse_length_field(count_field)?;
+        if roster.len() != count {
+            return Err(invalid("M roster length does not match its own count"));
+        }
+
+        enum RosterToken {
+            Value(usize),
+            Miss,
+            WrongNode,
+        }
+
+        let mut total_value_bytes: usize = 0;
+        let tokens = roster
+            .iter()
+            .map(|token| match *token {
+                "-" => Ok(RosterToken::Miss),
+                "W" => Ok(RosterToken::WrongNode),
+                length => {
+                    let length = parse_length_field(length)?;
+                    total_value_bytes = total_value_bytes
+                        .checked_add(length)
+                        .ok_or_else(|| invalid("M roster value length overflow"))?;
+                    Ok(RosterToken::Value(length))
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        if total_value_bytes > MAX_REQUEST_SIZE {
+            return Err(invalid("M reply values exceed the request-size limit"));
+        }
+
+        read_exact_into(stream, buf, total_value_bytes).await?;
+        let mut body = buf.split_to(total_value_bytes).freeze();
+
+        let entries = tokens
+            .into_iter()
+            .map(|token| match token {
+                RosterToken::Value(length) => ProxyMultiEntry::Value(body.split_to(length)),
+                RosterToken::Miss => ProxyMultiEntry::Miss,
+                RosterToken::WrongNode => ProxyMultiEntry::WrongNode,
+            })
+            .collect();
+
+        let reply = NodeReply::Multi(entries);
+        if !matches!(expect, Expect::Multi) {
+            return Err(invalid("backend reply does not fit the request"));
+        }
+        return Ok(reply);
+    }
+
     // Issue #129: `I`'s header carries an extra optional `<ttl>` field
     // ahead of the tag — same "present-but-unlabeled trailing field"
     // shape `S`'s own optional TTL has, but backend connections are
@@ -1668,6 +1789,7 @@ async fn read_reply<S: AsyncRead + Unpin>(
                 NodeReply::Stored | NodeReply::NotFound | NodeReply::WrongNode | NodeReply::Error,
                 Expect::CasSet
             )
+            | (NodeReply::Error, Expect::Multi)
     );
     if !shape_ok {
         return Err(invalid("backend reply does not fit the request"));
@@ -1686,6 +1808,24 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     };
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
+    frame
+}
+
+/// Issue #128 measurement prototype: one sub-frame per owner, carrying
+/// only that owner's slice of the original request's keys — see
+/// `dispatch_request`'s `Request::MultiGet` arm.
+fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
+    let key_lengths: String = keys
+        .iter()
+        .map(|key| format!(" {}", key.len()))
+        .collect();
+    let mut frame =
+        format!("m {} {}{key_lengths} {TAG_PLACEHOLDER}\n", namespace.len(), keys.len())
+            .into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
     frame
 }
 
@@ -1978,6 +2118,41 @@ fn respond_value(value: &[u8], tag: Option<u32>) -> Vec<u8> {
     framed
 }
 
+/// Issue #128 measurement prototype: `M <n> <r-1>...<r-n> [tag]\n<hit
+/// values, concatenated>` — the client-facing reassembly of every group's
+/// `finish_multi_get` result, mirroring the node's own `Response::Multi`
+/// wire form (`src/response.rs`) byte-for-byte.
+fn respond_multi(entries: &[ProxyMultiEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("M {}", entries.len());
+    let mut values_len = 0;
+
+    for entry in entries {
+        match entry {
+            ProxyMultiEntry::Value(value) => {
+                header.push(' ');
+                header.push_str(&value.len().to_string());
+                values_len += value.len();
+            }
+            ProxyMultiEntry::Miss => header.push_str(" -"),
+            ProxyMultiEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+    if let Some(tag) = tag {
+        header.push(' ');
+        header.push_str(&tag.to_string());
+    }
+    header.push('\n');
+
+    let mut framed = Vec::with_capacity(header.len() + values_len);
+    framed.extend_from_slice(header.as_bytes());
+    for entry in entries {
+        if let ProxyMultiEntry::Value(value) = entry {
+            framed.extend_from_slice(value);
+        }
+    }
+    framed
+}
+
 /// Issue #129: `INCR`'s success reply — `I <len> [ttl] [tag]\n<value>`,
 /// mirroring `Response::Incremented`'s own wire form on the node side
 /// (`src/response.rs`).
@@ -2229,6 +2404,64 @@ async fn dispatch_request(
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
+        // Issue #128 measurement prototype: group keys by primary owner
+        // — this is the one dispatch shape that splits a single client
+        // frame across multiple backend sub-frames (every other op
+        // resolves to exactly one key's worth of backend traffic).
+        // Deliberately crude, per the module's #128 section: primary
+        // only (no replica reads — matches `Request::Get`'s own
+        // primary-first reads), no refan on a failed or `W` sub-batch
+        // (a failure there answers its whole group `WrongNode`, same
+        // signal a stale single-key `W` gives — "refresh and re-issue
+        // just these").
+        Request::MultiGet { namespace, keys } => {
+            let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+            let mut missing = Vec::new();
+
+            for (position, key) in keys.iter().enumerate() {
+                let mut owners = ring.owners(&namespace, key).into_iter();
+                let Some(primary) = owners.next() else {
+                    missing.push(position);
+                    continue;
+                };
+
+                if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
+                    group.1.push(position);
+                    group.2.push(key.clone());
+                } else {
+                    groups.push((primary, vec![position], vec![key.clone()]));
+                }
+            }
+
+            if groups.is_empty() {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            }
+
+            let mut pending = Vec::with_capacity(groups.len());
+            for (owner, _, group_keys) in &groups {
+                pending.push(
+                    context
+                        .backends
+                        .enqueue(
+                            &context,
+                            owner,
+                            frame_multi_get(&namespace, group_keys),
+                            Expect::Multi,
+                        )
+                        .await,
+                );
+            }
+            let positions: Vec<Vec<usize>> = groups
+                .into_iter()
+                .map(|(_, positions, _)| positions)
+                .collect();
+
+            tokio::spawn(async move {
+                let result = finish_multi_get(keys.len(), missing, positions, pending, tag).await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
         Request::Clear { namespace } => {
             let pending = enqueue_clear(&context, &ring, Some(&namespace)).await;
             tokio::spawn(async move {
@@ -2302,6 +2535,48 @@ async fn retry_get_on(
         }
     }
     Err(Fatal)
+}
+
+/// Issue #128 measurement prototype: awaits every owner group's `M`
+/// sub-reply concurrently and splices the per-key results back into the
+/// client's original request order. `missing` (no roster entry at all)
+/// and any group whose sub-request failed or came back malformed are
+/// answered `WrongNode` for their keys — the prototype's stand-in for a
+/// real refresh-and-retry, since a caller already knows how to react to
+/// a per-key `W`.
+async fn finish_multi_get(
+    total: usize,
+    missing: Vec<usize>,
+    positions: Vec<Vec<usize>>,
+    pending: Vec<PendingReply>,
+    tag: Option<u32>,
+) -> DriverResult {
+    let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; total];
+
+    for position in missing {
+        entries[position] = Some(ProxyMultiEntry::WrongNode);
+    }
+
+    for (group_positions, reply) in positions.into_iter().zip(pending) {
+        match reply.await {
+            Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
+                for (position, entry) in group_positions.into_iter().zip(results) {
+                    entries[position] = Some(entry);
+                }
+            }
+            _ => {
+                for position in group_positions {
+                    entries[position] = Some(ProxyMultiEntry::WrongNode);
+                }
+            }
+        }
+    }
+
+    let entries: Vec<ProxyMultiEntry> = entries
+        .into_iter()
+        .map(|entry| entry.expect("every position filled by one of the two loops above"))
+        .collect();
+    Ok(respond_multi(&entries, tag))
 }
 
 /// Enqueues a write/delete on every owner, primary first, in one ordered
@@ -3588,6 +3863,50 @@ mod tests {
                             }
                         }
                     }
+                    // Issue #128 measurement prototype: mirrors the real
+                    // node's `m`/`M` — see `Command::MultiGet` (src/
+                    // command.rs) for the frame grammar this reimplements.
+                    "m" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let count: usize = fields[1].parse().unwrap();
+                        let key_lengths: Vec<usize> = fields[2..2 + count]
+                            .iter()
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        let total: usize = ns_length + key_lengths.iter().sum::<usize>();
+                        read_exact_into(&mut stream, &mut buf, total).await?;
+                        let body = buf.split_to(total);
+                        let namespace = body[..ns_length].to_vec();
+                        let mut cursor = ns_length;
+                        let keys: Vec<Vec<u8>> = key_lengths
+                            .iter()
+                            .map(|&length| {
+                                let key = body[cursor..cursor + length].to_vec();
+                                cursor += length;
+                                key
+                            })
+                            .collect();
+
+                        let values: Vec<Option<Vec<u8>>> = {
+                            let store = store.lock().unwrap();
+                            keys.iter()
+                                .map(|key| store.get(&(namespace.clone(), key.clone())).cloned())
+                                .collect()
+                        };
+
+                        let mut header = format!("M {count}");
+                        for value in &values {
+                            match value {
+                                Some(value) => header.push_str(&format!(" {}", value.len())),
+                                None => header.push_str(" -"),
+                            }
+                        }
+                        header.push_str(&format!(" {}\n", tag(&fields)));
+                        stream.write_all(header.as_bytes()).await?;
+                        for value in values.into_iter().flatten() {
+                            stream.write_all(&value).await?;
+                        }
+                    }
                     "S" | "s" => {
                         let offset = if command == "s" { 1 } else { 0 };
                         let ns_length: usize = if command == "s" {
@@ -4102,6 +4421,75 @@ mod tests {
         stream.write_all(b"D 4\nnameG 4\nname").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    // Issue #128 measurement prototype: multi-get through the proxy.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_returns_hits_and_misses_in_request_order() {
+        let (_nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream
+            .write_all(b"S 1 1\na1S 1 1\nb2")
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        stream.write_all(b"m 0 3 1 1 1\nabc").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 3 1 1 -");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"12");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_splits_across_owners_and_preserves_request_order() {
+        // R=1: a batch spanning both nodes must fan out to each owner's
+        // own sub-frame and splice the results back in request order,
+        // regardless of which owner answers first.
+        let (nodes, proxy) = cluster(1).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            1,
+        );
+
+        let mut on_a = None;
+        let mut on_b = None;
+        for index in 0..32u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == nodes[0].addr && on_a.is_none() {
+                on_a = Some(key);
+            } else if owner == nodes[1].addr && on_b.is_none() {
+                on_b = Some(key);
+            }
+        }
+        let (key_a, key_b) = (on_a.expect("no key hashed to node a"), on_b.expect("no key hashed to node b"));
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        for key in [&key_a, &key_b] {
+            let frame = format!("S {} 1\n{key}v", key.len());
+            stream.write_all(frame.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+
+        // Request in a→b order once and b→a order once: the reassembly
+        // must always match the request's own order, not arrival order.
+        for (first, second) in [(&key_a, &key_b), (&key_b, &key_a)] {
+            let frame = format!(
+                "m 0 2 {} {}\n{first}{second}",
+                first.len(),
+                second.len()
+            );
+            stream.write_all(frame.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+            read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+            assert_eq!(&buf.split_to(2)[..], b"vv");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
