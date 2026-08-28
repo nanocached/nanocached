@@ -14,9 +14,29 @@ fn ttl_field(ttl: Option<Duration>) -> String {
         .unwrap_or_default()
 }
 
+/// One key's outcome inside a `Response::Multi` (issue #128 measurement
+/// prototype) — the per-key partial-result states a batched `m` request
+/// can answer with. `WrongNode` is never produced by `Command::MultiGet`'s
+/// own `execute` (which only ever sees keys the connection handler has
+/// already confirmed this node owns); the handler splices it in per-key
+/// for the ones it doesn't, mirroring the single-key `G`/`Response::WrongNode`
+/// path instead of failing the whole frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiEntry {
+    Value(Bytes),
+    Miss,
+    WrongNode,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {
     Value(Bytes),
+    /// Issue #128 measurement prototype: reply to `m` (`Command::MultiGet`)
+    /// — one `MultiEntry` per requested key, in request order. Wire form:
+    /// `M <n> <r-1>...<r-n> [tag]\n<values of the hits, concatenated in
+    /// order>`, where each `<r-i>` is a decimal byte length (hit), `-`
+    /// (miss), or `W` (wrong node) — see `encode`.
+    Multi(Vec<MultiEntry>),
     Stored,
     Deleted,
     NotFound,
@@ -105,6 +125,43 @@ pub enum Response {
     Stats(Box<CacheStats>),
 }
 
+/// `Response::Multi`'s shared wire encoding for both `encode` and
+/// `encode_with_tag` — see `Response::Multi`'s doc comment for the frame
+/// grammar.
+fn encode_multi(entries: &[MultiEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("M {}", entries.len());
+    let mut values_len = 0;
+
+    for entry in entries {
+        match entry {
+            MultiEntry::Value(value) => {
+                header.push(' ');
+                header.push_str(&value.len().to_string());
+                values_len += value.len();
+            }
+            MultiEntry::Miss => header.push_str(" -"),
+            MultiEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+
+    if let Some(tag) = tag {
+        header.push(' ');
+        header.push_str(&tag.to_string());
+    }
+    header.push('\n');
+
+    let mut encoded = Vec::with_capacity(header.len() + values_len);
+    encoded.extend_from_slice(header.as_bytes());
+
+    for entry in entries {
+        if let MultiEntry::Value(value) = entry {
+            encoded.extend_from_slice(value);
+        }
+    }
+
+    encoded
+}
+
 impl Response {
     pub fn encode(&self) -> Vec<u8> {
         match self {
@@ -143,6 +200,8 @@ impl Response {
 
                 encoded
             }
+
+            Self::Multi(entries) => encode_multi(entries, None),
 
             Self::Entries(_)
             | Self::Keys(_)
@@ -191,6 +250,8 @@ impl Response {
 
                 encoded
             }
+
+            Self::Multi(entries) => encode_multi(entries, Some(tag)),
 
             _ => unreachable!("only G/S/D/i responses have a tagged form (echoed response tags)"),
         }
