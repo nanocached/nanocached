@@ -1211,7 +1211,10 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
                 keys.push(body.slice(cursor..cursor + length));
                 cursor += length;
             }
-            Ok(ParseOutcome::Ready(Request::MultiGet { namespace, keys }, tag))
+            Ok(ParseOutcome::Ready(
+                Request::MultiGet { namespace, keys },
+                tag,
+            ))
         }
 
         // Issue #150: `o <ns-len> <n> <key-len-1> <value-len-1>...
@@ -1745,14 +1748,18 @@ async fn read_reply<S: AsyncRead + Unpin>(
     // decoded here rather than joining the generic `(marker, fields)`
     // match below.
     if marker == "M" {
-        let (tag_field, rest) = fields.split_last().ok_or_else(|| invalid("malformed M reply"))?;
+        let (tag_field, rest) = fields
+            .split_last()
+            .ok_or_else(|| invalid("malformed M reply"))?;
         if *tag_field != tag.to_string() {
             return Err(invalid(&format!(
                 "backend reply tag mismatch: expected {tag}, got {tag_field}"
             )));
         }
 
-        let (count_field, roster) = rest.split_first().ok_or_else(|| invalid("malformed M reply"))?;
+        let (count_field, roster) = rest
+            .split_first()
+            .ok_or_else(|| invalid("malformed M reply"))?;
         let count = parse_length_field(count_field)?;
         if roster.len() != count {
             return Err(invalid("M roster length does not match its own count"));
@@ -1806,14 +1813,18 @@ async fn read_reply<S: AsyncRead + Unpin>(
     // Issue #150: `O`'s roster is variable-length like `M`'s, but has no
     // body — a set has nothing to echo back.
     if marker == "O" {
-        let (tag_field, rest) = fields.split_last().ok_or_else(|| invalid("malformed O reply"))?;
+        let (tag_field, rest) = fields
+            .split_last()
+            .ok_or_else(|| invalid("malformed O reply"))?;
         if *tag_field != tag.to_string() {
             return Err(invalid(&format!(
                 "backend reply tag mismatch: expected {tag}, got {tag_field}"
             )));
         }
 
-        let (count_field, roster) = rest.split_first().ok_or_else(|| invalid("malformed O reply"))?;
+        let (count_field, roster) = rest
+            .split_first()
+            .ok_or_else(|| invalid("malformed O reply"))?;
         let count = parse_length_field(count_field)?;
         if roster.len() != count {
             return Err(invalid("O roster length does not match its own count"));
@@ -1937,13 +1948,13 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
 /// only that owner's slice of the original request's keys — see
 /// `dispatch_request`'s `Request::MultiGet` arm.
 fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
-    let key_lengths: String = keys
-        .iter()
-        .map(|key| format!(" {}", key.len()))
-        .collect();
-    let mut frame =
-        format!("m {} {}{key_lengths} {TAG_PLACEHOLDER}\n", namespace.len(), keys.len())
-            .into_bytes();
+    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let mut frame = format!(
+        "m {} {}{key_lengths} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        keys.len()
+    )
+    .into_bytes();
     frame.extend_from_slice(namespace);
     for key in keys {
         frame.extend_from_slice(key);
@@ -1955,7 +1966,12 @@ fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
 /// `dispatch_request`'s `Request::MultiSet` arm for why grouping is by
 /// address rather than by rank (a batch's keys can put the same node in
 /// different roles). One shared `ttl` for the whole frame.
-fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Option<u64>) -> Vec<u8> {
+fn frame_multi_set(
+    namespace: &[u8],
+    keys: &[Bytes],
+    values: &[Bytes],
+    ttl: Option<u64>,
+) -> Vec<u8> {
     let mut lengths = String::new();
     for (key, value) in keys.iter().zip(values) {
         lengths.push_str(&format!(" {} {}", key.len(), value.len()));
@@ -2672,8 +2688,10 @@ async fn dispatch_request(
 
             let mut pending = Vec::with_capacity(groups.len());
             for (owner, legs) in &groups {
-                let group_keys: Vec<Bytes> =
-                    legs.iter().map(|(position, _)| keys[*position].clone()).collect();
+                let group_keys: Vec<Bytes> = legs
+                    .iter()
+                    .map(|(position, _)| keys[*position].clone())
+                    .collect();
                 let group_values: Vec<Bytes> = legs
                     .iter()
                     .map(|(position, _)| values[*position].clone())
@@ -2884,7 +2902,12 @@ async fn retry_multi_get(
     for (owner, group_positions, group_keys) in groups {
         let reply = context
             .backends
-            .call(context, &owner, frame_multi_get(namespace, &group_keys), Expect::Multi)
+            .call(
+                context,
+                &owner,
+                frame_multi_get(namespace, &group_keys),
+                Expect::Multi,
+            )
             .await;
 
         match reply {
@@ -3039,10 +3062,14 @@ async fn retry_multi_set(
     }
 
     for (owner, legs) in groups {
-        let group_keys: Vec<Bytes> =
-            legs.iter().map(|(position, _)| keys[*position].clone()).collect();
-        let group_values: Vec<Bytes> =
-            legs.iter().map(|(position, _)| values[*position].clone()).collect();
+        let group_keys: Vec<Bytes> = legs
+            .iter()
+            .map(|(position, _)| keys[*position].clone())
+            .collect();
+        let group_values: Vec<Bytes> = legs
+            .iter()
+            .map(|(position, _)| values[*position].clone())
+            .collect();
         let reply = context
             .backends
             .call(
@@ -4990,10 +5017,7 @@ mod tests {
         let (_nodes, proxy) = cluster(2).await;
         let (mut stream, mut buf) = connect_and_auth(&proxy).await;
 
-        stream
-            .write_all(b"S 1 1\na1S 1 1\nb2")
-            .await
-            .unwrap();
+        stream.write_all(b"S 1 1\na1S 1 1\nb2").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
 
@@ -5028,7 +5052,10 @@ mod tests {
                 on_b = Some(key);
             }
         }
-        let (key_a, key_b) = (on_a.expect("no key hashed to node a"), on_b.expect("no key hashed to node b"));
+        let (key_a, key_b) = (
+            on_a.expect("no key hashed to node a"),
+            on_b.expect("no key hashed to node b"),
+        );
 
         let (mut stream, mut buf) = connect_and_auth(&proxy).await;
         for key in [&key_a, &key_b] {
@@ -5040,11 +5067,7 @@ mod tests {
         // Request in a→b order once and b→a order once: the reassembly
         // must always match the request's own order, not arrival order.
         for (first, second) in [(&key_a, &key_b), (&key_b, &key_a)] {
-            let frame = format!(
-                "m 0 2 {} {}\n{first}{second}",
-                first.len(),
-                second.len()
-            );
+            let frame = format!("m 0 2 {} {}\n{first}{second}", first.len(), second.len());
             stream.write_all(frame.as_bytes()).await.unwrap();
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
             read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
