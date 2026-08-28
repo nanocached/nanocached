@@ -1,7 +1,7 @@
-// Issue #128 measurement prototype: throwaway benchmark comparing a
-// client-side loop of single-key `G` frames against a batched `m`
-// (multi-get) frame, direct-to-node and via the proxy. Not a shipped
-// tool — its only job is producing the numbers #128's decision rests on.
+// Issue #128/#150: throwaway benchmark comparing a client-side loop of
+// single-key frames against a batched multi-op frame (`m`/multi-get,
+// `o`/multi-set), direct-to-node and via the proxy. Not a shipped tool —
+// its only job is producing the numbers #128's/#150's decisions rest on.
 // Speaks the wire directly (no SDK): the loop arm needs no ownership
 // routing at all when pointed at a single node, and the proxy's own
 // owner-grouping is exactly the fan-out path this issue's "does bulk pay
@@ -21,7 +21,8 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  \
          bulkbench preload <addr> <keyspace> <value-size>\n  \
-         bulkbench run <addr> <loop|bulk> <keyspace> <batch> <concurrency> <duration-secs>\n\n\
+         bulkbench run <addr> <get|set> <loop|bulk> <keyspace> <batch> <concurrency> \
+         <duration-secs> <value-size>\n\n\
          Optional env: BULKBENCH_SECRET (sent as an untagged `A` before either subcommand)."
     );
     std::process::exit(2);
@@ -92,6 +93,50 @@ fn encode_multi_get(keys: &[Vec<u8>]) -> Vec<u8> {
         frame.extend_from_slice(key);
     }
     frame
+}
+
+fn encode_multi_set(keys: &[Vec<u8>], value: &[u8]) -> Vec<u8> {
+    let mut lengths = String::new();
+    for key in keys {
+        lengths.push_str(&format!(" {} {}", key.len(), value.len()));
+    }
+    let header = format!("o 0 {}{lengths}\n", keys.len());
+    let mut frame = header.into_bytes();
+    for key in keys {
+        frame.extend_from_slice(key);
+        frame.extend_from_slice(value);
+    }
+    frame
+}
+
+/// Reads one `S` reply (bare `S\n`) and asserts it succeeded.
+async fn read_set_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read reply header");
+    assert_eq!(line.trim_end(), "S", "unexpected reply to S: {line:?}");
+}
+
+/// Reads one `o` reply (`O <n> <r-1>...<r-n>\n`, no body) and returns how
+/// many of the `n` entries were `S` (stored) — used only to sanity-check
+/// the batch against what was requested.
+async fn read_multi_ack_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> (usize, usize) {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read reply header");
+    let line = line.trim_end();
+    let mut fields = line.split(' ');
+    assert_eq!(fields.next(), Some("O"), "unexpected reply to o: {line:?}");
+    let count: usize = fields
+        .next()
+        .expect("missing O count field")
+        .parse()
+        .expect("bad O count field");
+
+    let stored = (0..count)
+        .map(|_| fields.next().expect("missing O roster token"))
+        .filter(|&token| token == "S")
+        .count();
+
+    (count, stored)
 }
 
 /// Reads one `G` reply (`V <len>\n<value>` or `N\n`) and discards the
@@ -179,18 +224,25 @@ async fn preload(args: &[String]) {
 }
 
 async fn run(args: &[String]) {
-    let [addr, arm, keyspace, batch, concurrency, duration] = args else {
+    let [addr, op, arm, keyspace, batch, concurrency, duration, value_size] = args else {
         usage()
     };
     let keyspace: u64 = keyspace.parse().expect("bad keyspace");
     let batch: usize = batch.parse().expect("bad batch");
     let concurrency: usize = concurrency.parse().expect("bad concurrency");
     let duration = Duration::from_secs_f64(duration.parse().expect("bad duration"));
+    let value_size: usize = value_size.parse().expect("bad value-size");
     let bulk = match arm.as_str() {
         "loop" => false,
         "bulk" => true,
         _ => usage(),
     };
+    let set = match op.as_str() {
+        "get" => false,
+        "set" => true,
+        _ => usage(),
+    };
+    let value = vec![b'x'; value_size];
 
     let deadline = Instant::now() + duration;
     let batches = Arc::new(AtomicU64::new(0));
@@ -201,6 +253,7 @@ async fn run(args: &[String]) {
     let mut workers = Vec::with_capacity(concurrency);
     for worker in 0..concurrency {
         let addr = addr.clone();
+        let value = value.clone();
         let batches = Arc::clone(&batches);
         let keys_done = Arc::clone(&keys_done);
         let hits_done = Arc::clone(&hits_done);
@@ -220,22 +273,43 @@ async fn run(args: &[String]) {
                     .collect();
 
                 let start = Instant::now();
-                if bulk {
-                    let frame = encode_multi_get(&keys);
-                    reader.get_mut().write_all(&frame).await.expect("write m");
-                    let (count, hits) = read_multi_reply(&mut reader).await;
-                    assert_eq!(count, keys.len(), "M roster size mismatch");
-                    local_hits += hits as u64;
-                } else {
-                    let mut frame = Vec::new();
-                    for key in &keys {
-                        frame.extend_from_slice(&encode_get(key));
+                match (set, bulk) {
+                    (false, true) => {
+                        let frame = encode_multi_get(&keys);
+                        reader.get_mut().write_all(&frame).await.expect("write m");
+                        let (count, hits) = read_multi_reply(&mut reader).await;
+                        assert_eq!(count, keys.len(), "M roster size mismatch");
+                        local_hits += hits as u64;
                     }
-                    reader.get_mut().write_all(&frame).await.expect("write g");
-                    for _ in &keys {
-                        if read_get_reply(&mut reader).await {
-                            local_hits += 1;
+                    (false, false) => {
+                        let mut frame = Vec::new();
+                        for key in &keys {
+                            frame.extend_from_slice(&encode_get(key));
                         }
+                        reader.get_mut().write_all(&frame).await.expect("write g");
+                        for _ in &keys {
+                            if read_get_reply(&mut reader).await {
+                                local_hits += 1;
+                            }
+                        }
+                    }
+                    (true, true) => {
+                        let frame = encode_multi_set(&keys, &value);
+                        reader.get_mut().write_all(&frame).await.expect("write o");
+                        let (count, stored) = read_multi_ack_reply(&mut reader).await;
+                        assert_eq!(count, keys.len(), "O roster size mismatch");
+                        local_hits += stored as u64;
+                    }
+                    (true, false) => {
+                        let mut frame = Vec::new();
+                        for key in &keys {
+                            frame.extend_from_slice(&encode_set(key, &value));
+                        }
+                        reader.get_mut().write_all(&frame).await.expect("write s");
+                        for _ in &keys {
+                            read_set_reply(&mut reader).await;
+                        }
+                        local_hits += batch as u64;
                     }
                 }
                 local_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -262,7 +336,7 @@ async fn run(args: &[String]) {
     let total_keys = keys_done.load(Ordering::Relaxed);
     let total_hits = hits_done.load(Ordering::Relaxed);
     println!(
-        "{{\"arm\":\"{arm}\",\"batch\":{batch},\"concurrency\":{concurrency},\
+        "{{\"op\":\"{op}\",\"arm\":\"{arm}\",\"batch\":{batch},\"concurrency\":{concurrency},\
          \"batches\":{},\"keys\":{total_keys},\"keys_per_sec\":{:.0},\
          \"hit_rate\":{:.4},\
          \"batch_p50_ms\":{:.3},\"batch_p99_ms\":{:.3}}}",
