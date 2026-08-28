@@ -2,7 +2,7 @@ use crate::cache::{Cache, SWEEP_BUDGET};
 use crate::command::{Command, MigrateProgress, ParseError, parse_resumable};
 use crate::hash_ring::HashRing;
 use crate::key::Key;
-use crate::response::Response;
+use crate::response::{MultiAckEntry, MultiEntry, Response};
 use bytes::{Bytes, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -1756,6 +1756,130 @@ async fn handle_connection(
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
+
+                continue;
+            }
+            // Issue #128 measurement prototype: per-key wrong-node
+            // filtering happens here, before the actor ever sees the
+            // frame — same check `Get`'s arm makes per key, just batched.
+            // Keys this node owns go to the actor as one `Command::MultiGet`
+            // (one round trip for all of them); keys it doesn't are
+            // answered `MultiEntry::WrongNode` without ever reaching the
+            // actor. Results are spliced back into the original request
+            // order before replying — the client never sees the owned/
+            // not-owned split.
+            Ok((Command::MultiGet { namespace, keys }, tag)) => {
+                let mut entries: Vec<Option<MultiEntry>> = vec![None; keys.len()];
+                let mut owned_positions = Vec::with_capacity(keys.len());
+                let mut owned_keys = Vec::with_capacity(keys.len());
+
+                for (position, name) in keys.into_iter().enumerate() {
+                    let wrong = config.node_context.as_ref().is_some_and(|node_context| {
+                        wrong_node(node_context, &Key::new(namespace.clone(), name.clone()))
+                    });
+
+                    if wrong {
+                        entries[position] = Some(MultiEntry::WrongNode);
+                    } else {
+                        owned_positions.push(position);
+                        owned_keys.push(name);
+                    }
+                }
+
+                if !owned_keys.is_empty() {
+                    let response = execute_command(
+                        &request_tx,
+                        Command::MultiGet {
+                            namespace,
+                            keys: owned_keys,
+                        },
+                    )
+                    .await?;
+
+                    let Response::Multi(results) = response else {
+                        unreachable!("Command::MultiGet always answers with Response::Multi");
+                    };
+
+                    for (position, result) in owned_positions.into_iter().zip(results) {
+                        entries[position] = Some(result);
+                    }
+                }
+
+                let entries = entries
+                    .into_iter()
+                    .map(|entry| entry.expect("every position filled by one of the two branches"))
+                    .collect();
+                write_response(
+                    &mut stream,
+                    &encode_response(&Response::Multi(entries), tag),
+                )
+                .await?;
+
+                continue;
+            }
+            // Issue #150: same per-key wrong-node filtering as
+            // `MultiGet`'s arm above — keys this node owns go to the
+            // actor as one `Command::MultiSet`; keys it doesn't are
+            // answered `MultiAckEntry::WrongNode` without ever reaching
+            // the actor.
+            Ok((
+                Command::MultiSet {
+                    namespace,
+                    keys,
+                    values,
+                    ttl,
+                },
+                tag,
+            )) => {
+                let mut entries: Vec<Option<MultiAckEntry>> = vec![None; keys.len()];
+                let mut owned_positions = Vec::with_capacity(keys.len());
+                let mut owned_keys = Vec::with_capacity(keys.len());
+                let mut owned_values = Vec::with_capacity(keys.len());
+
+                for (position, (name, value)) in keys.into_iter().zip(values).enumerate() {
+                    let wrong = config.node_context.as_ref().is_some_and(|node_context| {
+                        wrong_node(node_context, &Key::new(namespace.clone(), name.clone()))
+                    });
+
+                    if wrong {
+                        entries[position] = Some(MultiAckEntry::WrongNode);
+                    } else {
+                        owned_positions.push(position);
+                        owned_keys.push(name);
+                        owned_values.push(value);
+                    }
+                }
+
+                if !owned_keys.is_empty() {
+                    let response = execute_command(
+                        &request_tx,
+                        Command::MultiSet {
+                            namespace,
+                            keys: owned_keys,
+                            values: owned_values,
+                            ttl,
+                        },
+                    )
+                    .await?;
+
+                    let Response::MultiAck(results) = response else {
+                        unreachable!("Command::MultiSet always answers with Response::MultiAck");
+                    };
+
+                    for (position, result) in owned_positions.into_iter().zip(results) {
+                        entries[position] = Some(result);
+                    }
+                }
+
+                let entries = entries
+                    .into_iter()
+                    .map(|entry| entry.expect("every position filled by one of the two branches"))
+                    .collect();
+                write_response(
+                    &mut stream,
+                    &encode_response(&Response::MultiAck(entries), tag),
+                )
+                .await?;
 
                 continue;
             }

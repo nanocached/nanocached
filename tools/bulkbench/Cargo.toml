@@ -1,0 +1,10 @@
+[package]
+name = "bulkbench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "time"] }
+
+[workspace]

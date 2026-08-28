@@ -945,6 +945,24 @@ enum Request {
         namespace: Bytes,
     },
     ClearAll,
+    /// Issues #128/#150: `m` (batched get). Always namespaced, same
+    /// reasoning as `Incr`/CAS — no pre-namespace legacy form. See
+    /// `dispatch_request`'s arm for the owner-grouping fan-out.
+    MultiGet {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
+    },
+    /// Issue #150: `o` (batched set). Always namespaced. One shared
+    /// `ttl` for the whole batch, not per-key — see `Command::MultiSet`'s
+    /// (`src/command.rs`) doc comment for why. See `dispatch_request`'s
+    /// arm for the by-owner-address fan-out (unlike `MultiGet`'s
+    /// by-primary grouping, since a write must reach every owner).
+    MultiSet {
+        namespace: Bytes,
+        keys: Vec<Bytes>,
+        values: Vec<Bytes>,
+        ttl: Option<u64>,
+    },
 }
 
 /// Issue #141: `k`'s (and `x`'s) `<cond>` field, decoded. Independent
@@ -1163,6 +1181,103 @@ fn parse_request(input: &mut BytesMut, tagged: bool) -> io::Result<ParseOutcome>
                 Request::Delete { namespace, key }
             };
             Ok(ParseOutcome::Ready(request, tag))
+        }
+
+        // Issue #128 measurement prototype: `m <ns-len> <n>
+        // <key-len-1>...<key-len-n> [tag]` — every field up to the
+        // optional tag is a plain length, so `split_tag` (which parses
+        // every field as one) handles the whole header in one call,
+        // unlike `i`/`k`'s hand-peeled non-length fields.
+        "m" => {
+            let (lengths, tag) = split_tag(&fields)?;
+            let [namespace_length, count, key_lengths @ ..] = lengths.as_slice() else {
+                return Err(invalid("bad multi-get header"));
+            };
+            if *count == 0 || key_lengths.len() != *count {
+                return Err(invalid("bad multi-get header"));
+            }
+            if key_lengths.contains(&0) {
+                return Err(invalid("empty key in multi-get"));
+            }
+            let body_length = key_lengths
+                .iter()
+                .try_fold(*namespace_length, |sum, &length| sum.checked_add(length))
+                .ok_or_else(|| invalid("frame length overflow"))?;
+            let body = body!(body_length);
+            let namespace = body.slice(..*namespace_length);
+            let mut cursor = *namespace_length;
+            let mut keys = Vec::with_capacity(key_lengths.len());
+            for &length in key_lengths {
+                keys.push(body.slice(cursor..cursor + length));
+                cursor += length;
+            }
+            Ok(ParseOutcome::Ready(
+                Request::MultiGet { namespace, keys },
+                tag,
+            ))
+        }
+
+        // Issue #150: `o <ns-len> <n> <key-len-1> <value-len-1>...
+        // <key-len-n> <value-len-n> [ttl] [tag]` — `split_tag` still
+        // handles the whole header in one call (ttl is a plain length
+        // too), but unlike `m`'s flat list, the field count after
+        // `<n>` is ambiguous between "no ttl" (`2n` fields) and "ttl"
+        // (`2n + 1`) until `n` itself resolves it.
+        "o" => {
+            let (lengths, tag) = split_tag(&fields)?;
+            let [namespace_length, count, rest @ ..] = lengths.as_slice() else {
+                return Err(invalid("bad multi-set header"));
+            };
+            let count = *count;
+            if count == 0 {
+                return Err(invalid("bad multi-set header"));
+            }
+            let pairs_len = count
+                .checked_mul(2)
+                .ok_or_else(|| invalid("bad multi-set header"))?;
+            let (pairs, ttl) = match rest.len().checked_sub(pairs_len) {
+                Some(0) => (rest, None),
+                Some(1) => (&rest[..pairs_len], Some(rest[pairs_len] as u64)),
+                _ => return Err(invalid("bad multi-set header")),
+            };
+
+            let mut lengths_pairs = Vec::with_capacity(count);
+            for pair in pairs.chunks_exact(2) {
+                let (key_length, value_length) = (pair[0], pair[1]);
+                if key_length == 0 {
+                    return Err(invalid("empty key in multi-set"));
+                }
+                lengths_pairs.push((key_length, value_length));
+            }
+
+            let body_length = lengths_pairs
+                .iter()
+                .try_fold(*namespace_length, |sum, &(key_length, value_length)| {
+                    sum.checked_add(key_length)
+                        .and_then(|sum| sum.checked_add(value_length))
+                })
+                .ok_or_else(|| invalid("frame length overflow"))?;
+            let body = body!(body_length);
+            let namespace = body.slice(..*namespace_length);
+            let mut cursor = *namespace_length;
+            let mut keys = Vec::with_capacity(count);
+            let mut values = Vec::with_capacity(count);
+            for (key_length, value_length) in lengths_pairs {
+                keys.push(body.slice(cursor..cursor + key_length));
+                cursor += key_length;
+                values.push(body.slice(cursor..cursor + value_length));
+                cursor += value_length;
+            }
+
+            Ok(ParseOutcome::Ready(
+                Request::MultiSet {
+                    namespace,
+                    keys,
+                    values,
+                    ttl,
+                },
+                tag,
+            ))
         }
 
         "S" | "s" => {
@@ -1389,6 +1504,34 @@ enum Expect {
     /// or `W`/`E`. `x`'s reply reuses `Expect::Deleted` unchanged (`D`/`N`
     /// is already exactly that shape).
     CasSet,
+    /// Issues #128/#150: `M <n> <r-1>...<r-n> <tag>` + concatenated hit
+    /// values, or `E`. Parsed specially in `read_reply` (a variable
+    /// roster, unlike every other reply's fixed field count), never
+    /// reaches the generic `(marker, fields)` match there.
+    Multi,
+    /// Issue #150: `O <n> <r-1>...<r-n> <tag>`, no body, or `E`. Parsed
+    /// specially in `read_reply` alongside `Expect::Multi`, same reason.
+    MultiAck,
+}
+
+/// One key's outcome inside a backend's `M` reply (issues #128/#150) —
+/// independent reimplementation of the node's `crate::response::MultiEntry`
+/// (this binary shares no modules with the node, see `CasCondition`'s
+/// doc comment for the established policy).
+#[derive(Debug, Clone, PartialEq)]
+enum ProxyMultiEntry {
+    Value(Bytes),
+    Miss,
+    WrongNode,
+}
+
+/// One key's outcome inside a backend's `O` reply (issue #150) —
+/// independent reimplementation of the node's
+/// `crate::response::MultiAckEntry`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProxyAckEntry {
+    Stored,
+    WrongNode,
 }
 
 /// One reply from a node, already tag-verified.
@@ -1408,6 +1551,12 @@ enum NodeReply {
     Deleted,
     Cleared,
     WrongNode,
+    /// Issues #128/#150: `M`'s per-key roster, already decoded — see
+    /// `Expect::Multi`.
+    Multi(Vec<ProxyMultiEntry>),
+    /// Issue #150: `O`'s per-key roster, already decoded — see
+    /// `Expect::MultiAck`.
+    MultiAck(Vec<ProxyAckEntry>),
     /// `E`, or a reply that doesn't fit `Expect` — the connection is
     /// dropped by the reader either way.
     Error,
@@ -1593,6 +1742,110 @@ async fn read_reply<S: AsyncRead + Unpin>(
     }
 
     let fields: Vec<&str> = parts.collect();
+
+    // Issue #128 measurement prototype: `M`'s roster is variable-length
+    // (`n` per-key tokens, not `V`/`I`'s fixed field count), so it's
+    // decoded here rather than joining the generic `(marker, fields)`
+    // match below.
+    if marker == "M" {
+        let (tag_field, rest) = fields
+            .split_last()
+            .ok_or_else(|| invalid("malformed M reply"))?;
+        if *tag_field != tag.to_string() {
+            return Err(invalid(&format!(
+                "backend reply tag mismatch: expected {tag}, got {tag_field}"
+            )));
+        }
+
+        let (count_field, roster) = rest
+            .split_first()
+            .ok_or_else(|| invalid("malformed M reply"))?;
+        let count = parse_length_field(count_field)?;
+        if roster.len() != count {
+            return Err(invalid("M roster length does not match its own count"));
+        }
+
+        enum RosterToken {
+            Value(usize),
+            Miss,
+            WrongNode,
+        }
+
+        let mut total_value_bytes: usize = 0;
+        let tokens = roster
+            .iter()
+            .map(|token| match *token {
+                "-" => Ok(RosterToken::Miss),
+                "W" => Ok(RosterToken::WrongNode),
+                length => {
+                    let length = parse_length_field(length)?;
+                    total_value_bytes = total_value_bytes
+                        .checked_add(length)
+                        .ok_or_else(|| invalid("M roster value length overflow"))?;
+                    Ok(RosterToken::Value(length))
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        if total_value_bytes > MAX_REQUEST_SIZE {
+            return Err(invalid("M reply values exceed the request-size limit"));
+        }
+
+        read_exact_into(stream, buf, total_value_bytes).await?;
+        let mut body = buf.split_to(total_value_bytes).freeze();
+
+        let entries = tokens
+            .into_iter()
+            .map(|token| match token {
+                RosterToken::Value(length) => ProxyMultiEntry::Value(body.split_to(length)),
+                RosterToken::Miss => ProxyMultiEntry::Miss,
+                RosterToken::WrongNode => ProxyMultiEntry::WrongNode,
+            })
+            .collect();
+
+        let reply = NodeReply::Multi(entries);
+        if !matches!(expect, Expect::Multi) {
+            return Err(invalid("backend reply does not fit the request"));
+        }
+        return Ok(reply);
+    }
+
+    // Issue #150: `O`'s roster is variable-length like `M`'s, but has no
+    // body — a set has nothing to echo back.
+    if marker == "O" {
+        let (tag_field, rest) = fields
+            .split_last()
+            .ok_or_else(|| invalid("malformed O reply"))?;
+        if *tag_field != tag.to_string() {
+            return Err(invalid(&format!(
+                "backend reply tag mismatch: expected {tag}, got {tag_field}"
+            )));
+        }
+
+        let (count_field, roster) = rest
+            .split_first()
+            .ok_or_else(|| invalid("malformed O reply"))?;
+        let count = parse_length_field(count_field)?;
+        if roster.len() != count {
+            return Err(invalid("O roster length does not match its own count"));
+        }
+
+        let entries = roster
+            .iter()
+            .map(|token| match *token {
+                "S" => Ok(ProxyAckEntry::Stored),
+                "W" => Ok(ProxyAckEntry::WrongNode),
+                _ => Err(invalid("malformed O roster token")),
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+
+        let reply = NodeReply::MultiAck(entries);
+        if !matches!(expect, Expect::MultiAck) {
+            return Err(invalid("backend reply does not fit the request"));
+        }
+        return Ok(reply);
+    }
+
     // Issue #129: `I`'s header carries an extra optional `<ttl>` field
     // ahead of the tag — same "present-but-unlabeled trailing field"
     // shape `S`'s own optional TTL has, but backend connections are
@@ -1668,6 +1921,8 @@ async fn read_reply<S: AsyncRead + Unpin>(
                 NodeReply::Stored | NodeReply::NotFound | NodeReply::WrongNode | NodeReply::Error,
                 Expect::CasSet
             )
+            | (NodeReply::Error, Expect::Multi)
+            | (NodeReply::Error, Expect::MultiAck)
     );
     if !shape_ok {
         return Err(invalid("backend reply does not fit the request"));
@@ -1686,6 +1941,53 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     };
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
+    frame
+}
+
+/// Issue #128 measurement prototype: one sub-frame per owner, carrying
+/// only that owner's slice of the original request's keys — see
+/// `dispatch_request`'s `Request::MultiGet` arm.
+fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
+    let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
+    let mut frame = format!(
+        "m {} {}{key_lengths} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        keys.len()
+    )
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
+    frame
+}
+
+/// Issue #150: one sub-frame per involved owner *address* — see
+/// `dispatch_request`'s `Request::MultiSet` arm for why grouping is by
+/// address rather than by rank (a batch's keys can put the same node in
+/// different roles). One shared `ttl` for the whole frame.
+fn frame_multi_set(
+    namespace: &[u8],
+    keys: &[Bytes],
+    values: &[Bytes],
+    ttl: Option<u64>,
+) -> Vec<u8> {
+    let mut lengths = String::new();
+    for (key, value) in keys.iter().zip(values) {
+        lengths.push_str(&format!(" {} {}", key.len(), value.len()));
+    }
+    let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
+    let mut frame = format!(
+        "o {} {}{lengths}{ttl_field} {TAG_PLACEHOLDER}\n",
+        namespace.len(),
+        keys.len()
+    )
+    .into_bytes();
+    frame.extend_from_slice(namespace);
+    for (key, value) in keys.iter().zip(values) {
+        frame.extend_from_slice(key);
+        frame.extend_from_slice(value);
+    }
     frame
 }
 
@@ -1978,6 +2280,63 @@ fn respond_value(value: &[u8], tag: Option<u32>) -> Vec<u8> {
     framed
 }
 
+/// Issue #128 measurement prototype: `M <n> <r-1>...<r-n> [tag]\n<hit
+/// values, concatenated>` — the client-facing reassembly of every group's
+/// `finish_multi_get` result, mirroring the node's own `Response::Multi`
+/// wire form (`src/response.rs`) byte-for-byte.
+fn respond_multi(entries: &[ProxyMultiEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("M {}", entries.len());
+    let mut values_len = 0;
+
+    for entry in entries {
+        match entry {
+            ProxyMultiEntry::Value(value) => {
+                header.push(' ');
+                header.push_str(&value.len().to_string());
+                values_len += value.len();
+            }
+            ProxyMultiEntry::Miss => header.push_str(" -"),
+            ProxyMultiEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+    if let Some(tag) = tag {
+        header.push(' ');
+        header.push_str(&tag.to_string());
+    }
+    header.push('\n');
+
+    let mut framed = Vec::with_capacity(header.len() + values_len);
+    framed.extend_from_slice(header.as_bytes());
+    for entry in entries {
+        if let ProxyMultiEntry::Value(value) = entry {
+            framed.extend_from_slice(value);
+        }
+    }
+    framed
+}
+
+/// Issue #150: `O <n> <r-1>...<r-n> [tag]\n` — the client-facing
+/// reassembly of every group's `finish_multi_set` result, mirroring the
+/// node's own `Response::MultiAck` wire form (`src/response.rs`)
+/// byte-for-byte. No body, unlike `respond_multi`'s hit values.
+fn respond_multi_ack(entries: &[ProxyAckEntry], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("O {}", entries.len());
+
+    for entry in entries {
+        match entry {
+            ProxyAckEntry::Stored => header.push_str(" S"),
+            ProxyAckEntry::WrongNode => header.push_str(" W"),
+        }
+    }
+    if let Some(tag) = tag {
+        header.push(' ');
+        header.push_str(&tag.to_string());
+    }
+    header.push('\n');
+
+    header.into_bytes()
+}
+
 /// Issue #129: `INCR`'s success reply — `I <len> [ttl] [tag]\n<value>`,
 /// mirroring `Response::Incremented`'s own wire form on the node side
 /// (`src/response.rs`).
@@ -2229,6 +2588,147 @@ async fn dispatch_request(
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
             });
         }
+        // Issue #150: group keys by primary owner — this is the one
+        // dispatch shape that splits a single client frame across
+        // multiple backend sub-frames (every other op resolves to
+        // exactly one key's worth of backend traffic). Primary only, no
+        // replica reads — matches `Request::Get`'s own primary-first
+        // reads. A failed or `W` sub-batch gets one bounded
+        // refresh-and-retry in `finish_multi_get`/`retry_multi_get`,
+        // mirroring `finish_get`/`retry_get_on`'s existing shape.
+        Request::MultiGet { namespace, keys } => {
+            let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+            let mut missing = Vec::new();
+
+            for (position, key) in keys.iter().enumerate() {
+                let mut owners = ring.owners(&namespace, key).into_iter();
+                let Some(primary) = owners.next() else {
+                    missing.push(position);
+                    continue;
+                };
+
+                if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
+                    group.1.push(position);
+                    group.2.push(key.clone());
+                } else {
+                    groups.push((primary, vec![position], vec![key.clone()]));
+                }
+            }
+
+            if groups.is_empty() {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            }
+
+            let mut pending = Vec::with_capacity(groups.len());
+            for (owner, _, group_keys) in &groups {
+                pending.push(
+                    context
+                        .backends
+                        .enqueue(
+                            &context,
+                            owner,
+                            frame_multi_get(&namespace, group_keys),
+                            Expect::Multi,
+                        )
+                        .await,
+                );
+            }
+            let positions: Vec<Vec<usize>> = groups
+                .into_iter()
+                .map(|(_, positions, _)| positions)
+                .collect();
+
+            tokio::spawn(async move {
+                let result = finish_multi_get(
+                    &context, &namespace, &keys, missing, positions, pending, tag,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
+        // Issue #150: unlike `MultiGet`'s by-primary grouping, a write
+        // must reach every owner, so this groups by owner *address* —
+        // a batch's keys can put the same node in different roles
+        // (primary for one key, replica for another), and grouping by
+        // address collapses that into one sub-frame per node either
+        // way. Each leg remembers whether its owner is that key's
+        // primary: only the primary's outcome decides the key's
+        // client-facing status; replica outcomes are logged and
+        // swallowed, exactly like `finish_write`'s existing stance.
+        Request::MultiSet {
+            namespace,
+            keys,
+            values,
+            ttl,
+        } => {
+            let mut groups: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+            let mut missing = Vec::new();
+
+            for (position, key) in keys.iter().enumerate() {
+                let owners = ring.owners(&namespace, key);
+                if owners.is_empty() {
+                    missing.push(position);
+                    continue;
+                }
+                for (rank, owner) in owners.iter().enumerate() {
+                    let leg = (position, rank == 0);
+                    if let Some(group) = groups.iter_mut().find(|(addr, _)| addr == owner) {
+                        group.1.push(leg);
+                    } else {
+                        groups.push((owner.clone(), vec![leg]));
+                    }
+                }
+            }
+
+            if groups.is_empty() {
+                let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+                return result_rx;
+            }
+
+            let mut pending = Vec::with_capacity(groups.len());
+            for (owner, legs) in &groups {
+                let group_keys: Vec<Bytes> = legs
+                    .iter()
+                    .map(|(position, _)| keys[*position].clone())
+                    .collect();
+                let group_values: Vec<Bytes> = legs
+                    .iter()
+                    .map(|(position, _)| values[*position].clone())
+                    .collect();
+                pending.push(
+                    context
+                        .backends
+                        .enqueue(
+                            &context,
+                            owner,
+                            frame_multi_set(&namespace, &group_keys, &group_values, ttl),
+                            Expect::MultiAck,
+                        )
+                        .await,
+                );
+            }
+            let groups_legs: Vec<Vec<(usize, bool)>> =
+                groups.into_iter().map(|(_, legs)| legs).collect();
+
+            tokio::spawn(async move {
+                let result = finish_multi_set(
+                    &context,
+                    MultiSetBatch {
+                        namespace: &namespace,
+                        keys: &keys,
+                        values: &values,
+                        ttl,
+                    },
+                    missing,
+                    groups_legs,
+                    pending,
+                    tag,
+                )
+                .await;
+                let _ = result_tx.send(soften(result, retry_capable, tag, &context));
+            });
+        }
         Request::Clear { namespace } => {
             let pending = enqueue_clear(&context, &ring, Some(&namespace)).await;
             tokio::spawn(async move {
@@ -2302,6 +2802,305 @@ async fn retry_get_on(
         }
     }
     Err(Fatal)
+}
+
+/// Issue #150: awaits every owner group's `M` sub-reply and splices the
+/// per-key results back into the client's original request order.
+/// `missing` (no roster entry at all — only possible together with an
+/// empty ring, which the dispatch arm already answers `transient_reply`
+/// for before this is ever called) is answered `WrongNode` immediately.
+/// A group whose reply is malformed, transport-failed, or carries a
+/// per-key `WrongNode` gets exactly one bounded refresh-and-retry via
+/// `retry_multi_get` — never a second one, and never a whole-frame
+/// failure: partial-result semantics mean a key that's still wrong after
+/// the retry degrades to its own `WrongNode` entry, same as every other
+/// key's independent outcome.
+async fn finish_multi_get(
+    context: &ProxyContext,
+    namespace: &[u8],
+    keys: &[Bytes],
+    missing: Vec<usize>,
+    positions: Vec<Vec<usize>>,
+    pending: Vec<PendingReply>,
+    tag: Option<u32>,
+) -> DriverResult {
+    let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; keys.len()];
+    let mut retry_positions = Vec::new();
+
+    for position in missing {
+        entries[position] = Some(ProxyMultiEntry::WrongNode);
+    }
+
+    for (group_positions, reply) in positions.into_iter().zip(pending) {
+        match reply.await {
+            Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
+                for (position, entry) in group_positions.into_iter().zip(results) {
+                    if matches!(entry, ProxyMultiEntry::WrongNode) {
+                        retry_positions.push(position);
+                    } else {
+                        entries[position] = Some(entry);
+                    }
+                }
+            }
+            _ => retry_positions.extend(group_positions),
+        }
+    }
+
+    if !retry_positions.is_empty() {
+        retry_multi_get(context, namespace, keys, &retry_positions, &mut entries).await;
+    }
+
+    let entries: Vec<ProxyMultiEntry> = entries
+        .into_iter()
+        .map(|entry| entry.unwrap_or(ProxyMultiEntry::WrongNode))
+        .collect();
+    Ok(respond_multi(&entries, tag))
+}
+
+/// Issue #150: the one bounded refresh-and-retry pass for keys the first
+/// pass left inconclusive — mirrors `finish_get`'s "a single
+/// refresh-and-reroute, not a loop." Retried keys are regrouped by their
+/// *fresh* top owner (which can differ per key even though they shared a
+/// primary before the refresh — a stale ring can be wrong about more
+/// than one key's placement at once) and dispatched via `.call`, same
+/// transparent-redial reasoning as `retry_get_on`/`refan_write`. Fills
+/// every position in `retry_positions` — with a real result or a final
+/// `WrongNode` — so the caller never sees a gap.
+async fn retry_multi_get(
+    context: &ProxyContext,
+    namespace: &[u8],
+    keys: &[Bytes],
+    retry_positions: &[usize],
+    entries: &mut [Option<ProxyMultiEntry>],
+) {
+    force_refresh(context).await;
+
+    let Some(ring) = current_ring(context) else {
+        for &position in retry_positions {
+            entries[position] = Some(ProxyMultiEntry::WrongNode);
+        }
+        return;
+    };
+
+    let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+    for &position in retry_positions {
+        let key = &keys[position];
+        let mut owners = ring.owners(namespace, key).into_iter();
+        let Some(primary) = owners.next() else {
+            entries[position] = Some(ProxyMultiEntry::WrongNode);
+            continue;
+        };
+
+        if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
+            group.1.push(position);
+            group.2.push(key.clone());
+        } else {
+            groups.push((primary, vec![position], vec![key.clone()]));
+        }
+    }
+
+    for (owner, group_positions, group_keys) in groups {
+        let reply = context
+            .backends
+            .call(
+                context,
+                &owner,
+                frame_multi_get(namespace, &group_keys),
+                Expect::Multi,
+            )
+            .await;
+
+        match reply {
+            Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
+                for (position, entry) in group_positions.into_iter().zip(results) {
+                    entries[position] = Some(entry);
+                }
+            }
+            _ => {
+                for position in group_positions {
+                    entries[position] = Some(ProxyMultiEntry::WrongNode);
+                }
+            }
+        }
+    }
+}
+
+/// Issue #150: the batch a `finish_multi_set`/`retry_multi_set` pass
+/// works against — bundled purely to stay under clippy's argument-count
+/// lint; `keys`/`values` are parallel, `ttl` is the one shared value for
+/// the whole batch (see `Command::MultiSet`'s doc comment).
+struct MultiSetBatch<'a> {
+    namespace: &'a [u8],
+    keys: &'a [Bytes],
+    values: &'a [Bytes],
+    ttl: Option<u64>,
+}
+
+/// Issue #150: awaits every owner group's `O` sub-reply and reduces it to
+/// each key's client-facing status. Only a *primary* leg's outcome
+/// matters for that key; a replica leg's `WrongNode` or transport
+/// failure is logged and swallowed, exactly like `finish_write`'s
+/// existing stance (the primary already has — or, after the retry
+/// below, will have — the authoritative copy). A primary `WrongNode` or
+/// a whole group that failed/came back malformed marks its primary legs
+/// for the same one-bounded-retry pass `finish_multi_get` uses.
+async fn finish_multi_set(
+    context: &ProxyContext,
+    batch: MultiSetBatch<'_>,
+    missing: Vec<usize>,
+    groups_legs: Vec<Vec<(usize, bool)>>,
+    pending: Vec<PendingReply>,
+    tag: Option<u32>,
+) -> DriverResult {
+    let MultiSetBatch {
+        namespace,
+        keys,
+        values,
+        ttl,
+    } = batch;
+    let mut entries: Vec<Option<ProxyAckEntry>> = vec![None; keys.len()];
+    let mut retry_positions = Vec::new();
+
+    for position in missing {
+        entries[position] = Some(ProxyAckEntry::WrongNode);
+    }
+
+    for (legs, reply) in groups_legs.into_iter().zip(pending) {
+        match reply.await {
+            Ok(NodeReply::MultiAck(results)) if results.len() == legs.len() => {
+                for ((position, is_primary), result) in legs.into_iter().zip(results) {
+                    if !is_primary {
+                        if matches!(result, ProxyAckEntry::WrongNode) {
+                            eprintln!("WARN replica multi-set leg wrong-node for one key");
+                        }
+                        continue;
+                    }
+                    match result {
+                        ProxyAckEntry::Stored => entries[position] = Some(ProxyAckEntry::Stored),
+                        ProxyAckEntry::WrongNode => retry_positions.push(position),
+                    }
+                }
+            }
+            _ => {
+                for (position, is_primary) in legs {
+                    if is_primary {
+                        retry_positions.push(position);
+                    } else {
+                        eprintln!("WARN replica multi-set leg failed");
+                    }
+                }
+            }
+        }
+    }
+
+    if !retry_positions.is_empty() {
+        retry_multi_set(
+            context,
+            MultiSetBatch {
+                namespace,
+                keys,
+                values,
+                ttl,
+            },
+            &retry_positions,
+            &mut entries,
+        )
+        .await;
+    }
+
+    let entries: Vec<ProxyAckEntry> = entries
+        .into_iter()
+        .map(|entry| entry.unwrap_or(ProxyAckEntry::WrongNode))
+        .collect();
+    Ok(respond_multi_ack(&entries, tag))
+}
+
+/// Issue #150: the one bounded refresh-and-retry pass for multi-set,
+/// mirroring `refan_write`'s "re-send to every owner including
+/// replicas" — a retried key's whole write is re-fanned from the fresh
+/// ring, not just its primary, since the replicas that already got the
+/// first pass's write are harmless to write again (the op is
+/// idempotent, same reasoning `refan_write` relies on for single-key
+/// writes).
+async fn retry_multi_set(
+    context: &ProxyContext,
+    batch: MultiSetBatch<'_>,
+    retry_positions: &[usize],
+    entries: &mut [Option<ProxyAckEntry>],
+) {
+    let MultiSetBatch {
+        namespace,
+        keys,
+        values,
+        ttl,
+    } = batch;
+    force_refresh(context).await;
+
+    let Some(ring) = current_ring(context) else {
+        for &position in retry_positions {
+            entries[position] = Some(ProxyAckEntry::WrongNode);
+        }
+        return;
+    };
+
+    let mut groups: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+    for &position in retry_positions {
+        let key = &keys[position];
+        let owners = ring.owners(namespace, key);
+        if owners.is_empty() {
+            entries[position] = Some(ProxyAckEntry::WrongNode);
+            continue;
+        }
+        for (rank, owner) in owners.iter().enumerate() {
+            let leg = (position, rank == 0);
+            if let Some(group) = groups.iter_mut().find(|(addr, _)| addr == owner) {
+                group.1.push(leg);
+            } else {
+                groups.push((owner.clone(), vec![leg]));
+            }
+        }
+    }
+
+    for (owner, legs) in groups {
+        let group_keys: Vec<Bytes> = legs
+            .iter()
+            .map(|(position, _)| keys[*position].clone())
+            .collect();
+        let group_values: Vec<Bytes> = legs
+            .iter()
+            .map(|(position, _)| values[*position].clone())
+            .collect();
+        let reply = context
+            .backends
+            .call(
+                context,
+                &owner,
+                frame_multi_set(namespace, &group_keys, &group_values, ttl),
+                Expect::MultiAck,
+            )
+            .await;
+
+        match reply {
+            Ok(NodeReply::MultiAck(results)) if results.len() == legs.len() => {
+                for ((position, is_primary), result) in legs.into_iter().zip(results) {
+                    if is_primary {
+                        entries[position] = Some(result);
+                    } else if matches!(result, ProxyAckEntry::WrongNode) {
+                        eprintln!("WARN replica multi-set leg wrong-node for one key (retry)");
+                    }
+                }
+            }
+            _ => {
+                for (position, is_primary) in legs {
+                    if is_primary {
+                        entries[position] = Some(ProxyAckEntry::WrongNode);
+                    } else {
+                        eprintln!("WARN replica multi-set leg failed (retry)");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Enqueues a write/delete on every owner, primary first, in one ordered
@@ -3588,6 +4387,113 @@ mod tests {
                             }
                         }
                     }
+                    // Issue #128 measurement prototype: mirrors the real
+                    // node's `m`/`M` — see `Command::MultiGet` (src/
+                    // command.rs) for the frame grammar this reimplements.
+                    "m" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let count: usize = fields[1].parse().unwrap();
+                        let key_lengths: Vec<usize> = fields[2..2 + count]
+                            .iter()
+                            .map(|field| field.parse().unwrap())
+                            .collect();
+                        let total: usize = ns_length + key_lengths.iter().sum::<usize>();
+                        read_exact_into(&mut stream, &mut buf, total).await?;
+                        let body = buf.split_to(total);
+                        let namespace = body[..ns_length].to_vec();
+                        let mut cursor = ns_length;
+                        let keys: Vec<Vec<u8>> = key_lengths
+                            .iter()
+                            .map(|&length| {
+                                let key = body[cursor..cursor + length].to_vec();
+                                cursor += length;
+                                key
+                            })
+                            .collect();
+
+                        let values: Vec<Option<Vec<u8>>> = {
+                            let store = store.lock().unwrap();
+                            keys.iter()
+                                .map(|key| store.get(&(namespace.clone(), key.clone())).cloned())
+                                .collect()
+                        };
+
+                        // Issue #150: simulates the real node's own
+                        // per-key wrong-node check catching a stale
+                        // slice of an otherwise-valid roster — the
+                        // proxy's `retry_multi_get` path only ever sees
+                        // this shape (a `W` token inside a well-formed
+                        // `M` roster), never a whole-frame `W`.
+                        let first_wrong = wrong_once.swap(false, Ordering::SeqCst);
+
+                        let mut header = format!("M {count}");
+                        for (index, value) in values.iter().enumerate() {
+                            if first_wrong && index == 0 {
+                                header.push_str(" W");
+                                continue;
+                            }
+                            match value {
+                                Some(value) => header.push_str(&format!(" {}", value.len())),
+                                None => header.push_str(" -"),
+                            }
+                        }
+                        header.push_str(&format!(" {}\n", tag(&fields)));
+                        stream.write_all(header.as_bytes()).await?;
+                        for (index, value) in values.into_iter().enumerate() {
+                            if first_wrong && index == 0 {
+                                continue;
+                            }
+                            if let Some(value) = value {
+                                stream.write_all(&value).await?;
+                            }
+                        }
+                    }
+                    // Issue #150: mirrors the real node's own `o`/`O` —
+                    // see `Command::MultiSet` (src/command.rs). No TTL
+                    // fidelity, same as this mock's `S`/`s` arm.
+                    "o" => {
+                        let ns_length: usize = fields[0].parse().unwrap();
+                        let count: usize = fields[1].parse().unwrap();
+                        let mut pairs = Vec::with_capacity(count);
+                        for pair in 0..count {
+                            let key_length: usize = fields[2 + pair * 2].parse().unwrap();
+                            let value_length: usize = fields[3 + pair * 2].parse().unwrap();
+                            pairs.push((key_length, value_length));
+                        }
+                        let total: usize =
+                            ns_length + pairs.iter().map(|(k, v)| k + v).sum::<usize>();
+                        read_exact_into(&mut stream, &mut buf, total).await?;
+                        let body = buf.split_to(total);
+                        let namespace = body[..ns_length].to_vec();
+                        let mut cursor = ns_length;
+                        let mut entries = Vec::with_capacity(count);
+                        for (key_length, value_length) in pairs {
+                            let key = body[cursor..cursor + key_length].to_vec();
+                            cursor += key_length;
+                            let value = body[cursor..cursor + value_length].to_vec();
+                            cursor += value_length;
+                            entries.push((key, value));
+                        }
+
+                        // Same per-key wrong-node simulation as the "m"
+                        // arm above.
+                        let first_wrong = wrong_once.swap(false, Ordering::SeqCst);
+
+                        let mut header = format!("O {count}");
+                        for (index, (key, value)) in entries.into_iter().enumerate() {
+                            if first_wrong && index == 0 {
+                                header.push_str(" W");
+                                continue;
+                            }
+                            store
+                                .lock()
+                                .unwrap()
+                                .insert((namespace.clone(), key), value);
+                            header.push_str(" S");
+                        }
+                        header.push_str(&format!(" {}\n", tag(&fields)));
+                        stream.write_all(header.as_bytes()).await?;
+                    }
                     "S" | "s" => {
                         let offset = if command == "s" { 1 } else { 0 };
                         let ns_length: usize = if command == "s" {
@@ -4102,6 +5008,232 @@ mod tests {
         stream.write_all(b"D 4\nnameG 4\nname").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    // Issue #128 measurement prototype: multi-get through the proxy.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_returns_hits_and_misses_in_request_order() {
+        let (_nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\na1S 1 1\nb2").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        stream.write_all(b"m 0 3 1 1 1\nabc").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 3 1 1 -");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"12");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_splits_across_owners_and_preserves_request_order() {
+        // R=1: a batch spanning both nodes must fan out to each owner's
+        // own sub-frame and splice the results back in request order,
+        // regardless of which owner answers first.
+        let (nodes, proxy) = cluster(1).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            1,
+        );
+
+        let mut on_a = None;
+        let mut on_b = None;
+        for index in 0..32u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == nodes[0].addr && on_a.is_none() {
+                on_a = Some(key);
+            } else if owner == nodes[1].addr && on_b.is_none() {
+                on_b = Some(key);
+            }
+        }
+        let (key_a, key_b) = (
+            on_a.expect("no key hashed to node a"),
+            on_b.expect("no key hashed to node b"),
+        );
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        for key in [&key_a, &key_b] {
+            let frame = format!("S {} 1\n{key}v", key.len());
+            stream.write_all(frame.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        }
+
+        // Request in a→b order once and b→a order once: the reassembly
+        // must always match the request's own order, not arrival order.
+        for (first, second) in [(&key_a, &key_b), (&key_b, &key_a)] {
+            let frame = format!("m 0 2 {} {}\n{first}{second}", first.len(), second.len());
+            stream.write_all(frame.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+            read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+            assert_eq!(&buf.split_to(2)[..], b"vv");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_retries_a_per_key_wrong_node_after_a_refresh() {
+        // Issue #150: the node's own per-key check catches a stale
+        // slice of the roster (`wrong_once` makes the mock answer the
+        // batch's first key `W` once, exactly like a real node would) —
+        // the retry lands on the same node (the ring didn't actually
+        // change) and this time it answers for real, so the client
+        // still sees every key correctly.
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"S 1 1\na1S 1 1\nb2").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        nodes[0].wrong_node_once.store(true, Ordering::SeqCst);
+        nodes[1].wrong_node_once.store(true, Ordering::SeqCst);
+
+        stream.write_all(b"m 0 2 1 1\nab").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"12");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_degrades_only_the_unreachable_keys_to_wrong_node() {
+        // Issue #150: partial-result semantics — a batch spanning a
+        // live owner and a permanently unreachable one must still
+        // answer the live owner's keys correctly, and only degrade the
+        // unreachable owner's keys to `WrongNode` (never fail the whole
+        // frame, and never let one bad group cost the others their
+        // answer).
+        let live = MockNode::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let discovery = start_mock_discovery(
+            vec![
+                ("node-live".to_string(), live.addr.clone()),
+                ("node-dead".to_string(), dead_addr.clone()),
+            ],
+            1,
+        )
+        .await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+
+        let ring = RingView::new(
+            vec![
+                ("node-live".to_string(), live.addr.clone()),
+                ("node-dead".to_string(), dead_addr.clone()),
+            ],
+            1,
+        );
+        let mut on_live = None;
+        let mut on_dead = None;
+        for index in 0..32u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == live.addr && on_live.is_none() {
+                on_live = Some(key);
+            } else if owner == dead_addr && on_dead.is_none() {
+                on_dead = Some(key);
+            }
+        }
+        let (key_live, key_dead) = (
+            on_live.expect("no key hashed to the live node"),
+            on_dead.expect("no key hashed to the dead node"),
+        );
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let frame = format!("S {} 1\n{key_live}v", key_live.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        let frame = format!(
+            "m 0 2 {} {}\n{key_live}{key_dead}",
+            key_live.len(),
+            key_dead.len()
+        );
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 W");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+    }
+
+    // Issue #150: multi-set through the proxy.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_stores_every_key_and_replicates() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        stream.write_all(b"o 0 2 1 1 1 1\nabcd").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+
+        for node in &nodes {
+            assert_eq!(node.entry(b"", b"a"), Some(b"b".to_vec()));
+            assert_eq!(node.entry(b"", b"c"), Some(b"d".to_vec()));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_groups_by_address_when_roles_differ_across_keys() {
+        // R=2 with 2 nodes: every key's owners are both nodes, but
+        // which one is *primary* can differ per key — enough to
+        // exercise "group by address, not by rank" (the same node's
+        // sub-frame can carry one key it's primary for and another it's
+        // only a replica for) without needing a third node.
+        let (nodes, proxy) = cluster(2).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+
+        let mut primary_a = None;
+        let mut primary_b = None;
+        for index in 0..32u8 {
+            let key = format!("key-{index}");
+            let owner = ring.owners(b"", key.as_bytes())[0].clone();
+            if owner == nodes[0].addr && primary_a.is_none() {
+                primary_a = Some(key);
+            } else if owner == nodes[1].addr && primary_b.is_none() {
+                primary_b = Some(key);
+            }
+        }
+        let (key_a, key_b) = (
+            primary_a.expect("no key primaried by node a"),
+            primary_b.expect("no key primaried by node b"),
+        );
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let frame = format!(
+            "o 0 2 {} 1 {} 1\n{key_a}1{key_b}2",
+            key_a.len(),
+            key_b.len()
+        );
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
+
+        for node in &nodes {
+            assert_eq!(node.entry(b"", key_a.as_bytes()), Some(b"1".to_vec()));
+            assert_eq!(node.entry(b"", key_b.as_bytes()), Some(b"2".to_vec()));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_retries_a_per_key_wrong_node_after_a_refresh() {
+        let (nodes, proxy) = cluster(2).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        nodes[0].wrong_node_once.store(true, Ordering::SeqCst);
+        nodes[1].wrong_node_once.store(true, Ordering::SeqCst);
+
+        stream.write_all(b"o 0 2 1 1 1 1\nabcd").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "O 2 S S");
     }
 
     #[tokio::test(flavor = "current_thread")]
