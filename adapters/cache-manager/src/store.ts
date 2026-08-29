@@ -128,20 +128,32 @@ export class NanocachedStore implements Store {
     await this.ns.clear();
   }
 
-  /** Client-side loop over `get`, concurrently (`Promise.all` preserves
-   * input order in its output regardless of completion order) — bulk
-   * wire ops are explicitly a separate decision from this issue, per the
-   * adapter spec. Missing keys come back as `undefined` holes, exactly
-   * like individual `get` misses. */
+  /** One wire round trip per involved node (issue #152), via the SDK's
+   * `getMany` — vs. a `get` per key. Missing keys come back as
+   * `undefined` holes, exactly like individual `get` misses; array order
+   * matches the input `keys` order regardless of the returned Map's
+   * iteration order. */
   async mget(...keys: string[]): Promise<unknown[]> {
-    return Promise.all(keys.map((key) => this.get(key)));
+    if (keys.length === 0) return [];
+    const raw = await this.ns.getMany(keys);
+    return keys.map((key) => {
+      const value = raw.get(key);
+      return value === undefined ? undefined : (JSON.parse(value) as unknown);
+    });
   }
 
-  /** Client-side loop over `set`, concurrently. `ttl` (if given) applies
-   * to every entry, same as cache-manager's own multi-store fallback for
-   * a store lacking a native `mset`. */
+  /** One wire round trip per involved node (issue #152), via the SDK's
+   * `setMany` — vs. a `set` per key. `ttl` (if given) applies to every
+   * entry, matching `setMany`'s own single-TTL-per-call signature.
+   * `undefined` values are skipped, same no-op convention as `set`. */
   async mset(entries: Array<[string, unknown]>, ttl?: Milliseconds): Promise<void> {
-    await Promise.all(entries.map(([key, value]) => this.set(key, value, ttl)));
+    const values: Record<string, string> = {};
+    for (const [key, value] of entries) {
+      if (value === undefined) continue;
+      values[key] = JSON.stringify(value);
+    }
+    if (Object.keys(values).length === 0) return;
+    await this.ns.setMany(values, resolveTtlSeconds(ttl, this.defaultTtlMs));
   }
 
   /** Client-side loop over `del`, concurrently. */

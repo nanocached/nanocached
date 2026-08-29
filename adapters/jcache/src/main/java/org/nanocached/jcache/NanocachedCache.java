@@ -1,6 +1,8 @@
 package org.nanocached.jcache;
 
 import java.lang.management.ManagementFactory;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -9,6 +11,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.cache.Cache;
@@ -138,18 +141,64 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         return ValueCodec.deserialize(raw.get());
     }
 
+    /**
+     * Batches the wire round trip for keys the SDK's bulk {@code getManyBytes} can carry losslessly
+     * (issue #152) — its keys are UTF-8 strings, and only {@link KeyCodec}'s typed-key branch ({@code
+     * String}/{@code Number}/{@code Boolean}/{@code Character}/{@code UUID}, encoded there with {@code
+     * getBytes(UTF_8)} already) is guaranteed to round-trip through a UTF-8 decode/re-encode unchanged.
+     * A {@code byte[]} key is arbitrary opaque bytes the caller controls, and the JDK-serialization
+     * fallback branch starts with non-UTF-8 magic bytes — both fall back to the per-key {@link #get}
+     * path below, exactly as before this change, so no key type loses correctness for a batching win.
+     */
     @Override
     public Map<K, V> getAll(Set<? extends K> keys) {
         requireNotClosed();
         Objects.requireNonNull(keys, "keys");
         Map<K, V> result = new HashMap<>();
+        if (keys.isEmpty()) {
+            return result;
+        }
+        List<K> bulkKeys = new ArrayList<>();
+        List<String> wireKeys = new ArrayList<>();
         for (K key : keys) {
-            V value = get(key);
-            if (value != null) {
-                result.put(key, value);
+            if (isBulkSafeKey(key)) {
+                bulkKeys.add(key);
+                wireKeys.add(new String(KeyCodec.toKeyBytes(key), StandardCharsets.UTF_8));
+            }
+        }
+        if (!wireKeys.isEmpty()) {
+            Map<String, byte[]> raw = namespace.getManyBytes(wireKeys);
+            for (int i = 0; i < bulkKeys.size(); i++) {
+                K key = bulkKeys.get(i);
+                byte[] value = raw.get(wireKeys.get(i));
+                if (value == null) {
+                    statistics.recordMiss();
+                    continue;
+                }
+                statistics.recordHit();
+                refreshAccessExpiryIfConfigured(KeyCodec.toKeyBytes(key), value);
+                result.put(key, ValueCodec.deserialize(value));
+            }
+        }
+        for (K key : keys) {
+            if (!isBulkSafeKey(key)) {
+                V value = get(key);
+                if (value != null) {
+                    result.put(key, value);
+                }
             }
         }
         return result;
+    }
+
+    /** See {@link #getAll(Set)}'s doc — whether {@code key}'s {@link KeyCodec#toKeyBytes} output is
+     * guaranteed valid UTF-8 that round-trips through the bulk SDK's string-keyed wire API. */
+    private static boolean isBulkSafeKey(Object key) {
+        return key instanceof String
+                || key instanceof Number
+                || key instanceof Boolean
+                || key instanceof Character
+                || key instanceof UUID;
     }
 
     @Override
@@ -394,6 +443,15 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         return oldValue;
     }
 
+    /**
+     * Left as a per-key loop (issue #152 audit): unlike {@link #getAll}, batching this would need a
+     * bulk write with one TTL per call ({@code setManyBytes}), but each entry here can resolve to a
+     * different TTL ({@code expiryForCreation} vs. {@code expiryForUpdate}, themselves not necessarily
+     * equal across entries) and {@link #put}'s CAS-metadata read/old-value tracking for listeners is
+     * still per key — a correct batched form would need grouping by resolved TTL plus the same
+     * bulk-safe-key split {@link #getAll} uses, for a write path this adapter's callers rarely batch
+     * at meaningful size. Not attempted here; revisit if profiling shows it matters.
+     */
     @Override
     public void putAll(Map<? extends K, ? extends V> map) {
         requireNotClosed();

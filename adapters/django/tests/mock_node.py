@@ -1,8 +1,9 @@
 """A trimmed, synchronous stand-in for nanocached-node, speaking just
 enough of the wire protocol — ``A``, namespaced ``g``/``s``/``d`` (issue
 #105) with their legacy ``G``/``S``/``D`` counterparts, ``c``/``F``
-(issue #106), and ``i`` (issue #129) — for these adapter tests to
-exercise NanocachedCache over a real TCP socket without the Rust binary.
+(issue #106), ``i`` (issue #129), and ``m``/``o`` (issue #152) — for
+these adapter tests to exercise NanocachedCache over a real TCP socket
+without the Rust binary.
 A trimmed re-implementation of
 ``sdk/python/tests/mock_servers.py``'s ``MockNode`` (that module is
 private to the SDK's own test suite, see the shared adapters spec) built
@@ -44,6 +45,8 @@ class MockNode:
         self.clear_count = 0
         self.flush_count = 0
         self.incr_count = 0
+        self.multi_get_count = 0
+        self.multi_set_count = 0
 
         self._lock = threading.Lock()
         self._server: socketserver.ThreadingTCPServer | None = None
@@ -239,6 +242,43 @@ class MockNode:
                                     new_bytes,
                                 )
                     wfile.write(reply)
+                    wfile.flush()
+
+                elif cmd == b"m":
+                    # Batched get (issue #152, docs/protocol.html "m / o"):
+                    # <namespace-length> <n> <key-length-1> ... <key-length-n>
+                    # — no legacy uppercase form, no per-key W in a
+                    # single-node mock (there's only ever one owner).
+                    namespace = rfile.read(int(parts[1]))
+                    n = int(parts[2])
+                    key_lengths = [int(p) for p in parts[3 : 3 + n]]
+                    keys = [rfile.read(length) for length in key_lengths]
+                    self.multi_get_count += 1
+                    values = [self._get_entry(namespace, key) for key in keys]
+                    results = [b"%d" % len(value) if value is not None else b"-" for value in values]
+                    header = b"M %d %b\n" % (n, b" ".join(results))
+                    body = b"".join(value for value in values if value is not None)
+                    wfile.write(header + body)
+                    wfile.flush()
+
+                elif cmd == b"o":
+                    # Batched set (issue #152, docs/protocol.html "m / o"):
+                    # <namespace-length> <n> <key-length-1> <value-length-1>
+                    # ... <key-length-n> <value-length-n> [<ttl-seconds>] —
+                    # one shared TTL for the whole batch, omitted when 0.
+                    namespace = rfile.read(int(parts[1]))
+                    n = int(parts[2])
+                    pair_fields = parts[3 : 3 + 2 * n]
+                    key_lengths = [int(p) for p in pair_fields[0::2]]
+                    value_lengths = [int(p) for p in pair_fields[1::2]]
+                    ttl = int(parts[3 + 2 * n]) if len(parts) > 3 + 2 * n else 0
+                    self.multi_set_count += 1
+                    for key_length, value_length in zip(key_lengths, value_lengths):
+                        key = rfile.read(key_length)
+                        value = rfile.read(value_length)
+                        self._set_entry(namespace, key, value, ttl)
+                    results = b" ".join([b"S"] * n)
+                    wfile.write(b"O %d %b\n" % (n, results))
                     wfile.flush()
 
                 else:

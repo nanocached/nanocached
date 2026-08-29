@@ -346,21 +346,31 @@ class NanocachedCache(BaseCache):
         return self._run(lambda: self._namespace_handle.get_bytes(cache_key)) is not None
 
     def get_many(self, keys, version=None):
-        # Client-side loop, per the issue spec — the wire has no
-        # multi-get, unlike memcached/redis.
-        result = {}
-        for key in keys:
-            value = self.get(key, self._missing_key, version=version)
-            if value is not self._missing_key:
-                result[key] = value
-        return result
+        # One wire round trip per involved node (issue #152), via the
+        # SDK's get_many_bytes — vs. a get() per key. cache_keys maps
+        # the namespaced wire key back to the caller's original key,
+        # since get_many_bytes echoes back whatever keys it was given.
+        cache_keys = {self.make_and_validate_key(key, version=version): key for key in keys}
+        if not cache_keys:
+            return {}
+        raw = self._run(lambda: self._namespace_handle.get_many_bytes(list(cache_keys)))
+        return {cache_keys[cache_key]: _decode_value(value) for cache_key, value in raw.items()}
 
     def set_many(self, data, timeout=DEFAULT_TIMEOUT, version=None):
-        # Client-side loop; always returns [] (the "no failed keys"
-        # convention BaseCache's own default set_many uses) since a
-        # failure here raises instead of being collected per-key.
-        for key, value in data.items():
-            self.set(key, value, timeout=timeout, version=version)
+        # One wire round trip per involved node (issue #152), via the
+        # SDK's set_many — vs. a set() per key. Always returns [] (the
+        # "no failed keys" convention BaseCache's own default set_many
+        # uses) since a failure here raises instead of being collected
+        # per-key. wire_ttl is resolved once for the whole call, matching
+        # set_many's own single-timeout signature.
+        if not data:
+            return []
+        wire_ttl = self.get_backend_timeout(timeout)
+        if wire_ttl is _DO_NOT_CACHE:
+            self.delete_many(data.keys(), version=version)
+            return []
+        payload = {self.make_and_validate_key(key, version=version): _encode_value(value) for key, value in data.items()}
+        self._run(lambda: self._namespace_handle.set_many(payload, ttl_seconds=wire_ttl))
         return []
 
     def delete_many(self, keys, version=None):
