@@ -153,4 +153,23 @@ public class NanocachedException extends RuntimeException {
             this.partialValues = partialValues;
         }
     }
+
+    /**
+     * As {@link PartialWrongNode}, but raised by the positional,
+     * {@code byte[]}-keyed {@link NanocachedClient#getManyBytes(byte[][])}
+     * (issue #160). {@code partialValues} is the same positional array a
+     * successful call would have returned ({@code null} for a miss);
+     * since a {@code null} slot alone cannot tell a miss from a key that
+     * is still wrong-node, {@code unresolvedIndices} lists (ascending)
+     * the positions that did NOT resolve.
+     */
+    public static final class PartialWrongNodeRaw extends WrongNode {
+        public final byte[][] partialValues;
+        public final int[] unresolvedIndices;
+
+        public PartialWrongNodeRaw(byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
+            this.partialValues = partialValues;
+            this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+        }
+    }
 }

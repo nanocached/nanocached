@@ -1187,6 +1187,12 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.getManyBytes(namespace, keys);
         }
 
+        /** As {@link NanocachedClient#getManyBytes(byte[][])}, scoped to
+         * {@link #namespace()} (issue #160). */
+        public byte[][] getManyBytes(byte[][] keys) {
+            return NanocachedClient.this.getManyBytes(namespace, keys);
+        }
+
         public void set(String key, String value) {
             set(key, value, 0L);
         }
@@ -1233,6 +1239,16 @@ public final class NanocachedClient implements AutoCloseable {
          * to {@link #namespace()} (issue #151). */
         public void setManyBytes(Map<String, byte[]> values, long ttlSeconds) {
             NanocachedClient.this.setManyBytes(namespace, values, ttlSeconds);
+        }
+
+        public void setManyBytes(byte[][] keys, byte[][] values) {
+            setManyBytes(keys, values, 0L);
+        }
+
+        /** As {@link NanocachedClient#setManyBytes(byte[][], byte[][], long)},
+         * scoped to {@link #namespace()} (issue #160). */
+        public void setManyBytes(byte[][] keys, byte[][] values, long ttlSeconds) {
+            NanocachedClient.this.setManyBytes(namespace, keys, values, ttlSeconds);
         }
 
         public OptionalLong incr(String key, long delta) {
@@ -1596,7 +1612,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /** Shared by {@link #getMany(List)} and {@link Namespace#getMany}:
-     * decodes {@link #getManyBytes(byte[], List)}'s raw result, or — on a
+     * decodes {@link #getManyBytes(byte[], byte[][])}'s raw result, or — on a
      * partial failure — decodes the {@link
      * NanocachedException.PartialWrongNode}'s own partial map and
      * rethrows the UTF-8-decoded counterpart ({@link
@@ -1647,13 +1663,59 @@ public final class NanocachedClient implements AutoCloseable {
         }
         byte[][] keyBytes = new byte[keys.size()][];
         for (int i = 0; i < keys.size(); i++) {
-            byte[] bytes = keys.get(i).getBytes(StandardCharsets.UTF_8);
-            validateKey(namespace, bytes);
-            keyBytes[i] = bytes;
+            keyBytes[i] = keys.get(i).getBytes(StandardCharsets.UTF_8);
+        }
+        try {
+            return spliceMany(keys, getManyBytes(namespace, keyBytes));
+        } catch (NanocachedException.PartialWrongNodeRaw partial) {
+            throw new NanocachedException.PartialWrongNode(spliceMany(keys, partial.partialValues));
+        }
+    }
+
+    /** Re-keys a positional {@link #getManyBytes(byte[], byte[][])}
+     * result by its original {@code String} keys, dropping misses
+     * ({@code null} slots) so "a miss is simply absent" holds for the
+     * map-shaped API. */
+    private static Map<String, byte[]> spliceMany(List<String> keys, byte[][] positional) {
+        Map<String, byte[]> values = new LinkedHashMap<>(keys.size());
+        for (int i = 0; i < positional.length; i++) {
+            if (positional[i] != null) values.put(keys.get(i), positional[i]);
+        }
+        return values;
+    }
+
+    /** The {@code byte[]}-keyed counterpart of {@link
+     * #getManyBytes(List)} (issue #160), for callers whose keys are not
+     * UTF-8 text — the bulk analogue of {@link #getBytes(byte[])}. The
+     * result is positional: {@code result[i]} is {@code keys[i]}'s raw
+     * value, or {@code null} for a miss (a {@code byte[]} cannot key a
+     * {@code Map} by content, so a {@code Map<byte[], byte[]>} would be
+     * useless). {@code keys} must be non-empty.
+     *
+     * <p>Same batch semantics as the {@code String}-keyed form —
+     * chunking, one bounded refresh-and-retry, single-mode {@code W}
+     * propagation — except the partial-failure exception is the
+     * positional {@link NanocachedException.PartialWrongNodeRaw}, whose
+     * {@code partialValues} is this same positional array and whose
+     * {@code unresolvedIndices} names the keys that are still
+     * wrong-node (a {@code null} slot alone can't tell a miss from an
+     * unresolved key). */
+    public byte[][] getManyBytes(byte[][] keys) {
+        return getManyBytes(EMPTY_NAMESPACE, keys);
+    }
+
+    /** The namespaced, positional core every {@code getMany} variant
+     * is built on — see {@link #getManyBytes(byte[][])}. */
+    byte[][] getManyBytes(byte[] namespace, byte[][] keys) {
+        if (keys.length == 0) {
+            throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
+        }
+        for (byte[] key : keys) {
+            validateKey(namespace, key);
         }
         beforeOperation();
 
-        Map<String, byte[]> values = new ConcurrentHashMap<>(keys.size());
+        byte[][] values = new byte[keys.length][];
 
         boolean single;
         synchronized (stateLock) {
@@ -1661,31 +1723,31 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (single) {
-            List<Connection.MultiEntry> entries = multiGetChunked(this::singleConnection, namespace, keyBytes);
-            boolean wrongNode = false;
+            List<Connection.MultiEntry> entries = multiGetChunked(this::singleConnection, namespace, keys);
+            List<Integer> unresolved = new ArrayList<>();
             for (int i = 0; i < entries.size(); i++) {
                 Connection.MultiEntry entry = entries.get(i);
                 if (entry.ok()) {
-                    values.put(keys.get(i), maybeDecompress(entry.value()));
+                    values[i] = maybeDecompress(entry.value());
                 } else if (entry.wrongNode()) {
-                    wrongNode = true;
+                    unresolved.add(i);
                 }
             }
-            if (wrongNode) throw new NanocachedException.PartialWrongNode(values);
+            if (!unresolved.isEmpty()) throw new NanocachedException.PartialWrongNodeRaw(values, unresolved);
             return values;
         }
 
-        List<Integer> retry = multiGetPass(namespace, keys, keyBytes, values, null);
+        List<Integer> retry = multiGetPass(namespace, keys, values, null);
         if (retry.isEmpty()) return values;
         maybeRefresh(true);
-        retry = multiGetPass(namespace, keys, keyBytes, values, retry);
-        if (!retry.isEmpty()) throw new NanocachedException.PartialWrongNode(values);
+        retry = multiGetPass(namespace, keys, values, retry);
+        if (!retry.isEmpty()) throw new NanocachedException.PartialWrongNodeRaw(values, retry);
         return values;
     }
 
     /** {@code compress}'s decompression step (see {@link
      * #getBytes(byte[], byte[])}), generalized so {@link
-     * #getManyBytes(byte[], List)}'s per-entry splicing can share it: a
+     * #getManyBytes(byte[], byte[][])}'s per-entry splicing can share it: a
      * no-op when {@code compress} is off. */
     private byte[] maybeDecompress(byte[] value) {
         return compress ? Compression.decompressValue(value) : value;
@@ -1711,7 +1773,7 @@ public final class NanocachedClient implements AutoCloseable {
         return entries;
     }
 
-    /** One pass of {@link #getManyBytes(byte[], List)}'s cluster routing:
+    /** One pass of {@link #getManyBytes(byte[], byte[][])}'s cluster routing:
      * group the given indices (every key, when {@code retryIndices} is
      * {@code null} — the initial pass — or just the keys a previous pass
      * left unresolved) by their current primary owner (matching plain
@@ -1722,12 +1784,11 @@ public final class NanocachedClient implements AutoCloseable {
      * outright. Called once for the initial pass and once more, if
      * needed, after a single forced refresh. */
     private List<Integer> multiGetPass(
-            byte[] namespace, List<String> keys, byte[][] keyBytes,
-            Map<String, byte[]> values, List<Integer> retryIndices) {
+            byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
-            indices = new ArrayList<>(keys.size());
-            for (int i = 0; i < keys.size(); i++) indices.add(i);
+            indices = new ArrayList<>(keyBytes.length);
+            for (int i = 0; i < keyBytes.length; i++) indices.add(i);
         }
 
         Map<String, List<Integer>> groups = new LinkedHashMap<>();
@@ -1746,7 +1807,7 @@ public final class NanocachedClient implements AutoCloseable {
             String owner = group.getKey();
             List<Integer> groupIndices = group.getValue();
             legs.add(CompletableFuture.supplyAsync(
-                    () -> runMultiGetLeg(namespace, owner, groupIndices, keys, keyBytes, values), replicaWriters));
+                    () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values), replicaWriters));
         }
         for (CompletableFuture<List<Integer>> leg : legs) {
             try {
@@ -1769,7 +1830,7 @@ public final class NanocachedClient implements AutoCloseable {
      * compress} mismatch, not a routing outcome). */
     private List<Integer> runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
-            List<String> keys, byte[][] keyBytes, Map<String, byte[]> values) {
+            byte[][] keyBytes, byte[][] values) {
         byte[][] groupKeys = new byte[groupIndices.size()][];
         for (int i = 0; i < groupIndices.size(); i++) {
             groupKeys[i] = keyBytes[groupIndices.get(i)];
@@ -1789,7 +1850,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (entry.wrongNode()) {
                 retry.add(idx);
             } else if (entry.ok()) {
-                values.put(keys.get(idx), maybeDecompress(entry.value()));
+                values[idx] = maybeDecompress(entry.value());
             }
         }
         return retry;
@@ -1907,25 +1968,50 @@ public final class NanocachedClient implements AutoCloseable {
     /** The namespaced counterpart of {@link #setManyBytes(Map, long)}
      * (issue #151) — see {@link #namespace}. */
     void setManyBytes(byte[] namespace, Map<String, byte[]> values, long ttlSeconds) {
-        if (values.isEmpty()) {
+        byte[][] keyBytes = new byte[values.size()][];
+        byte[][] valueBytes = new byte[values.size()][];
+        int i = 0;
+        for (Map.Entry<String, byte[]> entry : values.entrySet()) {
+            keyBytes[i] = entry.getKey().getBytes(StandardCharsets.UTF_8);
+            valueBytes[i] = entry.getValue();
+            i++;
+        }
+        setManyBytes(namespace, keyBytes, valueBytes, ttlSeconds);
+    }
+
+    public void setManyBytes(byte[][] keys, byte[][] values) {
+        setManyBytes(keys, values, 0L);
+    }
+
+    /** The {@code byte[]}-keyed counterpart of {@link
+     * #setManyBytes(Map, long)} (issue #160): stores {@code values[i]}
+     * under {@code keys[i]} for every position, with the same batch
+     * semantics (shared {@code ttlSeconds}, chunking, one bounded
+     * refresh-and-retry, plain {@link NanocachedException.WrongNode} if
+     * some keys are still wrong-node afterwards). {@code keys} and
+     * {@code values} must be non-empty and the same length. */
+    public void setManyBytes(byte[][] keys, byte[][] values, long ttlSeconds) {
+        setManyBytes(EMPTY_NAMESPACE, keys, values, ttlSeconds);
+    }
+
+    /** The namespaced, positional core every {@code setMany} variant is
+     * built on — see {@link #setManyBytes(byte[][], byte[][], long)}. */
+    void setManyBytes(byte[] namespace, byte[][] keys, byte[][] values, long ttlSeconds) {
+        if (keys.length == 0) {
             throw new IllegalArgumentException("nanocached: setMany/setManyBytes requires at least one key");
+        }
+        if (keys.length != values.length) {
+            throw new IllegalArgumentException(
+                    "nanocached: setManyBytes got " + keys.length + " keys but " + values.length + " values");
         }
         if (ttlSeconds < 0) {
             throw new IllegalArgumentException(
                     "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
-        List<String> keys = new ArrayList<>(values.size());
-        byte[][] keyBytes = new byte[values.size()][];
-        byte[][] valueBytes = new byte[values.size()][];
-        int i = 0;
-        for (Map.Entry<String, byte[]> entry : values.entrySet()) {
-            byte[] key = entry.getKey().getBytes(StandardCharsets.UTF_8);
-            byte[] original = entry.getValue();
-            validateKeyAndValue(namespace, key, original);
-            keys.add(entry.getKey());
-            keyBytes[i] = key;
-            valueBytes[i] = compress ? Compression.compressValue(original, compressionThreshold) : original;
-            i++;
+        byte[][] valueBytes = new byte[keys.length][];
+        for (int i = 0; i < keys.length; i++) {
+            validateKeyAndValue(namespace, keys[i], values[i]);
+            valueBytes[i] = compress ? Compression.compressValue(values[i], compressionThreshold) : values[i];
         }
         beforeOperation();
 
@@ -1938,17 +2024,17 @@ public final class NanocachedClient implements AutoCloseable {
 
         if (single) {
             List<Connection.MultiEntry> entries =
-                    multiSetChunked(this::singleConnection, namespace, keyBytes, valueBytes, wireTtlSeconds);
+                    multiSetChunked(this::singleConnection, namespace, keys, valueBytes, wireTtlSeconds);
             for (Connection.MultiEntry entry : entries) {
                 if (entry.wrongNode()) throw new NanocachedException.WrongNode();
             }
             return;
         }
 
-        List<Integer> retry = multiSetPass(namespace, keys, keyBytes, valueBytes, wireTtlSeconds, null);
+        List<Integer> retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, null);
         if (retry.isEmpty()) return;
         maybeRefresh(true);
-        retry = multiSetPass(namespace, keys, keyBytes, valueBytes, wireTtlSeconds, retry);
+        retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, retry);
         if (!retry.isEmpty()) throw new NanocachedException.WrongNode();
     }
 
@@ -1982,7 +2068,7 @@ public final class NanocachedClient implements AutoCloseable {
         final List<Boolean> isPrimary = new ArrayList<>();
     }
 
-    /** One pass of {@link #setManyBytes(byte[], Map, long)}'s cluster
+    /** One pass of {@link #setManyBytes(byte[], byte[][], byte[][], long)}'s cluster
      * routing: for every key still needing resolution (every key, when
      * {@code retryIndices} is {@code null}, or just what a previous pass
      * left unresolved), build one sub-batch per <b>owner name across
@@ -1998,12 +2084,12 @@ public final class NanocachedClient implements AutoCloseable {
      * fireAndForgetReplicas}, exactly like a single-key replica write —
      * see {@link #runMultiSetLeg}. */
     private List<Integer> multiSetPass(
-            byte[] namespace, List<String> keys, byte[][] keyBytes, byte[][] valueBytes,
+            byte[] namespace, byte[][] keyBytes, byte[][] valueBytes,
             Long ttlSeconds, List<Integer> retryIndices) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
-            indices = new ArrayList<>(keys.size());
-            for (int i = 0; i < keys.size(); i++) indices.add(i);
+            indices = new ArrayList<>(keyBytes.length);
+            for (int i = 0; i < keyBytes.length; i++) indices.add(i);
         }
 
         Map<String, OwnerBatch> owners = new LinkedHashMap<>();

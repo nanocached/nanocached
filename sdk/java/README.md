@@ -162,10 +162,20 @@ Map<String, String> values = client.getMany(List.of("a", "b", "missing"));
 A missing key is simply absent from the returned `Map`, the same "a
 miss is not an error" shape `get`/`getBytes` use. Both are also
 namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
-same as `get`/`set`. Batch keys are always `String` — unlike
-single-key `get`/`set`, `getMany`/`setMany` don't accept `byte[]`
-keys, since a `byte[]` can't safely key a `Map` (identity, not
-content, equality).
+same as `get`/`set`.
+
+For keys that aren't UTF-8 text, the `byte[]`-keyed overloads are
+*positional* rather than map-shaped, since a `byte[]` can't key a
+`Map` by content: `getManyBytes(byte[][] keys)` returns a `byte[][]`
+where `result[i]` is `keys[i]`'s value or `null` on a miss, and
+`setManyBytes(byte[][] keys, byte[][] values, long ttlSeconds)` stores
+`values[i]` under `keys[i]`:
+
+```java
+byte[][] keys = {opaqueKey1, opaqueKey2};
+byte[][] values = client.getManyBytes(keys); // values[1] == null → miss
+client.setManyBytes(keys, new byte[][] {v1, v2}, 60);
+```
 
 **A batch never fails as a whole.** Each key's outcome is independent:
 if some keys are still routed to the wrong node after one bounded
@@ -176,7 +186,10 @@ call), `getMany`/`getManyBytes` throw
 `catch (NanocachedException.WrongNode)` handling keeps working
 unchanged while a caller that wants the partial results can read them
 off the exception (`getMany`'s own decoded counterpart is
-`NanocachedException.PartialWrongNodeStrings`):
+`NanocachedException.PartialWrongNodeStrings`; the positional
+`getManyBytes(byte[][])` throws `PartialWrongNodeRaw`, whose
+`partialValues` is the positional array and whose `unresolvedIndices`
+tells an unresolved slot apart from a plain miss):
 
 ```java
 try {
