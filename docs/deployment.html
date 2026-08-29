@@ -54,7 +54,7 @@ do protocol handshakes) — bind it to an internal interface and don't
 expose it outside the task network. Omitting the flag disables the
 endpoint entirely.</p>
 
-<h2>Metrics to scale on</h2>
+<h2 id="metrics">Metrics to scale on</h2>
 <p><strong>Nodes</strong> scale on the memory watermark. Sum
 <code>nanocached_node_memory_used_bytes</code> over the fleet, divide by
 the summed <code>nanocached_node_memory_max_bytes</code>, and target a
@@ -108,7 +108,7 @@ in-flight requests within <code>--drain-timeout</code> (default 25),
 and exits 0. Clients connected to it reconnect to a surviving proxy
 transparently — at most one reconnect per connection.</p>
 
-<h3>Sizing the stop grace</h3>
+<h3 id="stop-grace">Sizing the stop grace</h3>
 <p>The orchestrator's grace period must outlast the drain:
 <strong>set ECS <code>stopTimeout</code> / Kubernetes
 <code>terminationGracePeriodSeconds</code> to at least
@@ -376,22 +376,245 @@ KEDA; the proxy tier can scale on plain CPU or on
 StatefulSet with stable DNS names — every node must list the same
 discovery addresses in the same order.</p>
 
-<h2>ECS</h2>
-<p>The same shape: set <code>stopTimeout</code> on the container
-definition (default is 30&nbsp;s — raise it if you raise
-<code>--drain-timeout</code>), point the task health check at
-<code>/readyz</code>, and scrape <code>/metrics</code> with the
-CloudWatch agent or ADOT collector to drive target-tracking policies.
-Service Connect / Cloud Map gives discovery its stable addresses.</p>
-<pre><code>"containerDefinitions": [{
+<h2 id="ecs">ECS (Fargate)</h2>
+<p>A clustered deployment: one discovery service plus a node service
+of three tasks, each an ECS service on Fargate, with Cloud Map giving
+discovery its stable name. Every command and task definition below
+was run against a real account in this order — including a scale-in
+under load — and torn down afterwards; the numbers quoted are from
+that run.</p>
+<div class="note">Needs an image newer than <code>0.3.0</code>:
+<code>--drain-timeout</code> and <code>--metrics-port</code> are not
+in the <code>0.3.0</code> tag. Until the next release, pin
+<code>ghcr.io/nanocached/nanocached-node:latest</code> by digest
+(<code>docker manifest inspect</code> prints it).</div>
+
+<h3>Network and IAM</h3>
+<p>The VPC is the one the <a href="#ec2">EC2 section</a> builds
+(<code>VPC_ID</code>, <code>SUBNET_ID</code>). Tasks get a public IP
+so Fargate can pull from <code>ghcr.io</code> and reach CloudWatch
+without a NAT gateway; nothing inbound uses it. One security group
+covers the whole cluster and its clients — tasks talk to each other on
+the data and discovery ports, and the operations ports are open only to
+the VPC:</p>
+<pre><code>SG_ID=$(aws ec2 create-security-group --group-name $NAME-ecs \
+  --description "nanocached ECS cluster" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+aws ec2 authorize-security-group-ingress --group-id $SG_ID --ip-permissions \
+  "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$SG_ID,Description=data + discovery within the cluster}]" \
+  "IpProtocol=tcp,FromPort=9356,ToPort=9357,IpRanges=[{CidrIp=10.0.0.0/16,Description=operations endpoints from inside the VPC}]"</code></pre>
+<p>Two roles: the <em>execution</em> role lets ECS write container
+logs to CloudWatch; the <em>task</em> role is what the containers
+themselves run as — ECS Exec (a shell into a task) and, for the
+metrics sidecar below, <code>cloudwatch:PutMetricData</code>:</p>
+<pre><code>TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+  "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam create-role --role-name $NAME-ecs-execution --assume-role-policy-document "$TRUST"
+aws iam attach-role-policy --role-name $NAME-ecs-execution \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam create-role --role-name $NAME-ecs-task --assume-role-policy-document "$TRUST"
+aws iam put-role-policy --role-name $NAME-ecs-task --policy-name task --policy-document '{
+  "Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":[
+    "ssmmessages:CreateControlChannel","ssmmessages:CreateDataChannel",
+    "ssmmessages:OpenControlChannel","ssmmessages:OpenDataChannel",
+    "cloudwatch:PutMetricData","logs:PutLogEvents","logs:CreateLogGroup",
+    "logs:CreateLogStream","logs:DescribeLogStreams","logs:DescribeLogGroups"],"Resource":"*"}]}'
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)</code></pre>
+
+<h3>Discovery's address: Cloud Map</h3>
+<p>Nodes find discovery by name, so discovery needs a name that
+resolves to whatever task is currently running it. Cloud Map's private
+DNS namespace does that: an <code>A</code> record ECS keeps pointed
+at the discovery task's IP.</p>
+<pre><code>OP=$(aws servicediscovery create-private-dns-namespace --name $NAME.local --vpc $VPC_ID \
+  --query OperationId --output text)
+# poll until Operation.Status is SUCCESS (about 30 s), then:
+NS_ID=$(aws servicediscovery get-operation --operation-id $OP --query Operation.Targets.NAMESPACE --output text)
+DISC_SD_ARN=$(aws servicediscovery create-service --name disc --namespace-id $NS_ID \
+  --dns-config "RoutingPolicy=MULTIVALUE,DnsRecords=[{Type=A,TTL=5}]" \
+  --health-check-custom-config FailureThreshold=1 --query Service.Arn --output text)
+
+aws ecs create-cluster --cluster-name $NAME
+aws logs create-log-group --log-group-name /ecs/$NAME</code></pre>
+<p>That gives every node the same single address,
+<code>disc.nanocached.local:8357</code>. For discovery HA the rule is
+"every node must list the same discovery addresses in the same order"
+— and a multi-value <code>A</code> record does <em>not</em> promise an
+order, so don't run two discovery tasks behind one name. Run one ECS
+service per replica, each registered under its own Cloud Map name
+(<code>disc-0</code>, <code>disc-1</code>), and list those in every
+node's <code>--discovery</code>.</p>
+
+<h3>Task definitions</h3>
+<p>Both images are Alpine-based, so the health check can use
+BusyBox's <code>wget</code> — it is in the image. The node's
+<code>stopTimeout</code> is the drain budget plus a margin (see <a
+href="#stop-grace">sizing the stop grace</a>).</p>
+<pre><code>cat &gt; td-discovery.json &lt;&lt;EOF
+[{
+  "name": "nanocached-discovery",
+  "image": "ghcr.io/nanocached/nanocached-discovery:latest",
+  "essential": true,
+  "command": ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2", "--metrics-port", "9357"],
+  "portMappings": [{"containerPort": 8357}, {"containerPort": 9357}],
+  "healthCheck": {"command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9357/readyz || exit 1"],
+                  "interval": 10, "timeout": 5, "retries": 3, "startPeriod": 30},
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/$NAME",
+                       "awslogs-region": "$AWS_REGION", "awslogs-stream-prefix": "discovery"}}
+}]
+EOF
+cat &gt; td-node.json &lt;&lt;EOF
+[{
   "name": "nanocached-node",
-  "command": ["--host", "0.0.0.0", "--discovery", "disc.internal:8357",
-              "--drain-timeout", "20", "--metrics-port", "9356"],
+  "image": "ghcr.io/nanocached/nanocached-node:latest",
+  "essential": true,
+  "command": ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc.$NAME.local:8357",
+              "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"],
+  "portMappings": [{"containerPort": 8356}, {"containerPort": 9356}],
   "stopTimeout": 45,
-  "healthCheck": {
-    "command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9356/readyz || exit 1"]
-  }
-}]</code></pre>
+  "healthCheck": {"command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9356/readyz || exit 1"],
+                  "interval": 10, "timeout": 5, "retries": 3, "startPeriod": 120},
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/$NAME",
+                       "awslogs-region": "$AWS_REGION", "awslogs-stream-prefix": "node"}}
+}]
+EOF
+for f in discovery node; do
+  aws ecs register-task-definition --family $NAME-$f --network-mode awsvpc \
+    --requires-compatibilities FARGATE --cpu 512 --memory 1024 \
+    --execution-role-arn arn:aws:iam::$ACCOUNT:role/$NAME-ecs-execution \
+    --task-role-arn arn:aws:iam::$ACCOUNT:role/$NAME-ecs-task \
+    --container-definitions file://td-$f.json
+done</code></pre>
+<p><b>Why <code>startPeriod</code> is 120 on the node.</b> A node's
+<code>/readyz</code> only turns 200 once it has joined the cluster,
+and joining waits on two things outside its control: the Cloud Map
+record becoming resolvable (the first node tasks in the verification
+run logged <code>failed to lookup address information: Name does not
+resolve</code> for a while — the node keeps retrying, but with a
+30&nbsp;s <code>startPeriod</code> ECS declared them unhealthy and
+replaced them before the name appeared) and discovery's own 15&nbsp;s
+startup grace plus the join handoff from the existing members. The
+replacements came up fine, so a short <code>startPeriod</code>
+self-heals — it just costs a couple of task churns at every deploy.
+Give it two minutes.</p>
+
+<h3>Services</h3>
+<p>Discovery first, and wait for it — nodes launched before the name
+resolves go through the churn just described:</p>
+<pre><code>NETCFG="awsvpcConfiguration={subnets=[$SUBNET_ID],securityGroups=[$SG_ID],assignPublicIp=ENABLED}"
+aws ecs create-service --cluster $NAME --service-name discovery --launch-type FARGATE \
+  --task-definition $NAME-discovery --desired-count 1 --network-configuration "$NETCFG" \
+  --service-registries registryArn=$DISC_SD_ARN --enable-execute-command
+aws ecs wait services-stable --cluster $NAME --services discovery
+
+aws ecs create-service --cluster $NAME --service-name node --launch-type FARGATE \
+  --task-definition $NAME-node --desired-count 3 --network-configuration "$NETCFG" \
+  --enable-execute-command
+aws ecs wait services-stable --cluster $NAME --services node</code></pre>
+<p>Check from any instance in the security group (the <code>L</code>
+query lists members, see the <a href="protocol.html">protocol</a>;
+<code>tests/e2e/disc.py</code> in the repository wraps it):</p>
+<pre><code>$ getent hosts disc.nanocached.local
+10.1.0.191      disc.nanocached.local
+$ python3 disc.py disc.nanocached.local:8357
+count=3 r=2 [('19ebe199-…', '10.1.0.240:8356'), ('f1774568-…', '10.1.0.79:8356'), ('bd6e29d6-…', '10.1.0.84:8356')]</code></pre>
+<p>Clients use the same name: <code>connect(["disc.nanocached.local:8357"])</code>
+in any SDK. (The client host in the verification run was an Amazon
+Linux 2023 instance — its stock Python is 3.9, and the Python SDK
+needs 3.11: <code>dnf install python3.11 python3.11-pip</code>.)</p>
+
+<h3>Scale-in, verified</h3>
+<p>With 30,000 keys seeded and a mixed load running (8 connections,
+70% reads, 8,300 ops/s), <code>aws ecs update-service --desired-count
+2</code> made ECS pick a task and send it SIGTERM. Its log, with the
+ECS timestamps alongside:</p>
+<pre><code>11:27:37.3  ECS stoppingAt
+11:27:37.6  INFO shutdown signal received — decommissioning (budget 20s)
+11:27:42.6  INFO decommission: handed off 20052 entr(ies)
+11:27:42.6  INFO decommission: forwarding window open for 15s
+11:27:42.6  (discovery) INFO node left the cluster: 1c6275f9-…
+11:27:57.6  INFO decommission finished — shutting down        ← exit code 0
+11:28:31.8  ECS stoppedAt</code></pre>
+<p>So the abstraction holds: ECS's SIGTERM → <code>stopTimeout</code>
+→ SIGKILL sequence is exactly the <code>docker stop -t</code> the E2E
+scenarios simulate. The container used its full 20&nbsp;s budget (5 s
+of handoff, then the forwarding window) and exited 0 well inside the
+45&nbsp;s grace — <code>containers[0].exitCode</code> is
+<code>0</code>, not <code>137</code>. Membership went 3&nbsp;→&nbsp;2
+the moment the handoff finished. The load saw <b>0 misses, 0 corrupt
+reads and 0 errors</b> across 499,316 operations, and a post-drain read
+of the 10,000 keys the load never touched found all 10,000. Note that
+ECS reports <code>stoppedAt</code> about half a minute after the
+container is gone (ENI teardown and bookkeeping) — read the exit code,
+not the timestamps, to judge the drain.</p>
+<p>On Fargate Spot the interruption is the same SIGTERM with a
+two-minute warning; keep <code>stopTimeout</code> at or below
+120&nbsp;s there (ECS caps it) — the default 25&nbsp;s drain fits
+either way.</p>
+
+<h3>Metrics and autoscaling</h3>
+<div class="warn">Not yet exercised on a real account — everything
+above was; this subsection is the intended wiring and will be
+verified next.</div>
+<p>Fargate has no host agent to scrape <code>/metrics</code>, so run
+the AWS Distro for OpenTelemetry collector as a sidecar in the node
+task: it scrapes <code>127.0.0.1:9356</code> and publishes each series
+as a CloudWatch metric in the <code>nanocached</code> namespace. Add
+this container to <code>td-node.json</code> (the config travels as an
+environment variable — no config file to mount):</p>
+<pre><code>{
+  "name": "aws-otel-collector",
+  "image": "public.ecr.aws/aws-observability/aws-otel-collector:latest",
+  "essential": false,
+  "environment": [{"name": "AOT_CONFIG_CONTENT", "value": "receivers:\n  prometheus:\n    config:\n      scrape_configs:\n        - job_name: nanocached-node\n          scrape_interval: 15s\n          static_configs:\n            - targets: [\"127.0.0.1:9356\"]\nprocessors:\n  batch: {}\nexporters:\n  awsemf:\n    namespace: nanocached\n    log_group_name: /ecs/nanocached-metrics\n    dimension_rollup_option: NoDimensionRollup\n    metric_declarations:\n      - dimensions: [[]]\n        metric_name_selectors: [\"^nanocached_node_.*\"]\nservice:\n  pipelines:\n    metrics:\n      receivers: [prometheus]\n      processors: [batch]\n      exporters: [awsemf]\n"}],
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/$NAME",
+                       "awslogs-region": "$AWS_REGION", "awslogs-stream-prefix": "adot"}}
+}</code></pre>
+<p>Then a target-tracking policy on the memory watermark (the metric
+to scale a node tier on — see <a href="#metrics">above</a>). With
+<code>dimensions: [[]]</code> every task publishes to the same
+dimensionless series, so <code>Average</code> across tasks is the
+fleet's watermark:</p>
+<pre><code>aws application-autoscaling register-scalable-target --service-namespace ecs \
+  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
+  --min-capacity 3 --max-capacity 9
+aws application-autoscaling put-scaling-policy --service-namespace ecs \
+  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
+  --policy-name memory-watermark --policy-type TargetTrackingScaling \
+  --target-tracking-scaling-policy-configuration '{
+    "TargetValue": 70,
+    "CustomizedMetricSpecification": {
+      "Namespace": "nanocached", "MetricName": "nanocached_node_memory_used_bytes",
+      "Statistic": "Average", "Unit": "None"
+    },
+    "ScaleInCooldown": 300, "ScaleOutCooldown": 60
+  }'</code></pre>
+<p><code>TargetValue</code> is in the metric's own unit, so scale the
+number to your <code>--max-memory</code> (70% of 512&nbsp;MiB is
+375809638) — or publish a ratio from the collector with a
+<code>metricstransform</code> processor and track that instead.</p>
+
+<h3>Teardown</h3>
+<pre><code>for s in node discovery; do
+  aws ecs update-service --cluster $NAME --service $s --desired-count 0
+  aws ecs delete-service --cluster $NAME --service $s --force
+done
+aws ecs wait services-inactive --cluster $NAME --services node discovery
+for arn in $(aws ecs list-task-definitions --family-prefix $NAME- --query taskDefinitionArns --output text); do
+  aws ecs deregister-task-definition --task-definition $arn
+done
+aws ecs delete-cluster --cluster $NAME
+SD_ID=${DISC_SD_ARN##*/}
+aws servicediscovery delete-service --id $SD_ID        # after its instances deregister (a few seconds)
+aws servicediscovery delete-namespace --id $NS_ID
+aws logs delete-log-group --log-group-name /ecs/$NAME
+aws iam detach-role-policy --role-name $NAME-ecs-execution \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam delete-role --role-name $NAME-ecs-execution
+aws iam delete-role-policy --role-name $NAME-ecs-task --policy-name task
+aws iam delete-role --role-name $NAME-ecs-task
+aws ec2 delete-security-group --group-id $SG_ID     # once the tasks' ENIs are gone (~1 min)</code></pre>
+<p>…then the VPC teardown from the EC2 section.</p>
 
 <h2>Verifying a deployment</h2>
 <p>The repository ships runnable scale-in scenarios under
