@@ -29,6 +29,7 @@ import javax.cache.expiry.AccessedExpiryPolicy;
 import javax.cache.expiry.CreatedExpiryPolicy;
 import javax.cache.expiry.Duration;
 import javax.cache.expiry.EternalExpiryPolicy;
+import javax.cache.expiry.ExpiryPolicy;
 import javax.cache.management.CacheStatisticsMXBean;
 import javax.cache.processor.EntryProcessor;
 import javax.cache.spi.CachingProvider;
@@ -212,6 +213,108 @@ class NanocachedCacheTest {
         assertFalse(cache.containsKey("a"));
         assertTrue(node.casDeleteCount.get() >= 2, "a forced mismatch must cause a retry");
     }
+
+    // ── batched getAll / putAll (issue #160) ─────────────────────────
+
+    @Test
+    void getAllBatchesEveryKeyTypeIntoOneBulkRead() {
+        MutableConfiguration<Object, String> config = new MutableConfiguration<>();
+        config.setTypes(Object.class, String.class);
+        config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+        Cache<Object, String> mixed = manager.createCache("mixed-keys", config);
+        byte[] opaque = {(byte) 0xFF, (byte) 0xFE, 0, 1};
+        SerializableKey serialized = new SerializableKey("s", 7);
+        mixed.put("str", "1");
+        mixed.put(42L, "2");
+        mixed.put(opaque, "3");
+        mixed.put(serialized, "4");
+        node.multiGetCount.set(0);
+
+        Map<Object, String> all = mixed.getAll(Set.of("str", 42L, opaque, serialized, "missing"));
+
+        assertEquals(4, all.size());
+        assertEquals("1", all.get("str"));
+        assertEquals("2", all.get(42L));
+        assertEquals("3", all.get(opaque));
+        assertEquals("4", all.get(serialized));
+        assertEquals(1, node.multiGetCount.get(), "one bulk read, no per-key fallback");
+    }
+
+    @Test
+    void putAllIssuesOneBulkWritePerResolvedTtl() {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(FactoryBuilder.factoryOf(new SplitExpiryPolicy()));
+        Cache<String, String> split = manager.createCache("split-widgets", config);
+        split.put("existing", "old");
+        node.multiSetCount.set(0);
+        node.multiGetCount.set(0);
+
+        split.putAll(Map.of("existing", "new", "fresh1", "1", "fresh2", "2"));
+
+        assertEquals(1, node.multiGetCount.get(), "one bulk read decides create-vs-update");
+        assertEquals(2, node.multiSetCount.get(), "one bulk write per distinct TTL");
+        assertEquals(30L, storedTtlSeconds("split-widgets", "existing"));
+        assertEquals(60L, storedTtlSeconds("split-widgets", "fresh1"));
+        assertEquals(60L, storedTtlSeconds("split-widgets", "fresh2"));
+        assertEquals("new", split.get("existing"));
+    }
+
+    @Test
+    void putAllFiresCreatedAndUpdatedEventsWithOldValues() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
+        cache.put("a", "1");
+        events.clear();
+
+        cache.putAll(new java.util.LinkedHashMap<>(Map.of("a", "2")) {{ put("b", "3"); }});
+
+        assertEquals(List.of("UPDATED:a:2:old=1", "CREATED:b:3"), events);
+    }
+
+    @Test
+    void putAllWithDurationZeroDeletesExistingAndSkipsNew() {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(CreatedExpiryPolicy.factoryOf(Duration.ZERO));
+        Cache<String, String> zeroCache = manager.createCache("zero-all", config);
+        node.multiSetCount.set(0);
+
+        zeroCache.putAll(Map.of("a", "1", "b", "2"));
+
+        assertNull(zeroCache.get("a"));
+        assertNull(zeroCache.get("b"));
+        assertEquals(0, node.multiSetCount.get());
+    }
+
+    @Test
+    void putAllOfAnEmptyMapIsANoOp() {
+        cache.putAll(Map.of());
+        assertEquals(0, node.multiGetCount.get());
+        assertEquals(0, node.multiSetCount.get());
+    }
+
+    /** creation → 60 s, update → 30 s: two distinct TTLs within one putAll. */
+    private static final class SplitExpiryPolicy implements ExpiryPolicy, java.io.Serializable {
+        @Override
+        public Duration getExpiryForCreation() {
+            return new Duration(java.util.concurrent.TimeUnit.SECONDS, 60);
+        }
+
+        @Override
+        public Duration getExpiryForAccess() {
+            return null;
+        }
+
+        @Override
+        public Duration getExpiryForUpdate() {
+            return new Duration(java.util.concurrent.TimeUnit.SECONDS, 30);
+        }
+    }
+
+    private record SerializableKey(String name, int id) implements java.io.Serializable {}
 
     // ── bulk removal / clear ────────────────────────────────────────
 

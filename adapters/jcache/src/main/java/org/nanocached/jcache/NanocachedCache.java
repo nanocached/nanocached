@@ -1,17 +1,16 @@
 package org.nanocached.jcache;
 
 import java.lang.management.ManagementFactory;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.cache.Cache;
@@ -142,13 +141,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * Batches the wire round trip for keys the SDK's bulk {@code getManyBytes} can carry losslessly
-     * (issue #152) — its keys are UTF-8 strings, and only {@link KeyCodec}'s typed-key branch ({@code
-     * String}/{@code Number}/{@code Boolean}/{@code Character}/{@code UUID}, encoded there with {@code
-     * getBytes(UTF_8)} already) is guaranteed to round-trip through a UTF-8 decode/re-encode unchanged.
-     * A {@code byte[]} key is arbitrary opaque bytes the caller controls, and the JDK-serialization
-     * fallback branch starts with non-UTF-8 magic bytes — both fall back to the per-key {@link #get}
-     * path below, exactly as before this change, so no key type loses correctness for a batching win.
+     * One batched wire round trip per owner for every key (issue #152, completed in #160): the SDK's
+     * positional {@code getManyBytes(byte[][])} carries {@link KeyCodec#toKeyBytes}'s output verbatim,
+     * so {@code byte[]} keys and JDK-serialized fallback keys batch exactly like {@code String} ones —
+     * there is no longer a "bulk-safe" subset that has to fall back to per-key {@link #get}.
      */
     @Override
     public Map<K, V> getAll(Set<? extends K> keys) {
@@ -158,47 +154,23 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         if (keys.isEmpty()) {
             return result;
         }
-        List<K> bulkKeys = new ArrayList<>();
-        List<String> wireKeys = new ArrayList<>();
-        for (K key : keys) {
-            if (isBulkSafeKey(key)) {
-                bulkKeys.add(key);
-                wireKeys.add(new String(KeyCodec.toKeyBytes(key), StandardCharsets.UTF_8));
-            }
+        List<K> ordered = new ArrayList<>(keys);
+        byte[][] wireKeys = new byte[ordered.size()][];
+        for (int i = 0; i < ordered.size(); i++) {
+            wireKeys[i] = KeyCodec.toKeyBytes(Objects.requireNonNull(ordered.get(i), "key"));
         }
-        if (!wireKeys.isEmpty()) {
-            Map<String, byte[]> raw = namespace.getManyBytes(wireKeys);
-            for (int i = 0; i < bulkKeys.size(); i++) {
-                K key = bulkKeys.get(i);
-                byte[] value = raw.get(wireKeys.get(i));
-                if (value == null) {
-                    statistics.recordMiss();
-                    continue;
-                }
-                statistics.recordHit();
-                refreshAccessExpiryIfConfigured(KeyCodec.toKeyBytes(key), value);
-                result.put(key, ValueCodec.deserialize(value));
+        byte[][] raw = namespace.getManyBytes(wireKeys);
+        for (int i = 0; i < ordered.size(); i++) {
+            byte[] value = raw[i];
+            if (value == null) {
+                statistics.recordMiss();
+                continue;
             }
-        }
-        for (K key : keys) {
-            if (!isBulkSafeKey(key)) {
-                V value = get(key);
-                if (value != null) {
-                    result.put(key, value);
-                }
-            }
+            statistics.recordHit();
+            refreshAccessExpiryIfConfigured(wireKeys[i], value);
+            result.put(ordered.get(i), ValueCodec.deserialize(value));
         }
         return result;
-    }
-
-    /** See {@link #getAll(Set)}'s doc — whether {@code key}'s {@link KeyCodec#toKeyBytes} output is
-     * guaranteed valid UTF-8 that round-trips through the bulk SDK's string-keyed wire API. */
-    private static boolean isBulkSafeKey(Object key) {
-        return key instanceof String
-                || key instanceof Number
-                || key instanceof Boolean
-                || key instanceof Character
-                || key instanceof UUID;
     }
 
     @Override
@@ -444,20 +416,71 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * Left as a per-key loop (issue #152 audit): unlike {@link #getAll}, batching this would need a
-     * bulk write with one TTL per call ({@code setManyBytes}), but each entry here can resolve to a
-     * different TTL ({@code expiryForCreation} vs. {@code expiryForUpdate}, themselves not necessarily
-     * equal across entries) and {@link #put}'s CAS-metadata read/old-value tracking for listeners is
-     * still per key — a correct batched form would need grouping by resolved TTL plus the same
-     * bulk-safe-key split {@link #getAll} uses, for a write path this adapter's callers rarely batch
-     * at meaningful size. Not attempted here; revisit if profiling shows it matters.
+     * The batched form of {@link #put} (issue #160): one bulk read tells which entries already exist
+     * (each entry's TTL is {@code expiryForUpdate} vs. {@code expiryForCreation} accordingly, and the
+     * old value feeds the update listeners), then the writes are grouped by resolved TTL — the SDK's
+     * {@code setManyBytes} takes one TTL per call — and issued as one bulk set per distinct TTL. An
+     * entry whose policy resolves to {@link Duration#ZERO} is never stored; if it already existed it
+     * is deleted instead, exactly as {@link #put} does.
      */
     @Override
     public void putAll(Map<? extends K, ? extends V> map) {
         requireNotClosed();
         Objects.requireNonNull(map, "map");
+        if (map.isEmpty()) {
+            return;
+        }
+        List<K> keys = new ArrayList<>(map.size());
+        List<V> values = new ArrayList<>(map.size());
+        byte[][] wireKeys = new byte[map.size()][];
+        byte[][] wireValues = new byte[map.size()][];
+        int n = 0;
         for (Map.Entry<? extends K, ? extends V> entry : map.entrySet()) {
-            put(entry.getKey(), entry.getValue());
+            K key = Objects.requireNonNull(entry.getKey(), "key");
+            V value = Objects.requireNonNull(entry.getValue(), "value");
+            keys.add(key);
+            values.add(value);
+            wireKeys[n] = KeyCodec.toKeyBytes(key);
+            wireValues[n] = ValueCodec.serialize(value);
+            n++;
+        }
+
+        byte[][] existing = namespace.getManyBytes(wireKeys);
+
+        // Resolved TTL → the positions that share it. Insertion order is
+        // kept so the groups' writes (and their listener events) follow
+        // the caller's map iteration order group by group.
+        Map<Long, List<Integer>> byTtl = new LinkedHashMap<>();
+        for (int i = 0; i < n; i++) {
+            boolean present = existing[i] != null;
+            OptionalLong ttl = wireTtlSeconds(
+                    present ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation());
+            if (ttl.isEmpty()) {
+                if (present) {
+                    namespace.delete(wireKeys[i]);
+                }
+                continue;
+            }
+            byTtl.computeIfAbsent(ttl.getAsLong(), ignored -> new ArrayList<>()).add(i);
+        }
+
+        for (Map.Entry<Long, List<Integer>> group : byTtl.entrySet()) {
+            List<Integer> positions = group.getValue();
+            byte[][] groupKeys = new byte[positions.size()][];
+            byte[][] groupValues = new byte[positions.size()][];
+            for (int g = 0; g < positions.size(); g++) {
+                groupKeys[g] = wireKeys[positions.get(g)];
+                groupValues[g] = wireValues[positions.get(g)];
+            }
+            namespace.setManyBytes(groupKeys, groupValues, group.getKey());
+            for (int i : positions) {
+                statistics.recordPut();
+                if (existing[i] != null) {
+                    fireUpdated(keys.get(i), values.get(i), ValueCodec.deserialize(existing[i]));
+                } else {
+                    fireCreated(keys.get(i), values.get(i));
+                }
+            }
         }
     }
 

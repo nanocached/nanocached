@@ -262,6 +262,84 @@ class NanocachedClientTest {
         }
     }
 
+    // ── byte[]-keyed バッチ get/set (issue #160) ──────────────────
+
+    @Test
+    void positionalGetManyBytesHandlesNonUtf8KeysAndMisses() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[] opaque = {(byte) 0xFF, (byte) 0xFE, 0, 1};
+                byte[] magic = {(byte) 0xAC, (byte) 0xED, 0, 5};
+                client.set(opaque, "one".getBytes(StandardCharsets.UTF_8));
+                client.set(magic, "two".getBytes(StandardCharsets.UTF_8));
+                byte[][] values = client.getManyBytes(new byte[][] {
+                        opaque, "missing".getBytes(StandardCharsets.UTF_8), magic});
+                assertEquals(3, values.length);
+                assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), values[0]);
+                assertNull(values[1]);
+                assertArrayEquals("two".getBytes(StandardCharsets.UTF_8), values[2]);
+                assertEquals(1, node.multiGetCount.get());
+            }
+        }
+    }
+
+    @Test
+    void positionalSetManyBytesStoresEveryPair() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[][] keys = {{(byte) 0xFF, 1}, {(byte) 0xFF, 2}};
+                byte[][] values = {{10}, {20}};
+                client.setManyBytes(keys, values);
+                assertEquals(1, node.multiSetCount.get());
+                assertArrayEquals(new byte[] {10}, client.getBytes(keys[0]).orElseThrow());
+                assertArrayEquals(new byte[] {20}, client.getBytes(keys[1]).orElseThrow());
+            }
+        }
+    }
+
+    @Test
+    void positionalBulkOpsValidateTheirArguments() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertThrows(IllegalArgumentException.class, () -> client.getManyBytes(new byte[0][]));
+                assertThrows(IllegalArgumentException.class,
+                        () -> client.setManyBytes(new byte[0][], new byte[0][]));
+                assertThrows(IllegalArgumentException.class,
+                        () -> client.setManyBytes(new byte[][] {{1}, {2}}, new byte[][] {{1}}));
+                assertThrows(IllegalArgumentException.class,
+                        () -> client.setManyBytes(new byte[][] {{1}}, new byte[][] {{1}}, -1L));
+            }
+        }
+    }
+
+    @Test
+    void positionalBulkOpsAreNamespaced() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace ns = client.namespace("tenant");
+                byte[][] key = {{7}};
+                ns.setManyBytes(key, new byte[][] {{1}});
+                client.setManyBytes(key, new byte[][] {{2}});
+                assertArrayEquals(new byte[] {1}, ns.getManyBytes(key)[0]);
+                assertArrayEquals(new byte[] {2}, client.getManyBytes(key)[0]);
+            }
+        }
+    }
+
+    @Test
+    void positionalWrongNodeNamesTheUnresolvedIndices() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                node.answerWrongNodeOnce();
+                NanocachedException.PartialWrongNodeRaw failure = assertThrows(
+                        NanocachedException.PartialWrongNodeRaw.class,
+                        () -> client.getManyBytes(new byte[][] {{1}, {2}}));
+                assertEquals(2, failure.partialValues.length);
+                assertTrue(failure.unresolvedIndices.length > 0);
+            }
+        }
+    }
+
     // ── INCR/DECR (issue #129) ────────────────────────────────────
 
     @Test
