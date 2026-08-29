@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Deployment — nanocached</title>
-<meta name="description" content="Run nanocached on ECS or EKS: metrics for autoscaling, readiness probes, and graceful scale-in via SIGTERM.">
+<meta name="description" content="Run nanocached on a single EC2 instance, on ECS or on EKS: network setup, metrics for autoscaling, readiness probes, and graceful scale-in via SIGTERM.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -30,12 +30,13 @@
 <main>
 
 <h1>Deployment</h1>
-<p class="lede">Everything an orchestrator needs to scale nanocached in
-both directions: Prometheus metrics to act on, probes to route around
-instances that aren't ready, and a SIGTERM-driven drain so scale-in
-never loses data.</p>
+<p class="lede">A complete single-instance deployment on EC2 first —
+network, security groups, IAM, systemd — then everything an
+orchestrator needs to scale nanocached in both directions: Prometheus
+metrics to act on, probes to route around instances that aren't ready,
+and a SIGTERM-driven drain so scale-in never loses data.</p>
 
-<h2>The operations endpoint</h2>
+<h2 id="ops">The operations endpoint</h2>
 <p>Each binary takes <code>--metrics-port &lt;port&gt;</code> and serves
 three paths on it (plain HTTP, on <code>--host</code>):</p>
 <div class="table-wrap">
@@ -118,6 +119,240 @@ in-network transfer, but measure with your value sizes; keys that miss
 the budget are logged and left to the surviving replicas. The default
 25&nbsp;s fits inside a spot interruption's 2-minute warning with room
 to spare.</p>
+
+<h2 id="ec2">Single node on EC2</h2>
+<p>The simplest production shape: one <code>nanocached-node</code> on one
+instance, standalone (no discovery server, no replication — a cache, so
+losing the instance loses its contents and nothing else). This section
+builds everything around it from an empty account with the AWS CLI:
+a VPC and public subnet, two security groups, an SSM-only instance
+role, and an Amazon Linux 2023 instance that installs Docker and runs
+the node under systemd from user-data. Every command was run against a
+real account in this order and then torn down with the commands at the
+end.</p>
+<p>The shape of the network: the node has a public IP only so it can
+pull its image and reach Systems Manager — nothing inbound ever uses
+it. Its security group admits the data port only from the
+<em>application's</em> security group, the operations port only from
+inside the VPC, and no SSH at all; you get a shell through SSM Session
+Manager. Clients run in the same VPC and carry the
+<code>nanocached-app</code> security group.</p>
+
+<pre><code>export AWS_REGION=us-east-1
+NAME=nanocached
+TAG="{Key=Project,Value=$NAME}"     # every resource carries it — see teardown</code></pre>
+
+<h3>Network</h3>
+<pre><code>VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 \
+  --tag-specifications "ResourceType=vpc,Tags=[$TAG]" --query Vpc.VpcId --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames
+
+SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.0.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG]" --query Subnet.SubnetId --output text)
+aws ec2 modify-subnet-attribute --subnet-id $SUBNET_ID --map-public-ip-on-launch
+
+IGW_ID=$(aws ec2 create-internet-gateway \
+  --tag-specifications "ResourceType=internet-gateway,Tags=[$TAG]" \
+  --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=route-table,Tags=[$TAG]" --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $SUBNET_ID</code></pre>
+<p>Name the availability zone explicitly. Left to AWS, the subnet can
+land in a zone that doesn't offer the instance type you're about to
+launch (<code>us-east-1e</code> has no <code>t3</code>, and
+<code>run-instances</code> fails with <code>Unsupported</code> only
+after the network is built).</p>
+<p>Already have a VPC? Set <code>VPC_ID</code> and <code>SUBNET_ID</code>
+to an existing public subnet and skip this block; substitute your VPC's
+CIDR for <code>10.0.0.0/16</code> in the operations-port rule below.</p>
+
+<h3>Security groups</h3>
+<p>Two groups: <code>nanocached-app</code> is a label the clients wear
+(no rules of its own); <code>nanocached-node</code> refers to it, so
+adding a client is a matter of launching it in the app group, never of
+editing an IP allow-list.</p>
+<pre><code>APP_SG=$(aws ec2 create-security-group --group-name $NAME-app \
+  --description "nanocached clients" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+NODE_SG=$(aws ec2 create-security-group --group-name $NAME-node \
+  --description "nanocached node" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $NODE_SG --ip-permissions \
+  "IpProtocol=tcp,FromPort=8356,ToPort=8356,UserIdGroupPairs=[{GroupId=$APP_SG,Description=data port from app tier}]" \
+  "IpProtocol=tcp,FromPort=9356,ToPort=9356,IpRanges=[{CidrIp=10.0.0.0/16,Description=operations endpoint from inside the VPC}]"</code></pre>
+<p>Port 22 is deliberately absent. The operations endpoint is
+unauthenticated (<a href="#ops">above</a>), which is why its rule is a
+CIDR inside the VPC rather than <code>0.0.0.0/0</code>; the default
+outbound rule (allow all) stays, since the instance needs to pull its
+image and talk to SSM.</p>
+
+<h3>IAM</h3>
+<p>One role, one managed policy: <code>AmazonSSMManagedInstanceCore</code>
+is what lets Session Manager and Run Command reach the instance without
+a key pair or an open port.</p>
+<pre><code>aws iam create-role --role-name $NAME-ec2 --tags Key=Project,Value=$NAME \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam create-instance-profile --instance-profile-name $NAME-ec2
+aws iam add-role-to-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
+sleep 15   # a brand-new instance profile takes a few seconds to become launchable</code></pre>
+
+<h3>The instance</h3>
+<p>Save this as <code>node-user-data.sh</code>. It installs Docker,
+writes the auth secret to a root-only environment file, and registers
+a systemd unit that runs the published image with host networking
+(no Docker NAT on the data path) and restarts it if it ever exits.</p>
+<pre><code>#!/bin/bash
+set -euo pipefail
+dnf install -y docker
+systemctl enable --now docker
+
+install -d -m 700 /etc/nanocached
+cat &gt; /etc/nanocached/env &lt;&lt;'ENV'
+NANOCACHED_AUTH_SECRET=change-me
+ENV
+chmod 600 /etc/nanocached/env
+
+cat &gt; /etc/systemd/system/nanocached-node.service &lt;&lt;'UNIT'
+[Unit]
+Description=nanocached node
+After=docker.service
+Requires=docker.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm -f nanocached-node
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node:0.3.0
+ExecStart=/usr/bin/docker run --rm --name nanocached-node \
+  --network host \
+  --env-file /etc/nanocached/env \
+  ghcr.io/nanocached/nanocached-node:0.3.0 \
+  --host 0.0.0.0 --port 8356 --metrics-port 9356 \
+  --max-memory 1073741824
+ExecStop=/usr/bin/docker stop -t 30 nanocached-node
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now nanocached-node</code></pre>
+<p>Three things to change for your own deployment:</p>
+<ul>
+  <li><b><code>NANOCACHED_AUTH_SECRET</code></b> — pick a real one. It
+  is an environment variable rather than a flag so it never shows up in
+  <code>ps</code>; the file is <code>0600</code> for the same reason.
+  Clients pass the same value (see <a href="getting-started.html#auth">authentication</a>).</li>
+  <li><b><code>--max-memory</code></b> — the cache's budget in bytes.
+  1&nbsp;GiB is right for a 2&nbsp;GiB <code>t3.small</code>: leave
+  the kernel, Docker and the per-connection buffers the rest. Scale it
+  with the instance; the <a href="capacity-planner.html">capacity
+  planner</a> turns a hit-rate target into a number.</li>
+  <li><b>The image tag</b> — pinned to a version so an instance
+  replacement can't silently pick up a different build.</li>
+</ul>
+<p>Launch it, plus a throwaway client in the app group to verify from:</p>
+<pre><code>AMI_ID=$(aws ssm get-parameter \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query Parameter.Value --output text)
+
+NODE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
+  --subnet-id $SUBNET_ID --security-group-ids $NODE_SG \
+  --iam-instance-profile Name=$NAME-ec2 --user-data file://node-user-data.sh \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-node}]" \
+  --query 'Instances[0].InstanceId' --output text)
+
+CLIENT_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.micro \
+  --subnet-id $SUBNET_ID --security-group-ids $APP_SG \
+  --iam-instance-profile Name=$NAME-ec2 \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-client}]" \
+  --query 'Instances[0].InstanceId' --output text)
+
+aws ec2 wait instance-running --instance-ids $NODE_ID $CLIENT_ID
+NODE_IP=$(aws ec2 describe-instances --instance-ids $NODE_ID \
+  --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)</code></pre>
+<p>From launch to a ready node took about 70&nbsp;s (Docker install
+plus the image pull); Systems Manager needs another minute or so to
+register the instances before Run Command can reach them.</p>
+
+<h3>Verifying</h3>
+<p>On the node itself (<code>aws ssm start-session --target $NODE_ID</code>
+for a shell, or <code>aws ssm send-command</code> as below):</p>
+<pre><code>aws ssm send-command --instance-ids $NODE_ID --document-name AWS-RunShellScript \
+  --parameters 'commands=["systemctl is-active nanocached-node",
+    "curl -s -o /dev/null -w healthz=%{http_code}\\\\n http://127.0.0.1:9356/healthz",
+    "curl -s -o /dev/null -w readyz=%{http_code}\\\\n http://127.0.0.1:9356/readyz"]'
+# active / healthz=200 / readyz=200</code></pre>
+<p>From the client — the same smoke test as <a
+href="getting-started.html">getting started</a>, with the <code>A</code>
+frame in front because a secret is set. Amazon Linux 2023 has no
+<code>nc</code> by default, so use Python:</p>
+<pre><code>python3 - &lt;&lt;PY
+import socket
+s = socket.create_connection(("$NODE_IP", 8356), timeout=5)
+s.sendall(b"A 9\nchange-meS 4 5\nnameAliceG 4\nname"); s.shutdown(socket.SHUT_WR)
+buf = b""
+while (c := s.recv(4096)): buf += c
+print(buf)
+PY
+# b'On\nS\nV 5\nAlice'   — authenticated, stored, read back
+curl -s http://$NODE_IP:9356/metrics | grep -v '^#' | head -3
+# nanocached_node_memory_used_bytes 109
+# nanocached_node_memory_max_bytes 1073741824
+# nanocached_node_entries 1</code></pre>
+<p>Two negative checks are worth running once, because they are what
+the security groups are for: the same <code>G</code> without a
+preceding <code>A</code> gets <code>En</code> and a closed connection,
+and from anywhere outside the security group — your laptop, say —
+both ports refuse:</p>
+<pre><code>NODE_PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $NODE_ID \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+nc -z -w 5 $NODE_PUBLIC_IP 8356 || echo "8356 blocked (expected)"
+nc -z -w 5 $NODE_PUBLIC_IP 9356 || echo "9356 blocked (expected)"</code></pre>
+<p>Finally, <code>systemctl restart nanocached-node</code> on the node:
+<code>/readyz</code> answered 200 again within 4&nbsp;s. Note that a
+standalone node has nobody to hand its entries to, so a restart is a
+cold cache — that is the trade-off this shape makes, and the reason to
+graduate to the clustered ECS/EKS shapes below once an empty cache after
+a restart is no longer acceptable.</p>
+
+<h3>Teardown</h3>
+<p>The reverse order — instances first (a security group can't be
+deleted while an ENI references it, and the VPC can't go until
+everything inside it has):</p>
+<pre><code>aws ec2 terminate-instances --instance-ids $NODE_ID $CLIENT_ID
+aws ec2 wait instance-terminated --instance-ids $NODE_ID $CLIENT_ID
+
+aws iam remove-role-from-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
+aws iam delete-instance-profile --instance-profile-name $NAME-ec2
+aws iam detach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name $NAME-ec2
+
+aws ec2 delete-security-group --group-id $NODE_SG   # first: it references $APP_SG
+aws ec2 delete-security-group --group-id $APP_SG
+
+ASSOC=$(aws ec2 describe-route-tables --route-table-ids $RTB_ID \
+  --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text)
+aws ec2 disassociate-route-table --association-id $ASSOC
+aws ec2 delete-route-table --route-table-id $RTB_ID
+aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
+aws ec2 delete-subnet --subnet-id $SUBNET_ID
+aws ec2 delete-vpc --vpc-id $VPC_ID</code></pre>
+<p>Because everything carried the <code>Project=nanocached</code> tag,
+<code>aws resourcegroupstaggingapi get-resources --tag-filters
+Key=Project,Values=nanocached</code> is the check that nothing is left
+billing.</p>
 
 <h2>EKS / Kubernetes</h2>
 <pre><code>containers:

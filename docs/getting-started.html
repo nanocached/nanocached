@@ -130,7 +130,7 @@ part of the cluster learned elsewhere. Clients simply skip to the next
 seed, so a partially rolled-out misconfiguration degrades loudly
 instead of silently splitting routing.</p>
 
-<h2>Authentication</h2>
+<h2 id="auth">Authentication</h2>
 <p>Set <code>NANOCACHED_AUTH_SECRET</code> to require clients to
 authenticate before any other command. It is an environment variable —
 not a flag — so the secret never shows in <code>ps</code> output. Set it
