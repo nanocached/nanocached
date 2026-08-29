@@ -24,7 +24,7 @@ public class NanocachedException extends RuntimeException {
      * and retry once; it only escapes when that retry also fails, or in
      * single-node mode where there is no discovery to refresh from.
      */
-    public static final class WrongNode extends NanocachedException {
+    public static class WrongNode extends NanocachedException {
         public WrongNode() {
             super("nanocached: this node does not hold the requested key");
         }
@@ -108,6 +108,49 @@ public class NanocachedException extends RuntimeException {
     public static final class NotNumeric extends NanocachedException {
         public NotNumeric() {
             super("nanocached: the stored value is not an integer INCR can operate on");
+        }
+    }
+
+    /**
+     * Raised by {@link NanocachedClient#getManyBytes} (issue #151) when
+     * some keys are still wrong-node after the one bounded
+     * refresh-and-retry every batch gets (the per-key analogue of {@code
+     * getBytes}' own {@code W} refresh-and-retry) — a subclass of {@link
+     * WrongNode}, so existing {@code catch (WrongNode)} handling keeps
+     * working unchanged. {@code partialValues} holds every key that DID
+     * resolve — a batch never fails as a whole
+     * (docs/protocol.html#multi), so a handful of stale placements
+     * shouldn't force discarding an otherwise successful batch. {@link
+     * NanocachedClient#setManyBytes} has nothing to return on success, so
+     * it just throws a plain {@link WrongNode} on the same condition —
+     * there's no partial payload worth attaching.
+     *
+     * <p>A separate, non-generic class from {@link PartialWrongNodeStrings}
+     * rather than one class parameterized over the value type: the JLS
+     * forbids a generic class from being a (direct or indirect) subclass
+     * of {@link Throwable}.
+     */
+    public static final class PartialWrongNode extends WrongNode {
+        public final java.util.Map<String, byte[]> partialValues;
+
+        public PartialWrongNode(java.util.Map<String, byte[]> partialValues) {
+            this.partialValues = partialValues;
+        }
+    }
+
+    /**
+     * As {@link PartialWrongNode}, but raised by {@link
+     * NanocachedClient#getMany} — the UTF-8-decoded counterpart, thrown
+     * once the raw {@link PartialWrongNode} its {@code getManyBytes} call
+     * underneath threw has had its {@code partialValues} decoded the same
+     * way a successful {@code getMany} decodes {@code getManyBytes}' own
+     * result.
+     */
+    public static final class PartialWrongNodeStrings extends WrongNode {
+        public final java.util.Map<String, String> partialValues;
+
+        public PartialWrongNodeStrings(java.util.Map<String, String> partialValues) {
+            this.partialValues = partialValues;
         }
     }
 }

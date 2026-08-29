@@ -147,6 +147,62 @@ receive the primary's literal resulting value (and TTL) as an ordinary
 missed an earlier write or independently evicted the key still converges
 to the exact same bytes as the primary instead of drifting from it.
 
+## Batched get and set
+
+`getMany`/`getManyBytes` and `setMany`/`setManyBytes` (the `m`/`o`
+frames) fetch or store several keys in one round trip per owner
+instead of one round trip per key:
+
+```java
+client.setMany(Map.of("a", "1", "b", "2")); // shared ttlSeconds for the whole batch
+Map<String, String> values = client.getMany(List.of("a", "b", "missing"));
+// {"a": "1", "b": "2"} — "missing" is simply absent
+```
+
+A missing key is simply absent from the returned `Map`, the same "a
+miss is not an error" shape `get`/`getBytes` use. Both are also
+namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
+same as `get`/`set`. Batch keys are always `String` — unlike
+single-key `get`/`set`, `getMany`/`setMany` don't accept `byte[]`
+keys, since a `byte[]` can't safely key a `Map` (identity, not
+content, equality).
+
+**A batch never fails as a whole.** Each key's outcome is independent:
+if some keys are still routed to the wrong node after one bounded
+refresh-and-retry (the same policy `get`/`set` apply per key, not per
+call), `getMany`/`getManyBytes` throw
+`NanocachedException.PartialWrongNode` — a `WrongNode` subclass whose
+`partialValues` field holds every key that DID resolve, so existing
+`catch (NanocachedException.WrongNode)` handling keeps working
+unchanged while a caller that wants the partial results can read them
+off the exception (`getMany`'s own decoded counterpart is
+`NanocachedException.PartialWrongNodeStrings`):
+
+```java
+try {
+    return client.getMany(keys);
+} catch (NanocachedException.PartialWrongNodeStrings partial) {
+    return partial.partialValues;
+}
+```
+
+`setMany`/`setManyBytes` have nothing to return on success, so they
+just throw a plain `NanocachedException.WrongNode` on the same
+condition — every other key in the batch was still stored. In
+single-node/proxy mode a `W` propagates immediately, exactly like
+`get`/`set`'s own single-mode behavior — there is no ring to refresh
+against.
+
+Within one `setMany`/`setManyBytes` batch, the same node can be one
+key's primary and another key's replica at once; it receives exactly
+one `o` sub-frame either way, and only its answer for the keys it is
+primary for decides those keys' outcome — a replica-held key's
+failure is logged-and-swallowed into `stats().replicaWriteFailures`,
+exactly like a plain `set`'s own replica legs.
+
+Very large batches are transparently split into more than one `m`/`o`
+sub-frame per owner — callers never need to think about this.
+
 ## Compare-and-set
 
 `putIfAbsent`/`replaceIfPresent`/`replace`/`deleteIfMatches` are

@@ -18,7 +18,9 @@ import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -359,6 +361,17 @@ public final class NanocachedClient implements AutoCloseable {
     // connection with no response (a bare key+value length rejection is
     // never sent back — see request_is_too_large in server.rs).
     private static final int MAX_REQUEST_BYTES = 1024 * 1024 - 256;
+
+    // Batched get/set (issue #151): bounds how many keys getMany/
+    // getManyBytes/setMany/setManyBytes pack into a single `m`/`o`
+    // sub-frame per owner before splitting into more than one (batch
+    // chunking) — a reply header (Connection.MAX_HEADER_LINE_LENGTH, 4
+    // KiB) must fit every key's/value's decimal length field plus
+    // separators. 400 keys' worth of "9999 9999 " fields (worst case, a
+    // 4-digit length pair) is ~4000 bytes, comfortably under that cap
+    // with room for the count/tag fields — same value the Go and
+    // TypeScript SDKs use.
+    private static final int MAX_BATCH_KEYS = 400;
 
     public static Options builder() {
         return new Options();
@@ -1162,6 +1175,18 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.getWithToken(namespace, key);
         }
 
+        /** As {@link NanocachedClient#getMany(List)}, scoped to
+         * {@link #namespace()} (issue #151). */
+        public Map<String, String> getMany(List<String> keys) {
+            return NanocachedClient.this.getManyDecoded(namespace, keys);
+        }
+
+        /** As {@link NanocachedClient#getManyBytes(List)}, scoped to
+         * {@link #namespace()} (issue #151). */
+        public Map<String, byte[]> getManyBytes(List<String> keys) {
+            return NanocachedClient.this.getManyBytes(namespace, keys);
+        }
+
         public void set(String key, String value) {
             set(key, value, 0L);
         }
@@ -1188,6 +1213,26 @@ public final class NanocachedClient implements AutoCloseable {
          * {@link #namespace()}. */
         public boolean delete(byte[] key) {
             return NanocachedClient.this.delete(namespace, key);
+        }
+
+        public void setMany(Map<String, String> values) {
+            setMany(values, 0L);
+        }
+
+        /** As {@link NanocachedClient#setMany(Map, long)}, scoped to
+         * {@link #namespace()} (issue #151). */
+        public void setMany(Map<String, String> values, long ttlSeconds) {
+            NanocachedClient.this.setManyString(namespace, values, ttlSeconds);
+        }
+
+        public void setManyBytes(Map<String, byte[]> values) {
+            setManyBytes(values, 0L);
+        }
+
+        /** As {@link NanocachedClient#setManyBytes(Map, long)}, scoped
+         * to {@link #namespace()} (issue #151). */
+        public void setManyBytes(Map<String, byte[]> values, long ttlSeconds) {
+            NanocachedClient.this.setManyBytes(namespace, values, ttlSeconds);
         }
 
         public OptionalLong incr(String key, long delta) {
@@ -1525,6 +1570,231 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    // ── Batched get/set (issue #151) ─────────────────────────────────
+    // m/o — see docs/protocol.html#multi. Every requested key's owner is
+    // still resolved via HashRing/ownerNames, exactly like a single
+    // getBytes/set: getManyBytes groups keys by primary owner and issues
+    // one `m` sub-frame per owner (batch chunking splits an
+    // over-MAX_BATCH_KEYS group further); setManyBytes groups by every
+    // owner across every rank, since one batch's keys can place the same
+    // node as primary for one key and a replica for another. A batch
+    // never fails as a whole (docs/protocol.html#multi): getManyBytes
+    // returns every key that resolved, throwing
+    // NanocachedException.PartialWrongNode (carrying that partial map)
+    // only if some keys are still wrong-node after one bounded
+    // refresh-and-retry — the same policy getBytes' own withWrongNodeRetry
+    // applies, generalized to a per-key roster instead of an
+    // all-or-nothing retry. setManyBytes has nothing to return on
+    // success, so it just throws a plain NanocachedException.WrongNode on
+    // the same condition.
+
+    /** As {@link #getManyBytes(List)}, decoding every hit as strict
+     * UTF-8.
+     * @throws UncheckedIOException if a stored value is not valid UTF-8 */
+    public Map<String, String> getMany(List<String> keys) {
+        return getManyDecoded(EMPTY_NAMESPACE, keys);
+    }
+
+    /** Shared by {@link #getMany(List)} and {@link Namespace#getMany}:
+     * decodes {@link #getManyBytes(byte[], List)}'s raw result, or — on a
+     * partial failure — decodes the {@link
+     * NanocachedException.PartialWrongNode}'s own partial map and
+     * rethrows the UTF-8-decoded counterpart ({@link
+     * NanocachedException.PartialWrongNodeStrings}) instead. */
+    private Map<String, String> getManyDecoded(byte[] namespace, List<String> keys) {
+        try {
+            return decodeMany(getManyBytes(namespace, keys));
+        } catch (NanocachedException.PartialWrongNode partial) {
+            throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+        }
+    }
+
+    private static Map<String, String> decodeMany(Map<String, byte[]> raw) {
+        Map<String, String> values = new LinkedHashMap<>(raw.size());
+        for (Map.Entry<String, byte[]> entry : raw.entrySet()) {
+            values.put(entry.getKey(), decodeUtf8Strict(entry.getValue()));
+        }
+        return values;
+    }
+
+    /** Returns every requested key's raw value in one round trip per
+     * owner (batched get, docs/protocol.html#multi) — a missing key is
+     * simply absent from the returned map, never an error, the same "a
+     * miss is not an error" contract {@link #getBytes(byte[])} itself
+     * has. {@code keys} must be non-empty.
+     *
+     * <p>A batch never fails as a whole: if some keys are still
+     * wrong-node after one bounded refresh-and-retry, throws {@link
+     * NanocachedException.PartialWrongNode} whose {@code partialValues}
+     * holds every key that DID resolve, rather than discarding a
+     * mostly-successful batch over a handful of stale placements. In
+     * single-node/proxy mode a {@code W} propagates immediately, exactly
+     * as {@link #getBytes(byte[])}'s own single-mode behavior does —
+     * there is no ring to refresh against.
+     *
+     * <p>Larger batches are transparently split into more than one
+     * {@code m} sub-frame per owner (batch chunking, see {@link
+     * #MAX_BATCH_KEYS}) — callers never need to think about this. */
+    public Map<String, byte[]> getManyBytes(List<String> keys) {
+        return getManyBytes(EMPTY_NAMESPACE, keys);
+    }
+
+    /** The namespaced counterpart of {@link #getManyBytes(List)} (issue
+     * #151) — see {@link #namespace}. */
+    Map<String, byte[]> getManyBytes(byte[] namespace, List<String> keys) {
+        if (keys.isEmpty()) {
+            throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
+        }
+        byte[][] keyBytes = new byte[keys.size()][];
+        for (int i = 0; i < keys.size(); i++) {
+            byte[] bytes = keys.get(i).getBytes(StandardCharsets.UTF_8);
+            validateKey(namespace, bytes);
+            keyBytes[i] = bytes;
+        }
+        beforeOperation();
+
+        Map<String, byte[]> values = new ConcurrentHashMap<>(keys.size());
+
+        boolean single;
+        synchronized (stateLock) {
+            single = ring == null;
+        }
+
+        if (single) {
+            List<Connection.MultiEntry> entries = multiGetChunked(this::singleConnection, namespace, keyBytes);
+            boolean wrongNode = false;
+            for (int i = 0; i < entries.size(); i++) {
+                Connection.MultiEntry entry = entries.get(i);
+                if (entry.ok()) {
+                    values.put(keys.get(i), maybeDecompress(entry.value()));
+                } else if (entry.wrongNode()) {
+                    wrongNode = true;
+                }
+            }
+            if (wrongNode) throw new NanocachedException.PartialWrongNode(values);
+            return values;
+        }
+
+        List<Integer> retry = multiGetPass(namespace, keys, keyBytes, values, null);
+        if (retry.isEmpty()) return values;
+        maybeRefresh(true);
+        retry = multiGetPass(namespace, keys, keyBytes, values, retry);
+        if (!retry.isEmpty()) throw new NanocachedException.PartialWrongNode(values);
+        return values;
+    }
+
+    /** {@code compress}'s decompression step (see {@link
+     * #getBytes(byte[], byte[])}), generalized so {@link
+     * #getManyBytes(byte[], List)}'s per-entry splicing can share it: a
+     * no-op when {@code compress} is off. */
+    private byte[] maybeDecompress(byte[] value) {
+        return compress ? Compression.decompressValue(value) : value;
+    }
+
+    /** Issues one or more {@code m} sub-frames against whatever {@code
+     * connectionFor} resolves to — already grouped to one owner (or the
+     * single/proxy target) by the caller — splitting into {@link
+     * #MAX_BATCH_KEYS}-sized chunks (batch chunking) so no reply header
+     * risks exceeding {@link Connection#MAX_HEADER_LINE_LENGTH}. */
+    private List<Connection.MultiEntry> multiGetChunked(
+            java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys) {
+        List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
+        for (int start = 0; start < keys.length; start += MAX_BATCH_KEYS) {
+            int end = Math.min(start + MAX_BATCH_KEYS, keys.length);
+            byte[][] chunk = Arrays.copyOfRange(keys, start, end);
+            List<Connection.MultiEntry> chunkEntries = applyReconnecting(
+                    connectionFor, connection -> connection.multiGet(namespace, chunk));
+            for (int i = start; i < end; i++) {
+                entries.set(i, chunkEntries.get(i - start));
+            }
+        }
+        return entries;
+    }
+
+    /** One pass of {@link #getManyBytes(byte[], List)}'s cluster routing:
+     * group the given indices (every key, when {@code retryIndices} is
+     * {@code null} — the initial pass — or just the keys a previous pass
+     * left unresolved) by their current primary owner (matching plain
+     * {@code get}'s own primary-first stance), dispatch one (possibly
+     * chunked) {@code m} exchange per owner concurrently, splice hits
+     * into {@code values}, and return the indices still unresolved: a
+     * per-key {@code W}, or a whole owner group whose call failed
+     * outright. Called once for the initial pass and once more, if
+     * needed, after a single forced refresh. */
+    private List<Integer> multiGetPass(
+            byte[] namespace, List<String> keys, byte[][] keyBytes,
+            Map<String, byte[]> values, List<Integer> retryIndices) {
+        List<Integer> indices = retryIndices;
+        if (indices == null) {
+            indices = new ArrayList<>(keys.size());
+            for (int i = 0; i < keys.size(); i++) indices.add(i);
+        }
+
+        Map<String, List<Integer>> groups = new LinkedHashMap<>();
+        List<Integer> retry = new ArrayList<>();
+        for (int idx : indices) {
+            List<String> owners = ownerNames(namespace, keyBytes[idx]);
+            if (owners.isEmpty()) {
+                retry.add(idx);
+                continue;
+            }
+            groups.computeIfAbsent(owners.get(0), name -> new ArrayList<>()).add(idx);
+        }
+
+        List<CompletableFuture<List<Integer>>> legs = new ArrayList<>(groups.size());
+        for (Map.Entry<String, List<Integer>> group : groups.entrySet()) {
+            String owner = group.getKey();
+            List<Integer> groupIndices = group.getValue();
+            legs.add(CompletableFuture.supplyAsync(
+                    () -> runMultiGetLeg(namespace, owner, groupIndices, keys, keyBytes, values), replicaWriters));
+        }
+        for (CompletableFuture<List<Integer>> leg : legs) {
+            try {
+                retry.addAll(leg.join());
+            } catch (CompletionException wrapped) {
+                throw unwrapReplicaBug(wrapped);
+            }
+        }
+        return retry;
+    }
+
+    /** One owner group's {@code m} exchange, run on {@link
+     * #replicaWriters} by {@link #multiGetPass}: a connection-level
+     * failure retries the whole group (indistinguishable from a
+     * possibly-idle-closed connection, same stance {@link
+     * #applyReconnecting}'s own callers take elsewhere); a per-key {@code
+     * W} retries just that key; a hit is spliced into {@code values}
+     * (decompression failures propagate, aborting the batch immediately —
+     * never fed into the retry pass, since they're a client-side {@code
+     * compress} mismatch, not a routing outcome). */
+    private List<Integer> runMultiGetLeg(
+            byte[] namespace, String owner, List<Integer> groupIndices,
+            List<String> keys, byte[][] keyBytes, Map<String, byte[]> values) {
+        byte[][] groupKeys = new byte[groupIndices.size()][];
+        for (int i = 0; i < groupIndices.size(); i++) {
+            groupKeys[i] = keyBytes[groupIndices.get(i)];
+        }
+
+        List<Connection.MultiEntry> entries;
+        try {
+            entries = multiGetChunked(() -> memberConnection(owner), namespace, groupKeys);
+        } catch (NanocachedException connectionFailure) {
+            return new ArrayList<>(groupIndices);
+        }
+
+        List<Integer> retry = new ArrayList<>();
+        for (int i = 0; i < groupIndices.size(); i++) {
+            int idx = groupIndices.get(i);
+            Connection.MultiEntry entry = entries.get(i);
+            if (entry.wrongNode()) {
+                retry.add(idx);
+            } else if (entry.ok()) {
+                values.put(keys.get(idx), maybeDecompress(entry.value()));
+            }
+        }
+        return retry;
+    }
+
     public void set(String key, String value) {
         set(key, value, 0L);
     }
@@ -1580,6 +1850,263 @@ public final class NanocachedClient implements AutoCloseable {
         beforeOperation();
         return withWrongNodeRetry(
                 () -> write(namespace, key, connection -> connection.delete(namespace, key)));
+    }
+
+    public void setMany(Map<String, String> values) {
+        setMany(values, 0L);
+    }
+
+    /** As {@link #setManyBytes(Map, long)}, encoding every value as UTF-8. */
+    public void setMany(Map<String, String> values, long ttlSeconds) {
+        setManyString(EMPTY_NAMESPACE, values, ttlSeconds);
+    }
+
+    private void setManyString(byte[] namespace, Map<String, String> values, long ttlSeconds) {
+        Map<String, byte[]> raw = new LinkedHashMap<>(values.size());
+        for (Map.Entry<String, String> entry : values.entrySet()) {
+            raw.put(entry.getKey(), entry.getValue().getBytes(StandardCharsets.UTF_8));
+        }
+        setManyBytes(namespace, raw, ttlSeconds);
+    }
+
+    public void setManyBytes(Map<String, byte[]> values) {
+        setManyBytes(values, 0L);
+    }
+
+    /** Stores every raw value in {@code values} in one round trip per
+     * involved node (batched set, docs/protocol.html#multi).
+     * {@code ttlSeconds == 0} means no expiry, shared by the whole batch
+     * — not per key, since every real caller of a batched set (Django's
+     * {@code set_many}, cache-manager's {@code mset}) already passes one
+     * TTL per call. {@code values} must be non-empty. Transparently
+     * compresses values at or above {@code compressionThreshold} when
+     * {@code compress} is enabled, exactly like {@link #set(byte[],
+     * byte[], long)}.
+     *
+     * <p>Within one batch, the same node can be a key's primary and
+     * another key's replica at once — it receives exactly one {@code o}
+     * sub-frame either way, and only its answer for the keys it is
+     * primary for decides that key's outcome; a replica-held key's
+     * failure or {@code W} is logged-and-swallowed into {@link
+     * #stats()}'s {@code replicaWriteFailures}, exactly like {@link
+     * #set(byte[], byte[], long)}'s own replica legs ({@link #write}). A
+     * batch never fails as a whole: if some keys' primaries are still
+     * wrong-node after one bounded refresh-and-retry, this throws {@link
+     * NanocachedException.WrongNode} — every other key in the batch was
+     * still stored. In single-node/proxy mode a {@code W} propagates
+     * immediately, exactly as {@link #set(byte[], byte[], long)}'s own
+     * single-mode behavior does.
+     *
+     * <p>Larger batches are transparently split into more than one
+     * {@code o} sub-frame per node (batch chunking, see {@link
+     * #MAX_BATCH_KEYS}). */
+    public void setManyBytes(Map<String, byte[]> values, long ttlSeconds) {
+        setManyBytes(EMPTY_NAMESPACE, values, ttlSeconds);
+    }
+
+    /** The namespaced counterpart of {@link #setManyBytes(Map, long)}
+     * (issue #151) — see {@link #namespace}. */
+    void setManyBytes(byte[] namespace, Map<String, byte[]> values, long ttlSeconds) {
+        if (values.isEmpty()) {
+            throw new IllegalArgumentException("nanocached: setMany/setManyBytes requires at least one key");
+        }
+        if (ttlSeconds < 0) {
+            throw new IllegalArgumentException(
+                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+        }
+        List<String> keys = new ArrayList<>(values.size());
+        byte[][] keyBytes = new byte[values.size()][];
+        byte[][] valueBytes = new byte[values.size()][];
+        int i = 0;
+        for (Map.Entry<String, byte[]> entry : values.entrySet()) {
+            byte[] key = entry.getKey().getBytes(StandardCharsets.UTF_8);
+            byte[] original = entry.getValue();
+            validateKeyAndValue(namespace, key, original);
+            keys.add(entry.getKey());
+            keyBytes[i] = key;
+            valueBytes[i] = compress ? Compression.compressValue(original, compressionThreshold) : original;
+            i++;
+        }
+        beforeOperation();
+
+        Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
+
+        boolean single;
+        synchronized (stateLock) {
+            single = ring == null;
+        }
+
+        if (single) {
+            List<Connection.MultiEntry> entries =
+                    multiSetChunked(this::singleConnection, namespace, keyBytes, valueBytes, wireTtlSeconds);
+            for (Connection.MultiEntry entry : entries) {
+                if (entry.wrongNode()) throw new NanocachedException.WrongNode();
+            }
+            return;
+        }
+
+        List<Integer> retry = multiSetPass(namespace, keys, keyBytes, valueBytes, wireTtlSeconds, null);
+        if (retry.isEmpty()) return;
+        maybeRefresh(true);
+        retry = multiSetPass(namespace, keys, keyBytes, valueBytes, wireTtlSeconds, retry);
+        if (!retry.isEmpty()) throw new NanocachedException.WrongNode();
+    }
+
+    /** {@link #multiGetChunked}'s write-side twin: one or more {@code o}
+     * sub-frames against whatever {@code connectionFor} resolves to,
+     * split into {@link #MAX_BATCH_KEYS}-sized chunks the same way. */
+    private List<Connection.MultiEntry> multiSetChunked(
+            java.util.function.Supplier<Connection> connectionFor, byte[] namespace,
+            byte[][] keys, byte[][] values, Long ttlSeconds) {
+        List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
+        for (int start = 0; start < keys.length; start += MAX_BATCH_KEYS) {
+            int end = Math.min(start + MAX_BATCH_KEYS, keys.length);
+            byte[][] keyChunk = Arrays.copyOfRange(keys, start, end);
+            byte[][] valueChunk = Arrays.copyOfRange(values, start, end);
+            List<Connection.MultiEntry> chunkEntries = applyReconnecting(
+                    connectionFor, connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
+            for (int i = start; i < end; i++) {
+                entries.set(i, chunkEntries.get(i - start));
+            }
+        }
+        return entries;
+    }
+
+    /** One owner's key/isPrimary membership across one {@link
+     * #multiSetPass} call — see that method's own doc comment for why a
+     * key can appear here with {@code isPrimary} false: the same node
+     * can be primary for one key in the batch and a replica for
+     * another. */
+    private static final class OwnerBatch {
+        final List<Integer> indices = new ArrayList<>();
+        final List<Boolean> isPrimary = new ArrayList<>();
+    }
+
+    /** One pass of {@link #setManyBytes(byte[], Map, long)}'s cluster
+     * routing: for every key still needing resolution (every key, when
+     * {@code retryIndices} is {@code null}, or just what a previous pass
+     * left unresolved), build one sub-batch per <b>owner name across
+     * every rank</b> — not just primaries, unlike {@link
+     * #multiGetPass} — because within one batch the same node can be
+     * primary for one key and a replica for another; each owner
+     * therefore gets exactly one {@code o} sub-frame covering every key
+     * it holds in any role. Only a leg's <em>primary</em> keys can end
+     * up in the returned retry list; a leg's replica-held keys are
+     * logged-and-swallowed into {@link #replicaWriteFailures} instead,
+     * mirroring {@link #write}'s stance for single-key set. A leg that is
+     * a pure replica for every key it holds is eligible for {@code
+     * fireAndForgetReplicas}, exactly like a single-key replica write —
+     * see {@link #runMultiSetLeg}. */
+    private List<Integer> multiSetPass(
+            byte[] namespace, List<String> keys, byte[][] keyBytes, byte[][] valueBytes,
+            Long ttlSeconds, List<Integer> retryIndices) {
+        List<Integer> indices = retryIndices;
+        if (indices == null) {
+            indices = new ArrayList<>(keys.size());
+            for (int i = 0; i < keys.size(); i++) indices.add(i);
+        }
+
+        Map<String, OwnerBatch> owners = new LinkedHashMap<>();
+        List<Integer> retry = Collections.synchronizedList(new ArrayList<>());
+        for (int idx : indices) {
+            List<String> names = ownerNames(namespace, keyBytes[idx]);
+            if (names.isEmpty()) {
+                retry.add(idx);
+                continue;
+            }
+            for (int rank = 0; rank < names.size(); rank++) {
+                OwnerBatch batch = owners.computeIfAbsent(names.get(rank), name -> new OwnerBatch());
+                batch.indices.add(idx);
+                batch.isPrimary.add(rank == 0);
+            }
+        }
+
+        List<CompletableFuture<Void>> legs = new ArrayList<>();
+        for (Map.Entry<String, OwnerBatch> ownerEntry : owners.entrySet()) {
+            String name = ownerEntry.getKey();
+            OwnerBatch batch = ownerEntry.getValue();
+            Runnable leg = () -> runMultiSetLeg(namespace, name, batch, keyBytes, valueBytes, ttlSeconds, retry);
+
+            boolean pureReplica = !batch.isPrimary.contains(Boolean.TRUE);
+            // Fire-and-forget replica writes: with fireAndForgetReplicas, up to
+            // maxInFlightBackgroundReplicaWrites legs run in the
+            // background instead of being waited for below — mirrors
+            // write()'s own fire-and-forget branch exactly, including its
+            // close()-race fallbacks.
+            if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
+                try {
+                    CompletableFuture.runAsync(leg, replicaWriters)
+                            .whenComplete((ignoredResult, error) -> {
+                                backgroundReplicaWritePermits.release();
+                                reportBackgroundWriteBug(error);
+                            });
+                } catch (RejectedExecutionException rejected) {
+                    backgroundReplicaWritePermits.release();
+                    leg.run();
+                }
+                continue;
+            }
+
+            legs.add(submitReplicaWrite(leg));
+        }
+
+        RuntimeException legBug = null;
+        for (CompletableFuture<Void> pending : legs) {
+            try {
+                pending.join();
+            } catch (CompletionException wrapped) {
+                legBug = unwrapReplicaBug(wrapped);
+            }
+        }
+        if (legBug != null) throw legBug;
+        return retry;
+    }
+
+    /** Dispatches one owner's {@code o} sub-batch (via {@link
+     * #multiSetChunked}) and applies its result to {@code retry}/{@link
+     * #replicaWriteFailures}: only primary-held keys can end up appended
+     * to {@code retry}; every replica-held key's failure or {@code W} is
+     * counted in {@link #replicaWriteFailures} instead, mirroring {@link
+     * #write}'s own stance for single-key set. A connection-level
+     * failure for the whole leg is treated the same way, key by key,
+     * since the SAME sub-frame can carry both primary- and replica-held
+     * keys and a transport failure doesn't distinguish between them.
+     * {@code retry} must already be a thread-safe list — this runs
+     * concurrently with every other owner's leg. */
+    private void runMultiSetLeg(
+            byte[] namespace, String name, OwnerBatch batch, byte[][] keyBytes, byte[][] valueBytes,
+            Long ttlSeconds, List<Integer> retry) {
+        byte[][] groupKeys = new byte[batch.indices.size()][];
+        byte[][] groupValues = new byte[batch.indices.size()][];
+        for (int i = 0; i < batch.indices.size(); i++) {
+            int idx = batch.indices.get(i);
+            groupKeys[i] = keyBytes[idx];
+            groupValues[i] = valueBytes[idx];
+        }
+
+        List<Connection.MultiEntry> entries;
+        try {
+            entries = multiSetChunked(() -> memberConnection(name), namespace, groupKeys, groupValues, ttlSeconds);
+        } catch (NanocachedException connectionFailure) {
+            for (int i = 0; i < batch.indices.size(); i++) {
+                if (batch.isPrimary.get(i)) {
+                    retry.add(batch.indices.get(i));
+                } else {
+                    replicaWriteFailures.incrementAndGet();
+                }
+            }
+            return;
+        }
+
+        for (int i = 0; i < batch.indices.size(); i++) {
+            boolean primary = batch.isPrimary.get(i);
+            Connection.MultiEntry entry = entries.get(i);
+            if (!primary) {
+                if (entry.wrongNode()) replicaWriteFailures.incrementAndGet();
+                continue;
+            }
+            if (entry.wrongNode()) retry.add(batch.indices.get(i));
+        }
     }
 
     // INCR/DECR (issue #129): as volatile as set — LRU eviction and TTL

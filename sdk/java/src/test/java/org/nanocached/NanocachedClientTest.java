@@ -163,6 +163,105 @@ class NanocachedClientTest {
         }
     }
 
+    // ── バッチ get/set (issue #151) ──────────────────────────────
+
+    @Test
+    void getManyReturnsHitsAndOmitsMisses() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "1");
+                client.set("b", "2");
+                Map<String, String> values = client.getMany(List.of("a", "b", "missing"));
+                assertEquals(Map.of("a", "1", "b", "2"), values);
+                assertEquals(1, node.multiGetCount.get());
+            }
+        }
+    }
+
+    @Test
+    void getManyBytesRoundTripsArbitraryBytes() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[] value = {0, 1, 2, (byte) 0xFF, 0x7F};
+                client.set("raw".getBytes(StandardCharsets.UTF_8), value);
+                Map<String, byte[]> values = client.getManyBytes(List.of("raw"));
+                assertArrayEquals(value, values.get("raw"));
+            }
+        }
+    }
+
+    @Test
+    void getManyRejectsAnEmptyKeyList() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertThrows(IllegalArgumentException.class, () -> client.getMany(List.of()));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyBytes(List.of()));
+            }
+        }
+    }
+
+    @Test
+    void setManyStoresEveryPairAndGetManyReadsThemBack() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.setMany(Map.of("a", "1", "b", "2", "c", "3"));
+                assertEquals(Map.of("a", "1", "b", "2", "c", "3"),
+                        client.getMany(List.of("a", "b", "c")));
+                assertEquals(1, node.multiSetCount.get());
+            }
+        }
+    }
+
+    @Test
+    void setManyTtlZeroMeansNoExpiryAndNegativeIsRejected() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.setMany(Map.of("k", "v"), 0);
+                assertEquals(Optional.of("v"), client.get("k"));
+                assertThrows(IllegalArgumentException.class, () -> client.setMany(Map.of("k", "v"), -1L));
+                assertThrows(IllegalArgumentException.class, () -> client.setManyBytes(
+                        Map.of("k", "v".getBytes(StandardCharsets.UTF_8)), -1L));
+            }
+        }
+    }
+
+    @Test
+    void setManyRejectsAnEmptyValueMap() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                assertThrows(IllegalArgumentException.class, () -> client.setMany(Map.of()));
+                assertThrows(IllegalArgumentException.class, () -> client.setManyBytes(Map.of()));
+            }
+        }
+    }
+
+    @Test
+    void batchedGetSetAreScopedByNamespace() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace ns = client.namespace("tenant-a");
+                ns.setMany(Map.of("k", "namespaced"));
+                client.setMany(Map.of("k", "default"));
+                assertEquals(Map.of("k", "namespaced"), ns.getMany(List.of("k")));
+                assertEquals(Map.of("k", "default"), client.getMany(List.of("k")));
+            }
+        }
+    }
+
+    @Test
+    void wrongNodePropagatesForBatchedOpsInSingleMode() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                node.answerWrongNodeOnce();
+                assertThrows(NanocachedException.PartialWrongNode.class,
+                        () -> client.getManyBytes(List.of("a", "b")));
+                node.answerWrongNodeOnce();
+                assertThrows(NanocachedException.WrongNode.class,
+                        () -> client.setMany(Map.of("a", "1")));
+            }
+        }
+    }
+
     // ── INCR/DECR (issue #129) ────────────────────────────────────
 
     @Test
@@ -1453,6 +1552,106 @@ class NanocachedClientTest {
                 for (MockNode node : cluster.nodes().values()) {
                     assertFalse(node.store.containsKey(stored));
                 }
+            }
+        }
+    }
+
+    // ── クラスタでのバッチ get/set (issue #151) ─────────────────────
+
+    @Test
+    void batchedGetSetRouteAcrossOwnersAndReassembleInCallerOrder() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                List<String> keys = new ArrayList<>();
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < 20; i++) {
+                    keys.add("key-" + i);
+                    values.put("key-" + i, "value-" + i);
+                }
+                client.setMany(values);
+                assertEquals(values, client.getMany(keys));
+                // Every key routed to exactly one owner: both nodes together
+                // received every `o`/`m` sub-frame, and each key landed on
+                // exactly the node HashRing itself would route it to.
+                int totalStored = cluster.nodes().values().stream().mapToInt(n -> n.store.size()).sum();
+                assertEquals(20, totalStored);
+                assertTrue(cluster.nodes().values().stream().allMatch(n -> !n.store.isEmpty()),
+                        "20 keys hashed across 2 owners should touch both nodes");
+            }
+        }
+    }
+
+    @Test
+    void batchedWritesFanOutToEveryOwnerWhenReplicated() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < 10; i++) values.put("key-" + i, "v");
+                client.setMany(values);
+                for (String key : values.keySet()) {
+                    String stored = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+                    for (MockNode node : cluster.nodes().values()) {
+                        assertTrue(node.store.containsKey(stored), key + " missing from a node");
+                    }
+                }
+                assertEquals(values.keySet().stream().map(k -> "v").toList().size(),
+                        client.getMany(new ArrayList<>(values.keySet())).size());
+            }
+        }
+    }
+
+    @Test
+    void aDeadReplicaDoesNotFailABatchedWrite() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "written-anyway";
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                cluster.nodes().get(owners.get(1)).close();
+                Thread.sleep(50);
+                client.setMany(Map.of(key, "v"));
+                assertTrue(cluster.nodes().get(owners.get(0)).store
+                        .containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                assertEquals(Map.of(key, "v"), client.getMany(List.of(key)));
+            }
+        }
+    }
+
+    @Test
+    void batchedGetWrongNodeTriggersRefreshAndOneRetry() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "some-key";
+                client.setMany(Map.of(key, "v"));
+                MockNode owner = cluster.nodes()
+                        .get(new HashRing(NAMES).route(key.getBytes(StandardCharsets.UTF_8)));
+
+                owner.answerWrongNodeOnce();
+                assertEquals(Map.of(key, "v"), client.getMany(List.of(key)));
+
+                owner.answerWrongNodeOnce();
+                owner.answerWrongNodeOnce();
+                NanocachedException.PartialWrongNode failure = assertThrows(
+                        NanocachedException.PartialWrongNode.class, () -> client.getManyBytes(List.of(key)));
+                assertTrue(failure.partialValues.isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void batchedSetWrongNodeTriggersRefreshAndOneRetry() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "some-key";
+                MockNode owner = cluster.nodes()
+                        .get(new HashRing(NAMES).route(key.getBytes(StandardCharsets.UTF_8)));
+
+                owner.answerWrongNodeOnce();
+                client.setMany(Map.of(key, "v"));
+                assertEquals(Map.of(key, "v"), client.getMany(List.of(key)));
+
+                owner.answerWrongNodeOnce();
+                owner.answerWrongNodeOnce();
+                assertThrows(NanocachedException.WrongNode.class, () -> client.setMany(Map.of(key, "v2")));
             }
         }
     }

@@ -64,6 +64,10 @@ final class MockServers {
         /** As {@link #casSetCount}, for `x` (compare-and-set delete, issue
          * #141) frames. */
         final AtomicInteger casDeleteCount = new AtomicInteger();
+        /** Counts every `m` (multi-get, issue #151) frame received. */
+        final AtomicInteger multiGetCount = new AtomicInteger();
+        /** Counts every `o` (multi-set, issue #151) frame received. */
+        final AtomicInteger multiSetCount = new AtomicInteger();
         /** Counts every `g`/`s`/`d` frame received — never incremented by
          * `G`/`S`/`D`. Lets a test prove the empty (default) namespace
          * really does send the legacy frame, not `g 0 ...`/etc (issue
@@ -763,6 +767,95 @@ final class MockServers {
                             } else {
                                 out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
+                            out.flush();
+                        }
+                        // Batched get/set (issue #151): always namespaced on
+                        // the wire (0-length namespace = default), like
+                        // INCR/CAS — no legacy pre-namespace form. `m`
+                        // answers `M`; `o` answers `O`. A single mock node's
+                        // whole received frame answers `W` uniformly when
+                        // takeWrongNode() is armed, since a real node never
+                        // owns some-but-not-all of a frame's keys the client
+                        // itself already grouped by owner (only the client's
+                        // routing table could be stale for the entire
+                        // group at once).
+                        case "m" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            int n = Integer.parseInt(parts[2]);
+                            String[] keys = new String[n];
+                            for (int i = 0; i < n; i++) {
+                                keys[i] = keyOf(in.readNBytes(Integer.parseInt(parts[3 + i])));
+                            }
+                            multiGetCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            boolean wrongNode = takeWrongNode();
+                            StringBuilder header = new StringBuilder("M ").append(n);
+                            ByteArrayOutputStream body = new ByteArrayOutputStream();
+                            for (String key : keys) {
+                                if (wrongNode) {
+                                    header.append(" W");
+                                    continue;
+                                }
+                                byte[] value = namespacedGet(ns, key);
+                                if (value == null) {
+                                    header.append(" -");
+                                } else {
+                                    header.append(' ').append(value.length);
+                                    body.write(value, 0, value.length);
+                                }
+                            }
+                            header.append(tagSuffix).append('\n');
+                            out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+                            out.write(body.toByteArray());
+                            out.flush();
+                        }
+                        case "o" -> {
+                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            int n = Integer.parseInt(parts[2]);
+                            int[] keyLens = new int[n];
+                            int[] valueLens = new int[n];
+                            for (int i = 0; i < n; i++) {
+                                keyLens[i] = Integer.parseInt(parts[3 + i * 2]);
+                                valueLens[i] = Integer.parseInt(parts[4 + i * 2]);
+                            }
+                            int fixedFieldCount = 3 + n * 2;
+                            int ttlFieldCount = parts.length - fixedFieldCount - (tagged ? 1 : 0);
+                            long ttlSeconds = ttlFieldCount > 0 ? Long.parseLong(parts[fixedFieldCount]) : 0;
+                            String[] keys = new String[n];
+                            byte[][] values = new byte[n][];
+                            for (int i = 0; i < n; i++) {
+                                keys[i] = keyOf(in.readNBytes(keyLens[i]));
+                                values[i] = in.readNBytes(valueLens[i]);
+                            }
+                            multiSetCount.incrementAndGet();
+                            if (silent) {
+                                break; // half-open: frame consumed, never answered
+                            }
+                            if (takeRetryable()) {
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.flush();
+                                break;
+                            }
+                            boolean wrongNode = takeWrongNode();
+                            StringBuilder header = new StringBuilder("O ").append(n);
+                            for (int i = 0; i < n; i++) {
+                                if (wrongNode) {
+                                    header.append(" W");
+                                } else {
+                                    namespacedPut(ns, keys[i], values[i]);
+                                    namespacedPutTtl(ns, keys[i], ttlSeconds);
+                                    header.append(" S");
+                                }
+                            }
+                            header.append(tagSuffix).append('\n');
+                            out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
                             out.flush();
                         }
                         case "d" -> {

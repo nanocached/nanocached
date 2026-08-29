@@ -407,6 +407,138 @@ final class Connection {
     }
 
     /**
+     * An {@code M}/{@code O} response whose result-roster length doesn't
+     * match the request's key count: the streams are just as desynced as
+     * a kind mismatch ({@link #mismatch}), so this poisons the connection
+     * the same way.
+     */
+    private NanocachedException desyncedEntryCount(String op, int got, int want) {
+        NanocachedException error = new NanocachedException.ConnectionFailed(
+                "nanocached: " + op + " response roster length " + got
+                        + " does not match request key count " + want + " (connection desynced)",
+                null);
+        poison(error);
+        return error;
+    }
+
+    /** Parses a decimal field as {@code readResponse}'s length/count
+     * fields do throughout: a non-numeric or negative field is protocol
+     * garbage, reported here as -1 so every caller's existing {@code < 0}
+     * bounds check catches it uniformly. */
+    private static int parseNonNegativeInt(String field) {
+        try {
+            int value = Integer.parseInt(field);
+            return value < 0 ? -1 : value;
+        } catch (NumberFormatException malformed) {
+            return -1;
+        }
+    }
+
+    // Batched get/set (issue #151): `m`/`o` — same always-namespaced
+    // shape as INCR/CAS (an explicit <namespace-length>, 0 = default
+    // namespace; no legacy pre-namespace form — batching has no
+    // pre-batching wire form to stay compatible with). Restricted to one
+    // namespace per frame (docs/protocol.html#multi): rendezvous hashing
+    // routes on (namespace, key), so a frame mixing namespaces couldn't
+    // route as a single unit anyway. Routing (grouping keys by owner,
+    // wrong-node retry, replica fan-out for multiSet) is
+    // NanocachedClient's job, same split as every other op here.
+
+    /** Sends {@code m} — one round trip for every key in {@code keys}
+     * (docs/protocol.html#multi). {@code entries[i]} answers
+     * {@code keys[i]}, in request order. A reply whose roster length
+     * doesn't match {@code keys.length} is treated as a desynced
+     * connection, same stance as {@link #mismatch} — a malformed reply
+     * can't be trusted key-for-key. */
+    List<MultiEntry> multiGet(byte[] namespace, byte[][] keys) {
+        Response response = request(tag -> buildMultiGetFrame(namespace, keys, tag));
+        if (response.marker() != 'M') throw mismatch(response.marker());
+        if (response.entries().size() != keys.length) {
+            throw desyncedEntryCount("multi-get", response.entries().size(), keys.length);
+        }
+        return response.entries();
+    }
+
+    /** Builds an {@code m} request frame: {@code m <ns-len> <n>
+     * <key-len-1> ... <key-len-n>[ <tag>]\n<ns><key-1>...<key-n>}
+     * (docs/protocol.html#multi). */
+    private static byte[] buildMultiGetFrame(byte[] namespace, byte[][] keys, Integer tag) {
+        StringBuilder header = new StringBuilder("m ").append(namespace.length).append(' ').append(keys.length);
+        for (byte[] key : keys) {
+            header.append(' ').append(key.length);
+        }
+        header.append(tagSuffix(tag)).append('\n');
+        byte[] headerBytes = header.toString().getBytes(StandardCharsets.US_ASCII);
+
+        int bodyLength = namespace.length;
+        for (byte[] key : keys) {
+            bodyLength += key.length;
+        }
+        byte[] frame = new byte[headerBytes.length + bodyLength];
+        int offset = 0;
+        System.arraycopy(headerBytes, 0, frame, offset, headerBytes.length);
+        offset += headerBytes.length;
+        System.arraycopy(namespace, 0, frame, offset, namespace.length);
+        offset += namespace.length;
+        for (byte[] key : keys) {
+            System.arraycopy(key, 0, frame, offset, key.length);
+            offset += key.length;
+        }
+        return frame;
+    }
+
+    /** Sends {@code o} — stores every key/value pair in one round trip,
+     * one shared {@code ttlSeconds} (null means no expiry) for the whole
+     * batch rather than per key (docs/protocol.html#multi).
+     * {@code entries[i]} answers {@code keys[i]}/{@code values[i]}, in
+     * request order; see {@link #multiGet} for the same "only a desynced
+     * roster is an error" stance. */
+    List<MultiEntry> multiSet(byte[] namespace, byte[][] keys, byte[][] values, Long ttlSeconds) {
+        Response response = request(tag -> buildMultiSetFrame(namespace, keys, values, ttlSeconds, tag));
+        if (response.marker() != 'O') throw mismatch(response.marker());
+        if (response.entries().size() != keys.length) {
+            throw desyncedEntryCount("multi-set", response.entries().size(), keys.length);
+        }
+        return response.entries();
+    }
+
+    /** Builds an {@code o} request frame: {@code o <ns-len> <n>
+     * <key-len-1> <value-len-1> ... <key-len-n> <value-len-n> [<ttl>][
+     * <tag>]\n<ns><key-1><value-1>...<key-n><value-n>}
+     * (docs/protocol.html#multi). The optional TTL sits ahead of the tag,
+     * same convention {@link #casSet}'s own {@code [ttl]} uses. */
+    private static byte[] buildMultiSetFrame(
+            byte[] namespace, byte[][] keys, byte[][] values, Long ttlSeconds, Integer tag) {
+        StringBuilder header = new StringBuilder("o ").append(namespace.length).append(' ').append(keys.length);
+        for (int i = 0; i < keys.length; i++) {
+            header.append(' ').append(keys[i].length).append(' ').append(values[i].length);
+        }
+        if (ttlSeconds != null) {
+            header.append(' ').append(ttlSeconds);
+        }
+        header.append(tagSuffix(tag)).append('\n');
+        byte[] headerBytes = header.toString().getBytes(StandardCharsets.US_ASCII);
+
+        int bodyLength = namespace.length;
+        for (int i = 0; i < keys.length; i++) {
+            bodyLength += keys[i].length + values[i].length;
+        }
+        byte[] frame = new byte[headerBytes.length + bodyLength];
+        int offset = 0;
+        System.arraycopy(headerBytes, 0, frame, offset, headerBytes.length);
+        offset += headerBytes.length;
+        System.arraycopy(namespace, 0, frame, offset, namespace.length);
+        offset += namespace.length;
+        for (int i = 0; i < keys.length; i++) {
+            System.arraycopy(keys[i], 0, frame, offset, keys[i].length);
+            offset += keys[i].length;
+            System.arraycopy(values[i], 0, frame, offset, values[i].length);
+            offset += values[i].length;
+        }
+        return frame;
+    }
+
+    /**
      * Marks the connection closed, closes the socket, and rejects every
      * still-pending request with error. Safe to call more than once —
      * from a writer noticing a failed write, the reader thread noticing a
@@ -478,8 +610,42 @@ final class Connection {
 
     /** {@code ttlSeconds} is only ever non-null for an {@code I} response
      * that carried one (issue #129) — every other marker leaves it {@code
-     * null}. */
-    private record Response(int marker, byte[] value, int tag, Long ttlSeconds) {}
+     * null}. {@code entries} is only ever non-null for an {@code M}
+     * (multi-get) or {@code O} (multi-set) response (issue #151,
+     * docs/protocol.html#multi) — every other marker leaves it {@code
+     * null}, {@code value} unused for those two markers instead. */
+    private record Response(int marker, byte[] value, int tag, Long ttlSeconds, List<MultiEntry> entries) {}
+
+    /** One key's outcome inside an {@code M} (multi-get) or {@code O}
+     * (multi-set) response (issue #151, docs/protocol.html#multi) — a
+     * batch never fails as a whole, so each key's result is independent
+     * of every other key's, same as the server's own multi-ack. Reused
+     * for both response kinds rather than two near-identical types:
+     * <ul>
+     * <li>{@code M}: {@link #ok} true is a hit ({@link #value} holds the
+     * bytes, possibly empty); {@link #wrongNode} is a per-key {@code W};
+     * neither set is a clean miss ({@code -}).
+     * <li>{@code O}: {@link #ok} true is {@code S} (stored);
+     * {@link #wrongNode} is {@code W}; {@link #value} is always
+     * {@code null} — a set has nothing to echo back.
+     * </ul> */
+    record MultiEntry(byte[] value, boolean ok, boolean wrongNode) {
+        static MultiEntry ofHit(byte[] value) {
+            return new MultiEntry(value, true, false);
+        }
+
+        static MultiEntry ofMiss() {
+            return new MultiEntry(null, false, false);
+        }
+
+        static MultiEntry ofWrongNode() {
+            return new MultiEntry(null, false, true);
+        }
+
+        static MultiEntry ofStored() {
+            return new MultiEntry(null, true, false);
+        }
+    }
 
     /** A pending request's future paired with the tag its response must
      * echo (echoed response tags) — meaningless (and never compared) on an untagged
@@ -731,7 +897,7 @@ final class Connection {
                             "nanocached: invalid value length in response", null);
                 }
                 int tag = tagged ? parseTag(fields[1]) : -1;
-                return new Response(marker, readExactly(length), tag, null);
+                return new Response(marker, readExactly(length), tag, null, null);
             }
             // 'I' is INCR's (issue #129) hit reply: `I <value-length>
             // [<ttl-seconds>] [<tag>]`. The ttl field is optional exactly
@@ -771,13 +937,13 @@ final class Connection {
                     }
                 }
                 int tag = tagged ? parseTag(fields[fields.length - 1]) : -1;
-                return new Response(marker, readExactly(length), tag, ttlSeconds);
+                return new Response(marker, readExactly(length), tag, ttlSeconds, null);
             }
             // Busy is always bare (echoed response tags): it's an unsolicited
             // pre-auth response, never an answer to a tagged request.
             case 'B' -> {
                 expectLf(); // the trailing '\n'
-                return new Response(marker, null, -1, null);
+                return new Response(marker, null, -1, null, null);
             }
             // 'C' is CLEAR namespace / flush everything's (issue #106) only
             // reply — same bare-or-tagged shape as S/D/N/W. 'R' (issue
@@ -790,9 +956,87 @@ final class Connection {
             case 'S', 'D', 'N', 'W', 'C', 'R', 'T' -> {
                 if (!tagged) {
                     expectLf(); // the trailing '\n'
-                    return new Response(marker, null, -1, null);
+                    return new Response(marker, null, -1, null, null);
                 }
-                return new Response(marker, null, parseTag(readLine()), null);
+                return new Response(marker, null, parseTag(readLine()), null, null);
+            }
+            // 'M' is multi-get's (issue #151, docs/protocol.html#multi)
+            // reply: `M <n> <result-1> ... <result-n>[ <tag>]\n<hit
+            // values, concatenated in request order>`. Each result token
+            // is "-" (miss), "W" (wrong node), or a decimal byte length
+            // (a hit — that many trailing body bytes belong to this key,
+            // read here, inline, in token order, since only hit tokens
+            // consume body bytes).
+            case 'M' -> {
+                String[] fields = readLine().split(" ");
+                if (fields.length < 1) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid multi-get header in response", null);
+                }
+                int count = parseNonNegativeInt(fields[0]);
+                if (count < 0) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid multi-get count in response", null);
+                }
+                int wantFields = 1 + count + (tagged ? 1 : 0);
+                if (fields.length != wantFields) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid multi-get header in response", null);
+                }
+                List<MultiEntry> entries = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    String token = fields[1 + i];
+                    switch (token) {
+                        case "-" -> entries.add(MultiEntry.ofMiss());
+                        case "W" -> entries.add(MultiEntry.ofWrongNode());
+                        default -> {
+                            int length = parseNonNegativeInt(token);
+                            if (length < 0 || length > MAX_VALUE_LENGTH) {
+                                throw new NanocachedException.ConnectionFailed(
+                                        "nanocached: invalid multi-get result length in response", null);
+                            }
+                            entries.add(MultiEntry.ofHit(readExactly(length)));
+                        }
+                    }
+                }
+                int tag = tagged ? parseTag(fields[1 + count]) : -1;
+                return new Response(marker, null, tag, null, entries);
+            }
+            // 'O' is multi-set's (issue #151, docs/protocol.html#multi)
+            // reply: `O <n> <result-1> ... <result-n>[ <tag>]\n` — no
+            // body, unlike M's hit values (a set has nothing to echo
+            // back). Each token is "S" (stored) or "W" (wrong node).
+            // Never confused with the `On`/`OnT` identify reply:
+            // Identify.java handles that before a Connection exists, and
+            // no other request ever answers with a leading 'O'.
+            case 'O' -> {
+                String[] fields = readLine().split(" ");
+                if (fields.length < 1) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid multi-set header in response", null);
+                }
+                int count = parseNonNegativeInt(fields[0]);
+                if (count < 0) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid multi-set count in response", null);
+                }
+                int wantFields = 1 + count + (tagged ? 1 : 0);
+                if (fields.length != wantFields) {
+                    throw new NanocachedException.ConnectionFailed(
+                            "nanocached: invalid multi-set header in response", null);
+                }
+                List<MultiEntry> entries = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    String token = fields[1 + i];
+                    switch (token) {
+                        case "S" -> entries.add(MultiEntry.ofStored());
+                        case "W" -> entries.add(MultiEntry.ofWrongNode());
+                        default -> throw new NanocachedException.ConnectionFailed(
+                                "nanocached: invalid multi-set result token in response", null);
+                    }
+                }
+                int tag = tagged ? parseTag(fields[1 + count]) : -1;
+                return new Response(marker, null, tag, null, entries);
             }
             default -> throw new NanocachedException.ConnectionFailed(
                     "nanocached: unexpected response from server: " + (char) marker, null);
