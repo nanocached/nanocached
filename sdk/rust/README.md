@@ -129,6 +129,59 @@ replica that missed an earlier write (or evicted the key on its own)
 converges to the primary's exact value instead of drifting from replaying
 the increment independently.
 
+## Batched get and set
+
+`get_many`/`get_many_bytes` and `set_many`/`set_many_bytes` (the `m`/`o`
+frames) fetch or store several keys in one round trip per owner instead
+of one round trip per key:
+
+```rust
+use std::collections::HashMap;
+
+client.set_many(&HashMap::from([("a".to_string(), "1".to_string())]), 0).await?; // shared ttl_seconds for the whole batch
+let values = client.get_many(&["a", "b", "missing"]).await?;
+// {"a": "1"} — "missing" is simply absent
+```
+
+A missing key is simply absent from the returned `HashMap`, the same "a
+miss is not an error" shape `get`/`get_bytes` use. Both are also
+namespace-scoped: `client.namespace(ns).get_many(...)`/`.set_many(...)`,
+same as `get`/`set`. Batch keys are always `String`-shaped (`&[impl
+AsRef<str>]` for reads, `&HashMap<String, _>` for writes) — unlike
+single-key `get`/`set`, which accept any `impl AsRef<[u8]>`.
+
+**A batch never fails as a whole.** Each key's outcome is independent:
+if some keys are still routed to the wrong node after one bounded
+refresh-and-retry (the same policy `get`/`set` apply per key, not per
+call), `get_many`/`get_many_bytes` return
+`Err(Error::PartialWrongNode(map))`/`Err(Error::PartialWrongNodeText(map))`
+— the `map` holds every key that DID resolve, so a caller that wants the
+partial results can match on it directly:
+
+```rust
+match client.get_many(&keys).await {
+    Ok(values) => values,
+    Err(Error::PartialWrongNodeText(partial)) => partial,
+    Err(error) => return Err(error),
+}
+```
+
+`set_many`/`set_many_bytes` have nothing to attach on a persisting
+wrong-node, so they just return a plain `Err(Error::WrongNode)` — every
+other key in the batch was still stored. In single-node/proxy mode a `W`
+propagates immediately, exactly like `get`/`set`'s own single-mode
+behavior — there is no ring to refresh against.
+
+Within one `set_many`/`set_many_bytes` batch, the same node can be one
+key's primary and another key's replica at once; it receives exactly
+one `o` sub-frame either way, and only its answer for the keys it is
+primary for decides those keys' outcome — a replica-held key's failure
+is logged-and-swallowed into `stats().replica_write_failures`, exactly
+like a plain `set`'s own replica legs.
+
+Very large batches are transparently split into more than one `m`/`o`
+sub-frame per owner — callers never need to think about this.
+
 ## Compare-and-set
 
 `put_if_absent`, `replace_if_present`, `replace`, and `delete_if_matches`

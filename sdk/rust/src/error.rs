@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 /// Every error this SDK returns on its own behalf.
@@ -66,6 +67,23 @@ pub enum Error {
     /// transient failure.
     #[cfg(feature = "compression")]
     Decompression(String),
+    /// issue #151 — `get_many`/`get_many_bytes` when some keys are still
+    /// wrong-node after the one bounded refresh-and-retry every batch
+    /// gets (the per-key analogue of `get`/`get_bytes`' own `W`
+    /// refresh-and-retry). Carries every key that DID resolve — a batch
+    /// never fails as a whole (docs/protocol.html#multi), so a handful
+    /// of stale placements shouldn't force discarding an otherwise
+    /// successful batch. `set_many`/`set_many_bytes` have nothing to
+    /// attach, so they return a plain [`Self::WrongNode`] on the same
+    /// condition. In single-node/proxy mode a `W` propagates
+    /// immediately, exactly as `get`/`get_bytes`' own single-mode
+    /// behavior does — there is no ring to refresh against.
+    PartialWrongNode(HashMap<String, Vec<u8>>),
+    /// As [`Self::PartialWrongNode`], but returned by `get_many` — the
+    /// UTF-8-decoded counterpart, produced once
+    /// [`Self::PartialWrongNode`]'s own map has been decoded the same
+    /// way a successful `get_many` decodes `get_many_bytes`' own result.
+    PartialWrongNodeText(HashMap<String, String>),
 }
 
 impl fmt::Display for Error {
@@ -93,6 +111,10 @@ impl fmt::Display for Error {
             }
             #[cfg(feature = "compression")]
             Error::Decompression(message) => write!(f, "{message}"),
+            Error::PartialWrongNode(_) | Error::PartialWrongNodeText(_) => write!(
+                f,
+                "nanocached: some keys in this batch are still wrong-node after a refresh-and-retry"
+            ),
         }
     }
 }

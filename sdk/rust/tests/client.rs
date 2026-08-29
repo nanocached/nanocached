@@ -119,6 +119,12 @@ struct NodeState {
     /// node has ever received — a replica must never receive one either;
     /// see `cas_sets`'s own doc comment.
     cas_deletes: AtomicUsize,
+    /// How many `m` (multi-get, issue #151) requests this node has ever
+    /// received.
+    multi_gets: AtomicUsize,
+    /// How many `o` (multi-set, issue #151) requests this node has ever
+    /// received.
+    multi_sets: AtomicUsize,
 }
 
 struct MockNode {
@@ -576,6 +582,127 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     }
                 };
                 if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            "m" => {
+                // issue #151 — batched get (docs/protocol.html#multi):
+                // always namespaced, no legacy uppercase form, exactly
+                // like `i`/`k`. This whole received frame answers `W`
+                // uniformly when take_wrong_node() is armed, since a
+                // real node never owns some-but-not-all of a frame's
+                // keys the client itself already grouped by owner.
+                let namespace = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                let n: usize = parts[2].parse().unwrap();
+                let mut keys = Vec::with_capacity(n);
+                for i in 0..n {
+                    let key_len: usize = parts[3 + i].parse().unwrap();
+                    keys.push(read_exact(&mut stream, key_len).await);
+                }
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                state.multi_gets.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let wrong_node = take_wrong_node(&state);
+                let mut header = format!("M {n}");
+                let mut body = Vec::new();
+                {
+                    let store = state.store.lock().unwrap();
+                    for key in &keys {
+                        if wrong_node {
+                            header.push_str(" W");
+                            continue;
+                        }
+                        match store.get(&store_key(&namespace, key)) {
+                            Some(value) => {
+                                header.push_str(&format!(" {}", value.len()));
+                                body.extend_from_slice(value);
+                            }
+                            None => header.push_str(" -"),
+                        }
+                    }
+                }
+                header.push_str(&tag_suffix);
+                header.push('\n');
+                if stream.get_mut().write_all(header.as_bytes()).await.is_err() {
+                    return;
+                }
+                if stream.get_mut().write_all(&body).await.is_err() {
+                    return;
+                }
+            }
+            "o" => {
+                // issue #151 — batched set: always namespaced, no legacy
+                // uppercase form.
+                let namespace = read_exact(&mut stream, parts[1].parse().unwrap()).await;
+                let n: usize = parts[2].parse().unwrap();
+                let mut key_lens = Vec::with_capacity(n);
+                let mut value_lens = Vec::with_capacity(n);
+                for i in 0..n {
+                    key_lens.push(parts[3 + i * 2].parse::<usize>().unwrap());
+                    value_lens.push(parts[4 + i * 2].parse::<usize>().unwrap());
+                }
+                // Fields before any optional [<ttl>] [<tag>] trailer —
+                // disambiguated the same way `S`'s own optional trailing
+                // ttl field is, purely by whether this connection is
+                // tagged, never guessed frame by frame.
+                let base = 3 + n * 2;
+                let extra = parts.len() - base;
+                let ttl_seconds: u64 = if tagged {
+                    if extra == 2 {
+                        parts[base].parse().unwrap_or(0)
+                    } else {
+                        0
+                    }
+                } else if extra == 1 {
+                    parts[base].parse().unwrap_or(0)
+                } else {
+                    0
+                };
+                let _ = ttl_seconds; // this mock doesn't model per-key expiry
+                let mut keys = Vec::with_capacity(n);
+                let mut values = Vec::with_capacity(n);
+                for i in 0..n {
+                    keys.push(read_exact(&mut stream, key_lens[i]).await);
+                    values.push(read_exact(&mut stream, value_lens[i]).await);
+                }
+                if state.silent.load(Ordering::SeqCst) {
+                    continue;
+                }
+                state.multi_sets.fetch_add(1, Ordering::SeqCst);
+                if take_one(&state.retryable_replies) {
+                    let reply = format!("R{tag_suffix}\n");
+                    if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let wrong_node = take_wrong_node(&state);
+                let mut header = format!("O {n}");
+                if wrong_node {
+                    for _ in 0..n {
+                        header.push_str(" W");
+                    }
+                } else {
+                    let mut store = state.store.lock().unwrap();
+                    let mut store_namespaces = state.store_namespaces.lock().unwrap();
+                    for i in 0..n {
+                        let composite = store_key(&namespace, &keys[i]);
+                        store.insert(composite.clone(), values[i].clone());
+                        store_namespaces.insert(composite, namespace.clone());
+                        header.push_str(" S");
+                    }
+                }
+                header.push_str(&tag_suffix);
+                header.push('\n');
+                if stream.get_mut().write_all(header.as_bytes()).await.is_err() {
                     return;
                 }
             }
@@ -2174,6 +2301,169 @@ async fn discovery_node_list_exceeding_the_aggregate_cap_is_rejected() {
     discovery.stop();
 }
 
+// ── バッチ get/set (issue #151) ──────────────────────────────────
+
+#[tokio::test]
+async fn get_many_returns_hits_and_omits_misses() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("a", "1", 0).await.unwrap();
+    client.set("b", "2", 0).await.unwrap();
+    let values = client.get_many(&["a", "b", "missing"]).await.unwrap();
+    assert_eq!(
+        values,
+        HashMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string())
+        ])
+    );
+    assert_eq!(node.state.multi_gets.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_many_bytes_round_trips_raw_byte_values() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client
+        .set(b"raw".to_vec(), vec![0, 1, 2, 254, 255], 0)
+        .await
+        .unwrap();
+    let values = client.get_many_bytes(&["raw"]).await.unwrap();
+    assert_eq!(values.get("raw"), Some(&vec![0, 1, 2, 254, 255]));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_many_rejects_an_empty_key_list() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let empty: [&str; 0] = [];
+    assert!(matches!(
+        client.get_many(&empty).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.get_many_bytes(&empty).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn set_many_stores_every_pair_and_get_many_reads_them_back() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    let values = HashMap::from([
+        ("a".to_string(), "1".to_string()),
+        ("b".to_string(), "2".to_string()),
+        ("c".to_string(), "3".to_string()),
+    ]);
+    client.set_many(&values, 0).await.unwrap();
+    assert_eq!(client.get_many(&["a", "b", "c"]).await.unwrap(), values);
+    assert_eq!(node.state.multi_sets.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn set_many_ttl_zero_means_no_expiry() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client
+        .set_many(&HashMap::from([("k".to_string(), "v".to_string())]), 0)
+        .await
+        .unwrap();
+    assert_eq!(client.get("k").await.unwrap(), Some("v".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn set_many_rejects_an_empty_value_map() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    assert!(matches!(
+        client.set_many(&HashMap::new(), 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        client.set_many_bytes(&HashMap::new(), 0).await,
+        Err(Error::InvalidArgument(_))
+    ));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn batched_get_set_are_scoped_by_namespace() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("tenant-a");
+
+    ns.set_many(
+        &HashMap::from([("k".to_string(), "namespaced".to_string())]),
+        0,
+    )
+    .await
+    .unwrap();
+    client
+        .set_many(
+            &HashMap::from([("k".to_string(), "default".to_string())]),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ns.get_many(&["k"]).await.unwrap(),
+        HashMap::from([("k".to_string(), "namespaced".to_string())])
+    );
+    assert_eq!(
+        client.get_many(&["k"]).await.unwrap(),
+        HashMap::from([("k".to_string(), "default".to_string())])
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn wrong_node_propagates_for_batched_ops_in_single_mode() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    node.state.wrong_node_replies.fetch_add(1, Ordering::SeqCst);
+    assert!(matches!(
+        client.get_many_bytes(&["a", "b"]).await,
+        Err(Error::PartialWrongNode(_))
+    ));
+    node.state.wrong_node_replies.fetch_add(1, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .set_many(&HashMap::from([("a".to_string(), "1".to_string())]), 0)
+            .await,
+        Err(Error::WrongNode)
+    ));
+
+    client.close().await;
+    node.stop();
+}
+
 // ── クラスタと複製 ────────────────────────────────────────────────
 
 async fn start_cluster(replication: usize) -> (Vec<(String, MockNode)>, MockDiscovery) {
@@ -2327,6 +2617,196 @@ async fn fans_writes_out_to_every_owner() {
             );
         }
     }
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// ── クラスタでのバッチ get/set (issue #151) ──────────────────────────
+
+#[tokio::test]
+async fn batched_get_set_route_across_owners_and_reassemble_in_caller_order() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let mut keys = Vec::new();
+    let mut values = HashMap::new();
+    for i in 0..20 {
+        keys.push(format!("key-{i}"));
+        values.insert(format!("key-{i}"), format!("value-{i}"));
+    }
+    client.set_many(&values, 0).await.unwrap();
+    assert_eq!(client.get_many(&keys).await.unwrap(), values);
+
+    let total: usize = nodes
+        .iter()
+        .map(|(_, node)| node.state.store.lock().unwrap().len())
+        .sum();
+    assert_eq!(total, 20);
+    assert!(nodes
+        .iter()
+        .all(|(_, node)| !node.state.store.lock().unwrap().is_empty()));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn batched_writes_fan_out_to_every_owner_when_replicated() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let mut values = HashMap::new();
+    for i in 0..10 {
+        values.insert(format!("key-{i}"), "v".to_string());
+    }
+    client.set_many(&values, 0).await.unwrap();
+    for key in values.keys() {
+        let stored = key.clone().into_bytes();
+        for (name, node) in &nodes {
+            assert!(
+                node.state.store.lock().unwrap().contains_key(&stored),
+                "{key} missing from {name}"
+            );
+        }
+    }
+    let keys: Vec<String> = values.keys().cloned().collect();
+    assert_eq!(client.get_many(&keys).await.unwrap().len(), values.len());
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_dead_replica_does_not_fail_a_batched_write() {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("written-anyway");
+    node_by_name(&nodes, &owners[1]).stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    client
+        .set_many(
+            &HashMap::from([("written-anyway".to_string(), "v".to_string())]),
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(node_by_name(&nodes, &owners[0])
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(b"written-anyway".as_slice()));
+    assert_eq!(
+        client.get_many(&["written-anyway"]).await.unwrap(),
+        HashMap::from([("written-anyway".to_string(), "v".to_string())])
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn batched_get_wrong_node_triggers_refresh_and_one_retry() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    client
+        .set_many(
+            &HashMap::from([("some-key".to_string(), "v".to_string())]),
+            0,
+        )
+        .await
+        .unwrap();
+    let primary = owners_of("some-key")[0].clone();
+    let owner = node_by_name(&nodes, &primary);
+
+    owner
+        .state
+        .wrong_node_replies
+        .fetch_add(1, Ordering::SeqCst);
+    assert_eq!(
+        client.get_many(&["some-key"]).await.unwrap(),
+        HashMap::from([("some-key".to_string(), "v".to_string())])
+    );
+
+    owner
+        .state
+        .wrong_node_replies
+        .fetch_add(2, Ordering::SeqCst);
+    match client.get_many_bytes(&["some-key"]).await {
+        Err(Error::PartialWrongNode(partial)) => assert!(partial.is_empty()),
+        other => panic!("expected PartialWrongNode, got {other:?}"),
+    }
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn batched_set_wrong_node_triggers_refresh_and_one_retry() {
+    let (nodes, discovery) = start_cluster(1).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let primary = owners_of("some-key")[0].clone();
+    let owner = node_by_name(&nodes, &primary);
+
+    owner
+        .state
+        .wrong_node_replies
+        .fetch_add(1, Ordering::SeqCst);
+    client
+        .set_many(
+            &HashMap::from([("some-key".to_string(), "v".to_string())]),
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client.get_many(&["some-key"]).await.unwrap(),
+        HashMap::from([("some-key".to_string(), "v".to_string())])
+    );
+
+    owner
+        .state
+        .wrong_node_replies
+        .fetch_add(2, Ordering::SeqCst);
+    assert!(matches!(
+        client
+            .set_many(
+                &HashMap::from([("some-key".to_string(), "v2".to_string())]),
+                0
+            )
+            .await,
+        Err(Error::WrongNode)
+    ));
 
     client.close().await;
     discovery.stop();
