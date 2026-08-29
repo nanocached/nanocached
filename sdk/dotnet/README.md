@@ -179,6 +179,63 @@ the delta, so a replica can never drift from the primary (e.g. after an
 earlier dropped replica write). `NanocachedNamespace` exposes the same
 `IncrAsync`/`DecrAsync` pair, scoped to its namespace.
 
+## Batched get and set
+
+`GetManyAsync`/`GetManyBytesAsync` and `SetManyAsync`/`SetManyBytesAsync`
+(the `m`/`o` frames) fetch or store several keys in one round trip per
+owner instead of one round trip per key:
+
+```csharp
+await client.SetManyAsync(new Dictionary<string, string> { ["a"] = "1", ["b"] = "2" }); // shared ttlSeconds for the whole batch
+Dictionary<string, string> values = await client.GetManyAsync(new[] { "a", "b", "missing" });
+// {"a": "1", "b": "2"} — "missing" is simply absent
+```
+
+A missing key is simply absent from the returned `Dictionary`, the same
+"a miss is not an error" shape `GetAsync`/`GetBytesAsync` use. Both are
+also namespace-scoped: `client.Namespace(ns).GetManyAsync(...)`/
+`.SetManyAsync(...)`, same as `GetAsync`/`SetAsync`. Batch keys are
+always `string` — unlike single-key `GetAsync`/`SetAsync`,
+`GetManyAsync`/`SetManyAsync` don't accept `byte[]` keys, since a
+`byte[]` can't safely key a `Dictionary` (reference, not content,
+identity).
+
+**A batch never fails as a whole.** Each key's outcome is independent:
+if some keys are still routed to the wrong node after one bounded
+refresh-and-retry (the same policy `GetAsync`/`SetAsync` apply per key,
+not per call), `GetManyAsync`/`GetManyBytesAsync` throw
+`PartialWrongNodeException<T>` — a `WrongNodeException` subclass whose
+`PartialValues` property holds every key that DID resolve, so existing
+`catch (WrongNodeException)` handling keeps working unchanged while a
+caller that wants the partial results can read them off the exception:
+
+```csharp
+try
+{
+    return await client.GetManyAsync(keys);
+}
+catch (PartialWrongNodeException<Dictionary<string, string>> partial)
+{
+    return partial.PartialValues;
+}
+```
+
+`SetManyAsync`/`SetManyBytesAsync` have nothing to return on success, so
+they just throw a plain `WrongNodeException` on the same condition —
+every other key in the batch was still stored. In single-node/proxy
+mode a `W` propagates immediately, exactly like `GetAsync`/`SetAsync`'s
+own single-mode behavior — there is no ring to refresh against.
+
+Within one `SetManyAsync`/`SetManyBytesAsync` batch, the same node can
+be one key's primary and another key's replica at once; it receives
+exactly one `o` sub-frame either way, and only its answer for the keys
+it is primary for decides those keys' outcome — a replica-held key's
+failure is logged-and-swallowed into `Stats().ReplicaWriteFailures`,
+exactly like a plain `SetAsync`'s own replica legs.
+
+Very large batches are transparently split into more than one `m`/`o`
+sub-frame per owner — callers never need to think about this.
+
 ## Compare-and-set
 
 `PutIfAbsentAsync`, `ReplaceIfPresentAsync`, `ReplaceAsync`, and

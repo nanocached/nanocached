@@ -89,6 +89,28 @@ public sealed class NanocachedNamespace
     /// <summary>Returns whether the key existed before this call.</summary>
     public Task<bool> DeleteAsync(byte[] key) => _client.DeleteAsync(_namespace, key);
 
+    /// <summary>issue #151: as <see cref="NanocachedClient.GetManyAsync(IReadOnlyList{string})"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<Dictionary<string, string>> GetManyAsync(IReadOnlyList<string> keys) =>
+        _client.GetManyAsync(_namespace, keys);
+
+    /// <summary>issue #151: as <see cref="NanocachedClient.GetManyBytesAsync(IReadOnlyList{string})"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task<Dictionary<string, byte[]>> GetManyBytesAsync(IReadOnlyList<string> keys) =>
+        _client.GetManyBytesAsync(_namespace, keys);
+
+    /// <summary>issue #151: as
+    /// <see cref="NanocachedClient.SetManyAsync(IReadOnlyDictionary{string, string}, long)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task SetManyAsync(IReadOnlyDictionary<string, string> values, long ttlSeconds = 0) =>
+        _client.SetManyAsync(_namespace, values, ttlSeconds);
+
+    /// <summary>issue #151: as
+    /// <see cref="NanocachedClient.SetManyBytesAsync(IReadOnlyDictionary{string, byte[]}, long)"/>,
+    /// scoped to this handle's namespace.</summary>
+    public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0) =>
+        _client.SetManyBytesAsync(_namespace, values, ttlSeconds);
+
     /// <summary>issue #129: as <see cref="NanocachedClient.IncrAsync(byte[], long)"/>,
     /// scoped to this handle's namespace. As volatile as
     /// <see cref="SetAsync(byte[], byte[], long)"/> — not for durable

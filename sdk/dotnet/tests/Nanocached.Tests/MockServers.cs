@@ -78,6 +78,16 @@ public sealed class MockNode : IDisposable
     public string? LastCasDeleteHeader => _lastCasDeleteHeader;
     private volatile string? _lastCasDeleteHeader;
 
+    /// <summary>issue #151: how many <c>m</c> (multi-get) requests this
+    /// server has received.</summary>
+    public int MultiGetRequestCount => _multiGetRequestCount;
+    private int _multiGetRequestCount;
+
+    /// <summary>issue #151: how many <c>o</c> (multi-set) requests this
+    /// server has received.</summary>
+    public int MultiSetRequestCount => _multiSetRequestCount;
+    private int _multiSetRequestCount;
+
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
     private readonly byte[]? _requiredSecret;
@@ -766,6 +776,111 @@ public sealed class MockNode : IDisposable
                                 stream,
                                 Store.TryRemove(KeyOf(namespaceBytes, key), out _) ? $"D{tag}\n" : $"N{tag}\n");
                         }
+                        break;
+                    }
+                    // issue #151 — batched get/set: always namespaced (no
+                    // legacy uppercase form), like INCR/CAS. This whole
+                    // received frame answers W uniformly when
+                    // TakeWrongNode() is armed, since a real node never
+                    // owns some-but-not-all of a frame's keys the client
+                    // itself already grouped by owner.
+                    case "m":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        int n = int.Parse(parts[2], CultureInfo.InvariantCulture);
+                        var keys = new byte[n][];
+                        for (int i = 0; i < n; i++)
+                        {
+                            keys[i] = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3 + i], CultureInfo.InvariantCulture));
+                        }
+                        Interlocked.Increment(ref _multiGetRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+
+                        bool wrongNode = TakeWrongNode();
+                        var header = new StringBuilder("M ").Append(n);
+                        using var body = new MemoryStream();
+                        for (int i = 0; i < n; i++)
+                        {
+                            if (wrongNode)
+                            {
+                                header.Append(" W");
+                                continue;
+                            }
+                            if (Store.TryGetValue(KeyOf(namespaceBytes, keys[i]), out byte[]? value))
+                            {
+                                header.Append(' ').Append(value.Length);
+                                body.Write(value);
+                            }
+                            else
+                            {
+                                header.Append(" -");
+                            }
+                        }
+                        header.Append(tag).Append('\n');
+                        await Wire.WriteAsync(stream, header.ToString());
+                        await stream.WriteAsync(body.ToArray());
+                        break;
+                    }
+                    case "o":
+                    {
+                        byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        int n = int.Parse(parts[2], CultureInfo.InvariantCulture);
+                        var keyLens = new int[n];
+                        var valueLens = new int[n];
+                        for (int i = 0; i < n; i++)
+                        {
+                            keyLens[i] = int.Parse(parts[3 + i * 2], CultureInfo.InvariantCulture);
+                            valueLens[i] = int.Parse(parts[4 + i * 2], CultureInfo.InvariantCulture);
+                        }
+                        int fixedFieldCount = 3 + n * 2;
+                        int ttlFieldCount = parts.Length - fixedFieldCount - (tagged ? 1 : 0);
+                        long ttlSeconds = ttlFieldCount > 0
+                            ? long.Parse(parts[fixedFieldCount], CultureInfo.InvariantCulture)
+                            : 0;
+                        var keys = new byte[n][];
+                        var values = new byte[n][];
+                        for (int i = 0; i < n; i++)
+                        {
+                            keys[i] = await Wire.ReadExactlyAsync(stream, keyLens[i]);
+                            values[i] = await Wire.ReadExactlyAsync(stream, valueLens[i]);
+                        }
+                        Interlocked.Increment(ref _multiSetRequestCount);
+                        if (_silent)
+                        {
+                            break; // half-open: frame consumed, never answered
+                        }
+                        if (TakeOne(ref _retryableReplies))
+                        {
+                            await Wire.WriteAsync(stream, $"R{tag}\n");
+                            break;
+                        }
+
+                        bool wrongNode = TakeWrongNode();
+                        var header = new StringBuilder("O ").Append(n);
+                        for (int i = 0; i < n; i++)
+                        {
+                            if (wrongNode)
+                            {
+                                header.Append(" W");
+                            }
+                            else
+                            {
+                                string storeKey = KeyOf(namespaceBytes, keys[i]);
+                                Store[storeKey] = values[i];
+                                _ttls[storeKey] = ttlSeconds;
+                                header.Append(" S");
+                            }
+                        }
+                        header.Append(tag).Append('\n');
+                        await Wire.WriteAsync(stream, header.ToString());
                         break;
                     }
                     // issue #106: c/F never have a legacy uppercase

@@ -216,6 +216,14 @@ public sealed class NanocachedClient : IDisposable
     // — an over-limit frame gets no reply at all).
     private const int MaxRequestBytes = 1024 * 1024 - 256;
 
+    // issue #151 — batched get/set: bounds how many keys GetManyAsync/
+    // GetManyBytesAsync/SetManyAsync/SetManyBytesAsync pack into a single
+    // `m`/`o` sub-frame per owner before splitting into more than one
+    // (batch chunking) — a reply header must fit every key's/value's
+    // decimal length field plus separators. Same value the Go/TypeScript/
+    // Python/Java SDKs use.
+    private const int MaxBatchKeys = 400;
+
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
     // Reserved by the SDKs so a real application key can never collide
     // with it: a GET refreshes the pinged key's server-side LRU recency,
@@ -1009,6 +1017,254 @@ public sealed class NanocachedClient : IDisposable
         return null;
     }
 
+    // ── batched get/set (issue #151) ─────────────────────────────────
+    // m/o — see docs/protocol.html#multi. Every requested key's owner is
+    // still resolved via HashRing/OwnerNames, exactly like a single
+    // GetBytesAsync/SetAsync: GetManyBytesAsync groups keys by primary
+    // owner and issues one `m` sub-frame per owner (batch chunking
+    // splits an over-MaxBatchKeys group further); SetManyBytesAsync
+    // groups by every owner across every rank, since one batch's keys
+    // can place the same node as primary for one key and a replica for
+    // another. A batch never fails as a whole (docs/protocol.html#multi):
+    // GetManyBytesAsync returns every key that resolved, throwing
+    // PartialWrongNodeException<T> (carrying that partial dictionary)
+    // only if some keys are still wrong-node after one bounded
+    // refresh-and-retry — the same policy GetBytesAsync's own
+    // WithClusterRetryAsync applies, generalized to a per-key roster
+    // instead of an all-or-nothing retry. SetManyBytesAsync has nothing
+    // to return on success, so it just throws a plain WrongNodeException
+    // on the same condition.
+
+    /// <summary>As <see cref="GetManyBytesAsync(IReadOnlyList{string})"/>,
+    /// decoding every hit as UTF-8.</summary>
+    public Task<Dictionary<string, string>> GetManyAsync(IReadOnlyList<string> keys) =>
+        GetManyAsync(EmptyNamespace, keys);
+
+    /// <summary>issue #105: as <see cref="GetManyAsync(IReadOnlyList{string})"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal async Task<Dictionary<string, string>> GetManyAsync(byte[] namespaceBytes, IReadOnlyList<string> keys)
+    {
+        try
+        {
+            return DecodeMany(await GetManyBytesAsync(namespaceBytes, keys).ConfigureAwait(false));
+        }
+        catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
+        {
+            throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
+        }
+    }
+
+    private static Dictionary<string, string> DecodeMany(Dictionary<string, byte[]> raw)
+    {
+        var values = new Dictionary<string, string>(raw.Count);
+        foreach ((string key, byte[] value) in raw)
+        {
+            values[key] = StrictUtf8.GetString(value);
+        }
+        return values;
+    }
+
+    /// <summary>Returns every requested key's raw value in one round trip
+    /// per owner (batched get, docs/protocol.html#multi) — a missing key
+    /// is simply absent from the returned dictionary, never an error, the
+    /// same "a miss is not an error" contract <see cref="GetBytesAsync(byte[])"/>
+    /// itself has. <paramref name="keys"/> must be non-empty.
+    ///
+    /// <para>A batch never fails as a whole: if some keys are still
+    /// wrong-node after one bounded refresh-and-retry, throws
+    /// <see cref="PartialWrongNodeException{T}"/> whose
+    /// <c>PartialValues</c> holds every key that DID resolve, rather than
+    /// discarding a mostly-successful batch over a handful of stale
+    /// placements. In single-node/proxy mode a <c>W</c> propagates
+    /// immediately, exactly as <see cref="GetBytesAsync(byte[])"/>'s own
+    /// single-mode behavior does — there is no ring to refresh
+    /// against.</para>
+    ///
+    /// <para>Larger batches are transparently split into more than one
+    /// <c>m</c> sub-frame per owner (batch chunking, see
+    /// <see cref="MaxBatchKeys"/>) — callers never need to think about
+    /// this.</para></summary>
+    public Task<Dictionary<string, byte[]>> GetManyBytesAsync(IReadOnlyList<string> keys) =>
+        GetManyBytesAsync(EmptyNamespace, keys);
+
+    /// <summary>issue #105: as <see cref="GetManyBytesAsync(IReadOnlyList{string})"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task<Dictionary<string, byte[]>> GetManyBytesAsync(byte[] namespaceBytes, IReadOnlyList<string> keys)
+    {
+        if (keys.Count == 0)
+        {
+            throw new ArgumentException(
+                "nanocached: GetManyAsync/GetManyBytesAsync requires at least one key", nameof(keys));
+        }
+        var keyBytes = new byte[keys.Count][];
+        for (int i = 0; i < keys.Count; i++)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(keys[i]);
+            ValidateKey(namespaceBytes, bytes);
+            keyBytes[i] = bytes;
+        }
+        await BeforeOperationAsync().ConfigureAwait(false);
+
+        var values = new Dictionary<string, byte[]>(keys.Count);
+
+        if (_ring is null)
+        {
+            List<Connection.MultiEntry> entries =
+                await MultiGetChunkedAsync(null, namespaceBytes, keyBytes).ConfigureAwait(false);
+            bool wrongNode = false;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                Connection.MultiEntry entry = entries[i];
+                if (entry.Ok)
+                {
+                    values[keys[i]] = MaybeDecompress(entry.Value!);
+                }
+                else if (entry.WrongNode)
+                {
+                    wrongNode = true;
+                }
+            }
+            if (wrongNode) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
+            return values;
+        }
+
+        List<int>? retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, null).ConfigureAwait(false);
+        if (retry.Count == 0) return values;
+        await MaybeRefreshAsync(force: true).ConfigureAwait(false);
+        retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, retry).ConfigureAwait(false);
+        if (retry.Count > 0) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
+        return values;
+    }
+
+    /// <summary><c>Compress</c>'s decompression step (see
+    /// <see cref="GetBytesAsync(byte[], byte[])"/>), generalized so
+    /// <see cref="GetManyBytesAsync(byte[], IReadOnlyList{string})"/>'s
+    /// per-entry splicing can share it: a no-op when <c>Compress</c> is
+    /// off.</summary>
+    private byte[] MaybeDecompress(byte[] value) => _compress ? Compression.DecompressValue(value) : value;
+
+    /// <summary>Issues one or more <c>m</c> sub-frames against
+    /// <paramref name="slot"/>'s connection (<c>null</c> for the
+    /// single/proxy target) — already grouped to one owner by the caller
+    /// — splitting into <see cref="MaxBatchKeys"/>-sized chunks (batch
+    /// chunking) so no reply header risks exceeding the wire's header
+    /// bound.</summary>
+    private async Task<List<Connection.MultiEntry>> MultiGetChunkedAsync(
+        string? slot, byte[] namespaceBytes, byte[][] keys)
+    {
+        var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
+        for (int start = 0; start < keys.Length; start += MaxBatchKeys)
+        {
+            int end = Math.Min(start + MaxBatchKeys, keys.Length);
+            ArraySegment<byte[]> chunk = new(keys, start, end - start);
+            List<Connection.MultiEntry> chunkEntries = await ApplyReconnectingAsync(
+                slot, connection => connection.MultiGetAsync(namespaceBytes, chunk)).ConfigureAwait(false);
+            for (int i = start; i < end; i++)
+            {
+                entries[i] = chunkEntries[i - start];
+            }
+        }
+        return entries;
+    }
+
+    /// <summary>One pass of <see cref="GetManyBytesAsync(byte[], IReadOnlyList{string})"/>'s
+    /// cluster routing: group the given indices (every key, when
+    /// <paramref name="retryIndices"/> is <c>null</c> — the initial pass —
+    /// or just the keys a previous pass left unresolved) by their current
+    /// primary owner (matching plain <c>Get</c>'s own primary-first
+    /// stance), dispatch one (possibly chunked) <c>m</c> exchange per
+    /// owner concurrently, splice hits into <paramref name="values"/>,
+    /// and return the indices still unresolved: a per-key <c>W</c>, or a
+    /// whole owner group whose call failed outright. Called once for the
+    /// initial pass and once more, if needed, after a single forced
+    /// refresh.</summary>
+    private async Task<List<int>> MultiGetPassAsync(
+        byte[] namespaceBytes, IReadOnlyList<string> keys, byte[][] keyBytes,
+        Dictionary<string, byte[]> values, List<int>? retryIndices)
+    {
+        List<int> indices = retryIndices ?? Enumerable.Range(0, keys.Count).ToList();
+
+        var groups = new Dictionary<string, List<int>>();
+        var retry = new List<int>();
+        foreach (int idx in indices)
+        {
+            IReadOnlyList<string> owners = OwnerNames(namespaceBytes, keyBytes[idx]);
+            if (owners.Count == 0)
+            {
+                retry.Add(idx);
+                continue;
+            }
+            if (!groups.TryGetValue(owners[0], out List<int>? group))
+            {
+                group = new List<int>();
+                groups[owners[0]] = group;
+            }
+            group.Add(idx);
+        }
+
+        var legs = new List<Task<List<int>>>(groups.Count);
+        foreach ((string owner, List<int> groupIndices) in groups)
+        {
+            legs.Add(RunMultiGetLegAsync(namespaceBytes, owner, groupIndices, keys, keyBytes, values));
+        }
+        foreach (Task<List<int>> leg in legs)
+        {
+            retry.AddRange(await leg.ConfigureAwait(false));
+        }
+        return retry;
+    }
+
+    /// <summary>One owner group's <c>m</c> exchange: a connection-level
+    /// failure retries the whole group (indistinguishable from a
+    /// possibly-idle-closed connection, same stance
+    /// <see cref="ApplyReconnectingAsync{T}"/>'s own callers take
+    /// elsewhere); a per-key <c>W</c> retries just that key; a hit is
+    /// spliced into <paramref name="values"/> (a client-side <c>Compress</c>
+    /// mismatch propagates, aborting the batch immediately — never fed
+    /// into the retry pass, since it isn't a routing outcome).</summary>
+    private async Task<List<int>> RunMultiGetLegAsync(
+        byte[] namespaceBytes, string owner, List<int> groupIndices,
+        IReadOnlyList<string> keys, byte[][] keyBytes, Dictionary<string, byte[]> values)
+    {
+        var groupKeys = new byte[groupIndices.Count][];
+        for (int i = 0; i < groupIndices.Count; i++)
+        {
+            groupKeys[i] = keyBytes[groupIndices[i]];
+        }
+
+        List<Connection.MultiEntry> entries;
+        try
+        {
+            entries = await MultiGetChunkedAsync(owner, namespaceBytes, groupKeys).ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is NanocachedException)
+        {
+            return new List<int>(groupIndices);
+        }
+
+        var retry = new List<int>();
+        for (int i = 0; i < groupIndices.Count; i++)
+        {
+            int idx = groupIndices[i];
+            Connection.MultiEntry entry = entries[i];
+            if (entry.WrongNode)
+            {
+                retry.Add(idx);
+            }
+            else if (entry.Ok)
+            {
+                // Under lock: multiple owner legs run concurrently and
+                // Dictionary isn't thread-safe for concurrent writers.
+                lock (values)
+                {
+                    values[keys[idx]] = MaybeDecompress(entry.Value!);
+                }
+            }
+        }
+        return retry;
+    }
+
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
     public Task SetAsync(string key, string value, long ttlSeconds = 0) =>
         SetAsync(EmptyNamespace, key, value, ttlSeconds);
@@ -1070,6 +1326,296 @@ public sealed class NanocachedClient : IDisposable
         return await WithClusterRetryAsync(
             () => WriteAsync(namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key)))
             .ConfigureAwait(false);
+    }
+
+    public Task SetManyAsync(IReadOnlyDictionary<string, string> values, long ttlSeconds = 0) =>
+        SetManyAsync(EmptyNamespace, values, ttlSeconds);
+
+    /// <summary>issue #105: as <see cref="SetManyAsync(IReadOnlyDictionary{string, string}, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/> — the internal method
+    /// <see cref="NanocachedNamespace"/> forwards to.</summary>
+    internal Task SetManyAsync(byte[] namespaceBytes, IReadOnlyDictionary<string, string> values, long ttlSeconds = 0)
+    {
+        var raw = new Dictionary<string, byte[]>(values.Count);
+        foreach ((string key, string value) in values)
+        {
+            raw[key] = Encoding.UTF8.GetBytes(value);
+        }
+        return SetManyBytesAsync(namespaceBytes, raw, ttlSeconds);
+    }
+
+    /// <summary>Stores every raw value in <paramref name="values"/> in one
+    /// round trip per involved node (batched set,
+    /// docs/protocol.html#multi). <paramref name="ttlSeconds"/> of 0 (the
+    /// default) means no expiry, shared by the whole batch — not per key,
+    /// since every real caller of a batched set (Django's
+    /// <c>set_many</c>, cache-manager's <c>mset</c>) already passes one
+    /// TTL per call. <paramref name="values"/> must be non-empty.
+    /// Transparently compresses values at or above
+    /// <c>CompressionThreshold</c> when <c>Compress</c> is enabled,
+    /// exactly like <see cref="SetAsync(byte[], byte[], long)"/>.
+    ///
+    /// <para>Within one batch, the same node can be a key's primary and
+    /// another key's replica at once — it receives exactly one <c>o</c>
+    /// sub-frame either way, and only its answer for the keys it is
+    /// primary for decides that key's outcome; a replica-held key's
+    /// failure or <c>W</c> is logged-and-swallowed into
+    /// <c>Stats().ReplicaWriteFailures</c>, exactly like
+    /// <see cref="SetAsync(byte[], byte[], long)"/>'s own replica legs
+    /// (<see cref="WriteAsync{T}"/>). A batch never fails as a whole: if
+    /// some keys' primaries are still wrong-node after one bounded
+    /// refresh-and-retry, this throws <see cref="WrongNodeException"/> —
+    /// every other key in the batch was still stored. In
+    /// single-node/proxy mode a <c>W</c> propagates immediately, exactly
+    /// as <see cref="SetAsync(byte[], byte[], long)"/>'s own single-mode
+    /// behavior does.</para>
+    ///
+    /// <para>Larger batches are transparently split into more than one
+    /// <c>o</c> sub-frame per node (batch chunking, see
+    /// <see cref="MaxBatchKeys"/>).</para></summary>
+    public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0) =>
+        SetManyBytesAsync(EmptyNamespace, values, ttlSeconds);
+
+    /// <summary>issue #105: as <see cref="SetManyBytesAsync(IReadOnlyDictionary{string, byte[]}, long)"/>,
+    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    internal async Task SetManyBytesAsync(
+        byte[] namespaceBytes, IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0)
+    {
+        if (values.Count == 0)
+        {
+            throw new ArgumentException(
+                "nanocached: SetManyAsync/SetManyBytesAsync requires at least one key", nameof(values));
+        }
+        if (ttlSeconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(ttlSeconds), $"nanocached: ttlSeconds must be non-negative, got {ttlSeconds}");
+        }
+
+        var keys = new List<string>(values.Count);
+        var keyBytes = new byte[values.Count][];
+        var valueBytes = new byte[values.Count][];
+        int i = 0;
+        foreach ((string key, byte[] original) in values)
+        {
+            byte[] kb = Encoding.UTF8.GetBytes(key);
+            ValidateKeyAndValue(namespaceBytes, kb, original);
+            keys.Add(key);
+            keyBytes[i] = kb;
+            valueBytes[i] = _compress ? Compression.CompressValue(original, _compressionThreshold) : original;
+            i++;
+        }
+        await BeforeOperationAsync().ConfigureAwait(false);
+
+        if (_ring is null)
+        {
+            List<Connection.MultiEntry> entries = await MultiSetChunkedAsync(
+                null, namespaceBytes, keyBytes, valueBytes, ttlSeconds).ConfigureAwait(false);
+            foreach (Connection.MultiEntry entry in entries)
+            {
+                if (entry.WrongNode) throw new WrongNodeException();
+            }
+            return;
+        }
+
+        List<int> retry =
+            await MultiSetPassAsync(namespaceBytes, keys, keyBytes, valueBytes, ttlSeconds, null).ConfigureAwait(false);
+        if (retry.Count == 0) return;
+        await MaybeRefreshAsync(force: true).ConfigureAwait(false);
+        retry = await MultiSetPassAsync(namespaceBytes, keys, keyBytes, valueBytes, ttlSeconds, retry)
+            .ConfigureAwait(false);
+        if (retry.Count > 0) throw new WrongNodeException();
+    }
+
+    /// <summary><see cref="MultiGetChunkedAsync"/>'s write-side twin: one
+    /// or more <c>o</c> sub-frames against <paramref name="slot"/>'s
+    /// connection, split into <see cref="MaxBatchKeys"/>-sized chunks the
+    /// same way.</summary>
+    private async Task<List<Connection.MultiEntry>> MultiSetChunkedAsync(
+        string? slot, byte[] namespaceBytes, byte[][] keys, byte[][] values, long ttlSeconds)
+    {
+        var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
+        for (int start = 0; start < keys.Length; start += MaxBatchKeys)
+        {
+            int end = Math.Min(start + MaxBatchKeys, keys.Length);
+            ArraySegment<byte[]> keyChunk = new(keys, start, end - start);
+            ArraySegment<byte[]> valueChunk = new(values, start, end - start);
+            List<Connection.MultiEntry> chunkEntries = await ApplyReconnectingAsync(
+                slot, connection => connection.MultiSetAsync(namespaceBytes, keyChunk, valueChunk, ttlSeconds))
+                .ConfigureAwait(false);
+            for (int idx = start; idx < end; idx++)
+            {
+                entries[idx] = chunkEntries[idx - start];
+            }
+        }
+        return entries;
+    }
+
+    /// <summary>One owner's key/IsPrimary membership across one
+    /// <see cref="MultiSetPassAsync"/> call — see that method's own doc
+    /// comment for why a key can appear here with <c>IsPrimary</c> false:
+    /// the same node can be primary for one key in the batch and a
+    /// replica for another.</summary>
+    private sealed class OwnerBatch
+    {
+        public readonly List<int> Indices = new();
+        public readonly List<bool> IsPrimary = new();
+    }
+
+    /// <summary>One pass of <see cref="SetManyBytesAsync(byte[], IReadOnlyDictionary{string, byte[]}, long)"/>'s
+    /// cluster routing: for every key still needing resolution (every
+    /// key, when <paramref name="retryIndices"/> is <c>null</c>, or just
+    /// what a previous pass left unresolved), build one sub-batch per
+    /// <b>owner name across every rank</b> — not just primaries, unlike
+    /// <see cref="MultiGetPassAsync"/> — because within one batch the
+    /// same node can be primary for one key and a replica for another;
+    /// each owner therefore gets exactly one <c>o</c> sub-frame covering
+    /// every key it holds in any role. Only a leg's <em>primary</em> keys
+    /// can end up in the returned retry list; a leg's replica-held keys
+    /// are logged-and-swallowed into <see cref="_replicaWriteFailures"/>
+    /// instead, mirroring <see cref="WriteAsync{T}"/>'s stance for
+    /// single-key set. A leg that is a pure replica for every key it
+    /// holds is eligible for <c>FireAndForgetReplicas</c>, exactly like a
+    /// single-key replica write — see
+    /// <see cref="RunMultiSetLegAsync"/>.</summary>
+    private async Task<List<int>> MultiSetPassAsync(
+        byte[] namespaceBytes, List<string> keys, byte[][] keyBytes, byte[][] valueBytes,
+        long ttlSeconds, List<int>? retryIndices)
+    {
+        List<int> indices = retryIndices ?? Enumerable.Range(0, keys.Count).ToList();
+
+        var owners = new Dictionary<string, OwnerBatch>();
+        var retry = new List<int>();
+        foreach (int idx in indices)
+        {
+            IReadOnlyList<string> names = OwnerNames(namespaceBytes, keyBytes[idx]);
+            if (names.Count == 0)
+            {
+                retry.Add(idx);
+                continue;
+            }
+            for (int rank = 0; rank < names.Count; rank++)
+            {
+                if (!owners.TryGetValue(names[rank], out OwnerBatch? batch))
+                {
+                    batch = new OwnerBatch();
+                    owners[names[rank]] = batch;
+                }
+                batch.Indices.Add(idx);
+                batch.IsPrimary.Add(rank == 0);
+            }
+        }
+
+        var legs = new List<Task>();
+        foreach ((string name, OwnerBatch batch) in owners)
+        {
+            Task RunLegAsync() => RunMultiSetLegAsync(namespaceBytes, name, batch, keyBytes, valueBytes, ttlSeconds, retry);
+
+            // Fire-and-forget replica writes: with FireAndForgetReplicas,
+            // up to MaxInFlightBackgroundReplicaWrites legs run in the
+            // background instead of being waited for below — mirrors
+            // WriteAsync's own fire-and-forget branch exactly, including
+            // its Close()-race fallback.
+            bool pureReplica = !batch.IsPrimary.Contains(true);
+            if (_fireAndForgetReplicas && pureReplica && _backgroundReplicaPermits.Wait(0))
+            {
+                Task background = Task.Run(RunLegAsync);
+                _ = background.ContinueWith(
+                    completed =>
+                    {
+                        if (completed.Exception is not null)
+                        {
+                            Interlocked.Increment(ref _replicaWriteFailures);
+                        }
+                        _backgroundReplicaPermits.Release();
+                    },
+                    TaskScheduler.Default);
+                continue;
+            }
+
+            legs.Add(RunLegAsync());
+        }
+
+        Exception? legBug = null;
+        foreach (Task leg in legs)
+        {
+            try
+            {
+                await leg.ConfigureAwait(false);
+            }
+            catch (Exception error)
+            {
+                legBug = error;
+            }
+        }
+        if (legBug is not null) ExceptionDispatchInfo.Capture(legBug).Throw();
+        return retry;
+    }
+
+    /// <summary>Dispatches one owner's <c>o</c> sub-batch (via
+    /// <see cref="MultiSetChunkedAsync"/>) and applies its result to
+    /// <paramref name="retry"/>/<see cref="_replicaWriteFailures"/>: only
+    /// primary-held keys can end up appended to <paramref name="retry"/>;
+    /// every replica-held key's failure or <c>W</c> is counted in
+    /// <see cref="_replicaWriteFailures"/> instead, mirroring
+    /// <see cref="WriteAsync{T}"/>'s own stance for single-key set. A
+    /// connection-level failure for the whole leg is treated the same
+    /// way, key by key, since the SAME sub-frame can carry both primary-
+    /// and replica-held keys and a transport failure doesn't distinguish
+    /// between them. <paramref name="retry"/> is shared by every
+    /// concurrently-running owner leg, so every access is under
+    /// <c>lock (retry)</c>.</summary>
+    private async Task RunMultiSetLegAsync(
+        byte[] namespaceBytes, string name, OwnerBatch batch, byte[][] keyBytes, byte[][] valueBytes,
+        long ttlSeconds, List<int> retry)
+    {
+        var groupKeys = new byte[batch.Indices.Count][];
+        var groupValues = new byte[batch.Indices.Count][];
+        for (int i = 0; i < batch.Indices.Count; i++)
+        {
+            int idx = batch.Indices[i];
+            groupKeys[i] = keyBytes[idx];
+            groupValues[i] = valueBytes[idx];
+        }
+
+        List<Connection.MultiEntry> entries;
+        try
+        {
+            entries = await MultiSetChunkedAsync(name, namespaceBytes, groupKeys, groupValues, ttlSeconds)
+                .ConfigureAwait(false);
+        }
+        catch (Exception error) when (error is NanocachedException or IOException
+            or System.Net.Sockets.SocketException or ObjectDisposedException)
+        {
+            // Swallowed by design (client-side replication) for
+            // replica-held keys — see the class doc comment above; only a
+            // primary-held key's failure feeds the retry pass. Narrowed
+            // to the connection layer's own failure types, so a genuine
+            // programming bug propagates instead of being treated like a
+            // dead owner.
+            lock (retry)
+            {
+                for (int i = 0; i < batch.Indices.Count; i++)
+                {
+                    if (batch.IsPrimary[i]) retry.Add(batch.Indices[i]);
+                    else Interlocked.Increment(ref _replicaWriteFailures);
+                }
+            }
+            return;
+        }
+
+        lock (retry)
+        {
+            for (int i = 0; i < batch.Indices.Count; i++)
+            {
+                if (!batch.IsPrimary[i])
+                {
+                    if (entries[i].WrongNode) Interlocked.Increment(ref _replicaWriteFailures);
+                    continue;
+                }
+                if (entries[i].WrongNode) retry.Add(batch.Indices[i]);
+            }
+        }
     }
 
     // ── incr / decr (issue #129) ─────────────────────────────────
