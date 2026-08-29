@@ -35,13 +35,13 @@ import ssl as ssl_module
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from ._compression import compress_value, decompress_value
-from ._connection import CAS_ABSENT, CAS_PRESENT, Connection
+from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection
 from ._digest import content_digest
-from ._errors import AlreadyClosedError, NanocachedError, WrongNodeError
+from ._errors import AlreadyClosedError, NanocachedError, PartialWrongNodeError, WrongNodeError
 from ._hashring import HashRing
 from ._identify import (
     ClusterTarget,
@@ -171,6 +171,17 @@ _MAX_REQUEST_HEADER_BYTES = 256
 # closes the shared, pipelined connection and takes every other in-flight
 # request on it down too.
 _MAX_REQUEST_BYTES = 1024 * 1024 - _MAX_REQUEST_HEADER_BYTES
+
+# Batched get/set (issues #128/#150/#151): the SDK transparently splits a
+# larger batch into more than one m/o sub-frame per owner so no reply
+# header risks outgrowing this connection's read buffer. Python's own
+# ceiling here is generous — asyncio.StreamReader's default internal
+# limit is 64 KiB, 16x Go's 4 KiB maxHeaderLineLength that its own 400
+# derives from — so 400 is chosen to match every other SDK's chunking
+# behavior (identical test expectations, identical operational
+# characteristics), not because Python needs a smaller number of its
+# own.
+_MAX_BATCH_KEYS = 400
 
 
 def _warn(message: str) -> None:
@@ -980,6 +991,387 @@ class NanocachedClient:
                 namespace, key_bytes, lambda connection: connection.delete(key_bytes, namespace)
             )
         )
+
+    # ── Batched get and set (issues #128/#150/#151) ────────────────────
+    #
+    # get_many/get_many_bytes/set_many exist because a caller with N keys
+    # otherwise pays N round trips — one m/o sub-frame per involved node
+    # replaces that with one, transparently chunked into more than one
+    # sub-frame when a batch exceeds _MAX_BATCH_KEYS. A batch never fails
+    # as a whole: every key's outcome (hit/miss/stored/wrong-node) is
+    # independent (docs/protocol.html "m / o — batched get and set").
+    # Both str and bytes keys are accepted, matching every other method
+    # on this client — the returned dict is keyed by whichever original
+    # object the caller passed, indexed by position rather than by
+    # encoded bytes, so a batch may freely mix the two; because "a" and
+    # b"a" encode identically, a batch containing both is rejected
+    # up-front with ValueError rather than silently colliding.
+
+    def _dedupe_batch_keys(
+        self, keys: Sequence[str | bytes], namespace: bytes
+    ) -> tuple[list[str | bytes], list[bytes]]:
+        originals: list[str | bytes] = []
+        key_bytes_list: list[bytes] = []
+        seen: dict[bytes, str | bytes] = {}
+        for original in keys:
+            key_bytes = _to_bytes(original)
+            _check_key(key_bytes, namespace)
+            if key_bytes in seen:
+                raise ValueError(
+                    f"nanocached: duplicate key after encoding: {original!r} and "
+                    f"{seen[key_bytes]!r} both encode to {key_bytes!r}"
+                )
+            seen[key_bytes] = original
+            originals.append(original)
+            key_bytes_list.append(key_bytes)
+        return originals, key_bytes_list
+
+    def _maybe_decompress(self, value: bytes) -> bytes:
+        return decompress_value(value) if self._compress else value
+
+    async def get_many_bytes(self, keys: Sequence[str | bytes]) -> dict[str | bytes, bytes]:
+        """The raw companion to get_many(): no UTF-8 decoding. See
+        get_many()'s docstring for the batch contract."""
+        return await self._get_many_bytes(b"", keys)
+
+    async def get_many(self, keys: Sequence[str | bytes]) -> dict[str | bytes, str]:
+        """Batched get (issues #128/#150/#151): one round trip per
+        involved node instead of one per key. ``keys`` must be
+        non-empty. A miss is simply absent from the returned dict, the
+        same "a miss is not an error" contract get() itself has.
+
+        A batch never fails as a whole: if some keys are still
+        wrong-node after one bounded refresh-and-retry (the same policy
+        get()'s own _with_wrong_node_retry applies, generalized to a
+        per-key roster instead of an all-or-nothing retry — see
+        _multi_get_pass()), this raises PartialWrongNodeError — a
+        WrongNodeError subclass — whose ``partial_values`` holds every
+        key that DID resolve, rather than discarding a
+        mostly-successful batch over a handful of stale placements. In
+        single-node/proxy mode a ``W`` propagates immediately as a plain
+        WrongNodeError, exactly as get()'s own single-mode behavior
+        does — there is no ring to refresh against.
+
+        Larger batches are transparently split into more than one ``m``
+        sub-frame per owner (_MAX_BATCH_KEYS) — callers never need to
+        think about this. Hedged reads and read repair do not apply to
+        batches: hedging's miss sentinel and read repair both assume a
+        single value, not a partial-hit roster (Go's and TypeScript's
+        ports made the same call)."""
+        return await self._get_many(b"", keys)
+
+    async def _get_many_bytes(
+        self, namespace: bytes, keys: Sequence[str | bytes]
+    ) -> dict[str | bytes, bytes]:
+        """The namespace-carrying implementation behind get_many_bytes()
+        and Namespace.get_many_bytes() — see _get_bytes()."""
+        if not keys:
+            raise ValueError("nanocached: get_many/get_many_bytes requires at least one key")
+        originals, key_bytes_list = self._dedupe_batch_keys(keys, namespace)
+        await self._before_operation()
+
+        if self._ring is None:
+            entries, error = await self._multi_get_chunked(
+                self._single_connection, namespace, key_bytes_list
+            )
+            values: dict[str | bytes, bytes] = {}
+            for original, entry in zip(originals, entries):
+                if isinstance(entry, (bytes, bytearray)):
+                    values[original] = self._maybe_decompress(entry)
+            if error is not None:
+                raise error
+            if any(entry is WRONG_NODE for entry in entries):
+                raise WrongNodeError()
+            return values
+
+        values = {}
+        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, None)
+        if not retry:
+            return values
+        await self._maybe_refresh(force=True)
+        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, retry)
+        if retry:
+            raise PartialWrongNodeError(values)
+        return values
+
+    async def _get_many(self, namespace: bytes, keys: Sequence[str | bytes]) -> dict[str | bytes, str]:
+        """The namespace-carrying implementation behind get_many() and
+        Namespace.get_many() — see _get()."""
+        try:
+            raw = await self._get_many_bytes(namespace, keys)
+        except PartialWrongNodeError as error:
+            error.partial_values = {key: value.decode() for key, value in error.partial_values.items()}
+            raise
+        return {key: value.decode() for key, value in raw.items()}
+
+    async def _multi_get_chunked(
+        self, connection_getter, namespace: bytes, keys: list[bytes]
+    ) -> tuple[list[bytes | None | object], BaseException | None]:
+        """Issues one or more ``m`` sub-frames for ``keys`` — already
+        grouped to one owner (or the single/proxy target) by the caller
+        — splitting into _MAX_BATCH_KEYS-sized chunks so no reply header
+        risks growing unbounded. ``connection_getter`` is a zero-arg
+        async callable returning the Connection to use, called fresh per
+        chunk, so a mid-batch reconnect is handled the same way a
+        single-key get/set is. Always returns len(keys) entries: a chunk
+        that fails outright (a connection-level failure, not a per-key
+        ``W``) leaves the remaining keys' entries at the zero value
+        (None — a clean miss) and that chunk's error is returned
+        alongside — the caller treats that gap as "still needs a
+        retry", exactly like a per-key WrongNode."""
+        entries: list[bytes | None | object] = [None] * len(keys)
+        for start in range(0, len(keys), _MAX_BATCH_KEYS):
+            chunk = keys[start : start + _MAX_BATCH_KEYS]
+            try:
+                connection = await connection_getter()
+                chunk_entries = await connection.multi_get(chunk, namespace)
+            except _SWALLOWABLE_ERRORS as error:
+                return entries, error
+            entries[start : start + len(chunk)] = chunk_entries
+        return entries, None
+
+    async def _multi_get_pass(
+        self,
+        namespace: bytes,
+        originals: list[str | bytes],
+        key_bytes_list: list[bytes],
+        values: dict[str | bytes, bytes],
+        retry_indices: list[int] | None,
+    ) -> list[int]:
+        """Runs one pass of get_many_bytes' cluster routing: group the
+        given indices (every key, when retry_indices is None — the
+        initial pass — or just the keys a previous pass left unresolved)
+        by their current primary owner (matching plain get()'s own
+        primary-first stance), dispatch one (possibly chunked) ``m``
+        exchange per owner concurrently, splice hits into ``values``,
+        and return the indices still unresolved: a per-key ``W``, or a
+        whole owner group whose call failed outright (indistinguishable
+        from a possibly-idle-closed connection, same stance _read()
+        itself takes). Called once for the initial pass and once more,
+        if needed, after a single forced refresh — see
+        _get_many_bytes()."""
+        indices = retry_indices if retry_indices is not None else list(range(len(originals)))
+
+        groups: dict[str, list[int]] = {}
+        retry: list[int] = []
+        for idx in indices:
+            owners = self._owner_names(namespace, key_bytes_list[idx])
+            if not owners:
+                retry.append(idx)
+                continue
+            groups.setdefault(owners[0], []).append(idx)
+
+        async def run_group(owner: str, group_indices: list[int]) -> tuple[list[int], dict[str | bytes, bytes]]:
+            group_keys = [key_bytes_list[idx] for idx in group_indices]
+            entries, error = await self._multi_get_chunked(
+                lambda: self._member_connection(owner), namespace, group_keys
+            )
+            if error is not None:
+                return list(group_indices), {}
+            local_retry: list[int] = []
+            local_values: dict[str | bytes, bytes] = {}
+            for idx, entry in zip(group_indices, entries):
+                if entry is WRONG_NODE:
+                    local_retry.append(idx)
+                elif entry is not None:
+                    local_values[originals[idx]] = self._maybe_decompress(entry)
+            return local_retry, local_values
+
+        results = await asyncio.gather(*(run_group(owner, idxs) for owner, idxs in groups.items()))
+        for local_retry, local_values in results:
+            retry.extend(local_retry)
+            values.update(local_values)
+        return retry
+
+    async def set_many(
+        self, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0
+    ) -> None:
+        """Batched set (issues #128/#150/#151): one round trip per
+        involved node instead of one per key. ``ttl_seconds`` is shared
+        by the whole batch, not per key (one real caller of a batched
+        set — Django's set_many, cache-manager's mset — already passes
+        one TTL per call); 0 (the default) means no expiry. ``values``
+        must be non-empty. Transparently compresses values at or above
+        ``compression_threshold`` when ``compress`` is enabled, exactly
+        like set().
+
+        Within one batch, the same node can be a key's primary and
+        another key's replica at once — it receives exactly one ``o``
+        sub-frame either way, and only its answer for the keys it is
+        primary for decides that key's outcome; a replica-held key's
+        failure or ``W`` is logged-and-swallowed into
+        stats().replica_write_failures, exactly like set()'s own replica
+        legs. A batch never fails as a whole: if some keys' primaries
+        are still wrong-node after one bounded refresh-and-retry, this
+        raises a plain WrongNodeError — every other key in the batch was
+        still stored (there is nothing partial worth attaching, unlike
+        get_many/get_many_bytes, since a write has no value to return).
+        In single-node/proxy mode a ``W`` propagates immediately, exactly
+        as set()'s own single-mode behavior does.
+
+        Larger batches are transparently split into more than one ``o``
+        sub-frame per node (_MAX_BATCH_KEYS)."""
+        await self._set_many(b"", values, ttl_seconds=ttl_seconds)
+
+    async def _set_many(
+        self, namespace: bytes, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0
+    ) -> None:
+        """The namespace-carrying implementation behind set_many() and
+        Namespace.set_many() — see _set()."""
+        if not values:
+            raise ValueError("nanocached: set_many requires at least one key")
+        if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
+            raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
+
+        key_bytes_list: list[bytes] = []
+        value_bytes_list: list[bytes] = []
+        seen: dict[bytes, str | bytes] = {}
+        for original, value in values.items():
+            key_bytes, value_bytes = _to_bytes(original), _to_bytes(value)
+            # See _set()'s own comment: validated before compressing, and
+            # re-checked after, purely as a defense-in-depth backstop.
+            _check_key_and_value(key_bytes, value_bytes, namespace)
+            if self._compress:
+                value_bytes = compress_value(value_bytes, self._compression_threshold)
+                _check_key_and_value(key_bytes, value_bytes, namespace)
+            if key_bytes in seen:
+                raise ValueError(
+                    f"nanocached: duplicate key after encoding: {original!r} and "
+                    f"{seen[key_bytes]!r} both encode to {key_bytes!r}"
+                )
+            seen[key_bytes] = original
+            key_bytes_list.append(key_bytes)
+            value_bytes_list.append(value_bytes)
+        await self._before_operation()
+
+        if self._ring is None:
+            entries, error = await self._multi_set_chunked(
+                self._single_connection, namespace, key_bytes_list, value_bytes_list, ttl_seconds
+            )
+            if error is not None:
+                raise error
+            if any(entry is WRONG_NODE for entry in entries):
+                raise WrongNodeError()
+            return
+
+        retry = await self._multi_set_pass(
+            namespace, key_bytes_list, value_bytes_list, ttl_seconds, None
+        )
+        if not retry:
+            return
+        await self._maybe_refresh(force=True)
+        retry = await self._multi_set_pass(
+            namespace, key_bytes_list, value_bytes_list, ttl_seconds, retry
+        )
+        if retry:
+            raise WrongNodeError()
+
+    async def _multi_set_chunked(
+        self,
+        connection_getter,
+        namespace: bytes,
+        keys: list[bytes],
+        values: list[bytes],
+        ttl_seconds: int,
+    ) -> tuple[list[bool | object], BaseException | None]:
+        """_multi_get_chunked's write-side twin: one or more ``o``
+        sub-frames against ``connection_getter`` for keys/values (already
+        grouped to one owner, or the single/proxy target), split into
+        _MAX_BATCH_KEYS-sized chunks. Always returns len(keys) entries; a
+        chunk that fails outright leaves the remaining keys' entries at
+        the zero value (False) and that chunk's error is returned
+        alongside."""
+        entries: list[bool | object] = [False] * len(keys)
+        for start in range(0, len(keys), _MAX_BATCH_KEYS):
+            end = start + _MAX_BATCH_KEYS
+            try:
+                connection = await connection_getter()
+                chunk_entries = await connection.multi_set(
+                    keys[start:end], values[start:end], ttl_seconds, namespace
+                )
+            except _SWALLOWABLE_ERRORS as error:
+                return entries, error
+            entries[start:end] = chunk_entries
+        return entries, None
+
+    async def _multi_set_pass(
+        self,
+        namespace: bytes,
+        key_bytes_list: list[bytes],
+        value_bytes_list: list[bytes],
+        ttl_seconds: int,
+        retry_indices: list[int] | None,
+    ) -> list[int]:
+        """Runs one pass of set_many's cluster routing: for every key
+        still needing resolution (every key, when retry_indices is None,
+        or just what a previous pass left unresolved), build one
+        sub-batch per **owner name across every rank** — not just
+        primaries, unlike _multi_get_pass — because within one batch the
+        same node can be primary for one key and a replica for another
+        (see set_many()'s own docstring); each owner therefore gets
+        exactly one ``o`` sub-frame covering every key it holds in any
+        role. Only a leg's *primary* keys can end up in the returned
+        retry list; a leg's replica-held keys are logged-and-swallowed
+        into stats().replica_write_failures instead, mirroring
+        _dispatch_replica_writes' stance for a single-key set(). A leg
+        that is a pure replica for every key it holds is eligible for
+        fire_and_forget_replicas, exactly like a single-key replica
+        write."""
+        indices = retry_indices if retry_indices is not None else list(range(len(key_bytes_list)))
+
+        owners: dict[str, tuple[list[int], list[bool]]] = {}
+        retry: list[int] = []
+        for idx in indices:
+            names = self._owner_names(namespace, key_bytes_list[idx])
+            if not names:
+                retry.append(idx)
+                continue
+            for rank, name in enumerate(names):
+                owner_indices, owner_is_primary = owners.setdefault(name, ([], []))
+                owner_indices.append(idx)
+                owner_is_primary.append(rank == 0)
+
+        async def run_leg(name: str, leg_indices: list[int], is_primary: list[bool]) -> list[int]:
+            group_keys = [key_bytes_list[idx] for idx in leg_indices]
+            group_values = [value_bytes_list[idx] for idx in leg_indices]
+            entries, error = await self._multi_set_chunked(
+                lambda: self._member_connection(name), namespace, group_keys, group_values, ttl_seconds
+            )
+            leg_retry: list[int] = []
+            if error is not None:
+                for idx, primary in zip(leg_indices, is_primary):
+                    if primary:
+                        leg_retry.append(idx)
+                    else:
+                        self._replica_write_failures += 1
+                return leg_retry
+            for idx, primary, entry in zip(leg_indices, is_primary, entries):
+                if not primary:
+                    if entry is WRONG_NODE:
+                        self._replica_write_failures += 1
+                    continue
+                if entry is WRONG_NODE:
+                    leg_retry.append(idx)
+            return leg_retry
+
+        synchronous_legs = []
+        for name, (leg_indices, is_primary) in owners.items():
+            pure_replica = not any(is_primary)
+            if (
+                pure_replica
+                and self._fire_and_forget_replicas
+                and not self._closed
+                and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+            ):
+                task = asyncio.ensure_future(run_leg(name, leg_indices, is_primary))
+                self._background_replica_writes.add(task)
+                task.add_done_callback(self._background_replica_writes.discard)
+                continue
+            synchronous_legs.append(run_leg(name, leg_indices, is_primary))
+
+        for leg_retry in await asyncio.gather(*synchronous_legs):
+            retry.extend(leg_retry)
+        return retry
 
     async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
         """Atomically adds ``delta`` (may be negative) to the integer
@@ -1995,6 +2387,23 @@ class Namespace:
     async def delete(self, key: str | bytes) -> bool:
         """Same as NanocachedClient.delete(), scoped to this namespace."""
         return await self._client._delete(self._namespace, key)
+
+    async def get_many_bytes(self, keys: Sequence[str | bytes]) -> dict[str | bytes, bytes]:
+        """Same as NanocachedClient.get_many_bytes(), scoped to this
+        namespace (issues #128/#150/#151)."""
+        return await self._client._get_many_bytes(self._namespace, keys)
+
+    async def get_many(self, keys: Sequence[str | bytes]) -> dict[str | bytes, str]:
+        """Same as NanocachedClient.get_many(), scoped to this namespace
+        (issues #128/#150/#151)."""
+        return await self._client._get_many(self._namespace, keys)
+
+    async def set_many(
+        self, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0
+    ) -> None:
+        """Same as NanocachedClient.set_many(), scoped to this namespace
+        (issues #128/#150/#151)."""
+        await self._client._set_many(self._namespace, values, ttl_seconds=ttl_seconds)
 
     async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
         """Same as NanocachedClient.incr(), scoped to this namespace

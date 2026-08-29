@@ -2,8 +2,9 @@
 the cache protocol (``G``/``S``/``D``, and their namespaced counterparts
 ``g``/``s``/``d`` — issue #105 — plus ``c``/``F`` to clear a namespace or
 flush every namespace, issue #106, ``i`` to increment/decrement a counter,
-issue #129, and ``k``/``x`` for compare-and-set, issue #141 — the ``A``
-identify exchange happens in ``_identify`` before a Connection exists).
+issue #129, ``k``/``x`` for compare-and-set, issue #141, and ``m``/``o``
+for batched get/set, issues #128/#150/#151 — the ``A`` identify exchange
+happens in ``_identify`` before a Connection exists).
 
 Requests are pipelined onto the socket and matched to responses in send
 order (request pipelining): a dedicated read loop task consumes responses
@@ -19,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from ._errors import NanocachedError, NotNumericError, RetryableError, WrongNodeError
 
@@ -49,6 +50,13 @@ _RETRYABLE_RETRY_DELAYS = (0.05, 0.10)
 # the same 30s the Go and Rust SDKs use. A module global only so tests
 # can shorten it.
 _REQUEST_TIMEOUT = 30.0
+
+# One parsed response's payload: plain bytes (V), (value, ttl_seconds)
+# (I), a multi_get roster (M — list[bytes | None | _MultiWrongNode]), a
+# multi_set roster (O — list[bool | _MultiWrongNode]), or None (every
+# other marker). Widened for issues #128/#150/#151; every pre-existing
+# marker's payload shape is unchanged.
+_ResponsePayload = bytes | tuple[bytes, int | None] | list[object] | None
 
 
 # Echoed response tags: on a tagged-mode connection every request header carries the
@@ -158,6 +166,56 @@ def _encode_cas_delete(key: bytes, cond: bytes, tag: int | None = None, namespac
     return b"x %d %d %b%b\n%b%b" % (len(namespace), len(key), cond, _tag_field(tag), namespace, key)
 
 
+# Batched get and set (issues #128/#150/#151): like i/k/x above, m/o
+# always carry <namespace-length> (0 for the default namespace) — neither
+# op has a pre-namespace legacy uppercase form. Unlike every op above,
+# the number of length fields in the header is variable (one, or one pair
+# for m/o respectively, per key), so these can't reuse the fixed-arity
+# `%`-formatting style the others use — the header is assembled field by
+# field instead (docs/protocol.html "m / o — batched get and set").
+def _encode_multi_get(
+    keys: Sequence[bytes], tag: int | None = None, namespace: bytes = b""
+) -> bytes:
+    fields = [b"m", b"%d" % len(namespace), b"%d" % len(keys)]
+    fields.extend(b"%d" % len(key) for key in keys)
+    header = b" ".join(fields) + _tag_field(tag) + b"\n"
+    return header + namespace + b"".join(keys)
+
+
+def _encode_multi_set(
+    keys: Sequence[bytes],
+    values: Sequence[bytes],
+    ttl_seconds: int = 0,
+    tag: int | None = None,
+    namespace: bytes = b"",
+) -> bytes:
+    fields = [b"o", b"%d" % len(namespace), b"%d" % len(keys)]
+    for key, value in zip(keys, values):
+        fields.append(b"%d" % len(key))
+        fields.append(b"%d" % len(value))
+    # 0 means no expiry — omitted from the wire, exactly like
+    # _encode_set's own ttl_seconds field.
+    if ttl_seconds != 0:
+        fields.append(b"%d" % ttl_seconds)
+    header = b" ".join(fields) + _tag_field(tag) + b"\n"
+    body = namespace + b"".join(key + value for key, value in zip(keys, values))
+    return header + body
+
+
+class _MultiWrongNode:
+    """Sentinel marking one key's per-key ``W`` inside a multi_get/
+    multi_set roster (issues #128/#150/#151) — distinct from a clean
+    miss (``None``), which only multi_get's roster can produce."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "WRONG_NODE"
+
+
+WRONG_NODE = _MultiWrongNode()
+
+
 class Connection:
     def __init__(
         self,
@@ -190,7 +248,7 @@ class Connection:
         # under (None on an untagged connection) — the expected echo
         # _read_loop checks the response against before handing it out.
         self._pending: deque[
-            tuple[int | None, asyncio.Future[tuple[bytes, bytes | tuple[bytes, int | None] | None]]]
+            tuple[int | None, asyncio.Future[tuple[bytes, _ResponsePayload]]]
         ] = deque()
         self._closed = False
         self._last_used = time.monotonic()
@@ -301,6 +359,38 @@ class Connection:
             raise WrongNodeError()
         raise self._mismatch(marker)
 
+    async def multi_get(
+        self, keys: Sequence[bytes], namespace: bytes = b""
+    ) -> list[bytes | None | _MultiWrongNode]:
+        """Sends one ``m`` request for every key in ``keys`` (issues
+        #128/#150/#151) and returns one roster entry per key, in request
+        order: the hit's raw bytes, ``None`` for a clean miss, or
+        WRONG_NODE for that key's own ``W``. Unlike get(), there is no
+        whole-frame ``W`` to raise — a batch never fails as a whole — so
+        any marker other than ``M`` is a desync, exactly like clear()'s
+        own stance."""
+        marker, entries = await self._request(lambda tag: _encode_multi_get(keys, tag, namespace))
+        if marker == b"M":
+            assert entries is not None
+            return entries  # type: ignore[return-value]
+        raise self._mismatch(marker)
+
+    async def multi_set(
+        self, keys: Sequence[bytes], values: Sequence[bytes], ttl_seconds: int, namespace: bytes = b""
+    ) -> list[bool | _MultiWrongNode]:
+        """Sends one ``o`` request storing every (key, value) pair in
+        ``keys``/``values`` under one shared TTL (issues
+        #128/#150/#151) and returns one roster entry per key, in request
+        order: ``True`` for stored, or WRONG_NODE for that key's own
+        ``W`` — see multi_get()."""
+        marker, entries = await self._request(
+            lambda tag: _encode_multi_set(keys, values, ttl_seconds, tag, namespace)
+        )
+        if marker == b"O":
+            assert entries is not None
+            return entries  # type: ignore[return-value]
+        raise self._mismatch(marker)
+
     async def clear(self, namespace: bytes = b"") -> None:
         """Drops every entry in ``namespace`` on this node (issue #106) —
         a namespace-length of 0 clears the default namespace. Never
@@ -390,7 +480,7 @@ class Connection:
 
     async def _request(
         self, build: Callable[[int | None], bytes]
-    ) -> tuple[bytes, bytes | tuple[bytes, int | None] | None]:
+    ) -> tuple[bytes, _ResponsePayload]:
         """Sends ``build``'s request and returns its (marker, value)
         answer. Retryable-error status `R` (issue #125): when the answer
         is `R`, this request is transparently retried on this SAME
@@ -420,7 +510,7 @@ class Connection:
 
     async def _send(
         self, build: Callable[[int | None], bytes]
-    ) -> asyncio.Future[tuple[bytes, bytes | tuple[bytes, int | None] | None]]:
+    ) -> asyncio.Future[tuple[bytes, _ResponsePayload]]:
         """Enqueues one request frame and returns its pending future,
         unawaited — the raw "write one frame, get back a slot to await"
         primitive _request() calls once per attempt (including retries)."""
@@ -428,7 +518,7 @@ class Connection:
             raise ConnectionError("nanocached: connection is closed")
 
         future: asyncio.Future[
-            tuple[bytes, bytes | tuple[bytes, int | None] | None]
+            tuple[bytes, _ResponsePayload]
         ] = asyncio.get_running_loop().create_future()
         async with self._write_lock:
             if self.closed:
@@ -566,7 +656,7 @@ class Connection:
     # swallowable by the retry layer (_SWALLOWABLE_ERRORS covers both).
     async def _read_one_response(
         self,
-    ) -> tuple[bytes, bytes | tuple[bytes, int | None] | None, int | None]:
+    ) -> tuple[bytes, _ResponsePayload, int | None]:
         marker = await self._reader.readexactly(1)
 
         if marker == b"V":
@@ -625,6 +715,80 @@ class Connection:
             tag = self._parse_tag(fields[2 if has_ttl else 1]) if self._tagged else None
             value = await self._reader.readexactly(length)
             return marker, (value, ttl_seconds), tag
+
+        if marker == b"M":
+            # Batched get's response (issues #128/#150/#151): `M <n>
+            # <result-1>...<result-n> [<tag>]\n<hit bytes, concatenated in
+            # request order>` (docs/protocol.html "m / o"). Unlike V/I
+            # this has a variable number of header fields (n of them), so
+            # the header line is read whole before any body byte is
+            # touched — a lying n can never cause an out-of-bounds read,
+            # it only ever fails the field-count check below against
+            # whatever readuntil's own bounded read actually delivered.
+            # Each token is a decimal byte length (a hit — read that many
+            # body bytes next, in request order), "-" (a clean miss), or
+            # "W" (this key's own wrong-node).
+            header = await self._reader.readuntil(b"\n")
+            fields = header[1:-1].split(b" ")
+            if len(fields) < 1:
+                raise NanocachedError("nanocached: invalid multi-get header in response")
+            try:
+                count = int(fields[0])
+            except ValueError:
+                count = -1
+            if count < 0:
+                raise NanocachedError("nanocached: invalid multi-get count in response")
+            want_fields = 1 + count + (1 if self._tagged else 0)
+            if len(fields) != want_fields:
+                raise NanocachedError("nanocached: invalid multi-get header in response")
+            tag = self._parse_tag(fields[1 + count]) if self._tagged else None
+            entries: list[bytes | None | _MultiWrongNode] = []
+            for token in fields[1 : 1 + count]:
+                if token == b"-":
+                    entries.append(None)
+                elif token == b"W":
+                    entries.append(WRONG_NODE)
+                else:
+                    try:
+                        length = int(token)
+                    except ValueError:
+                        length = -1
+                    if length < 0 or length > _MAX_VALUE_LENGTH:
+                        raise NanocachedError(
+                            "nanocached: invalid multi-get result length in response"
+                        )
+                    entries.append(await self._reader.readexactly(length))
+            return marker, entries, tag
+
+        if marker == b"O":
+            # Batched set's response (issues #128/#150/#151): `O <n>
+            # <result-1>...<result-n> [<tag>]\n` — no body, unlike `M`'s
+            # hit values (a set has nothing to echo back). Each token is
+            # "S" (stored) or "W" (wrong node); parsing otherwise mirrors
+            # `M` above.
+            header = await self._reader.readuntil(b"\n")
+            fields = header[1:-1].split(b" ")
+            if len(fields) < 1:
+                raise NanocachedError("nanocached: invalid multi-set header in response")
+            try:
+                count = int(fields[0])
+            except ValueError:
+                count = -1
+            if count < 0:
+                raise NanocachedError("nanocached: invalid multi-set count in response")
+            want_fields = 1 + count + (1 if self._tagged else 0)
+            if len(fields) != want_fields:
+                raise NanocachedError("nanocached: invalid multi-set header in response")
+            tag = self._parse_tag(fields[1 + count]) if self._tagged else None
+            ack_entries: list[bool | _MultiWrongNode] = []
+            for token in fields[1 : 1 + count]:
+                if token == b"S":
+                    ack_entries.append(True)
+                elif token == b"W":
+                    ack_entries.append(WRONG_NODE)
+                else:
+                    raise NanocachedError("nanocached: invalid multi-set result token in response")
+            return marker, ack_entries, tag
 
         if marker in (b"S", b"D", b"N", b"W", b"C", b"R", b"T"):
             if self._tagged:
