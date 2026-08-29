@@ -21,7 +21,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  * handshake (the SDK always negotiates tagged mode), namespaced {@code
  * g}/{@code s}/{@code d}/{@code c}, and the compare-and-set {@code k}/
  * {@code x} (issue #141) this adapter's {@code putIfAbsent}/{@code
- * replace}/{@code deleteIfMatches}/{@code getWithToken} rely on. A
+ * replace}/{@code deleteIfMatches}/{@code getWithToken} rely on, and the
+ * batched {@code m} (issue #152) this adapter's {@code getAll} uses for
+ * its bulk-safe keys. A
  * trimmed, independent reimplementation — see the adapters' shared
  * "duplicate per module rather than share a test double" convention
  * (e.g. {@code nanocached-spring}'s own {@code MockNode}).
@@ -36,6 +38,8 @@ final class MockNode implements AutoCloseable {
     final AtomicInteger clearCount = new AtomicInteger();
     final AtomicInteger casSetCount = new AtomicInteger();
     final AtomicInteger casDeleteCount = new AtomicInteger();
+    final AtomicInteger multiGetCount = new AtomicInteger();
+    final AtomicInteger multiSetCount = new AtomicInteger();
     /** When set, the next {@code k}/{@code x} request answers a
      * mismatch ({@code N}) regardless of whether the condition actually
      * holds — a one-shot fault, cleared on use. Exists purely to prove
@@ -122,6 +126,14 @@ final class MockNode implements AutoCloseable {
                     }
                     case "k" -> casSet(in, out, parts, tagged, tagSuffix);
                     case "x" -> casDelete(in, out, parts, tagSuffix);
+                    case "m" -> {
+                        byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        multiGet(in, out, ns(namespace), parts, tagSuffix);
+                    }
+                    case "o" -> {
+                        byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+                        multiSet(in, out, ns(namespace), parts, tagged, tagSuffix);
+                    }
                     default -> throw new IOException("unexpected command " + parts[0]);
                 }
             }
@@ -161,6 +173,70 @@ final class MockNode implements AutoCloseable {
         byte[] key = in.readNBytes(keyLength);
         boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
         reply(out, (existed ? "D" : "N") + tagSuffix + "\n");
+    }
+
+    /** {@code m <ns-len> <n> <key-len-1> ... <key-len-n> [tag]}, docs/protocol.html
+     * "m / o". Reply: {@code M <n> <result-1> ... <result-n> [tag]\n<hit values>},
+     * each result a decimal byte length (hit) or {@code -} (miss) — no {@code W}
+     * from a single-node mock. */
+    private void multiGet(InputStream in, OutputStream out, String namespace, String[] parts, String tagSuffix)
+            throws IOException {
+        int n = Integer.parseInt(parts[2]);
+        int[] keyLengths = new int[n];
+        for (int i = 0; i < n; i++) {
+            keyLengths[i] = Integer.parseInt(parts[3 + i]);
+        }
+        multiGetCount.incrementAndGet();
+        byte[][] values = new byte[n][];
+        for (int i = 0; i < n; i++) {
+            byte[] key = in.readNBytes(keyLengths[i]);
+            Entry entry = entry(namespace, key);
+            values[i] = entry == null ? null : entry.value();
+        }
+        StringBuilder header = new StringBuilder("M ").append(n);
+        for (byte[] value : values) {
+            header.append(' ').append(value == null ? "-" : String.valueOf(value.length));
+        }
+        header.append(tagSuffix).append('\n');
+        out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+        for (byte[] value : values) {
+            if (value != null) {
+                out.write(value);
+            }
+        }
+        out.flush();
+    }
+
+    /** {@code o <ns-len> <n> <key-len-1> <val-len-1> ... <key-len-n> <val-len-n>
+     * [ttl] [tag]}, docs/protocol.html "m / o" — one shared TTL for the whole
+     * batch, omitted from the wire when 0. Reply: {@code O <n> <result-1> ...
+     * <result-n> [tag]\n}, every result {@code S} — no {@code W} from a
+     * single-node mock. */
+    private void multiSet(
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
+            throws IOException {
+        int n = Integer.parseInt(parts[2]);
+        int[] keyLengths = new int[n];
+        int[] valueLengths = new int[n];
+        for (int i = 0; i < n; i++) {
+            keyLengths[i] = Integer.parseInt(parts[3 + 2 * i]);
+            valueLengths[i] = Integer.parseInt(parts[4 + 2 * i]);
+        }
+        int trailing = parts.length - (3 + 2 * n) - (tagged ? 1 : 0);
+        long ttlSeconds = trailing > 0 ? Long.parseLong(parts[3 + 2 * n]) : 0;
+        multiSetCount.incrementAndGet();
+        for (int i = 0; i < n; i++) {
+            byte[] key = in.readNBytes(keyLengths[i]);
+            byte[] value = in.readNBytes(valueLengths[i]);
+            store(namespace).put(ByteBuffer.wrap(key), new Entry(value, ttlSeconds));
+        }
+        StringBuilder header = new StringBuilder("O ").append(n);
+        for (int i = 0; i < n; i++) {
+            header.append(" S");
+        }
+        header.append(tagSuffix).append('\n');
+        out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+        out.flush();
     }
 
     /** {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]}. {@code

@@ -8,7 +8,8 @@
  * keep-alive probe against the default namespace, never sent by this
  * store's own operations) and `F` (never sent by this adapter, since
  * `reset()` is always a namespace `c`; kept for protocol completeness/a
- * possible future test).
+ * possible future test), and namespaced `m`/`o` (issue #152 — `mget`/
+ * `mset`'s bulk wire ops).
  *
  * This is a fresh re-implementation for this module, not a copy of the
  * SDK's own (private) test double — see the shared adapter spec, item 3.
@@ -183,6 +184,68 @@ export async function startMockNode(): Promise<MockNode> {
             clears++;
             namespaceStores.clear();
             socket.write("C\n");
+            break;
+          }
+
+          case "m": {
+            // Batched get (issue #152, docs/protocol.html "m / o"):
+            // `m <ns-len> <n> <key-len-1> ... <key-len-n>\n<namespace><key-1>...<key-n>`.
+            lastCommand = command;
+            const namespaceLength = Number(parts[1]);
+            const n = Number(parts[2]);
+            const keyLengths: number[] = [];
+            for (let i = 0; i < n; i++) keyLengths.push(Number(parts[3 + i]));
+            const totalKeyLength = keyLengths.reduce((sum, len) => sum + len, 0);
+            if (buffer.length < bodyStart + namespaceLength + totalKeyLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            let offset = bodyStart + namespaceLength;
+            const keys: string[] = [];
+            for (const len of keyLengths) {
+              keys.push(buffer.subarray(offset, offset + len).toString("utf8"));
+              offset += len;
+            }
+            buffer = buffer.subarray(offset);
+
+            const store = storeFor(namespace);
+            const values = keys.map((key) => store.get(key));
+            const results = values.map((value) => (value === undefined ? "-" : String(value.length)));
+            const hits = values.filter((value): value is Buffer => value !== undefined);
+            socket.write(Buffer.concat([Buffer.from(`M ${n} ${results.join(" ")}\n`), ...hits]));
+            break;
+          }
+
+          case "o": {
+            // Batched set (issue #152, docs/protocol.html "m / o"): one
+            // shared TTL for the whole batch, omitted from the wire when 0.
+            // `o <ns-len> <n> <key-len-1> <val-len-1> ... <key-len-n> <val-len-n> [ttl]\n<namespace><key-1><value-1>...<key-n><value-n>`.
+            lastCommand = command;
+            const namespaceLength = Number(parts[1]);
+            const n = Number(parts[2]);
+            const keyLengths: number[] = [];
+            const valueLengths: number[] = [];
+            for (let i = 0; i < n; i++) {
+              keyLengths.push(Number(parts[3 + 2 * i]));
+              valueLengths.push(Number(parts[4 + 2 * i]));
+            }
+            const trailingFieldCount = parts.length - (3 + 2 * n);
+            const ttl = trailingFieldCount > 0 ? Number(parts[3 + 2 * n]) : 0;
+            const totalKeyValueLength =
+              keyLengths.reduce((sum, len) => sum + len, 0) + valueLengths.reduce((sum, len) => sum + len, 0);
+            if (buffer.length < bodyStart + namespaceLength + totalKeyValueLength) return;
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            let offset = bodyStart + namespaceLength;
+            const store = storeFor(namespace);
+            for (let i = 0; i < n; i++) {
+              const key = buffer.subarray(offset, offset + keyLengths[i]).toString("utf8");
+              offset += keyLengths[i];
+              const value = Buffer.from(buffer.subarray(offset, offset + valueLengths[i]));
+              offset += valueLengths[i];
+              store.set(key, value);
+            }
+            buffer = buffer.subarray(offset);
+            lastSetTtl = ttl;
+
+            socket.write(`O ${n} ${new Array(n).fill("S").join(" ")}\n`);
             break;
           }
 
