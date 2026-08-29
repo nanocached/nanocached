@@ -3701,7 +3701,7 @@ async fn transfer_with_retries(
 
     for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
         if stream.is_none() {
-            match connect_and_authenticate(node_context, joining_addr).await {
+            match connect_and_authenticate(node_context, joining_addr, AuthPeer::Node).await {
                 Ok(connected) => *stream = Some(connected),
                 Err(error) => {
                     eprintln!(
@@ -3982,7 +3982,7 @@ async fn run_decommission(
         let mut delivered = false;
         for _ in 0..KEY_TRANSFER_ATTEMPTS {
             if !streams.contains_key(addr) {
-                match connect_and_authenticate(&node_context, addr).await {
+                match connect_and_authenticate(&node_context, addr, AuthPeer::Node).await {
                     Ok(stream) => {
                         streams.insert(addr.clone(), stream);
                     }
@@ -4041,7 +4041,8 @@ async fn run_decommission(
 async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
     for addr in discovery_addrs {
         let result = timeout(OUTBOUND_IO_TIMEOUT, async {
-            let mut stream = connect_and_authenticate(node_context, addr).await?;
+            let mut stream =
+                connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
             let mut frame = format!(
                 "V {} {}\n",
                 node_context.name.len(),
@@ -4153,7 +4154,7 @@ async fn fetch_roster_once(
     const MAX_ROSTER_ENTRIES: usize = 4096;
     const MAX_NAME_OR_ADDR_LENGTH: usize = 1024;
 
-    let mut stream = connect_and_authenticate(node_context, addr).await?;
+    let mut stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
     stream.write_all(b"L\n").await?;
 
     let mut buf = Vec::new();
@@ -4436,15 +4437,49 @@ async fn sweep(request_tx: &mpsc::Sender<CacheRequest>, marked: bool) -> Option<
     }
 }
 
+/// Which kind of peer an outbound connection is for. A node acks the `A`
+/// handshake with `On`, a discovery server with `Od` (each names itself so
+/// a client can tell them apart from the first reply) — so an outbound
+/// connection has to know who it is dialling to accept the right ack.
+/// Before this distinction the decommission path's roster fetch and leave
+/// notification dialled discovery expecting a node's `On`, and with
+/// `NANOCACHED_AUTH_SECRET` set every SIGTERM-driven scale-in gave up on
+/// the handoff ("joining node rejected the auth secret"); the entries were
+/// lost with the task and the leave arrived as a liveness eviction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthPeer {
+    Node,
+    Discovery,
+}
+
+impl AuthPeer {
+    fn auth_ack(self) -> &'static [u8; 3] {
+        match self {
+            AuthPeer::Node => b"On\n",
+            AuthPeer::Discovery => b"Od\n",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            AuthPeer::Node => "joining node",
+            AuthPeer::Discovery => "discovery server",
+        }
+    }
+}
+
 /// Connects to `addr` and, if `node_context.auth_secret` is set, performs
 /// the auth handshake it expects before accepting any other command —
-/// shared by every place that opens an outbound node-to-node connection
-/// (`run_migration`'s own persistent connection, and the one-shot
+/// shared by every place that opens an outbound connection to another
+/// node (`run_migration`'s own persistent connection, the one-shot
 /// `set_on_joining_node`/`delete_on_joining_node` calls used to forward a
-/// racing client write mid-migration).
+/// racing client write mid-migration, the decommission handoff) and to a
+/// discovery server (the decommission's roster fetch and leave). `peer`
+/// selects the ack to expect.
 async fn connect_and_authenticate(
     node_context: &NodeContext,
     addr: &str,
+    peer: AuthPeer,
 ) -> io::Result<ClientStream> {
     let mut stream = connect_client_stream(addr, node_context.tls_connector.as_ref()).await?;
 
@@ -4455,10 +4490,10 @@ async fn connect_and_authenticate(
             let mut ack = [0u8; 3];
             stream.read_exact(&mut ack).await?;
 
-            if &ack != b"On\n" {
+            if &ack != peer.auth_ack() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "joining node rejected the auth secret",
+                    format!("{} rejected the auth secret", peer.describe()),
                 ));
             }
             io::Result::Ok(())
@@ -4778,7 +4813,8 @@ async fn forward_on_shared_connection(
 
     let result = tokio::time::timeout_at(deadline, async {
         if connection.is_none() {
-            *connection = Some(connect_and_authenticate(node_context, &target.addr).await?);
+            *connection =
+                Some(connect_and_authenticate(node_context, &target.addr, AuthPeer::Node).await?);
         }
         // Just ensured `Some` above (and nothing else can steal the slot
         // back to `None` while this guard is held).
@@ -7134,69 +7170,8 @@ mod tests {
         // Mock discovery: serves L (self + peer), records V.
         let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
-        let left: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let left_record = Arc::clone(&left);
-        let peer_addr_for_l = peer_addr.clone();
-        let discovery_task = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = discovery_listener.accept().await else {
-                    return;
-                };
-                let left_record = Arc::clone(&left_record);
-                let peer_addr = peer_addr_for_l.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut chunk = [0u8; 1024];
-                    loop {
-                        let Ok(bytes_read) = stream.read(&mut chunk).await else {
-                            return;
-                        };
-                        if bytes_read == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&chunk[..bytes_read]);
-                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
-                            continue;
-                        };
-                        let line: Vec<u8> = buf.drain(..=position).collect();
-                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
-                        if line == "L" {
-                            let entries = [("leaver", "127.0.0.1:1"), ("peer", peer_addr.as_str())];
-                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
-                            for (name, addr) in entries {
-                                response.extend_from_slice(
-                                    format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
-                                        .as_bytes(),
-                                );
-                            }
-                            let _ = stream.write_all(&response).await;
-                        } else if line.starts_with("V ") {
-                            let lengths: Vec<usize> = line
-                                .split(' ')
-                                .skip(1)
-                                .map(|field| field.parse().unwrap())
-                                .collect();
-                            let need = lengths[0] + lengths[1];
-                            while buf.len() < need {
-                                let Ok(bytes_read) = stream.read(&mut chunk).await else {
-                                    return;
-                                };
-                                if bytes_read == 0 {
-                                    return;
-                                }
-                                buf.extend_from_slice(&chunk[..bytes_read]);
-                            }
-                            let body: Vec<u8> = buf.drain(..need).collect();
-                            left_record
-                                .lock()
-                                .unwrap()
-                                .push(String::from_utf8_lossy(&body[..lengths[0]]).into_owned());
-                            let _ = stream.write_all(b"R\n").await;
-                        }
-                    }
-                });
-            }
-        });
+        let (left, discovery_task) =
+            spawn_mock_discovery(discovery_listener, peer_addr.clone(), None);
 
         let node_context = NodeContext {
             name: "leaver".to_string(),
@@ -7241,6 +7216,179 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    /// Issue #124 helper: a fake discovery server that serves `L` (the
+    /// leaver plus `peer_addr`, R=1), records the name in every `V`, and —
+    /// when `secret` is set — insists on the `A` handshake first, acking
+    /// it the way a discovery server does (`Od`, not a node's `On`).
+    fn spawn_mock_discovery(
+        discovery_listener: TcpListener,
+        peer_addr: String,
+        secret: Option<&'static [u8]>,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let left: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let left_record = Arc::clone(&left);
+        let peer_addr_for_l = peer_addr;
+        let discovery_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = discovery_listener.accept().await else {
+                    return;
+                };
+                let left_record = Arc::clone(&left_record);
+                let peer_addr = peer_addr_for_l.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    let mut authenticated = secret.is_none();
+                    loop {
+                        let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if bytes_read == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..bytes_read]);
+                        let Some(position) = buf.iter().position(|byte| *byte == b'\n') else {
+                            continue;
+                        };
+                        let line: Vec<u8> = buf.drain(..=position).collect();
+                        let line = String::from_utf8_lossy(&line[..line.len() - 1]).into_owned();
+                        if let Some(length) = line.strip_prefix("A ") {
+                            let need: usize = length.parse().unwrap();
+                            while buf.len() < need {
+                                let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                    return;
+                                };
+                                if bytes_read == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..bytes_read]);
+                            }
+                            let presented: Vec<u8> = buf.drain(..need).collect();
+                            if Some(presented.as_slice()) == secret {
+                                authenticated = true;
+                                let _ = stream.write_all(b"Od\n").await;
+                            } else {
+                                let _ = stream.write_all(b"Ed\n").await;
+                                return;
+                            }
+                            continue;
+                        }
+                        assert!(authenticated, "command before auth: {line:?}");
+                        if line == "L" {
+                            let entries = [("leaver", "127.0.0.1:1"), ("peer", peer_addr.as_str())];
+                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                            for (name, addr) in entries {
+                                response.extend_from_slice(
+                                    format!("{} {}\n{name}{addr}\n", name.len(), addr.len())
+                                        .as_bytes(),
+                                );
+                            }
+                            let _ = stream.write_all(&response).await;
+                        } else if line.starts_with("V ") {
+                            let lengths: Vec<usize> = line
+                                .split(' ')
+                                .skip(1)
+                                .map(|field| field.parse().unwrap())
+                                .collect();
+                            let need = lengths[0] + lengths[1];
+                            while buf.len() < need {
+                                let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                    return;
+                                };
+                                if bytes_read == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..bytes_read]);
+                            }
+                            let body: Vec<u8> = buf.drain(..need).collect();
+                            left_record
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&body[..lengths[0]]).into_owned());
+                            let _ = stream.write_all(b"R\n").await;
+                        }
+                    }
+                });
+            }
+        });
+        (left, discovery_task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decommission_authenticates_to_discovery_with_discoverys_own_ack() {
+        // Found on ECS (issue #167 verification): with
+        // NANOCACHED_AUTH_SECRET set on both binaries the decommission's
+        // roster fetch and leave notification dialled discovery expecting
+        // a node's `On` ack, got `Od`, and gave up on the handoff — every
+        // scale-in lost the leaver's entries. Same choreography as the
+        // test above, with both peers demanding the handshake.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        for index in 0..20u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (left, discovery_task) = spawn_mock_discovery(
+            discovery_listener,
+            peer_addr.clone(),
+            Some(b"shared-secret"),
+        );
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: Some(Bytes::from_static(b"shared-secret")),
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+        };
+
+        let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
+        let expected: usize = (0..20u8)
+            .filter(|index| before.is_owner(&key(format!("key-{index}").as_bytes()), "leaver", 1))
+            .count();
+        assert!(expected > 0, "the sample must give the leaver some keys");
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr.clone()],
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(frames.len(), expected, "frames: {frames:?}");
+        assert!(frames.iter().all(|frame| frame.starts_with(b"U 0 ")));
+        assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
+        assert!(node_context.leaving.lock().unwrap().is_some());
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     /// Issue #124 helper: a fake surviving peer recording every `U`
     /// frame it receives and acking `S`.
     fn spawn_recording_peer(
@@ -7274,6 +7422,25 @@ mod tests {
                             .skip(1)
                             .map(|field| field.parse().unwrap())
                             .collect();
+                        if header.starts_with("A ") {
+                            // Auth handshake: consume the secret, ack as a
+                            // node does. Not recorded — the tests count
+                            // handoff frames.
+                            let frame_end = header_end + 1 + fields[0];
+                            while buf.len() < frame_end {
+                                let mut chunk = [0u8; 1024];
+                                let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                    return;
+                                };
+                                if bytes_read == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..bytes_read]);
+                            }
+                            let _ = buf.split_to(frame_end);
+                            let _ = connection.write_all(b"On\n").await;
+                            continue;
+                        }
                         assert!(header.starts_with("U "), "unexpected frame {header:?}");
                         let body_length = fields[0] + fields[1] + fields[2];
                         let frame_end = header_end + 1 + body_length;
