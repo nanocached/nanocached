@@ -402,6 +402,60 @@ In a cluster, only the primary owner ever runs the increment — replicas
 receive its literal result as an ordinary `set` instead, so a replica can
 never drift from the primary by re-deriving the increment on its own.
 
+## Batched get and set
+
+`getMany`/`getManyBytes` and `setMany`/`setManyBytes` (the `m`/`o`
+frames) fetch or store several keys in one round trip per owner instead
+of one round trip per key:
+
+```ts
+await client.setMany({ a: "1", b: "2" }); // shared ttlSeconds for the whole batch
+const values = await client.getMany(["a", "b", "missing"]);
+// values instanceof Map — {"a" => "1", "b" => "2"}; "missing" is simply absent
+```
+
+A missing key is simply absent from the returned `Map`, the same "a
+miss is not an error" shape `get`/`getBytes` use. Both are also
+namespace-scoped: `client.namespace(ns).getMany(...)`/`.setMany(...)`,
+same as `get`/`set`. Batch keys are always `string` — unlike single-key
+`get`/`set`, `getMany`/`setMany` don't accept `Uint8Array` keys, since a
+`Uint8Array` can't safely key a `Map` (reference, not content,
+identity).
+
+**A batch never fails as a whole.** Each key's outcome is independent:
+if some keys are still routed to the wrong node after one bounded
+refresh-and-retry (the same policy `get`/`set` apply per key, not per
+call), `getMany`/`getManyBytes` throw `PartialWrongNodeError` — a
+`WrongNodeError` subclass whose `.partialValues` property holds every
+key that DID resolve, so existing `catch (WrongNodeError)` handling
+keeps working unchanged while a caller that wants the partial results
+can read them off the error:
+
+```ts
+try {
+  return await client.getMany(keys);
+} catch (error) {
+  if (error instanceof PartialWrongNodeError) return error.partialValues;
+  throw error;
+}
+```
+
+`setMany`/`setManyBytes` have nothing to return on success, so they
+just throw a plain `WrongNodeError` on the same condition — every other
+key in the batch was still stored. In single-node/proxy mode a `W`
+propagates immediately, exactly like `get`/`set`'s own single-mode
+behavior — there is no ring to refresh against.
+
+Within one `setMany`/`setManyBytes` batch, the same node can be one
+key's primary and another key's replica at once; it receives exactly
+one `o` sub-frame either way, and only its answer for the keys it is
+primary for decides those keys' outcome — a replica-held key's failure
+is logged-and-swallowed into `stats().replicaWriteFailures`, exactly
+like a plain `set`'s own replica legs.
+
+Very large batches are transparently split into more than one `m`/`o`
+sub-frame per owner — callers never need to think about this.
+
 ## Compare-and-set
 
 Conditional writes and deletes — `add`, `replace`, and a value-checked
@@ -471,6 +525,12 @@ spec.
   `number | null` (`null` on a miss); throws `NotNumericError` if the
   stored value isn't an integer `incr` can operate on; see
   [`incr`/`decr`](#incr--decr) above
+- `client.getMany(keys)` — resolves `Map<string, string>`, missing keys
+  simply absent; `client.getManyBytes(keys)` — resolves `Map<string,
+  Buffer>`; see [Batched get and set](#batched-get-and-set) above
+- `client.setMany(values, ttlSeconds = 0)` — `values: Record<string,
+  string>`; `client.setManyBytes(values, ttlSeconds = 0)` — `values:
+  Record<string, Uint8Array>`; see [Batched get and set](#batched-get-and-set)
 - `client.getWithToken(key)` — resolves `{ value: Buffer; token: string } |
   null`; see [Compare-and-set](#compare-and-set) above
 - `client.putIfAbsent(key, value, ttlSeconds = 0)` — resolves `boolean`
@@ -487,10 +547,10 @@ spec.
   [Compare-and-set](#compare-and-set)
 - `client.namespace(ns)` — returns a `NanocachedNamespace` handle scoped to
   `ns` (a `string` or `Uint8Array`), exposing `get`/`getBytes`/
-  `getWithToken`/`set`/`delete`/`clear`/`incr`/`decr`/`putIfAbsent`/
-  `replaceIfPresent`/`replace`/`deleteIfMatches` with the same signatures
-  and semantics as above; `handle.namespace` exposes the raw namespace
-  bytes
+  `getWithToken`/`set`/`delete`/`getMany`/`getManyBytes`/`setMany`/
+  `setManyBytes`/`clear`/`incr`/`decr`/`putIfAbsent`/`replaceIfPresent`/
+  `replace`/`deleteIfMatches` with the same signatures and semantics as
+  above; `handle.namespace` exposes the raw namespace bytes
 - `handle.clear()` — resolves (`Promise<void>`) once every node in the
   cluster (or the single node in standalone mode) has cleared that
   namespace; see [Namespaces](#namespaces)
@@ -510,7 +570,10 @@ spec.
   is monotonic for the lifetime of this client
 
 Every error the SDK itself raises — `AlreadyClosedError`,
-`WrongNodeError`, `ConnectionLostError`, `RetryableError`,
+`WrongNodeError` (and its `PartialWrongNodeError` subclass, thrown by
+`getMany`/`getManyBytes` when a batch is still partially wrong-node
+after one refresh — see [Batched get and set](#batched-get-and-set)),
+`ConnectionLostError`, `RetryableError`,
 `NotNumericError`, `DecompressionError`, `DiscoveryBusyError`, and
 protocol/auth failures —
 extends the exported `NanocachedError` base class, so `error instanceof

@@ -11,11 +11,12 @@ import {
   NanocachedClient,
   NanocachedError,
   NotNumericError,
+  PartialWrongNodeError,
   RetryableError,
   WrongNodeError,
 } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
-import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING } from "../src/client.js";
+import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
@@ -1970,6 +1971,357 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
     } finally {
       client.close();
       await cluster.close().catch(() => {});
+    }
+  });
+});
+
+describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a single node (issues #128/#150/#151)", () => {
+  it("returns hits and misses in one call, missing keys simply absent", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "1");
+        await client.set("c", "3");
+
+        const values = await client.getMany(["a", "b", "c"]);
+        assert.equal(values.size, 2);
+        assert.equal(values.get("a"), "1");
+        assert.equal(values.get("c"), "3");
+        assert.equal(values.has("b"), false);
+        assert.equal(node.multiGetCount(), 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("setMany then getMany round trips a shared TTL across the whole batch", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.setMany({ a: "1", b: "2" }, 60);
+        assert.equal(node.lastSetTtl(), 60);
+        assert.equal(node.multiSetCount(), 1);
+
+        const values = await client.getMany(["a", "b"]);
+        assert.equal(values.get("a"), "1");
+        assert.equal(values.get("b"), "2");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getManyBytes/setManyBytes round-trip raw bytes", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.setManyBytes({ a: Buffer.from([1, 2, 3]) });
+        const values = await client.getManyBytes(["a"]);
+        assert.deepEqual(values.get("a"), Buffer.from([1, 2, 3]));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("rejects an empty keys/values input synchronously", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await assert.rejects(client.getMany([]), RangeError);
+        await assert.rejects(client.getManyBytes([]), RangeError);
+        await assert.rejects(client.setMany({}), RangeError);
+        await assert.rejects(client.setManyBytes({}), RangeError);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("splits a batch larger than MAX_BATCH_KEYS into more than one m/o sub-frame, transparently", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const total = MAX_BATCH_KEYS + 50;
+        const values: Record<string, string> = {};
+        const keys: string[] = [];
+        for (let i = 0; i < total; i++) {
+          const key = `key-${i}`;
+          keys.push(key);
+          values[key] = `value-${i}`;
+        }
+
+        await client.setMany(values);
+        assert.equal(node.multiSetCount(), 2);
+
+        const got = await client.getMany(keys);
+        assert.equal(node.multiGetCount(), 2);
+        assert.equal(got.size, total);
+        for (const [key, want] of Object.entries(values)) {
+          assert.equal(got.get(key), want);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("works scoped to a namespace, same as get/set/delete", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const users = client.namespace("users");
+        await users.setMany({ "1": "alice", "2": "bob" });
+        const values = await users.getMany(["1", "2"]);
+        assert.equal(values.get("1"), "alice");
+        assert.equal(values.get("2"), "bob");
+        // The default namespace is untouched.
+        assert.equal((await client.getMany(["1", "2"])).size, 0);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a per-key W propagates immediately in single mode — no ring to refresh against", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "1");
+        await client.set("b", "2");
+        node.answerMultiWrongNodeTimes("a", 1);
+
+        try {
+          await client.getMany(["a", "b"]);
+          assert.fail("expected getMany to reject");
+        } catch (error) {
+          assert.ok(error instanceof PartialWrongNodeError);
+          assert.ok(error instanceof WrongNodeError);
+          assert.equal((error as PartialWrongNodeError<Map<string, string>>).partialValues.get("b"), "2");
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster replication (issues #128/#150/#151)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster(replication = 2) {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary] = ring.owners(Buffer.from(key), replication);
+        return nodes.find(({ name }) => name === primary)!;
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  function keyWithPrimary(name: string, replication = 2): string {
+    const ring = new HashRing(names);
+    for (let i = 0; i < 1000; i++) {
+      const key = `key-${i}`;
+      if (ring.owners(Buffer.from(key), replication)[0] === name) return key;
+    }
+    throw new Error(`no key routes to ${name}`);
+  }
+
+  it("splits a batch across owners by primary and reassembles it in caller order", async () => {
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const values: Record<string, string> = {};
+      const keys: string[] = [];
+      for (let i = 0; i < 20; i++) {
+        const key = `key-${i}`;
+        keys.push(key);
+        values[key] = `value-${i}`;
+      }
+      await client.setMany(values);
+
+      const got = await client.getMany(keys);
+      for (const [key, want] of Object.entries(values)) {
+        assert.equal(got.get(key), want);
+      }
+
+      // With 20 keys spread over 2 owners by HRW, both nodes should have
+      // answered at least one `m` — proving the batch really was split by
+      // owner rather than all sent to a single node.
+      for (const { mock } of cluster.nodes) {
+        assert.ok(mock.multiGetCount() > 0, "expected every node to receive at least one m frame");
+      }
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("stores on every owner with replication 2", async () => {
+    const cluster = await startReplicatedCluster(2);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const values: Record<string, string> = {};
+      const keys: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        const key = `key-${i}`;
+        keys.push(key);
+        values[key] = `value-${i}`;
+      }
+      await client.setMany(values);
+
+      for (const key of keys) {
+        for (const { mock } of cluster.nodes) {
+          assert.ok(mock.store.has(key), `expected ${key} on every owner`);
+        }
+      }
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("sends exactly one o sub-frame to a node that is primary for one key and replica for another", async () => {
+    const cluster = await startReplicatedCluster(2);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const keyA = keyWithPrimary(names[0]);
+      const keyB = keyWithPrimary(names[1]);
+
+      await client.setMany({ [keyA]: "va", [keyB]: "vb" });
+
+      for (const { mock } of cluster.nodes) {
+        assert.equal(mock.multiSetCount(), 1, "expected one sub-frame covering both its primary and replica key");
+        assert.ok(mock.store.has(keyA) && mock.store.has(keyB));
+      }
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("recovers a per-key W after one forced refresh", async () => {
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const wrongKey = "wrong-key";
+      const okKey = "ok-key";
+      await client.set(wrongKey, "w");
+      await client.set(okKey, "ok");
+
+      const owner = cluster.ownerOf(wrongKey);
+      owner.mock.answerMultiWrongNodeTimes(wrongKey, 1);
+
+      const values = await client.getMany([wrongKey, okKey]);
+      assert.equal(values.get(wrongKey), "w");
+      assert.equal(values.get(okKey), "ok");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("degrades to a partial map wrapped in PartialWrongNodeError when a per-key W persists", async () => {
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const wrongKey = "wrong-key";
+      const okKey = "ok-key";
+      await client.set(wrongKey, "w");
+      await client.set(okKey, "ok");
+
+      const owner = cluster.ownerOf(wrongKey);
+      owner.mock.answerMultiWrongNodeTimes(wrongKey, 2); // survives the initial pass AND the one retry
+
+      try {
+        await client.getMany([wrongKey, okKey]);
+        assert.fail("expected getMany to reject");
+      } catch (error) {
+        assert.ok(error instanceof PartialWrongNodeError);
+        assert.ok(error instanceof WrongNodeError);
+        const partial = (error as PartialWrongNodeError<Map<string, string>>).partialValues;
+        assert.equal(partial.get(okKey), "ok");
+        assert.equal(partial.has(wrongKey), false);
+      }
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("setMany recovers a per-key W after one forced refresh", async () => {
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const wrongKey = "wrong-key";
+      const okKey = "ok-key";
+      const owner = cluster.ownerOf(wrongKey);
+      owner.mock.answerMultiWrongNodeTimes(wrongKey, 1);
+
+      await client.setMany({ [wrongKey]: "w", [okKey]: "ok" });
+
+      assert.ok(owner.mock.store.has(wrongKey));
+      assert.ok(owner.mock.store.has(okKey));
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("setMany throws plain WrongNodeError (no partial payload) when a per-key W persists", async () => {
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const wrongKey = "wrong-key";
+      const owner = cluster.ownerOf(wrongKey);
+      owner.mock.answerMultiWrongNodeTimes(wrongKey, 2);
+
+      await assert.rejects(client.setMany({ [wrongKey]: "w", "ok-key": "ok" }), (error: unknown) => {
+        assert.ok(error instanceof WrongNodeError);
+        assert.ok(!(error instanceof PartialWrongNodeError));
+        return true;
+      });
+    } finally {
+      client.close();
+      await cluster.close();
     }
   });
 });
@@ -3965,6 +4317,32 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         // A hedge would have sent a second G shortly after the first;
         // exactly one reached the wire.
         assert.equal(proxy.getCount(), 1);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxy.close()]);
+    }
+  });
+
+  it("getMany/setMany ride the single proxy connection, no owner grouping (issues #128/#150/#151)", async () => {
+    const proxy = await startMockNode();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([{ name: "proxy-1", address: proxy.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        await client.setMany({ a: "1", b: "2" });
+        assert.equal(proxy.multiSetCount(), 1);
+
+        const values = await client.getMany(["a", "b", "missing"]);
+        assert.equal(values.get("a"), "1");
+        assert.equal(values.get("b"), "2");
+        assert.equal(values.has("missing"), false);
+        assert.equal(proxy.multiGetCount(), 1);
       } finally {
         client.close();
       }

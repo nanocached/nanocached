@@ -68,7 +68,13 @@ export const MAX_REQUEST_BYTES = 1024 * 1024 - MAX_REQUEST_HEADER_LENGTH;
 // per-namespace limit beyond that shared budget (ns-spec.md's SDK-port
 // spec, "no limit on ns beyond the request size rules the SDK already
 // applies to key+value").
-function checkKey(key: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): void {
+//
+// Exported (in addition to checkKeyAndValue below) so NanocachedClient's
+// getMany/getManyBytes (issues #128/#150/#151) can validate every key
+// eagerly, before any network I/O — the same fail-fast-up-front
+// contract every other public method already gets by calling this
+// indirectly through its own encoder.
+export function checkKey(key: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE): void {
   if (key.length === 0) {
     throw new RangeError("nanocached: key must not be empty");
   }
@@ -291,8 +297,100 @@ export function encodeClearAll(tag?: number): Buffer {
   return toAscii(`F${tagField(tag)}\n`);
 }
 
+// m/o — batched get/set (issues #128/#150/#151, docs/protocol.html#multi):
+// n keys under one round trip through the cache instead of n independent
+// get/set calls. Always namespaced, same class as i/k/x above — there is
+// no legacy uppercase form to preserve. o shares one ttlSeconds across
+// the whole batch, not per key: every real caller of a batched set
+// (Django's set_many, cache-manager's mset) already passes one TTL per
+// call, so a per-key TTL field would complicate the frame for no
+// consumer that exists.
+export function encodeMultiGet(keys: readonly Uint8Array[], tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+  if (keys.length === 0) {
+    throw new RangeError("nanocached: encodeMultiGet requires at least one key");
+  }
+  // Per-key checkKey catches an empty key or one key alone too large;
+  // the running total below catches what per-key checking alone would
+  // miss — many small keys whose sum still can't fit the server's own
+  // per-request cap.
+  let total = namespace.length;
+  for (const key of keys) {
+    checkKey(key, namespace);
+    total += key.length;
+  }
+  if (total > MAX_REQUEST_BYTES) {
+    throw new RangeError(
+      `nanocached: namespace and keys together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+    );
+  }
+
+  const lengths = keys.map((key) => ` ${key.length}`).join("");
+  const header = `m ${namespace.length} ${keys.length}${lengths}${tagField(tag)}\n`;
+  return Buffer.concat([toAscii(header), namespace, ...keys]);
+}
+
+export function encodeMultiSet(
+  keys: readonly Uint8Array[],
+  values: readonly Uint8Array[],
+  ttlSeconds = 0,
+  tag?: number,
+  namespace: Uint8Array = EMPTY_NAMESPACE,
+): Buffer {
+  if (keys.length === 0) {
+    throw new RangeError("nanocached: encodeMultiSet requires at least one key");
+  }
+  if (keys.length !== values.length) {
+    throw new RangeError(`nanocached: encodeMultiSet keys/values length mismatch (${keys.length} vs ${values.length})`);
+  }
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
+    throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+  }
+
+  let total = namespace.length;
+  const lengthFields: string[] = new Array(keys.length);
+  for (let i = 0; i < keys.length; i++) {
+    checkKeyAndValue(keys[i], values[i], namespace);
+    total += keys[i].length + values[i].length;
+    lengthFields[i] = ` ${keys[i].length} ${values[i].length}`;
+  }
+  if (total > MAX_REQUEST_BYTES) {
+    throw new RangeError(
+      `nanocached: namespace, keys and values together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+    );
+  }
+
+  const ttlField = ttlSeconds === 0 ? "" : ` ${ttlSeconds}`;
+  const header = `o ${namespace.length} ${keys.length}${lengthFields.join("")}${ttlField}${tagField(tag)}\n`;
+  const pieces: Uint8Array[] = [toAscii(header), namespace];
+  for (let i = 0; i < keys.length; i++) {
+    pieces.push(keys[i], values[i]);
+  }
+  return Buffer.concat(pieces);
+}
+
+/** One key's outcome inside an `M` (multi-get) or `O` (multi-set)
+ * response roster (issues #128/#150/#151, docs/protocol.html#multi) — a
+ * batch never fails as a whole, so each key's result is independent of
+ * every other key's. `"hit"`/`"miss"` are `M`-only (a `O` reply has
+ * nothing to echo back); `"stored"` is `O`-only; `"wrongNode"` is
+ * shared by both. */
+export type MultiEntry = { readonly kind: "hit"; readonly value: Buffer } | { readonly kind: "miss" } | { readonly kind: "wrongNode" };
+export type MultiAckEntry = { readonly kind: "stored" } | { readonly kind: "wrongNode" };
+
 export interface ParsedResponse {
-  kind: "value" | "stored" | "deleted" | "notFound" | "busy" | "wrongNode" | "cleared" | "retryable" | "incremented" | "notNumeric";
+  kind:
+    | "value"
+    | "stored"
+    | "deleted"
+    | "notFound"
+    | "busy"
+    | "wrongNode"
+    | "cleared"
+    | "retryable"
+    | "incremented"
+    | "notNumeric"
+    | "multi"
+    | "multiAck";
   value?: Buffer;
   /** echoed response tags: the echoed request tag, present on every response parsed
    * in tagged mode except the unsolicited `busy`. */
@@ -306,6 +404,14 @@ export interface ParsedResponse {
    * "ttl then tag" — disambiguated purely by whether the connection is
    * tagged, never guessed frame by frame. */
   ttlSeconds?: number;
+  /** Batched get's per-key roster (issues #128/#150/#151), present only
+   * on a `"multi"` response, one entry per requested key in request
+   * order (docs/protocol.html#multi). */
+  entries?: MultiEntry[];
+  /** Batched set's per-key roster, present only on a `"multiAck"`
+   * response — see `entries`' own doc comment; the same per-key
+   * independence, just without hit bytes to carry. */
+  ackEntries?: MultiAckEntry[];
 }
 
 // The server's own request cap is 1 MiB; this constant doubles that as
@@ -359,7 +465,27 @@ const MARKER_INCREMENTED = 0x49; // 'I'
 // counter grammar, or applying `<delta>` would overflow the representable
 // range — a new marker, not used by any other op.
 const MARKER_NOT_NUMERIC = 0x54; // 'T'
+// Batched get/set (issues #128/#150/#151): `M` answers `m`, `O` answers
+// `o`. Never confused with the `On`/`OnT` identify reply — identify.ts
+// handles that before a Connection exists, and no other request's reply
+// ever begins with 'O'.
+const MARKER_MULTI = 0x4d; // 'M'
+const MARKER_MULTI_ACK = 0x4f; // 'O'
 const LF = 0x0a;
+
+// The longest a legal `M`/`O` response header can ever be before its
+// terminating LF. Unlike every other response kind, a batch's header
+// grows with the number of keys, so there's no small fixed bound the way
+// MAX_VALUE_HEADER_LENGTH is for `V` — sized instead against
+// NanocachedClient's own MAX_BATCH_KEYS (client.ts), which never sends
+// more than that many keys in one `m`/`o`: a roster token costs at most
+// `len(String(MAX_VALUE_LENGTH)) + 1 = 8` bytes (a decimal hit length
+// plus its separating space), so 400 keys comfortably fit under 4 KiB
+// with a tag field to spare — the same derivation the Go SDK's
+// maxHeaderLineLength/maxBatchKeys pair uses (sdk/go/connection.go,
+// sdk/go/client.go). A peer whose claimed roster would need a longer
+// header than this can never complete anyway (see parseMultiHeader).
+const MAX_MULTI_HEADER_LENGTH = 4096;
 
 // Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
 // bare `Number(field)` also accepts scientific notation ("1e2"), leading
@@ -387,6 +513,79 @@ function parseTtlSeconds(field: string): number {
     throw new NanocachedError("nanocached: invalid ttl in response");
   }
   return Number(field);
+}
+
+interface MultiHeader {
+  count: number;
+  tokens: string[];
+  tag?: number;
+  headerEnd: number;
+}
+
+// Shared by tryParseResponse's MARKER_MULTI/MARKER_MULTI_ACK cases and
+// peekMultiFrameLength below, so the two can never disagree about what a
+// legal `M`/`O` header looks like. Returns null while the header line
+// itself is still incomplete (bounded by MAX_MULTI_HEADER_LENGTH, like
+// every other header search in this module); throws on anything
+// malformed once the LF is seen — a lying `count` can never cause an
+// out-of-bounds read, since `fields` is already fully materialized from
+// the one (already length-bounded) header line before count is even
+// read.
+function parseMultiHeader(buf: Buffer, tagged: boolean): MultiHeader | null {
+  const headerEnd = buf.indexOf(LF);
+  if (headerEnd === -1) {
+    if (buf.length > MAX_MULTI_HEADER_LENGTH) {
+      throw new NanocachedError("nanocached: invalid multi-get/multi-set response (missing header terminator)");
+    }
+    return null;
+  }
+
+  const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+  const count = Number(fields[0]);
+  if (!Number.isInteger(count) || count < 0) {
+    throw new NanocachedError("nanocached: invalid multi-get/multi-set count in response");
+  }
+  const expectedFields = 1 + count + (tagged ? 1 : 0);
+  if (fields.length !== expectedFields) {
+    throw new NanocachedError("nanocached: invalid multi-get/multi-set header in response");
+  }
+
+  const tokens = fields.slice(1, 1 + count);
+  const tag = tagged ? parseTag(fields[1 + count]) : undefined;
+  return { count, tokens, tag, headerEnd };
+}
+
+/** Peeks the total byte length an in-progress `M`/`O` response frame
+ * will need once complete, without waiting for the body — unlike every
+ * other response kind, a batch's total size depends on its roster (the
+ * sum of however many hit lengths `M` declares), so Connection's own
+ * incomplete-frame backstop (MAX_RESPONSE_FRAME_LENGTH, sized for one
+ * value) can't bound it without this. Returns undefined while that
+ * isn't computable yet (header incomplete, or the buffer isn't a multi
+ * response at all) — never throws; a malformed header is left for
+ * tryParseResponse itself to reject the next time it's actually
+ * invoked. */
+export function peekMultiFrameLength(buf: Buffer, tagged: boolean): number | undefined {
+  if (buf.length === 0 || (buf[0] !== MARKER_MULTI && buf[0] !== MARKER_MULTI_ACK)) return undefined;
+
+  let header: MultiHeader | null;
+  try {
+    header = parseMultiHeader(buf, tagged);
+  } catch {
+    return undefined;
+  }
+  if (header === null) return undefined;
+
+  if (buf[0] === MARKER_MULTI_ACK) return header.headerEnd + 1; // no body
+
+  let total = header.headerEnd + 1;
+  for (const token of header.tokens) {
+    if (token === "-" || token === "W") continue;
+    const length = Number(token);
+    if (!Number.isInteger(length) || length < 0) return undefined;
+    total += length;
+  }
+  return total;
 }
 
 /** Parses one response frame from the front of `buf`, returning `null`
@@ -532,6 +731,74 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         },
         consumed: valueEnd,
       };
+    }
+
+    // `M` — batched get's reply (issues #128/#150/#151): `M <n>
+    // <result-1>...<result-n>[ <tag>]\n<hit values, concatenated in
+    // request order>`. Each token is a decimal byte length (a hit —
+    // that many body bytes belong to this key, in order), "-" (a clean
+    // miss), or "W" (this node doesn't own this particular key). The
+    // whole header is parsed before any body byte is read, so the
+    // total body length is known up front — see peekMultiFrameLength,
+    // which Connection uses to bound its own incomplete-frame backstop
+    // for exactly this reason.
+    case MARKER_MULTI: {
+      const header = parseMultiHeader(buf, tagged);
+      if (header === null) return null;
+
+      const hitLengths: number[] = new Array(header.count);
+      let bodyLength = 0;
+      for (let i = 0; i < header.count; i++) {
+        const token = header.tokens[i];
+        if (token === "-" || token === "W") {
+          hitLengths[i] = -1;
+          continue;
+        }
+        const length = Number(token);
+        if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
+          throw new NanocachedError("nanocached: invalid multi-get result length in response");
+        }
+        hitLengths[i] = length;
+        bodyLength += length;
+      }
+
+      const bodyStart = header.headerEnd + 1;
+      const bodyEnd = bodyStart + bodyLength;
+      if (buf.length < bodyEnd) return null;
+
+      const entries: MultiEntry[] = new Array(header.count);
+      let offset = bodyStart;
+      for (let i = 0; i < header.count; i++) {
+        const token = header.tokens[i];
+        if (token === "-") {
+          entries[i] = { kind: "miss" };
+        } else if (token === "W") {
+          entries[i] = { kind: "wrongNode" };
+        } else {
+          const length = hitLengths[i];
+          entries[i] = { kind: "hit", value: Buffer.from(buf.subarray(offset, offset + length)) };
+          offset += length;
+        }
+      }
+
+      return { response: { kind: "multi", entries, tag: header.tag }, consumed: bodyEnd };
+    }
+
+    // `O` — batched set's reply (issues #150/#151): `O <n>
+    // <result-1>...<result-n>[ <tag>]\n` — no body, unlike `M`'s hit
+    // values (a set has nothing to echo back). Each token is "S"
+    // (stored) or "W" (wrong node).
+    case MARKER_MULTI_ACK: {
+      const header = parseMultiHeader(buf, tagged);
+      if (header === null) return null;
+
+      const ackEntries: MultiAckEntry[] = header.tokens.map((token) => {
+        if (token === "S") return { kind: "stored" };
+        if (token === "W") return { kind: "wrongNode" };
+        throw new NanocachedError("nanocached: invalid multi-set result token in response");
+      });
+
+      return { response: { kind: "multiAck", ackEntries, tag: header.tag }, consumed: header.headerEnd + 1 };
     }
 
     default:

@@ -89,6 +89,18 @@ export interface MockNode extends MockServerBase {
    * ever received — lets a test assert a clear fanned out to every node,
    * even one holding no keys in the cleared namespace. */
   clearCount(): number;
+  /** How many `m` (batched get, issues #128/#150/#151) requests this
+   * server has ever received. */
+  multiGetCount(): number;
+  /** How many `o` (batched set, issues #150/#151) requests this server
+   * has ever received. */
+  multiSetCount(): number;
+  /** Makes every `m`/`o` roster containing `key` answer just that key
+   * `W`, for the next `times` such requests (consumed one per match,
+   * across as many separate `m`/`o` calls as it takes) — the batched
+   * analogue of `answerWrongNodeOnce`, which answers a whole G/S `W`
+   * instead of naming a single key inside a roster. */
+  answerMultiWrongNodeTimes(key: string, times: number): void;
   /** Retryable-error status (issue #125): queue `n` one-off `R` replies
    * (tagged correctly on a tagged connection) for the next `n` data
    * requests — any of `G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`, in whatever order
@@ -299,6 +311,16 @@ export async function startMockNode(
   // Retryable-error status (issue #125).
   let retryableReplies = 0;
   let lastAuthHeader = "";
+  // Batched get/set (issues #128/#150/#151).
+  let multiGets = 0;
+  let multiSets = 0;
+  // multiWrongNodeKey/multiWrongNodeLeft: when multiWrongNodeKey is set,
+  // every `m`/`o` roster containing that exact key answers just that key
+  // `W`, for as long as multiWrongNodeLeft has budget left (consumed one
+  // per match) — the batched analogue of wrongNodeReplies, which answers
+  // a whole G/S `W` instead of naming a single key inside a batch.
+  let multiWrongNodeKey: string | undefined;
+  let multiWrongNodeLeft = 0;
 
   const server = createServer((socket) => {
     connections++;
@@ -508,6 +530,130 @@ export async function startMockNode(
             } else {
               socket.write(`S${tag}\n`);
             }
+            break;
+          }
+
+          // Batched get (issues #128/#150/#151): `m <ns-len> <n>
+          // <key-len-1>...<key-len-n>[ <tag>]\n<ns><key-1>...<key-n>` —
+          // always namespaced, no legacy uppercase form (see
+          // encodeMultiGet). Answers `M <n> <result-1>...<result-n>[
+          // <tag>]\n<hit values, concatenated in request order>`
+          // (docs/protocol.html#multi): a decimal byte length for a
+          // hit, "-" for a clean miss, "W" for a per-key wrong-node
+          // (multiWrongNodeKey/multiWrongNodeLeft above).
+          case "m": {
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const count = Number(parts[2]);
+            const keyLengths = parts.slice(3, 3 + count).map(Number);
+            const totalKeyLength = keyLengths.reduce((sum, length) => sum + length, 0);
+            if (buffer.length < bodyStart + namespaceLength + totalKeyLength) return;
+
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const keys: string[] = new Array(count);
+            let cursor = bodyStart + namespaceLength;
+            for (let i = 0; i < count; i++) {
+              keys[i] = buffer.subarray(cursor, cursor + keyLengths[i]).toString("utf8");
+              cursor += keyLengths[i];
+            }
+            buffer = buffer.subarray(cursor);
+            multiGets++;
+
+            if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            let header = `M ${count}`;
+            const hits: Buffer[] = [];
+            for (const key of keys) {
+              if (multiWrongNodeKey === key && multiWrongNodeLeft > 0) {
+                multiWrongNodeLeft--;
+                header += " W";
+                continue;
+              }
+              const value = targetStore.get(key);
+              if (value === undefined) {
+                header += " -";
+              } else {
+                header += ` ${value.length}`;
+                hits.push(value);
+              }
+            }
+            socket.write(Buffer.concat([Buffer.from(`${header}${tag}\n`), ...hits]));
+            break;
+          }
+
+          // Batched set (issues #150/#151): `o <ns-len> <n> <key-len-1>
+          // <value-len-1>...<key-len-n> <value-len-n> [<ttl>][ <tag>]\n
+          // <ns><key-1><value-1>...<key-n><value-n>` — one shared TTL
+          // for the whole batch, not per key (see encodeMultiSet).
+          // Answers `O <n> <result-1>...<result-n>[ <tag>]\n` (no
+          // body): "S" (stored) or "W" (per-key wrong-node, same
+          // multiWrongNodeKey knob `m` uses).
+          case "o": {
+            lastCommand = parts[0];
+            const namespaceLength = Number(parts[1]);
+            const count = Number(parts[2]);
+            const lengthFields: number[] = [];
+            for (let i = 0; i < count; i++) {
+              lengthFields.push(Number(parts[3 + 2 * i]), Number(parts[3 + 2 * i + 1]));
+            }
+            const totalBodyLength = lengthFields.reduce((sum, length) => sum + length, 0);
+            if (buffer.length < bodyStart + namespaceLength + totalBodyLength) return;
+
+            // The ttl field, when present, always sits immediately after
+            // the last length field, regardless of whether the
+            // connection is tagged — same convention `s`'s own ttlField
+            // above relies on.
+            const lengthFieldCount = 3 + 2 * count;
+            const ttlFieldCount = parts.length - (tagged ? lengthFieldCount + 1 : lengthFieldCount);
+            const ttl = ttlFieldCount > 0 ? Number(parts[lengthFieldCount]) : 0;
+
+            const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
+            const keys: string[] = new Array(count);
+            const values: Buffer[] = new Array(count);
+            let cursor = bodyStart + namespaceLength;
+            for (let i = 0; i < count; i++) {
+              const keyLength = lengthFields[2 * i];
+              const valueLength = lengthFields[2 * i + 1];
+              keys[i] = buffer.subarray(cursor, cursor + keyLength).toString("utf8");
+              cursor += keyLength;
+              values[i] = Buffer.from(buffer.subarray(cursor, cursor + valueLength));
+              cursor += valueLength;
+            }
+            buffer = buffer.subarray(cursor);
+            multiSets++;
+
+            if (silent) break;
+
+            if (retryableReplies > 0) {
+              retryableReplies--;
+              socket.write(`R${tag}\n`);
+              break;
+            }
+
+            const targetStore = storeFor(namespace);
+            const targetTtls = ttlsFor(namespace);
+            lastSetTtl = ttl;
+            let header = `O ${count}`;
+            for (let i = 0; i < count; i++) {
+              const key = keys[i];
+              if (multiWrongNodeKey === key && multiWrongNodeLeft > 0) {
+                multiWrongNodeLeft--;
+                header += " W";
+                continue;
+              }
+              targetStore.set(key, values[i]);
+              if (ttl > 0) targetTtls.set(key, ttl);
+              else targetTtls.delete(key);
+              header += " S";
+            }
+            socket.write(`${header}${tag}\n`);
             break;
           }
 
@@ -812,6 +958,12 @@ export async function startMockNode(
     casCount: () => casRequests,
     casDeleteCount: () => casDeleteRequests,
     clearCount: () => clears,
+    multiGetCount: () => multiGets,
+    multiSetCount: () => multiSets,
+    answerMultiWrongNodeTimes: (key, times) => {
+      multiWrongNodeKey = key;
+      multiWrongNodeLeft += times;
+    },
     failClearOnce: () => {
       failClearReplies++;
     },
