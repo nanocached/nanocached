@@ -90,7 +90,7 @@ internal sealed class Connection
     // _writeGate critical section — never touched concurrently, so no
     // Interlocked ceremony is needed here the way _closedFlag needs one.
     private uint _nextTag;
-    private readonly ConcurrentQueue<(TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds)> Tcs, uint? Tag)> _pending = new();
+    private readonly ConcurrentQueue<(TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)> Tcs, uint? Tag)> _pending = new();
     private readonly Stopwatch _sinceLastUse = Stopwatch.StartNew();
     private readonly Action? _onClosed;
     // 0 = open, 1 = closed. An int (not a bool) so Close() can gate on it
@@ -247,7 +247,7 @@ internal sealed class Connection
     /// namespace bytes ahead of the key.</summary>
     internal async Task<byte[]?> GetAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, value, _) = await RequestAsync(tag =>
+        var (marker, value, _, _) = await RequestAsync(tag =>
             Frame(GetHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
@@ -269,7 +269,7 @@ internal sealed class Connection
     /// doc comment for the legacy-vs-namespaced frame rule.</summary>
     internal async Task SetAsync(byte[] namespaceBytes, byte[] key, byte[] value, long ttlSeconds)
     {
-        var (marker, _, _) = await RequestAsync(tag =>
+        var (marker, _, _, _) = await RequestAsync(tag =>
             Frame(SetHeader(namespaceBytes, key.Length, value.Length, ttlSeconds, tag), namespaceBytes, key, value))
             .ConfigureAwait(false);
         if (marker == (byte)'W') throw new WrongNodeException();
@@ -283,7 +283,7 @@ internal sealed class Connection
     /// doc comment for the legacy-vs-namespaced frame rule.</summary>
     internal async Task<bool> DeleteAsync(byte[] namespaceBytes, byte[] key)
     {
-        var (marker, _, _) = await RequestAsync(tag =>
+        var (marker, _, _, _) = await RequestAsync(tag =>
             Frame(DeleteHeader(namespaceBytes, key.Length, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
@@ -309,7 +309,7 @@ internal sealed class Connection
     /// to.</summary>
     internal async Task ClearAsync(byte[] namespaceBytes)
     {
-        var (marker, _, _) = await RequestAsync(tag =>
+        var (marker, _, _, _) = await RequestAsync(tag =>
             Frame(ClearHeader(namespaceBytes, tag), namespaceBytes, EmptyNamespace, null))
             .ConfigureAwait(false);
         if (marker != (byte)'C') throw Mismatch(marker);
@@ -320,7 +320,7 @@ internal sealed class Connection
     /// doc comment for the shared <c>C</c>-ack/no-<c>W</c> rules.</summary>
     internal async Task ClearAllAsync()
     {
-        var (marker, _, _) = await RequestAsync(tag =>
+        var (marker, _, _, _) = await RequestAsync(tag =>
             Encoding.ASCII.GetBytes($"F{TagField(tag)}\n"))
             .ConfigureAwait(false);
         if (marker != (byte)'C') throw Mismatch(marker);
@@ -349,7 +349,7 @@ internal sealed class Connection
     /// counter drift from the primary's).</para></summary>
     internal async Task<(long Value, long TtlSeconds)?> IncrAsync(byte[] namespaceBytes, byte[] key, long delta)
     {
-        var (marker, value, ttlSeconds) = await RequestAsync(tag =>
+        var (marker, value, ttlSeconds, _) = await RequestAsync(tag =>
             Frame(IncrHeader(namespaceBytes, key.Length, delta, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         switch (marker)
@@ -462,7 +462,7 @@ internal sealed class Connection
     /// reach a different outcome than the primary just did).</para></summary>
     internal async Task<bool> CasAsync(byte[] namespaceBytes, byte[] key, byte[] value, string cond, long ttlSeconds)
     {
-        var (marker, _, _) = await RequestAsync(tag =>
+        var (marker, _, _, _) = await RequestAsync(tag =>
             Frame(CasHeader(namespaceBytes, key.Length, value.Length, cond, ttlSeconds, tag), namespaceBytes, key, value))
             .ConfigureAwait(false);
         return marker switch
@@ -488,7 +488,7 @@ internal sealed class Connection
     /// <c>x</c>).</summary>
     internal async Task<bool> RemoveIfMatchesAsync(byte[] namespaceBytes, byte[] key, string digest)
     {
-        var (marker, _, _) = await RequestAsync(tag =>
+        var (marker, _, _, _) = await RequestAsync(tag =>
             Frame(RemoveIfMatchesHeader(namespaceBytes, key.Length, digest, tag), namespaceBytes, key, null))
             .ConfigureAwait(false);
         return marker switch
@@ -498,6 +498,160 @@ internal sealed class Connection
             (byte)'W' => throw new WrongNodeException(),
             _ => throw Mismatch(marker),
         };
+    }
+
+    // issue #151 — batched get/set: `m`/`o` — same always-namespaced shape
+    // as INCR/CAS (an explicit <namespace-length>, 0 = default namespace;
+    // no legacy pre-namespace form — batching postdates namespaces).
+    // Restricted to one namespace per frame (docs/protocol.html#multi):
+    // rendezvous hashing routes on (namespace, key), so a frame mixing
+    // namespaces couldn't route as a single unit anyway. Routing (grouping
+    // keys by owner, wrong-node retry, replica fan-out for MultiSetAsync)
+    // is NanocachedClient's job, same split as every other op here.
+
+    /// <summary>One key's outcome inside an <c>M</c> (multi-get) or
+    /// <c>O</c> (multi-set) response (issue #151,
+    /// docs/protocol.html#multi) — a batch never fails as a whole, so
+    /// each key's result is independent of every other key's. Reused for
+    /// both response kinds rather than two near-identical types:
+    /// <list type="bullet">
+    /// <item><c>M</c>: <see cref="Ok"/> true is a hit (<see cref="Value"/>
+    /// holds the bytes, possibly empty); <see cref="WrongNode"/> is a
+    /// per-key <c>W</c>; neither set is a clean miss (<c>-</c>).</item>
+    /// <item><c>O</c>: <see cref="Ok"/> true is <c>S</c> (stored);
+    /// <see cref="WrongNode"/> is <c>W</c>; <see cref="Value"/> is always
+    /// <c>null</c> — a set has nothing to echo back.</item>
+    /// </list></summary>
+    internal readonly struct MultiEntry
+    {
+        public byte[]? Value { get; }
+        public bool Ok { get; }
+        public bool WrongNode { get; }
+
+        private MultiEntry(byte[]? value, bool ok, bool wrongNode)
+        {
+            Value = value;
+            Ok = ok;
+            WrongNode = wrongNode;
+        }
+
+        internal static MultiEntry Hit(byte[] value) => new(value, true, false);
+        internal static MultiEntry Miss() => new(null, false, false);
+        internal static MultiEntry Wrong() => new(null, false, true);
+        internal static MultiEntry Stored() => new(null, true, false);
+    }
+
+    /// <summary>Sends <c>m</c> — one round trip for every key in
+    /// <paramref name="keys"/> (docs/protocol.html#multi).
+    /// <c>entries[i]</c> answers <c>keys[i]</c>, in request order. A
+    /// reply whose roster length doesn't match <c>keys.Count</c> is
+    /// treated as a desynced connection, same stance as
+    /// <see cref="Mismatch"/> — a malformed reply can't be trusted
+    /// key-for-key.</summary>
+    internal async Task<List<MultiEntry>> MultiGetAsync(byte[] namespaceBytes, IReadOnlyList<byte[]> keys)
+    {
+        var (marker, _, _, entries) = await RequestAsync(tag =>
+            MultiGetFrame(namespaceBytes, keys, tag)).ConfigureAwait(false);
+        if (marker != (byte)'M') throw Mismatch(marker);
+        if (entries!.Count != keys.Count) throw DesyncedEntryCount("multi-get", entries.Count, keys.Count);
+        return entries;
+    }
+
+    /// <summary>Builds an <c>m</c> request frame: <c>m &lt;ns-len&gt;
+    /// &lt;n&gt; &lt;key-len-1&gt; ... &lt;key-len-n&gt;[ &lt;tag&gt;]\n&lt;ns&gt;&lt;key-1&gt;...&lt;key-n&gt;</c>
+    /// (docs/protocol.html#multi).</summary>
+    private static byte[] MultiGetFrame(byte[] namespaceBytes, IReadOnlyList<byte[]> keys, uint? tag)
+    {
+        var header = new StringBuilder("m ").Append(namespaceBytes.Length).Append(' ').Append(keys.Count);
+        foreach (byte[] key in keys)
+        {
+            header.Append(' ').Append(key.Length);
+        }
+        header.Append(TagField(tag)).Append('\n');
+        byte[] headerBytes = Encoding.ASCII.GetBytes(header.ToString());
+
+        int bodyLength = namespaceBytes.Length;
+        foreach (byte[] key in keys) bodyLength += key.Length;
+        var frame = new byte[headerBytes.Length + bodyLength];
+        int offset = 0;
+        headerBytes.CopyTo(frame, offset);
+        offset += headerBytes.Length;
+        namespaceBytes.CopyTo(frame, offset);
+        offset += namespaceBytes.Length;
+        foreach (byte[] key in keys)
+        {
+            key.CopyTo(frame, offset);
+            offset += key.Length;
+        }
+        return frame;
+    }
+
+    /// <summary>Sends <c>o</c> — stores every key/value pair in one round
+    /// trip, one shared <paramref name="ttlSeconds"/> (0 means no expiry)
+    /// for the whole batch rather than per key
+    /// (docs/protocol.html#multi). <c>entries[i]</c> answers
+    /// <c>keys[i]</c>/<c>values[i]</c>, in request order; see
+    /// <see cref="MultiGetAsync"/> for the same "only a desynced roster
+    /// is an error" stance.</summary>
+    internal async Task<List<MultiEntry>> MultiSetAsync(
+        byte[] namespaceBytes, IReadOnlyList<byte[]> keys, IReadOnlyList<byte[]> values, long ttlSeconds)
+    {
+        var (marker, _, _, entries) = await RequestAsync(tag =>
+            MultiSetFrame(namespaceBytes, keys, values, ttlSeconds, tag)).ConfigureAwait(false);
+        if (marker != (byte)'O') throw Mismatch(marker);
+        if (entries!.Count != keys.Count) throw DesyncedEntryCount("multi-set", entries.Count, keys.Count);
+        return entries;
+    }
+
+    /// <summary>Builds an <c>o</c> request frame: <c>o &lt;ns-len&gt;
+    /// &lt;n&gt; &lt;key-len-1&gt; &lt;value-len-1&gt; ... &lt;key-len-n&gt;
+    /// &lt;value-len-n&gt; [&lt;ttl&gt;][ &lt;tag&gt;]\n&lt;ns&gt;&lt;key-1&gt;&lt;value-1&gt;...&lt;key-n&gt;&lt;value-n&gt;</c>
+    /// (docs/protocol.html#multi). The optional TTL sits ahead of the
+    /// tag, same convention <see cref="CasHeader"/>'s own
+    /// <c>[ttl-seconds]</c> uses.</summary>
+    private static byte[] MultiSetFrame(
+        byte[] namespaceBytes, IReadOnlyList<byte[]> keys, IReadOnlyList<byte[]> values, long ttlSeconds, uint? tag)
+    {
+        var header = new StringBuilder("o ").Append(namespaceBytes.Length).Append(' ').Append(keys.Count);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            header.Append(' ').Append(keys[i].Length).Append(' ').Append(values[i].Length);
+        }
+        if (ttlSeconds != 0)
+        {
+            header.Append(' ').Append(ttlSeconds);
+        }
+        header.Append(TagField(tag)).Append('\n');
+        byte[] headerBytes = Encoding.ASCII.GetBytes(header.ToString());
+
+        int bodyLength = namespaceBytes.Length;
+        for (int i = 0; i < keys.Count; i++) bodyLength += keys[i].Length + values[i].Length;
+        var frame = new byte[headerBytes.Length + bodyLength];
+        int offset = 0;
+        headerBytes.CopyTo(frame, offset);
+        offset += headerBytes.Length;
+        namespaceBytes.CopyTo(frame, offset);
+        offset += namespaceBytes.Length;
+        for (int i = 0; i < keys.Count; i++)
+        {
+            keys[i].CopyTo(frame, offset);
+            offset += keys[i].Length;
+            values[i].CopyTo(frame, offset);
+            offset += values[i].Length;
+        }
+        return frame;
+    }
+
+    /// <summary>An <c>M</c>/<c>O</c> response whose result-roster length
+    /// doesn't match the request's key count: the streams are just as
+    /// desynced as a kind mismatch (<see cref="Mismatch"/>), so this
+    /// poisons the connection the same way.</summary>
+    private ConnectionLostException DesyncedEntryCount(string op, int got, int want)
+    {
+        Close();
+        return new ConnectionLostException(
+            $"nanocached: {op} response roster length {got} does not match request key count {want} "
+            + "(connection desynced)");
     }
 
     /// <summary>issue #105: <paramref name="namespaceBytes"/> leads the
@@ -578,11 +732,11 @@ internal sealed class Connection
     /// attempt, so a tagged connection claims a fresh tag per attempt —
     /// see <see cref="SendOnceAsync"/>'s own doc comment for what it does
     /// with it.</summary>
-    private async Task<(byte Marker, byte[]? Value, long TtlSeconds)> RequestAsync(Func<uint?, byte[]> buildFrame)
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)> RequestAsync(Func<uint?, byte[]> buildFrame)
     {
         for (int attempt = 1; ; attempt++)
         {
-            (byte Marker, byte[]? Value, long TtlSeconds) response = await SendOnceAsync(buildFrame).ConfigureAwait(false);
+            (byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries) response = await SendOnceAsync(buildFrame).ConfigureAwait(false);
             if (response.Marker != (byte)'R')
             {
                 return response;
@@ -621,14 +775,14 @@ internal sealed class Connection
     /// before anything is enqueued — an encoder that rejects its input
     /// must fail with nothing queued, or the next response would resolve
     /// an orphaned waiter and desync the stream (echoed response tags).</param>
-    private async Task<(byte Marker, byte[]? Value, long TtlSeconds)> SendOnceAsync(Func<uint?, byte[]> buildFrame)
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)> SendOnceAsync(Func<uint?, byte[]> buildFrame)
     {
         if (IsClosed)
         {
             throw new ConnectionLostException("nanocached: connection is closed");
         }
 
-        var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds)>(
+        var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         await _writeGate.WaitAsync().ConfigureAwait(false);
@@ -691,7 +845,7 @@ internal sealed class Connection
     {
         while (true)
         {
-            (byte Marker, byte[]? Value, long TtlSeconds, uint? Tag) response;
+            (byte Marker, byte[]? Value, long TtlSeconds, uint? Tag, List<MultiEntry>? Entries) response;
             try
             {
                 response = await ReadResponseAsync().ConfigureAwait(false);
@@ -801,11 +955,11 @@ internal sealed class Connection
                 return;
             }
 
-            pending.Tcs.TrySetResult((response.Marker, response.Value, response.TtlSeconds));
+            pending.Tcs.TrySetResult((response.Marker, response.Value, response.TtlSeconds, response.Entries));
         }
     }
 
-    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, uint? Tag)> ReadResponseAsync()
+    private async Task<(byte Marker, byte[]? Value, long TtlSeconds, uint? Tag, List<MultiEntry>? Entries)> ReadResponseAsync()
     {
         byte marker = await ReadByteAsync().ConfigureAwait(false);
         switch (marker)
@@ -832,7 +986,7 @@ internal sealed class Connection
 
                 var value = new byte[length];
                 await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
-                return (marker, value, 0, tag);
+                return (marker, value, 0, tag, null);
             }
             case (byte)'I':
             {
@@ -869,7 +1023,7 @@ internal sealed class Connection
 
                 var value = new byte[length];
                 await _stream.ReadExactlyAsync(value).ConfigureAwait(false);
-                return (marker, value, ttlSeconds, tag);
+                return (marker, value, ttlSeconds, tag, null);
             }
             case (byte)'S':
             case (byte)'D':
@@ -882,7 +1036,7 @@ internal sealed class Connection
                 if (!_tagged)
                 {
                     await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
-                    return (marker, null, 0, null);
+                    return (marker, null, 0, null, null);
                 }
 
                 // Tagged: `<marker> <tag>\n` — a byte other than the
@@ -898,13 +1052,94 @@ internal sealed class Connection
                         "nanocached: response is missing its tag (connection desynced)");
                 }
                 uint tag = ParseTag(await ReadLineAsync().ConfigureAwait(false));
-                return (marker, null, 0, tag);
+                return (marker, null, 0, tag, null);
             }
             case (byte)'B':
                 // Busy is unsolicited and always bare (echoed response tags) — never
                 // tagged, even on a tagged connection.
                 await ExpectLfAsync().ConfigureAwait(false); // the trailing '\n'
-                return (marker, null, 0, null);
+                return (marker, null, 0, null, null);
+            // issue #151 — batched get/set (docs/protocol.html#multi):
+            // `M <n> <result-1> ... <result-n>[ <tag>]\n<hit values,
+            // concatenated in request order>`. Each result token is "-"
+            // (miss), "W" (wrong node), or a decimal byte length (a hit —
+            // that many trailing body bytes belong to this key, read
+            // here, inline, in token order, since only hit tokens consume
+            // body bytes).
+            case (byte)'M':
+            {
+                string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
+                if (fields.Length < 1 || !int.TryParse(fields[0], out int count) || count < 0)
+                {
+                    throw new ConnectionLostException("nanocached: invalid multi-get header in response");
+                }
+                int wantFields = 1 + count + (_tagged ? 1 : 0);
+                if (fields.Length != wantFields)
+                {
+                    throw new ConnectionLostException("nanocached: invalid multi-get header in response");
+                }
+                var entries = new List<MultiEntry>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    string token = fields[1 + i];
+                    if (token == "-")
+                    {
+                        entries.Add(MultiEntry.Miss());
+                    }
+                    else if (token == "W")
+                    {
+                        entries.Add(MultiEntry.Wrong());
+                    }
+                    else
+                    {
+                        if (!int.TryParse(token, out int length) || length < 0 || length > MaxValueLength)
+                        {
+                            throw new ConnectionLostException(
+                                "nanocached: invalid multi-get result length in response");
+                        }
+                        var hit = new byte[length];
+                        await _stream.ReadExactlyAsync(hit).ConfigureAwait(false);
+                        entries.Add(MultiEntry.Hit(hit));
+                    }
+                }
+                uint? tag = _tagged ? ParseTag(fields[1 + count]) : null;
+                return (marker, null, 0, tag, entries);
+            }
+            // issue #151: `O <n> <result-1> ... <result-n>[ <tag>]\n` — no
+            // body, unlike M's hit values (a set has nothing to echo
+            // back). Each token is "S" (stored) or "W" (wrong node).
+            case (byte)'O':
+            {
+                string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
+                if (fields.Length < 1 || !int.TryParse(fields[0], out int count) || count < 0)
+                {
+                    throw new ConnectionLostException("nanocached: invalid multi-set header in response");
+                }
+                int wantFields = 1 + count + (_tagged ? 1 : 0);
+                if (fields.Length != wantFields)
+                {
+                    throw new ConnectionLostException("nanocached: invalid multi-set header in response");
+                }
+                var entries = new List<MultiEntry>(count);
+                for (int i = 0; i < count; i++)
+                {
+                    string token = fields[1 + i];
+                    if (token == "S")
+                    {
+                        entries.Add(MultiEntry.Stored());
+                    }
+                    else if (token == "W")
+                    {
+                        entries.Add(MultiEntry.Wrong());
+                    }
+                    else
+                    {
+                        throw new ConnectionLostException("nanocached: invalid multi-set result token in response");
+                    }
+                }
+                uint? tag = _tagged ? ParseTag(fields[1 + count]) : null;
+                return (marker, null, 0, tag, entries);
+            }
             default:
                 // A garbage marker means the stream is desynced; poison
                 // and classify as connection-level (issue #8) so the

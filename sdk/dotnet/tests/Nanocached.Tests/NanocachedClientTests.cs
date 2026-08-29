@@ -924,6 +924,108 @@ public class NanocachedClientTests
         Assert.Contains("invalid node address", error.Message);
     }
 
+    // ── バッチ get/set (issue #151) ──────────────────────────────
+
+    [Fact]
+    public async Task GetManyReturnsHitsAndOmitsMisses()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("a", "1");
+        await client.SetAsync("b", "2");
+        Dictionary<string, string> values = await client.GetManyAsync(new[] { "a", "b", "missing" });
+        Assert.Equal(new Dictionary<string, string> { ["a"] = "1", ["b"] = "2" }, values);
+        Assert.Equal(1, node.MultiGetRequestCount);
+    }
+
+    [Fact]
+    public async Task GetManyBytesRoundTripsRawByteValues()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        byte[] value = { 0, 1, 2, 254, 255 };
+        await client.SetAsync(Bytes("raw"), value);
+        Dictionary<string, byte[]> values = await client.GetManyBytesAsync(new[] { "raw" });
+        Assert.Equal(value, values["raw"]);
+    }
+
+    [Fact]
+    public async Task GetManyRejectsAnEmptyKeyList()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetManyAsync(Array.Empty<string>()));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetManyBytesAsync(Array.Empty<string>()));
+    }
+
+    [Fact]
+    public async Task SetManyStoresEveryPairAndGetManyReadsThemBack()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetManyAsync(new Dictionary<string, string> { ["a"] = "1", ["b"] = "2", ["c"] = "3" });
+        Dictionary<string, string> values = await client.GetManyAsync(new[] { "a", "b", "c" });
+        Assert.Equal(new Dictionary<string, string> { ["a"] = "1", ["b"] = "2", ["c"] = "3" }, values);
+        Assert.Equal(1, node.MultiSetRequestCount);
+    }
+
+    [Fact]
+    public async Task SetManyTtlZeroMeansNoExpiryAndNegativeIsRejected()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetManyAsync(new Dictionary<string, string> { ["k"] = "v" }, 0);
+        Assert.Equal("v", await client.GetAsync("k"));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => client.SetManyAsync(new Dictionary<string, string> { ["k"] = "v" }, -1));
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => client.SetManyBytesAsync(new Dictionary<string, byte[]> { ["k"] = Bytes("v") }, -1));
+    }
+
+    [Fact]
+    public async Task SetManyRejectsAnEmptyValueDictionary()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.SetManyAsync(new Dictionary<string, string>()));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.SetManyBytesAsync(new Dictionary<string, byte[]>()));
+    }
+
+    [Fact]
+    public async Task BatchedGetSetAreScopedByNamespace()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        NanocachedNamespace ns = client.Namespace("tenant-a");
+        await ns.SetManyAsync(new Dictionary<string, string> { ["k"] = "namespaced" });
+        await client.SetManyAsync(new Dictionary<string, string> { ["k"] = "default" });
+        Assert.Equal(new Dictionary<string, string> { ["k"] = "namespaced" }, await ns.GetManyAsync(new[] { "k" }));
+        Assert.Equal(new Dictionary<string, string> { ["k"] = "default" }, await client.GetManyAsync(new[] { "k" }));
+    }
+
+    [Fact]
+    public async Task WrongNodePropagatesForBatchedOpsInSingleMode()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        node.AnswerWrongNodeOnce();
+        await Assert.ThrowsAsync<PartialWrongNodeException<Dictionary<string, byte[]>>>(
+            () => client.GetManyBytesAsync(new[] { "a", "b" }));
+        node.AnswerWrongNodeOnce();
+        await Assert.ThrowsAsync<WrongNodeException>(
+            () => client.SetManyAsync(new Dictionary<string, string> { ["a"] = "1" }));
+    }
+
     // ── クラスタと複製 ────────────────────────────────────────────
 
     private sealed record Cluster(
@@ -1069,6 +1171,113 @@ public class NanocachedClientTests
         {
             Assert.False(node.Store.ContainsKey(stored));
         }
+    }
+
+    // ── クラスタでのバッチ get/set (issue #151) ─────────────────────
+
+    [Fact]
+    public async Task BatchedGetSetRouteAcrossOwnersAndReassembleInCallerOrder()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        var keys = new List<string>();
+        var values = new Dictionary<string, string>();
+        for (int i = 0; i < 20; i++)
+        {
+            keys.Add($"key-{i}");
+            values[$"key-{i}"] = $"value-{i}";
+        }
+        await client.SetManyAsync(values);
+        Assert.Equal(values, await client.GetManyAsync(keys));
+
+        int totalStored = cluster.Nodes.Values.Sum(node => node.Store.Count);
+        Assert.Equal(20, totalStored);
+        Assert.All(cluster.Nodes.Values, node => Assert.True(node.Store.Count > 0));
+    }
+
+    [Fact]
+    public async Task BatchedWritesFanOutToEveryOwnerWhenReplicated()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        var values = new Dictionary<string, string>();
+        for (int i = 0; i < 10; i++) values[$"key-{i}"] = "v";
+        await client.SetManyAsync(values);
+        foreach (string key in values.Keys)
+        {
+            string stored = MockNode.KeyOf(Bytes(key));
+            foreach (var (name, node) in cluster.Nodes)
+            {
+                Assert.True(node.Store.ContainsKey(stored), $"{key} missing from {name}");
+            }
+        }
+        Assert.Equal(values.Count, (await client.GetManyAsync(values.Keys.ToList())).Count);
+    }
+
+    [Fact]
+    public async Task ADeadReplicaDoesNotFailABatchedWrite()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        IReadOnlyList<string> owners = OwnersOf("written-anyway");
+        cluster.Nodes[owners[1]].Dispose();
+        await Task.Delay(50);
+
+        await client.SetManyAsync(new Dictionary<string, string> { ["written-anyway"] = "v" });
+        Assert.True(cluster.Nodes[owners[0]].Store.ContainsKey(MockNode.KeyOf(Bytes("written-anyway"))));
+        Assert.Equal(
+            new Dictionary<string, string> { ["written-anyway"] = "v" },
+            await client.GetManyAsync(new[] { "written-anyway" }));
+    }
+
+    [Fact]
+    public async Task BatchedGetWrongNodeTriggersRefreshAndOneRetry()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        await client.SetManyAsync(new Dictionary<string, string> { ["some-key"] = "v" });
+        MockNode owner = cluster.Nodes[new HashRing(Names).Route(Bytes("some-key"))];
+
+        owner.AnswerWrongNodeOnce();
+        Assert.Equal(
+            new Dictionary<string, string> { ["some-key"] = "v" },
+            await client.GetManyAsync(new[] { "some-key" }));
+
+        owner.AnswerWrongNodeOnce();
+        owner.AnswerWrongNodeOnce();
+        PartialWrongNodeException<Dictionary<string, byte[]>> failure =
+            await Assert.ThrowsAsync<PartialWrongNodeException<Dictionary<string, byte[]>>>(
+                () => client.GetManyBytesAsync(new[] { "some-key" }));
+        Assert.Empty(failure.PartialValues);
+    }
+
+    [Fact]
+    public async Task BatchedSetWrongNodeTriggersRefreshAndOneRetry()
+    {
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        MockNode owner = cluster.Nodes[new HashRing(Names).Route(Bytes("some-key"))];
+
+        owner.AnswerWrongNodeOnce();
+        await client.SetManyAsync(new Dictionary<string, string> { ["some-key"] = "v" });
+        Assert.Equal(
+            new Dictionary<string, string> { ["some-key"] = "v" },
+            await client.GetManyAsync(new[] { "some-key" }));
+
+        owner.AnswerWrongNodeOnce();
+        owner.AnswerWrongNodeOnce();
+        await Assert.ThrowsAsync<WrongNodeException>(
+            () => client.SetManyAsync(new Dictionary<string, string> { ["some-key"] = "v2" }));
     }
 
     // ── incr / decr (issue #129) ─────────────────────────────────

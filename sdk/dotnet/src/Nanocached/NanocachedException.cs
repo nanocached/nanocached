@@ -20,10 +20,40 @@ public sealed class AlreadyClosedException : NanocachedException
 /// stale. The client catches this internally to refresh the node list and
 /// retry once; it only escapes when that retry also fails, or in
 /// single-node mode where there is no discovery to refresh from.
+///
+/// <para>Not <c>sealed</c> (unlike this SDK's other leaf exceptions) so
+/// <see cref="PartialWrongNodeException{T}"/> — issue #151's batched-get
+/// partial-failure carrier — can subclass it while still satisfying every
+/// existing <c>catch (WrongNodeException)</c>.</para>
 /// </summary>
-public sealed class WrongNodeException : NanocachedException
+public class WrongNodeException : NanocachedException
 {
     public WrongNodeException() : base("nanocached: this node does not hold the requested key") { }
+}
+
+/// <summary>
+/// issue #151 — raised by <c>NanocachedClient.GetManyAsync</c>/
+/// <c>NanocachedClient.GetManyBytesAsync</c> when some keys are
+/// still wrong-node after the one bounded refresh-and-retry every batch
+/// gets (the per-key analogue of <c>GetAsync</c>'s own <c>W</c>
+/// refresh-and-retry). A <see cref="WrongNodeException"/> subclass, so
+/// existing <c>catch (WrongNodeException)</c> handling keeps working
+/// unchanged; <see cref="PartialValues"/> holds every key that DID
+/// resolve — a batch never fails as a whole (docs/protocol.html#multi),
+/// so a handful of stale placements shouldn't force discarding an
+/// otherwise successful batch. <c>NanocachedClient.SetManyAsync</c>/
+/// <c>NanocachedClient.SetManyBytesAsync</c> have nothing to
+/// return on success, so they just throw a plain
+/// <see cref="WrongNodeException"/> on the same condition.
+/// </summary>
+public sealed class PartialWrongNodeException<T> : WrongNodeException
+{
+    public T PartialValues { get; }
+
+    public PartialWrongNodeException(T partialValues)
+    {
+        PartialValues = partialValues;
+    }
 }
 
 /// <summary>
