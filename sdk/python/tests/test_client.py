@@ -18,6 +18,7 @@ from nanocached import (
     NanocachedClient,
     NanocachedError,
     NotNumericError,
+    PartialWrongNodeError,
     RetryableError,
     WrongNodeError,
     content_digest,
@@ -1535,6 +1536,73 @@ class CasEncodingTests(unittest.TestCase):
         self.assertEqual(
             _encode_cas_delete(b"k", digest, namespace=b"users"),
             b"x 5 1 %b\nusers" % digest + b"k",
+        )
+
+
+class MultiEncodingTests(unittest.TestCase):
+    # Batched get/set (issues #128/#150/#151): docs/protocol.html "m / o
+    # — batched get and set" is the authoritative wire spec these pin —
+    # like `i`/`k`/`x`, neither op has a legacy uppercase form, so even
+    # the default namespace still carries <namespace-length> 0.
+
+    def test_encodes_untagged_multi_get(self):
+        from nanocached._connection import _encode_multi_get
+
+        self.assertEqual(_encode_multi_get([b"a", b"bb"]), b"m 0 2 1 2\nabb")
+
+    def test_encodes_namespaced_multi_get(self):
+        from nanocached._connection import _encode_multi_get
+
+        self.assertEqual(
+            _encode_multi_get([b"a", b"bb"], namespace=b"users"),
+            b"m 5 2 1 2\nusersabb",
+        )
+
+    def test_encodes_tagged_multi_get(self):
+        from nanocached._connection import _encode_multi_get
+
+        self.assertEqual(_encode_multi_get([b"a", b"bb"], tag=7), b"m 0 2 1 2 7\nabb")
+
+    def test_encodes_a_single_key_multi_get(self):
+        from nanocached._connection import _encode_multi_get
+
+        self.assertEqual(_encode_multi_get([b"k"]), b"m 0 1 1\nk")
+
+    def test_namespace_may_contain_arbitrary_bytes(self):
+        from nanocached._connection import _encode_multi_get
+
+        self.assertEqual(
+            _encode_multi_get([b"k"], namespace=b"\xff\x00"), b"m 2 1 1\n\xff\x00k"
+        )
+
+    def test_encodes_untagged_multi_set_without_ttl(self):
+        from nanocached._connection import _encode_multi_set
+
+        self.assertEqual(
+            _encode_multi_set([b"a", b"bb"], [b"1", b"22"]), b"o 0 2 1 1 2 2\na1bb22"
+        )
+
+    def test_encodes_multi_set_with_ttl(self):
+        from nanocached._connection import _encode_multi_set
+
+        self.assertEqual(
+            _encode_multi_set([b"k"], [b"v"], ttl_seconds=60), b"o 0 1 1 1 60\nkv"
+        )
+
+    def test_encodes_namespaced_multi_set(self):
+        from nanocached._connection import _encode_multi_set
+
+        self.assertEqual(
+            _encode_multi_set([b"k"], [b"v"], namespace=b"users"),
+            b"o 5 1 1 1\nuserskv",
+        )
+
+    def test_encodes_tagged_multi_set_with_ttl(self):
+        from nanocached._connection import _encode_multi_set
+
+        self.assertEqual(
+            _encode_multi_set([b"k"], [b"v"], ttl_seconds=60, tag=7),
+            b"o 0 1 1 1 60 7\nkv",
         )
 
 
@@ -4062,6 +4130,29 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await proxy_a.close()
             await proxy_b.close()
 
+    async def test_get_many_and_set_many_ride_the_single_proxy_connection(self):
+        # No owner grouping in proxy mode — the proxy splits/reassembles
+        # server-side (docs/protocol.html "m / o"); this client just
+        # sends one (possibly chunked) sub-frame straight to it.
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[], proxies=[(NAMES[0], proxy.address)]
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True
+            )
+            try:
+                await client.set_many({"a": "1", "b": "2"})
+                self.assertEqual(await client.get_many(["a", "b"]), {"a": "1", "b": "2"})
+                self.assertEqual(proxy.multi_set_count, 1)
+                self.assertEqual(proxy.multi_get_count, 1)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
     async def test_hedge_option_is_inert_in_proxy_mode(self):
         proxy = await MockNode().start()
         discovery = await MockDiscovery(
@@ -4082,6 +4173,278 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await discovery.close()
             await proxy.close()
+
+
+class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
+    # Batched get/set (issues #128/#150/#151), single-node coverage — see
+    # MultiClusterTests below for owner grouping, replication, and the
+    # per-key wrong-node refresh-and-retry contract.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_get_many_mixes_hits_and_misses(self):
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            self.assertEqual(
+                await client.get_many(["a", "b", "missing"]), {"a": "va", "b": "vb"}
+            )
+            self.assertEqual(
+                await client.get_many_bytes(["a", "b", "missing"]),
+                {"a": b"va", "b": b"vb"},
+            )
+        finally:
+            await client.close()
+
+    async def test_str_and_bytes_keys_may_be_mixed_and_are_keyed_by_the_original_object(self):
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set(b"bb", "vbb")
+            result = await client.get_many(["a", b"bb"])
+            self.assertEqual(result, {"a": "va", b"bb": "vbb"})
+            self.assertIn("a", result)
+            self.assertIn(b"bb", result)
+        finally:
+            await client.close()
+
+    async def test_duplicate_key_after_encoding_is_rejected(self):
+        client = await self.connect()
+        try:
+            with self.assertRaisesRegex(ValueError, "duplicate key after encoding"):
+                await client.get_many(["a", b"a"])
+            with self.assertRaisesRegex(ValueError, "duplicate key after encoding"):
+                await client.set_many({"a": "1", b"a": "2"})
+        finally:
+            await client.close()
+
+    async def test_empty_batch_is_rejected(self):
+        client = await self.connect()
+        try:
+            with self.assertRaises(ValueError):
+                await client.get_many([])
+            with self.assertRaises(ValueError):
+                await client.get_many_bytes([])
+            with self.assertRaises(ValueError):
+                await client.set_many({})
+        finally:
+            await client.close()
+
+    async def test_set_many_shares_one_ttl_across_the_batch(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"}, ttl_seconds=60)
+            self.assertEqual(self.node.last_set_ttl, 60)
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "1", "b": "2"})
+        finally:
+            await client.close()
+
+    async def test_a_batch_larger_than_max_batch_keys_is_transparently_chunked(self):
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            await client.set_many(values)
+            self.assertEqual(self.node.multi_set_count, 2)
+            self.assertEqual(await client.get_many(list(values.keys())), values)
+            self.assertEqual(self.node.multi_get_count, 2)
+        finally:
+            await client.close()
+
+    async def test_a_persisting_wrong_node_propagates_immediately_in_single_mode(self):
+        # No ring to refresh against in single-node mode — mirrors get()'s
+        # own single-mode behavior (_read/_write's `self._ring is None`
+        # branch).
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            self.node.answer_wrong_node_for_keys({b"a"})
+            with self.assertRaises(WrongNodeError):
+                await client.get_many(["a"])
+
+            self.node.answer_wrong_node_for_keys({b"a"})
+            with self.assertRaises(WrongNodeError):
+                await client.set_many({"a": "v2"})
+        finally:
+            await client.close()
+
+
+class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
+    # Batched get/set (issues #128/#150/#151), cluster coverage: owner
+    # grouping (get: primary only; set: every rank), the node-that-is-
+    # primary-for-one-key-and-replica-for-another case (#150's
+    # asymmetry), and the per-key wrong-node refresh-and-retry contract
+    # (_multi_get_pass/_multi_set_pass) — mirrors ReplicationTests'/
+    # ClusterTests' own start_cluster/owners_of pattern.
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_get_many_reassembles_hits_split_across_owners(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                keys = [f"key-{i}" for i in range(30)]
+                values = {key: f"value of {key}" for key in keys}
+                await client.set_many(values)
+                self.assertEqual(await client.get_many(keys), values)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_set_many_stores_on_every_owner_under_replication(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                keys = [f"key-{i}" for i in range(30)]
+                await client.set_many({key: "v" for key in keys})
+                for key in keys:
+                    for owner in self.owners_of(key):
+                        self.assertIn(
+                            key.encode(), nodes[owner].store, f"{key} missing from {owner}"
+                        )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_node_primary_for_one_key_and_replica_for_another_gets_one_subframe(self):
+        # #150's asymmetry: within one set_many batch, the same node can
+        # own one key as primary and another as replica at once — it must
+        # still receive exactly one `o` sub-frame, never two.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                candidates = [f"k{i}" for i in range(200)]
+                owner_sets = {key: self.owners_of(key) for key in candidates}
+                pair = next(
+                    (key1, key2, owner_sets[key1][0])
+                    for key1 in candidates
+                    for key2 in candidates
+                    if key1 != key2
+                    and owner_sets[key1][0] == owner_sets[key2][1]
+                    and owner_sets[key1][0] != owner_sets[key2][0]
+                )
+                key1, key2, shared_owner = pair
+                before = nodes[shared_owner].multi_set_count
+                await client.set_many({key1: "v1", key2: "v2"})
+                self.assertEqual(nodes[shared_owner].multi_set_count - before, 1)
+                self.assertEqual(await client.get_many([key1, key2]), {key1: "v1", key2: "v2"})
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_replica_leg_wrong_node_is_swallowed_and_counted(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                key = "replica-fails"
+                primary, replica = self.owners_of(key)
+                nodes[replica].answer_wrong_node_for_keys({key.encode()})
+                await client.set_many({key: "v"})  # must not raise
+                self.assertEqual(client.stats().replica_write_failures, 1)
+                self.assertIn(key.encode(), nodes[primary].store)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_per_key_wrong_node_is_healed_by_one_refresh_and_retry(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                key, other = "some-key", "other-key"
+                await client.set_many({key: "v", other: "v2"})
+                owner = nodes[self.owners_of(key)[0]]
+
+                owner.answer_wrong_node_for_keys({key.encode()}, times=1)
+                self.assertEqual(
+                    await client.get_many([key, other]), {key: "v", other: "v2"}
+                )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_persisting_per_key_wrong_node_raises_partial_wrong_node_error(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                key, other = "some-key", "other-key"
+                await client.set_many({key: "v", other: "v2"})
+                owner = nodes[self.owners_of(key)[0]]
+
+                owner.answer_wrong_node_for_keys({key.encode()}, times=10)
+                with self.assertRaises(PartialWrongNodeError) as ctx:
+                    await client.get_many([key, other])
+                self.assertEqual(ctx.exception.partial_values, {other: "v2"})
+                # A subclass of WrongNodeError — existing handling keeps
+                # working unchanged.
+                self.assertIsInstance(ctx.exception, WrongNodeError)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_set_many_persisting_wrong_node_raises_plain_wrong_node_error(self):
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                key, other = "some-key", "other-key"
+                owner = nodes[self.owners_of(key)[0]]
+                owner.answer_wrong_node_for_keys({key.encode()}, times=10)
+
+                with self.assertRaises(WrongNodeError) as ctx:
+                    await client.set_many({key: "v", other: "v2"})
+                self.assertNotIsInstance(ctx.exception, PartialWrongNodeError)
+                # The other key was still stored — a batch never fails as
+                # a whole.
+                self.assertEqual(await client.get_many([other]), {other: "v2"})
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
 
 
 if __name__ == "__main__":

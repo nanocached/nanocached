@@ -26,6 +26,23 @@ class WrongNodeError(NanocachedError):
         super().__init__("nanocached: this node does not hold the requested key")
 
 
+class PartialWrongNodeError(WrongNodeError):
+    """Raised by get_many/get_many_bytes (issues #128/#150/#151) when some
+    keys are still wrong-node after the one bounded refresh-and-retry
+    every batch gets (see NanocachedClient's own multi-get docstring). A
+    subclass of WrongNodeError, so existing ``except WrongNodeError:``
+    handling keeps working unchanged; ``partial_values`` holds every key
+    that DID resolve, keyed by the original object the caller passed, so
+    a caller who wants a mostly-successful batch's data instead of
+    discarding it can still get at it. set_many has nothing partial
+    worth attaching on this condition and raises a plain WrongNodeError
+    instead."""
+
+    def __init__(self, partial_values: dict) -> None:
+        super().__init__()
+        self.partial_values = partial_values
+
+
 class AuthenticationError(NanocachedError):
     """The server rejected the ``A`` handshake's secret — either no
     ``auth_secret`` was configured for a server that requires one, or the

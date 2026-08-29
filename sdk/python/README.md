@@ -176,6 +176,49 @@ rather than replaying the increment on them, so a replica can never drift
 onto a value the primary doesn't itself hold (e.g. from an earlier
 dropped replica write, or the replica separately evicting the key).
 
+## Batched get and set
+
+`get_many`/`get_many_bytes` and `set_many` (the `m`/`o` frames) fetch or
+store several keys in one round trip per owner instead of one round
+trip per key:
+
+```python
+await client.set_many({"a": "1", "b": "2"}, ttl_seconds=60)  # one shared TTL for the whole batch
+values = await client.get_many(["a", "b", "missing"])
+# values == {"a": "1", "b": "2"} — "missing" is simply absent
+```
+
+A missing key is simply absent from the returned dict, the same "a miss
+is not an error" shape `get`/`get_bytes` use. Keys may be `str` or
+`bytes`, freely mixed within one call — the result dict is keyed by
+whichever original object was passed in, not by its encoded bytes, so a
+batch containing both `"a"` and `b"a"` is rejected up front with
+`ValueError` rather than silently colliding. Both are also
+namespace-scoped: `client.namespace(ns).get_many(...)`/`.set_many(...)`,
+same as `get`/`set`.
+
+**A batch never fails as a whole.** Each key's outcome is independent:
+if some keys are still routed to the wrong node after one bounded
+refresh-and-retry (the same policy `get`/`set` apply per key, not per
+call), `get_many`/`get_many_bytes` raise `PartialWrongNodeError` — a
+`WrongNodeError` subclass — whose `.partial_values` holds every key
+that DID resolve, rather than discarding a mostly-successful batch;
+`set_many` raises a plain `WrongNodeError` while every other key in the
+batch was still stored. In single-node/proxy mode a `W` propagates
+immediately, exactly like `get`/`set`'s own single-mode behavior — there
+is no ring to refresh against.
+
+Within one `set_many` batch, the same node can be one key's primary and
+another key's replica at once; it receives exactly one `o` sub-frame
+either way, and only its answer for the keys it is primary for decides
+those keys' outcome — a replica-held key's failure is
+logged-and-swallowed into `stats().replica_write_failures`, exactly like
+a plain `set`'s own replica legs.
+
+Very large batches are transparently split into more than one `m`/`o`
+sub-frame per owner — callers never need to think about this. Hedged
+reads and read repair do not apply to batches.
+
 ## Compare-and-set
 
 `put_if_absent`, `replace_if_present`, `replace`, and `delete_if_matches`

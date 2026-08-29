@@ -109,9 +109,24 @@ class MockNode:
         # counters) and never a `k`/`x` of its own.
         self.cas_set_count = 0
         self.cas_delete_count = 0
+        # Batched get/set (issues #128/#150/#151): counts every `m`/`o`
+        # frame this node receives, regardless of outcome — the key
+        # proof, alongside incr_count/cas_set_count above, that a batch
+        # split across owners really did land exactly one sub-frame per
+        # involved node (including a node that is primary for one key
+        # and replica for another — it must receive exactly one `o`,
+        # never two).
+        self.multi_get_count = 0
+        self.multi_set_count = 0
         self._fail_clear_replies = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
+        # Batched get/set (issues #128/#150/#151): unlike
+        # answer_wrong_node_once() (whole-frame), M/O need a *per-key* W
+        # inside an otherwise-normal roster — see
+        # answer_wrong_node_for_keys().
+        self._multi_wrong_node_keys: set[bytes] = set()
+        self._multi_wrong_node_times = 0
         self._wrong_tag_replies = 0
         self._swallowed_gets = 0
         self._malformed_value_replies = 0
@@ -203,6 +218,16 @@ class MockNode:
         `R` otherwise. Simulates nanocached-proxy answering a transiently
         failed request without closing the connection."""
         self._retryable_replies += times
+
+    def answer_wrong_node_for_keys(self, keys: set[bytes], times: int = 1) -> None:
+        """The next ``times`` m/o requests answer `W` for any key in
+        ``keys`` inside their roster, and normally for every other key
+        in the same batch (issues #128/#150/#151) — unlike
+        answer_wrong_node_once(), which is whole-frame, M/O need a
+        per-key W. ``times`` counts down per m/o request received, not
+        per key."""
+        self._multi_wrong_node_keys = set(keys)
+        self._multi_wrong_node_times = times
 
     def fail_next_clear_once(self) -> None:
         """Closes the connection instead of acking the next `c`/`F` this
@@ -627,6 +652,83 @@ class MockNode:
                         writer.write(b"D" + tag_suffix + b"\n")
                     else:
                         writer.write(b"N" + tag_suffix + b"\n")
+                    await writer.drain()
+
+                elif parts[0] == b"m":
+                    # Batched get (issues #128/#150/#151): `m <ns-len>
+                    # <n> <key-len-1>...<key-len-n> [<tag>]\n<ns><key-1>
+                    # ...<key-n>` — always namespaced, no legacy
+                    # uppercase form, mirroring `i`/`k`/`x` above.
+                    namespace = await reader.readexactly(int(parts[1]))
+                    count = int(parts[2])
+                    key_lengths = [int(x) for x in parts[3 : 3 + count]]
+                    keys = [await reader.readexactly(length) for length in key_lengths]
+                    self.multi_get_count += 1
+                    if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    consume_wrong = self._multi_wrong_node_times > 0
+                    if consume_wrong:
+                        self._multi_wrong_node_times -= 1
+                    roster_tokens = []
+                    body = b""
+                    for key in keys:
+                        if consume_wrong and key in self._multi_wrong_node_keys:
+                            roster_tokens.append(b"W")
+                            continue
+                        value = self._get_entry(namespace, key)
+                        if value is None:
+                            roster_tokens.append(b"-")
+                        else:
+                            roster_tokens.append(b"%d" % len(value))
+                            body += value
+                    header = b" ".join([b"M", b"%d" % count, *roster_tokens]) + tag_suffix + b"\n"
+                    writer.write(header + body)
+                    await writer.drain()
+
+                elif parts[0] == b"o":
+                    # Batched set (issues #128/#150/#151): `o <ns-len>
+                    # <n> <key-len-1> <value-len-1>...<key-len-n>
+                    # <value-len-n> [<ttl>] [<tag>]\n<ns><k1><v1>...
+                    # <kn><vn>` — one shared TTL for the whole batch.
+                    namespace = await reader.readexactly(int(parts[1]))
+                    count = int(parts[2])
+                    length_fields = parts[3 : 3 + 2 * count]
+                    key_lengths = [int(x) for x in length_fields[0::2]]
+                    value_lengths = [int(x) for x in length_fields[1::2]]
+                    base_field_count = (3 + 2 * count) + (1 if tagged else 0)
+                    ttl = int(parts[3 + 2 * count]) if len(parts) > base_field_count else 0
+                    self.last_set_ttl = ttl
+                    keys = []
+                    values = []
+                    for key_len, value_len in zip(key_lengths, value_lengths):
+                        keys.append(await reader.readexactly(key_len))
+                        values.append(await reader.readexactly(value_len))
+                    self.multi_set_count += 1
+                    if self._silent:
+                        continue
+                    if self._retryable_replies > 0:
+                        self._retryable_replies -= 1
+                        writer.write(b"R" + tag_suffix + b"\n")
+                        await writer.drain()
+                        continue
+                    consume_wrong = self._multi_wrong_node_times > 0
+                    if consume_wrong:
+                        self._multi_wrong_node_times -= 1
+                    roster_tokens = []
+                    for key, value in zip(keys, values):
+                        if consume_wrong and key in self._multi_wrong_node_keys:
+                            roster_tokens.append(b"W")
+                            continue
+                        self._set_entry(namespace, key, value)
+                        self.entry_ttl[(namespace, key)] = ttl
+                        roster_tokens.append(b"S")
+                    header = b" ".join([b"O", b"%d" % count, *roster_tokens]) + tag_suffix + b"\n"
+                    writer.write(header)
                     await writer.drain()
 
                 else:
