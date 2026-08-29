@@ -9,8 +9,11 @@ import {
   encodeDelete,
   encodeGet,
   encodeIncr,
+  encodeMultiGet,
+  encodeMultiSet,
   encodeSet,
   MAX_REQUEST_BYTES,
+  peekMultiFrameLength,
   tryParseResponse,
 } from "../src/protocol.js";
 
@@ -131,6 +134,95 @@ describe("encodeIncr (issue #129)", () => {
     assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), Number.MAX_SAFE_INTEGER));
     assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), -Number.MAX_SAFE_INTEGER));
     assert.doesNotThrow(() => encodeIncr(Buffer.from("key"), 0));
+  });
+});
+
+describe("encodeMultiGet (issues #128/#150/#151)", () => {
+  it("always frames the namespace length, even for the default namespace", () => {
+    assert.deepEqual(encodeMultiGet([Buffer.from("a"), Buffer.from("bb")]), Buffer.from("m 0 2 1 2\nabb"));
+  });
+
+  it("frames a named namespace ahead of the keys, matching i's field order", () => {
+    assert.deepEqual(
+      encodeMultiGet([Buffer.from("a")], undefined, NS),
+      Buffer.concat([Buffer.from("m 5 1 1\n"), NS, Buffer.from("a")]),
+    );
+  });
+
+  it("appends the tag as the last header field", () => {
+    assert.deepEqual(encodeMultiGet([Buffer.from("a")], 9), Buffer.from("m 0 1 1 9\na"));
+  });
+
+  it("accepts a binary namespace and binary keys, no delimiter or escaping", () => {
+    const ns = Buffer.from([0xff, 0x00]);
+    const key = Buffer.from([0x01, 0x02, 0x03]);
+    assert.deepEqual(encodeMultiGet([key], undefined, ns), Buffer.concat([Buffer.from("m 2 1 3\n"), ns, key]));
+  });
+
+  it("rejects an empty keys array synchronously", () => {
+    assert.throws(() => encodeMultiGet([]), RangeError);
+  });
+
+  it("rejects an empty key inside the batch synchronously", () => {
+    assert.throws(() => encodeMultiGet([Buffer.from("a"), Buffer.alloc(0)]), RangeError);
+  });
+
+  it("rejects a single key beyond MAX_REQUEST_BYTES synchronously", () => {
+    assert.throws(() => encodeMultiGet([Buffer.alloc(MAX_REQUEST_BYTES + 1)]), RangeError);
+  });
+
+  it("rejects many keys whose combined size exceeds MAX_REQUEST_BYTES even though no single key does", () => {
+    const keys = Array.from({ length: 10 }, () => Buffer.alloc(Math.ceil(MAX_REQUEST_BYTES / 9)));
+    assert.throws(() => encodeMultiGet(keys), RangeError);
+  });
+});
+
+describe("encodeMultiSet (issues #150/#151)", () => {
+  const keys = [Buffer.from("a"), Buffer.from("bb")];
+  const values = [Buffer.from("x"), Buffer.from("yy")];
+
+  it("omits the TTL field when zero (the default), same as encodeSet", () => {
+    assert.deepEqual(encodeMultiSet(keys, values), Buffer.from("o 0 2 1 1 2 2\naxbbyy"));
+  });
+
+  it("appends the TTL after the length fields when given", () => {
+    assert.deepEqual(encodeMultiSet(keys, values, 60), Buffer.from("o 0 2 1 1 2 2 60\naxbbyy"));
+  });
+
+  it("frames a named namespace ahead of the keys", () => {
+    assert.deepEqual(
+      encodeMultiSet(keys, values, 0, undefined, NS),
+      Buffer.concat([Buffer.from("o 5 2 1 1 2 2\n"), NS, Buffer.from("axbbyy")]),
+    );
+  });
+
+  it("appends the tag as the last header field, after the TTL when both are present", () => {
+    assert.deepEqual(encodeMultiSet(keys, values, 0, 9), Buffer.from("o 0 2 1 1 2 2 9\naxbbyy"));
+    assert.deepEqual(encodeMultiSet(keys, values, 60, 9), Buffer.from("o 0 2 1 1 2 2 60 9\naxbbyy"));
+  });
+
+  it("rejects an empty keys array synchronously", () => {
+    assert.throws(() => encodeMultiSet([], []), RangeError);
+  });
+
+  it("rejects a keys/values length mismatch synchronously", () => {
+    assert.throws(() => encodeMultiSet([Buffer.from("a")], []), RangeError);
+  });
+
+  it("rejects an empty key inside the batch synchronously", () => {
+    assert.throws(() => encodeMultiSet([Buffer.alloc(0)], [Buffer.from("v")]), RangeError);
+  });
+
+  it("rejects non-integer and negative TTLs synchronously", () => {
+    for (const ttl of [3.5, -1, NaN, Infinity]) {
+      assert.throws(() => encodeMultiSet(keys, values, ttl), RangeError);
+    }
+  });
+
+  it("rejects many pairs whose combined size exceeds MAX_REQUEST_BYTES even though no single pair does", () => {
+    const bigKeys = Array.from({ length: 10 }, () => Buffer.alloc(1));
+    const bigValues = Array.from({ length: 10 }, () => Buffer.alloc(Math.ceil(MAX_REQUEST_BYTES / 9)));
+    assert.throws(() => encodeMultiSet(bigKeys, bigValues), RangeError);
   });
 });
 
@@ -449,6 +541,108 @@ describe("tryParseResponse — INCR's `I` response (issue #129)", () => {
 
   it("throws on a non-decimal ttl field", () => {
     assert.throws(() => tryParseResponse(Buffer.from("I 2 abc\n42")), /invalid ttl/);
+  });
+});
+
+describe("tryParseResponse — batched get/set M/O (issues #128/#150/#151)", () => {
+  it("parses a roster of hits, a miss, and a wrong-node, with hit bytes concatenated in order", () => {
+    const parsed = tryParseResponse(Buffer.from("M 3 1 - 2\nabc"));
+    assert.equal(parsed?.consumed, 13);
+    assert.deepEqual(parsed?.response, {
+      kind: "multi",
+      entries: [{ kind: "hit", value: Buffer.from("a") }, { kind: "miss" }, { kind: "hit", value: Buffer.from("bc") }],
+      tag: undefined,
+    });
+  });
+
+  it("parses an all-wrong-node roster with no body at all", () => {
+    const parsed = tryParseResponse(Buffer.from("M 2 W W\n"));
+    assert.equal(parsed?.consumed, 8);
+    assert.deepEqual(parsed?.response.entries, [{ kind: "wrongNode" }, { kind: "wrongNode" }]);
+  });
+
+  it("returns null while the header or a hit's body is incomplete", () => {
+    assert.equal(tryParseResponse(Buffer.from("M 2 1")), null);
+    assert.equal(tryParseResponse(Buffer.from("M 2 1 1\na")), null); // second hit's byte hasn't arrived yet
+  });
+
+  it("parses a tagged multi-get response", () => {
+    const parsed = tryParseResponse(Buffer.from("M 1 - 9\n"), true);
+    assert.equal(parsed?.consumed, 8);
+    assert.deepEqual(parsed?.response, { kind: "multi", entries: [{ kind: "miss" }], tag: 9 });
+  });
+
+  it("throws on a malformed roster (count disagrees with the field count actually present)", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("M 3 1 -\n")), /invalid multi-get\/multi-set header/);
+  });
+
+  it("throws on an invalid hit length", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("M 1 x\n")), /invalid multi-get result length/);
+  });
+
+  it("stores results are S/W, with no body — the reply completes the instant its header is read", () => {
+    const parsed = tryParseResponse(Buffer.from("O 2 S W\nEXTRA"));
+    assert.equal(parsed?.consumed, 8);
+    assert.deepEqual(parsed?.response, { kind: "multiAck", ackEntries: [{ kind: "stored" }, { kind: "wrongNode" }], tag: undefined });
+  });
+
+  it("parses a tagged multi-set response", () => {
+    const parsed = tryParseResponse(Buffer.from("O 1 S 9\n"), true);
+    assert.deepEqual(parsed?.response, { kind: "multiAck", ackEntries: [{ kind: "stored" }], tag: 9 });
+  });
+
+  it("returns null while an O header is incomplete", () => {
+    assert.equal(tryParseResponse(Buffer.from("O 2 S")), null);
+  });
+
+  it("throws on an invalid multi-set result token", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("O 1 X\n")), /invalid multi-set result token/);
+  });
+
+  it("consumes only the first frame when several M/O frames are buffered back to back", () => {
+    const parsed = tryParseResponse(Buffer.from("M 1 -\nO 1 S\n"));
+    assert.equal(parsed?.consumed, 6);
+    assert.equal(parsed?.response.kind, "multi");
+  });
+
+  it("copies hit bytes out of the shared receive buffer, not a view into it", () => {
+    const buf = Buffer.from("M 1 2\nab");
+    const parsed = tryParseResponse(buf);
+    const entries = parsed?.response.entries;
+    buf.fill(0);
+    assert.deepEqual(entries?.[0], { kind: "hit", value: Buffer.from("ab") });
+  });
+});
+
+describe("peekMultiFrameLength (issues #128/#150/#151)", () => {
+  it("computes the total M frame length from the header alone, before the body arrives", () => {
+    // Header declares two 5-byte hits; only 3 of those 10 body bytes
+    // have actually arrived yet.
+    const buf = Buffer.from("M 2 5 5\nabc");
+    assert.equal(peekMultiFrameLength(buf, false), "M 2 5 5\n".length + 10);
+  });
+
+  it("returns the header length alone for O, which has no body", () => {
+    const buf = Buffer.from("O 2 S W");
+    assert.equal(peekMultiFrameLength(buf, false), undefined); // header not yet terminated
+    assert.equal(peekMultiFrameLength(Buffer.from("O 2 S W\n"), false), "O 2 S W\n".length);
+  });
+
+  it("returns undefined for a non-multi marker", () => {
+    assert.equal(peekMultiFrameLength(Buffer.from("V 5\nAlice"), false), undefined);
+  });
+
+  it("returns undefined while the header line itself hasn't arrived yet", () => {
+    assert.equal(peekMultiFrameLength(Buffer.from("M 2 5"), false), undefined);
+  });
+
+  it("returns undefined on an empty buffer", () => {
+    assert.equal(peekMultiFrameLength(Buffer.alloc(0), false), undefined);
+  });
+
+  it("accounts for the tag field in tagged mode", () => {
+    const buf = Buffer.from("M 1 3 9\nabc");
+    assert.equal(peekMultiFrameLength(buf, true), "M 1 3 9\n".length + 3);
   });
 });
 

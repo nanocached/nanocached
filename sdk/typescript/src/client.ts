@@ -6,7 +6,7 @@ import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
-import { checkKeyAndValue, contentDigest, EMPTY_NAMESPACE, type CasCondition } from "./protocol.js";
+import { checkKey, checkKeyAndValue, contentDigest, EMPTY_NAMESPACE, type CasCondition, type MultiAckEntry, type MultiEntry } from "./protocol.js";
 
 export { ConnectionLostError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
@@ -25,6 +25,25 @@ export class AlreadyClosedError extends NanocachedError {
   constructor() {
     super("nanocached: this client is closed");
     this.name = "AlreadyClosedError";
+  }
+}
+
+/** Thrown by getMany/getManyBytes (issues #128/#150/#151) when some
+ * keys are still wrong-node after the one bounded refresh-and-retry
+ * every batch gets (the per-key analogue of get/set's own `W`
+ * refresh-and-retry) — a subclass of WrongNodeError, so existing
+ * `catch (WrongNodeError)` handling keeps working unchanged.
+ * `partialValues` holds every key that DID resolve (a `Map<string,
+ * Buffer>` from getManyBytes, `Map<string, string>` from getMany) —
+ * a batch never fails as a whole (docs/protocol.html#multi), so a
+ * handful of stale placements shouldn't force discarding an otherwise
+ * successful batch. setMany/setManyBytes have nothing to return on
+ * success, so they just throw a plain WrongNodeError on the same
+ * condition — there's no partial payload worth attaching. */
+export class PartialWrongNodeError<T = unknown> extends WrongNodeError {
+  constructor(public readonly partialValues: T) {
+    super();
+    this.name = "PartialWrongNodeError";
   }
 }
 
@@ -285,6 +304,15 @@ function shuffled<T>(items: readonly T[]): T[] {
 // on use rather than on a timer — see NanocachedClient.maybeRefreshNodeList.
 const NODE_LIST_STALE_AFTER_MS = 30_000;
 
+// Batch chunking (issues #128/#150/#151): NanocachedClient never sends
+// more than this many keys in one `m`/`o` sub-frame — larger batches
+// transparently become more than one sub-frame per owner, invisible to
+// callers. Sized against protocol.ts's MAX_MULTI_HEADER_LENGTH (see its
+// own derivation comment) — matches the Go SDK's identically-derived
+// maxBatchKeys (sdk/go/client.go). Exported only so tests can assert
+// against it directly, mirroring FIRE_AND_FORGET_TUNING/KEEPALIVE_TUNING.
+export const MAX_BATCH_KEYS = 400;
+
 // Tracks, per connect() target (not per instance — there's no `close()` yet
 // to hook into), how many live sockets are still open for it. Purely a
 // programming-error guard: catches "connect() called again for the same
@@ -372,6 +400,10 @@ interface NamespaceOps {
   getWithToken(key: string | Uint8Array): Promise<{ value: Buffer; token: string } | null>;
   set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void>;
   delete(key: string | Uint8Array): Promise<boolean>;
+  getMany(keys: readonly string[]): Promise<Map<string, string>>;
+  getManyBytes(keys: readonly string[]): Promise<Map<string, Buffer>>;
+  setMany(values: Record<string, string>, ttlSeconds: number): Promise<void>;
+  setManyBytes(values: Record<string, Uint8Array>, ttlSeconds: number): Promise<void>;
   clear(): Promise<void>;
   incr(key: string | Uint8Array, delta: number): Promise<number | null>;
   decr(key: string | Uint8Array, delta: number): Promise<number | null>;
@@ -422,6 +454,26 @@ export class NanocachedNamespace {
   /** See `NanocachedClient.delete`. */
   delete(key: string | Uint8Array): Promise<boolean> {
     return this.ops.delete(key);
+  }
+
+  /** See `NanocachedClient.getMany`. */
+  getMany(keys: readonly string[]): Promise<Map<string, string>> {
+    return this.ops.getMany(keys);
+  }
+
+  /** See `NanocachedClient.getManyBytes`. */
+  getManyBytes(keys: readonly string[]): Promise<Map<string, Buffer>> {
+    return this.ops.getManyBytes(keys);
+  }
+
+  /** See `NanocachedClient.setMany`. */
+  setMany(values: Record<string, string>, ttlSeconds = 0): Promise<void> {
+    return this.ops.setMany(values, ttlSeconds);
+  }
+
+  /** See `NanocachedClient.setManyBytes`. */
+  setManyBytes(values: Record<string, Uint8Array>, ttlSeconds = 0): Promise<void> {
+    return this.ops.setManyBytes(values, ttlSeconds);
   }
 
   /** Clears this namespace (issue #106) — every entry in it, on every
@@ -1194,6 +1246,375 @@ export class NanocachedClient {
     );
   }
 
+  // ── batched get/set (issues #128/#150/#151) ────────────────────────
+
+  /** Returns every requested key's value as a string, in one round trip
+   * per owner (batched get) instead of one round trip per key — see
+   * `getManyBytes`, which this decodes, for the full contract (missing
+   * keys, the partial-result error, chunking). */
+  async getMany(keys: readonly string[]): Promise<Map<string, string>> {
+    return this.getManyInNamespace(EMPTY_NAMESPACE, keys);
+  }
+
+  private async getManyInNamespace(namespace: Uint8Array, keys: readonly string[]): Promise<Map<string, string>> {
+    try {
+      return this.decodeMany(await this.getManyBytesInNamespace(namespace, keys));
+    } catch (error) {
+      if (error instanceof PartialWrongNodeError) {
+        throw new PartialWrongNodeError(this.decodeMany(error.partialValues as Map<string, Buffer>));
+      }
+      throw error;
+    }
+  }
+
+  private decodeMany(raw: Map<string, Buffer>): Map<string, string> {
+    const values = new Map<string, string>();
+    for (const [key, value] of raw) values.set(key, UTF8_DECODER.decode(value));
+    return values;
+  }
+
+  /** Returns every requested key's raw value in one round trip per
+   * owner (batched get, docs/protocol.html#multi) — a missing key is
+   * simply absent from the returned map, never an error, the same "a
+   * miss is not an error" contract `getBytes` itself has. `keys` must
+   * be non-empty.
+   *
+   * A batch never fails as a whole: if some keys are still wrong-node
+   * after one bounded refresh-and-retry (the same policy `getBytes`
+   * itself applies, generalized to a per-key roster instead of an
+   * all-or-nothing retry — see `multiGetPass`), this throws
+   * `PartialWrongNodeError` whose `.partialValues` holds every key that
+   * DID resolve, rather than discarding a mostly-successful batch over
+   * a handful of stale placements. In single-node/proxy mode a `W`
+   * propagates the same way, immediately — there is no ring to refresh
+   * against.
+   *
+   * Larger batches are transparently split into more than one `m`
+   * sub-frame per owner (batch chunking, see MAX_BATCH_KEYS) —
+   * callers never need to think about this. */
+  async getManyBytes(keys: readonly string[]): Promise<Map<string, Buffer>> {
+    return this.getManyBytesInNamespace(EMPTY_NAMESPACE, keys);
+  }
+
+  private async getManyBytesInNamespace(namespace: Uint8Array, keys: readonly string[]): Promise<Map<string, Buffer>> {
+    if (this.closed) throw new AlreadyClosedError();
+    if (keys.length === 0) {
+      throw new RangeError("nanocached: getMany/getManyBytes requires at least one key");
+    }
+    // Eager, up-front, before any network I/O — the same fail-fast
+    // contract every other public method already gets from its own
+    // encoder; a bad key deep in a 900-key batch must not leave earlier
+    // sub-frames already sent before it's discovered.
+    const keyBytes = keys.map((key) => {
+      const bytes = Buffer.from(key, "utf8");
+      checkKey(bytes, namespace);
+      return bytes;
+    });
+    await this.maybeRefreshNodeList();
+
+    const values = new Map<string, Buffer>();
+
+    if (this.target.kind !== "cluster") {
+      // Single/proxy mode: no retry layer at all, matching
+      // getRawInNamespace's own non-cluster branch (withWrongNodeRetry
+      // excludes "single", and a proxy connection has no ring to
+      // refresh against either way).
+      const entries = await this.multiGetChunked(() => this.connectionForSingleTarget(), namespace, keyBytes);
+      let wrongNode = false;
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (entry.kind === "hit") values.set(keys[i], entry.value);
+        else if (entry.kind === "wrongNode") wrongNode = true;
+      }
+      if (wrongNode) throw new PartialWrongNodeError(values);
+      return values;
+    }
+
+    let retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, undefined);
+    if (retryIndices.length === 0) return values;
+
+    await this.maybeRefreshNodeList({ force: true });
+    retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, retryIndices);
+    if (retryIndices.length > 0) throw new PartialWrongNodeError(values);
+    return values;
+  }
+
+  /** One pass of getManyBytes' cluster routing: group the given indices
+   * (every key, when retryIndices is undefined — the initial pass — or
+   * just what a previous pass left unresolved) by their current
+   * primary owner (matching readFromOwners' own primary-first stance),
+   * dispatch one (possibly chunked) `m` exchange per owner
+   * concurrently, splice hits into values, and return the indices
+   * still unresolved: a per-key `W`, or a whole owner group whose call
+   * failed outright — indistinguishable from a possibly-idle-closed
+   * connection, the same stance memberConnection's own callers take
+   * elsewhere. Called once for the initial pass and once more, if
+   * needed, after a single forced refresh — see
+   * getManyBytesInNamespace. This deliberately does not reuse
+   * withWrongNodeRetry (whole-operation, exception-driven); it's the
+   * same two-pass-with-forced-refresh idiom fanoutClear/
+   * clearFanoutAttempt already use, just keyed per-key instead of
+   * per-node. */
+  private async multiGetPass(
+    namespace: Uint8Array,
+    keys: readonly string[],
+    keyBytes: readonly Buffer[],
+    values: Map<string, Buffer>,
+    retryIndices: readonly number[] | undefined,
+  ): Promise<number[]> {
+    const indices = retryIndices ?? keyBytes.map((_, index) => index);
+
+    const groups = new Map<string, number[]>();
+    const retry: number[] = [];
+    for (const index of indices) {
+      const owners = this.ownerNames(keyBytes[index], namespace);
+      if (owners.length === 0) {
+        retry.push(index);
+        continue;
+      }
+      const primary = owners[0];
+      const group = groups.get(primary);
+      if (group) group.push(index);
+      else groups.set(primary, [index]);
+    }
+
+    await Promise.all(
+      [...groups.entries()].map(async ([owner, groupIndices]) => {
+        const groupKeyBytes = groupIndices.map((index) => keyBytes[index]);
+        let entries: MultiEntry[];
+        try {
+          entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
+        } catch {
+          retry.push(...groupIndices);
+          return;
+        }
+        for (let i = 0; i < groupIndices.length; i++) {
+          const index = groupIndices[i];
+          const entry = entries[i];
+          if (entry.kind === "wrongNode") retry.push(index);
+          else if (entry.kind === "hit") values.set(keys[index], entry.value);
+        }
+      }),
+    );
+
+    return retry;
+  }
+
+  /** Issues one or more `m` sub-frames against whatever `connectionFor`
+   * resolves to — already grouped to one owner (or the single/proxy
+   * target) by the caller — splitting into MAX_BATCH_KEYS-sized chunks
+   * (batch chunking) so no reply header risks exceeding
+   * protocol.ts's MAX_MULTI_HEADER_LENGTH. `connectionFor` is called
+   * fresh for every chunk (not resolved once up front), so a mid-batch
+   * reconnect is handled exactly the way a single-key get/set handles
+   * one today. */
+  private async multiGetChunked(
+    connectionFor: () => Promise<Connection>,
+    namespace: Uint8Array,
+    keyBytes: readonly Buffer[],
+  ): Promise<MultiEntry[]> {
+    const entries: MultiEntry[] = new Array(keyBytes.length);
+    for (let start = 0; start < keyBytes.length; start += MAX_BATCH_KEYS) {
+      const end = Math.min(start + MAX_BATCH_KEYS, keyBytes.length);
+      const connection = await connectionFor();
+      const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
+      for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+    }
+    return entries;
+  }
+
+  /** Stores every value in `values` in one round trip per involved node
+   * (batched set) instead of one round trip per key — see
+   * `setManyBytes` for the raw-bytes form this wraps, including its
+   * wrong-node and replication contract. `ttlSeconds` is shared by the
+   * whole batch, not per key (one real caller of a batched set —
+   * Django's `set_many`, cache-manager's `mset` — already passes one
+   * TTL per call). */
+  async setMany(values: Record<string, string>, ttlSeconds = 0): Promise<void> {
+    return this.setManyStringInNamespace(EMPTY_NAMESPACE, values, ttlSeconds);
+  }
+
+  private async setManyStringInNamespace(namespace: Uint8Array, values: Record<string, string>, ttlSeconds: number): Promise<void> {
+    const raw: Record<string, Uint8Array> = {};
+    for (const [key, value] of Object.entries(values)) raw[key] = Buffer.from(value, "utf8");
+    return this.setManyInNamespace(namespace, raw, ttlSeconds);
+  }
+
+  /** Stores every raw value in `values` in one round trip per involved
+   * node (batched set, docs/protocol.html#multi). `ttlSeconds` is a
+   * whole number of seconds shared by the whole batch; 0 means no
+   * expiry, negative or non-integer is rejected. `values` must be
+   * non-empty. Transparently compresses values at or above
+   * `compressionThreshold` when `compress` is enabled, exactly like
+   * `setBytes`.
+   *
+   * Within one batch, the same node can be a key's primary and another
+   * key's replica at once — it receives exactly one `o` sub-frame
+   * either way, and only its answer for the keys it is primary for
+   * decides those keys' outcome; a replica-held key's failure is
+   * logged-and-swallowed into `stats().replicaWriteFailures`, exactly
+   * like `setBytes`' own replica legs (`writeToOwners`). A batch never
+   * fails as a whole: if some keys' primaries are still wrong-node
+   * after one bounded refresh-and-retry, this throws `WrongNodeError`
+   * — every other key in the batch was still stored. In
+   * single-node/proxy mode a `W` propagates immediately, exactly as
+   * `setBytes`' own single-mode behavior does.
+   *
+   * Larger batches are transparently split into more than one `o`
+   * sub-frame per node (batch chunking, see MAX_BATCH_KEYS). */
+  async setManyBytes(values: Record<string, Uint8Array>, ttlSeconds = 0): Promise<void> {
+    return this.setManyInNamespace(EMPTY_NAMESPACE, values, ttlSeconds);
+  }
+
+  private async setManyInNamespace(namespace: Uint8Array, values: Record<string, Uint8Array>, ttlSeconds: number): Promise<void> {
+    if (this.closed) throw new AlreadyClosedError();
+    const keys = Object.keys(values);
+    if (keys.length === 0) {
+      throw new RangeError("nanocached: setMany/setManyBytes requires at least one key");
+    }
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
+      throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+    }
+    // Eager, up-front, before any network I/O — see
+    // getManyBytesInNamespace's own doc comment for why.
+    const keyBytes = new Array<Buffer>(keys.length);
+    const valueBytes = new Array<Buffer>(keys.length);
+    for (let i = 0; i < keys.length; i++) {
+      const key = Buffer.from(keys[i], "utf8");
+      const original = Buffer.from(values[keys[i]]);
+      checkKeyAndValue(key, original, namespace);
+      keyBytes[i] = key;
+      valueBytes[i] = this.compress ? compressValue(original, this.compressionThreshold) : original;
+    }
+    await this.maybeRefreshNodeList();
+
+    if (this.target.kind !== "cluster") {
+      const entries = await this.multiSetChunked(() => this.connectionForSingleTarget(), namespace, keyBytes, valueBytes, ttlSeconds);
+      if (entries.some((entry) => entry.kind === "wrongNode")) throw new WrongNodeError();
+      return;
+    }
+
+    let retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, undefined);
+    if (retryIndices.length === 0) return;
+
+    await this.maybeRefreshNodeList({ force: true });
+    retryIndices = await this.multiSetPass(namespace, keyBytes, valueBytes, ttlSeconds, retryIndices);
+    if (retryIndices.length > 0) throw new WrongNodeError();
+  }
+
+  /** multiGetChunked's write-side twin: one or more `o` sub-frames
+   * against whatever `connectionFor` resolves to, split into
+   * MAX_BATCH_KEYS-sized chunks the same way. */
+  private async multiSetChunked(
+    connectionFor: () => Promise<Connection>,
+    namespace: Uint8Array,
+    keyBytes: readonly Buffer[],
+    valueBytes: readonly Buffer[],
+    ttlSeconds: number,
+  ): Promise<MultiAckEntry[]> {
+    const entries: MultiAckEntry[] = new Array(keyBytes.length);
+    for (let start = 0; start < keyBytes.length; start += MAX_BATCH_KEYS) {
+      const end = Math.min(start + MAX_BATCH_KEYS, keyBytes.length);
+      const connection = await connectionFor();
+      const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
+      for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+    }
+    return entries;
+  }
+
+  /** One pass of setManyBytes' cluster routing: for every key still
+   * needing resolution (every key, when retryIndices is undefined, or
+   * just what a previous pass left unresolved), build one sub-batch
+   * per **owner name across every rank** — not just primaries, unlike
+   * multiGetPass — because within one batch the same node can be
+   * primary for one key and a replica for another (see setManyBytes'
+   * own doc comment); each owner therefore gets exactly one `o`
+   * sub-frame covering every key it holds in any role. Only a leg's
+   * *primary* keys can end up in the returned retry list; a leg's
+   * replica-held keys are logged-and-swallowed into
+   * stats().replicaWriteFailures instead, mirroring writeToOwners'
+   * stance for single-key set. A leg that is a pure replica for every
+   * key it holds is eligible for fireAndForgetReplicas, exactly like a
+   * single-key replica write. */
+  private async multiSetPass(
+    namespace: Uint8Array,
+    keyBytes: readonly Buffer[],
+    valueBytes: readonly Buffer[],
+    ttlSeconds: number,
+    retryIndices: readonly number[] | undefined,
+  ): Promise<number[]> {
+    const indices = retryIndices ?? keyBytes.map((_, index) => index);
+
+    const groups = new Map<string, { indices: number[]; isPrimary: boolean[] }>();
+    const retry: number[] = [];
+    for (const index of indices) {
+      const names = this.ownerNames(keyBytes[index], namespace);
+      if (names.length === 0) {
+        retry.push(index);
+        continue;
+      }
+      names.forEach((name, rank) => {
+        let group = groups.get(name);
+        if (!group) {
+          group = { indices: [], isPrimary: [] };
+          groups.set(name, group);
+        }
+        group.indices.push(index);
+        group.isPrimary.push(rank === 0);
+      });
+    }
+
+    const legs: Promise<void>[] = [];
+    for (const [name, group] of groups) {
+      const runLeg = async (): Promise<void> => {
+        let entries: MultiAckEntry[];
+        try {
+          const groupKeyBytes = group.indices.map((index) => keyBytes[index]);
+          const groupValueBytes = group.indices.map((index) => valueBytes[index]);
+          entries = await this.multiSetChunked(() => this.memberConnection(name), namespace, groupKeyBytes, groupValueBytes, ttlSeconds);
+        } catch (error) {
+          // Swallowed by design, mirroring writeToOwners' replicaWrite
+          // closure — an actual programming bug (isSwallowable) still
+          // propagates instead of vanishing into a retry/stat.
+          if (!isSwallowable(error)) throw error;
+          for (let i = 0; i < group.indices.length; i++) {
+            if (group.isPrimary[i]) retry.push(group.indices[i]);
+            else this.replicaWriteFailures++;
+          }
+          return;
+        }
+        for (let i = 0; i < group.indices.length; i++) {
+          if (!group.isPrimary[i]) {
+            if (entries[i].kind === "wrongNode") this.replicaWriteFailures++;
+            continue;
+          }
+          if (entries[i].kind === "wrongNode") retry.push(group.indices[i]);
+        }
+      };
+
+      const pureReplica = group.isPrimary.every((primary) => !primary);
+      if (this.fireAndForgetReplicas && pureReplica && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        // Detached: a pure-replica leg holds no primary key, so it has
+        // nothing to contribute to `retry` — see runLeg's own bounds.
+        // `!this.closed` is rechecked synchronously, immediately before
+        // `.add()`, with no `await` between (issue #47 audit
+        // invariant), mirroring writeToOwners exactly.
+        const background = runLeg();
+        const settled = background.catch(() => {});
+        this.backgroundReplicaWrites.add(background);
+        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        continue;
+      }
+
+      const leg = runLeg();
+      leg.catch(() => {});
+      legs.push(leg);
+    }
+
+    await Promise.all(legs);
+    return retry;
+  }
+
   /** INCR/DECR (issue #129). Unlike `writeToOwners` (which sends the same
    * write to every owner), a cluster incr only ever sends `i` to the
    * primary — see `incrOnOwners` for why and how the result reaches
@@ -1290,6 +1711,10 @@ export class NanocachedClient {
       getWithToken: (key) => this.getWithTokenInNamespace(namespaceBytes, key),
       set: (key, value, ttlSeconds) => this.setInNamespace(namespaceBytes, key, value, ttlSeconds),
       delete: (key) => this.deleteInNamespace(namespaceBytes, key),
+      getMany: (keys) => this.getManyInNamespace(namespaceBytes, keys),
+      getManyBytes: (keys) => this.getManyBytesInNamespace(namespaceBytes, keys),
+      setMany: (values, ttlSeconds) => this.setManyStringInNamespace(namespaceBytes, values, ttlSeconds),
+      setManyBytes: (values, ttlSeconds) => this.setManyInNamespace(namespaceBytes, values, ttlSeconds),
       clear: () => this.clearInNamespace(namespaceBytes),
       incr: (key, delta) => this.incrInNamespace(namespaceBytes, key, delta),
       decr: (key, delta) => this.incrInNamespace(namespaceBytes, key, -delta),

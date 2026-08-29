@@ -10,10 +10,15 @@ import {
   encodeDelete,
   encodeGet,
   encodeIncr,
+  encodeMultiGet,
+  encodeMultiSet,
   encodeSet,
   MAX_RESPONSE_FRAME_LENGTH,
+  peekMultiFrameLength,
   tryParseResponse,
   type CasCondition,
+  type MultiAckEntry,
+  type MultiEntry,
   type ParsedResponse,
 } from "./protocol.js";
 
@@ -277,15 +282,63 @@ export class Connection {
     if (response.kind !== "cleared") throw this.mismatch(response);
   }
 
+  /** Batched get (issues #128/#150/#151): `n` keys under one round trip
+   * through the cache, instead of `n` independent `get()` calls. Always
+   * namespaced on the wire (namespace defaults to the default
+   * namespace, matching `incr`'s own default) — `m` has no legacy
+   * uppercase form. Returns one entry per key, in request order: a
+   * batch never fails as a whole (docs/protocol.html#multi), so a
+   * per-key `W` lives inside the returned array, never as a thrown
+   * `WrongNodeError` for the whole call. This is the single-node
+   * primitive only — `NanocachedClient` is what groups keys by owner
+   * and drives the per-key refresh-and-retry pass. */
+  async multiGet(keys: readonly Uint8Array[], namespace: Uint8Array = EMPTY_NAMESPACE): Promise<MultiEntry[]> {
+    const response = await this.send((tag) => encodeMultiGet(keys, tag, namespace));
+    if (response.kind !== "multi" || response.entries === undefined) throw this.mismatch(response);
+    if (response.entries.length !== keys.length) {
+      throw this.desynced(
+        `multi-get response roster length ${response.entries.length} does not match request key count ${keys.length}`,
+      );
+    }
+    return response.entries;
+  }
+
+  /** Batched set (issues #150/#151): `n` keys stored under one round
+   * trip, one shared `ttlSeconds` for the whole batch rather than per
+   * key. See `multiGet` for the same per-key independence contract and
+   * always-namespaced shape. */
+  async multiSet(
+    keys: readonly Uint8Array[],
+    values: readonly Uint8Array[],
+    ttlSeconds = 0,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<MultiAckEntry[]> {
+    const response = await this.send((tag) => encodeMultiSet(keys, values, ttlSeconds, tag, namespace));
+    if (response.kind !== "multiAck" || response.ackEntries === undefined) throw this.mismatch(response);
+    if (response.ackEntries.length !== keys.length) {
+      throw this.desynced(
+        `multi-set response roster length ${response.ackEntries.length} does not match request key count ${keys.length}`,
+      );
+    }
+    return response.ackEntries;
+  }
+
   /** A well-formed response of the wrong kind (a `stored` answering a G)
    * means the request/response streams are misaligned — every later
    * response would answer the wrong request, silently returning other
    * keys' data. Poison the connection, and classify as a connection error
    * so the client's retry layer redials and retries once. */
   private mismatch(response: ParsedResponse): ConnectionLostError {
-    const error = new ConnectionLostError(
-      `nanocached: response "${response.kind}" does not match the request (connection desynced)`,
-    );
+    return this.desynced(`response "${response.kind}" does not match the request`);
+  }
+
+  /** Same fatal classification as `mismatch` above, but for a
+   * well-formed response of the *right* kind whose roster length still
+   * disagrees with the request (issues #128/#150/#151, `multiGet`/
+   * `multiSet`) — the streams are just as desynced as a kind mismatch
+   * would indicate. */
+  private desynced(message: string): ConnectionLostError {
+    const error = new ConnectionLostError(`nanocached: ${message} (connection desynced)`);
     this.poison(error);
     return error;
   }
@@ -421,7 +474,19 @@ export class Connection {
         // covering the value body (and any other response kind), so a
         // malicious server can't wedge this open by trickling bytes that
         // never assemble into a parseable frame (issue #12 follow-up).
-        if (buffer.length > MAX_RESPONSE_FRAME_LENGTH) {
+        // A batched `M`/`O` reply's total size depends on its roster
+        // (issues #128/#150/#151) rather than one fixed value, so
+        // MAX_RESPONSE_FRAME_LENGTH alone — sized for exactly one
+        // maximally-sized `V` — would kill a large, perfectly legitimate
+        // batch reply mid-flight. peekMultiFrameLength reads the
+        // already-received header (if any) to compute the real total
+        // once it's known, widening the backstop to match; every other
+        // response kind's bound is completely unaffected (peek returns
+        // undefined for them).
+        const expectedMultiLength = peekMultiFrameLength(buffer, this.tagged);
+        const limit =
+          expectedMultiLength === undefined ? MAX_RESPONSE_FRAME_LENGTH : Math.max(MAX_RESPONSE_FRAME_LENGTH, expectedMultiLength);
+        if (buffer.length > limit) {
           this.lastError = new NanocachedError("nanocached: response frame exceeds maximum size (connection desynced)");
           this.socket.destroy();
           return;
