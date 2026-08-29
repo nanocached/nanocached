@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::cas::{content_digest, CasToken};
 use crate::compression::resolve_compression;
-use crate::connection::{CasCondition, Connection};
+use crate::connection::{CasCondition, Connection, MultiEntry};
 use crate::error::{Error, Result};
 use crate::hash_ring::HashRing;
 use crate::identify::{
@@ -84,6 +84,13 @@ const DEFAULT_RECONNECT_COOLDOWN: Duration = Duration::from_secs(1);
 /// never trips that connection-poisoning rejection (issue #47 audit item
 /// R1; see README's "Errors" section).
 const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
+
+/// issue #151 — batched get/set: bounds how many keys `get_many`/
+/// `get_many_bytes`/`set_many`/`set_many_bytes` pack into a single
+/// `m`/`o` sub-frame per owner before splitting into more than one
+/// (batch chunking) — same value the Go/TypeScript/Python/Java/.NET
+/// SDKs use.
+const MAX_BATCH_KEYS: usize = 400;
 
 /// The default namespace — always the empty byte string. Every
 /// namespace-less `get`/`set`/`delete` call on this client passes this,
@@ -170,6 +177,19 @@ fn validate_key_and_value(namespace: &[u8], key: &[u8], value: &[u8]) -> Result<
 /// [`Namespace::get`] so the two stay identical instead of drifting.
 fn decode_utf8_value(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes).map_err(Error::InvalidUtf8)
+}
+
+/// [`NanocachedClient::get_many_in`]'s own UTF-8 decode, generalized
+/// over a whole batch — shares [`decode_utf8_value`]'s strict-decoder
+/// contract per value: any single non-UTF-8 value fails the whole
+/// decode (issue #151), the same "one bad value poisons the batch's
+/// text form" stance `get`/`get_bytes` already have for a single key.
+fn decode_many(raw: HashMap<String, Vec<u8>>) -> Result<HashMap<String, String>> {
+    let mut values = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        values.insert(key, decode_utf8_value(value)?);
+    }
+    Ok(values)
 }
 
 /// `decr`'s delta negation (issue #129) — shared by
@@ -546,6 +566,17 @@ impl WriteBody<'_> {
 enum OwnedWriteBody {
     Set { value: Vec<u8>, ttl_seconds: u64 },
     Delete,
+}
+
+/// One owner's key/`is_primary` membership across one
+/// [`NanocachedClient::multi_set_pass`] call — see that method's own
+/// doc comment for why a key can appear here with `is_primary` false:
+/// the same node can be primary for one key in the batch and a replica
+/// for another (issue #151).
+#[derive(Default)]
+struct MultiSetOwnerBatch {
+    indices: Vec<usize>,
+    is_primary: Vec<bool>,
 }
 
 /// One hedged-read leg's outcome (hedged reads, issue #64): tagged with
@@ -1504,6 +1535,560 @@ impl NanocachedClient {
             })
         })
         .await
+    }
+
+    // ── batched get/set (issue #151) ─────────────────────────────────
+    // m/o — see docs/protocol.html#multi. Every requested key's owner is
+    // still resolved via HashRing/owner_names, exactly like a single
+    // get_bytes/set: get_many_bytes groups keys by primary owner and
+    // issues one `m` sub-frame per owner (batch chunking splits an
+    // over-MAX_BATCH_KEYS group further); set_many_bytes groups by every
+    // owner across every rank, since one batch's keys can place the same
+    // node as primary for one key and a replica for another. A batch
+    // never fails as a whole (docs/protocol.html#multi): get_many_bytes
+    // returns every key that resolved, wrapped in
+    // Err(Error::PartialWrongNode) (carrying that partial map) only if
+    // some keys are still wrong-node after one bounded refresh-and-retry
+    // — the same policy get_bytes' own with_cluster_retry applies,
+    // generalized to a per-key roster instead of an all-or-nothing
+    // retry. set_many_bytes has nothing to return on success, so it just
+    // returns Err(Error::WrongNode) on the same condition.
+
+    /// As [`Self::get_many_bytes`], decoding every hit as UTF-8.
+    pub async fn get_many<K: AsRef<str>>(&self, keys: &[K]) -> Result<HashMap<String, String>> {
+        self.get_many_in(DEFAULT_NAMESPACE, keys).await
+    }
+
+    /// The shared implementation behind [`Self::get_many`] and
+    /// [`Namespace::get_many`] (Namespaces, issue #105).
+    async fn get_many_in<K: AsRef<str>>(
+        &self,
+        namespace: &[u8],
+        keys: &[K],
+    ) -> Result<HashMap<String, String>> {
+        match self.get_many_bytes_in(namespace, keys).await {
+            Ok(raw) => decode_many(raw),
+            Err(Error::PartialWrongNode(partial)) => {
+                Err(Error::PartialWrongNodeText(decode_many(partial)?))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Returns every requested key's raw value in one round trip per
+    /// owner (batched get, docs/protocol.html#multi) — a missing key is
+    /// simply absent from the returned map, never an error, the same "a
+    /// miss is not an error" contract [`Self::get_bytes`] itself has.
+    /// `keys` must be non-empty.
+    ///
+    /// A batch never fails as a whole: if some keys are still wrong-node
+    /// after one bounded refresh-and-retry, returns
+    /// `Err(Error::PartialWrongNode)` whose map holds every key that DID
+    /// resolve, rather than discarding a mostly-successful batch over a
+    /// handful of stale placements. In single-node/proxy mode a `W`
+    /// propagates immediately, exactly as [`Self::get_bytes`]'s own
+    /// single-mode behavior does — there is no ring to refresh against.
+    ///
+    /// Larger batches are transparently split into more than one `m`
+    /// sub-frame per owner (batch chunking, see [`MAX_BATCH_KEYS`]) —
+    /// callers never need to think about this.
+    pub async fn get_many_bytes<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        self.get_many_bytes_in(DEFAULT_NAMESPACE, keys).await
+    }
+
+    /// The shared implementation behind [`Self::get_many_bytes`] and
+    /// [`Namespace::get_many_bytes`] (Namespaces, issue #105).
+    async fn get_many_bytes_in<K: AsRef<str>>(
+        &self,
+        namespace: &[u8],
+        keys: &[K],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        if keys.is_empty() {
+            return Err(Error::InvalidArgument(
+                "nanocached: get_many/get_many_bytes requires at least one key".to_string(),
+            ));
+        }
+        let key_strings: Vec<&str> = keys.iter().map(|key| key.as_ref()).collect();
+        let mut key_bytes: Vec<Vec<u8>> = Vec::with_capacity(key_strings.len());
+        for key in &key_strings {
+            let bytes = key.as_bytes().to_vec();
+            validate_key(namespace, &bytes)?;
+            key_bytes.push(bytes);
+        }
+        self.before_operation().await?;
+
+        let mut values: HashMap<String, Vec<u8>> = HashMap::with_capacity(key_strings.len());
+
+        let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
+        if single {
+            let entries = self.multi_get_chunked(None, namespace, &key_bytes).await?;
+            let mut wrong_node = false;
+            for (i, entry) in entries.into_iter().enumerate() {
+                match entry {
+                    MultiEntry::Hit(value) => {
+                        values.insert(key_strings[i].to_string(), self.maybe_decompress(value)?);
+                    }
+                    MultiEntry::WrongNode => wrong_node = true,
+                    MultiEntry::Miss | MultiEntry::Stored => {}
+                }
+            }
+            if wrong_node {
+                return Err(Error::PartialWrongNode(values));
+            }
+            return Ok(values);
+        }
+
+        let indices: Vec<usize> = (0..key_strings.len()).collect();
+        let retry = self
+            .multi_get_pass(namespace, &key_strings, &key_bytes, &mut values, indices)
+            .await?;
+        if retry.is_empty() {
+            return Ok(values);
+        }
+        self.maybe_refresh(true).await;
+        let retry = self
+            .multi_get_pass(namespace, &key_strings, &key_bytes, &mut values, retry)
+            .await?;
+        if !retry.is_empty() {
+            return Err(Error::PartialWrongNode(values));
+        }
+        Ok(values)
+    }
+
+    /// `compress`'s decompression step (see [`Self::get_bytes_in`]),
+    /// generalized so [`Self::get_many_bytes_in`]'s per-entry splicing
+    /// can share it: a no-op when `compress` is off.
+    fn maybe_decompress(&self, value: Vec<u8>) -> Result<Vec<u8>> {
+        if self.inner.compress {
+            crate::compression::decompress_value(&value)
+        } else {
+            Ok(value)
+        }
+    }
+
+    /// Issues one or more `m` sub-frames against `slot`'s connection
+    /// (`None` for the single/proxy target) — already grouped to one
+    /// owner by the caller — splitting into [`MAX_BATCH_KEYS`]-sized
+    /// chunks (batch chunking) so no reply header risks exceeding the
+    /// wire's header bound.
+    async fn multi_get_chunked(
+        &self,
+        slot: Option<&str>,
+        namespace: &[u8],
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<MultiEntry>> {
+        let mut entries = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(MAX_BATCH_KEYS) {
+            let op = |connection: Arc<Connection>| async move {
+                connection.multi_get(namespace, chunk).await
+            };
+            let chunk_entries = self.apply_reconnecting(slot, &op).await?;
+            entries.extend(chunk_entries);
+        }
+        Ok(entries)
+    }
+
+    /// One pass of [`Self::get_many_bytes_in`]'s cluster routing: group
+    /// the given `indices` (every key, on the initial pass, or just the
+    /// keys a previous pass left unresolved) by their current primary
+    /// owner (matching plain `get`'s own primary-first stance), dispatch
+    /// one (possibly chunked) `m` exchange per owner concurrently,
+    /// splice hits into `values`, and return the indices still
+    /// unresolved: a per-key `W`, or a whole owner group whose call
+    /// failed outright. Called once for the initial pass and once more,
+    /// if needed, after a single forced refresh.
+    async fn multi_get_pass(
+        &self,
+        namespace: &[u8],
+        key_strings: &[&str],
+        key_bytes: &[Vec<u8>],
+        values: &mut HashMap<String, Vec<u8>>,
+        indices: Vec<usize>,
+    ) -> Result<Vec<usize>> {
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut retry = Vec::new();
+        {
+            let state = self.inner.state.lock().await;
+            for idx in indices {
+                let owners = Self::owner_names(&state, namespace, &key_bytes[idx]);
+                match owners.into_iter().next() {
+                    Some(primary) => groups.entry(primary).or_default().push(idx),
+                    None => retry.push(idx),
+                }
+            }
+        }
+
+        let outcomes =
+            futures_util::future::join_all(groups.iter().map(|(owner, group_indices)| {
+                self.run_multi_get_leg(namespace, owner, group_indices, key_strings, key_bytes)
+            }))
+            .await;
+
+        for outcome in outcomes {
+            let outcome = outcome?;
+            retry.extend(outcome.0);
+            for (key, value) in outcome.1 {
+                values.insert(key, value);
+            }
+        }
+        Ok(retry)
+    }
+
+    /// One owner group's `m` exchange, run concurrently with every other
+    /// group by [`Self::multi_get_pass`]: a connection-level failure
+    /// retries the whole group (indistinguishable from a
+    /// possibly-idle-closed connection, same stance
+    /// [`Self::apply_reconnecting`]'s own callers take elsewhere); a
+    /// per-key `W` retries just that key; a hit is returned for the
+    /// caller to splice into `values` once every group has finished (a
+    /// client-side `compress` mismatch propagates, aborting the batch
+    /// immediately — never fed into the retry pass, since it isn't a
+    /// routing outcome). Returns `(retry indices, decoded hits)` rather
+    /// than mutating shared state directly, since every group runs
+    /// concurrently with the others.
+    async fn run_multi_get_leg(
+        &self,
+        namespace: &[u8],
+        owner: &str,
+        group_indices: &[usize],
+        key_strings: &[&str],
+        key_bytes: &[Vec<u8>],
+    ) -> Result<(Vec<usize>, Vec<(String, Vec<u8>)>)> {
+        let group_keys: Vec<Vec<u8>> = group_indices
+            .iter()
+            .map(|&i| key_bytes[i].clone())
+            .collect();
+        let entries = match self
+            .multi_get_chunked(Some(owner), namespace, &group_keys)
+            .await
+        {
+            Ok(entries) => entries,
+            Err(_connection_failure) => return Ok((group_indices.to_vec(), Vec::new())),
+        };
+
+        let mut retry = Vec::new();
+        let mut hits = Vec::new();
+        for (&idx, entry) in group_indices.iter().zip(entries) {
+            match entry {
+                MultiEntry::WrongNode => retry.push(idx),
+                MultiEntry::Hit(value) => {
+                    hits.push((key_strings[idx].to_string(), self.maybe_decompress(value)?));
+                }
+                MultiEntry::Miss | MultiEntry::Stored => {}
+            }
+        }
+        Ok((retry, hits))
+    }
+
+    pub async fn set_many(&self, values: &HashMap<String, String>, ttl_seconds: u64) -> Result<()> {
+        self.set_many_in(DEFAULT_NAMESPACE, values, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::set_many`] and
+    /// [`Namespace::set_many`] (Namespaces, issue #105).
+    async fn set_many_in(
+        &self,
+        namespace: &[u8],
+        values: &HashMap<String, String>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
+        let raw: HashMap<String, Vec<u8>> = values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_bytes().to_vec()))
+            .collect();
+        self.set_many_bytes_in(namespace, &raw, ttl_seconds).await
+    }
+
+    /// Stores every raw value in `values` in one round trip per involved
+    /// node (batched set, docs/protocol.html#multi). `ttl_seconds == 0`
+    /// means no expiry, shared by the whole batch — not per key, since
+    /// every real caller of a batched set (Django's `set_many`,
+    /// cache-manager's `mset`) already passes one TTL per call. `values`
+    /// must be non-empty. Transparently compresses values at or above
+    /// `compression_threshold` when `compress` is enabled, exactly like
+    /// [`Self::set`].
+    ///
+    /// Within one batch, the same node can be a key's primary and
+    /// another key's replica at once — it receives exactly one `o`
+    /// sub-frame either way, and only its answer for the keys it is
+    /// primary for decides that key's outcome; a replica-held key's
+    /// failure or `W` is logged-and-swallowed into
+    /// `stats().replica_write_failures`, exactly like [`Self::set`]'s
+    /// own replica legs ([`Self::write`]). A batch never fails as a
+    /// whole: if some keys' primaries are still wrong-node after one
+    /// bounded refresh-and-retry, this returns `Err(Error::WrongNode)` —
+    /// every other key in the batch was still stored. In
+    /// single-node/proxy mode a `W` propagates immediately, exactly as
+    /// [`Self::set`]'s own single-mode behavior does.
+    ///
+    /// Larger batches are transparently split into more than one `o`
+    /// sub-frame per node (batch chunking, see [`MAX_BATCH_KEYS`]).
+    pub async fn set_many_bytes(
+        &self,
+        values: &HashMap<String, Vec<u8>>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
+        self.set_many_bytes_in(DEFAULT_NAMESPACE, values, ttl_seconds)
+            .await
+    }
+
+    /// The shared implementation behind [`Self::set_many_bytes`] and
+    /// [`Namespace::set_many_bytes`] (Namespaces, issue #105).
+    async fn set_many_bytes_in(
+        &self,
+        namespace: &[u8],
+        values: &HashMap<String, Vec<u8>>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Err(Error::InvalidArgument(
+                "nanocached: set_many/set_many_bytes requires at least one key".to_string(),
+            ));
+        }
+        let mut key_bytes: Vec<Vec<u8>> = Vec::with_capacity(values.len());
+        let mut value_bytes: Vec<Vec<u8>> = Vec::with_capacity(values.len());
+        for (key, original) in values {
+            let key_owned = key.as_bytes().to_vec();
+            validate_key_and_value(namespace, &key_owned, original)?;
+            key_bytes.push(key_owned);
+            value_bytes.push(if self.inner.compress {
+                crate::compression::compress_value(original, self.inner.compression_threshold)
+            } else {
+                original.clone()
+            });
+        }
+        self.before_operation().await?;
+
+        let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
+        if single {
+            let entries = self
+                .multi_set_chunked(None, namespace, &key_bytes, &value_bytes, ttl_seconds)
+                .await?;
+            if entries
+                .iter()
+                .any(|entry| matches!(entry, MultiEntry::WrongNode))
+            {
+                return Err(Error::WrongNode);
+            }
+            return Ok(());
+        }
+
+        let indices: Vec<usize> = (0..key_bytes.len()).collect();
+        let retry = self
+            .multi_set_pass(namespace, &key_bytes, &value_bytes, ttl_seconds, indices)
+            .await;
+        if retry.is_empty() {
+            return Ok(());
+        }
+        self.maybe_refresh(true).await;
+        let retry = self
+            .multi_set_pass(namespace, &key_bytes, &value_bytes, ttl_seconds, retry)
+            .await;
+        if !retry.is_empty() {
+            return Err(Error::WrongNode);
+        }
+        Ok(())
+    }
+
+    /// [`Self::multi_get_chunked`]'s write-side twin: one or more `o`
+    /// sub-frames against `slot`'s connection, split into
+    /// [`MAX_BATCH_KEYS`]-sized chunks the same way.
+    async fn multi_set_chunked(
+        &self,
+        slot: Option<&str>,
+        namespace: &[u8],
+        keys: &[Vec<u8>],
+        values: &[Vec<u8>],
+        ttl_seconds: u64,
+    ) -> Result<Vec<MultiEntry>> {
+        let mut entries = Vec::with_capacity(keys.len());
+        for (key_chunk, value_chunk) in keys
+            .chunks(MAX_BATCH_KEYS)
+            .zip(values.chunks(MAX_BATCH_KEYS))
+        {
+            let op = |connection: Arc<Connection>| async move {
+                connection
+                    .multi_set(namespace, key_chunk, value_chunk, ttl_seconds)
+                    .await
+            };
+            let chunk_entries = self.apply_reconnecting(slot, &op).await?;
+            entries.extend(chunk_entries);
+        }
+        Ok(entries)
+    }
+
+    /// One pass of [`Self::set_many_bytes_in`]'s cluster routing: for
+    /// every key still needing resolution (every key, on the initial
+    /// pass, or just what a previous pass left unresolved), build one
+    /// sub-batch per **owner name across every rank** — not just
+    /// primaries, unlike [`Self::multi_get_pass`] — because within one
+    /// batch the same node can be primary for one key and a replica for
+    /// another; each owner therefore gets exactly one `o` sub-frame
+    /// covering every key it holds in any role. Only a leg's *primary*
+    /// keys can end up in the returned retry list; a leg's replica-held
+    /// keys are logged-and-swallowed into `stats().replica_write_failures`
+    /// instead, mirroring [`Self::write`]'s stance for single-key set. A
+    /// leg that is a pure replica for every key it holds is eligible for
+    /// `fire_and_forget_replicas`, exactly like a single-key replica
+    /// write — see [`Self::run_multi_set_leg`]. Infallible by design: a
+    /// leg's connection-level failure is always swallowed into the retry
+    /// list or `stats().replica_write_failures`, never propagated —
+    /// matching every other batched-set SDK in this repo.
+    async fn multi_set_pass(
+        &self,
+        namespace: &[u8],
+        key_bytes: &[Vec<u8>],
+        value_bytes: &[Vec<u8>],
+        ttl_seconds: u64,
+        indices: Vec<usize>,
+    ) -> Vec<usize> {
+        let mut owners: HashMap<String, MultiSetOwnerBatch> = HashMap::new();
+        let mut retry = Vec::new();
+        {
+            let state = self.inner.state.lock().await;
+            for idx in indices {
+                let names = Self::owner_names(&state, namespace, &key_bytes[idx]);
+                if names.is_empty() {
+                    retry.push(idx);
+                    continue;
+                }
+                for (rank, name) in names.into_iter().enumerate() {
+                    let batch = owners.entry(name).or_default();
+                    batch.indices.push(idx);
+                    batch.is_primary.push(rank == 0);
+                }
+            }
+        }
+
+        let mut joined = Vec::with_capacity(owners.len());
+        for (name, batch) in owners {
+            let leg_keys: Vec<Vec<u8>> = batch
+                .indices
+                .iter()
+                .map(|&i| key_bytes[i].clone())
+                .collect();
+            let leg_values: Vec<Vec<u8>> = batch
+                .indices
+                .iter()
+                .map(|&i| value_bytes[i].clone())
+                .collect();
+            let pure_replica = !batch.is_primary.iter().any(|&primary| primary);
+
+            // Fire-and-forget replica writes: with fire_and_forget_replicas,
+            // up to background_replica_cap legs run detached on their own
+            // tokio task instead of being awaited below — mirrors
+            // `replicate_writes`'s own fire-and-forget branch exactly,
+            // including its close()-race fallback.
+            if self.inner.fire_and_forget_replicas && pure_replica {
+                if let Ok(permit) =
+                    Arc::clone(&self.inner.background_replica_permits).try_acquire_owned()
+                {
+                    if self.inner.closed.load(Ordering::SeqCst) {
+                        drop(permit);
+                    } else {
+                        let client = self.clone();
+                        let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
+                        tokio::spawn(async move {
+                            let _permit = permit; // held until this task finishes
+                            let _ = client
+                                .run_multi_set_leg(
+                                    &owned_namespace,
+                                    &name,
+                                    &batch,
+                                    &leg_keys,
+                                    &leg_values,
+                                    ttl_seconds,
+                                )
+                                .await;
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let client = self.clone();
+            let owned_namespace = namespace.to_vec();
+            joined.push(async move {
+                client
+                    .run_multi_set_leg(
+                        &owned_namespace,
+                        &name,
+                        &batch,
+                        &leg_keys,
+                        &leg_values,
+                        ttl_seconds,
+                    )
+                    .await
+            });
+        }
+
+        for mut leg_retry in futures_util::future::join_all(joined).await {
+            retry.append(&mut leg_retry);
+        }
+        retry
+    }
+
+    /// Dispatches one owner's `o` sub-batch (via
+    /// [`Self::multi_set_chunked`]) and returns the indices that need
+    /// retrying: only primary-held keys can end up in the returned list;
+    /// every replica-held key's failure or `W` is counted in
+    /// `stats().replica_write_failures` instead, mirroring
+    /// [`Self::write`]'s own stance for single-key set. A
+    /// connection-level failure for the whole leg is treated the same
+    /// way, key by key, since the SAME sub-frame can carry both primary-
+    /// and replica-held keys and a transport failure doesn't distinguish
+    /// between them.
+    async fn run_multi_set_leg(
+        &self,
+        namespace: &[u8],
+        name: &str,
+        batch: &MultiSetOwnerBatch,
+        leg_keys: &[Vec<u8>],
+        leg_values: &[Vec<u8>],
+        ttl_seconds: u64,
+    ) -> Vec<usize> {
+        let mut retry = Vec::new();
+        match self
+            .multi_set_chunked(Some(name), namespace, leg_keys, leg_values, ttl_seconds)
+            .await
+        {
+            Ok(entries) => {
+                for ((&idx, &is_primary), entry) in
+                    batch.indices.iter().zip(&batch.is_primary).zip(entries)
+                {
+                    let wrong_node = matches!(entry, MultiEntry::WrongNode);
+                    if !is_primary {
+                        if wrong_node {
+                            self.inner
+                                .stats
+                                .replica_write_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
+                    if wrong_node {
+                        retry.push(idx);
+                    }
+                }
+            }
+            Err(_connection_failure) => {
+                for i in 0..batch.indices.len() {
+                    if batch.is_primary[i] {
+                        retry.push(batch.indices[i]);
+                    } else {
+                        self.inner
+                            .stats
+                            .replica_write_failures
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        retry
     }
 
     /// Atomically adds `delta` (negative decrements — there is no separate
@@ -2872,6 +3457,41 @@ impl Namespace {
     /// See [`NanocachedClient::delete`]; scoped to this namespace.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.client.delete_in(&self.namespace, key).await
+    }
+
+    /// See [`NanocachedClient::get_many`]; scoped to this namespace
+    /// (issue #151).
+    pub async fn get_many<K: AsRef<str>>(&self, keys: &[K]) -> Result<HashMap<String, String>> {
+        self.client.get_many_in(&self.namespace, keys).await
+    }
+
+    /// See [`NanocachedClient::get_many_bytes`]; scoped to this namespace
+    /// (issue #151).
+    pub async fn get_many_bytes<K: AsRef<str>>(
+        &self,
+        keys: &[K],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        self.client.get_many_bytes_in(&self.namespace, keys).await
+    }
+
+    /// See [`NanocachedClient::set_many`]; scoped to this namespace
+    /// (issue #151).
+    pub async fn set_many(&self, values: &HashMap<String, String>, ttl_seconds: u64) -> Result<()> {
+        self.client
+            .set_many_in(&self.namespace, values, ttl_seconds)
+            .await
+    }
+
+    /// See [`NanocachedClient::set_many_bytes`]; scoped to this namespace
+    /// (issue #151).
+    pub async fn set_many_bytes(
+        &self,
+        values: &HashMap<String, Vec<u8>>,
+        ttl_seconds: u64,
+    ) -> Result<()> {
+        self.client
+            .set_many_bytes_in(&self.namespace, values, ttl_seconds)
+            .await
     }
 
     /// See [`NanocachedClient::incr`]; scoped to this namespace.

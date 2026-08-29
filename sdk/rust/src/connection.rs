@@ -75,7 +75,10 @@ pub static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 /// response tags), when present, is verified against the pending slot's
 /// expected tag by the read loop itself and never reaches this type — see
 /// `WireResponse`.
-type RawResponse = (u8, Option<Vec<u8>>, Option<u64>);
+/// The fourth field is only ever `Some` for an `M`/`O` response (issue
+/// #151, docs/protocol.html#multi) — every other marker leaves it
+/// `None`, `value`/`ttl_seconds` unused for those two markers instead.
+type RawResponse = (u8, Option<Vec<u8>>, Option<u64>, Option<Vec<MultiEntry>>);
 type RawResponseSender = oneshot::Sender<Result<RawResponse>>;
 
 /// A pending request's queue slot: the sender its response ultimately
@@ -169,6 +172,27 @@ pub(crate) enum ResponseKind {
     /// [`ResponseKind::NotFound`] and [`Error::NotNumeric`] respectively,
     /// not as variants here — see `Connection::incr`.
     Incr(i64, Option<u64>),
+    /// `M` (multi-get) or `O` (multi-set) — issue #151,
+    /// docs/protocol.html#multi. One entry per requested key, in request
+    /// order; see [`MultiEntry`].
+    Multi(Vec<MultiEntry>),
+}
+
+/// One key's outcome inside an `M` (multi-get) or `O` (multi-set)
+/// response (issue #151, docs/protocol.html#multi) — a batch never
+/// fails as a whole, so each key's result is independent of every
+/// other key's. Reused for both response kinds rather than two
+/// near-identical types:
+/// - `M`: [`Self::Hit`] (the value, possibly empty) or [`Self::Miss`]
+///   (`-`); [`Self::WrongNode`] is a per-key `W`.
+/// - `O`: [`Self::Stored`] (`S`) or [`Self::WrongNode`] (`W`); there is
+///   no miss shape (`O` never uses [`Self::Hit`]/[`Self::Miss`]).
+#[derive(Debug, Clone)]
+pub(crate) enum MultiEntry {
+    Hit(Vec<u8>),
+    Miss,
+    Stored,
+    WrongNode,
 }
 
 /// The three `<cond>` shapes `k`/`x` accept (compare-and-set, issue
@@ -481,6 +505,63 @@ impl Connection {
         }
     }
 
+    /// Sends `m` (issue #151, docs/protocol.html#multi) — one round trip
+    /// for every key in `keys`. `entries[i]` answers `keys[i]`, in
+    /// request order. A reply whose roster length doesn't match
+    /// `keys.len()` is treated as a desynced connection, same stance as
+    /// [`Self::mismatch`] — a malformed reply can't be trusted
+    /// key-for-key.
+    pub(crate) async fn multi_get(
+        &self,
+        namespace: &[u8],
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<MultiEntry>> {
+        match self
+            .request(|tag| encode_multi_get(namespace, keys, tag))
+            .await?
+        {
+            ResponseKind::Multi(entries) if entries.len() == keys.len() => Ok(entries),
+            ResponseKind::Multi(entries) => {
+                self.close();
+                Err(Error::ConnectionLost(format!(
+                    "nanocached: multi-get response roster length {} does not match request key count {} (connection desynced)",
+                    entries.len(),
+                    keys.len()
+                )))
+            }
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
+    /// Sends `o` (issue #151) — stores every key/value pair in one round
+    /// trip, one shared `ttl_seconds` (0 means no expiry) for the whole
+    /// batch rather than per key. `entries[i]` answers
+    /// `keys[i]`/`values[i]`, in request order; see [`Self::multi_get`]
+    /// for the same "only a desynced roster is an error" stance.
+    pub(crate) async fn multi_set(
+        &self,
+        namespace: &[u8],
+        keys: &[Vec<u8>],
+        values: &[Vec<u8>],
+        ttl_seconds: u64,
+    ) -> Result<Vec<MultiEntry>> {
+        match self
+            .request(|tag| encode_multi_set(namespace, keys, values, ttl_seconds, tag))
+            .await?
+        {
+            ResponseKind::Multi(entries) if entries.len() == keys.len() => Ok(entries),
+            ResponseKind::Multi(entries) => {
+                self.close();
+                Err(Error::ConnectionLost(format!(
+                    "nanocached: multi-set response roster length {} does not match request key count {} (connection desynced)",
+                    entries.len(),
+                    keys.len()
+                )))
+            }
+            other => Err(self.mismatch(&other)),
+        }
+    }
+
     /// Wraps `request_uncapped` in `REQUEST_TIMEOUT_MS`: if the whole
     /// round trip hasn't completed by then, the server is presumed dead
     /// (a half-open server that accepts but never answers looks
@@ -647,6 +728,7 @@ impl Connection {
             ResponseKind::Deleted => "deleted",
             ResponseKind::Cleared => "cleared",
             ResponseKind::Incr(_, _) => "incr",
+            ResponseKind::Multi(_) => "multi",
         };
         self.close();
         Error::ConnectionLost(format!(
@@ -862,6 +944,60 @@ fn encode_cas_delete(namespace: &[u8], key: &[u8], digest: [u8; 16], tag: Option
     frame
 }
 
+/// Builds an `m` frame (issue #151, batched get/set,
+/// docs/protocol.html#multi): `m <namespace-length> <n> <key-length-1>
+/// ... <key-length-n>[ <tag>]\n<namespace><key-1>...<key-n>` — always
+/// namespaced, no legacy uppercase form, exactly like `encode_incr`/
+/// `encode_cas_set`.
+fn encode_multi_get(namespace: &[u8], keys: &[Vec<u8>], tag: Option<u32>) -> Vec<u8> {
+    let mut header = format!("m {} {}", namespace.len(), keys.len());
+    for key in keys {
+        header.push_str(&format!(" {}", key.len()));
+    }
+    if let Some(tag) = tag {
+        header.push_str(&format!(" {tag}"));
+    }
+    header.push('\n');
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    for key in keys {
+        frame.extend_from_slice(key);
+    }
+    frame
+}
+
+/// Builds an `o` frame (issue #151): `o <namespace-length> <n>
+/// <key-length-1> <value-length-1> ... <key-length-n> <value-length-n>
+/// [<ttl-seconds>][ <tag>]\n<namespace><key-1><value-1>...<key-n><value-n>`.
+/// The optional TTL sits ahead of the tag, same convention `encode_set`'s
+/// own `[ttl] [tag]` uses.
+fn encode_multi_set(
+    namespace: &[u8],
+    keys: &[Vec<u8>],
+    values: &[Vec<u8>],
+    ttl_seconds: u64,
+    tag: Option<u32>,
+) -> Vec<u8> {
+    let mut header = format!("o {} {}", namespace.len(), keys.len());
+    for (key, value) in keys.iter().zip(values) {
+        header.push_str(&format!(" {} {}", key.len(), value.len()));
+    }
+    if ttl_seconds != 0 {
+        header.push_str(&format!(" {ttl_seconds}"));
+    }
+    if let Some(tag) = tag {
+        header.push_str(&format!(" {tag}"));
+    }
+    header.push('\n');
+    let mut frame = header.into_bytes();
+    frame.extend_from_slice(namespace);
+    for (key, value) in keys.iter().zip(values) {
+        frame.extend_from_slice(key);
+        frame.extend_from_slice(value);
+    }
+    frame
+}
+
 /// This connection's only reader, for its whole lifetime — nothing else
 /// may read from `read_half`. Consumes responses off the wire and
 /// dispatches each to the oldest pending request (FIFO —
@@ -883,7 +1019,7 @@ async fn read_loop(
             result = read_one_response(&mut read_half, shared.tagged) => result,
         };
 
-        let (marker, value, ttl_seconds, tag) = match response {
+        let (marker, value, ttl_seconds, tag, entries) = match response {
             Ok(response) => response,
             Err(error) => {
                 // error belongs to whichever request has been waiting
@@ -956,7 +1092,7 @@ async fn read_loop(
         // as a tag mismatch (mirrors Go's `default: mismatch`).
         if !matches!(
             marker,
-            b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R' | b'I' | b'T'
+            b'V' | b'N' | b'S' | b'D' | b'W' | b'C' | b'R' | b'I' | b'T' | b'M' | b'O'
         ) {
             let message = format!(
                 "nanocached: unexpected response from server: {} (connection desynced)",
@@ -971,7 +1107,7 @@ async fn read_loop(
         // An Err here just means the caller abandoned this request after
         // its write completed (see `Connection::request`) — nothing to
         // do, the queue position was already correctly consumed above.
-        let _ = slot.tx.send(Ok((marker, value, ttl_seconds)));
+        let _ = slot.tx.send(Ok((marker, value, ttl_seconds, entries)));
     }
 }
 
@@ -1018,7 +1154,13 @@ async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
 /// `read_one_response`/`read_loop` ever see this fourth field; once
 /// verified it's stripped down to a plain [`RawResponse`] before being
 /// handed to a waiting caller.
-type WireResponse = (u8, Option<Vec<u8>>, Option<u64>, Option<u32>);
+type WireResponse = (
+    u8,
+    Option<Vec<u8>>,
+    Option<u64>,
+    Option<u32>,
+    Option<Vec<MultiEntry>>,
+);
 
 async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Result<WireResponse> {
     let marker = read_half.read_u8().await?;
@@ -1054,7 +1196,7 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
                 })?;
             let mut value = vec![0u8; length];
             read_half.read_exact(&mut value).await?;
-            Ok((marker, Some(value), None, tag))
+            Ok((marker, Some(value), None, tag, None))
         }
         b'I' => {
             // INCR success (issue #129): `<value-length> [<ttl-seconds>]
@@ -1110,13 +1252,13 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
             };
             let mut value = vec![0u8; length];
             read_half.read_exact(&mut value).await?;
-            Ok((marker, Some(value), ttl_seconds, tag))
+            Ok((marker, Some(value), ttl_seconds, tag, None))
         }
         b'B' => {
             // `B` (busy) is always untagged — unsolicited, sent before
             // auth (and so before tagging) even completes (echoed response tags).
             read_half.read_u8().await?; // the trailing '\n'
-            Ok((marker, None, None, None))
+            Ok((marker, None, None, None, None))
         }
         b'S' | b'D' | b'N' | b'W' | b'C' | b'R' | b'T' => {
             if tagged {
@@ -1126,11 +1268,91 @@ async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Re
                 // #129) — every no-value marker's tag rides as its header
                 // line's sole field.
                 let line = read_line(read_half).await?;
-                Ok((marker, None, None, Some(parse_tag(line.trim())?)))
+                Ok((marker, None, None, Some(parse_tag(line.trim())?), None))
             } else {
                 read_half.read_u8().await?; // the trailing '\n'
-                Ok((marker, None, None, None))
+                Ok((marker, None, None, None, None))
             }
+        }
+        // issue #151 — batched get/set (docs/protocol.html#multi): `M`
+        // answers `m` (multi-get), `O` answers `o` (multi-set). `M <n>
+        // <result-1> ... <result-n>[ <tag>]\n<hit values, concatenated in
+        // request order>` — each result token is "-" (miss), "W" (wrong
+        // node), or a decimal byte length (a hit — that many trailing
+        // body bytes belong to this key, read here, inline, in token
+        // order, since only hit tokens consume body bytes). `O`'s
+        // reply has the same header shape but no body (a set has
+        // nothing to echo back) and only "S"/"W" tokens.
+        b'M' | b'O' => {
+            let header = read_line(read_half).await?;
+            let header = header.trim();
+            let mut fields = header.split(' ').filter(|field| !field.is_empty());
+            let count: usize = fields
+                .next()
+                .and_then(|field| field.parse().ok())
+                .ok_or_else(|| {
+                    Error::Protocol(format!(
+                        "nanocached: invalid multi-{} header in response",
+                        if marker == b'M' { "get" } else { "set" }
+                    ))
+                })?;
+            let rest: Vec<&str> = fields.collect();
+            let (result_tokens, tag): (&[&str], Option<u32>) = if tagged {
+                if rest.len() != count + 1 {
+                    return Err(Error::Protocol(format!(
+                        "nanocached: invalid multi-{} header in response",
+                        if marker == b'M' { "get" } else { "set" }
+                    )));
+                }
+                (&rest[..count], Some(parse_tag(rest[count])?))
+            } else {
+                if rest.len() != count {
+                    return Err(Error::Protocol(format!(
+                        "nanocached: invalid multi-{} header in response",
+                        if marker == b'M' { "get" } else { "set" }
+                    )));
+                }
+                (&rest[..], None)
+            };
+
+            let mut entries = Vec::with_capacity(count);
+            if marker == b'M' {
+                for token in result_tokens {
+                    match *token {
+                        "-" => entries.push(MultiEntry::Miss),
+                        "W" => entries.push(MultiEntry::WrongNode),
+                        length_field => {
+                            let length: usize = length_field
+                                .parse()
+                                .ok()
+                                .filter(|length| *length <= MAX_VALUE_LENGTH)
+                                .ok_or_else(|| {
+                                    Error::Protocol(
+                                        "nanocached: invalid multi-get result length in response"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let mut value = vec![0u8; length];
+                            read_half.read_exact(&mut value).await?;
+                            entries.push(MultiEntry::Hit(value));
+                        }
+                    }
+                }
+            } else {
+                for token in result_tokens {
+                    match *token {
+                        "S" => entries.push(MultiEntry::Stored),
+                        "W" => entries.push(MultiEntry::WrongNode),
+                        _ => {
+                            return Err(Error::Protocol(
+                                "nanocached: invalid multi-set result token in response"
+                                    .to_string(),
+                            ))
+                        }
+                    }
+                }
+            }
+            Ok((marker, None, None, tag, Some(entries)))
         }
         other => Err(Error::Protocol(format!(
             "nanocached: unexpected response from server: {}",
@@ -1152,13 +1374,17 @@ fn parse_tag(field: &str) -> Result<u32> {
 impl TryFrom<RawResponse> for ResponseKind {
     type Error = Error;
 
-    fn try_from((marker, value, ttl_seconds): RawResponse) -> Result<Self> {
+    fn try_from((marker, value, ttl_seconds, entries): RawResponse) -> Result<Self> {
         match marker {
             b'V' => Ok(ResponseKind::Value(value.unwrap_or_default())),
             b'N' => Ok(ResponseKind::NotFound),
             b'S' => Ok(ResponseKind::Stored),
             b'D' => Ok(ResponseKind::Deleted),
             b'C' => Ok(ResponseKind::Cleared),
+            // issue #151: M/O always carry `entries` (see `RawResponse`'s
+            // own doc comment) — `unwrap_or_default` only ever matters
+            // for tests that construct a bare `RawResponse` by hand.
+            b'M' | b'O' => Ok(ResponseKind::Multi(entries.unwrap_or_default())),
             b'I' => {
                 let text = value.unwrap_or_default();
                 let counter = std::str::from_utf8(&text)
@@ -1337,7 +1563,7 @@ mod tests {
     #[test]
     fn cleared_response_converts_from_the_c_marker() {
         assert!(matches!(
-            ResponseKind::try_from((b'C', None, None)),
+            ResponseKind::try_from((b'C', None, None, None)),
             Ok(ResponseKind::Cleared)
         ));
     }
@@ -1391,7 +1617,7 @@ mod tests {
     #[test]
     fn incr_response_converts_from_the_i_marker_without_a_ttl() {
         assert!(matches!(
-            ResponseKind::try_from((b'I', Some(b"42".to_vec()), None)),
+            ResponseKind::try_from((b'I', Some(b"42".to_vec()), None, None)),
             Ok(ResponseKind::Incr(42, None))
         ));
     }
@@ -1399,7 +1625,7 @@ mod tests {
     #[test]
     fn incr_response_converts_from_the_i_marker_with_a_ttl() {
         assert!(matches!(
-            ResponseKind::try_from((b'I', Some(b"42".to_vec()), Some(60))),
+            ResponseKind::try_from((b'I', Some(b"42".to_vec()), Some(60), None)),
             Ok(ResponseKind::Incr(42, Some(60)))
         ));
     }
@@ -1407,7 +1633,7 @@ mod tests {
     #[test]
     fn incr_response_converts_a_negative_value_from_the_i_marker() {
         assert!(matches!(
-            ResponseKind::try_from((b'I', Some(b"-7".to_vec()), None)),
+            ResponseKind::try_from((b'I', Some(b"-7".to_vec()), None, None)),
             Ok(ResponseKind::Incr(-7, None))
         ));
     }
@@ -1518,7 +1744,7 @@ mod tests {
     #[test]
     fn not_found_response_converts_from_the_n_marker() {
         assert!(matches!(
-            ResponseKind::try_from((b'N', None, None)),
+            ResponseKind::try_from((b'N', None, None, None)),
             Ok(ResponseKind::NotFound)
         ));
     }
@@ -1526,7 +1752,7 @@ mod tests {
     #[test]
     fn not_numeric_response_converts_from_the_t_marker_to_an_error() {
         assert!(matches!(
-            ResponseKind::try_from((b'T', None, None)),
+            ResponseKind::try_from((b'T', None, None, None)),
             Err(Error::NotNumeric)
         ));
     }
