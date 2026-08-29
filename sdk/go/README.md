@@ -258,6 +258,43 @@ replaying could let a replica drift from the primary (e.g. after a
 dropped earlier replica write), while forwarding the literal result keeps
 every replica byte-identical to it.
 
+## Batched get and set
+
+`GetMany`/`GetManyBytes` and `SetMany`/`SetManyBytes` (the `m`/`o`
+frames) fetch or store several keys in one round trip per owner instead
+of one round trip per key:
+
+```go
+err = client.SetMany(map[string]string{"a": "1", "b": "2"}, 0) // shared ttlSeconds for the whole batch
+values, err := client.GetMany([]string{"a", "b", "missing"})
+// values == map[string]string{"a": "1", "b": "2"} — "missing" is simply absent
+```
+
+A missing key is simply absent from the returned map, the same "a miss
+is not an error" shape `Get`/`GetBytes` use. Both are also
+namespace-scoped: `client.Namespace(ns).GetMany(...)`/`.SetMany(...)`,
+same as `Get`/`Set`.
+
+**A batch never fails as a whole.** Each key's outcome is independent:
+if some keys are still routed to the wrong node after one bounded
+refresh-and-retry (the same policy `Get`/`Set` apply per key, not
+per call), `GetManyBytes` returns the partial map together with
+`ErrWrongNode` rather than discarding a mostly-successful batch, and
+`SetManyBytes` returns `ErrWrongNode` while every other key in the
+batch was still stored. In single-node/proxy mode a `W` propagates
+immediately, exactly like `Get`/`Set`'s own single-mode behavior — there
+is no ring to refresh against.
+
+Within one `SetMany`/`SetManyBytes` batch, the same node can be one
+key's primary and another key's replica at once; it receives exactly
+one `o` sub-frame either way, and only its answer for the keys it is
+primary for decides those keys' outcome — a replica-held key's failure
+is logged-and-swallowed into `Stats().ReplicaWriteFailures`, exactly
+like a plain `Set`'s own replica legs.
+
+Very large batches are transparently split into more than one `m`/`o`
+sub-frame per owner — callers never need to think about this.
+
 ## Compare-and-set
 
 `PutIfAbsent`/`ReplaceIfPresent`/`Replace` (the `k` frame) and
