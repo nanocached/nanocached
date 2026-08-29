@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Deployment — nanocached</title>
-<meta name="description" content="Run nanocached on a single EC2 instance, on ECS or on EKS: network setup, metrics for autoscaling, readiness probes, and graceful scale-in via SIGTERM.">
+<meta name="description" content="Verified nanocached deployments: a single node on EC2, and an autoscaled multi-AZ cluster on ECS Fargate and on EKS — network, IAM, secrets, probes, and graceful scale-in via SIGTERM.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -30,11 +30,14 @@
 <main>
 
 <h1>Deployment</h1>
-<p class="lede">A complete single-instance deployment on EC2 first —
-network, security groups, IAM, systemd — then everything an
-orchestrator needs to scale nanocached in both directions: Prometheus
-metrics to act on, probes to route around instances that aren't ready,
-and a SIGTERM-driven drain so scale-in never loses data.</p>
+<p class="lede">Three verified deployments, each built from an empty
+account and torn down again: a <a href="#ec2">single node on EC2</a>
+(network, security groups, IAM, systemd), and a replicated, autoscaled,
+multi-AZ cluster on <a href="#ecs">ECS Fargate</a> and on <a
+href="#eks">EKS</a>. First, what every orchestrator needs from
+nanocached: probes to route around instances that aren't ready,
+metrics to scale on, and a SIGTERM-driven drain so scale-in never
+loses data.</p>
 
 <h2 id="ops">The operations endpoint</h2>
 <p>Each binary takes <code>--metrics-port &lt;port&gt;</code> and serves
@@ -751,27 +754,280 @@ list-namespaces</code> no longer lists <code>nanocached.local</code>
 <code>get-role</code> for the names above all come back not found, and
 there is no non-default VPC.</p>
 
-<h2>EKS / Kubernetes</h2>
-<pre><code>containers:
-  - name: nanocached-node
-    image: ghcr.io/nanocached/nanocached-node:latest
-    args: ["--host", "0.0.0.0", "--discovery", "disc-0.disc:8357,disc-1.disc:8357",
-           "--drain-timeout", "20", "--metrics-port", "9356"]
-    ports:
-      - containerPort: 8356
-      - containerPort: 9356
-    readinessProbe:
-      httpGet: { path: /readyz, port: 9356 }
-    livenessProbe:
-      httpGet: { path: /healthz, port: 9356 }
-terminationGracePeriodSeconds: 45   # > drain-timeout + margin</code></pre>
-<p>No <code>preStop</code> hook is needed — the SIGTERM Kubernetes sends
-<em>is</em> the drain trigger. For autoscaling on the memory watermark,
-feed <code>/metrics</code> to your HPA through the Prometheus adapter or
-KEDA; the proxy tier can scale on plain CPU or on
-<code>client_connections</code> the same way. Run discovery as a
-StatefulSet with stable DNS names — every node must list the same
-discovery addresses in the same order.</p>
+<h2 id="eks">Cluster on EKS (multi-AZ)</h2>
+<p>The same cluster as the ECS guide — one discovery, two to four nodes
+across two zones, autoscaled on CPU — expressed in Kubernetes objects,
+on an EKS cluster that <code>eksctl</code> builds from one config file
+(VPC, subnets in two zones, security groups, IAM roles, control plane,
+a managed node group). Discovery's stable address is a
+<code>ClusterIP</code> Service; a <code>HorizontalPodAutoscaler</code>
+grows and shrinks the node Deployment; the drain on scale-in is the
+SIGTERM Kubernetes already sends. Every command was run in this order
+against a real account, including a scale-out and scale-in under load,
+then torn down with the commands at the end.</p>
+
+<h3>The cluster</h3>
+<p><code>eks-cluster.yaml</code>:</p>
+<pre><code>apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: nanocached
+  region: us-east-1
+  version: "1.33"
+  tags: {Project: nanocached}
+availabilityZones: [us-east-1a, us-east-1b]
+vpc:
+  nat:
+    gateway: Disable          # nodes sit in public subnets; nothing needs a NAT
+managedNodeGroups:
+  - name: ng-1
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    volumeSize: 20
+    privateNetworking: false
+    ssh: {allow: false}
+    tags: {Project: nanocached}</code></pre>
+<pre><code>eksctl create cluster -f eks-cluster.yaml     # about 22 minutes
+kubectl get nodes -L topology.kubernetes.io/zone
+# ip-192-168-4-4.ec2.internal    Ready   us-east-1a
+# ip-192-168-48-48.ec2.internal  Ready   us-east-1b</code></pre>
+<p>Two worker nodes, one per zone, is the minimum for the zone spread
+below to mean anything. The node group is pinned at two because the
+HPA scales <em>pods</em>; four 1&nbsp;GiB node pods fit on two
+<code>t3.medium</code>s with room for discovery and the system pods.
+Growing the pod ceiling past that means either bigger instances or a
+cluster autoscaler for the node group — a separate decision. The
+cluster's own security groups already allow all traffic between pods
+and nothing from outside: the worker nodes have public IPs (for image
+pulls and the control plane) but no inbound rule reaches them, and
+neither 8356 nor 9356 answers from the internet.</p>
+<p><code>eksctl</code> also installs the <code>metrics-server</code>
+EKS add-on, which is what the HPA reads. Don't apply the upstream
+<code>components.yaml</code> on top of it — that overwrites the
+add-on's Service selector, the Metrics API goes dark (<code>unable to
+fetch metrics from resource</code> in the HPA's events), and the fix is
+to delete and re-create the add-on.</p>
+
+<h3>The workload</h3>
+<p><code>nanocached.yaml</code> — everything in one namespace:</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: nanocached
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nanocached-auth
+  namespace: nanocached
+type: Opaque
+stringData:
+  NANOCACHED_AUTH_SECRET: change-me
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discovery
+  namespace: nanocached
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: nanocached-discovery}
+  template:
+    metadata:
+      labels: {app: nanocached-discovery}
+    spec:
+      containers:
+        - name: discovery
+          image: ghcr.io/nanocached/nanocached-discovery@sha256:879595cd9513073c38ddf2ab970a839f7359e3094b6148854dd72d19b0123231
+          args: ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
+                 "--metrics-port", "9357"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8357, name: discovery}
+            - {containerPort: 9357, name: ops}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: disc
+  namespace: nanocached
+spec:
+  selector: {app: nanocached-discovery}
+  ports:
+    - {name: discovery, port: 8357, targetPort: discovery}
+    - {name: ops, port: 9357, targetPort: ops}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node
+  namespace: nanocached
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: nanocached-node}
+  template:
+    metadata:
+      labels: {app: nanocached-node}
+    spec:
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: nanocached-node}
+      containers:
+        - name: node
+          image: ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af
+          args: ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc:8357",
+                 "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8356, name: data}
+            - {containerPort: 9356, name: ops}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+            failureThreshold: 36        # 3 minutes of not-ready before it counts
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {memory: 1Gi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: node
+  namespace: nanocached
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: node}
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 30}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{type: Pods, value: 1, periodSeconds: 60}]
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies: [{type: Pods, value: 1, periodSeconds: 120}]</code></pre>
+<p>The choices that matter, beyond those the ECS guide already
+explains (<code>/healthz</code> for discovery's liveness and
+<code>/readyz</code> for the node's readiness, a memory budget that
+leaves room under the limit, images pinned by digest):</p>
+<ul>
+  <li><b><code>disc:8357</code></b> is the Service name, resolvable the
+  moment it is created. Node pods that start before discovery is
+  ready see <em>Connection refused</em> (the Service has no endpoints
+  until discovery's readiness probe passes), retry every 5&nbsp;s and
+  join as soon as it does — no ordering step is needed, unlike Cloud
+  Map on ECS.</li>
+  <li><b><code>topologySpreadConstraints</code></b> on zone with
+  <code>DoNotSchedule</code>: with R=2, both copies of a key in one
+  zone is the failure mode this prevents. Two, three and four pods
+  were placed 1/1, 2/1 and 2/2 across the zones in verification.</li>
+  <li><b><code>terminationGracePeriodSeconds: 45</code></b> against
+  <code>--drain-timeout 20</code>, as on ECS. No <code>preStop</code>
+  hook: the SIGTERM is the drain.</li>
+  <li><b>Readiness <code>failureThreshold: 36</code></b> (three
+  minutes) plays the role ECS's <code>startPeriod</code> does — a
+  joiner waiting its turn in a staged join is not-ready but not
+  broken. Liveness stays at the default threshold; a process that
+  stops answering <code>/healthz</code> should be restarted.</li>
+  <li><b><code>resources.requests.cpu</code></b> is what the HPA's
+  percentage is <em>of</em>; without a request the HPA has nothing
+  to compute. The <code>behavior</code> block scales one pod per
+  minute up and one per two minutes down, after two minutes below
+  target — deliberately faster than the defaults (which wait five
+  minutes to scale down) so the verification fits in a coffee break;
+  the defaults are the safer production choice.</li>
+  <li><b>The Secret</b> is <code>envFrom</code>, so the auth secret
+  becomes <code>NANOCACHED_AUTH_SECRET</code> without appearing in
+  the pod spec. Rotating it is <code>kubectl apply</code> of the new
+  value and a <code>rollout restart</code> of both Deployments.</li>
+</ul>
+<pre><code>kubectl apply -f nanocached.yaml
+kubectl -n nanocached rollout status deploy/discovery
+kubectl -n nanocached rollout status deploy/node
+kubectl -n nanocached get pods -o wide
+# discovery-…   1/1  Running   ip-192-168-4-4.ec2.internal
+# node-…-76v5m  1/1  Running   ip-192-168-48-48.ec2.internal
+# node-…-rs7kp  1/1  Running   ip-192-168-4-4.ec2.internal
+kubectl -n nanocached get hpa node
+# NAME   REFERENCE         TARGETS       MINPODS   MAXPODS   REPLICAS
+# node   Deployment/node   cpu: 0%/30%   2         4         2</code></pre>
+<p>Discovery's roster metric, from inside the cluster:</p>
+<pre><code>kubectl -n nanocached run curl --rm -it --image=curlimages/curl --restart=Never -- \
+  -s http://disc:9357/metrics | grep ^nanocached_discovery_members
+# nanocached_discovery_members 2</code></pre>
+
+<h3>Verifying</h3>
+<p>A client pod with the Python SDK stands in for the application:</p>
+<pre><code>kubectl -n nanocached run client --image=python:3.11-slim --restart=Never -- \
+  sh -c "pip install -q nanocached==0.3.0 && sleep 7200"
+kubectl -n nanocached cp smoke.py client:/tmp/smoke.py    # the EC2 smoke test with DISC = [("disc", 8357)]
+kubectl -n nanocached exec client -- python /tmp/smoke.py
+# 2 / hello / True / None / AuthenticationError</code></pre>
+<p><b>Scale-out.</b> With 20,000 seeded entries and the same mixed load
+as the ECS run (24 connections, 7,000&nbsp;ops/s against two pods),
+the HPA went to three pods 53&nbsp;s after the load started and to
+four a minute later (the one-pod-per-minute policy). Each new pod
+joined through the staged handoff and was promoted within seconds;
+the load saw 0 misses, 0 corrupt reads and 0 errors across 3.0
+million operations.</p>
+<p><b>Scale-in.</b> Two minutes after CPU fell below target the HPA
+removed one pod, and another two minutes later (<code>kubectl describe
+hpa node</code> lists each <code>SuccessfulRescale</code> with its
+reason). Each leaver's log — capture it with <code>kubectl logs -f</code>
+<em>before</em> the scale-in, because a deleted pod's log goes with
+it — was the drain:</p>
+<pre><code>INFO shutdown signal received — decommissioning (budget 20s)
+INFO decommission: handed off 10005 entr(ies)
+INFO decommission: forwarding window open for 12s
+INFO decommission finished — shutting down</code></pre>
+<p>Discovery logged <code>node left the cluster</code> for both, the two
+survivors were one per zone, and all 20,000 entries were still
+readable afterwards.</p>
+<p><b>Logs</b> are the ordinary <code>kubectl logs</code>:</p>
+<pre><code>kubectl -n nanocached logs deploy/discovery
+kubectl -n nanocached logs -l app=nanocached-node --prefix | grep decommission</code></pre>
+
+<h3>Teardown</h3>
+<pre><code>kubectl delete namespace nanocached
+eksctl delete cluster --name nanocached --region us-east-1 --wait     # about 12 minutes</code></pre>
+<p><code>eksctl</code> removes its two CloudFormation stacks and with
+them the VPC, security groups, IAM roles and the OIDC provider.
+Confirm with <code>aws eks list-clusters</code> (empty), <code>aws
+cloudformation list-stacks --stack-status-filter CREATE_COMPLETE
+DELETE_FAILED</code> (no <code>eksctl-nanocached-*</code>),
+<code>aws ec2 describe-vpcs --filters Name=isDefault,Values=false</code>
+(empty) and <code>aws iam list-roles --query
+'Roles[?starts_with(RoleName,`eksctl-nanocached`)]'</code> (empty). If
+the create ever fails part-way, the cluster stack is left with
+termination protection on — <code>aws cloudformation
+update-termination-protection --no-enable-termination-protection
+--stack-name eksctl-nanocached-cluster</code> before deleting it.</p>
 
 <h2>Verifying a deployment</h2>
 <p>The repository ships runnable scale-in scenarios under
