@@ -1951,9 +1951,14 @@ public sealed class NanocachedClient : IDisposable
         ReplaceAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), token, Encoding.UTF8.GetBytes(newValue), ttlSeconds);
 
     /// <summary>issue #141: as <see cref="ReplaceAsync(byte[], string, byte[], long)"/>,
-    /// scoped to <paramref name="namespaceBytes"/>.</summary>
-    internal Task<bool> ReplaceAsync(byte[] namespaceBytes, byte[] key, string token, byte[] newValue, long ttlSeconds = 0) =>
-        CasAsync(namespaceBytes, key, newValue, token, ttlSeconds);
+    /// scoped to <paramref name="namespaceBytes"/>. issue #223: validates
+    /// <paramref name="token"/> before it ever reaches the wire — see
+    /// <see cref="ValidateToken"/>.</summary>
+    internal Task<bool> ReplaceAsync(byte[] namespaceBytes, byte[] key, string token, byte[] newValue, long ttlSeconds = 0)
+    {
+        ValidateToken(token);
+        return CasAsync(namespaceBytes, key, newValue, token, ttlSeconds);
+    }
 
     public Task<bool> DeleteIfMatchesAsync(string key, string token) => DeleteIfMatchesAsync(EmptyNamespace, key, token);
 
@@ -1977,9 +1982,12 @@ public sealed class NanocachedClient : IDisposable
         DeleteIfMatchesAsync(namespaceBytes, Encoding.UTF8.GetBytes(key), token);
 
     /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(byte[], string)"/>,
-    /// scoped to <paramref name="namespaceBytes"/>.</summary>
+    /// scoped to <paramref name="namespaceBytes"/>. issue #223: validates
+    /// <paramref name="token"/> before it ever reaches the wire — see
+    /// <see cref="ValidateToken"/>.</summary>
     internal async Task<bool> DeleteIfMatchesAsync(byte[] namespaceBytes, byte[] key, string token)
     {
+        ValidateToken(token);
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
@@ -2241,6 +2249,42 @@ public sealed class NanocachedClient : IDisposable
                     : $"nanocached: namespace ({namespaceBytes.Length} bytes) + key ({key.Length} bytes) + "
                       + $"value ({value.Length} bytes) = {total} bytes, which exceeds the "
                       + $"{MaxRequestBytes}-byte request limit (server MAX_REQUEST_SIZE, src/server.rs, is 1 MiB)");
+        }
+    }
+
+    /// <summary>issue #223: rejects a caller-supplied CAS <paramref
+    /// name="token"/> that isn't exactly 32 lowercase hex characters —
+    /// mirrors Java's <c>validateToken</c>. <see cref="CasAsync(byte[], byte[], byte[], string, long)"/>'s
+    /// wire encoding embeds <c>cond</c> (the <c>k</c> frame's condition
+    /// field, and the <c>x</c> frame's digest) as a bare, non-length-
+    /// prefixed field terminated by a newline — an unvalidated token
+    /// (e.g. one forwarded from external input) could contain <c>\n</c>
+    /// and smuggle an extra pipelined request onto the connection. Only
+    /// called on the real digest path (<see cref="ReplaceAsync(byte[], byte[], string, byte[], long)"/>,
+    /// <see cref="DeleteIfMatchesAsync(byte[], byte[], string)"/>) —
+    /// never on the internal <see cref="CondAbsent"/>/<see cref="CondPresent"/>
+    /// sentinels, which are fixed, safe constants, not caller
+    /// input.</summary>
+    private static void ValidateToken(string token)
+    {
+        bool valid = token is { Length: 32 };
+        if (valid)
+        {
+            foreach (char c in token)
+            {
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+                {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if (!valid)
+        {
+            throw new ArgumentException(
+                "nanocached: token must be a 32-character lowercase hex digest "
+                    + "(from ContentDigest/GetWithTokenAsync), got: " + (token ?? "null"),
+                nameof(token));
         }
     }
 
