@@ -66,10 +66,13 @@ func keyHash(namespace, key []byte) uint64 {
 	if len(namespace) == 0 {
 		return fnv1a(key)
 	}
-	// Namespaces are bounded by the request-size limit (1 MiB, see
-	// maxRequestBytes), so this cast never truncates — it's the
-	// canonical encoding width every implementation uses, not a
-	// narrowing that could actually occur.
+	// namespace is bounded by the request-size limit (1 MiB) by the
+	// time any caller in this package reaches here — validateKey/
+	// validateKeyAndValue/validateNamespaceForClear in client.go fold
+	// the namespace into that bound for every namespaced entry point
+	// (issue #228) — so this cast never truncates; it's the canonical
+	// encoding width every implementation uses, not a narrowing that
+	// could actually occur.
 	var lengthBytes [4]byte
 	binary.BigEndian.PutUint32(lengthBytes[:], uint32(len(namespace)))
 	hash := fnv1a(lengthBytes[:])

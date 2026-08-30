@@ -1324,6 +1324,120 @@ func TestRejectsAnOversizedKeyOnGetAndDelete(t *testing.T) {
 	}
 }
 
+// TestRejectsANamespacePlusKeyThatExceedsMaxRequestBytes is issue #228's
+// fix: validateKey previously only summed key alone, so a namespace whose
+// bytes push namespace+key past maxRequestBytes sailed past client-side
+// validation, got serialized onto the wire (namespace bytes lead the g/d
+// wire frames, see appendGetFrame/appendDeleteFrame), and only then hit
+// the server's own request cap — which rejects it by silently closing the
+// connection with no response, poisoning every other request pipelined
+// behind it. This must be caught before any network I/O, exactly like the
+// namespace-less oversized-key case above.
+func TestRejectsANamespacePlusKeyThatExceedsMaxRequestBytes(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// namespace alone is under maxRequestBytes, but namespace+key is not.
+	bigNamespace := string(make([]byte, maxRequestBytes))
+	ns := client.Namespace(bigNamespace)
+
+	if _, _, err := ns.GetBytes("k"); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by GetBytes, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, _, err := ns.Get("k"); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by Get, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := ns.Delete("k"); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by Delete, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, _, err := ns.Incr("k", 1); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by Incr, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, _, err := ns.Decr("k", 1); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by Decr, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := ns.GetMany([]string{"k"}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by GetMany, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := ns.DeleteIfMatches("k", CasToken{}); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key accepted by DeleteIfMatches, err = %v, want ErrInvalidArgument", err)
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (validation must reject before any network I/O)", got)
+	}
+}
+
+// TestRejectsANamespacePlusKeyPlusValueThatExceedsMaxRequestBytes is
+// TestRejectsANamespacePlusKeyThatExceedsMaxRequestBytes's write-path
+// counterpart (issue #228): a namespace+key comfortably under
+// maxRequestBytes can still push the combined namespace+key+value total
+// over it once value is added, exactly like the namespace-less
+// key+value case validateKeyAndValue already covers.
+func TestRejectsANamespacePlusKeyPlusValueThatExceedsMaxRequestBytes(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// namespace+key is under maxRequestBytes, but namespace+key+value is not.
+	bigNamespace := string(make([]byte, maxRequestBytes-10))
+	value := make([]byte, 10)
+	ns := client.Namespace(bigNamespace)
+
+	if err := ns.SetBytes("k", value, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key+value accepted by SetBytes, err = %v, want ErrInvalidArgument", err)
+	}
+	if err := ns.SetManyBytes(map[string][]byte{"k": value}, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key+value accepted by SetManyBytes, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := ns.PutIfAbsent("k", value, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key+value accepted by PutIfAbsent, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := ns.ReplaceIfPresent("k", value, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key+value accepted by ReplaceIfPresent, err = %v, want ErrInvalidArgument", err)
+	}
+	if _, err := ns.Replace("k", CasToken{}, value, 0); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace+key+value accepted by Replace, err = %v, want ErrInvalidArgument", err)
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (validation must reject before any network I/O)", got)
+	}
+}
+
+// TestRejectsAnOversizedNamespaceOnClear is Clear's own bound (issue
+// #228, matching #106's clear frame): a clear frame carries no key, only
+// the namespace, so unlike Get/Set/Delete there is nothing else to sum
+// it against — the namespace alone must be caught client-side before it
+// can trip the server's request cap and get the connection silently
+// closed.
+func TestRejectsAnOversizedNamespaceOnClear(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	bigNamespace := string(make([]byte, maxRequestBytes+1))
+	ns := client.Namespace(bigNamespace)
+
+	if err := ns.Clear(); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("oversized namespace accepted by Clear, err = %v, want ErrInvalidArgument", err)
+	}
+
+	if got := node.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d, want 1 (validation must reject before any network I/O)", got)
+	}
+}
+
 func TestAnInvalidRequestDoesNotPoisonConcurrentValidRequestsOnTheSameConnection(t *testing.T) {
 	// Key/size validation runs before any network I/O, so an invalid call
 	// (empty key) never touches the wire at all — and so can never desync
