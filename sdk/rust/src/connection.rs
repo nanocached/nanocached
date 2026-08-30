@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{split, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::error::{Error, Result};
@@ -278,6 +278,17 @@ impl Connection {
     ) -> Self {
         crate::open_targets::increment(&tracking_key);
         let (read_half, write_half) = split(stream);
+        // Issue #191: every response header (`read_line`, below) was read
+        // one byte at a time straight off the raw `ReadHalf`, costing a
+        // syscall/poll per byte. Wrapping it here, in `BufReader::new`
+        // (freshly created, never populated from an existing socket read),
+        // means the buffer lives for exactly this connection's lifetime —
+        // it's moved into `read_loop`, this connection's only reader (see
+        // that fn's own doc comment), and dropped with it, so a poisoned
+        // or dropped connection can never leak buffered bytes into another
+        // one. Mirrors `identify.rs`'s `BufReader::new(stream)` for the
+        // same auth/discovery header reads.
+        let read_half = BufReader::new(read_half);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let shared = Arc::new(Shared {
@@ -1004,7 +1015,7 @@ fn encode_multi_set(
 /// Request pipelining), until told to stop (poisoned by any of the
 /// triggers in `Shared::mark_closed`) or a read itself fails.
 async fn read_loop(
-    mut read_half: ReadHalf<Stream>,
+    mut read_half: BufReader<ReadHalf<Stream>>,
     shared: Arc<Shared>,
     shutdown_tx: watch::Sender<bool>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1162,7 +1173,10 @@ type WireResponse = (
     Option<Vec<MultiEntry>>,
 );
 
-async fn read_one_response(read_half: &mut ReadHalf<Stream>, tagged: bool) -> Result<WireResponse> {
+async fn read_one_response(
+    read_half: &mut BufReader<ReadHalf<Stream>>,
+    tagged: bool,
+) -> Result<WireResponse> {
     let marker = read_half.read_u8().await?;
     match marker {
         b'V' => {
