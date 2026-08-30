@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   contentDigest,
@@ -13,6 +13,7 @@ import {
   encodeMultiSet,
   encodeSet,
   MAX_REQUEST_BYTES,
+  MULTI_GET_TUNING,
   peekMultiFrameLength,
   tryParseResponse,
 } from "../src/protocol.js";
@@ -578,6 +579,27 @@ describe("tryParseResponse — batched get/set M/O (issues #128/#150/#151)", () 
 
   it("throws on an invalid hit length", () => {
     assert.throws(() => tryParseResponse(Buffer.from("M 1 x\n")), /invalid multi-get result length/);
+  });
+
+  describe("cumulative response size bound (issue #207)", () => {
+    const originalBound = MULTI_GET_TUNING.maxResponseBytes;
+    afterEach(() => {
+      MULTI_GET_TUNING.maxResponseBytes = originalBound;
+    });
+
+    it("throws once the running total of hit lengths crosses the bound, even before the body arrives", () => {
+      MULTI_GET_TUNING.maxResponseBytes = 3;
+      // Header alone declares 2 + 2 = 4 bytes, already over the shrunk
+      // 3-byte bound — must throw off the header, never waiting for (or
+      // allocating) either hit's body.
+      assert.throws(() => tryParseResponse(Buffer.from("M 2 2 2\n")), /multi-get response exceeds 3 bytes/);
+    });
+
+    it("does not throw for a roster whose total sits right at the bound", () => {
+      MULTI_GET_TUNING.maxResponseBytes = 3;
+      const parsed = tryParseResponse(Buffer.from("M 1 3\nabc"));
+      assert.deepEqual(parsed?.response.entries, [{ kind: "hit", value: Buffer.from("abc") }]);
+    });
   });
 
   it("stores results are S/W, with no body — the reply completes the instant its header is read", () => {
