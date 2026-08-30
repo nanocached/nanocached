@@ -1731,6 +1731,64 @@ public class NanocachedClientTests
         Assert.Equal("k 5 1 1 A", node.LastCasHeader);
     }
 
+    // issue #223: a caller-supplied CAS token is embedded into the "k"/"x"
+    // headers as a bare, non-length-prefixed field — an unvalidated token
+    // (e.g. forwarded from external input) could contain '\n' and smuggle
+    // an extra pipelined request onto the connection. ReplaceAsync and
+    // DeleteIfMatchesAsync (and the NanocachedNamespace wrapper, which
+    // shares the same internal entry point) must reject a malformed token
+    // synchronously, before any frame is built — mirroring the ttl/empty-key
+    // checks above and Java's validateToken.
+    [Fact]
+    public async Task RejectsMalformedCasTokensBeforeBuildingAnyFrame()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v1");
+        string validToken = NanocachedClient.ContentDigest(Bytes("v1"));
+
+        // Uppercase hex is not accepted — the digest is always lowercase.
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.ReplaceAsync("k", validToken.ToUpperInvariant(), "v2"));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.DeleteIfMatchesAsync("k", validToken.ToUpperInvariant()));
+
+        // Wrong length (short and long).
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.ReplaceAsync("k", validToken[..31], "v2"));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.DeleteIfMatchesAsync("k", validToken + "a"));
+
+        // An embedded newline — the actual header-injection vector.
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.ReplaceAsync("k", "a\nS 0 0\n" + new string('a', 24), "v2"));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.DeleteIfMatchesAsync("k", "a\nS 0 0\n" + new string('a', 24)));
+
+        // Empty token.
+        await Assert.ThrowsAsync<ArgumentException>(() => client.ReplaceAsync("k", "", "v2"));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.DeleteIfMatchesAsync("k", ""));
+
+        // Rejected client-side, before any request frame — the value is
+        // untouched and no extra request reached the connection.
+        Assert.Equal("v1", await client.GetAsync("k"));
+        Assert.Equal(1, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task RejectsMalformedCasTokensOnTheNamespaceWrapper()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        NanocachedNamespace ns = client.Namespace("users");
+
+        await ns.SetAsync("k", "v1");
+
+        await Assert.ThrowsAsync<ArgumentException>(() => ns.ReplaceAsync("k", "not-hex", "v2"));
+        await Assert.ThrowsAsync<ArgumentException>(() => ns.DeleteIfMatchesAsync("k", "not-hex"));
+    }
+
     [Fact]
     public async Task CasFrameCarriesTheTagOnATaggedConnection()
     {
