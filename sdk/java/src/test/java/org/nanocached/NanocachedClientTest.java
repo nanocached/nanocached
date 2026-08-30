@@ -1806,6 +1806,50 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void multiGetDrainsEveryLegAndReportsASecondLegsBugAfterTheFirstFails() throws Exception {
+        // Regression for issue #230: multiGetPass used to rethrow on the
+        // first failing leg's join() without draining the remaining
+        // legs, so a second, independent leg's bug would vanish silently
+        // instead of being observed — unlike multiSetPass/write(), which
+        // always drain every leg first. Two owners each hold a corrupted
+        // "compressed" value (an unrecognized marker byte, which escapes
+        // runMultiGetLeg as a DecompressionFailed rather than being fed
+        // into the retry pass, per that method's own doc comment); the
+        // first leg's failure must still propagate, and the second leg's
+        // failure must still be counted via reportBackgroundWriteBug
+        // rather than being lost.
+        try (Cluster cluster = startCluster(1)) {
+            String keyOnNodeA = null;
+            String keyOnNodeB = null;
+            for (int i = 0; i < 1000 && (keyOnNodeA == null || keyOnNodeB == null); i++) {
+                String candidate = "gk-" + i;
+                String owner = new HashRing(NAMES).route(candidate.getBytes(StandardCharsets.UTF_8));
+                if (owner.equals(NAMES.get(0)) && keyOnNodeA == null) keyOnNodeA = candidate;
+                if (owner.equals(NAMES.get(1)) && keyOnNodeB == null) keyOnNodeB = candidate;
+            }
+            assertTrue(keyOnNodeA != null && keyOnNodeB != null, "need one key routing to each node");
+            String finalKeyOnNodeA = keyOnNodeA;
+            String finalKeyOnNodeB = keyOnNodeB;
+
+            byte[] corrupt = {0x02, 1, 2, 3}; // unrecognized compression marker byte
+            cluster.nodes().get(NAMES.get(0)).store.put(
+                    MockNode.keyOf(keyOnNodeA.getBytes(StandardCharsets.UTF_8)), corrupt);
+            cluster.nodes().get(NAMES.get(1)).store.put(
+                    MockNode.keyOf(keyOnNodeB.getBytes(StandardCharsets.UTF_8)), corrupt);
+
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    .compress(true))) {
+                long before = client.stats().backgroundWriteBugs();
+                assertThrows(NanocachedException.DecompressionFailed.class,
+                        () -> client.getManyBytes(List.of(finalKeyOnNodeA, finalKeyOnNodeB)));
+                assertEquals(before + 1, client.stats().backgroundWriteBugs(),
+                        "the second owner leg's decompression bug must still be observed, not silently dropped");
+            }
+        }
+    }
+
     // ── クラスタでの INCR/DECR (issue #129) ─────────────────────────
     // The one thing that must never happen: a replica replaying the
     // increment itself. Comparing final stored values between primary and
