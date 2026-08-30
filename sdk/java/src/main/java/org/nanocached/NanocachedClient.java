@@ -1822,13 +1822,28 @@ public final class NanocachedClient implements AutoCloseable {
             legs.add(CompletableFuture.supplyAsync(
                     () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values), replicaWriters));
         }
+        // Always drain every leg, even after one has already failed: a leg
+        // that fails fast (e.g. a decompression error escaping
+        // runMultiGetLeg) must not leave later legs un-joined, hiding a
+        // second, independent bug — the same stance write()'s replica legs
+        // and multiSetPass's owner legs already take. Only the first
+        // failure is rethrown; any additional leg's bug is still
+        // counted/logged via reportBackgroundWriteBug rather than vanishing
+        // silently (issue #230).
+        RuntimeException legBug = null;
         for (CompletableFuture<List<Integer>> leg : legs) {
             try {
                 retry.addAll(leg.join());
             } catch (CompletionException wrapped) {
-                throw unwrapReplicaBug(wrapped);
+                RuntimeException bug = unwrapReplicaBug(wrapped);
+                if (legBug == null) {
+                    legBug = bug;
+                } else {
+                    reportBackgroundWriteBug(bug);
+                }
             }
         }
+        if (legBug != null) throw legBug;
         return retry;
     }
 
