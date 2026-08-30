@@ -29,6 +29,16 @@ from ._errors import NanocachedError, NotNumericError, RetryableError, WrongNode
 # malicious frame, never just a legitimately large value.
 _MAX_VALUE_LENGTH = 2 * 1024 * 1024
 
+# Bounds the sum of every hit's declared length across one multi-get
+# (`M`) reply (issue #207, follow-up to #179's Java fix, PR #201). Each
+# individual length is already capped at _MAX_VALUE_LENGTH above, but
+# that alone doesn't bound the reply as a whole: a node answering a
+# 400-key multi-get with 400 x 2 MiB hits would force ~800 MB of
+# allocation from a single reply. Reuses the same 64 MiB figure as
+# _compression.py's own decompression-bomb cap. A module global only so
+# tests can shrink it (mirrors _REQUEST_TIMEOUT above).
+_MAX_MULTIGET_RESPONSE_BYTES = 64 * 1024 * 1024
+
 # A tag is a u32 in decimal (echoed response tags).
 _MAX_TAG = 0xFFFFFFFF
 
@@ -765,6 +775,15 @@ class Connection:
                 raise NanocachedError("nanocached: invalid multi-get header in response")
             tag = self._parse_tag(fields[1 + count]) if self._tagged else None
             entries: list[bytes | None | _MultiWrongNode] = []
+            # Cumulative-bytes bound (issue #207): each individual
+            # length is already checked against _MAX_VALUE_LENGTH below,
+            # but that alone doesn't bound the reply as a whole — track
+            # the running total and fail BEFORE readexactly() would
+            # allocate the next body, so an oversized claim poisons the
+            # connection instead of forcing the allocation first (mirrors
+            # _identify.py's _read_entries tracking total_bytes against
+            # _MAX_NODE_LIST_RESPONSE_LENGTH).
+            total_bytes = 0
             for token in fields[1 : 1 + count]:
                 if token == b"-":
                     entries.append(None)
@@ -779,6 +798,12 @@ class Connection:
                         raise NanocachedError(
                             "nanocached: invalid multi-get result length in response"
                         )
+                    total_bytes += length
+                    if total_bytes > _MAX_MULTIGET_RESPONSE_BYTES:
+                        raise NanocachedError(
+                            "nanocached: multi-get response exceeds "
+                            f"{_MAX_MULTIGET_RESPONSE_BYTES} bytes (connection desynced)"
+                        )
                     entries.append(await self._reader.readexactly(length))
             return marker, entries, tag
 
@@ -787,7 +812,11 @@ class Connection:
             # <result-1>...<result-n> [<tag>]\n` — no body, unlike `M`'s
             # hit values (a set has nothing to echo back). Each token is
             # "S" (stored) or "W" (wrong node); parsing otherwise mirrors
-            # `M` above.
+            # `M` above. No cumulative-bytes bound needed here (issue
+            # #207, unlike `M` above): ack tokens are fixed-width single
+            # characters with no length-prefixed body, so this loop is
+            # already O(count), and count is already bounded by the
+            # header line's own length cap (readuntil's internal limit).
             header = await self._reader.readuntil(b"\n")
             fields = header[1:-1].split(b" ")
             if len(fields) < 1:

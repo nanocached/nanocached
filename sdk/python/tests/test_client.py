@@ -4528,6 +4528,60 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_a_multi_get_reply_over_the_cumulative_bytes_bound_is_rejected_as_a_desync(self):
+        # Issue #207 (follow-up to #179's Java fix, PR #201): each
+        # individual entry's declared length is already capped at
+        # _MAX_VALUE_LENGTH, but nothing previously bounded the SUM of
+        # every hit's length across one `M` reply — a node answering a
+        # 400-key multi-get with 400 x (per-value cap) hits could force
+        # hundreds of MB of allocation from a single reply. Shrinks the
+        # module-level bound so two small (real, 2-byte) values are
+        # enough to trip it without moving tens of megabytes over
+        # loopback, mirroring RequestTimeoutTests' own pattern for
+        # _REQUEST_TIMEOUT.
+        from nanocached import _connection as connection_module
+
+        default_bound = connection_module._MAX_MULTIGET_RESPONSE_BYTES
+        connection_module._MAX_MULTIGET_RESPONSE_BYTES = 3
+        try:
+            client = await self.connect()
+            try:
+                await client.set("a", "xy")
+                await client.set("b", "zw")
+                with self.assertRaisesRegex(NanocachedError, "exceeds"):
+                    await client.get_many(["a", "b"])
+
+                # The connection was poisoned, so the redial that follows
+                # proves the client recovers cleanly instead of staying
+                # desynced — restore the real-world bound first so the
+                # redial's own (still 4-byte) reply isn't rejected too.
+                connection_module._MAX_MULTIGET_RESPONSE_BYTES = default_bound
+                self.assertEqual(await client.get_many(["a", "b"]), {"a": "xy", "b": "zw"})
+            finally:
+                await client.close()
+        finally:
+            connection_module._MAX_MULTIGET_RESPONSE_BYTES = default_bound
+
+    async def test_a_multi_get_reply_just_under_the_cumulative_bytes_bound_succeeds(self):
+        # Companion to the test above: a reply whose cumulative size is
+        # right at (not over) the shrunk bound must still succeed
+        # normally, proving the check is a strict "greater than", not an
+        # off-by-one that rejects legitimate replies.
+        from nanocached import _connection as connection_module
+
+        default_bound = connection_module._MAX_MULTIGET_RESPONSE_BYTES
+        connection_module._MAX_MULTIGET_RESPONSE_BYTES = 4
+        try:
+            client = await self.connect()
+            try:
+                await client.set("a", "xy")
+                await client.set("b", "zw")
+                self.assertEqual(await client.get_many(["a", "b"]), {"a": "xy", "b": "zw"})
+            finally:
+                await client.close()
+        finally:
+            connection_module._MAX_MULTIGET_RESPONSE_BYTES = default_bound
+
 
 class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
     # Batched get/set (issues #128/#150/#151), cluster coverage: owner
