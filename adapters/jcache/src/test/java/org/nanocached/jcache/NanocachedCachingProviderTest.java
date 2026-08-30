@@ -1,5 +1,6 @@
 package org.nanocached.jcache;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -7,7 +8,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import javax.cache.CacheException;
 import javax.cache.CacheManager;
 import javax.cache.Caching;
@@ -105,6 +115,60 @@ class NanocachedCachingProviderTest {
             CacheManager second = provider.getCacheManager(uri, null, propertiesFor(node));
             assertNotSame(first, second);
             assertTrue(!second.isClosed());
+        }
+    }
+
+    @Test
+    void racingRequestsForTheSameKeyConvergeOnOneManagerAndCloseEveryLosingClient() throws Exception {
+        // issue #192: the blocking connect must run outside
+        // ConcurrentHashMap#compute — otherwise every racer would
+        // effectively serialize behind that key's bucket lock. Racing
+        // several threads for the same (uri, classLoader) instead lets
+        // each dial its own client concurrently; only one may end up
+        // backing the manager everyone gets back, and every other
+        // racer's client must be closed rather than leaked.
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            URI uri = URI.create("test:race");
+            ClassLoader classLoader = getClass().getClassLoader();
+            int racers = 8;
+            ExecutorService pool = Executors.newFixedThreadPool(racers);
+            try {
+                CountDownLatch ready = new CountDownLatch(racers);
+                CountDownLatch go = new CountDownLatch(1);
+                List<Future<CacheManager>> futures = new ArrayList<>();
+                for (int i = 0; i < racers; i++) {
+                    futures.add(pool.submit(() -> {
+                        ready.countDown();
+                        go.await();
+                        return provider.getCacheManager(uri, classLoader, propertiesFor(node));
+                    }));
+                }
+                ready.await();
+                go.countDown();
+
+                Set<CacheManager> managers = new HashSet<>();
+                for (Future<CacheManager> future : futures) {
+                    managers.add(future.get(10, TimeUnit.SECONDS));
+                }
+
+                assertEquals(1, managers.size(), "every racer must converge on the same manager");
+                // A losing client's close() call returns once it has shut
+                // its own socket down, but the mock node's server thread
+                // still needs a moment to observe the resulting EOF and
+                // decrement liveConnectionCount — bounded poll rather than
+                // asserting immediately. Only the winner's connection
+                // stays open in the end, however many raced.
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (node.liveConnectionCount.get() != 1 && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertEquals(
+                        1,
+                        node.liveConnectionCount.get(),
+                        "every losing client must be closed, not leaked");
+            } finally {
+                pool.shutdownNow();
+            }
         }
     }
 

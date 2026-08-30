@@ -40,6 +40,15 @@ final class MockNode implements AutoCloseable {
     final AtomicInteger casDeleteCount = new AtomicInteger();
     final AtomicInteger multiGetCount = new AtomicInteger();
     final AtomicInteger multiSetCount = new AtomicInteger();
+    /** Every accepted TCP connection, whether or not it goes on to
+     * authenticate (issue #192: used to prove a raced getCacheManager's
+     * "loser" client actually dialed in, rather than the race being
+     * decided before any connect happened at all). */
+    final AtomicInteger connectionCount = new AtomicInteger();
+    /** Connections currently open (issue #192): connectionCount minus
+     * however many have since closed — used to prove a raced
+     * getCacheManager's losing client is actually closed, not leaked. */
+    final AtomicInteger liveConnectionCount = new AtomicInteger();
     /** When set, the next {@code k}/{@code x} request answers a
      * mismatch ({@code N}) regardless of whether the condition actually
      * holds — a one-shot fault, cleared on use. Exists purely to prove
@@ -89,6 +98,8 @@ final class MockNode implements AutoCloseable {
     }
 
     private void serve(Socket socket) {
+        connectionCount.incrementAndGet();
+        liveConnectionCount.incrementAndGet();
         try (socket) {
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
@@ -139,6 +150,8 @@ final class MockNode implements AutoCloseable {
             }
         } catch (IOException done) {
             // connection closed by the client (or test teardown)
+        } finally {
+            liveConnectionCount.decrementAndGet();
         }
     }
 

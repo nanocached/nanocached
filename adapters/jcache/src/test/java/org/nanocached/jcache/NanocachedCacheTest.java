@@ -324,6 +324,41 @@ class NanocachedCacheTest {
     }
 
     @Test
+    void getAllWithAnAccessExpiryPolicyRefreshesEveryHitInOneBulkWrite() {
+        // issue #192: getAll used to refresh an access-based ExpiryPolicy
+        // one key at a time (one wire round trip per hit); it must now
+        // batch every hit's refresh into a single setManyBytes call,
+        // exactly like putAll batches its writes.
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(
+                AccessedExpiryPolicy.factoryOf(new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)));
+        Cache<String, String> slidingCache = manager.createCache("sliding-all", config);
+        slidingCache.put("a", "1");
+        slidingCache.put("b", "2");
+
+        // Simulate time having passed, bypassing the cache, on both keys.
+        node.store("sliding-all")
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
+                        new MockNode.Entry(node.entry("sliding-all", KeyCodec.toKeyBytes("a")).value(), 5L));
+        node.store("sliding-all")
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")),
+                        new MockNode.Entry(node.entry("sliding-all", KeyCodec.toKeyBytes("b")).value(), 5L));
+        node.multiSetCount.set(0);
+
+        Map<String, String> all = slidingCache.getAll(Set.of("a", "b", "missing"));
+
+        assertEquals(2, all.size());
+        assertEquals("1", all.get("a"));
+        assertEquals("2", all.get("b"));
+        assertEquals(1, node.multiSetCount.get(), "one bulk write refreshes every hit's TTL");
+        assertEquals(30L, storedTtlSeconds("sliding-all", "a"), "a getAll must refresh the TTL via getExpiryForAccess");
+        assertEquals(30L, storedTtlSeconds("sliding-all", "b"), "a getAll must refresh the TTL via getExpiryForAccess");
+    }
+
+    @Test
     void putAllIssuesOneBulkWritePerResolvedTtl() {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);

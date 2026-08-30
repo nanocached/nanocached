@@ -400,6 +400,12 @@ type Client struct {
 
 	closed        bool
 	stopKeepalive chan struct{}
+	// keepaliveWG lets Close() wait for the keepalive goroutine itself to
+	// exit (issue #192) — otherwise it could still be mid-ping against a
+	// connection Close()'s teardown() is about to close out from under
+	// it, racing the very thing every other background-work WaitGroup
+	// here (backgroundReplicaWG, hedgedReadsWG) exists to prevent.
+	keepaliveWG sync.WaitGroup
 
 	single        *connection // single-node mode
 	singleAddress string
@@ -1982,6 +1988,11 @@ func (c *Client) Close() {
 	// readHedged), so Close() waits for them too before tearing down
 	// connections out from under them.
 	c.hedgedReadsWG.Wait()
+	// issue #192: wait for the keepalive goroutine to actually exit (it
+	// observes c.stopKeepalive above and returns), not just for it to be
+	// signalled — otherwise teardown() below could close a connection
+	// while a ping against it is still in flight.
+	c.keepaliveWG.Wait()
 	c.teardown()
 }
 
@@ -2630,7 +2641,9 @@ func (c *Client) fetchNodeList() ([]discoveredNode, int, bool) {
 // ── keep-alive ────────────────────────────────────────────────────
 
 func (c *Client) startKeepalive(interval time.Duration) {
+	c.keepaliveWG.Add(1)
 	go func() {
+		defer c.keepaliveWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -2650,14 +2663,32 @@ func (c *Client) startKeepalive(interval time.Duration) {
 			}
 			c.mu.Unlock()
 
-			for _, conn := range connections {
-				if conn.isClosed() || conn.idle() < interval {
-					continue // dead ones stay lazy; busy ones don't need a ping
-				}
-				// Any parseable reply proves liveness — N, or W from a
-				// non-owner — and resets the server's idle timer.
-				_, _, _ = conn.get(keepaliveKey)
-			}
+			pingIdleConnections(connections, interval)
 		}
 	}()
+}
+
+// pingIdleConnections sends a keepalive probe to every idle connection in
+// connections, in parallel — one goroutine per connection, all joined
+// before this returns (issue #192). Previously this ran sequentially, so
+// a slow or hung node delayed the ping reaching every other member until
+// its own request finished or timed out; bounded parallelism here means
+// one slow connection no longer holds up the rest. Extracted from
+// startKeepalive's loop body so it can be driven directly, with a
+// controlled connection order, in tests.
+func pingIdleConnections(connections []*connection, interval time.Duration) {
+	var pings sync.WaitGroup
+	for _, conn := range connections {
+		if conn.isClosed() || conn.idle() < interval {
+			continue // dead ones stay lazy; busy ones don't need a ping
+		}
+		pings.Add(1)
+		go func(conn *connection) {
+			defer pings.Done()
+			// Any parseable reply proves liveness — N, or W from a
+			// non-owner — and resets the server's idle timer.
+			_, _, _ = conn.get(keepaliveKey)
+		}(conn)
+	}
+	pings.Wait()
 }

@@ -2478,6 +2478,79 @@ func TestKeepAlivePingsAnIdleConnection(t *testing.T) {
 	}
 }
 
+// TestKeepAlivePingsIdleConnectionsInParallel is a regression for issue
+// #192: pings used to run sequentially, one connection at a time, so a
+// slow or hung node delayed the ping reaching every other member by its
+// own response time. Driving pingIdleConnections directly (rather than
+// through startKeepalive's ticker) makes this deterministic — connection
+// order no longer matters, since with N connections all delayed by d,
+// sequential pinging takes ~N*d while parallel pinging takes ~d
+// regardless of N.
+func TestKeepAlivePingsIdleConnectionsInParallel(t *testing.T) {
+	const (
+		nodeCount = 5
+		delay     = 150 * time.Millisecond
+	)
+
+	connections := make([]*connection, 0, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		node := startMockNode(t, nil)
+		node.delayGets(delay)
+		result, err := connectAndIdentify(node.address(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn := newConnection(result.conn, func() {}, result.tagged, nil)
+		defer conn.close()
+		connections = append(connections, conn)
+	}
+
+	// idle() must already exceed the interval for pingIdleConnections to
+	// probe a connection at all.
+	interval := time.Millisecond
+	time.Sleep(2 * time.Millisecond)
+
+	started := time.Now()
+	pingIdleConnections(connections, interval)
+	elapsed := time.Since(started)
+
+	// Sequential pinging of 5 connections each delayed 150ms would take
+	// ~750ms; parallel pinging takes ~150ms regardless of how many.
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("pingIdleConnections(%d connections, %v delay each) took %v, want well under %v (sequential would take ~%v)",
+			nodeCount, delay, elapsed, 400*time.Millisecond, time.Duration(nodeCount)*delay)
+	}
+}
+
+// TestCloseWaitsForTheKeepaliveGoroutine is a regression for issue #192:
+// Close() used to only signal the keepalive goroutine to stop
+// (close(stopKeepalive)) without waiting for it to actually exit — a ping
+// already in flight against a connection could still be running when
+// teardown() closed that same connection out from under it.
+func TestCloseWaitsForTheKeepaliveGoroutine(t *testing.T) {
+	defaultInterval := keepAliveInterval
+	keepAliveInterval = 20 * time.Millisecond
+	defer func() { keepAliveInterval = defaultInterval }()
+
+	node := startMockNode(t, nil)
+	node.delayGets(150 * time.Millisecond)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for a keep-alive ping to actually reach the node — getCount is
+	// incremented before the mock node sleeps out the delay, so this
+	// confirms a ping is now blocked in flight.
+	waitFor(t, func() bool { return node.getCount.Load() >= 1 }, "a keep-alive ping to start")
+
+	started := time.Now()
+	client.Close()
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond {
+		t.Fatalf("Close() returned after %v, want it to wait out the in-flight keep-alive ping (~150ms)", elapsed)
+	}
+}
+
 func TestARequestToAHalfOpenServerFailsWithinTheTimeoutAndCloseReturns(t *testing.T) {
 	// Regression: a server that completes the A handshake but then never
 	// answers a G/S/D (accepts the TCP connection and goes silent — a
