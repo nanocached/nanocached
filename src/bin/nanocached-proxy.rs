@@ -116,6 +116,7 @@
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -2326,6 +2327,46 @@ impl PendingReplyExt for PendingReply {
     }
 }
 
+/// Issue #177: runs every future in `futs` concurrently on the current
+/// task and returns their outputs in the same order as `futs` — a tiny
+/// local `join_all`, since the crate carries no `futures` dependency.
+/// Every fan-out site below (a write/clear/multi-set batch's per-owner
+/// `enqueue`/`call`) used to run these one at a time in a `for` loop, so
+/// one address that was slow to dial (or is being black-holed) delayed
+/// issuing the request to every other owner behind it in the loop —
+/// `tokio::spawn` isn't an option here since these futures borrow
+/// `context`/`addr`/... with a lifetime shorter than `'static`, so this
+/// polls them all in place instead of spawning them onto the runtime.
+async fn join_all<'a, T>(futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>) -> Vec<T> {
+    let len = futs.len();
+    let mut slots: Vec<Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>> =
+        futs.into_iter().map(Some).collect();
+    let mut outputs: Vec<Option<T>> = (0..len).map(|_| None).collect();
+    let mut remaining = len;
+    std::future::poll_fn(move |cx| {
+        for i in 0..len {
+            if let Some(fut) = slots[i].as_mut()
+                && let Poll::Ready(value) = fut.as_mut().poll(cx)
+            {
+                outputs[i] = Some(value);
+                slots[i] = None;
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(
+                outputs
+                    .iter_mut()
+                    .map(|value| value.take().unwrap())
+                    .collect(),
+            )
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
 /// The current ring, or `None` before the first successful fetch.
 fn current_ring(context: &ProxyContext) -> Option<Arc<RingView>> {
     context.ring.borrow().clone()
@@ -2700,20 +2741,22 @@ async fn dispatch_request(
                 return result_rx;
             }
 
-            let mut pending = Vec::with_capacity(groups.len());
-            for (owner, _, group_keys) in &groups {
-                pending.push(
-                    context
-                        .backends
-                        .enqueue(
-                            &context,
-                            owner,
-                            frame_multi_get(&namespace, group_keys),
-                            Expect::Multi,
-                        )
-                        .await,
-                );
-            }
+            // Issue #177: every group's `enqueue` (including whatever
+            // dial it takes) runs concurrently — a slow-to-dial owner
+            // must not delay issuing the request to the others.
+            let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = groups
+                .iter()
+                .map(|(owner, _, group_keys)| {
+                    let fut = context.backends.enqueue(
+                        &context,
+                        owner,
+                        frame_multi_get(&namespace, group_keys),
+                        Expect::Multi,
+                    );
+                    Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+                })
+                .collect();
+            let pending = join_all(futs).await;
             let positions: Vec<Vec<usize>> = groups
                 .into_iter()
                 .map(|(_, positions, _)| positions)
@@ -2766,28 +2809,29 @@ async fn dispatch_request(
                 return result_rx;
             }
 
-            let mut pending = Vec::with_capacity(groups.len());
-            for (owner, legs) in &groups {
-                let group_keys: Vec<Bytes> = legs
-                    .iter()
-                    .map(|(position, _)| keys[*position].clone())
-                    .collect();
-                let group_values: Vec<Bytes> = legs
-                    .iter()
-                    .map(|(position, _)| values[*position].clone())
-                    .collect();
-                pending.push(
-                    context
-                        .backends
-                        .enqueue(
-                            &context,
-                            owner,
-                            frame_multi_set(&namespace, &group_keys, &group_values, ttl),
-                            Expect::MultiAck,
-                        )
-                        .await,
-                );
-            }
+            // Issue #177: same concurrent fan-out as `MultiGet` above —
+            // one slow-to-dial owner must not delay the other groups.
+            let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = groups
+                .iter()
+                .map(|(owner, legs)| {
+                    let group_keys: Vec<Bytes> = legs
+                        .iter()
+                        .map(|(position, _)| keys[*position].clone())
+                        .collect();
+                    let group_values: Vec<Bytes> = legs
+                        .iter()
+                        .map(|(position, _)| values[*position].clone())
+                        .collect();
+                    let fut = context.backends.enqueue(
+                        &context,
+                        owner,
+                        frame_multi_set(&namespace, &group_keys, &group_values, ttl),
+                        Expect::MultiAck,
+                    );
+                    Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+                })
+                .collect();
+            let pending = join_all(futs).await;
             let groups_legs: Vec<Vec<(usize, bool)>> =
                 groups.into_iter().map(|(_, legs)| legs).collect();
 
@@ -2979,17 +3023,23 @@ async fn retry_multi_get(
         }
     }
 
-    for (owner, group_positions, group_keys) in groups {
-        let reply = context
-            .backends
-            .call(
+    // Issue #177: fan the regrouped retry out to every owner
+    // concurrently, same reasoning as the first pass in `dispatch_request`.
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = groups
+        .iter()
+        .map(|(owner, _, group_keys)| {
+            let fut = context.backends.call(
                 context,
-                &owner,
-                frame_multi_get(namespace, &group_keys),
+                owner,
+                frame_multi_get(namespace, group_keys),
                 Expect::Multi,
-            )
-            .await;
+            );
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    let replies = join_all(futs).await;
 
+    for ((_, group_positions, _), reply) in groups.into_iter().zip(replies) {
         match reply {
             Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
                 for (position, entry) in group_positions.into_iter().zip(results) {
@@ -3141,25 +3191,30 @@ async fn retry_multi_set(
         }
     }
 
-    for (owner, legs) in groups {
-        let group_keys: Vec<Bytes> = legs
-            .iter()
-            .map(|(position, _)| keys[*position].clone())
-            .collect();
-        let group_values: Vec<Bytes> = legs
-            .iter()
-            .map(|(position, _)| values[*position].clone())
-            .collect();
-        let reply = context
-            .backends
-            .call(
+    // Issue #177: same concurrent fan-out as `retry_multi_get` above.
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = groups
+        .iter()
+        .map(|(owner, legs)| {
+            let group_keys: Vec<Bytes> = legs
+                .iter()
+                .map(|(position, _)| keys[*position].clone())
+                .collect();
+            let group_values: Vec<Bytes> = legs
+                .iter()
+                .map(|(position, _)| values[*position].clone())
+                .collect();
+            let fut = context.backends.call(
                 context,
-                &owner,
+                owner,
                 frame_multi_set(namespace, &group_keys, &group_values, ttl),
                 Expect::MultiAck,
-            )
-            .await;
+            );
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    let replies = join_all(futs).await;
 
+    for ((_, legs), reply) in groups.into_iter().zip(replies) {
         match reply {
             Ok(NodeReply::MultiAck(results)) if results.len() == legs.len() => {
                 for ((position, is_primary), result) in legs.into_iter().zip(results) {
@@ -3183,8 +3238,9 @@ async fn retry_multi_set(
     }
 }
 
-/// Enqueues a write/delete on every owner, primary first, in one ordered
-/// pass; returns the pending replies (primary first).
+/// Enqueues a write/delete on every owner concurrently (issue #177: one
+/// owner slow to dial must not delay the others); returns the pending
+/// replies in owner order, primary first.
 async fn enqueue_write(
     context: &ProxyContext,
     ring: &RingView,
@@ -3194,16 +3250,16 @@ async fn enqueue_write(
 ) -> Vec<PendingReply> {
     let owners = ring.owners(namespace, key);
     let (frame, expect) = write_frame(namespace, key, write);
-    let mut pending = Vec::with_capacity(owners.len());
-    for addr in &owners {
-        pending.push(
-            context
+    let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = owners
+        .iter()
+        .map(|addr| {
+            let fut = context
                 .backends
-                .enqueue(context, addr, frame.clone(), expect)
-                .await,
-        );
-    }
-    pending
+                .enqueue(context, addr, frame.clone(), expect);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+        })
+        .collect();
+    join_all(futs).await
 }
 
 fn write_frame(
@@ -3285,12 +3341,18 @@ async fn refan_write(
     let Some((primary, replicas)) = owners.split_first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
-    for addr in replicas {
-        if let Err(error) = context
-            .backends
-            .call(context, addr, frame.clone(), expect)
-            .await
-        {
+    // Issue #177: every replica leg's `call` runs concurrently — a
+    // black-holed replica must not delay the others, or delay reaching
+    // the primary below.
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = replicas
+        .iter()
+        .map(|addr| {
+            let fut = context.backends.call(context, addr, frame.clone(), expect);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    for (addr, result) in replicas.iter().zip(join_all(futs).await) {
+        if let Err(error) = result {
             eprintln!("WARN replica write to {addr} failed: {error}");
         }
     }
@@ -3362,17 +3424,20 @@ async fn fan_out_write_result(
     ttl: Option<u64>,
     replicas: &[String],
 ) {
-    for addr in replicas {
-        if let Err(error) = context
-            .backends
-            .call(
-                context,
-                addr,
-                frame_set(namespace, key, value, ttl),
-                Expect::Stored,
-            )
-            .await
-        {
+    // Issue #177: concurrent, same reasoning as `refan_write`'s replica
+    // loop.
+    let frame = frame_set(namespace, key, value, ttl);
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = replicas
+        .iter()
+        .map(|addr| {
+            let fut = context
+                .backends
+                .call(context, addr, frame.clone(), Expect::Stored);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    for (addr, result) in replicas.iter().zip(join_all(futs).await) {
+        if let Err(error) = result {
             eprintln!("WARN replica incr-result write to {addr} failed: {error}");
         }
     }
@@ -3530,12 +3595,19 @@ async fn fan_out_delete_result(
     key: &[u8],
     replicas: &[String],
 ) {
-    for addr in replicas {
-        if let Err(error) = context
-            .backends
-            .call(context, addr, frame_delete(namespace, key), Expect::Deleted)
-            .await
-        {
+    // Issue #177: concurrent, same reasoning as `fan_out_write_result`.
+    let frame = frame_delete(namespace, key);
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = replicas
+        .iter()
+        .map(|addr| {
+            let fut = context
+                .backends
+                .call(context, addr, frame.clone(), Expect::Deleted);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    for (addr, result) in replicas.iter().zip(join_all(futs).await) {
+        if let Err(error) = result {
             eprintln!("WARN replica cas-delete-result write to {addr} failed: {error}");
         }
     }
@@ -3587,15 +3659,21 @@ async fn enqueue_clear(
         Some(namespace) => frame_clear(namespace),
         None => frame_clear_all(),
     };
-    let mut pending = Vec::new();
-    for addr in ring.all_addresses() {
-        let reply = context
-            .backends
-            .enqueue(context, &addr, frame.clone(), Expect::Cleared)
-            .await;
-        pending.push((addr, reply));
-    }
-    pending
+    let addrs = ring.all_addresses();
+    // Issue #177: fan out to every member concurrently — a single slow
+    // or black-holed member must not delay `enqueue` to the rest of the
+    // cluster on a `Clear`/`FlushAll`.
+    let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = addrs
+        .iter()
+        .map(|addr| {
+            let fut = context
+                .backends
+                .enqueue(context, addr, frame.clone(), Expect::Cleared);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+        })
+        .collect();
+    let replies = join_all(futs).await;
+    addrs.into_iter().zip(replies).collect()
 }
 
 /// `c`/`F`'s completion: every member must ack. Any failure forces one
@@ -3623,16 +3701,21 @@ async fn finish_clear(
         Some(namespace) => frame_clear(namespace),
         None => frame_clear_all(),
     };
-    let mut all_ok = true;
-    for addr in ring.all_addresses() {
-        all_ok &= matches!(
-            context
+    // Issue #177: concurrent, same reasoning as `enqueue_clear`.
+    let addrs = ring.all_addresses();
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = addrs
+        .iter()
+        .map(|addr| {
+            let fut = context
                 .backends
-                .call(context, &addr, frame.clone(), Expect::Cleared)
-                .await,
-            Ok(NodeReply::Cleared)
-        );
-    }
+                .call(context, addr, frame.clone(), Expect::Cleared);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    let all_ok = join_all(futs)
+        .await
+        .into_iter()
+        .all(|result| matches!(result, Ok(NodeReply::Cleared)));
     if all_ok {
         Ok(respond("C", tag))
     } else {
