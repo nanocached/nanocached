@@ -21,10 +21,16 @@ nanocached cluster.
 - **Values are JSON-serialized** (`JSON.stringify`/`JSON.parse`), the
   convention `cache-manager`'s own stores use (its Redis store does the
   same).
-- **`keys()`/`ttl()` are unsupported** — the wire has no key-enumeration
-  or TTL-readback operation, so both always throw a documented
-  `NotSupportedError` rather than returning a misleading empty/zero
-  answer.
+- **`keys()` is unsupported** — the wire has no key-enumeration operation,
+  so it always throws a documented `NotSupportedError` rather than
+  returning a misleading empty answer. **`ttl()` degrades gracefully
+  instead** ([#274](https://github.com/nanocached/nanocached/issues/274)):
+  the wire has no TTL-readback operation either, but `ttl()` is a
+  *required* `Store` member that `cache-manager`'s own `wrap()` calls
+  unconditionally whenever `refreshThreshold` is configured — throwing
+  there would turn every cache hit into an uncaught error. So `ttl()`
+  always returns `-1`, which `wrap()` treats as "unknown" and never
+  refreshes ahead for. See "Refresh-ahead" below.
 
 ## Setup
 
@@ -100,10 +106,25 @@ client directly, for anything this store doesn't itself surface —
 - **`reset()`** clears this store's namespace only (`CLEAR`, issue #106)
   — never `NanocachedClient.clearAll()`'s whole-cluster flush. Two stores
   on different namespaces are fully isolated from each other's `reset()`.
-- **`keys()`/`ttl()`** always throw `NotSupportedError`: a nanocached node
-  only ever answers about one key at a time (`get`/`set`/`delete`/`clear`),
-  so there is no request this store could send to enumerate a namespace's
-  keys or read back a stored TTL.
+- **`keys()`** always throws `NotSupportedError`: a nanocached node only
+  ever answers about one key at a time (`get`/`set`/`delete`/`clear`), so
+  there is no request this store could send to enumerate a namespace's
+  keys.
+- **Refresh-ahead (`refreshThreshold`) silently degrades to plain
+  caching.** `ttl()` always resolves `-1` — never a real remaining TTL,
+  since the wire has no TTL-readback operation either (same limitation as
+  `keys()`), and unlike `keys()`, `ttl()` can't just throw: it's a
+  required `Store` member, and `cache-manager`'s `wrap()` calls
+  `store.ttl(key)` unconditionally and uncaught whenever a caller passes
+  `refreshThreshold` (`cache.wrap(key, fn, ttl, refreshThreshold)` or the
+  `refreshThreshold` config option), on *every* cache hit. `-1` is exactly
+  the sentinel `wrap()`'s own logic already treats as "unknown TTL, skip
+  the refresh-ahead check" (`remainingTtl !== -1 && remainingTtl <
+  refreshThresholdConfig`), so passing `refreshThreshold` here never
+  throws and never triggers a background reload — it behaves exactly like
+  `wrap()` without `refreshThreshold` at all. If your application relies
+  on refresh-ahead actually firing before expiry, this store cannot
+  provide that; use `wrap()` for its cache-aside behavior only.
 - **`mget`/`mset`/`mdel`** are `Promise.all` loops over `get`/`set`/`del`
   — concurrent, not a single wire round trip. `mget` preserves key order
   in its result (including `undefined` holes for misses); `mset` applies
