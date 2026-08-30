@@ -1212,6 +1212,112 @@ describe("unsolicited busy response (issue #45)", () => {
   });
 });
 
+describe("onData's fatal paths route through poison() (issue #187)", () => {
+  it("a malformed response marks the connection closed synchronously, before the 'close' event", async () => {
+    // Regression: onData's response-parse-failure branch called
+    // socket.destroy() directly instead of poison(), so `closed` stayed
+    // false until destroy()'s 'close' event landed on a later tick —
+    // long enough for another request to pick this already-dead
+    // connection and write into it (extra ConnectionLostError + retry).
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+      const request = connection.get("k");
+
+      // Registered after Connection's own constructor already attached
+      // its 'data' listener, so Node invokes this one second for the
+      // same event — strictly after onData (and the poison() it must
+      // now trigger) has run, but still in the same synchronous turn as
+      // the data delivery, well before 'close' gets any chance to fire.
+      let closedWithinDataEvent = false;
+      socket.on("data", () => {
+        closedWithinDataEvent = connection.isClosed();
+      });
+
+      await waitFor(() => serverSockets.length === 1, "the server to accept the connection");
+      // Two fields where an untagged `V` response must have exactly one
+      // (protocol.ts's fields.length !== 1 check) — a garbage header
+      // that desyncs the stream.
+      serverSockets[0].write("V 5 5\n");
+
+      await assert.rejects(request, /invalid value header/);
+      assert.equal(closedWithinDataEvent, true, "isClosed() must already be true within the same 'data' event turn");
+      assert.equal(connection.isClosed(), true);
+    } finally {
+      for (const s of serverSockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("a frame that grows past the size cap without ever completing marks the connection closed synchronously", async () => {
+    // Regression: onData's oversize-frame branch (the backstop covering
+    // a value body that never assembles into a parseable frame, issue
+    // #12 follow-up) also called socket.destroy() directly instead of
+    // poison() — same synchronous-isClosed() gap as the parse-failure
+    // branch above. Exercised via onData directly: MAX_RESPONSE_FRAME_LENGTH
+    // is sized for exactly one maximally-sized `V` frame, so no chunk
+    // sequence a real server could trickle ever reaches this backstop
+    // without first tripping one of tryParseResponse's own smaller,
+    // per-field header-length checks (parseTtlSeconds on an `I`
+    // response's TTL field is the one exception — unlike the tag field,
+    // it has no digit-count cap — but only if the whole oversize header
+    // arrives already assembled, which real chunked delivery won't
+    // produce deterministically).
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+    const { MAX_RESPONSE_FRAME_LENGTH } = await import("../src/protocol.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+      const request = connection.get("k");
+
+      // An untagged `I <len> <ttl>` header whose TTL digit string alone
+      // is already past MAX_RESPONSE_FRAME_LENGTH, delivered as one
+      // frame: a valid, unbounded-length TTL field followed by its own
+      // terminating LF, then nothing else — genuinely still incomplete
+      // (the declared 5-byte value never arrives) but already past the
+      // whole-frame backstop by construction.
+      const oversizeTtl = "9".repeat(MAX_RESPONSE_FRAME_LENGTH);
+      const frame = Buffer.from(`I 5 ${oversizeTtl}\n`, "ascii");
+
+      // Fed directly to onData in one call: real socket delivery chunks
+      // a buffer this large across many 'data' events, and the header's
+      // own (much smaller) incomplete-terminator threshold would reject
+      // it long before this much ever accumulates — see the comment
+      // above.
+      (connection as unknown as { onData(chunk: Buffer): void }).onData(frame);
+
+      // True immediately after the synchronous onData() call returns —
+      // no 'close' event has had any chance to fire yet.
+      assert.equal(connection.isClosed(), true, "isClosed() must flip synchronously within the onData() call itself");
+      await assert.rejects(request, /exceeds maximum size/);
+    } finally {
+      for (const s of serverSockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("a failed write poisons the connection (audit finding)", () => {
   it("marks the connection closed and rejects other in-flight requests promptly, not after the 30s timeout", async () => {
     // Regression: Connection.send()'s write callback only spliced the
