@@ -572,8 +572,10 @@ struct ProxyContext {
     /// tagged, pipelined connection per node, multiplexing every client
     /// connection's traffic. This is what collapses the node-side
     /// connection count from "client connections × nodes" to "one per
-    /// node per proxy".
-    backends: SharedBackends,
+    /// node per proxy". `Arc`-wrapped so the roster refresher (issue
+    /// #220: pruning stale addresses on each fresh `RingView`) can hold
+    /// the same instance independently of this context.
+    backends: Arc<SharedBackends>,
     /// Issue #124: flips to `true` when a drain begins (SIGTERM/SIGINT).
     /// Connection readers stop taking new requests (writers still
     /// deliver what is in flight), the accept loop stops, `/readyz`
@@ -828,6 +830,7 @@ async fn run_refresher(
     config: RefresherConfig,
     ring_tx: watch::Sender<Option<Arc<RingView>>>,
     mut refresh_rx: mpsc::Receiver<()>,
+    backends: Arc<SharedBackends>,
 ) {
     let RefresherConfig {
         discovery,
@@ -844,6 +847,11 @@ async fn run_refresher(
 
         match fetch_roster(&discovery, &secret, &tls_connector).await {
             Ok(ring) => {
+                // Issue #220: prune `slots`/`dial_failures` against the
+                // fresh view right here, where the new roster is known —
+                // an address that dropped off the ring stops accumulating
+                // map entries from this point on.
+                backends.prune(&ring);
                 let _ = ring_tx.send(Some(ring));
             }
             Err(error) => {
@@ -2268,6 +2276,40 @@ impl SharedBackends {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         failures.remove(addr);
+    }
+
+    /// Issue #220: drops `slots`/`dial_failures` entries for addresses no
+    /// longer present in `ring` — otherwise a long-running proxy in an
+    /// autoscaling deployment (ECS/EKS) accumulates one entry per address
+    /// the cluster has ever used, growing without bound.
+    ///
+    /// Safe against a connection in flight on a pruned address: `slot()`
+    /// callers (and `run_backend`'s own teardown) hold their own `Arc`
+    /// clone of that address's slot, independent of the map entry, so
+    /// dropping the entry here neither drops nor disturbs a live
+    /// connection — it just stops being reachable through this map. If
+    /// the address later rejoins the ring, the next `slot()` call for it
+    /// creates a fresh, empty entry and redials, exactly as it would for
+    /// an address seen for the first time. `dialed` accounting is
+    /// unaffected: it is tracked by `run_backend`'s own teardown (see
+    /// issue #192) against the specific handle it owns, not by map
+    /// membership.
+    fn prune(&self, ring: &RingView) {
+        let live = ring.all_addresses();
+        {
+            let mut slots = self
+                .slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            slots.retain(|addr, _| live.contains(addr));
+        }
+        {
+            let mut failures = self
+                .dial_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            failures.retain(|addr, _| live.contains(addr));
+        }
     }
 
     /// Enqueues one tag-checked request on `addr`'s shared connection
@@ -4076,6 +4118,7 @@ async fn run(
     let (drain_tx, drain_rx) = watch::channel(false);
     let identity = ProxyIdentity::generate();
     println!("INFO proxy identity: {}", identity.name);
+    let backends = Arc::new(SharedBackends::new());
     let refresher = tokio::spawn(run_refresher(
         RefresherConfig {
             discovery: args.discovery.clone(),
@@ -4086,6 +4129,7 @@ async fn run(
         },
         ring_tx,
         refresh_rx,
+        Arc::clone(&backends),
     ));
 
     // Issue #124: SIGTERM/SIGINT begin the drain — the orchestrator's
@@ -4102,7 +4146,7 @@ async fn run(
         ring: ring_rx,
         refresh_now: refresh_tx,
         drain: drain_rx,
-        backends: SharedBackends::new(),
+        backends,
         requests_total: std::sync::atomic::AtomicU64::new(0),
         upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
     });
@@ -5235,6 +5279,7 @@ mod tests {
         let (refresh_tx, refresh_rx) = mpsc::channel(16);
         let (drain_tx, drain_rx) = watch::channel(false);
         let secret = secret.map(|secret| Bytes::from(secret.to_string()));
+        let backends = Arc::new(SharedBackends::new());
         tokio::spawn(run_refresher(
             RefresherConfig {
                 discovery: vec![discovery_addr.to_string()],
@@ -5245,6 +5290,7 @@ mod tests {
             },
             ring_tx,
             refresh_rx,
+            Arc::clone(&backends),
         ));
         let context = Arc::new(ProxyContext {
             secret,
@@ -5252,7 +5298,7 @@ mod tests {
             ring: ring_rx.clone(),
             refresh_now: refresh_tx,
             drain: drain_rx,
-            backends: SharedBackends::new(),
+            backends,
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         });
@@ -5345,7 +5391,7 @@ mod tests {
             tls_connector: None,
             ring: ring_rx,
             refresh_now: refresh_tx,
-            backends: SharedBackends::new(),
+            backends: Arc::new(SharedBackends::new()),
             drain: drain_rx,
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
@@ -6117,7 +6163,7 @@ mod tests {
             ring: watch::channel(None).1,
             refresh_now: mpsc::channel(4).0,
             drain: watch::channel(false).1,
-            backends: SharedBackends::new(),
+            backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         });
@@ -6156,6 +6202,120 @@ mod tests {
         })
         .await
         .expect("dialed gauge must reach 0 without any further traffic to the node");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pruning_drops_a_stale_addresss_slot_and_dial_failure_entries() {
+        // Issue #220: `slots`/`dial_failures` must not accumulate one
+        // entry per address the cluster has ever used — the roster
+        // refresher prunes both maps against each fresh `RingView`.
+        let node = MockNode::start().await;
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(None).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        // Dial address A and hold the slot the map hands back — this
+        // stands in for a caller that grabbed the slot just before a
+        // prune runs, per `slot()`'s own "an in-flight connection holds
+        // its own Arc clone" contract.
+        let slot_before_prune = context.backends.slot(&node.addr);
+        let reply = context
+            .backends
+            .enqueue(
+                &context,
+                &node.addr,
+                frame_set(b"", b"k", b"v", None),
+                Expect::Stored,
+            )
+            .await;
+        assert!(matches!(reply.await, Ok(NodeReply::Stored)));
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+
+        // A synthetic dial-failure record for the same address (as if an
+        // earlier dial attempt to it had failed) — prune must clear this
+        // map too, not just `slots`.
+        context.backends.note_dial_failure(&node.addr);
+        {
+            let slots = context.backends.slots.lock().unwrap();
+            assert!(slots.contains_key(&node.addr));
+            let failures = context.backends.dial_failures.lock().unwrap();
+            assert!(failures.contains_key(&node.addr));
+        }
+
+        // Refresh to a ring that no longer includes A.
+        let ring = RingView::new(vec![("other".to_string(), "127.0.0.1:1".to_string())], 1);
+        context.backends.prune(&ring);
+
+        {
+            let slots = context.backends.slots.lock().unwrap();
+            assert!(
+                !slots.contains_key(&node.addr),
+                "prune must drop the stale address's slot entry"
+            );
+            let failures = context.backends.dial_failures.lock().unwrap();
+            assert!(
+                !failures.contains_key(&node.addr),
+                "prune must drop the stale address's dial-failure entry"
+            );
+        }
+
+        // Pruning the map must not disturb the live connection itself —
+        // the `dialed` gauge is untouched, and the connection captured
+        // beforehand still serves requests normally.
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+        let handle = slot_before_prune
+            .lock()
+            .await
+            .clone()
+            .expect("the pre-prune slot still holds its connection");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .sender
+            .send(BackendRequest {
+                frame: frame_get(b"", b"k"),
+                expect: Expect::Value,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reply_rx.await.unwrap(),
+            Ok(NodeReply::Value(ref value)) if value.as_ref() == b"v"
+        ));
+
+        // And when that pruned-but-still-referenced connection eventually
+        // dies, its own teardown still finds and decrements the *same*
+        // `dialed` gauge — accounting stays correct even though the map
+        // no longer has an entry to route through.
+        node.close_once.store(true, Ordering::SeqCst);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        handle
+            .sender
+            .send(BackendRequest {
+                frame: frame_get(b"", b"k"),
+                expect: Expect::Value,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_err(),
+            "the dropped connection must fail this request"
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while context.backends.dialed.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dialed gauge must reach 0 even for a connection pruned from the map");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6224,7 +6384,7 @@ mod tests {
             ring: ring_rx,
             refresh_now: refresh_tx,
             drain: drain_rx,
-            backends: SharedBackends::new(),
+            backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(7),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(2),
         });
@@ -6291,7 +6451,7 @@ mod tests {
             ring: ring_rx,
             refresh_now: refresh_tx,
             drain: drain_rx,
-            backends: SharedBackends::new(),
+            backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         });
@@ -6408,7 +6568,7 @@ mod tests {
             ring: ring_rx,
             refresh_now: refresh_tx,
             drain: drain_rx,
-            backends: SharedBackends::new(),
+            backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         });
