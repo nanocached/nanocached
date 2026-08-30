@@ -2709,13 +2709,21 @@ async fn abandon_current_join(
 /// Holds a Waiting/Joining node's connection open after it sends `J`,
 /// since it has no other way to learn it's been promoted (see
 /// `NodeInfo::promoted`). Waits for either the promotion notification or
-/// the connection dying; any bytes the node sends in the meantime are a
-/// protocol error — a well-behaved node sends nothing more until
-/// promoted. Deliberately does not apply the ordinary idle timeout: a
-/// node may legitimately wait here far longer than `IDLE_TIMEOUT` while
-/// another node's join is in progress. It isn't unbounded, though —
-/// `sweep_expired` separately reaps a `Waiting` entry (and wakes this
-/// wait, the same way an abandoned join already does) once
+/// the connection dying; any byte newly read off `stream` while waiting is
+/// a protocol error — a well-behaved node sends nothing more until
+/// promoted. Issue #297 (doc fix only): this only covers bytes this
+/// function itself reads. Bytes the node sent in the very same read as its
+/// `J` — already sitting, unconsumed, in the outer loop's `received`
+/// buffer before `wait_for_promotion` is ever called — aren't examined
+/// here at all; they're left in `received` and only looked at again once
+/// promotion resumes the outer loop, where they're parsed as the start of
+/// the node's next command like any other bytes would be. So a same-read
+/// surplus isn't an immediate error — it's silently deferred, not rejected,
+/// until after promotion. Deliberately does not apply the ordinary idle
+/// timeout: a node may legitimately wait here far longer than
+/// `IDLE_TIMEOUT` while another node's join is in progress. It isn't
+/// unbounded, though — `sweep_expired` separately reaps a `Waiting` entry
+/// (and wakes this wait, the same way an abandoned join already does) once
 /// `waiting_timeout_for` has elapsed, so this can still return an error
 /// with no bytes ever having arrived on `stream`.
 async fn wait_for_promotion(
@@ -3818,26 +3826,70 @@ async fn handle_connection(
                 // Issue #124: the node has finished handing off its
                 // entries; take it out of membership now — every later
                 // heartbeat ack and `L` serves the post-leave roster.
+                //
+                // Issue #297: this removes whatever state the entry is in —
+                // a Waiting/Joining node can send `V` too (e.g. to abort its
+                // own pending join), not only an already-`Joined` one (see
+                // `DiscoveryCommand::NodeLeave`'s doc comment). Every other
+                // removal path (`on_node_connection_ended`,
+                // `abandon_current_join`, the waiting-eviction in
+                // `sweep_expired`) wakes `info.promoted` before dropping the
+                // entry so a connection parked in `wait_for_promotion` (no
+                // idle timeout while it waits) isn't stranded holding its
+                // `MAX_CONNECTIONS` permit forever; this path must too.
                 let outcome = {
                     let mut reg = lock(&registry);
                     match reg.get(&name) {
                         Some(info) if constant_time_eq(info.token.as_bytes(), token.as_bytes()) => {
-                            reg.remove(&name);
+                            let removed = reg.remove(&name).expect("just matched above");
+                            removed.promoted.notify_waiters();
+                            removed.promoted.notify_one();
                             // Issue #279: bumped here, still under `reg`,
                             // rather than after it drops below.
                             bump_roster(&registry);
-                            Ok(true)
+                            Ok(Some(removed.state))
                         }
                         Some(_) => Err(()),
-                        None => Ok(false),
+                        None => Ok(None),
                     }
                 };
 
                 match outcome {
-                    Ok(removed) => {
-                        if removed {
+                    Ok(removed_state) => {
+                        if removed_state.is_some() {
                             println!("INFO node left the cluster: {name}");
                         }
+
+                        // Issue #297: mirrors `sweep_expired`'s
+                        // `ready_member_evicted_mid_join` check (issue #34
+                        // forged-completion fix) for the same condition
+                        // reached a different way — a ready member of the
+                        // in-flight join leaving via an explicit,
+                        // authenticated `V` rather than a liveness eviction.
+                        // Left unabandoned, the join would stall until
+                        // `migration_timeout_for` (up to 2h) reaps it
+                        // instead of moving on immediately.
+                        if removed_state == Some(NodeState::Joined) {
+                            let ready_member_left_mid_join = lock_current_join(&current_join)
+                                .as_ref()
+                                .is_some_and(|pending| {
+                                    pending.expected.contains_key(&name)
+                                        && !pending.completed.contains(&name)
+                                });
+                            if ready_member_left_mid_join {
+                                abandon_current_join(
+                                    &registry,
+                                    &current_join,
+                                    &config.auth_secret,
+                                    &config.tls_connector,
+                                    config.replication,
+                                    config.list_ready_at,
+                                    "ready member left mid-join",
+                                )
+                                .await;
+                            }
+                        }
+
                         write_response(&mut stream, b"R\n").await?;
                         continue;
                     }
@@ -6815,6 +6867,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_v_wakes_and_closes_a_parked_waiting_connection() {
+        // Regression for issue #297 (a): every other removal path
+        // (`on_node_connection_ended`, `abandon_current_join`, the
+        // waiting-eviction in `sweep_expired`) wakes a removed entry's
+        // `promoted` `Notify` before dropping it, so a connection parked in
+        // `wait_for_promotion` (idle timeout deliberately disabled while it
+        // waits) is woken rather than stranded holding its
+        // `MAX_CONNECTIONS` permit forever. An explicit `V` removing a
+        // Waiting/Joining entry must do the same.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_node_a, mut node_b, registry, current_join) = {
+            let tuple = registry_with_a_joined_and_b_waiting(shutdown_rx.clone()).await;
+            std::mem::forget(_shutdown_tx);
+            tuple
+        };
+        assert_eq!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joining),
+            "node-b must still be parked in wait_for_promotion, not yet promoted"
+        );
+
+        let (mut caller, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        caller.write_all(b"V 6 9\nnode-btk-node-b").await.unwrap();
+        let mut ack = [0u8; 2];
+        caller.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"R\n");
+
+        // node-b's parked connection must observe the removal promptly —
+        // an error/close, matching every other removal path's behavior —
+        // instead of hanging forever.
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), node_b.read(&mut byte))
+            .await
+            .expect("the waiting connection was stranded by the V removal");
+        assert_eq!(
+            read.unwrap(),
+            0,
+            "expected the connection to close, not data"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn duplicate_j_connections_under_one_name_both_receive_the_promotion() {
         // Regression for issue #7: a second live `J` under the same name
         // (a redial racing a half-open old connection) shares the entry's
@@ -7246,6 +7358,80 @@ mod tests {
 
         shutdown_tx.send_replace(true);
         sweep_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_v_from_an_expected_ready_member_abandons_the_in_flight_join() {
+        // Regression for issue #297 (b): the sibling test above covers
+        // `sweep_expired`'s liveness-eviction path abandoning a join whose
+        // expected ready member just got evicted (issue #34
+        // forged-completion fix). An explicit, authenticated `V` from that
+        // same ready member reaches the identical condition a different
+        // way and must abandon the join just as promptly — left alone, it
+        // would otherwise stall until `migration_timeout_for` (up to 2h)
+        // eventually reaps it.
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        node_a.write_all(b"V 6 9\nnode-atk-node-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"R\n");
+
+        assert!(
+            lock_current_join(&current_join).is_none(),
+            "the join must be abandoned once an expected ready member explicitly leaves"
+        );
+        assert!(!lock(&registry).contains_key("node-a"));
+        assert!(
+            !lock(&registry).contains_key("node-b"),
+            "abandon_current_join must also strand the joining node's own entry"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
