@@ -2212,6 +2212,13 @@ fn promote_to_joined(registry: &Registry, name: &str) {
             info.last_heartbeat = Instant::now();
             Arc::clone(&info.promoted)
         });
+        if promoted.is_some() {
+            // A new `Joined` node changes the heartbeat-ack roster (issue
+            // #95). Issue #279: bumped here, still under `guard`, matching
+            // `bump_roster`'s documented invariant — not after the guard
+            // below drops.
+            bump_roster(registry);
+        }
         let members = guard
             .values()
             .filter(|info| info.state == NodeState::Joined)
@@ -2221,8 +2228,6 @@ fn promote_to_joined(registry: &Registry, name: &str) {
 
     if let Some(promoted) = promoted {
         registry.joins_total.fetch_add(1, Ordering::Relaxed);
-        // A new `Joined` node changes the heartbeat-ack roster (issue #95).
-        bump_roster(registry);
         println!("INFO join promoted: {name} (members now {members})");
         // Wake every currently-parked `J` connection (a duplicate `J`
         // under the same name shares this Notify — issue #7) AND store a
@@ -3195,6 +3200,18 @@ impl RosterSnapshot {
     /// Issue #30 (amended): a STRICT majority of voting nodes disputing
     /// this replica's own `--replication-factor` is what makes `L` answer
     /// `B\n` and the `H` ack withhold its roster. A tie does not refuse.
+    ///
+    /// Issue #279: while discovery-HA replicas disagree on
+    /// `--replication-factor` this way, `refuse()` is true and every `H`
+    /// this replica answers carries no roster at all (`cached_heartbeat_ack`
+    /// below folds this into a bare `A\n`) — so for as long as the
+    /// disagreement persists, nodes heartbeating against this replica learn
+    /// of NO membership change via heartbeat, eviction included. Since
+    /// eviction-triggered re-replication (#264/#266/#267) depends on that
+    /// channel to propagate promptly, a live `--replication-factor`
+    /// disagreement silently widens the window a stale owner is
+    /// under-replicated for on this replica — worth knowing when
+    /// diagnosing a re-replication delay, not just a routing one.
     fn refuse(&self) -> bool {
         self.dissenting.len() > self.agreeing
     }
@@ -3288,6 +3305,11 @@ fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
         built_generation = registry.generation.load(Ordering::Relaxed);
         snapshot = roster_snapshot_locked(&guard, replication);
     }
+    // Issue #279: the `refuse()` branch — a bare `A\n`, no roster — is
+    // exactly the case `RosterSnapshot::refuse`'s doc comment warns about:
+    // for as long as this replica's `--replication-factor` disagreement
+    // persists, every `H` answered here tells the heartbeating node
+    // nothing about membership, eviction included.
     let ack: Arc<[u8]> = if snapshot.refuse() {
         Arc::from(b"A\n".as_slice())
     } else {
@@ -3359,32 +3381,38 @@ async fn sweep_expired(
 
                 let mut heartbeat_evicted = Vec::new();
                 let mut waiting_evicted = Vec::new();
-                lock(&registry).retain(|name, info| {
-                    let keep = match info.state {
-                        NodeState::Joined => {
-                            now.duration_since(info.last_heartbeat) < liveness_timeout
-                        }
-                        NodeState::Waiting => {
-                            now.duration_since(info.waiting_since)
-                                < waiting_timeout_for(info.queue_position)
-                        }
-                        NodeState::Joining => true,
-                    };
-                    if !keep {
-                        match info.state {
-                            NodeState::Joined => heartbeat_evicted.push(name.clone()),
-                            NodeState::Waiting => {
-                                waiting_evicted.push((name.clone(), Arc::clone(&info.promoted)));
+                {
+                    let mut guard = lock(&registry);
+                    guard.retain(|name, info| {
+                        let keep = match info.state {
+                            NodeState::Joined => {
+                                now.duration_since(info.last_heartbeat) < liveness_timeout
                             }
-                            NodeState::Joining => unreachable!("Joining always kept above"),
+                            NodeState::Waiting => {
+                                now.duration_since(info.waiting_since)
+                                    < waiting_timeout_for(info.queue_position)
+                            }
+                            NodeState::Joining => true,
+                        };
+                        if !keep {
+                            match info.state {
+                                NodeState::Joined => heartbeat_evicted.push(name.clone()),
+                                NodeState::Waiting => {
+                                    waiting_evicted
+                                        .push((name.clone(), Arc::clone(&info.promoted)));
+                                }
+                                NodeState::Joining => unreachable!("Joining always kept above"),
+                            }
                         }
+                        keep
+                    });
+                    // Evicting a `Joined` node changes the heartbeat-ack
+                    // roster (issue #95); Waiting evictions don't (they're
+                    // never in it). Issue #279: bumped here, still under
+                    // `guard`, rather than after it drops.
+                    if !heartbeat_evicted.is_empty() {
+                        bump_roster(&registry);
                     }
-                    keep
-                });
-                // Evicting a `Joined` node changes the heartbeat-ack roster
-                // (issue #95); Waiting evictions don't (they're never in it).
-                if !heartbeat_evicted.is_empty() {
-                    bump_roster(&registry);
                 }
                 for name in &heartbeat_evicted {
                     eprintln!(
@@ -3795,6 +3823,9 @@ async fn handle_connection(
                     match reg.get(&name) {
                         Some(info) if constant_time_eq(info.token.as_bytes(), token.as_bytes()) => {
                             reg.remove(&name);
+                            // Issue #279: bumped here, still under `reg`,
+                            // rather than after it drops below.
+                            bump_roster(&registry);
                             Ok(true)
                         }
                         Some(_) => Err(()),
@@ -3805,7 +3836,6 @@ async fn handle_connection(
                 match outcome {
                     Ok(removed) => {
                         if removed {
-                            bump_roster(&registry);
                             println!("INFO node left the cluster: {name}");
                         }
                         write_response(&mut stream, b"R\n").await?;
@@ -4055,15 +4085,19 @@ async fn handle_connection(
                 let rejection = 'decide: {
                     let existing = {
                         let mut guard = lock(&registry);
-                        apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip)
+                        let outcome =
+                            apply_announce_to_existing(&mut guard, &name, &addr, &token, peer_ip);
+                        // Existing entry refreshed — bump only if its
+                        // address actually moved (issue #95). Issue #279:
+                        // bumped here, still under `guard`, rather than
+                        // after it drops below.
+                        if let Some(Ok(true)) = outcome {
+                            bump_roster(&registry);
+                        }
+                        outcome
                     };
                     match existing {
-                        Some(Ok(address_changed)) => {
-                            // Existing entry refreshed — bump only if its
-                            // address actually moved (issue #95).
-                            if address_changed {
-                                bump_roster(&registry);
-                            }
+                        Some(Ok(_address_changed)) => {
                             break 'decide None;
                         }
                         Some(Err(reason)) => break 'decide Some(reason),
