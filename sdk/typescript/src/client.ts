@@ -2220,14 +2220,23 @@ export class NanocachedClient {
     // with fireAndForgetReplicas, up to FIRE_AND_FORGET_TUNING.maxInFlight
     // replica legs run in the background instead of being waited for
     // below — past that cap, further legs fall back to the synchronous
-    // path exactly as with the option off.
-    const replicaWrites = replicaNames.map((name) => {
+    // path exactly as with the option off. Issue #233: kept in a separate
+    // `backgroundLegs` list (the #188 pattern) rather than folded into
+    // `synchronousReplicaWrites` as a resolved placeholder — unlike
+    // writeToOwners there's no primary-failure branch below to drain it
+    // into (the increment already committed by the time this runs), but
+    // discarding the real promise there is exactly the anti-pattern #188
+    // fixed, so this keeps it instead of repeating it.
+    const synchronousReplicaWrites: Promise<void>[] = [];
+    const backgroundLegs: Promise<void>[] = [];
+    for (const name of replicaNames) {
       if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const background = replicaWrite(name);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
         settled.finally(() => this.backgroundReplicaWrites.delete(background));
-        return Promise.resolve();
+        backgroundLegs.push(background);
+        continue;
       }
       const write = replicaWrite(name);
       // No-op catch attached synchronously, same reasoning as
@@ -2235,14 +2244,16 @@ export class NanocachedClient {
       // trip Node's unhandled-rejection detector before Promise.allSettled
       // below gets a chance to observe it.
       write.catch(() => {});
-      return write;
-    });
+      synchronousReplicaWrites.push(write);
+    }
 
     // Drained for close()'s tracking and so a genuine replica-leg bug
     // doesn't linger as an unhandled rejection — but the primary's
     // increment already happened, so its result is always what's
-    // returned; nothing here can turn it into a failure.
-    await Promise.allSettled(replicaWrites);
+    // returned; nothing here can turn it into a failure. `backgroundLegs`
+    // is deliberately not drained here (see the comment above it) — it's
+    // already tracked via `this.backgroundReplicaWrites` for close().
+    await Promise.allSettled(synchronousReplicaWrites);
 
     return { value: result.value, raw: result.raw };
   }
@@ -2304,14 +2315,19 @@ export class NanocachedClient {
     // FIRE_AND_FORGET_TUNING.maxInFlight replica legs run in the
     // background instead of being waited for below — past that cap,
     // further legs fall back to the synchronous path exactly as with the
-    // option off.
-    const replicaWrites = replicaNames.map((name) => {
+    // option off. Issue #233: kept in a separate `backgroundLegs` list
+    // (the #188 pattern) rather than folded into `synchronousReplicaWrites`
+    // as a resolved placeholder — see `incrOnOwners`'s identical comment.
+    const synchronousReplicaWrites: Promise<void>[] = [];
+    const backgroundLegs: Promise<void>[] = [];
+    for (const name of replicaNames) {
       if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const background = replicaWrite(name);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
         settled.finally(() => this.backgroundReplicaWrites.delete(background));
-        return Promise.resolve();
+        backgroundLegs.push(background);
+        continue;
       }
       const write = replicaWrite(name);
       // No-op catch attached synchronously, same reasoning as
@@ -2319,14 +2335,15 @@ export class NanocachedClient {
       // here must not trip Node's unhandled-rejection detector before
       // Promise.allSettled below gets a chance to observe it.
       write.catch(() => {});
-      return write;
-    });
+      synchronousReplicaWrites.push(write);
+    }
 
     // Drained for close()'s tracking and so a genuine replica-leg bug
     // doesn't linger as an unhandled rejection — but the primary's write
     // already happened, so its result is always what's returned; nothing
-    // here can turn it into a failure.
-    await Promise.allSettled(replicaWrites);
+    // here can turn it into a failure. `backgroundLegs` is deliberately
+    // not drained here — see `incrOnOwners`.
+    await Promise.allSettled(synchronousReplicaWrites);
 
     return true;
   }
@@ -2364,20 +2381,26 @@ export class NanocachedClient {
       }
     };
 
-    const replicaWrites = replicaNames.map((name) => {
+    // Issue #233: same `backgroundLegs`/`synchronousReplicaWrites` split
+    // as `incrOnOwners`/`casOnOwners` — a fire-and-forget leg's real
+    // promise is kept, not swapped for a resolved placeholder.
+    const synchronousReplicaWrites: Promise<void>[] = [];
+    const backgroundLegs: Promise<void>[] = [];
+    for (const name of replicaNames) {
       if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
         const background = replicaWrite(name);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
         settled.finally(() => this.backgroundReplicaWrites.delete(background));
-        return Promise.resolve();
+        backgroundLegs.push(background);
+        continue;
       }
       const write = replicaWrite(name);
       write.catch(() => {});
-      return write;
-    });
+      synchronousReplicaWrites.push(write);
+    }
 
-    await Promise.allSettled(replicaWrites);
+    await Promise.allSettled(synchronousReplicaWrites);
 
     return true;
   }

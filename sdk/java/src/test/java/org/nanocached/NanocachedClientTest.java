@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -2001,6 +2003,42 @@ class NanocachedClientTest {
                         () -> client.getManyBytes(List.of(finalKeyOnNodeA, finalKeyOnNodeB)));
                 assertEquals(before + 1, client.stats().backgroundWriteBugs(),
                         "the second owner leg's decompression bug must still be observed, not silently dropped");
+            }
+        }
+    }
+
+    @Test
+    void drainLegsKeepingFirstBugReportsEveryBugPastTheFirst() throws Exception {
+        // Regression for issue #233: multiSetPass and clearFanOutOnce used
+        // to just overwrite a single tracked "legBug" variable on every
+        // failing leg in turn, so only the LAST leg's bug ever reached the
+        // caller and every earlier one vanished without even being
+        // counted — unlike multiGetPass (issue #230), which always drains
+        // every leg and reports every bug past the first via
+        // reportBackgroundWriteBug. Both now share
+        // drainLegsKeepingFirstBug, exercised directly here with
+        // synthetic failing legs: every real protocol-level failure this
+        // SDK produces is already wrapped as a NanocachedException and
+        // caught well before this method ever sees it, so a genuine,
+        // uncaught bug isn't reproducible by feeding a real server bad
+        // data the way issue #230's own regression test could for GET.
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                RuntimeException first = new IllegalStateException("first leg's bug");
+                RuntimeException second = new IllegalStateException("second leg's bug");
+                RuntimeException third = new IllegalStateException("third leg's bug");
+                List<CompletableFuture<Void>> legs = List.of(
+                        CompletableFuture.completedFuture(null),
+                        CompletableFuture.failedFuture(first),
+                        CompletableFuture.failedFuture(second),
+                        CompletableFuture.failedFuture(third));
+
+                long before = client.stats().backgroundWriteBugs();
+                RuntimeException returned = client.drainLegsKeepingFirstBug(legs);
+
+                assertSame(first, returned, "the first leg's bug must be the one returned to the caller");
+                assertEquals(before + 2, client.stats().backgroundWriteBugs(),
+                        "the second and third legs' bugs must still be counted, not discarded");
             }
         }
     }

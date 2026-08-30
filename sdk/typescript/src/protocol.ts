@@ -572,12 +572,20 @@ function parseTag(field: string): number {
 // INCR's optional response-side TTL field (issue #129) — remaining
 // whole seconds, same strict decimal-digits-only grammar as a tag (see
 // TAG_PATTERN's own doc comment); a desynced/corrupt field must not be
-// silently accepted the way bare `Number(field)` would.
+// silently accepted the way bare `Number(field)` would. Issue #233: also
+// bounded by magnitude, same as parseTag — a long-enough digit string
+// parses to `Infinity` (or a value that's silently lost precision) via
+// bare `Number()` instead of failing, unlike Rust's `str::parse::<u64>`
+// (this field's wire type), which errors on overflow.
 function parseTtlSeconds(field: string): number {
   if (!TAG_PATTERN.test(field)) {
     throw new NanocachedError("nanocached: invalid ttl in response");
   }
-  return Number(field);
+  const ttlSeconds = Number(field);
+  if (!Number.isSafeInteger(ttlSeconds)) {
+    throw new NanocachedError("nanocached: invalid ttl in response");
+  }
+  return ttlSeconds;
 }
 
 interface MultiHeader {

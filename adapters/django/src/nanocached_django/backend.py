@@ -124,6 +124,16 @@ def _decode_value(raw: bytes) -> object:
     return pickle.loads(raw)
 
 
+async def _delete_all(handle, cache_keys: list) -> None:
+    """``delete_many``'s fan-out (issue #233): every key's ``delete()``
+    dispatched concurrently on ``handle``'s own event loop, in the one
+    coroutine ``_run`` awaits — a plain generator expression passed
+    straight to ``asyncio.gather`` isn't itself a coroutine (``_run``'s
+    ``make_coro`` must return one, for ``run_coroutine_threadsafe``), so
+    this exists to be that coroutine."""
+    await asyncio.gather(*(handle.delete(cache_key) for cache_key in cache_keys))
+
+
 def _split_host_port(address: str) -> tuple[str, int]:
     """Parses one ``"host:port"`` LOCATION entry. Deliberately not reusing
     the SDK's own internal splitter (``nanocached._identify.
@@ -452,8 +462,17 @@ class NanocachedCache(BaseCache):
         return []
 
     def delete_many(self, keys, version=None):
-        for key in keys:
-            self.delete(key, version=version)
+        # Issue #233: fanned out concurrently (asyncio.gather) in one
+        # _run round trip, rather than one delete() per key run fully
+        # sequentially — each delete() previously blocked the calling
+        # thread on its own separate run_coroutine_threadsafe().result()
+        # before the next key's delete even started, even though the
+        # wire has no bulk delete op for get_many/set_many's own
+        # single-round-trip treatment to reuse (issue #152).
+        cache_keys = [self.make_and_validate_key(key, version=version) for key in keys]
+        if not cache_keys:
+            return
+        self._run(lambda handle: _delete_all(handle, cache_keys))
 
     def clear(self):
         """This namespace's CLEAR (issue #106) — never the whole store,

@@ -658,11 +658,17 @@ enum OwnedWriteBody {
 /// [`NanocachedClient::multi_set_pass`] call — see that method's own
 /// doc comment for why a key can appear here with `is_primary` false:
 /// the same node can be primary for one key in the batch and a replica
-/// for another (issue #151).
+/// for another (issue #151). `keys`/`values` hold this owner's slice of
+/// the pass's key/value bytes as `Arc<[u8]>` (issue #233) — a key at
+/// replication R shows up in up to R owners' batches, so a plain
+/// `Vec<u8>::clone()` per owner would deep-copy the same bytes up to R
+/// times; cloning the `Arc` instead is just a refcount bump.
 #[derive(Default)]
 struct MultiSetOwnerBatch {
     indices: Vec<usize>,
     is_primary: Vec<bool>,
+    keys: Vec<Arc<[u8]>>,
+    values: Vec<Arc<[u8]>>,
 }
 
 /// One hedged-read leg's outcome (hedged reads, issue #64): tagged with
@@ -2007,17 +2013,22 @@ impl NanocachedClient {
     /// individually valid key/value pairs whose sum would exceed the
     /// server's `MAX_REQUEST_SIZE` is split into more sub-frames instead
     /// of sent as one oversized `o` frame.
-    async fn multi_set_chunked(
+    /// Generic over the key/value byte container (issue #233): the
+    /// single-target caller passes plain `Vec<u8>`s it already owns
+    /// outright, while the cluster fan-out (`multi_set_pass`) passes
+    /// `Arc<[u8]>`s shared across every owner a key was replicated to —
+    /// this doesn't care which, it only ever needs `&[u8]`.
+    async fn multi_set_chunked<B: AsRef<[u8]>>(
         &self,
         slot: Option<&str>,
         namespace: &[u8],
-        keys: &[Vec<u8>],
-        values: &[Vec<u8>],
+        keys: &[B],
+        values: &[B],
         ttl_seconds: u64,
     ) -> Result<Vec<MultiEntry>> {
         let mut entries = Vec::with_capacity(keys.len());
         let lengths = chunk_lengths(namespace.len(), keys.len(), |i| {
-            set_entry_cost(&keys[i], &values[i])
+            set_entry_cost(keys[i].as_ref(), values[i].as_ref())
         });
         let mut start = 0;
         for len in lengths {
@@ -2070,26 +2081,24 @@ impl NanocachedClient {
                     retry.push(idx);
                     continue;
                 }
+                // Issue #233: the `Arc`s are built once per key here, then
+                // just refcount-cloned into every owner below — see
+                // `MultiSetOwnerBatch`'s doc comment for why that matters
+                // at replication > 1.
+                let shared_key: Arc<[u8]> = Arc::from(key_bytes[idx].as_slice());
+                let shared_value: Arc<[u8]> = Arc::from(value_bytes[idx].as_slice());
                 for (rank, name) in names.into_iter().enumerate() {
                     let batch = owners.entry(name).or_default();
                     batch.indices.push(idx);
                     batch.is_primary.push(rank == 0);
+                    batch.keys.push(Arc::clone(&shared_key));
+                    batch.values.push(Arc::clone(&shared_value));
                 }
             }
         }
 
         let mut joined = Vec::with_capacity(owners.len());
         for (name, batch) in owners {
-            let leg_keys: Vec<Vec<u8>> = batch
-                .indices
-                .iter()
-                .map(|&i| key_bytes[i].clone())
-                .collect();
-            let leg_values: Vec<Vec<u8>> = batch
-                .indices
-                .iter()
-                .map(|&i| value_bytes[i].clone())
-                .collect();
             let pure_replica = !batch.is_primary.iter().any(|&primary| primary);
 
             // Fire-and-forget replica writes: with fire_and_forget_replicas,
@@ -2109,14 +2118,7 @@ impl NanocachedClient {
                         tokio::spawn(async move {
                             let _permit = permit; // held until this task finishes
                             let _ = client
-                                .run_multi_set_leg(
-                                    &owned_namespace,
-                                    &name,
-                                    &batch,
-                                    &leg_keys,
-                                    &leg_values,
-                                    ttl_seconds,
-                                )
+                                .run_multi_set_leg(&owned_namespace, &name, &batch, ttl_seconds)
                                 .await;
                         });
                         continue;
@@ -2128,14 +2130,7 @@ impl NanocachedClient {
             let owned_namespace = namespace.to_vec();
             joined.push(async move {
                 client
-                    .run_multi_set_leg(
-                        &owned_namespace,
-                        &name,
-                        &batch,
-                        &leg_keys,
-                        &leg_values,
-                        ttl_seconds,
-                    )
+                    .run_multi_set_leg(&owned_namespace, &name, &batch, ttl_seconds)
                     .await
             });
         }
@@ -2161,13 +2156,17 @@ impl NanocachedClient {
         namespace: &[u8],
         name: &str,
         batch: &MultiSetOwnerBatch,
-        leg_keys: &[Vec<u8>],
-        leg_values: &[Vec<u8>],
         ttl_seconds: u64,
     ) -> Vec<usize> {
         let mut retry = Vec::new();
         match self
-            .multi_set_chunked(Some(name), namespace, leg_keys, leg_values, ttl_seconds)
+            .multi_set_chunked(
+                Some(name),
+                namespace,
+                &batch.keys,
+                &batch.values,
+                ttl_seconds,
+            )
             .await
         {
             Ok(entries) => {

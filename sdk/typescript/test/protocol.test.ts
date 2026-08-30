@@ -543,6 +543,18 @@ describe("tryParseResponse — INCR's `I` response (issue #129)", () => {
   it("throws on a non-decimal ttl field", () => {
     assert.throws(() => tryParseResponse(Buffer.from("I 2 abc\n42")), /invalid ttl/);
   });
+
+  it("throws on a ttl field with no magnitude bound (issue #233)", () => {
+    // Regression: unlike parseTag's MAX_TAG check, parseTtlSeconds used
+    // to accept any all-digit string, so a desynced/corrupt field long
+    // enough to overflow `Number.isSafeInteger` (or even `Number` itself,
+    // returning `Infinity`) was silently accepted instead of raising a
+    // protocol error.
+    const hugeButFinite = "9".repeat(30); // parses to a finite double, but well past 2^53-1
+    assert.throws(() => tryParseResponse(Buffer.from(`I 2 ${hugeButFinite}\n42`)), /invalid ttl/);
+    const overflowsToInfinity = "9".repeat(400);
+    assert.throws(() => tryParseResponse(Buffer.from(`I 2 ${overflowsToInfinity}\n42`)), /invalid ttl/);
+  });
 });
 
 describe("tryParseResponse — batched get/set M/O (issues #128/#150/#151)", () => {

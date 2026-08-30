@@ -5,6 +5,8 @@ directly. Every test here goes through the standard Django cache API."""
 
 from __future__ import annotations
 
+import asyncio
+import time
 import unittest
 
 from support import ROUNDTRIP_NODE
@@ -98,6 +100,43 @@ class RoundTripTests(unittest.TestCase):
 
         self.cache.delete_many(["a", "b"])
         self.assertEqual(self.cache.get_many(["a", "b", "c"]), {"c": 3})
+
+    def test_delete_many_fans_out_concurrently(self) -> None:
+        # Regression for issue #233: delete_many used to call delete()
+        # once per key, each one blocking the calling thread on its own
+        # separate round trip before the next key's delete even started.
+        # It's now fanned out concurrently (asyncio.gather, in one _run
+        # round trip) instead — patch the namespace handle's delete()
+        # with an artificial per-call delay and check the wall time is
+        # close to ONE delay, not N of them stacked sequentially.
+        keys = [f"dm-{i}" for i in range(5)]
+        for key in keys:
+            self.cache.set(key, "v")
+
+        # set() above already forced a connect, so _namespace_handle is
+        # populated by now.
+        handle = self.cache._namespace_handle
+        original_delete = handle.delete
+        delay_seconds = 0.1
+
+        async def delayed_delete(key):
+            await asyncio.sleep(delay_seconds)
+            return await original_delete(key)
+
+        handle.delete = delayed_delete
+        try:
+            start = time.monotonic()
+            self.cache.delete_many(keys)
+            elapsed = time.monotonic() - start
+        finally:
+            handle.delete = original_delete
+
+        self.assertLess(
+            elapsed,
+            delay_seconds * len(keys),
+            "delete_many should fan its deletes out concurrently, not run them one at a time",
+        )
+        self.assertEqual(self.cache.get_many(keys), {})
 
     def test_incr_and_decr(self) -> None:
         self.cache.set("counter", 10)
