@@ -5161,6 +5161,52 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 
+  it("prunes the departed proxy's reconnect cooldown once refreshProxyTarget swaps to a new one (issue #296)", async () => {
+    // Regression: refreshProxyTarget used to swap `target.address` to the
+    // new proxy without ever deleting the old address's entry from
+    // reconnectCooldowns (only cluster-mode refreshNodeList pruned it) —
+    // in a long-lived viaProxy client behind a churning proxy fleet, that
+    // leaked one dead entry per departed proxy forever.
+    const [proxyA, proxyB] = await Promise.all([startMockNode(), startMockNode()]);
+    const byAddress = new Map([
+      [proxyA.address, proxyA],
+      [proxyB.address, proxyB],
+    ]);
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([
+      { name: "proxy-a", address: proxyA.address },
+      { name: "proxy-b", address: proxyB.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+      });
+      try {
+        await client.set("k", "v");
+
+        const landedAddress = proxyAddressOf(client);
+        const dead = byAddress.get(landedAddress)!;
+        const survivorAddress = landedAddress === proxyA.address ? proxyB.address : proxyA.address;
+
+        await dead.close();
+        await waitFor(() => singleConnectionClosed(client), "the client to notice the dead proxy");
+
+        // This get() forces the dead-proxy redial (arming its cooldown),
+        // then the refresh-and-retry swaps to the survivor.
+        assert.equal(await client.get("k"), null);
+        assert.equal(proxyAddressOf(client), survivorAddress);
+
+        const cooldowns: Map<string, unknown> = (client as any).reconnectCooldowns;
+        assert.ok(!cooldowns.has(landedAddress), "cooldown for the departed proxy was not pruned");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxyA.close().catch(() => {}), proxyB.close().catch(() => {})]);
+    }
+  });
+
   it("ignores readHedgeAfterMs — a proxy connection has no replicas to hedge to", async () => {
     const proxy = await startMockNode();
     const discovery = await startMockDiscovery([]);
