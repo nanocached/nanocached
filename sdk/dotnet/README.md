@@ -179,6 +179,9 @@ the delta, so a replica can never drift from the primary (e.g. after an
 earlier dropped replica write). `NanocachedNamespace` exposes the same
 `IncrAsync`/`DecrAsync` pair, scoped to its namespace.
 
+**Not idempotent** — see [Reconnect and keep-alive](#reconnect-and-keep-alive)
+for what that means for a request that loses its connection mid-flight.
+
 ## Batched get and set
 
 `GetManyAsync`/`GetManyBytesAsync` and `SetManyAsync`/`SetManyBytesAsync`
@@ -293,6 +296,10 @@ exposes the same methods, scoped to its namespace. See
 [docs/protocol.html#cas](../../docs/protocol.html#cas) for the wire
 format.
 
+**Not idempotent** — same caveat as `IncrAsync`/`DecrAsync`; see
+[Reconnect and keep-alive](#reconnect-and-keep-alive) for what that means
+for a request that loses its connection mid-flight.
+
 ## Replication
 
 The cluster's replication factor R rides along with the node list, so
@@ -391,8 +398,21 @@ a proxy connection has no ring and nobody else to hedge to.
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (all
-operations are idempotent).
+restart, a network blip) redials and retries once transparently — for
+`GetAsync`/`SetAsync`/`DeleteAsync`/`ClearAsync`/`ClearAllAsync`, which
+are idempotent, so replaying one after a redial is always safe.
+
+**`IncrAsync`/`DecrAsync`, `PutIfAbsentAsync`/`ReplaceIfPresentAsync`/
+`ReplaceAsync`, and `DeleteIfMatchesAsync` are NOT idempotent** (issue
+#225): replaying a fully-sent Incr would double-apply it, and replaying a
+fully-sent CAS/conditional-delete could report an already-succeeded
+operation as a mismatch. For these, the redial-and-retry only ever
+resends the request when the connection is known to have died *before*
+the request frame could be written at all (the idle-FIN case above —
+nothing reached the server). If the frame was fully written and only the
+reply was lost, the primary may already have applied the operation, and
+these methods throw `ConnectionLostException` instead of guessing —
+read the key back to find out which happened.
 
 `ConnectAsync` itself tolerates a node that discovery still lists but
 that can't be reached — typically one that just died and hasn't been

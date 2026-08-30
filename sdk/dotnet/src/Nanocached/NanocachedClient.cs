@@ -1695,7 +1695,22 @@ public sealed class NanocachedClient : IDisposable
     /// on each of them, which would let a replica drift from the primary
     /// (e.g. after an earlier dropped replica write, or an independent
     /// eviction). See <see cref="IncrPrimaryThenReplicateAsync"/> for the
-    /// full mechanics.</para></summary>
+    /// full mechanics.</para>
+    ///
+    /// <para><b>At-least-once on a lost connection (issue #225)</b>: unlike
+    /// <see cref="GetAsync(byte[])"/>/<see cref="SetAsync(byte[], byte[], long)"/>/
+    /// <see cref="DeleteAsync(byte[])"/> — which are idempotent, so this
+    /// SDK's built-in redial-and-retry-once always resends them — Incr is
+    /// NOT idempotent, so the redial-and-retry only ever resends this
+    /// request when the connection is known to have died before the
+    /// request frame could be written at all (e.g. the server's idle
+    /// timeout closed it first). If the request frame was fully written
+    /// and only the reply never arrived, the primary may already have
+    /// applied the increment; this method throws
+    /// <see cref="ConnectionLostException"/> in that case instead of
+    /// silently double-applying it. A caller that needs to know for certain
+    /// whether an Incr landed after seeing this exception should read the
+    /// counter back rather than assume either outcome.</para></summary>
     public Task<long?> IncrAsync(byte[] key, long delta) => IncrAsync(EmptyNamespace, key, delta);
 
     /// <summary>issue #129: as <see cref="IncrAsync(string, long)"/>,
@@ -1712,10 +1727,26 @@ public sealed class NanocachedClient : IDisposable
     {
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
-        return await WithClusterRetryAsync(() => IncrPrimaryThenReplicateAsync(namespaceBytes, key, delta))
-            .ConfigureAwait(false);
+        try
+        {
+            return await WithClusterRetryAsync(() => IncrPrimaryThenReplicateAsync(namespaceBytes, key, delta))
+                .ConfigureAwait(false);
+        }
+        catch (UnsafeToReplayException error)
+        {
+            // issue #225: the primary's request may already have been
+            // applied — surface the connection loss, never replay it.
+            throw error.Unwrap();
+        }
     }
 
+    /// <summary>issue #182: <see cref="IncrAsync(string, long)"/> with
+    /// <paramref name="delta"/> negated — never a different wire op. Same
+    /// at-least-once-on-a-lost-connection caveat as
+    /// <see cref="IncrAsync(byte[], long)"/> (issue #225): not idempotent,
+    /// so a connection lost after the request frame was already fully
+    /// written throws <see cref="ConnectionLostException"/> rather than
+    /// risk decrementing twice.</summary>
     public Task<long?> DecrAsync(string key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
 
     /// <summary>issue #129: <see cref="IncrAsync(byte[], long)"/> with
@@ -1723,7 +1754,9 @@ public sealed class NanocachedClient : IDisposable
     /// <c>i</c>'s own signed delta already covers decrementing. issue
     /// #182: delegates the negation to <see cref="NegateDecrDelta"/>,
     /// which rejects <see cref="long.MinValue"/> rather than silently
-    /// wrapping it back to itself.</summary>
+    /// wrapping it back to itself. See <see cref="IncrAsync(byte[], long)"/>'s
+    /// doc comment for the at-least-once-on-a-lost-connection caveat
+    /// (issue #225) this inherits.</summary>
     public Task<long?> DecrAsync(byte[] key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
 
     internal Task<long?> DecrAsync(byte[] namespaceBytes, string key, long delta) =>
@@ -1785,7 +1818,7 @@ public sealed class NanocachedClient : IDisposable
     {
         if (_ring is null)
         {
-            var single = await ApplyReconnectingAsync(
+            var single = await ApplyReconnectingNotIdempotentAsync(
                 null, connection => connection.IncrAsync(namespaceBytes, key, delta)).ConfigureAwait(false);
             return single?.Value;
         }
@@ -1796,7 +1829,7 @@ public sealed class NanocachedClient : IDisposable
             throw new ConnectionLostException("nanocached: no owner is reachable for this key");
         }
 
-        var primaryResult = await ApplyReconnectingAsync(
+        var primaryResult = await ApplyReconnectingNotIdempotentAsync(
             names[0], connection => connection.IncrAsync(namespaceBytes, key, delta)).ConfigureAwait(false);
         if (primaryResult is null) return null;
 
@@ -1929,7 +1962,23 @@ public sealed class NanocachedClient : IDisposable
     /// remaining owners as an ordinary <see cref="SetAsync(byte[], byte[], long)"/>,
     /// never by replaying <c>k</c> on a replica — see
     /// <see cref="IncrAsync(byte[], long)"/>'s doc comment for why that
-    /// matters.</para></summary>
+    /// matters.</para>
+    ///
+    /// <para><b>At-least-once on a lost connection (issue #225)</b>: like
+    /// <see cref="IncrAsync(byte[], long)"/>, CAS is NOT idempotent — a
+    /// mismatch response and an already-succeeded response mean different
+    /// things, so blindly replaying it after a redial could report an
+    /// already-successful CAS as a mismatch. The redial-and-retry this SDK
+    /// builds in for <see cref="GetAsync(byte[])"/>/<see cref="SetAsync(byte[], byte[], long)"/>/
+    /// <see cref="DeleteAsync(byte[])"/> only ever resends this request
+    /// when the connection is known to have died before the request frame
+    /// could be written at all; if the frame was fully written and only
+    /// the reply was lost, this method throws
+    /// <see cref="ConnectionLostException"/> instead of guessing. The same
+    /// caveat applies to <see cref="ReplaceIfPresentAsync(byte[], byte[], long)"/>,
+    /// <see cref="ReplaceAsync(byte[], string, byte[], long)"/>, and
+    /// <see cref="DeleteIfMatchesAsync(byte[], string)"/>, which all share
+    /// this same primary-then-replicate path.</para></summary>
     public Task<bool> PutIfAbsentAsync(byte[] key, byte[] value, long ttlSeconds = 0) =>
         PutIfAbsentAsync(EmptyNamespace, key, value, ttlSeconds);
 
@@ -1989,8 +2038,9 @@ public sealed class NanocachedClient : IDisposable
     /// own value-based CAS has).</para>
     ///
     /// <para>See <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s
-    /// doc comment for the shared not-a-lock caveat and replication
-    /// rule.</para></summary>
+    /// doc comment for the shared not-a-lock caveat, replication rule, and
+    /// — since ReplaceAsync is CAS, not idempotent — the
+    /// at-least-once-on-a-lost-connection caveat (issue #225).</para></summary>
     public Task<bool> ReplaceAsync(byte[] key, string token, byte[] newValue, long ttlSeconds = 0) =>
         ReplaceAsync(EmptyNamespace, key, token, newValue, ttlSeconds);
 
@@ -2022,7 +2072,19 @@ public sealed class NanocachedClient : IDisposable
     /// <para>Cluster replication: only the primary owner evaluates the
     /// digest; on success the SDK forwards the removal to the remaining
     /// owners as an ordinary <see cref="DeleteAsync(byte[])"/>, never by
-    /// replaying <c>x</c> on a replica.</para></summary>
+    /// replaying <c>x</c> on a replica.</para>
+    ///
+    /// <para><b>At-least-once on a lost connection (issue #225)</b>: unlike
+    /// <see cref="DeleteAsync(byte[])"/>, this is a conditional remove, not
+    /// idempotent — a mismatch and an already-succeeded removal mean
+    /// different things. The built-in redial-and-retry only ever resends
+    /// this request when the connection is known to have died before the
+    /// request frame could be written at all; if the frame was fully
+    /// written and only the reply was lost, this method throws
+    /// <see cref="ConnectionLostException"/> instead of reporting a
+    /// possibly-already-successful removal as a mismatch. See
+    /// <see cref="PutIfAbsentAsync(byte[], byte[], long)"/>'s doc comment
+    /// for the same caveat shared by every CAS method.</para></summary>
     public Task<bool> DeleteIfMatchesAsync(byte[] key, string token) => DeleteIfMatchesAsync(EmptyNamespace, key, token);
 
     /// <summary>issue #141: as <see cref="DeleteIfMatchesAsync(string, string)"/>,
@@ -2040,9 +2102,18 @@ public sealed class NanocachedClient : IDisposable
         ValidateToken(token);
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
-        return await WithClusterRetryAsync(
-            () => RemoveIfMatchesPrimaryThenReplicateAsync(namespaceBytes, key, token))
-            .ConfigureAwait(false);
+        try
+        {
+            return await WithClusterRetryAsync(
+                () => RemoveIfMatchesPrimaryThenReplicateAsync(namespaceBytes, key, token))
+                .ConfigureAwait(false);
+        }
+        catch (UnsafeToReplayException error)
+        {
+            // issue #225: same reasoning as IncrAsync — the primary's
+            // removal may already have been applied.
+            throw error.Unwrap();
+        }
     }
 
     /// <summary>issue #141: as <see cref="IncrAsync(byte[], byte[], long)"/>
@@ -2061,9 +2132,19 @@ public sealed class NanocachedClient : IDisposable
         ValidateKeyAndValue(namespaceBytes, key, value);
         byte[] outgoing = _compress ? Compression.CompressValue(value, _compressionThreshold) : value;
         await BeforeOperationAsync().ConfigureAwait(false);
-        return await WithClusterRetryAsync(
-            () => CasPrimaryThenReplicateAsync(namespaceBytes, key, outgoing, cond, ttlSeconds))
-            .ConfigureAwait(false);
+        try
+        {
+            return await WithClusterRetryAsync(
+                () => CasPrimaryThenReplicateAsync(namespaceBytes, key, outgoing, cond, ttlSeconds))
+                .ConfigureAwait(false);
+        }
+        catch (UnsafeToReplayException error)
+        {
+            // issue #225: same reasoning as IncrAsync — the primary's CAS
+            // may already have been applied (PutIfAbsentAsync/
+            // ReplaceIfPresentAsync/ReplaceAsync all funnel through here).
+            throw error.Unwrap();
+        }
     }
 
     /// <summary>issue #141 — mirrors <see cref="IncrPrimaryThenReplicateAsync"/>
@@ -2079,7 +2160,7 @@ public sealed class NanocachedClient : IDisposable
     {
         if (_ring is null)
         {
-            return await ApplyReconnectingAsync(
+            return await ApplyReconnectingNotIdempotentAsync(
                 null, connection => connection.CasAsync(namespaceBytes, key, value, cond, ttlSeconds))
                 .ConfigureAwait(false);
         }
@@ -2090,7 +2171,7 @@ public sealed class NanocachedClient : IDisposable
             throw new ConnectionLostException("nanocached: no owner is reachable for this key");
         }
 
-        bool stored = await ApplyReconnectingAsync(
+        bool stored = await ApplyReconnectingNotIdempotentAsync(
             names[0], connection => connection.CasAsync(namespaceBytes, key, value, cond, ttlSeconds))
             .ConfigureAwait(false);
         if (!stored) return false;
@@ -2110,7 +2191,7 @@ public sealed class NanocachedClient : IDisposable
     {
         if (_ring is null)
         {
-            return await ApplyReconnectingAsync(
+            return await ApplyReconnectingNotIdempotentAsync(
                 null, connection => connection.RemoveIfMatchesAsync(namespaceBytes, key, digest))
                 .ConfigureAwait(false);
         }
@@ -2121,7 +2202,7 @@ public sealed class NanocachedClient : IDisposable
             throw new ConnectionLostException("nanocached: no owner is reachable for this key");
         }
 
-        bool removed = await ApplyReconnectingAsync(
+        bool removed = await ApplyReconnectingNotIdempotentAsync(
             names[0], connection => connection.RemoveIfMatchesAsync(namespaceBytes, key, digest))
             .ConfigureAwait(false);
         if (!removed) return false;
@@ -2477,7 +2558,14 @@ public sealed class NanocachedClient : IDisposable
     /// FIN (e.g. the server's 60s idle timeout) on I/O, so lazy
     /// reconnect-on-use means the failed request poisons the connection,
     /// the redial replaces it, and the operation runs again. Safe because
-    /// get/set/delete are all idempotent.
+    /// get/set/delete/clear are all idempotent — replaying one after a
+    /// redial can never do anything worse than replaying it does anyway.
+    ///
+    /// <para>issue #225: NOT used for the primary leg of Incr/CAS/
+    /// RemoveIfMatches — those are not idempotent (replaying a fully-sent
+    /// Incr double-applies it; replaying a fully-sent CAS/conditional-delete
+    /// can report an already-successful op as a mismatch). See
+    /// <see cref="ApplyReconnectingNotIdempotentAsync{T}"/>.</para>
     /// </summary>
     private async Task<T> ApplyReconnectingAsync<T>(string? slot, Func<Connection, Task<T>> op)
     {
@@ -2488,6 +2576,93 @@ public sealed class NanocachedClient : IDisposable
         catch (ConnectionLostException)
         {
             return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// issue #225 — internal marker exception: wraps a
+    /// <see cref="ConnectionLostException"/> that must never be replayed,
+    /// not even by <see cref="WithClusterRetryAsync{T}"/>'s own broader
+    /// refresh-and-retry. Thrown only by
+    /// <see cref="ApplyReconnectingNotIdempotentAsync{T}"/>, specifically so
+    /// it passes UNCAUGHT through <see cref="WithClusterRetryAsync{T}"/>'s
+    /// <c>catch (... or ConnectionLostException)</c> — that catch would
+    /// otherwise retry the whole operation (refresh the ring, call the
+    /// delegate again) exactly as blindly as the bug this issue fixes.
+    /// Every public entry point whose primary leg can throw this
+    /// (<see cref="IncrAsync(byte[], byte[], long)"/>, the private
+    /// <c>CasAsync</c>, <see cref="DeleteIfMatchesAsync(byte[], byte[], string)"/>)
+    /// unwraps it back to the inner <see cref="ConnectionLostException"/>
+    /// before it can ever reach a caller — nothing outside this file ever
+    /// sees this type.
+    /// </summary>
+    private sealed class UnsafeToReplayException : Exception
+    {
+        private readonly ConnectionLostException _inner;
+
+        internal UnsafeToReplayException(ConnectionLostException inner) : base(inner.Message, inner)
+        {
+            _inner = inner;
+        }
+
+        internal ConnectionLostException Unwrap() => _inner;
+    }
+
+    /// <summary>
+    /// issue #225 — the non-idempotent counterpart to
+    /// <see cref="ApplyReconnectingAsync{T}"/>, used only for the primary
+    /// leg of Incr/CAS/RemoveIfMatches (<see cref="IncrPrimaryThenReplicateAsync"/>,
+    /// <see cref="CasPrimaryThenReplicateAsync"/>,
+    /// <see cref="RemoveIfMatchesPrimaryThenReplicateAsync"/> — never the
+    /// replica legs those forward as ordinary Set/Delete, which stay on the
+    /// plain idempotent-safe method above). Blindly redialing and resending
+    /// on ANY connection-level failure — what
+    /// <see cref="ApplyReconnectingAsync{T}"/> does — is unsafe here: if the
+    /// primary already applied the operation and only the reply was lost,
+    /// replaying it double-applies an Incr, or turns an already-successful
+    /// CAS/conditional-delete into a false mismatch.
+    ///
+    /// <para>Connection distinguishes the two failure shapes via
+    /// <see cref="ConnectionLostException.RequestNotSent"/>: true means the
+    /// request frame failed to write at all — the idle-FIN case, where the
+    /// connection was already dead and the peer never received so much as a
+    /// partial frame — so redialing and resending is exactly as safe as it
+    /// is for Get/Set/Delete, and this method retries once, just like
+    /// <see cref="ApplyReconnectingAsync{T}"/> does. False (the default on
+    /// every other <see cref="ConnectionLostException"/> — a lost reply
+    /// after a fully-written frame, a request timeout, a stream desync)
+    /// means the request may already have reached the peer: this method
+    /// does not retry, and wraps the exception in
+    /// <see cref="UnsafeToReplayException"/> so
+    /// <see cref="WithClusterRetryAsync{T}"/>'s own broader retry can't
+    /// replay it either — the caller unwraps it back to the plain
+    /// <see cref="ConnectionLostException"/> this SDK's exception contract
+    /// promises.</para>
+    /// </summary>
+    private async Task<T> ApplyReconnectingNotIdempotentAsync<T>(string? slot, Func<Connection, Task<T>> op)
+    {
+        try
+        {
+            return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
+        }
+        catch (ConnectionLostException error) when (error.RequestNotSent)
+        {
+            try
+            {
+                return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
+            }
+            catch (ConnectionLostException retryError)
+            {
+                // The redial's own attempt failed too — whatever the
+                // reason, this method never retries more than once (same
+                // bound as ApplyReconnectingAsync), and this failure must
+                // not be replayed further up either.
+                throw new UnsafeToReplayException(retryError);
+            }
+        }
+        catch (ConnectionLostException error)
+        {
+            throw new UnsafeToReplayException(error);
         }
     }
 

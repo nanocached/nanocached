@@ -81,9 +81,36 @@ public sealed class DiscoveryBusyException : NanocachedException
 /// <summary>A connection-level failure; the client redials lazily on the next use.</summary>
 public sealed class ConnectionLostException : NanocachedException
 {
+    /// <summary>
+    /// issue #225 — internal only: true when this specific failure happened
+    /// before, or while, the request frame was being written to the socket
+    /// (Connection's <c>IsClosed</c> pre-write checks, or a
+    /// <c>WriteAsync</c>/<c>FlushAsync</c> failure) — the idle-FIN case,
+    /// where the connection was already dead and the peer never received so
+    /// much as a partial frame. False (the default, used by every other
+    /// throw site — a lost reply after a fully-written frame, a request
+    /// timeout, a stream desync) means the request may already have reached
+    /// the peer and possibly been applied. <see cref="NanocachedClient"/>
+    /// uses this to decide whether replaying a non-idempotent request
+    /// (Incr/CAS/RemoveIfMatches) after a redial is safe: true is exactly
+    /// as safe as retrying an idempotent Get/Set/Delete; false is not — see
+    /// NanocachedClient's ApplyReconnectingNotIdempotentAsync.
+    /// </summary>
+    internal bool RequestNotSent { get; }
+
     public ConnectionLostException(string message) : base(message) { }
 
     public ConnectionLostException(string message, Exception inner) : base(message, inner) { }
+
+    internal ConnectionLostException(string message, bool requestNotSent) : base(message)
+    {
+        RequestNotSent = requestNotSent;
+    }
+
+    internal ConnectionLostException(string message, Exception inner, bool requestNotSent) : base(message, inner)
+    {
+        RequestNotSent = requestNotSent;
+    }
 }
 
 /// <summary>

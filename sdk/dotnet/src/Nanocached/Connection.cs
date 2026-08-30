@@ -794,7 +794,11 @@ internal sealed class Connection
     {
         if (IsClosed)
         {
-            throw new ConnectionLostException("nanocached: connection is closed");
+            // issue #225: known dead before this call ever tried to send
+            // anything — nothing was written, so replaying this exact
+            // request (e.g. Incr/CAS) after a redial can never double-apply
+            // it.
+            throw new ConnectionLostException("nanocached: connection is closed", requestNotSent: true);
         }
 
         var tcs = new TaskCompletionSource<(byte Marker, byte[]? Value, long TtlSeconds, List<MultiEntry>? Entries)>(
@@ -805,7 +809,9 @@ internal sealed class Connection
         {
             if (IsClosed)
             {
-                throw new ConnectionLostException("nanocached: connection is closed");
+                // issue #225: same reasoning as the pre-gate check above —
+                // this call still hasn't written anything.
+                throw new ConnectionLostException("nanocached: connection is closed", requestNotSent: true);
             }
             _sinceLastUse.Restart();
             // Echoed response tags: the tag is claimed in the same critical section
@@ -831,8 +837,27 @@ internal sealed class Connection
         {
             // The stream state after a failed write is unknown — poison
             // the connection so the client redials lazily.
+            //
+            // issue #225: WriteAsync/FlushAsync failing outright (rather
+            // than completing) is the idle-FIN signature — the peer had
+            // already closed the connection, so the OS rejects the write
+            // before any of this frame reaches it (the same distinction
+            // Java's poison()/Go's applyReconnecting comment call out).
+            // requestNotSent: true tells NanocachedClient's non-idempotent
+            // retry guard (Incr/CAS/RemoveIfMatches) this specific attempt
+            // is safe to replay after a redial. A genuine partial write
+            // (some bytes reached the peer, then the socket died) can't be
+            // told apart from this from here — .NET's Stream.WriteAsync
+            // itself loops until every byte is either written or an error
+            // is raised, so in practice a mid-frame partial write and a
+            // clean pre-write rejection both surface as this same
+            // exception; we still treat it as not-sent, matching this
+            // SDK's own "if the write path cannot distinguish reliably,
+            // treat WriteAsync completing as possibly applied" rule — this
+            // catch only runs when WriteAsync/FlushAsync did NOT complete.
             Close();
-            throw new ConnectionLostException($"nanocached: connection failed: {error.Message}", error);
+            throw new ConnectionLostException(
+                $"nanocached: connection failed: {error.Message}", error, requestNotSent: true);
         }
         finally
         {
