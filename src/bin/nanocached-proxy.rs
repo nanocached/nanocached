@@ -83,8 +83,8 @@
 //!   instead of being handed a proxy address out of band — a DNS/LB/VIP
 //!   in front of the proxies keeps working too. SDKs in discovery mode
 //!   keep working cluster-direct; the proxy is opt-in per client.
-//! - Auth: the shared secret (env `NANOCACHED_SECRET`, same as node and
-//!   discovery) is required of clients exactly as a node requires it,
+//! - Auth: the shared secret (env `NANOCACHED_AUTH_SECRET`, same as node
+//!   and discovery) is required of clients exactly as a node requires it,
 //!   and presented by the proxy on every backend and discovery
 //!   connection. One trust domain, pass-through by re-authentication.
 //! - TLS: `--tls-cert`/`--tls-key` terminate TLS for clients (same
@@ -190,11 +190,29 @@ impl ProxyIdentity {
     }
 }
 
+const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
+/// The name the proxy read before issue #165 — node and discovery always
+/// used `NANOCACHED_AUTH_SECRET`, so an operator following the docs got a
+/// proxy with auth silently off. Honoured for one release as a fallback,
+/// with a warning, so an existing deployment keeps working while it
+/// renames the variable.
+const LEGACY_AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_SECRET";
+
 fn read_auth_secret() -> Option<Bytes> {
-    std::env::var("NANOCACHED_SECRET")
-        .ok()
-        .filter(|secret| !secret.is_empty())
-        .map(Bytes::from)
+    read_auth_secret_from(|name| std::env::var(name).ok())
+}
+
+fn read_auth_secret_from(var: impl Fn(&str) -> Option<String>) -> Option<Bytes> {
+    let non_empty = |value: String| (!value.is_empty()).then_some(value);
+    if let Some(secret) = var(AUTH_SECRET_ENV_VAR).and_then(non_empty) {
+        return Some(Bytes::from(secret));
+    }
+    let legacy = var(LEGACY_AUTH_SECRET_ENV_VAR).and_then(non_empty)?;
+    eprintln!(
+        "WARN {LEGACY_AUTH_SECRET_ENV_VAR} is deprecated and will stop being read in a future \
+         release; set {AUTH_SECRET_ENV_VAR} instead (the name node and discovery use)"
+    );
+    Some(Bytes::from(legacy))
 }
 
 // ─── HRW ring (independent re-implementation, see module docs) ───────
@@ -332,7 +350,7 @@ fn usage() -> String {
      [--host <host>] [--port <port>] [--max-connections <n>] \
      [--tls-cert <pem> --tls-key <pem>] [--tls-ca <pem>] [--metrics-port <port>]\n\
      [--drain-timeout <secs>]\n\
-     The shared auth secret is read from NANOCACHED_SECRET."
+     The shared auth secret is read from NANOCACHED_AUTH_SECRET."
         .to_string()
 }
 
@@ -4085,6 +4103,56 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn auth_secret_comes_from_nanocached_auth_secret() {
+        // Issue #165: the proxy used to read NANOCACHED_SECRET while node
+        // and discovery read NANOCACHED_AUTH_SECRET.
+        let env = |name: &str| match name {
+            "NANOCACHED_AUTH_SECRET" => Some("shared".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            read_auth_secret_from(env),
+            Some(Bytes::from_static(b"shared"))
+        );
+    }
+
+    #[test]
+    fn auth_secret_falls_back_to_the_legacy_name() {
+        let env = |name: &str| match name {
+            "NANOCACHED_SECRET" => Some("legacy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            read_auth_secret_from(env),
+            Some(Bytes::from_static(b"legacy"))
+        );
+    }
+
+    #[test]
+    fn auth_secret_prefers_the_new_name_and_ignores_empty_values() {
+        let both = |name: &str| match name {
+            "NANOCACHED_AUTH_SECRET" => Some("new".to_string()),
+            "NANOCACHED_SECRET" => Some("legacy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            read_auth_secret_from(both),
+            Some(Bytes::from_static(b"new"))
+        );
+        let empty_new = |name: &str| match name {
+            "NANOCACHED_AUTH_SECRET" => Some(String::new()),
+            "NANOCACHED_SECRET" => Some("legacy".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            read_auth_secret_from(empty_new),
+            Some(Bytes::from_static(b"legacy"))
+        );
+        assert_eq!(read_auth_secret_from(|_| Some(String::new())), None);
+        assert_eq!(read_auth_secret_from(|_| None), None);
+    }
 
     // ── arg parsing ──────────────────────────────────────────────────
 
