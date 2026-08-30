@@ -31,6 +31,7 @@ import javax.cache.expiry.CreatedExpiryPolicy;
 import javax.cache.expiry.Duration;
 import javax.cache.expiry.EternalExpiryPolicy;
 import javax.cache.expiry.ExpiryPolicy;
+import javax.cache.expiry.ModifiedExpiryPolicy;
 import javax.cache.management.CacheStatisticsMXBean;
 import javax.cache.processor.EntryProcessor;
 import javax.cache.spi.CachingProvider;
@@ -394,10 +395,31 @@ class NanocachedCacheTest {
 
     @Test
     void putAllWithDurationZeroDeletesExistingAndSkipsNew() {
+        // ModifiedExpiryPolicy(ZERO), not CreatedExpiryPolicy(ZERO): per
+        // JSR-107, CreatedExpiryPolicy.getExpiryForUpdate() always returns
+        // null ("leave the current TTL alone"), so it can never actually
+        // resolve an *update* to Duration.ZERO — this test's "deletes
+        // existing" half went untested until issue #278. ModifiedExpiryPolicy
+        // resolves both creation and update to the given duration, so ZERO
+        // here really means "never retain," for a fresh key and an
+        // already-present one alike.
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
-        config.setExpiryPolicyFactory(CreatedExpiryPolicy.factoryOf(Duration.ZERO));
+        config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ZERO));
         Cache<String, String> zeroCache = manager.createCache("zero-all", config);
+
+        // Seed "a" as already-present, bypassing the cache — a ZERO policy
+        // can never create an entry through the cache itself (same reason
+        // accessedExpiryPolicyRefreshesTheTtlOnEveryGet seeds directly).
+        node.store("zero-all")
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
+                        new MockNode.Entry(ValueCodec.serialize("old"), 60L));
+
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        zeroCache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
         node.multiSetCount.set(0);
 
         zeroCache.putAll(Map.of("a", "1", "b", "2"));
@@ -405,6 +427,9 @@ class NanocachedCacheTest {
         assertNull(zeroCache.get("a"));
         assertNull(zeroCache.get("b"));
         assertEquals(0, node.multiSetCount.get());
+        // Issue #278: an update resolving to Duration.ZERO must fire
+        // Removed, exactly like every other removal path in this class.
+        assertEquals(List.of("REMOVED:a:old=old"), events);
     }
 
     @Test
@@ -504,6 +529,36 @@ class NanocachedCacheTest {
         zeroCache.put("a", "1");
 
         assertNull(zeroCache.get("a"));
+    }
+
+    @Test
+    void durationZeroOnUpdateDeletesTheExistingEntryAndFiresRemoved() {
+        // See putAllWithDurationZeroDeletesExistingAndSkipsNew's comment for
+        // why ModifiedExpiryPolicy, not CreatedExpiryPolicy, is what
+        // actually resolves an *update* to Duration.ZERO.
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ZERO));
+        Cache<String, String> zeroCache = manager.createCache("zero-update", config);
+
+        // Seed "a" as already-present, bypassing the cache — see the
+        // putAll test above for why.
+        node.store("zero-update")
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
+                        new MockNode.Entry(ValueCodec.serialize("old"), 60L));
+
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        zeroCache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
+
+        zeroCache.put("a", "1"); // update resolves to Duration.ZERO -> deletes
+
+        assertNull(zeroCache.get("a"));
+        // Issue #278: put()'s Duration.ZERO-on-update branch must fire
+        // Removed too, exactly like remove()/getAndRemove()/getAndPut().
+        assertEquals(List.of("REMOVED:a:old=old"), events);
     }
 
     @Test

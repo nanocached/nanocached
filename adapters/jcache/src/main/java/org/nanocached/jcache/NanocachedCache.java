@@ -260,8 +260,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 existing.isPresent() ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation();
         OptionalLong ttl = wireTtlSeconds(expiry);
         if (ttl.isEmpty()) {
+            // Issue #278: an update resolving to Duration.ZERO deletes the
+            // entry just like remove()/getAndRemove()/getAndPut()'s own
+            // TTL-zero branch do — so it must fire Removed the same way
+            // they do, not silently.
             if (existing.isPresent()) {
                 namespace.delete(keyBytes);
+                statistics.recordRemove();
+                fireRemoved(key, ValueCodec.deserialize(existing.get().value()));
             }
             return;
         }
@@ -525,8 +531,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             OptionalLong ttl = wireTtlSeconds(
                     present ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation());
             if (ttl.isEmpty()) {
+                // Issue #278: same as put()'s equivalent branch above —
+                // an update resolving to Duration.ZERO deletes the entry
+                // and must fire Removed, not go silent.
                 if (present) {
                     namespace.delete(wireKeys[i]);
+                    statistics.recordRemove();
+                    fireRemoved(keys.get(i), ValueCodec.deserialize(existing[i]));
                 }
                 continue;
             }
