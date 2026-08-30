@@ -58,6 +58,13 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Bounds how long `wait_for_join_log_lines` polls discovery's log file for
+/// lines it should already have written by the time it's called (see that
+/// function's doc comment). Deliberately much shorter than `JOIN_TIMEOUT`,
+/// which bounds an actual handoff and is meant for a different wait: this
+/// one only needs to cover the gap between discovery's stdout write and
+/// this process's read of the file, not a join actually taking place.
+const JOIN_LOG_POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const BUCKET_WIDTH: Duration = Duration::from_millis(250);
 /// Upper bound on a `G`/`V` reply's declared value length
 /// (`get`/`get_value`). The real server's own inbound request cap is
@@ -1176,6 +1183,48 @@ async fn wait_for_new_joined_node(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no new node appeared in L in time"))
 }
 
+/// Returns the 0-based line index of the first line in `log` starting with
+/// `prefix`, if any. Line index (rather than byte offset) is enough to
+/// compare the relative ordering of two lines in the same log.
+fn find_log_line(log: &str, prefix: &str) -> Option<usize> {
+    log.lines().position(|line| line.starts_with(prefix))
+}
+
+/// Polls the discovery log file at `log_path` until it contains a line
+/// starting with every prefix in `prefixes`, returning the full file
+/// contents once all are present. Discovery's stdout write and this
+/// process's read of the file happen in two different processes, so the
+/// lines aren't guaranteed to already be flushed to disk the instant the
+/// corresponding state change was observed over the wire (e.g. via `L`) —
+/// this bridges that gap, bounded by `JOIN_LOG_POLL_TIMEOUT` so a
+/// genuinely missing line (a real regression, or a logging change) fails
+/// fast instead of hanging.
+async fn wait_for_join_log_lines(log_path: &Path, prefixes: &[&str]) -> io::Result<String> {
+    timeout(JOIN_LOG_POLL_TIMEOUT, async {
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(log_path)
+                && prefixes
+                    .iter()
+                    .all(|prefix| find_log_line(&contents, prefix).is_some())
+            {
+                return contents;
+            }
+
+            sleep(POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "discovery's log at {log_path:?} never showed all expected join-transition \
+                 lines ({prefixes:?}) within {JOIN_LOG_POLL_TIMEOUT:?}"
+            ),
+        )
+    })
+}
+
 async fn run_simple_join(
     discovery_bin: &Path,
     node_bin: &Path,
@@ -1228,30 +1277,40 @@ async fn run_simple_join(
         stop_rx,
     ));
 
-    // A brief "before" baseline before the new node starts joining.
-    sleep(Duration::from_millis(500)).await;
+    // Everything below is fallible and, until it's captured here rather
+    // than propagated directly with `?`, an early error would return the
+    // function immediately, skipping the `stop_tx.send`/`workload.await`
+    // cleanup below and leaking `workload` running in the background.
+    let result: io::Result<(Duration, Duration)> = async {
+        // A brief "before" baseline before the new node starts joining.
+        sleep(Duration::from_millis(500)).await;
 
-    let join_started_at = test_start.elapsed();
-    let joining_node = spawn_node(
-        node_bin,
-        log_dir,
-        base_port + 1 + initial_nodes as u16,
-        &discovery.addr,
-    )?;
-    wait_until_connectable(&joining_node.addr).await?;
+        let join_started_at = test_start.elapsed();
+        let joining_node = spawn_node(
+            node_bin,
+            log_dir,
+            base_port + 1 + initial_nodes as u16,
+            &discovery.addr,
+        )?;
+        wait_until_connectable(&joining_node.addr).await?;
 
-    let (roster_after, replication_after, new_name, join_duration) =
-        wait_for_new_joined_node(&discovery.addr, &known_before, Instant::now()).await?;
-    println!("  node {new_name} joined in {join_duration:?}");
+        let (roster_after, replication_after, new_name, join_duration) =
+            wait_for_new_joined_node(&discovery.addr, &known_before, Instant::now()).await?;
+        println!("  node {new_name} joined in {join_duration:?}");
 
-    verify_handoff(&roster_after, replication_after, &new_name, args.keys).await?;
+        verify_handoff(&roster_after, replication_after, &new_name, args.keys).await?;
 
-    // A brief "after" window to see recovery.
-    sleep(Duration::from_millis(1000)).await;
+        // A brief "after" window to see recovery.
+        sleep(Duration::from_millis(1000)).await;
+
+        Ok((join_started_at, join_duration))
+    }
+    .await;
 
     let _ = stop_tx.send(true);
     let _ = workload.await;
 
+    let (join_started_at, join_duration) = result?;
     stats.report(join_started_at, &[join_started_at + join_duration]);
 
     Ok(())
@@ -1294,55 +1353,131 @@ async fn run_waiting_join(
         stop_rx,
     ));
 
-    sleep(Duration::from_millis(500)).await;
+    // Everything below is fallible and, until it's captured here rather
+    // than propagated directly with `?`, an early error would return the
+    // function immediately, skipping the `stop_tx.send`/`workload.await`
+    // cleanup below and leaking `workload` running in the background.
+    let discovery_log_path = log_dir.join(format!("discovery-{discovery_port}.log"));
+    let result: io::Result<(Duration, Duration, Duration)> = async {
+        sleep(Duration::from_millis(500)).await;
 
-    let join_started_at = test_start.elapsed();
+        let join_started_at = test_start.elapsed();
 
-    // Two nodes ask to join at nearly the same time; only one may be
-    // `Joining` at once (staged node join), so the second should be visibly
-    // delayed behind the first.
-    let second = spawn_node(node_bin, log_dir, base_port + 2, &discovery.addr)?;
-    let third = spawn_node(node_bin, log_dir, base_port + 3, &discovery.addr)?;
-    wait_until_connectable(&second.addr).await?;
-    wait_until_connectable(&third.addr).await?;
+        // Two nodes ask to join at nearly the same time; only one may be
+        // `Joining` at once (staged node join), so the second should be
+        // visibly delayed behind the first.
+        let second = spawn_node(node_bin, log_dir, base_port + 2, &discovery.addr)?;
+        let third = spawn_node(node_bin, log_dir, base_port + 3, &discovery.addr)?;
+        wait_until_connectable(&second.addr).await?;
+        wait_until_connectable(&third.addr).await?;
 
-    let poll_start = Instant::now();
-    let (roster_after_first, replication_after_first, first_new, first_duration) =
-        wait_for_new_joined_node(&discovery.addr, &known_before, poll_start).await?;
-    verify_handoff(
-        &roster_after_first,
-        replication_after_first,
-        &first_new,
-        args.keys,
-    )
-    .await?;
+        let poll_start = Instant::now();
+        let (roster_after_first, replication_after_first, first_new, first_duration) =
+            wait_for_new_joined_node(&discovery.addr, &known_before, poll_start).await?;
+        verify_handoff(
+            &roster_after_first,
+            replication_after_first,
+            &first_new,
+            args.keys,
+        )
+        .await?;
 
-    let mut known_after_first = known_before.clone();
-    known_after_first.insert(first_new.clone());
+        let mut known_after_first = known_before.clone();
+        known_after_first.insert(first_new.clone());
 
-    let (roster_after_second, replication_after_second, second_new, second_duration) =
-        wait_for_new_joined_node(&discovery.addr, &known_after_first, poll_start).await?;
-    verify_handoff(
-        &roster_after_second,
-        replication_after_second,
-        &second_new,
-        args.keys,
-    )
-    .await?;
+        let (roster_after_second, replication_after_second, second_new, second_duration) =
+            wait_for_new_joined_node(&discovery.addr, &known_after_first, poll_start).await?;
+        verify_handoff(
+            &roster_after_second,
+            replication_after_second,
+            &second_new,
+            args.keys,
+        )
+        .await?;
 
-    println!("  first new node ({first_new}) joined in {first_duration:?}");
-    println!("  second new node ({second_new}) joined in {second_duration:?}");
-    println!(
-        "  serialization gap: {:?} (should be well above 0 — a non-trivial join takes real \
-         time, so the second node must visibly wait behind the first rather than being \
-         promoted alongside it)",
-        second_duration.saturating_sub(first_duration)
-    );
+        println!("  first new node ({first_new}) joined in {first_duration:?}");
+        println!("  second new node ({second_new}) joined in {second_duration:?}");
 
-    sleep(Duration::from_millis(1000)).await;
+        // The durations above only show the two joins *finished* in
+        // order — that alone doesn't prove they were actually serialized,
+        // since a regression that let both proceed roughly in parallel
+        // could still happen to finish in this order. Check the real
+        // structural signal instead: discovery's own log must show one
+        // join's promotion strictly before the other join's start.
+        //
+        // Note: `first_new`/`second_new` reflect whichever order this
+        // harness's own `L` polling happened to observe the two new nodes
+        // in. Under a fast local join (handoff can finish in well under
+        // one `POLL_INTERVAL`), that polling order isn't guaranteed to
+        // match which node discovery actually promoted first — so the log
+        // itself, not these labels, is the source of truth for ordering.
+        let first_promoted_prefix = format!("INFO join promoted: {first_new} ");
+        let first_started_prefix = format!("INFO join started: {first_new} ");
+        let second_promoted_prefix = format!("INFO join promoted: {second_new} ");
+        let second_started_prefix = format!("INFO join started: {second_new} ");
+
+        let log_contents = wait_for_join_log_lines(
+            &discovery_log_path,
+            &[
+                first_promoted_prefix.as_str(),
+                first_started_prefix.as_str(),
+                second_promoted_prefix.as_str(),
+                second_started_prefix.as_str(),
+            ],
+        )
+        .await?;
+
+        let first_promoted_at = find_log_line(&log_contents, &first_promoted_prefix)
+            .expect("wait_for_join_log_lines guarantees this line is present");
+        let first_started_at = find_log_line(&log_contents, &first_started_prefix)
+            .expect("wait_for_join_log_lines guarantees this line is present");
+        let second_promoted_at = find_log_line(&log_contents, &second_promoted_prefix)
+            .expect("wait_for_join_log_lines guarantees this line is present");
+        let second_started_at = find_log_line(&log_contents, &second_started_prefix)
+            .expect("wait_for_join_log_lines guarantees this line is present");
+
+        let (earlier_name, earlier_promoted_at, later_name, later_started_at) =
+            if first_promoted_at <= second_promoted_at {
+                (
+                    &first_new,
+                    first_promoted_at,
+                    &second_new,
+                    second_started_at,
+                )
+            } else {
+                (
+                    &second_new,
+                    second_promoted_at,
+                    &first_new,
+                    first_started_at,
+                )
+            };
+
+        if later_started_at <= earlier_promoted_at {
+            return Err(io::Error::other(format!(
+                "staged join failed to serialize {first_new} and {second_new}: {later_name}'s \
+                 join started (discovery log line {later_started_at}) at or before \
+                 {earlier_name}'s join was promoted (discovery log line {earlier_promoted_at}) \
+                 — first joined in {first_duration:?}, second in {second_duration:?}"
+            )));
+        }
+
+        println!(
+            "  serialization gap: {:?} (well above 0, and discovery's own log confirms \
+             {later_name}'s join didn't start until {earlier_name}'s was fully promoted)",
+            second_duration.saturating_sub(first_duration)
+        );
+
+        sleep(Duration::from_millis(1000)).await;
+
+        Ok((join_started_at, first_duration, second_duration))
+    }
+    .await;
 
     let _ = stop_tx.send(true);
     let _ = workload.await;
+
+    let (join_started_at, first_duration, second_duration) = result?;
 
     stats.report(
         join_started_at,
@@ -1572,5 +1707,156 @@ mod tests {
             vec![("node-a".to_string(), "127.0.0.1:8356".to_string())]
         );
         server.await.unwrap();
+    }
+
+    /// `run_waiting_join`'s structural serialization check (see its doc
+    /// comment) rests entirely on `find_log_line` locating the right lines
+    /// in discovery's log and comparing their order. These tests exercise
+    /// that pure logic directly against synthetic log text, without
+    /// spawning any subprocess.
+    #[test]
+    fn find_log_line_locates_the_first_matching_prefix() {
+        let log = "INFO join started: node-b (handoff from 2 members)\n\
+                    INFO join promoted: node-a (members now 2)\n\
+                    INFO join started: node-c (handoff from 2 members)\n";
+
+        assert_eq!(find_log_line(log, "INFO join promoted: node-a "), Some(1));
+        assert_eq!(find_log_line(log, "INFO join started: node-c "), Some(2));
+        assert_eq!(find_log_line(log, "INFO join started: node-b "), Some(0));
+        assert_eq!(find_log_line(log, "INFO join promoted: node-z "), None);
+    }
+
+    #[test]
+    fn find_log_line_requires_the_trailing_space_to_avoid_prefix_collisions() {
+        // "node-a" is a name-prefix of "node-ab" — the trailing space
+        // baked into the match prefix must prevent a false partial match.
+        let log = "INFO join promoted: node-ab (members now 2)\n";
+        assert_eq!(find_log_line(log, "INFO join promoted: node-a "), None);
+    }
+
+    #[test]
+    fn detects_a_properly_serialized_join_from_log_order() {
+        let log = "INFO join started: node-a (handoff from 1 members)\n\
+                    INFO join promoted: node-a (members now 2)\n\
+                    INFO join started: node-b (handoff from 2 members)\n\
+                    INFO join promoted: node-b (members now 3)\n";
+
+        let promoted_at = find_log_line(log, "INFO join promoted: node-a ").unwrap();
+        let started_at = find_log_line(log, "INFO join started: node-b ").unwrap();
+        assert!(started_at > promoted_at);
+    }
+
+    #[test]
+    fn detects_a_non_serialized_join_from_log_order() {
+        // node-b's join started before node-a's was promoted — a
+        // regression that let the two joins race rather than serialize.
+        let log = "INFO join started: node-a (handoff from 1 members)\n\
+                    INFO join started: node-b (handoff from 1 members)\n\
+                    INFO join promoted: node-a (members now 2)\n\
+                    INFO join promoted: node-b (members now 3)\n";
+
+        let promoted_at = find_log_line(log, "INFO join promoted: node-a ").unwrap();
+        let started_at = find_log_line(log, "INFO join started: node-b ").unwrap();
+        assert!(started_at <= promoted_at);
+    }
+
+    /// Regression test: caught by an actual local run during development.
+    /// With very fast joins, this harness's own `L`-polling can observe the
+    /// two new nodes in the *opposite* order from the log's true promotion
+    /// order (both can already be promoted by the time the first `L` poll
+    /// fires). The serialization check must derive "which joined first"
+    /// from the log's promotion order, not from whichever name the harness
+    /// happened to label "first"/"second" — otherwise a perfectly
+    /// serialized join gets reported as a false failure.
+    #[test]
+    fn resolves_true_join_order_from_the_log_even_when_harness_labels_are_swapped() {
+        // Chronologically: node-b joined first (started+promoted before
+        // node-a even started), but suppose the harness's polling happened
+        // to label node-a as "first_new" and node-b as "second_new".
+        let log = "INFO join started: node-b (handoff from 1 members)\n\
+                    INFO join promoted: node-b (members now 2)\n\
+                    INFO join started: node-a (handoff from 2 members)\n\
+                    INFO join promoted: node-a (members now 3)\n";
+
+        let first_new = "node-a";
+        let second_new = "node-b";
+
+        let first_promoted_at =
+            find_log_line(log, &format!("INFO join promoted: {first_new} ")).unwrap();
+        let first_started_at =
+            find_log_line(log, &format!("INFO join started: {first_new} ")).unwrap();
+        let second_promoted_at =
+            find_log_line(log, &format!("INFO join promoted: {second_new} ")).unwrap();
+        let second_started_at =
+            find_log_line(log, &format!("INFO join started: {second_new} ")).unwrap();
+
+        let (earlier_promoted_at, later_started_at) = if first_promoted_at <= second_promoted_at {
+            (first_promoted_at, second_started_at)
+        } else {
+            (second_promoted_at, first_started_at)
+        };
+
+        // The true earlier join is node-b (promoted at line 1); the true
+        // later join is node-a (started at line 2), which is indeed after
+        // node-b's promotion — this was a properly serialized join despite
+        // the harness's labels being swapped from chronological order.
+        assert!(later_started_at > earlier_promoted_at);
+    }
+
+    #[tokio::test]
+    async fn wait_for_join_log_lines_returns_once_both_lines_are_present() {
+        let dir = std::env::temp_dir().join(format!(
+            "verify-staged-join-test-{}-{}",
+            std::process::id(),
+            test_scratch_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("discovery.log");
+        std::fs::write(
+            &log_path,
+            "INFO join promoted: node-a (members now 2)\n\
+             INFO join started: node-b (handoff from 2 members)\n",
+        )
+        .unwrap();
+
+        let contents = wait_for_join_log_lines(
+            &log_path,
+            &["INFO join promoted: node-a ", "INFO join started: node-b "],
+        )
+        .await
+        .unwrap();
+        assert!(contents.contains("join promoted: node-a"));
+        assert!(contents.contains("join started: node-b"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_join_log_lines_times_out_when_a_line_never_appears() {
+        let dir = std::env::temp_dir().join(format!(
+            "verify-staged-join-test-{}-{}",
+            std::process::id(),
+            test_scratch_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("discovery.log");
+        std::fs::write(&log_path, "INFO join promoted: node-a (members now 2)\n").unwrap();
+
+        let error = wait_for_join_log_lines(
+            &log_path,
+            &["INFO join promoted: node-a ", "INFO join started: node-b "],
+        )
+        .await
+        .expect_err("second line never appears, so this must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Per-test scratch-directory disambiguator, so two tests (or two
+    /// concurrent runs) never collide on the same temp path.
+    fn test_scratch_id() -> u64 {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
