@@ -1293,6 +1293,16 @@ impl NanocachedClient {
         close_all_connections(&state.target);
     }
 
+    /// Number of hedge legs currently tracked in `hedged_reads` — finished
+    /// legs still awaiting their next reap (see `spawn_hedge_leg`, issue
+    /// #180) as well as ones genuinely in flight. Public-but-hidden purely
+    /// as a test hook to observe that the JoinSet stays bounded instead of
+    /// growing for the client's lifetime.
+    #[doc(hidden)]
+    pub async fn hedged_reads_len(&self) -> usize {
+        self.inner.hedged_reads.lock().await.len()
+    }
+
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {
         match self.get_bytes(key).await? {
             Some(bytes) => Ok(Some(decode_utf8_value(bytes)?)),
@@ -2749,6 +2759,15 @@ impl NanocachedClient {
     ) -> Result<()> {
         let client = self.clone();
         let mut hedged = self.inner.hedged_reads.lock().await;
+        // Reap legs that finished since the last time anyone looked
+        // (issue #180): nothing else calls `join_next` outside `close()`,
+        // so without this the JoinSet grows for the lifetime of the
+        // client on any long-lived hedged-read workload. `try_join_next`
+        // never awaits, so this can't stall a leg that's still running,
+        // and it runs before the `closed` recheck below — reaping is
+        // unconditional and has no bearing on the close/closed ordering
+        // that recheck protects.
+        while hedged.try_join_next().is_some() {}
         // Re-check `closed` *after* taking the lock `close()` drains the
         // JoinSet under (issue #91): `close()` sets `closed` before it
         // acquires this lock (see `close()`), so a leg that gets the lock
