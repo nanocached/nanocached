@@ -32,6 +32,7 @@ Each `i*.sh` is one scenario; the paired `*.py` is its probe/loader.
 | `lr.sh` | — | 1-hour soak/churn long-run (kill/restart rounds, dual Python+.NET load, memory-trend analysis). |
 | `scalein.sh` | #124 | graceful node scale-in under load: R=2, 3 nodes, SIGTERM one mid-load → decommission (handoff, immediate leave, forwarding window), exit 0. Asserts zero errors/misses/corruption in the load and zero loss on an untouched key range. Needs `:dev` images built from a post-v0.3.0 commit (see the script header). |
 | `proxydrain.sh` | #124 | graceful proxy scale-in under via-proxy load: 2 proxies, SIGTERM one → immediate `Q` deregistration, in-flight finish, exit 0, clients reconnect to the survivor. Same zero-error/zero-loss assertions. Mounts the repo's Python SDK for `via_proxy`. |
+| `chaos.sh` | #266 | join → decommission → kill/restart rounds under hedged Python load (R=2, 3 nodes). Asserts leaver exit 0, load 0 miss / 0 corrupt, and 0 loss on an untouched key range. Currently **fails by design of the cluster**: ~350/10000 untouched keys are lost after two kills because an eviction never re-replicates (issue #266); also exposed #264/#267. `ROUNDS=6 NODE=... DISC=... ./chaos.sh` |
 
 ## Shared helpers
 
