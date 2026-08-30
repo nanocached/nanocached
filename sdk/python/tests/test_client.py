@@ -4540,6 +4540,59 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_set_many_bytes_over_the_byte_bound_splits_by_bytes_not_just_count(self):
+        # Issue #222: a handful of individually-valid pairs (nowhere near
+        # _MAX_BATCH_KEYS) whose combined namespace+key+value bytes
+        # exceed _MAX_REQUEST_BYTES must still be split into multiple
+        # `o` sub-frames — otherwise the server's request_is_too_large
+        # check would reject the whole frame with no reply at all,
+        # closing the shared connection.
+        from nanocached.client import _MAX_REQUEST_BYTES
+
+        client = await self.connect()
+        try:
+            # Four values, each individually well under _MAX_REQUEST_BYTES,
+            # but four of them summed comfortably exceed it — while the
+            # count (4) is nowhere near _MAX_BATCH_KEYS (400), so only the
+            # new cumulative-bytes bound can be responsible for a split.
+            value_size = _MAX_REQUEST_BYTES // 3
+            values = {f"k{i}": b"v" * value_size for i in range(4)}
+            await client.set_many(values)
+
+            self.assertGreater(self.node.multi_set_count, 1)
+            self.assertLess(self.node.multi_set_count, len(values))
+            for size in self.node.multi_set_frame_sizes:
+                self.assertLessEqual(size, 1024 * 1024)
+
+            result = await client.get_many_bytes(list(values.keys()))
+            self.assertEqual(result, values)
+        finally:
+            await client.close()
+
+    async def test_get_many_with_large_keys_over_the_byte_bound_splits_by_bytes(self):
+        # get_many's own m-frame twin of the set_many test above (issue
+        # #222): large keys alone (no values on the wire for `m`) can
+        # still sum past _MAX_REQUEST_BYTES well before _MAX_BATCH_KEYS
+        # keys are reached.
+        from nanocached.client import _MAX_REQUEST_BYTES
+
+        client = await self.connect()
+        try:
+            key_size = _MAX_REQUEST_BYTES // 3
+            keys = [b"k" * key_size + str(i).encode() for i in range(4)]
+            for i, key in enumerate(keys):
+                await client.set(key, f"v{i}")
+
+            result = await client.get_many_bytes(keys)
+
+            self.assertGreater(self.node.multi_get_count, 1)
+            self.assertLess(self.node.multi_get_count, len(keys))
+            for size in self.node.multi_get_frame_sizes:
+                self.assertLessEqual(size, 1024 * 1024)
+            self.assertEqual(len(result), len(keys))
+        finally:
+            await client.close()
+
     async def test_a_persisting_wrong_node_propagates_immediately_in_single_mode(self):
         # No ring to refresh against in single-node mode — mirrors get()'s
         # own single-mode behavior (_read/_write's `self._ring is None`
