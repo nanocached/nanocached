@@ -1096,6 +1096,97 @@ public class NanocachedClientTests
         }
     }
 
+    [Fact]
+    public async Task SetManyBytesAsyncSplitsByCumulativeBytesWhenIndividuallyValidPairsSumPastTheCap()
+    {
+        // Regression for issue #222: batch chunking used to split a
+        // sub-frame purely on key count (MaxBatchKeys, 400), never on
+        // cumulative size. Three ~600 KB values are each comfortably under
+        // the 1 MiB-ish MaxRequestBytes cap on their own (ValidateKeyAndValue
+        // passes each individually), but any two of them summed together
+        // already exceed it once packed into one `o` frame — before this
+        // fix, all three would have gone out as a single frame far over
+        // the server's real MAX_REQUEST_SIZE, which the server rejects by
+        // silently closing the connection (no response), surfacing to the
+        // caller as a confusing ConnectionLost/WrongNode instead of a
+        // clean round trip.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        var rng = new Random(222);
+        var values = new Dictionary<string, byte[]>();
+        for (int i = 0; i < 3; i++)
+        {
+            var bytes = new byte[600_000];
+            rng.NextBytes(bytes);
+            values[$"k{i}"] = bytes;
+        }
+
+        await client.SetManyBytesAsync(values);
+
+        // Two ~600 KB values already exceed the cap, so each pair had to
+        // go out on its own — proving the split actually happened, not
+        // just counting frames but checking each sub-frame's real
+        // namespace+key+value total stayed under 1 MiB.
+        Assert.True(
+            node.MultiSetRequestCount > 1,
+            $"expected more than one `o` sub-frame for 3 x 600 KB values, got {node.MultiSetRequestCount}");
+        foreach (long frameBytes in node.MultiSetFrameBytes)
+        {
+            Assert.True(frameBytes < 1024 * 1024, $"sub-frame carried {frameBytes} bytes, expected under 1 MiB");
+        }
+
+        Dictionary<string, byte[]> roundTripped = await client.GetManyBytesAsync(values.Keys.ToList());
+        Assert.Equal(values.Count, roundTripped.Count);
+        foreach ((string key, byte[] expected) in values)
+        {
+            Assert.Equal(expected, roundTripped[key]);
+        }
+    }
+
+    [Fact]
+    public async Task GetManyAsyncSplitsByCumulativeBytesForLargeKeys()
+    {
+        // GetManyChunkedAsync's counterpart to the SetMany test above: keys
+        // large enough that two of them summed exceed MaxRequestBytes, even
+        // though each is individually valid (ValidateKey passes each key
+        // alone). Values are small so the response side (issue #207's own
+        // bound) never factors in — this exercises only the request-side
+        // chunking this issue fixes.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        var rng = new Random(223);
+        var keys = new List<string>();
+        var expected = new Dictionary<string, string>();
+        for (int i = 0; i < 3; i++)
+        {
+            var keyBytes = new byte[600_000];
+            rng.NextBytes(keyBytes);
+            // Keep the key printable-ish and unique by prefixing an index;
+            // the wire treats a key as opaque bytes either way. UTF-8
+            // round-trips arbitrary bytes above 0x7F as replacement
+            // characters, so restrict to ASCII to keep the key stable
+            // across the encode the client performs internally.
+            for (int b = 0; b < keyBytes.Length; b++) keyBytes[b] = (byte)(keyBytes[b] & 0x7F);
+            string key = $"k{i}-" + Encoding.ASCII.GetString(keyBytes);
+            keys.Add(key);
+            expected[key] = $"v{i}";
+            await client.SetAsync(key, $"v{i}");
+        }
+
+        Dictionary<string, string> result = await client.GetManyAsync(keys);
+
+        Assert.True(
+            node.MultiGetRequestCount > 1,
+            $"expected more than one `m` sub-frame for 3 x ~600 KB keys, got {node.MultiGetRequestCount}");
+        foreach (long frameBytes in node.MultiGetFrameBytes)
+        {
+            Assert.True(frameBytes < 1024 * 1024, $"sub-frame carried {frameBytes} bytes, expected under 1 MiB");
+        }
+        Assert.Equal(expected, result);
+    }
+
     // ── クラスタと複製 ────────────────────────────────────────────
 
     private sealed record Cluster(

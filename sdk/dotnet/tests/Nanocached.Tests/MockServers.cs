@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -87,6 +88,21 @@ public sealed class MockNode : IDisposable
     /// server has received.</summary>
     public int MultiSetRequestCount => _multiSetRequestCount;
     private int _multiSetRequestCount;
+
+    /// <summary>issue #222: the namespace+key byte total (the same wire
+    /// bytes <c>MultiGetChunkedAsync</c>'s cumulative-bytes bound counts)
+    /// of every <c>m</c> request this server has received, in arrival
+    /// order — lets a test assert a batch-chunking split actually
+    /// happened by inspecting each sub-frame's real size, rather than
+    /// just its count.</summary>
+    public IReadOnlyList<long> MultiGetFrameBytes => _multiGetFrameBytes.ToArray();
+    private readonly ConcurrentQueue<long> _multiGetFrameBytes = new();
+
+    /// <summary>issue #222: the namespace+key+value byte total of every
+    /// <c>o</c> request this server has received, in arrival order — the
+    /// <see cref="MultiGetFrameBytes"/> counterpart for multi-set.</summary>
+    public IReadOnlyList<long> MultiSetFrameBytes => _multiSetFrameBytes.ToArray();
+    private readonly ConcurrentQueue<long> _multiSetFrameBytes = new();
 
     private readonly TcpListener _listener;
     private readonly ConcurrentDictionary<TcpClient, bool> _clients = new();
@@ -794,6 +810,10 @@ public sealed class MockNode : IDisposable
                             keys[i] = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3 + i], CultureInfo.InvariantCulture));
                         }
                         Interlocked.Increment(ref _multiGetRequestCount);
+                        // issue #222: namespace + every key's bytes — the
+                        // same total MultiGetChunkedAsync's cumulative
+                        // bound tracks, minus its header allowance.
+                        _multiGetFrameBytes.Enqueue(namespaceBytes.Length + keys.Sum(k => (long)k.Length));
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
@@ -853,6 +873,12 @@ public sealed class MockNode : IDisposable
                             values[i] = await Wire.ReadExactlyAsync(stream, valueLens[i]);
                         }
                         Interlocked.Increment(ref _multiSetRequestCount);
+                        // issue #222: namespace + every key's and value's
+                        // bytes — the same total MultiSetChunkedAsync's
+                        // cumulative bound tracks, minus its header
+                        // allowance.
+                        _multiSetFrameBytes.Enqueue(
+                            namespaceBytes.Length + keys.Sum(k => (long)k.Length) + values.Sum(v => (long)v.Length));
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
