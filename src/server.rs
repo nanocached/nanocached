@@ -1096,8 +1096,20 @@ async fn run_metrics_server(
             accepted = listener.accept() => accepted,
             _ = shutdown_rx.changed() => return,
         };
-        let Ok((stream, _)) = accepted else {
-            continue;
+        let (stream, _) = match accepted {
+            Ok(pair) => pair,
+            Err(error) => {
+                // Issue #184: mirrors `run`'s own accept loop (see
+                // `should_backoff_after_accept_error`'s doc comment) — an
+                // unadorned `continue` here would busy-loop this task hot
+                // under EMFILE/ENFILE instead of backing off, making
+                // recovery harder right when file descriptors are already
+                // scarce.
+                if should_backoff_after_accept_error(&error) {
+                    sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
 
         let request_tx = request_tx.clone();
