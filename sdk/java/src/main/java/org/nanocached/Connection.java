@@ -687,7 +687,11 @@ final class Connection {
      * marker mismatch never is. */
     private Response request(Function<Integer, byte[]> build) {
         if (isClosed()) {
-            throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
+            // notSent=true (issue #225): this call's frame never touched
+            // the wire — the connection was already dead (e.g. an
+            // idle-timeout FIN the reader thread already noticed), so a
+            // non-idempotent caller may safely redial and resend.
+            throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null, true);
         }
 
         PreparedRequest prepared = null;
@@ -695,7 +699,11 @@ final class Connection {
             CompletableFuture<Response> future = new CompletableFuture<>();
             synchronized (this) {
                 if (isClosed()) {
-                    throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null);
+                    // As above (notSent=true) — this attempt's frame still
+                    // hasn't been written; only a concurrent poison() (or
+                    // an 'R' retry racing a close) landed between the
+                    // check above and this one.
+                    throw new NanocachedException.ConnectionFailed("nanocached: connection is closed", null, true);
                 }
                 lastUsedNanos = System.nanoTime();
                 if (prepared == null) {
@@ -724,6 +732,11 @@ final class Connection {
                 } catch (IOException error) {
                     // The stream state after a failed write is unknown —
                     // poison the connection so the client redials lazily.
+                    // notSent stays false (issue #225): out.write may have
+                    // handed some or all of this frame's bytes to the OS
+                    // send buffer before failing, so a non-idempotent
+                    // caller must NOT treat this as "never sent" and
+                    // replay it.
                     poison(new NanocachedException.ConnectionFailed(
                             "nanocached: connection failed: " + error.getMessage(), error));
                 }

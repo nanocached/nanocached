@@ -55,8 +55,40 @@ public class NanocachedException extends RuntimeException {
 
     /** A connection-level failure; the client redials lazily on the next use. */
     public static final class ConnectionFailed extends NanocachedException {
+        /**
+         * Issue #225: {@code true} only when this connection is known to
+         * have never sent the failed request's bytes at all — {@link
+         * Connection#request}'s pre-write {@code isClosed()} checks are
+         * the only place this is set, and it means the connection was
+         * already marked closed before this call ever attempted to write,
+         * almost always because the reader thread had already noticed the
+         * peer's FIN (e.g. its idle timeout) moments earlier. Only then is
+         * redialing and resending a <em>non-idempotent</em> request
+         * (INCR/CAS/delete-if-matches) safe — see {@link
+         * NanocachedClient}'s {@code applyReconnectingNonIdempotent}.
+         * Every other {@code ConnectionFailed} (the write itself failing
+         * partway, a request timeout, or the reply simply never arriving
+         * after a successful write) leaves the request's fate genuinely
+         * unknown, so it must not be replayed. Irrelevant to get/set/
+         * delete/clear, which stay safe to retry unconditionally because
+         * they're idempotent regardless of this flag — always {@code
+         * false} on the public two-argument constructor those (and every
+         * caller outside {@link Connection}) use.
+         */
+        private final boolean notSent;
+
         public ConnectionFailed(String message, Throwable cause) {
+            this(message, cause, false);
+        }
+
+        ConnectionFailed(String message, Throwable cause, boolean notSent) {
             super(message, cause);
+            this.notSent = notSent;
+        }
+
+        /** See {@link #notSent}. */
+        public boolean notSent() {
+            return notSent;
         }
     }
 
