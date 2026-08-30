@@ -1413,7 +1413,11 @@ export class NanocachedClient {
       let wrongNode = false;
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
-        if (entry.kind === "hit") values.set(keys[i], entry.value);
+        // Same decompression `getBytesInNamespace` applies to a single
+        // get (issue #294) — without it, a compress-enabled client's
+        // batch reads would hand back marker-prefixed DEFLATE bytes
+        // instead of the original value.
+        if (entry.kind === "hit") values.set(keys[i], this.compress ? decompressValue(entry.value) : entry.value);
         else if (entry.kind === "wrongNode") wrongNode = true;
       }
       if (wrongNode) throw new PartialWrongNodeError(values);
@@ -1482,7 +1486,10 @@ export class NanocachedClient {
           const index = groupIndices[i];
           const entry = entries[i];
           if (entry.kind === "wrongNode") retry.push(index);
-          else if (entry.kind === "hit") values.set(keys[index], entry.value);
+          // Same decompression getBytesInNamespace applies to a single get
+          // (issue #294) — a cluster-mode batch read must not hand back
+          // marker-prefixed DEFLATE bytes when compress is enabled.
+          else if (entry.kind === "hit") values.set(keys[index], this.compress ? decompressValue(entry.value) : entry.value);
         }
       }),
     );
