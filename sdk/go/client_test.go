@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -4698,6 +4699,38 @@ func TestDecrSendsTheNegatedDelta(t *testing.T) {
 	// — never a separate wire command.
 	if node.iRequestsReceived() != 1 {
 		t.Fatalf("iRequestsReceived = %d, want 1 (Decr must reuse `i`, not a separate opcode)", node.iRequestsReceived())
+	}
+}
+
+// TestDecrRejectsMinInt64Delta covers issue #182: math.MinInt64 has no
+// valid int64 negation (two's complement wraps it back to itself), so a
+// naive `-delta` would silently turn Decr(math.MinInt64) into an Incr by
+// +2^63 instead of failing. Decr must reject it client-side, before any
+// `i` frame is sent.
+func TestDecrRejectsMinInt64Delta(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("counter", "20", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := client.Decr("counter", math.MinInt64); ok || !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Decr(math.MinInt64) = ok=%v err=%v, want ok=false err=ErrInvalidArgument", ok, err)
+	}
+	if node.iRequestsReceived() != 0 {
+		t.Fatalf("iRequestsReceived = %d, want 0 (math.MinInt64 must be rejected before any wire I/O)", node.iRequestsReceived())
+	}
+
+	ns := client.Namespace("counters")
+	if err := ns.Set("hits", "20", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := ns.Decr("hits", math.MinInt64); ok || !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("Namespace.Decr(math.MinInt64) = ok=%v err=%v, want ok=false err=ErrInvalidArgument", ok, err)
 	}
 }
 

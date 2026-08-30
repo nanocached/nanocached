@@ -755,6 +755,49 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await node.close()
 
+    async def test_refresh_dials_newly_discovered_nodes_concurrently(self):
+        # Issue #190: _refresh_node_list used to dial every newly
+        # discovered node in a sequential `for` loop, unlike
+        # _open_cluster's own concurrent bootstrap dial — several nodes
+        # joining at once, more than one of them slow to accept, stalled
+        # every operation waiting on _before_operation()'s refresh for
+        # roughly the SUM of their dial times instead of the max.
+        existing = await MockNode().start()
+        new_a = await MockNode().start()
+        new_b = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], existing.address)]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                delay = 0.12
+                new_a.delay_next_auth(delay)
+                new_b.delay_next_auth(delay)
+                discovery.nodes = [
+                    (NAMES[0], existing.address),
+                    ("new-a", new_a.address),
+                    ("new-b", new_b.address),
+                ]
+
+                start = asyncio.get_running_loop().time()
+                await client._maybe_refresh(force=True)
+                elapsed = asyncio.get_running_loop().time() - start
+
+                # Concurrent dialing takes roughly `delay` (the max of the
+                # two); a sequential loop would take roughly `2 * delay`
+                # (the sum) — the threshold sits well between the two.
+                self.assertLess(elapsed, delay * 1.5)
+                self.assertIn("new-a", client._members)
+                self.assertIn("new-b", client._members)
+                self.assertIsNotNone(client._members["new-a"].connection)
+                self.assertIsNotNone(client._members["new-b"].connection)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await existing.close()
+            await new_a.close()
+            await new_b.close()
+
 
 class IdentifyMalformedResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_unterminated_node_list_header_fails_promptly(self):
@@ -889,6 +932,26 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(client._keepalive_task.exception(), boom)
             finally:
                 await client.close()
+        finally:
+            await node.close()
+
+    async def test_close_awaits_the_keepalive_task_leaving_nothing_pending(self):
+        # Issue #189: close() cancelled the keepalive task but never
+        # gathered it (unlike _redials/_refresh_task/
+        # _background_replica_writes/_hedged_reads) — a loop torn down
+        # right after close() could log "Task was destroyed but it is
+        # pending!" for it. Assert the task itself is both finished and
+        # gone from asyncio.all_tasks() by the time close() returns.
+        node = await MockNode().start()
+        try:
+            self._client_module._KEEPALIVE_INTERVAL = 0.02
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            await wait_for(lambda: node.get_count >= 1, "a keep-alive ping")
+            keepalive_task = client._keepalive_task
+            self.assertIsNotNone(keepalive_task)
+            await client.close()
+            self.assertTrue(keepalive_task.done())
+            self.assertNotIn(keepalive_task, asyncio.all_tasks())
         finally:
             await node.close()
 
@@ -2343,6 +2406,49 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(elapsed, 0.3)
             finally:
                 await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_close_still_drains_a_replica_leg_orphaned_by_a_cancelled_write(self):
+        # Issue #189: the CancelledError path above (previous test) used
+        # to re-raise immediately without registering the still-running
+        # synchronous replica leg anywhere, leaving it a true orphan —
+        # nothing referenced it, so close()'s _teardown() could yank the
+        # connection out from under a write that was already on its way
+        # to succeeding. It must instead land on the replica, same as if
+        # the cancellation had never happened, with close() waiting for
+        # it via the same background-replica-write pool fire_and_forget
+        # dispatch uses.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            primary, replica = self.owners_of("k")
+            nodes[primary].delay_sets(0.3)
+            nodes[replica].delay_sets(0.08)
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(client.set("k", "v"), timeout=0.05)
+
+            # The replica leg is still in flight at this point (0.08s
+            # hasn't elapsed) with nothing awaiting it yet — before the
+            # fix this raced _teardown() below and warned "Task was
+            # destroyed but it is pending!" once the loop tore down.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                await client.close()
+                # Give a torn-down connection's socket-close callbacks
+                # (and any leftover task destruction) a chance to run and
+                # emit their warning before it's checked below.
+                await asyncio.sleep(0)
+
+            self.assertIn(
+                b"k",
+                nodes[replica].store,
+                "close() tore down the connection before the orphaned replica leg finished",
+            )
+            self.assertNotIn("destroyed", captured.getvalue())
         finally:
             await discovery.close()
             for node in nodes.values():
@@ -4372,6 +4478,53 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
             self.node.answer_wrong_node_for_keys({b"a"})
             with self.assertRaises(WrongNodeError):
                 await client.set_many({"a": "v2"})
+        finally:
+            await client.close()
+
+    async def test_a_multi_get_reply_with_too_few_entries_is_rejected_as_a_desync(self):
+        # Issue #181: a well-formed `M` header whose count doesn't match
+        # len(keys) must not silently resize `entries` via the slice
+        # assignment in _multi_get_chunked, shifting every later value
+        # onto the wrong key — it must raise and poison the connection,
+        # exactly like _mismatch's own wrong-marker desync.
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            self.node.answer_multi_get_bad_count_once(1)
+            with self.assertRaises(ConnectionError):
+                await client.get_many(["a", "b"])
+
+            # The connection was poisoned, so the redial that follows
+            # proves the client recovers cleanly instead of staying
+            # desynced.
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "va", "b": "vb"})
+        finally:
+            await client.close()
+
+    async def test_a_multi_get_reply_with_too_many_entries_is_rejected_as_a_desync(self):
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            self.node.answer_multi_get_bad_count_once(3)
+            with self.assertRaises(ConnectionError):
+                await client.get_many(["a", "b"])
+
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "va", "b": "vb"})
+        finally:
+            await client.close()
+
+    async def test_a_multi_set_reply_with_a_mismatched_entry_count_is_rejected_as_a_desync(self):
+        # Same contract as multi_get above, for `o`/multi_set (issue #181).
+        client = await self.connect()
+        try:
+            self.node.answer_multi_set_bad_count_once(1)
+            with self.assertRaises(ConnectionError):
+                await client.set_many({"a": "va", "b": "vb"})
+
+            await client.set_many({"a": "va", "b": "vb"})
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "va", "b": "vb"})
         finally:
             await client.close()
 

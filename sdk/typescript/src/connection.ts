@@ -462,8 +462,12 @@ export class Connection {
       try {
         parsed = tryParseResponse(buffer, this.tagged);
       } catch (error) {
-        this.lastError = error as Error;
-        this.socket.destroy();
+        // Route through poison() (issue #187) rather than destroying the
+        // socket directly: poison() flips `closed` synchronously, before
+        // destroy()'s 'close' event lands next tick. A direct destroy()
+        // left that window open for another request to pick this
+        // connection and write to an already-dead socket.
+        this.poison(error as Error);
         return;
       }
 
@@ -487,8 +491,9 @@ export class Connection {
         const limit =
           expectedMultiLength === undefined ? MAX_RESPONSE_FRAME_LENGTH : Math.max(MAX_RESPONSE_FRAME_LENGTH, expectedMultiLength);
         if (buffer.length > limit) {
-          this.lastError = new NanocachedError("nanocached: response frame exceeds maximum size (connection desynced)");
-          this.socket.destroy();
+          // poison() (issue #187), not a direct destroy(): see the parse-
+          // failure branch above for why isClosed() must flip synchronously.
+          this.poison(new NanocachedError("nanocached: response frame exceeds maximum size (connection desynced)"));
           return;
         }
         // Collapse back to a single stored chunk so later onData calls

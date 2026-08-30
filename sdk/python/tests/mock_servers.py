@@ -127,6 +127,14 @@ class MockNode:
         # answer_wrong_node_for_keys().
         self._multi_wrong_node_keys: set[bytes] = set()
         self._multi_wrong_node_times = 0
+        # Entry-count desync (issue #181): when set, the next `m`/`o`
+        # reply's roster is forced to this many entries regardless of how
+        # many keys were actually in the request — simulating a corrupt
+        # or desynced wire reply, independent of _multi_wrong_node_*
+        # above (which keeps the count correct and only changes per-key
+        # outcomes).
+        self._multi_get_reply_count_override: int | None = None
+        self._multi_set_reply_count_override: int | None = None
         self._wrong_tag_replies = 0
         self._swallowed_gets = 0
         self._malformed_value_replies = 0
@@ -143,6 +151,11 @@ class MockNode:
         self._get_delay = 0.0
         self._gets_delay = 0.0
         self._set_delay = 0.0
+        # Node-list refresh dialing new nodes (issue #190): holds the
+        # handshake's own `On`/`OnT`/`En` reply, so a test can prove a
+        # slow-to-accept node no longer stalls a refresh's dial of every
+        # other new node behind it.
+        self._auth_delay = 0.0
         self._silent = False
         self.last_set_ttl = 0
         self._server: asyncio.Server | None = None
@@ -229,6 +242,19 @@ class MockNode:
         self._multi_wrong_node_keys = set(keys)
         self._multi_wrong_node_times = times
 
+    def answer_multi_get_bad_count_once(self, count: int) -> None:
+        """The next `m` reply reports exactly ``count`` roster entries no
+        matter how many keys the request actually had (issue #181) —
+        proves Connection.multi_get() rejects a short/long reply as a
+        desync instead of silently misaligning every later key via the
+        slice assignment onto ``entries``."""
+        self._multi_get_reply_count_override = count
+
+    def answer_multi_set_bad_count_once(self, count: int) -> None:
+        """Same as answer_multi_get_bad_count_once() but for the next `o`
+        reply (issue #181)."""
+        self._multi_set_reply_count_override = count
+
     def fail_next_clear_once(self) -> None:
         """Closes the connection instead of acking the next `c`/`F` this
         node receives (issue #106) — simulates a node that's unreachable
@@ -252,6 +278,14 @@ class MockNode:
         """Hold every future S's response — for tests proving a caller
         isn't blocked on a slow replica leg (fire-and-forget replica writes)."""
         self._set_delay = seconds
+
+    def delay_next_auth(self, seconds: float) -> None:
+        """Hold the next connection's `A` handshake reply — simulates a
+        newly-joined node that is slow to accept/authenticate, so a test
+        can prove a node-list refresh dials new nodes concurrently
+        (issue #190) instead of letting one slow dial stall every other
+        new node behind it."""
+        self._auth_delay = seconds
 
     def go_silent_after_handshake(self) -> None:
         """Makes this node a half-open server from this point on: it
@@ -340,6 +374,9 @@ class MockNode:
                         else secret == self.required_secret
                     )
                     tagged = accepted and self.support_tags and len(parts) > 2 and parts[2] == b"T"
+                    if self._auth_delay > 0:
+                        delay, self._auth_delay = self._auth_delay, 0.0
+                        await asyncio.sleep(delay)
                     writer.write(b"OnT\n" if tagged else (b"On\n" if accepted else b"En\n"))
                     await writer.drain()
                     if not accepted:
@@ -674,19 +711,32 @@ class MockNode:
                     consume_wrong = self._multi_wrong_node_times > 0
                     if consume_wrong:
                         self._multi_wrong_node_times -= 1
-                    roster_tokens = []
-                    body = b""
+                    results: list[tuple[bytes, bytes | None]] = []
                     for key in keys:
                         if consume_wrong and key in self._multi_wrong_node_keys:
-                            roster_tokens.append(b"W")
+                            results.append((b"W", None))
                             continue
                         value = self._get_entry(namespace, key)
                         if value is None:
-                            roster_tokens.append(b"-")
+                            results.append((b"-", None))
                         else:
-                            roster_tokens.append(b"%d" % len(value))
-                            body += value
-                    header = b" ".join([b"M", b"%d" % count, *roster_tokens]) + tag_suffix + b"\n"
+                            results.append((b"%d" % len(value), value))
+                    # Entry-count desync (issue #181): force the reply to
+                    # a caller-chosen entry count, trimming or padding
+                    # with clean-miss tokens regardless of what was
+                    # actually requested/found above.
+                    if self._multi_get_reply_count_override is not None:
+                        override = self._multi_get_reply_count_override
+                        self._multi_get_reply_count_override = None
+                        if override <= len(results):
+                            results = results[:override]
+                        else:
+                            results = results + [(b"-", None)] * (override - len(results))
+                    roster_tokens = [token for token, _ in results]
+                    body = b"".join(value for _, value in results if value is not None)
+                    header = (
+                        b" ".join([b"M", b"%d" % len(roster_tokens), *roster_tokens]) + tag_suffix + b"\n"
+                    )
                     writer.write(header + body)
                     await writer.drain()
 
@@ -727,7 +777,18 @@ class MockNode:
                         self._set_entry(namespace, key, value)
                         self.entry_ttl[(namespace, key)] = ttl
                         roster_tokens.append(b"S")
-                    header = b" ".join([b"O", b"%d" % count, *roster_tokens]) + tag_suffix + b"\n"
+                    # Entry-count desync (issue #181): see the `m` handler
+                    # above for why/how.
+                    if self._multi_set_reply_count_override is not None:
+                        override = self._multi_set_reply_count_override
+                        self._multi_set_reply_count_override = None
+                        if override <= len(roster_tokens):
+                            roster_tokens = roster_tokens[:override]
+                        else:
+                            roster_tokens = roster_tokens + [b"S"] * (override - len(roster_tokens))
+                    header = (
+                        b" ".join([b"O", b"%d" % len(roster_tokens), *roster_tokens]) + tag_suffix + b"\n"
+                    )
                     writer.write(header)
                     await writer.drain()
 

@@ -76,20 +76,31 @@ import org.nanocached.NanocachedClient;
  *       {@link #clear()}.
  * </ul>
  *
- * <p><b>{@code getAndPut}/{@code getAndReplace}/{@code getAndRemove}
- * are genuinely atomic</b>, unlike the caveats {@code nanocached-spring}
- * had to carry before issue #141 shipped compare-and-set: each is a
- * bounded compare-and-set retry loop (read a token, attempt the
- * conditioned write, retry on a concurrent change) — see {@link
- * #MAX_CAS_RETRIES}.
+ * <p><b>{@code getAndPut}/{@code getAndReplace}/{@code getAndRemove}/
+ * {@code replace(K,V,V)}/{@code remove(K,V)} are genuinely atomic</b>,
+ * unlike the caveats {@code nanocached-spring} had to carry before
+ * issue #141 shipped compare-and-set: each is a bounded compare-and-set
+ * retry loop (read the current value and the digest it was read with,
+ * attempt the conditioned write, retry on a concurrent change) — see
+ * {@link #MAX_CAS_RETRIES}. The two-value-argument pair compares the
+ * read value against the caller's {@code oldValue} with {@code
+ * equals()} (issue #186) — not a digest of {@code oldValue}'s own
+ * re-serialized form, which would reject a value that is {@code
+ * equals()}-equal but not canonically serialized (a {@code HashMap}
+ * built in a different insertion order, a type with transient state,
+ * ...).
  */
 final class NanocachedCache<K, V> implements Cache<K, V> {
 
-    /** Bound on the {@code getAnd*} CAS retry loops — see the class doc.
-     * Under pathological sustained contention on one key, the loop falls
-     * back to a single unconditional write/delete so the call still
-     * makes progress, documented in the README as a best-effort
-     * fallback. */
+    /** Bound on the {@code getAnd*}/{@code replace(K,V,V)}/{@code
+     * remove(K,V)} CAS retry loops — see the class doc. Under
+     * pathological sustained contention on one key, {@code getAndPut}/
+     * {@code getAndReplace} fall back to a single unconditional
+     * write/delete so the call still makes progress, documented in the
+     * README as a best-effort fallback; {@code replace(K,V,V)}/{@code
+     * remove(K,V)} do not fall back — their contract is the comparison
+     * itself, so exhausting the retry budget there just reports
+     * failure. */
     private static final int MAX_CAS_RETRIES = 10;
 
     private static final long NO_EXPIRY = 0L;
@@ -351,28 +362,54 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     @Override
     public boolean replace(K key, V oldValue, V newValue) {
+        // Issue #186: JSR-107 specifies equals() semantics for the
+        // comparison, not "byte-for-byte identical serialized form" — a
+        // digest of ValueCodec.serialize(oldValue) compared against the
+        // stored digest fails for a value that's equals()-equal but not
+        // canonically serialized (HashMap/HashSet insertion order, a
+        // transient field, ...), a silent no-op. Instead this reads the
+        // current value and the digest it was read with — the same
+        // bounded compare-and-set retry loop getAndPut/getAndReplace
+        // use, see MAX_CAS_RETRIES — compares with equals(), and only
+        // then CASes on the digest that read actually observed.
         requireNotClosed();
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(oldValue, "oldValue");
         Objects.requireNonNull(newValue, "newValue");
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
-        String expectedToken = NanocachedClient.contentDigest(ValueCodec.serialize(oldValue));
-        OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
-        if (ttl.isEmpty()) {
-            boolean removed = namespace.deleteIfMatches(keyBytes, expectedToken);
-            if (removed) {
-                statistics.recordRemove();
-                fireRemoved(key, oldValue);
-            }
-            return removed;
-        }
         byte[] newValueBytes = ValueCodec.serialize(newValue);
-        boolean replaced = namespace.replace(keyBytes, expectedToken, newValueBytes, ttl.getAsLong());
-        if (replaced) {
-            statistics.recordPut();
-            fireUpdated(key, newValue, oldValue);
+        OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
+
+        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+            Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
+            if (existing.isEmpty()) {
+                return false;
+            }
+            V currentValue = ValueCodec.deserialize(existing.get().value());
+            if (!oldValue.equals(currentValue)) {
+                return false;
+            }
+            if (ttl.isEmpty()) {
+                if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                    statistics.recordRemove();
+                    fireRemoved(key, currentValue);
+                    return true;
+                }
+                continue;
+            }
+            if (namespace.replace(keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
+                statistics.recordPut();
+                fireUpdated(key, newValue, currentValue);
+                return true;
+            }
         }
-        return replaced;
+        // Sustained contention exhausted the retry budget. Unlike
+        // getAndPut/getAndReplace's fallbackOverwrite, this op's whole
+        // contract *is* the comparison — an unconditional overwrite
+        // here would silently violate it, so give up and report failure
+        // instead (JSR-107 doesn't require replace(K,V,V) to eventually
+        // succeed under contention).
+        return false;
     }
 
     @Override
@@ -543,17 +580,34 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     @Override
     public boolean remove(K key, V oldValue) {
+        // Issue #186: see replace(K, V, V)'s comment — equals()
+        // semantics, not a re-serialized digest, and the digest CASed
+        // on is the one the read actually observed.
         requireNotClosed();
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(oldValue, "oldValue");
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
-        String expectedToken = NanocachedClient.contentDigest(ValueCodec.serialize(oldValue));
-        boolean removed = namespace.deleteIfMatches(keyBytes, expectedToken);
-        if (removed) {
-            statistics.recordRemove();
-            fireRemoved(key, oldValue);
+
+        for (int attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+            Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
+            if (existing.isEmpty()) {
+                return false;
+            }
+            V currentValue = ValueCodec.deserialize(existing.get().value());
+            if (!oldValue.equals(currentValue)) {
+                return false;
+            }
+            if (namespace.deleteIfMatches(keyBytes, existing.get().token())) {
+                statistics.recordRemove();
+                fireRemoved(key, currentValue);
+                return true;
+            }
         }
-        return removed;
+        // Sustained contention exhausted the retry budget — see
+        // replace(K, V, V)'s comment: an unconditional delete here
+        // would silently violate the comparison this op promises, so
+        // give up and report failure instead.
+        return false;
     }
 
     @Override

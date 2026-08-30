@@ -1212,6 +1212,112 @@ describe("unsolicited busy response (issue #45)", () => {
   });
 });
 
+describe("onData's fatal paths route through poison() (issue #187)", () => {
+  it("a malformed response marks the connection closed synchronously, before the 'close' event", async () => {
+    // Regression: onData's response-parse-failure branch called
+    // socket.destroy() directly instead of poison(), so `closed` stayed
+    // false until destroy()'s 'close' event landed on a later tick —
+    // long enough for another request to pick this already-dead
+    // connection and write into it (extra ConnectionLostError + retry).
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+      const request = connection.get("k");
+
+      // Registered after Connection's own constructor already attached
+      // its 'data' listener, so Node invokes this one second for the
+      // same event — strictly after onData (and the poison() it must
+      // now trigger) has run, but still in the same synchronous turn as
+      // the data delivery, well before 'close' gets any chance to fire.
+      let closedWithinDataEvent = false;
+      socket.on("data", () => {
+        closedWithinDataEvent = connection.isClosed();
+      });
+
+      await waitFor(() => serverSockets.length === 1, "the server to accept the connection");
+      // Two fields where an untagged `V` response must have exactly one
+      // (protocol.ts's fields.length !== 1 check) — a garbage header
+      // that desyncs the stream.
+      serverSockets[0].write("V 5 5\n");
+
+      await assert.rejects(request, /invalid value header/);
+      assert.equal(closedWithinDataEvent, true, "isClosed() must already be true within the same 'data' event turn");
+      assert.equal(connection.isClosed(), true);
+    } finally {
+      for (const s of serverSockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("a frame that grows past the size cap without ever completing marks the connection closed synchronously", async () => {
+    // Regression: onData's oversize-frame branch (the backstop covering
+    // a value body that never assembles into a parseable frame, issue
+    // #12 follow-up) also called socket.destroy() directly instead of
+    // poison() — same synchronous-isClosed() gap as the parse-failure
+    // branch above. Exercised via onData directly: MAX_RESPONSE_FRAME_LENGTH
+    // is sized for exactly one maximally-sized `V` frame, so no chunk
+    // sequence a real server could trickle ever reaches this backstop
+    // without first tripping one of tryParseResponse's own smaller,
+    // per-field header-length checks (parseTtlSeconds on an `I`
+    // response's TTL field is the one exception — unlike the tag field,
+    // it has no digit-count cap — but only if the whole oversize header
+    // arrives already assembled, which real chunked delivery won't
+    // produce deterministically).
+    const { createServer, connect } = await import("node:net");
+    const { Connection } = await import("../src/connection.js");
+    const { MAX_RESPONSE_FRAME_LENGTH } = await import("../src/protocol.js");
+
+    const serverSockets: import("node:net").Socket[] = [];
+    const server = createServer((socket) => {
+      serverSockets.push(socket);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as import("node:net").AddressInfo).port;
+
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await new Promise<void>((resolve) => socket.once("connect", resolve));
+      const connection = new Connection(socket);
+      const request = connection.get("k");
+
+      // An untagged `I <len> <ttl>` header whose TTL digit string alone
+      // is already past MAX_RESPONSE_FRAME_LENGTH, delivered as one
+      // frame: a valid, unbounded-length TTL field followed by its own
+      // terminating LF, then nothing else — genuinely still incomplete
+      // (the declared 5-byte value never arrives) but already past the
+      // whole-frame backstop by construction.
+      const oversizeTtl = "9".repeat(MAX_RESPONSE_FRAME_LENGTH);
+      const frame = Buffer.from(`I 5 ${oversizeTtl}\n`, "ascii");
+
+      // Fed directly to onData in one call: real socket delivery chunks
+      // a buffer this large across many 'data' events, and the header's
+      // own (much smaller) incomplete-terminator threshold would reject
+      // it long before this much ever accumulates — see the comment
+      // above.
+      (connection as unknown as { onData(chunk: Buffer): void }).onData(frame);
+
+      // True immediately after the synchronous onData() call returns —
+      // no 'close' event has had any chance to fire yet.
+      assert.equal(connection.isClosed(), true, "isClosed() must flip synchronously within the onData() call itself");
+      await assert.rejects(request, /exceeds maximum size/);
+    } finally {
+      for (const s of serverSockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("a failed write poisons the connection (audit finding)", () => {
   it("marks the connection closed and rejects other in-flight requests promptly, not after the 30s timeout", async () => {
     // Regression: Connection.send()'s write callback only spliced the
@@ -2692,6 +2798,163 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
       );
     } finally {
       await cluster.close();
+    }
+  });
+});
+
+describe("fire-and-forget replica leg errors surface when the primary also fails (issue #188)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("set(): a genuine bug on the fire-and-forget replica leg surfaces once the primary fails too", async () => {
+    // Regression: writeToOwners' fire-and-forget branch pushed a resolved
+    // placeholder into synchronousReplicaWrites instead of the real leg
+    // promise, so a non-network error (a programming bug, not a dead
+    // replica) from a background replica leg vanished completely even
+    // when the primary write failed and the call had to reject with
+    // *something* anyway.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const key = "boom-key";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      // Establish real connections to both owners first...
+      await client.set(key, "v");
+
+      // ...then stub the primary's connection to fail the way a dead
+      // connection ordinarily would, and the replica's to simulate a bug
+      // in this SDK's own code (a TypeError, not a network-class error).
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "set", () => Promise.reject(new ConnectionLostError("primary connection lost")));
+      mock.method(replicaConnection, "set", () => {
+        throw new TypeError("injected programming bug");
+      });
+
+      await assert.rejects(client.set(key, "v2"), (error: unknown) => {
+        assert.ok(error instanceof TypeError, `expected the replica leg's TypeError to surface, got ${error}`);
+        return true;
+      });
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("set(): an ordinary connection failure on the fire-and-forget replica leg stays silent, even when the primary fails too", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const key = "boom-key-2";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "v");
+
+      // NanocachedError rather than ConnectionLostError here: the latter
+      // is retryable (withWrongNodeRetry forces a refresh and retries
+      // the whole set() once — isConnectionError), which would run this
+      // whole scenario twice and muddy the assertions below. A plain
+      // NanocachedError is swallowable (see isSwallowable) but not
+      // connection-shaped, so it propagates on the first attempt only —
+      // still a fully representative "ordinary, expected failure".
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "set", () => Promise.reject(new NanocachedError("primary connection lost")));
+      mock.method(replicaConnection, "set", () => Promise.reject(new NanocachedError("replica connection lost")));
+
+      await assert.rejects(client.set(key, "v2"), (error: unknown) => {
+        assert.ok(
+          error instanceof NanocachedError && /primary connection lost/.test(error.message),
+          `expected the primary's own error, got ${error}`,
+        );
+        return true;
+      });
+      assert.equal(
+        client.stats().replicaWriteFailures,
+        1,
+        "the replica's ordinary connection failure must still be counted as a swallow",
+      );
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("setMany(): a genuine bug on a fire-and-forget pure-replica leg surfaces once a primary-holding leg fails too", async () => {
+    // Same regression as above, for multiSetPass's fire-and-forget
+    // pure-replica legs: a single key at replication 2 makes the
+    // replica-owning node's whole leg pure-replica (it holds no primary
+    // key at all), so it's fire-and-forget-eligible on its own.
+    //
+    // Unlike writeToOwners, an ordinary (swallowable) failure on a
+    // primary-holding leg never throws in multiSetPass — it's folded
+    // into the returned retry list instead (see runLeg's own catch), so
+    // it can't stand in for "the primary leg fails" here. The primary's
+    // own leg is given a distinct programming bug (RangeError) instead,
+    // just to force Promise.all(legs) to reject — the assertion below is
+    // that the pure-replica leg's own bug (TypeError) is what actually
+    // surfaces, not the primary leg's.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const key = "boom-key";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.setMany({ [key]: "v" });
+
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "multiSet", () => {
+        throw new RangeError("injected primary-leg programming bug");
+      });
+      mock.method(replicaConnection, "multiSet", () => {
+        throw new TypeError("injected pure-replica-leg programming bug");
+      });
+
+      await assert.rejects(client.setMany({ [key]: "v2" }), (error: unknown) => {
+        assert.ok(error instanceof TypeError, `expected the pure-replica leg's TypeError to surface, got ${error}`);
+        return true;
+      });
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
     }
   });
 });

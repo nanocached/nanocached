@@ -3975,6 +3975,56 @@ async fn a_dead_primary_fails_over_immediately() {
 }
 
 #[tokio::test]
+async fn finished_hedge_legs_are_reaped_instead_of_accumulating() {
+    // Issue #180: `hedged_reads` (the JoinSet backing every hedge leg) was
+    // only ever drained by close(), so on a long-lived client every
+    // finished leg sat there until then — unbounded growth. spawn_hedge_leg
+    // now reaps finished legs itself, opportunistically, each time it's
+    // called. Reproduced by running several hedged reads sequentially, each
+    // spawning two legs (primary + replica), and giving each iteration's
+    // legs time to finish before the next iteration's first spawn_hedge_leg
+    // call (leg0, the primary) has a chance to reap them. Without the fix,
+    // hedged_reads_len() grows by two on every iteration and would read 2 *
+    // ITERATIONS here; with it, it stays bounded by whatever's still
+    // in-flight or unreaped from the very last iteration.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(
+        options(discovery.port).read_hedge_after(Duration::from_millis(20)),
+    )
+    .await
+    .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    // Slow enough to miss the 20ms hedge interval (so the replica leg gets
+    // spawned too) but still short enough that the primary's leg has
+    // finished well before the next iteration's sleep is up.
+    primary.state.gets_delay_ms.store(50, Ordering::SeqCst);
+
+    const ITERATIONS: usize = 20;
+    for _ in 0..ITERATIONS {
+        let value = client.get("k").await.unwrap();
+        assert_eq!(value, Some("v".to_string()));
+        // Outlast the primary's 50ms leg so it's finished (and reapable)
+        // before the next iteration's leg0 spawn_hedge_leg call runs.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    assert!(
+        client.hedged_reads_len().await <= 2,
+        "hedged_reads should stay bounded across {ITERATIONS} sequential hedged reads \
+         instead of accumulating every finished leg (issue #180)"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
 async fn read_hedge_after_rejects_a_zero_duration() {
     let result = NanocachedClient::connect(
         Options::new()

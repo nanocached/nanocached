@@ -1590,8 +1590,19 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
 /// keep the port internal.
 async fn run_metrics_server(listener: TcpListener, registry: Registry, list_ready_at: Instant) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                // Issue #184: mirrors `run`'s own accept loop above — an
+                // unadorned `continue` here would busy-loop this task hot
+                // under EMFILE/ENFILE instead of backing off, making
+                // recovery harder right when file descriptors are already
+                // scarce.
+                if is_fd_exhaustion_error(&error) {
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {
@@ -3807,7 +3818,9 @@ async fn handle_connection(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     match proxies.get(&name) {
-                        Some(existing) if existing.token == token => {
+                        Some(existing)
+                            if constant_time_eq(existing.token.as_bytes(), token.as_bytes()) =>
+                        {
                             proxies.remove(&name);
                             Ok(true)
                         }
@@ -3850,7 +3863,9 @@ async fn handle_connection(
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let at_capacity = proxies.len() >= MAX_PROXY_ENTRIES;
                     match proxies.get_mut(&name) {
-                        Some(existing) if existing.token == token => {
+                        Some(existing)
+                            if constant_time_eq(existing.token.as_bytes(), token.as_bytes()) =>
+                        {
                             existing.address = addr;
                             existing.last_seen = Instant::now();
                             true

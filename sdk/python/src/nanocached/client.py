@@ -1791,9 +1791,20 @@ class NanocachedClient:
         # any, is retrieved here instead of surfacing later as an
         # "exception was never retrieved" warning with nothing left to
         # report it to.
+        #
+        # The keepalive task is gathered here too (issue #189): unlike
+        # the redial/refresh tasks it IS cancelled just above, but that
+        # cancel() only schedules the cancellation — nothing before this
+        # ever awaited the task itself, so without this it stayed
+        # pending past close() and the loop teardown that usually follows
+        # could log "Task was destroyed but it is pending". gather()'s
+        # return_exceptions=True absorbs the resulting CancelledError the
+        # same way it absorbs a redial/refresh failure above.
         pending = list(self._redials.values())
         if self._refresh_task is not None:
             pending.append(self._refresh_task)
+        if self._keepalive_task is not None:
+            pending.append(self._keepalive_task)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
@@ -2088,7 +2099,22 @@ class NanocachedClient:
             # The caller gave up on this call (asyncio.wait_for, task
             # cancellation): propagate right away instead of first
             # waiting on every synchronous replica leg below — those
-            # finish on their own, and swallow their own failures.
+            # finish on their own, and swallow their own failures. But
+            # leaving replica_tasks as pure orphans here would break
+            # close()'s drain contract (issue #189): they are already-
+            # running asyncio Tasks that nothing else references, so a
+            # leg that would have succeeded can instead get its
+            # connection yanked out from under it by _teardown() once
+            # close() runs. Hand them to the same background-replica-
+            # write pool close() already drains via
+            # _drain_tasks(self._background_replica_writes) — exactly as
+            # if fire-and-forget dispatch had picked them up in the
+            # first place (_dispatch_replica_writes above) — so close()
+            # still waits for them instead of poisoning a write that was
+            # already on its way to succeeding.
+            for replica_task in replica_tasks:
+                self._background_replica_writes.add(replica_task)
+                replica_task.add_done_callback(self._background_replica_writes.discard)
             raise
         except BaseException as error:  # noqa: BLE001 - decided below, not swallowed
             result = None
@@ -2272,35 +2298,58 @@ class NanocachedClient:
                     stale.close()
                 del self._members[name]
 
+        new_nodes = []
         for node in cluster.nodes:
             existing = self._members.get(node.name)
             if existing is not None:
                 existing.address = node.address
                 continue
+            new_nodes.append(node)
+
+        async def dial(node: DiscoveredNode):
             try:
                 node_host, node_port = split_host_port(node.address)
                 target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
-                if not isinstance(target, NodeTarget):
-                    # Refresh is opportunistic/best-effort and must never
-                    # fail the caller's operation (client-side replication's
-                    # eventual-consistency model) — this node is just
-                    # skipped, counted in stats().refresh_failures.
-                    self._refresh_failures += 1
-                    continue
-                if self._closed:
-                    # close() ran while we were dialing (issue #10):
-                    # installing this socket now would leak it.
-                    target.writer.close()
-                    return
-                self._members[node.name] = _Member(
-                    node.address, self._new_connection(target.reader, target.writer, target.tagged)
-                )
-            except _SWALLOWABLE_ERRORS:
-                # Same rationale as above: never fail the caller over a
-                # refresh-time connect failure. A genuine programming
-                # error (anything outside _SWALLOWABLE_ERRORS) still
-                # propagates.
+            except _SWALLOWABLE_ERRORS as error:
+                # Same rationale as _fetch_node_list: never fail the
+                # caller over a refresh-time connect failure. A genuine
+                # programming error (anything outside _SWALLOWABLE_ERRORS)
+                # still propagates and fails this refresh.
+                return node, error
+            return node, target
+
+        # Dialed concurrently, like _open_cluster (issue #190) — a
+        # sequential loop here meant several nodes joining at once, with
+        # one of them slow or unreachable, stalled every operation
+        # waiting on _before_operation()'s refresh for up to
+        # N * dial timeout. A failed/slow dial of one node must not delay
+        # installing the others, mirrored from _open_cluster's own
+        # per-node outcome handling below.
+        outcomes = await asyncio.gather(*(dial(node) for node in new_nodes))
+
+        if self._closed:
+            # close() ran while we were dialing (issue #10): installing
+            # any of these sockets now would leak them, so every one that
+            # did connect is closed instead, none of them installed.
+            for _, outcome in outcomes:
+                if isinstance(outcome, NodeTarget):
+                    outcome.writer.close()
+            return
+
+        for node, outcome in outcomes:
+            if isinstance(outcome, Exception):
                 self._refresh_failures += 1
+                continue
+            if not isinstance(outcome, NodeTarget):
+                # Refresh is opportunistic/best-effort and must never fail
+                # the caller's operation (client-side replication's
+                # eventual-consistency model) — this node is just
+                # skipped, counted in stats().refresh_failures.
+                self._refresh_failures += 1
+                continue
+            self._members[node.name] = _Member(
+                node.address, self._new_connection(outcome.reader, outcome.writer, outcome.tagged)
+            )
 
         if self._closed:
             self._teardown()

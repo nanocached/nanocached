@@ -1096,8 +1096,20 @@ async fn run_metrics_server(
             accepted = listener.accept() => accepted,
             _ = shutdown_rx.changed() => return,
         };
-        let Ok((stream, _)) = accepted else {
-            continue;
+        let (stream, _) = match accepted {
+            Ok(pair) => pair,
+            Err(error) => {
+                // Issue #184: mirrors `run`'s own accept loop (see
+                // `should_backoff_after_accept_error`'s doc comment) — an
+                // unadorned `continue` here would busy-loop this task hot
+                // under EMFILE/ENFILE instead of backing off, making
+                // recovery harder right when file descriptors are already
+                // scarce.
+                if should_backoff_after_accept_error(&error) {
+                    sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
 
         let request_tx = request_tx.clone();
@@ -1851,10 +1863,16 @@ async fn handle_connection(
                 }
 
                 if !owned_keys.is_empty() {
+                    // Kept for the forwarding loop below — `owned_keys`/
+                    // `owned_values` are moved into the `Command::MultiSet`
+                    // call, and `Bytes::clone` is a cheap refcount bump.
+                    let forward_names = owned_keys.clone();
+                    let forward_values = owned_values.clone();
+
                     let response = execute_command(
                         &request_tx,
                         Command::MultiSet {
-                            namespace,
+                            namespace: namespace.clone(),
                             keys: owned_keys,
                             values: owned_values,
                             ttl,
@@ -1865,6 +1883,55 @@ async fn handle_connection(
                     let Response::MultiAck(results) = response else {
                         unreachable!("Command::MultiSet always answers with Response::MultiAck");
                     };
+
+                    // Issue #176: `Set` (below) forwards a write on a key
+                    // caught mid-handoff (staged join) or mid-drain
+                    // (decommission) so it isn't lost once `known_ring`
+                    // flips — `MultiSet` never did, so a bulk write during
+                    // either window silently vanished. Mirror it here, per
+                    // owned key, once the local write is confirmed stored
+                    // (`execute` only ever answers `Stored` for an owned
+                    // key, but check anyway rather than assume it).
+                    if let Some(node_context) = &config.node_context {
+                        for ((name, value), result) in forward_names
+                            .into_iter()
+                            .zip(forward_values)
+                            .zip(results.iter())
+                        {
+                            if !matches!(result, MultiAckEntry::Stored) {
+                                continue;
+                            }
+                            let key = Key::new(namespace.clone(), name);
+
+                            // Staged node join — see `migration_target_for`.
+                            if let Some(target) = migration_target_for(node_context, &key) {
+                                let _ = config
+                                    .migration_tx
+                                    .send(Box::pin(forward_with_retries(
+                                        node_context.clone(),
+                                        target,
+                                        OwnedForwardedWrite::Set {
+                                            key: key.clone(),
+                                            value: value.clone(),
+                                            ttl,
+                                        },
+                                    )))
+                                    .await;
+                            }
+
+                            // Decommission drain — see `leave_target_for`.
+                            if let Some(target) = leave_target_for(node_context, &key) {
+                                let _ = config
+                                    .migration_tx
+                                    .send(Box::pin(forward_with_retries(
+                                        node_context.clone(),
+                                        target,
+                                        OwnedForwardedWrite::HandoffSet { key, value, ttl },
+                                    )))
+                                    .await;
+                            }
+                        }
+                    }
 
                     for (position, result) in owned_positions.into_iter().zip(results) {
                         entries[position] = Some(result);
@@ -7095,6 +7162,235 @@ mod tests {
         connection_task.await.unwrap().unwrap();
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_multi_set_forwards_owned_keys_to_the_joining_node() {
+        // Issue #176: `MultiSet` (`o`) used to answer `MultiAck` without
+        // ever consulting `migration_target_for` — unlike `Set`, a bulk
+        // write for a key mid-handoff never reached the joining node, so
+        // the value was lost the moment `known_ring` flipped. This drives
+        // an `o` for two keys through `handle_connection` with a handoff
+        // in flight and checks both land on the joiner as forwarded `S`
+        // frames.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            // Two forwarded SETs, sequential on the one shared connection
+            // (mirrors `forwarded_writes_to_a_joining_node_reuse_one_connection`).
+            for _ in 0..2 {
+                let mut buffer = [0u8; 256];
+                let bytes_read = connection.read(&mut buffer).await.unwrap();
+                assert!(bytes_read > 0);
+                received.extend_from_slice(&buffer[..bytes_read]);
+                connection.write_all(b"S\n").await.unwrap();
+            }
+            received
+        });
+
+        // Two members, R=2: the joiner is in every key's top-R
+        // regardless of hash, so both keys must forward.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            // The transfer is still running (completed_at: None) — same
+            // as `migration_target_for`'s "still moving keys" case, the
+            // simplest state that keeps forwarding open.
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: joining_addr.clone(),
+                after_ring,
+                replication: 2,
+                completed_at: None,
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: None,
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: Vec::new(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Stands in for `run`'s own loop draining `migration_tx` — see
+        // `migrate_command_transfers_matching_keys_and_reports_completion`.
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(4);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(b"o 0 2 5 2 5 2\nkey-av1key-bv2")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O 2 S S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(migration_relay);
+
+        let received = joining_task.await.unwrap();
+        assert_eq!(
+            received,
+            b"S 5 2\nkey-av1S 5 2\nkey-bv2".to_vec(),
+            "both owned keys from the MultiSet must be forwarded to the joining node"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_multi_set_forwards_owned_keys_to_the_entrant() {
+        // Issue #176: the decommission-drain mirror of the test above —
+        // `leave_target_for` must see a `MultiSet`'s owned keys too, or a
+        // bulk write racing a drain-out is lost once the post-leave
+        // roster publishes.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        // R=1 over {leaver, peer}: whichever keys the leaver owns before
+        // leaving move to the peer once leaver drops out — the only
+        // member left.
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+
+        // Two keys the "leaver" owns pre-leave, found the same way
+        // `a_decommission_hands_off_owned_keys_and_leaves` samples them —
+        // consistent hashing means not every name qualifies.
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 2 {
+            let name = format!("key-{index}");
+            if before_ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 1000, "expected at least two owned keys in range");
+        }
+
+        let mut addresses = HashMap::new();
+        addresses.insert("peer".to_string(), peer_addr);
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(4);
+        let migration_relay = tokio::spawn(async move {
+            while let Some(task) = migration_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx,
+            },
+            shutdown_rx,
+        ));
+
+        let name_a = &owned_keys[0];
+        let name_b = &owned_keys[1];
+        let request = format!(
+            "o 0 2 {} 2 {} 2\n{name_a}v1{name_b}v2",
+            name_a.len(),
+            name_b.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O 2 S S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(migration_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            2,
+            "both owned keys must forward to the entrant"
+        );
+        let expected_a = format!("U 0 {} 2\n{name_a}v1", name_a.len()).into_bytes();
+        let expected_b = format!("U 0 {} 2\n{name_b}v2", name_b.len()).into_bytes();
+        assert!(frames.contains(&expected_a));
+        assert!(frames.contains(&expected_b));
     }
 
     #[test]
