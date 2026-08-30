@@ -1,14 +1,14 @@
 import { readFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { Connection, ConnectionLostError, isConnectionError, WrongNodeError } from "./connection.js";
+import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, WrongNodeError } from "./connection.js";
 import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
 import { checkKey, checkKeyAndValue, contentDigest, EMPTY_NAMESPACE, type CasCondition, type MultiAckEntry, type MultiEntry } from "./protocol.js";
 
-export { ConnectionLostError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
+export { ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
 export { contentDigest } from "./protocol.js";
@@ -1147,7 +1147,14 @@ export class NanocachedClient {
    * counter and returns the new value — `null` if the key is missing or
    * expired, matching `get`'s own miss convention. Throws
    * `NotNumericError` if the stored value isn't an integer INCR can
-   * operate on, or if applying `delta` would overflow.
+   * operate on, or if applying `delta` would overflow; throws
+   * `CounterOutOfRangeError` (issue #224) if the new counter falls
+   * outside `±Number.MAX_SAFE_INTEGER` — the wire protocol's counter is a
+   * full signed 64-bit integer, wider than a JS `number` can represent
+   * exactly, so this call refuses to silently hand back a rounded value.
+   * The increment itself still happened (and, in a cluster, was still
+   * replicated byte-exact) even when this throws — only the value handed
+   * back to *this* call is affected.
    *
    * **As volatile as `set`**: LRU eviction and TTL expiry reclaim an
    * incremented value exactly like any other entry, so this is for rate
@@ -1641,17 +1648,27 @@ export class NanocachedClient {
    * write to every owner), a cluster incr only ever sends `i` to the
    * primary — see `incrOnOwners` for why and how the result reaches
    * replicas instead. In single/proxy mode there is nothing to replicate,
-   * so this is just the one connection's own `incr`. */
+   * so this is just the one connection's own `incr`.
+   *
+   * Either branch can come back with a `value` that lost precision being
+   * parsed into a `number` (issue #224: the wire's counter is a full
+   * signed 64-bit integer, `Number.MAX_SAFE_INTEGER` is 2^53 - 1) — that
+   * check is applied once, here, after any replica fan-out already
+   * happened using the exact wire bytes (`incrOnOwners`'s `raw`), so a
+   * counter too large for this call to report back still leaves every
+   * replica byte-identical to the primary; only the value handed back to
+   * *this* caller is refused. */
   private async incrInNamespace(namespace: Uint8Array, key: string | Uint8Array, delta: number): Promise<number | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.withWrongNodeRetry(() =>
+    const result = await this.withWrongNodeRetry(() =>
       this.target.kind === "cluster"
         ? this.incrOnOwners(key, namespace, delta)
-        : this.connectionForSingleTarget()
-            .then((connection) => connection.incr(key, delta, namespace))
-            .then((result) => (result === null ? null : result.value)),
+        : this.connectionForSingleTarget().then((connection) => connection.incr(key, delta, namespace)),
     );
+    if (result === null) return null;
+    if (!Number.isSafeInteger(result.value)) throw new CounterOutOfRangeError(result.raw.toString("ascii"));
+    return result.value;
   }
 
   /** Compare-and-set (issue #141). Encodes/validates/compresses `value`
@@ -2060,8 +2077,22 @@ export class NanocachedClient {
    * (stats().replicaWriteFailures, fireAndForgetReplicas-aware) — but
    * because the primary's increment already succeeded and was (at least
    * best-effort) forwarded, its result is always what's returned,
-   * regardless of what happens on replicas. */
-  private async incrOnOwners(key: string | Uint8Array, namespace: Uint8Array, delta: number): Promise<number | null> {
+   * regardless of what happens on replicas.
+   *
+   * The replica `set` carries `result.raw` — the exact ASCII digit bytes
+   * the primary answered with — never `String(result.value)`. `value` is
+   * a `number`, which loses precision past `Number.MAX_SAFE_INTEGER`
+   * (issue #224); re-encoding *that* for the replica would silently
+   * diverge it from the primary's actual stored bytes once a counter grew
+   * past 2^53. Returning `raw` alongside `value` (rather than deciding
+   * here whether `value` is safe to hand back) lets `incrInNamespace`
+   * apply that check once, after this fan-out, for both the cluster and
+   * single/proxy paths. */
+  private async incrOnOwners(
+    key: string | Uint8Array,
+    namespace: Uint8Array,
+    delta: number,
+  ): Promise<{ value: number; raw: Buffer } | null> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
       throw new ConnectionLostError("nanocached: no owner is reachable for this key");
@@ -2070,10 +2101,10 @@ export class NanocachedClient {
     const primaryConnection = await this.memberConnection(primaryName);
     const result = await primaryConnection.incr(key, delta, namespace);
     if (result === null || replicaNames.length === 0) {
-      return result === null ? null : result.value;
+      return result === null ? null : { value: result.value, raw: result.raw };
     }
 
-    const valueBytes = Buffer.from(String(result.value), "ascii");
+    const valueBytes = result.raw;
     const ttlSeconds = result.ttlSeconds ?? 0;
 
     const replicaWrite = async (name: string): Promise<void> => {
@@ -2117,7 +2148,7 @@ export class NanocachedClient {
     // returned; nothing here can turn it into a failure.
     await Promise.allSettled(replicaWrites);
 
-    return result.value;
+    return { value: result.value, raw: result.raw };
   }
 
   /** Cluster compare-and-set (issue #141) — deliberately **not**
