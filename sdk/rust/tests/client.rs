@@ -125,6 +125,15 @@ struct NodeState {
     /// How many `o` (multi-set, issue #151) requests this node has ever
     /// received.
     multi_sets: AtomicUsize,
+    /// The total on-wire size (header line + newline + namespace + every
+    /// key) of each `m` frame this node has ever received, in receipt
+    /// order — lets a test confirm the client's batch-chunking byte bound
+    /// (issue #222) actually keeps every sub-frame under the server's
+    /// real request cap, not just that it split into more than one.
+    multi_get_frame_bytes: Mutex<Vec<usize>>,
+    /// `multi_get_frame_bytes`'s `o`-frame twin (namespace plus every key
+    /// and value, issue #222).
+    multi_set_frame_bytes: Mutex<Vec<usize>>,
 }
 
 struct MockNode {
@@ -603,6 +612,17 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     continue;
                 }
                 state.multi_gets.fetch_add(1, Ordering::SeqCst);
+                // issue #222 — records this frame's real on-wire size
+                // (header line + newline + namespace + every key) so a
+                // test can confirm the client's byte-bound chunking kept
+                // it under the server's actual request cap.
+                let frame_bytes =
+                    header.len() + 1 + namespace.len() + keys.iter().map(Vec::len).sum::<usize>();
+                state
+                    .multi_get_frame_bytes
+                    .lock()
+                    .unwrap()
+                    .push(frame_bytes);
                 if take_one(&state.retryable_replies) {
                     let reply = format!("R{tag_suffix}\n");
                     if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
@@ -677,6 +697,19 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     continue;
                 }
                 state.multi_sets.fetch_add(1, Ordering::SeqCst);
+                // issue #222 — this frame's real on-wire size (header
+                // line + newline + namespace + every key and value); see
+                // multi_get_frame_bytes's own comment above.
+                let frame_bytes = header.len()
+                    + 1
+                    + namespace.len()
+                    + key_lens.iter().sum::<usize>()
+                    + value_lens.iter().sum::<usize>();
+                state
+                    .multi_set_frame_bytes
+                    .lock()
+                    .unwrap()
+                    .push(frame_bytes);
                 if take_one(&state.retryable_replies) {
                     let reply = format!("R{tag_suffix}\n");
                     if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
@@ -2891,6 +2924,104 @@ async fn batched_set_wrong_node_triggers_refresh_and_one_retry() {
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+// ── batch chunking's byte bound (issue #222) ────────────────────────
+
+#[tokio::test]
+async fn set_many_bytes_batch_over_the_byte_cap_splits_into_multiple_o_subframes() {
+    // Regression: batch chunking used to split purely on MAX_BATCH_KEYS
+    // (400 keys), never on cumulative bytes — five individually valid
+    // ~300 KB values (each far under the ~1 MiB MAX_REQUEST_BYTES cap on
+    // its own) sum well past it, so one `o` sub-frame carrying all five
+    // would exceed the server's real MAX_REQUEST_SIZE and get the whole
+    // connection silently closed (see MAX_REQUEST_BYTES's doc comment in
+    // client.rs). The byte-bound chunker must split this into more than
+    // one `o` sub-frame instead, each safely under the server's 1 MiB
+    // cap, with every value still round-tripping.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    const VALUE_SIZE: usize = 300_000;
+    let mut values = HashMap::new();
+    for i in 0..5u8 {
+        let key = format!("key{i}");
+        let value = vec![b'a' + i; VALUE_SIZE];
+        values.insert(key, value);
+    }
+
+    client.set_many_bytes(&values, 0).await.unwrap();
+
+    // Only 5 keys, far under MAX_BATCH_KEYS (400) — more than one `o`
+    // sub-frame here can only be explained by the byte bound, not the
+    // key-count bound.
+    let sets = node.state.multi_sets.load(Ordering::SeqCst);
+    assert!(
+        sets > 1,
+        "expected the batch to split by bytes, got {sets} `o` sub-frame(s)"
+    );
+
+    // Every sub-frame the server actually received stayed under its real
+    // 1 MiB request cap.
+    for frame_bytes in node.state.multi_set_frame_bytes.lock().unwrap().iter() {
+        assert!(
+            *frame_bytes < 1024 * 1024,
+            "sub-frame of {frame_bytes} bytes exceeds the server's 1 MiB cap"
+        );
+    }
+
+    let keys: Vec<&str> = values.keys().map(String::as_str).collect();
+    let fetched = client.get_many_bytes(&keys).await.unwrap();
+    for (key, value) in &values {
+        assert_eq!(fetched.get(key), Some(value));
+    }
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_many_bytes_batch_over_the_byte_cap_splits_into_multiple_m_subframes() {
+    // get_many/get_many_bytes' read-side twin of the regression above:
+    // five individually valid ~300 KB keys (each far under
+    // MAX_REQUEST_BYTES on its own) sum well past it, so one `m`
+    // sub-frame carrying all five would exceed the server's real
+    // MAX_REQUEST_SIZE.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    const KEY_SIZE: usize = 300_000;
+    let mut keys = Vec::new();
+    let mut expected = HashMap::new();
+    for i in 0..5u8 {
+        let key = format!("k{i}{}", "x".repeat(KEY_SIZE));
+        let value = format!("v{i}");
+        client.set(&key, &value, 0).await.unwrap();
+        expected.insert(key.clone(), value);
+        keys.push(key);
+    }
+
+    let fetched = client.get_many(&keys).await.unwrap();
+    assert_eq!(fetched, expected);
+
+    // Only 5 keys, far under MAX_BATCH_KEYS (400) — more than one `m`
+    // sub-frame here can only be explained by the byte bound, not the
+    // key-count bound.
+    let gets = node.state.multi_gets.load(Ordering::SeqCst);
+    assert!(
+        gets > 1,
+        "expected the batch to split by bytes, got {gets} `m` sub-frame(s)"
+    );
+
+    for frame_bytes in node.state.multi_get_frame_bytes.lock().unwrap().iter() {
+        assert!(
+            *frame_bytes < 1024 * 1024,
+            "sub-frame of {frame_bytes} bytes exceeds the server's 1 MiB cap"
+        );
+    }
+
+    client.close().await;
+    node.stop();
 }
 
 // ── incr replication (issue #129) ───────────────────────────────────

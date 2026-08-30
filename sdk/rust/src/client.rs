@@ -92,6 +92,92 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024 - 256;
 /// SDKs use.
 const MAX_BATCH_KEYS: usize = 400;
 
+/// issue #222 — batch chunking's byte bound: fixed, non-per-entry
+/// overhead the chunker in [`chunk_lengths`] reserves once per sub-frame,
+/// on top of the real `namespace.len()` bytes it already counts.
+/// `encode_multi_get`/`encode_multi_set` (connection.rs) put, ahead of
+/// the per-entry `<key-length>[ <value-length>]` fields this constant
+/// does *not* cover (those are priced exactly, per entry, by
+/// [`get_entry_cost`]/[`set_entry_cost`]): the `m`/`o` marker and its
+/// space, the `<namespace-length>` field (at most 7 digits —
+/// `validate_key`/`validate_key_and_value` already bound `namespace.len()`
+/// under `MAX_REQUEST_BYTES`), the `<n>` field (at most 3 digits, since a
+/// chunk never holds more than `MAX_BATCH_KEYS` (400) entries), `o`'s
+/// optional `<ttl-seconds>` field (`u64::MAX` is 20 digits), the optional
+/// `<tag>` field both frames carry (`u32::MAX` is 10 digits), the
+/// separating spaces, and the trailing newline. Sized generously —
+/// correctness only needs an upper bound, not a tight one.
+const MULTI_FRAME_FIXED_OVERHEAD_BYTES: usize = 64;
+
+/// Decimal digit width of `n`, matching `format!("{n}")`'s length —
+/// used by [`get_entry_cost`]/[`set_entry_cost`] to price the exact
+/// `<length>` field(s) `encode_multi_get`/`encode_multi_set` add to the
+/// header for one entry (issue #222), rather than billing every entry
+/// for a worst-case guess.
+fn decimal_digits(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// The wire bytes one key adds to an `m` sub-frame: the key itself plus
+/// the `" <key-length>"` header field `encode_multi_get` writes for it
+/// (issue #222).
+fn get_entry_cost(key: &[u8]) -> usize {
+    key.len() + 1 + decimal_digits(key.len())
+}
+
+/// The wire bytes one key/value pair adds to an `o` sub-frame: the key
+/// and value themselves plus the `" <key-length> <value-length>"` header
+/// fields `encode_multi_set` writes for them (issue #222).
+fn set_entry_cost(key: &[u8], value: &[u8]) -> usize {
+    key.len() + value.len() + 2 + decimal_digits(key.len()) + decimal_digits(value.len())
+}
+
+/// Batch chunking's byte bound (issue #222): splits `entry_count`
+/// entries — each priced by `entry_cost(i)` (see [`get_entry_cost`]/
+/// [`set_entry_cost`]) — into contiguous sub-frame chunks, returning each
+/// chunk's length. A chunk never exceeds `MAX_BATCH_KEYS` entries or
+/// `MAX_REQUEST_BYTES` total bytes (`namespace_len` once per chunk, plus
+/// [`MULTI_FRAME_FIXED_OVERHEAD_BYTES`], plus every entry's own cost) —
+/// except that a chunk always holds at least one entry:
+/// `validate_key`/`validate_key_and_value` already reject any single
+/// namespace+key(+value) over `MAX_REQUEST_BYTES` before chunking ever
+/// runs, so the one case this bound cannot also honor — a validated
+/// entry that, only once this module's own per-entry header allowance is
+/// added on top, nominally overshoots this client-side budget — still
+/// fits under the server's real 1 MiB cap, inside `MAX_REQUEST_BYTES`'s
+/// own 256-byte cushion below that cap.
+fn chunk_lengths(
+    namespace_len: usize,
+    entry_count: usize,
+    entry_cost: impl Fn(usize) -> usize,
+) -> Vec<usize> {
+    let mut lengths = Vec::new();
+    let base = namespace_len + MULTI_FRAME_FIXED_OVERHEAD_BYTES;
+    let mut chunk_len = 0usize;
+    let mut chunk_bytes = 0usize;
+    for i in 0..entry_count {
+        let cost = entry_cost(i);
+        if chunk_len > 0
+            && (chunk_len == MAX_BATCH_KEYS || base + chunk_bytes + cost > MAX_REQUEST_BYTES)
+        {
+            lengths.push(chunk_len);
+            chunk_len = 0;
+            chunk_bytes = 0;
+        }
+        chunk_len += 1;
+        chunk_bytes += cost;
+    }
+    if chunk_len > 0 {
+        lengths.push(chunk_len);
+    }
+    lengths
+}
+
 /// The default namespace — always the empty byte string. Every
 /// namespace-less `get`/`set`/`delete` call on this client passes this,
 /// which is what keeps them on the legacy `G`/`S`/`D` wire forms
@@ -1551,8 +1637,9 @@ impl NanocachedClient {
     // m/o — see docs/protocol.html#multi. Every requested key's owner is
     // still resolved via HashRing/owner_names, exactly like a single
     // get_bytes/set: get_many_bytes groups keys by primary owner and
-    // issues one `m` sub-frame per owner (batch chunking splits an
-    // over-MAX_BATCH_KEYS group further); set_many_bytes groups by every
+    // issues one `m` sub-frame per owner (batch chunking splits a group
+    // over MAX_BATCH_KEYS entries, or over MAX_REQUEST_BYTES cumulative
+    // wire bytes (issue #222), further); set_many_bytes groups by every
     // owner across every rank, since one batch's keys can place the same
     // node as primary for one key and a replica for another. A batch
     // never fails as a whole (docs/protocol.html#multi): get_many_bytes
@@ -1600,7 +1687,8 @@ impl NanocachedClient {
     /// single-mode behavior does — there is no ring to refresh against.
     ///
     /// Larger batches are transparently split into more than one `m`
-    /// sub-frame per owner (batch chunking, see [`MAX_BATCH_KEYS`]) —
+    /// sub-frame per owner (batch chunking, bounded by both
+    /// [`MAX_BATCH_KEYS`] and cumulative wire bytes, issue #222) —
     /// callers never need to think about this.
     pub async fn get_many_bytes<K: AsRef<str>>(
         &self,
@@ -1681,9 +1769,12 @@ impl NanocachedClient {
 
     /// Issues one or more `m` sub-frames against `slot`'s connection
     /// (`None` for the single/proxy target) — already grouped to one
-    /// owner by the caller — splitting into [`MAX_BATCH_KEYS`]-sized
-    /// chunks (batch chunking) so no reply header risks exceeding the
-    /// wire's header bound.
+    /// owner by the caller — splitting into chunks bounded by both
+    /// [`MAX_BATCH_KEYS`] and, since issue #222, cumulative wire bytes
+    /// ([`chunk_lengths`]) so no `m` sub-frame risks exceeding either the
+    /// wire's header bound or the server's `MAX_REQUEST_SIZE` (a batch of
+    /// individually valid keys that would sum past it is split into more
+    /// sub-frames instead).
     async fn multi_get_chunked(
         &self,
         slot: Option<&str>,
@@ -1691,7 +1782,11 @@ impl NanocachedClient {
         keys: &[Vec<u8>],
     ) -> Result<Vec<MultiEntry>> {
         let mut entries = Vec::with_capacity(keys.len());
-        for chunk in keys.chunks(MAX_BATCH_KEYS) {
+        let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
+        let mut start = 0;
+        for len in lengths {
+            let chunk = &keys[start..start + len];
+            start += len;
             let op = |connection: Arc<Connection>| async move {
                 connection.multi_get(namespace, chunk).await
             };
@@ -1836,7 +1931,8 @@ impl NanocachedClient {
     /// [`Self::set`]'s own single-mode behavior does.
     ///
     /// Larger batches are transparently split into more than one `o`
-    /// sub-frame per node (batch chunking, see [`MAX_BATCH_KEYS`]).
+    /// sub-frame per node (batch chunking, bounded by both
+    /// [`MAX_BATCH_KEYS`] and cumulative wire bytes, issue #222).
     pub async fn set_many_bytes(
         &self,
         values: &HashMap<String, Vec<u8>>,
@@ -1905,8 +2001,12 @@ impl NanocachedClient {
     }
 
     /// [`Self::multi_get_chunked`]'s write-side twin: one or more `o`
-    /// sub-frames against `slot`'s connection, split into
-    /// [`MAX_BATCH_KEYS`]-sized chunks the same way.
+    /// sub-frames against `slot`'s connection, split the same way —
+    /// bounded by both [`MAX_BATCH_KEYS`] and, since issue #222,
+    /// cumulative wire bytes ([`chunk_lengths`]), so a batch of
+    /// individually valid key/value pairs whose sum would exceed the
+    /// server's `MAX_REQUEST_SIZE` is split into more sub-frames instead
+    /// of sent as one oversized `o` frame.
     async fn multi_set_chunked(
         &self,
         slot: Option<&str>,
@@ -1916,10 +2016,14 @@ impl NanocachedClient {
         ttl_seconds: u64,
     ) -> Result<Vec<MultiEntry>> {
         let mut entries = Vec::with_capacity(keys.len());
-        for (key_chunk, value_chunk) in keys
-            .chunks(MAX_BATCH_KEYS)
-            .zip(values.chunks(MAX_BATCH_KEYS))
-        {
+        let lengths = chunk_lengths(namespace.len(), keys.len(), |i| {
+            set_entry_cost(&keys[i], &values[i])
+        });
+        let mut start = 0;
+        for len in lengths {
+            let key_chunk = &keys[start..start + len];
+            let value_chunk = &values[start..start + len];
+            start += len;
             let op = |connection: Arc<Connection>| async move {
                 connection
                     .multi_set(namespace, key_chunk, value_chunk, ttl_seconds)
