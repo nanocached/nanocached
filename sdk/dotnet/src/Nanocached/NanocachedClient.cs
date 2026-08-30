@@ -3012,36 +3012,59 @@ public sealed class NanocachedClient : IDisposable
             }
         }
 
-        foreach (DiscoveredNode node in toOpen)
+        // Dial every newly discovered node concurrently (issue #227):
+        // this runs under _refreshGate, so a serial foreach here would
+        // block refreshes/retries for N × connect-timeout on a scale-out
+        // of N nodes. Every dial outcome is gathered first, then results
+        // are installed under one lock — mirroring OpenClusterAsync.
+        async Task<(DiscoveredNode Node, Connection? Connection, bool Failed)> DialNodeAsync(
+            DiscoveredNode node)
         {
             try
             {
-                Connection connection = await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false);
-                lock (_stateLock)
-                {
-                    if (_closed)
-                    {
-                        // Close() ran while we were dialing (issue #10):
-                        // installing this socket now would leak it.
-                        connection.Close();
-                        return;
-                    }
-                    _members[node.Name] = new Member(node.Address, connection);
-                }
+                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), false);
             }
             catch (NanocachedException)
             {
-                Interlocked.Increment(ref _refreshFailures);
-                // Left out of the ring for now; the next refresh retries
-                // it. Silent by design — refresh is opportunistic/
-                // best-effort and must never fail the caller's operation,
-                // consistent with client-side replication's eventual-consistency model.
-                // Counted via Stats().RefreshFailures.
+                return (node, null, true);
             }
         }
 
+        var outcomes = await Task.WhenAll(toOpen.Select(DialNodeAsync)).ConfigureAwait(false);
+
         lock (_stateLock)
         {
+            if (_closed)
+            {
+                // Close() ran while we were dialing (issue #10):
+                // installing these sockets now would leak them.
+                foreach (var (_, connection, _) in outcomes)
+                {
+                    connection?.Close();
+                }
+                return;
+            }
+
+            foreach (var (node, connection, failed) in outcomes)
+            {
+                if (connection is not null)
+                {
+                    _members[node.Name] = new Member(node.Address, connection);
+                    continue;
+                }
+
+                if (failed)
+                {
+                    Interlocked.Increment(ref _refreshFailures);
+                    // Left out of the ring for now; the next refresh
+                    // retries it. Silent by design — refresh is
+                    // opportunistic/best-effort and must never fail the
+                    // caller's operation, consistent with client-side
+                    // replication's eventual-consistency model. Counted
+                    // via Stats().RefreshFailures.
+                }
+            }
+
             _ring = new HashRing(_members.Keys.ToList());
             _replication = cluster.Replication;
         }
