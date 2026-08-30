@@ -3097,7 +3097,12 @@ fn adopt_membership(
                         active.marked_keys.len()
                     );
                 }
-                active.forwarding_open() && !joiner_listed
+                // A joiner discovery already confirmed and later dropped
+                // from its roster was *evicted*, not "not yet joined": the
+                // forwarding window that outlives the join must not hide
+                // that eviction (the doc comment above), so only an
+                // unconfirmed join keeps the roster at bay.
+                active.forwarding_open() && !joiner_listed && !active.confirmed
             }
             None => false,
         }
@@ -10486,6 +10491,23 @@ mod tests {
         assert_eq!(
             member_names(&known_ring),
             Some((vec!["joiner-0".to_string(), "test-node".to_string()], 2))
+        );
+        *known_ring.lock().unwrap() = None;
+
+        // The joiner was confirmed by an earlier roster and has now been
+        // evicted (roster without it) while this node is still inside
+        // the forwarding window: applied — otherwise every survivor keeps
+        // the dead joiner in its ring (answering `W` for its keys and
+        // forwarding writes to its address, which a later container may
+        // reuse) for the whole grace, up to minutes.
+        *known_ring.lock().unwrap() = None;
+        let mut confirmed = test_active_migration(Some(Instant::now()));
+        confirmed.confirmed = true;
+        *slot.lock().unwrap() = Some(confirmed);
+        adopt_membership(&known_ring, &slot, "d", vec!["test-node".to_string()], 2);
+        assert_eq!(
+            member_names(&known_ring),
+            Some((vec!["test-node".to_string()], 2))
         );
         *known_ring.lock().unwrap() = None;
 
