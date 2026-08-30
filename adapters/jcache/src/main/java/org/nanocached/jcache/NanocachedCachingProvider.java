@@ -44,13 +44,40 @@ public final class NanocachedCachingProvider implements CachingProvider {
         ClassLoader resolvedClassLoader = classLoader != null ? classLoader : getDefaultClassLoader();
         ManagerKey key = new ManagerKey(resolvedUri, resolvedClassLoader);
 
-        return managers.compute(key, (unused, existing) -> {
-            if (existing != null && !existing.isClosed()) {
-                return existing;
+        NanocachedCacheManager existing = managers.get(key);
+        if (existing != null && !existing.isClosed()) {
+            return existing;
+        }
+
+        // issue #192: the blocking connect must not run inside
+        // ConcurrentHashMap#compute below — its remapping function holds
+        // that key's bucket lock for as long as it runs, so a slow or
+        // hung dial used to stall every other getCacheManager/close call
+        // that happened to land on the same bucket, not just this key.
+        // Dial first, then atomically install-or-discard.
+        NanocachedClient client = connect(properties != null ? properties : new Properties());
+        NanocachedCacheManager created =
+                new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, client);
+
+        NanocachedCacheManager[] winner = new NanocachedCacheManager[1];
+        managers.compute(key, (unused, current) -> {
+            if (current != null && !current.isClosed()) {
+                winner[0] = current;
+                return current;
             }
-            NanocachedClient client = connect(properties != null ? properties : new Properties());
-            return new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, client);
+            winner[0] = created;
+            return created;
         });
+
+        if (winner[0] != created) {
+            // Lost the race to another thread's connect for the same
+            // key: close the raw client directly, not created.close() —
+            // that would also call provider.forget(uri, classLoader) on
+            // the shared key and evict the winner this thread must not
+            // touch.
+            client.close();
+        }
+        return winner[0];
     }
 
     private static NanocachedClient connect(Properties properties) {

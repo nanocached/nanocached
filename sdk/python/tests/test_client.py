@@ -863,6 +863,35 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_only_swallows_network_class_errors(self):
+        # issue #192: the ping loop's `except Exception: pass` used to
+        # hide any bug in connection.get() itself, not just a dead or
+        # flaky connection. Narrowed to _SWALLOWABLE_ERRORS (the same
+        # network-class tuple used everywhere else in this module), a
+        # non-network error raised by a ping must still surface as the
+        # keepalive task's own exception instead of vanishing.
+        node = await MockNode().start()
+        try:
+            self._client_module._KEEPALIVE_INTERVAL = 0.02
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                boom = RuntimeError("not a network error")
+
+                async def raise_boom(key):
+                    raise boom
+
+                client._single.get = raise_boom
+
+                await wait_for(
+                    lambda: client._keepalive_task.done(),
+                    "the keepalive task to crash on a non-network error",
+                )
+                self.assertIs(client._keepalive_task.exception(), boom)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
 
 class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
     # The progress-based request timeout (issue #42); the module-level
@@ -2871,6 +2900,75 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             # already-closed warning-and-return path.
             client._closed = False
             await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+
+class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
+    """issue #192: _MAX_INFLIGHT_HEDGE_LOSER_LEGS bounds how many losing
+    hedge legs run detached in the background, mirroring
+    _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES for fire-and-forget replica
+    writes — past the cap, a read's remaining legs are awaited
+    synchronously right there instead of being left running unbounded."""
+
+    TIMING_TOLERANCE_S = 0.03
+
+    def setUp(self):
+        from nanocached import client as client_module
+
+        self._client_module = client_module
+        self._default_cap = client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS
+
+    def tearDown(self):
+        self._client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS = self._default_cap
+
+    async def start_cluster(self):
+        node_a = await MockNode().start()
+        node_b = await MockNode().start()
+        nodes = {NAMES[0]: node_a, NAMES[1]: node_b}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=2
+        ).start()
+        return nodes, discovery
+
+    def owners_of(self, key: str):
+        return HashRing(NAMES).owners(key.encode(), 2)
+
+    async def test_falls_back_to_synchronous_past_the_cap(self):
+        self._client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS = 0
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.05
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.3)
+
+                start = asyncio.get_running_loop().time()
+                value = await client.get("k")
+                elapsed = asyncio.get_running_loop().time() - start
+
+                self.assertEqual(value, "v")
+                self.assertEqual(nodes[replica].get_count, 1, "the replica should have been hedged to")
+                # With no room under the cap, the slow primary's losing
+                # leg is awaited right here instead of being detached —
+                # the call doesn't return until it finishes, unlike the
+                # default-cap case (HedgedReadTests, same scenario) where
+                # it's left running in the background.
+                self.assertGreaterEqual(elapsed, 0.3 - self.TIMING_TOLERANCE_S, elapsed)
+                self.assertEqual(nodes[primary].get_count, 1)
+                self.assertEqual(
+                    client._hedged_reads,
+                    set(),
+                    "the awaited loser must already be gone, not left for close() to drain",
+                )
+            finally:
+                await client.close()
         finally:
             await discovery.close()
             for node in nodes.values():

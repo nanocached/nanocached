@@ -145,6 +145,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * positional {@code getManyBytes(byte[][])} carries {@link KeyCodec#toKeyBytes}'s output verbatim,
      * so {@code byte[]} keys and JDK-serialized fallback keys batch exactly like {@code String} ones —
      * there is no longer a "bulk-safe" subset that has to fall back to per-key {@link #get}.
+     *
+     * <p>An access-based {@link ExpiryPolicy} (issue #192) is likewise refreshed in one batched {@code
+     * setManyBytes} covering every hit, not one wire round trip per key: unlike {@link #putAll}, where
+     * each entry can resolve to a different TTL, {@code getExpiryForAccess()} is a single fixed,
+     * cache-wide policy — every hit resolves to the exact same outcome, so there is only ever one group
+     * to write, never several.
      */
     @Override
     public Map<K, V> getAll(Set<? extends K> keys) {
@@ -160,6 +166,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             wireKeys[i] = KeyCodec.toKeyBytes(Objects.requireNonNull(ordered.get(i), "key"));
         }
         byte[][] raw = namespace.getManyBytes(wireKeys);
+
+        Duration accessExpiry = expiryPolicy.getExpiryForAccess();
+        OptionalLong accessTtl = accessExpiry == null ? OptionalLong.empty() : wireTtlSeconds(accessExpiry);
+        boolean refreshesToPositiveTtl = accessExpiry != null && accessTtl.isPresent();
+        List<byte[]> refreshKeys = refreshesToPositiveTtl ? new ArrayList<>() : null;
+        List<byte[]> refreshValues = refreshesToPositiveTtl ? new ArrayList<>() : null;
+
         for (int i = 0; i < ordered.size(); i++) {
             byte[] value = raw[i];
             if (value == null) {
@@ -167,8 +180,27 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 continue;
             }
             statistics.recordHit();
-            refreshAccessExpiryIfConfigured(wireKeys[i], value);
+            if (accessExpiry != null) {
+                if (refreshesToPositiveTtl) {
+                    refreshKeys.add(wireKeys[i]);
+                    refreshValues.add(value);
+                } else {
+                    // Duration.ZERO: access expires the entry immediately.
+                    // No bulk-delete on the wire, so this stays per key —
+                    // the same as a single get() would do, and rare in
+                    // practice (an access policy of zero means "expire on
+                    // every read").
+                    namespace.delete(wireKeys[i]);
+                }
+            }
             result.put(ordered.get(i), ValueCodec.deserialize(value));
+        }
+
+        if (refreshesToPositiveTtl && !refreshKeys.isEmpty()) {
+            namespace.setManyBytes(
+                    refreshKeys.toArray(new byte[0][]),
+                    refreshValues.toArray(new byte[0][]),
+                    accessTtl.getAsLong());
         }
         return result;
     }

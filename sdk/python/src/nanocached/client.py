@@ -151,6 +151,19 @@ _KEEPALIVE_INTERVAL = 30.0
 # _KEEPALIVE_INTERVAL.
 _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES = 32
 
+# Hedged reads' losing legs (issue #64), analogous to
+# _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES above (issue #192): a losing leg
+# is normally left running detached in self._hedged_reads, drained by
+# close() — with no bound, a client issuing many concurrent hedged reads
+# against a slow owner could accumulate an unbounded number of them.
+# Tracked against the same set fire_and_forget's cap is *not* shared
+# with (self._hedged_reads, not self._background_replica_writes); past
+# this cap, a read's remaining legs are awaited synchronously right
+# there instead of being detached — the same "fall back to synchronous"
+# shape as fire_and_forget_replicas past its own cap. Mutable only so
+# tests can shrink it, mirroring _KEEPALIVE_INTERVAL.
+_MAX_INFLIGHT_HEDGE_LOSER_LEGS = 32
+
 # The longest a request header can ever legally be: marker + space + up to
 # 10-digit key length + space + up to 10-digit value length + space + up
 # to 10-digit TTL + up to 10-digit tag + LF (see _encode_get/_encode_set/
@@ -1939,6 +1952,28 @@ class NanocachedClient:
             for task in tasks:
                 task.add_done_callback(self._hedged_reads.discard)
 
+        async def resolve_losers(tasks: set[asyncio.Task[object]]) -> None:
+            # issue #192: this read has already decided its answer, with
+            # `tasks` left running. Normally they're detach()ed — left in
+            # the background for close() to eventually drain, same as
+            # always. But past _MAX_INFLIGHT_HEDGE_LOSER_LEGS concurrently
+            # detached legs (checked against self._hedged_reads, which
+            # still counts `tasks` themselves at this point), further ones
+            # are awaited right here instead — the same "fall back to
+            # synchronous" shape _dispatch_replica_writes uses past its
+            # own cap — so a client issuing many concurrent hedged reads
+            # against a slow owner can't accumulate unbounded background
+            # legs. Outcomes are ignored either way: a loser's result was
+            # never going to be used.
+            if not tasks:
+                return
+            if len(self._hedged_reads) < _MAX_INFLIGHT_HEDGE_LOSER_LEGS:
+                detach(tasks)
+                return
+            for task in tasks:
+                self._hedged_reads.discard(task)
+            await asyncio.wait(tasks)
+
         pending: set[asyncio.Task[object]] = {start(0)}
         next_index = 1
         last_error: Exception | None = None
@@ -1960,13 +1995,13 @@ class NanocachedClient:
                 try:
                     value = task.result()
                 except WrongNodeError:
-                    detach(pending)
+                    await resolve_losers(pending)
                     raise
                 except (NanocachedError, ConnectionError, OSError) as error:
                     last_error = error
                     continue
                 if value is not None or index == 0:
-                    detach(pending)
+                    await resolve_losers(pending)
                     return value
                 replica_missed = True
             if not pending and next_index < len(names):
@@ -2340,7 +2375,13 @@ class NanocachedClient:
                         # the SDKs: a real application key would have had
                         # its recency silently reset every tick.
                         await connection.get(_KEEPALIVE_KEY)
-                    except Exception:
+                    except _SWALLOWABLE_ERRORS:
+                        # issue #192: narrowed from a bare `except
+                        # Exception` — a keepalive ping is best-effort and
+                        # a dead/flaky connection is expected, but this
+                        # loop shouldn't also hide a bug elsewhere in
+                        # get()'s own code by swallowing every exception
+                        # it could ever raise.
                         pass
 
         self._keepalive_task = asyncio.ensure_future(ping_loop())

@@ -1246,7 +1246,20 @@ enum ParseError {
     EmptyField,
     EmptySecret,
     InvalidUtf8,
+    ControlCharacter,
     Incomplete,
+}
+
+/// Rejects control characters (`< 0x20` or `0x7F`) in a parsed name/token
+/// field — those fields are logged verbatim (`node registered`, `node
+/// left the cluster`, etc., issue #192), so a `\n` or other control byte
+/// smuggled through would let a malicious peer forge extra log lines.
+/// Checked once here rather than escaped at every print site.
+fn contains_control_character(value: &str) -> bool {
+    // `char::is_control` covers the Unicode Cc category, which already
+    // includes both `< 0x20` and `0x7F` (plus the C1 range) — a superset
+    // of what issue #192 asks to reject.
+    value.chars().any(char::is_control)
 }
 
 /// Parses one request from the front of `input`, removing the consumed
@@ -1483,6 +1496,14 @@ fn parse_two_string_fields(
     let second = String::from_utf8(frame[first_end..second_end].to_vec())
         .map_err(|_| ParseError::InvalidUtf8)?;
 
+    // issue #192: both fields end up in server logs verbatim (name via
+    // `node registered`/`node left the cluster`/etc., token never
+    // logged today but held to the same bar) — reject control
+    // characters here rather than escaping at every print site.
+    if contains_control_character(&first) || contains_control_character(&second) {
+        return Err(ParseError::ControlCharacter);
+    }
+
     Ok((first, second))
 }
 
@@ -1529,6 +1550,15 @@ fn parse_three_string_fields(
         .map_err(|_| ParseError::InvalidUtf8)?;
     let third = String::from_utf8(frame[second_end..third_end].to_vec())
         .map_err(|_| ParseError::InvalidUtf8)?;
+
+    // issue #192: `name`/`joining_name` are logged verbatim on handoff
+    // completion — same rejection as `parse_two_string_fields`.
+    if contains_control_character(&first)
+        || contains_control_character(&second)
+        || contains_control_character(&third)
+    {
+        return Err(ParseError::ControlCharacter);
+    }
 
     Ok((first, second, third))
 }
@@ -4455,6 +4485,35 @@ mod tests {
         // from source IP + this port, so a zero here is protocol garbage.
         let mut input = BytesMut::from(&b"J 9 0 5\nsome-nametok-a"[..]);
         assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn parse_rejects_a_join_name_containing_a_control_character() {
+        // issue #192: a `\n` smuggled through a name would forge extra
+        // log lines at the "node registered"/"node announced" print sites.
+        let mut input = BytesMut::from(&b"J 9 8356 5\nsome\nnametok-a"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::ControlCharacter));
+    }
+
+    #[test]
+    fn parse_rejects_a_heartbeat_token_containing_a_control_character() {
+        // issue #192: the token field is bound to the same rejection as
+        // the name field, even though it isn't logged today.
+        let mut input = BytesMut::from(&b"H 9 2 5\nsome-nameto\x7f-a"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::ControlCharacter));
+    }
+
+    #[test]
+    fn parse_rejects_a_complete_joining_name_containing_a_control_character() {
+        // issue #192: `joining_name` reaches the "handoff completed" log
+        // line too, so the `C` command gets the same rejection.
+        let mut input = BytesMut::from(&b"C 9 6 5\nsome-namejoin\x01rtok-a"[..]);
+        assert_eq!(parse(&mut input), Err(ParseError::ControlCharacter));
+    }
+
+    #[test]
+    fn contains_control_character_accepts_ordinary_printable_names() {
+        assert!(!contains_control_character("some-name-v4-uuid"));
     }
 
     #[test]

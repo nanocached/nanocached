@@ -1599,6 +1599,8 @@ impl BackendHandle {
         addr: &str,
         secret: &Option<Bytes>,
         tls_connector: &Option<TlsConnector>,
+        slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
+        dialed: Arc<std::sync::atomic::AtomicUsize>,
     ) -> io::Result<Self> {
         let mut stream = timeout(UPSTREAM_IO_TIMEOUT, connect_upstream(addr, tls_connector))
             .await
@@ -1628,7 +1630,15 @@ impl BackendHandle {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend handshake timed out"))??;
 
         let (sender, receiver) = mpsc::channel(BACKEND_QUEUE_DEPTH);
-        tokio::spawn(run_backend(stream, buf, receiver, addr.to_string()));
+        tokio::spawn(run_backend(
+            stream,
+            buf,
+            receiver,
+            addr.to_string(),
+            slot,
+            dialed,
+            sender.clone(),
+        ));
         Ok(Self { sender })
     }
 }
@@ -1654,13 +1664,28 @@ async fn run_backend(
     stream: UpstreamStream,
     buf: BytesMut,
     mut receiver: mpsc::Receiver<BackendRequest>,
-    _addr: String,
+    addr: String,
+    slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
+    dialed: Arc<std::sync::atomic::AtomicUsize>,
+    own_sender: mpsc::Sender<BackendRequest>,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     let (pending_tx, mut pending_rx) =
         mpsc::channel::<(u32, Expect, oneshot::Sender<io::Result<NodeReply>>)>(
             MAX_BACKEND_IN_FLIGHT,
         );
+
+    // issue #192: lets the reader wake the writer the instant it
+    // poisons, even with no further request queued to trip the
+    // `pending_tx.send` failure below — otherwise, with no more traffic
+    // to this node, the writer (and so this whole task, and the
+    // `dialed`-gauge decrement at the bottom) could sit parked on
+    // `receiver.recv()` forever after a poison, well past the point the
+    // connection is actually dead. `notify_one` before any waiter
+    // subscribes still delivers: the permit is stored and consumed by
+    // the writer's first `notified().await`.
+    let poisoned = Arc::new(tokio::sync::Notify::new());
+    let reader_poisoned = Arc::clone(&poisoned);
 
     // The reader half: resolves pending replies in FIFO order. The
     // per-reply timeout is a *progress* bound (each reply must arrive
@@ -1686,6 +1711,7 @@ async fn run_backend(
             let poisoned = result.is_err();
             let _ = reply.send(result);
             if poisoned {
+                reader_poisoned.notify_one();
                 return;
             }
         }
@@ -1693,7 +1719,15 @@ async fn run_backend(
 
     let mut next_tag: u32 = 0;
 
-    while let Some(request) = receiver.recv().await {
+    loop {
+        let request = tokio::select! {
+            request = receiver.recv() => match request {
+                Some(request) => request,
+                None => break,
+            },
+            () = poisoned.notified() => break,
+        };
+
         let tag = next_tag;
         next_tag = next_tag.wrapping_add(1);
 
@@ -1721,6 +1755,26 @@ async fn run_backend(
     // what is still pending, then stop.
     drop(pending_tx);
     let _ = reader.await;
+
+    // issue #192: name which backend poisoned — previously this task
+    // exited silently and the operator only learned from a downstream
+    // "backend connection is gone" error with no address attached.
+    eprintln!("WARN backend connection to {addr} poisoned; will redial on next request");
+
+    // issue #192: eagerly clear this connection's slot and decrement the
+    // `dialed` gauge right when the task actually exits, rather than
+    // leaving it counted as live until some later caller's send against
+    // it fails and `SharedBackends::enqueue` lazily notices. Only clear
+    // it if the slot still holds *this* connection — another task may
+    // already have redialed and replaced it.
+    let mut guard = slot.lock().await;
+    if guard
+        .as_ref()
+        .is_some_and(|current| current.sender.same_channel(&own_sender))
+    {
+        *guard = None;
+        dialed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The `{tag}` placeholder the framers leave in the header, replaced
@@ -2132,16 +2186,19 @@ fn frame_clear_all() -> Vec<u8> {
 struct SharedBackends {
     slots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<BackendHandle>>>>>,
     /// Issue #124: live backend connections, for the metrics gauge —
-    /// incremented on a successful dial, decremented when a dead handle
-    /// is dropped from its slot.
-    dialed: std::sync::atomic::AtomicUsize,
+    /// incremented on a successful dial, decremented when the
+    /// connection's own task exits (issue #192: eagerly, not merely
+    /// lazily on some later caller's failed send). `Arc`-wrapped so a
+    /// clone can be moved into `run_backend`, which does that decrement
+    /// itself.
+    dialed: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SharedBackends {
     fn new() -> Self {
         Self {
             slots: std::sync::Mutex::new(HashMap::new()),
-            dialed: std::sync::atomic::AtomicUsize::new(0),
+            dialed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -2183,8 +2240,14 @@ impl SharedBackends {
                 match guard.as_ref() {
                     Some(handle) => handle.clone(),
                     None => {
-                        match BackendHandle::connect(addr, &context.secret, &context.tls_connector)
-                            .await
+                        match BackendHandle::connect(
+                            addr,
+                            &context.secret,
+                            &context.tls_connector,
+                            Arc::clone(&slot),
+                            Arc::clone(&self.dialed),
+                        )
+                        .await
                         {
                             Ok(handle) => {
                                 *guard = Some(handle.clone());
@@ -5611,6 +5674,63 @@ mod tests {
             3,
             "each drop must cost exactly one redial"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_poisoned_backend_task_eagerly_decrements_the_dialed_gauge() {
+        // issue #192: previously the `dialed` gauge stayed counted for a
+        // dead connection until some *later* caller's send against it
+        // failed and `SharedBackends::enqueue` lazily noticed. Driving
+        // `enqueue` directly (bypassing `call`'s automatic redial, which
+        // would itself generate the "further traffic" that used to be
+        // required) isolates that: the gauge must reach 0 on its own,
+        // with nothing more ever sent to this node.
+        let node = MockNode::start().await;
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(None).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: SharedBackends::new(),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        let reply = context
+            .backends
+            .enqueue(
+                &context,
+                &node.addr,
+                frame_set(b"", b"k", b"v", None),
+                Expect::Stored,
+            )
+            .await;
+        assert!(matches!(reply.await, Ok(NodeReply::Stored)));
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+
+        // The node drops the connection without replying to this next
+        // request; nothing further is ever sent to it after that.
+        node.close_once.store(true, Ordering::SeqCst);
+        let reply = context
+            .backends
+            .enqueue(&context, &node.addr, frame_get(b"", b"k"), Expect::Value)
+            .await;
+        assert!(
+            reply.await.is_err(),
+            "the dropped connection must fail this request"
+        );
+
+        // Bounded poll: the backend task's own cleanup runs asynchronously
+        // once it observes the closed connection, not synchronously with
+        // the failed reply above.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while context.backends.dialed.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dialed gauge must reach 0 without any further traffic to the node");
     }
 
     #[tokio::test(flavor = "current_thread")]
