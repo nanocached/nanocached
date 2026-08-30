@@ -4277,6 +4277,53 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_a_multi_get_reply_with_too_few_entries_is_rejected_as_a_desync(self):
+        # Issue #181: a well-formed `M` header whose count doesn't match
+        # len(keys) must not silently resize `entries` via the slice
+        # assignment in _multi_get_chunked, shifting every later value
+        # onto the wrong key — it must raise and poison the connection,
+        # exactly like _mismatch's own wrong-marker desync.
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            self.node.answer_multi_get_bad_count_once(1)
+            with self.assertRaises(ConnectionError):
+                await client.get_many(["a", "b"])
+
+            # The connection was poisoned, so the redial that follows
+            # proves the client recovers cleanly instead of staying
+            # desynced.
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "va", "b": "vb"})
+        finally:
+            await client.close()
+
+    async def test_a_multi_get_reply_with_too_many_entries_is_rejected_as_a_desync(self):
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            self.node.answer_multi_get_bad_count_once(3)
+            with self.assertRaises(ConnectionError):
+                await client.get_many(["a", "b"])
+
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "va", "b": "vb"})
+        finally:
+            await client.close()
+
+    async def test_a_multi_set_reply_with_a_mismatched_entry_count_is_rejected_as_a_desync(self):
+        # Same contract as multi_get above, for `o`/multi_set (issue #181).
+        client = await self.connect()
+        try:
+            self.node.answer_multi_set_bad_count_once(1)
+            with self.assertRaises(ConnectionError):
+                await client.set_many({"a": "va", "b": "vb"})
+
+            await client.set_many({"a": "va", "b": "vb"})
+            self.assertEqual(await client.get_many(["a", "b"]), {"a": "va", "b": "vb"})
+        finally:
+            await client.close()
+
 
 class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
     # Batched get/set (issues #128/#150/#151), cluster coverage: owner
