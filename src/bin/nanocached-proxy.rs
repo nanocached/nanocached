@@ -1581,7 +1581,11 @@ enum NodeReply {
 }
 
 struct BackendRequest {
-    frame: Vec<u8>,
+    /// Issue #177: `Bytes`, not `Vec<u8>` — a write/clear fanned out to
+    /// several owners shares this one buffer across every replica leg's
+    /// `BackendRequest` (a cheap refcount bump), instead of each leg
+    /// carrying its own deep copy of the payload.
+    frame: Bytes,
     expect: Expect,
     reply: oneshot::Sender<io::Result<NodeReply>>,
 }
@@ -1783,7 +1787,7 @@ async fn run_backend(
 /// send order, and with it their tag, is known).
 const TAG_PLACEHOLDER: &str = "{tag}";
 
-fn substitute_tag(frame: Vec<u8>, tag: u32) -> Vec<u8> {
+fn substitute_tag(frame: Bytes, tag: u32) -> Bytes {
     let header_end = frame
         .iter()
         .position(|byte| *byte == b'\n')
@@ -1794,7 +1798,7 @@ fn substitute_tag(frame: Vec<u8>, tag: u32) -> Vec<u8> {
     let mut framed = header.into_bytes();
     framed.push(b'\n');
     framed.extend_from_slice(&frame[header_end + 1..]);
-    framed
+    framed.into()
 }
 
 async fn read_reply<S: AsyncRead + Unpin>(
@@ -2005,7 +2009,7 @@ async fn read_reply<S: AsyncRead + Unpin>(
 
 // ─── backend frame builders (proxy → node, always tagged) ────────────
 
-fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+fn frame_get(namespace: &[u8], key: &[u8]) -> Bytes {
     let mut frame = if namespace.is_empty() {
         format!("G {} {TAG_PLACEHOLDER}\n", key.len()).into_bytes()
     } else {
@@ -2013,13 +2017,13 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     };
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
 /// Issue #128 measurement prototype: one sub-frame per owner, carrying
 /// only that owner's slice of the original request's keys — see
 /// `dispatch_request`'s `Request::MultiGet` arm.
-fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
+fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Bytes {
     let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
     let mut frame = format!(
         "m {} {}{key_lengths} {TAG_PLACEHOLDER}\n",
@@ -2031,19 +2035,14 @@ fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
     for key in keys {
         frame.extend_from_slice(key);
     }
-    frame
+    frame.into()
 }
 
 /// Issue #150: one sub-frame per involved owner *address* — see
 /// `dispatch_request`'s `Request::MultiSet` arm for why grouping is by
 /// address rather than by rank (a batch's keys can put the same node in
 /// different roles). One shared `ttl` for the whole frame.
-fn frame_multi_set(
-    namespace: &[u8],
-    keys: &[Bytes],
-    values: &[Bytes],
-    ttl: Option<u64>,
-) -> Vec<u8> {
+fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Option<u64>) -> Bytes {
     let mut lengths = String::new();
     for (key, value) in keys.iter().zip(values) {
         lengths.push_str(&format!(" {} {}", key.len(), value.len()));
@@ -2060,10 +2059,10 @@ fn frame_multi_set(
         frame.extend_from_slice(key);
         frame.extend_from_slice(value);
     }
-    frame
+    frame.into()
 }
 
-fn frame_set(namespace: &[u8], key: &[u8], value: &[u8], ttl: Option<u64>) -> Vec<u8> {
+fn frame_set(namespace: &[u8], key: &[u8], value: &[u8], ttl: Option<u64>) -> Bytes {
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let mut frame = if namespace.is_empty() {
         format!(
@@ -2084,10 +2083,10 @@ fn frame_set(namespace: &[u8], key: &[u8], value: &[u8], ttl: Option<u64>) -> Ve
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame.extend_from_slice(value);
-    frame
+    frame.into()
 }
 
-fn frame_delete(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+fn frame_delete(namespace: &[u8], key: &[u8]) -> Bytes {
     let mut frame = if namespace.is_empty() {
         format!("D {} {TAG_PLACEHOLDER}\n", key.len()).into_bytes()
     } else {
@@ -2095,12 +2094,12 @@ fn frame_delete(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     };
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
 /// Issue #129: always the lowercase, namespaced `i` — `INCR` has no
 /// uppercase legacy form (see `Request::Incr`'s doc comment).
-fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Vec<u8> {
+fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Bytes {
     let mut frame = format!(
         "i {} {} {delta} {TAG_PLACEHOLDER}\n",
         namespace.len(),
@@ -2109,7 +2108,7 @@ fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Vec<u8> {
     .into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
 /// Issue #141: `<cond>`'s wire form for the outgoing `k`/`x` frame — the
@@ -2130,7 +2129,7 @@ fn frame_cas_set(
     condition: CasCondition,
     value: &[u8],
     ttl: Option<u64>,
-) -> Vec<u8> {
+) -> Bytes {
     let cond = cas_condition_field(condition);
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let mut frame = format!(
@@ -2143,11 +2142,11 @@ fn frame_cas_set(
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame.extend_from_slice(value);
-    frame
+    frame.into()
 }
 
 /// Issue #141: always the lowercase, namespaced `x`.
-fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> Vec<u8> {
+fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> Bytes {
     let cond = cas_condition_field(CasCondition::Digest(expected_digest));
     let mut frame = format!(
         "x {} {} {cond} {TAG_PLACEHOLDER}\n",
@@ -2157,17 +2156,17 @@ fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> 
     .into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
-fn frame_clear(namespace: &[u8]) -> Vec<u8> {
+fn frame_clear(namespace: &[u8]) -> Bytes {
     let mut frame = format!("c {} {TAG_PLACEHOLDER}\n", namespace.len()).into_bytes();
     frame.extend_from_slice(namespace);
-    frame
+    frame.into()
 }
 
-fn frame_clear_all() -> Vec<u8> {
-    format!("F {TAG_PLACEHOLDER}\n").into_bytes()
+fn frame_clear_all() -> Bytes {
+    format!("F {TAG_PLACEHOLDER}\n").into_bytes().into()
 }
 
 // ─── request drivers ─────────────────────────────────────────────────
@@ -2224,7 +2223,7 @@ impl SharedBackends {
         &self,
         context: &ProxyContext,
         addr: &str,
-        frame: Vec<u8>,
+        frame: Bytes,
         expect: Expect,
     ) -> PendingReply {
         let slot = self.slot(addr);
@@ -2300,7 +2299,7 @@ impl SharedBackends {
         &self,
         context: &ProxyContext,
         addr: &str,
-        frame: Vec<u8>,
+        frame: Bytes,
         expect: Expect,
     ) -> io::Result<NodeReply> {
         let first = self
@@ -3211,7 +3210,7 @@ fn write_frame(
     namespace: &[u8],
     key: &[u8],
     write: Option<(&Bytes, Option<u64>)>,
-) -> (Vec<u8>, Expect) {
+) -> (Bytes, Expect) {
     match write {
         Some((value, ttl)) => (frame_set(namespace, key, value, ttl), Expect::Stored),
         None => (frame_delete(namespace, key), Expect::Deleted),
