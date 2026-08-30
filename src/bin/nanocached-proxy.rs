@@ -2207,6 +2207,47 @@ fn frame_clear_all() -> Bytes {
 
 // ─── request drivers ─────────────────────────────────────────────────
 
+/// Issue #272: marks an `io::Error` returned by `SharedBackends::enqueue`
+/// as one where the frame provably never reached the backend's socket —
+/// a dial failure, the dial backoff fast-fail, or the request never got
+/// pulled off `run_backend`'s queue (and so never reached
+/// `write_half.write_all`) before the connection poisoned. Wraps the
+/// original error rather than replacing it, so logging still shows the
+/// real cause; `request_not_sent` is how a caller tests for the marker.
+/// Mirrors `sdk/go`'s `errRequestNotSent` (issue #225) — the same
+/// "definitely not sent" vs. "possibly sent" split, applied here instead
+/// of at the SDK layer.
+#[derive(Debug)]
+struct RequestNotSent(io::Error);
+
+impl std::fmt::Display for RequestNotSent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for RequestNotSent {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Wraps `error` with the `RequestNotSent` marker (see its doc comment).
+fn not_sent(error: io::Error) -> io::Error {
+    io::Error::other(RequestNotSent(error))
+}
+
+/// Whether `error` (from `SharedBackends::enqueue`) was wrapped by
+/// `not_sent` — i.e. the frame provably never reached the backend's
+/// socket, so a non-idempotent caller (INCR — issue #272) may safely
+/// retry it. Any other error means the frame may have reached the wire
+/// and must not be replayed.
+fn request_not_sent(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<RequestNotSent>().is_some())
+}
+
 /// Issue #110: the proxy-wide backend pool — one shared, tagged,
 /// pipelined connection per node, multiplexing every client
 /// connection's traffic. (#109 kept one per client connection per node,
@@ -2334,7 +2375,7 @@ impl SharedBackends {
         // failed shouldn't make every concurrent caller queue up behind
         // the lock only to hit the same backoff once they get it.
         if self.dial_recently_failed(addr) {
-            return PendingReply::failed(dial_backoff_error(addr));
+            return PendingReply::failed(not_sent(dial_backoff_error(addr)));
         }
 
         let slot = self.slot(addr);
@@ -2358,7 +2399,7 @@ impl SharedBackends {
                         // fail fast on the recheck instead of each
                         // paying their own `UPSTREAM_IO_TIMEOUT`.
                         if self.dial_recently_failed(addr) {
-                            return PendingReply::failed(dial_backoff_error(addr));
+                            return PendingReply::failed(not_sent(dial_backoff_error(addr)));
                         }
                         match BackendHandle::connect(
                             addr,
@@ -2378,7 +2419,7 @@ impl SharedBackends {
                             }
                             Err(error) => {
                                 self.note_dial_failure(addr);
-                                return PendingReply::failed(error);
+                                return PendingReply::failed(not_sent(error));
                             }
                         }
                     }
@@ -2397,9 +2438,9 @@ impl SharedBackends {
                 .is_ok()
             {
                 return Box::pin(async move {
-                    reply_rx
-                        .await
-                        .map_err(|_| io::Error::other("backend connection dropped mid-request"))?
+                    reply_rx.await.map_err(|_| {
+                        not_sent(io::Error::other("backend connection dropped mid-request"))
+                    })?
                 });
             }
 
@@ -2414,12 +2455,20 @@ impl SharedBackends {
             }
         }
 
-        PendingReply::failed(io::Error::other("backend connection is gone"))
+        PendingReply::failed(not_sent(io::Error::other("backend connection is gone")))
     }
 
     /// `enqueue` + await, with one transparent redial when the shared
     /// handle turned out dead — for the retry/fallback paths that run
     /// *after* initial dispatch, where ordering no longer applies.
+    ///
+    /// Issue #272: this retries unconditionally on ANY failure of the
+    /// first attempt, including one where the frame may already have
+    /// reached the wire — safe only for an idempotent frame (`Set`/
+    /// `Delete`, or the plain `Set` a successful `INCR`/`k` result is
+    /// fanned out to replicas as — see `fan_out_write_result`). A
+    /// non-idempotent frame (`INCR`) must use `call_non_idempotent`
+    /// below instead.
     async fn call(
         &self,
         context: &ProxyContext,
@@ -2434,6 +2483,36 @@ impl SharedBackends {
         match first {
             Ok(reply) => Ok(reply),
             Err(_) => self.enqueue(context, addr, frame, expect).await.await,
+        }
+    }
+
+    /// `call`'s counterpart for a non-idempotent frame (`INCR` — issue
+    /// #272, mirrors `sdk/go`'s `applyNonIdempotent` fix for #225):
+    /// retries via redial exactly like `call` (covering the same
+    /// idle-closed-connection case its doc comment describes), but ONLY
+    /// when `enqueue`'s failure is marked `request_not_sent` — the frame
+    /// provably never reached the backend's socket, so replaying it is
+    /// safe. Once a frame may have reached the wire, the failure is
+    /// returned to the caller as-is: the primary may already have
+    /// applied the delta, so replaying here would risk double-applying
+    /// it.
+    async fn call_non_idempotent(
+        &self,
+        context: &ProxyContext,
+        addr: &str,
+        frame: Bytes,
+        expect: Expect,
+    ) -> io::Result<NodeReply> {
+        let first = self
+            .enqueue(context, addr, frame.clone(), expect)
+            .await
+            .await;
+        match first {
+            Ok(reply) => Ok(reply),
+            Err(error) if request_not_sent(&error) => {
+                self.enqueue(context, addr, frame, expect).await.await
+            }
+            Err(error) => Err(error),
         }
     }
 }
@@ -3557,10 +3636,14 @@ async fn refan_write(
 /// it drift from the primary (e.g. after an eviction or a replica leg
 /// that missed an earlier write) — the same reasoning
 /// `src/server.rs`'s `Incr` connection handler documents for the
-/// node-local migration/decommission case. A primary `W` or transport
-/// failure re-runs the whole thing (primary INCR + replica fan-out) on
-/// the refreshed ring (`refan_incr`), same as a write's own `W`/failure
-/// handling.
+/// node-local migration/decommission case. A primary `W` or a transport
+/// failure that provably never reached the wire re-runs the whole thing
+/// (primary INCR + replica fan-out) on the refreshed ring (`refan_incr`),
+/// same as a write's own `W`/failure handling — but unlike a write,
+/// INCR is not idempotent: once the frame may have reached the primary,
+/// replaying it risks double-applying the delta (issue #272, mirrors
+/// #225's SDK-side fix), so that case is surfaced to the client instead
+/// of retried.
 async fn finish_incr(
     context: &ProxyContext,
     // `(namespace, key)`, grouped into one parameter purely to stay under
@@ -3584,9 +3667,17 @@ async fn finish_incr(
             force_refresh(context).await;
             refan_incr(context, address, delta, tag, retry_capable).await
         }
-        // Same "the shared connection may simply have been idle-closed"
-        // reasoning as `finish_write`'s own transport-failure arm.
-        Err(_) => refan_incr(context, address, delta, tag, retry_capable).await,
+        // Issue #272: only safe to retry when the frame provably never
+        // reached the backend socket (`request_not_sent`) — the "shared
+        // connection may simply have been idle-closed" case `finish_write`
+        // relies on. Once the frame may have reached the wire, retrying
+        // would risk a double-apply, so this surfaces `Fatal` instead
+        // (softened to a per-request `R` for a retry-capable client —
+        // the client's own choice whether to re-issue the INCR).
+        Err(error) if request_not_sent(&error) => {
+            refan_incr(context, address, delta, tag, retry_capable).await
+        }
+        Err(_) => Err(Fatal),
         Ok(_) => Err(Fatal),
     }
 }
@@ -3628,9 +3719,13 @@ async fn fan_out_write_result(
 }
 
 /// `finish_incr`'s retry path for both a primary `W` and a transport
-/// failure: re-fetches the current ring and runs the whole INCR (primary
-/// leg, then the replica fan-out) again via `call`, whose transparent
-/// redial recovers a dead shared connection.
+/// failure provably never sent: re-fetches the current ring and runs the
+/// whole INCR (primary leg, then the replica fan-out) again via
+/// `call_non_idempotent`, whose transparent redial recovers a dead
+/// shared connection WITHOUT replaying the `i` frame once it may have
+/// reached the wire (issue #272) — unlike `refan_write`'s `call`, which
+/// is safe to retry unconditionally only because Set/Delete are
+/// idempotent.
 async fn refan_incr(
     context: &ProxyContext,
     address: (&[u8], &[u8]),
@@ -3648,7 +3743,7 @@ async fn refan_incr(
     };
     match context
         .backends
-        .call(
+        .call_non_idempotent(
             context,
             primary,
             frame_incr(namespace, key, delta),
@@ -4651,6 +4746,13 @@ mod tests {
         /// request — simulates a node-side close (idle timeout, crash)
         /// on the shared connection.
         close_once: Arc<AtomicBool>,
+        /// Issue #272: applies the next `i` (INCR) request to the store,
+        /// then drops the connection instead of sending the `I` reply —
+        /// simulates the delta having landed at the primary while the
+        /// reply itself was lost (as opposed to `close_once`, which drops
+        /// before ever touching the store). Proves a retry after this
+        /// must not resend `i` and double-apply the delta.
+        close_after_incr_apply_once: Arc<AtomicBool>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         /// Issue #110: set when a request was already buffered before
@@ -4681,6 +4783,7 @@ mod tests {
                 flushed: Arc::new(AtomicUsize::new(0)),
                 wrong_node_once: Arc::new(AtomicBool::new(false)),
                 close_once: Arc::new(AtomicBool::new(false)),
+                close_after_incr_apply_once: Arc::new(AtomicBool::new(false)),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
@@ -4693,6 +4796,7 @@ mod tests {
             let flushed = Arc::clone(&node.flushed);
             let wrong_once = Arc::clone(&node.wrong_node_once);
             let close_once = Arc::clone(&node.close_once);
+            let close_after_incr_apply_once = Arc::clone(&node.close_after_incr_apply_once);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
@@ -4712,6 +4816,7 @@ mod tests {
                             flushed: Arc::clone(&flushed),
                             wrong_once: Arc::clone(&wrong_once),
                             close_once: Arc::clone(&close_once),
+                            close_after_incr_apply_once: Arc::clone(&close_after_incr_apply_once),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
@@ -4756,6 +4861,7 @@ mod tests {
         flushed: Arc<AtomicUsize>,
         wrong_once: Arc<AtomicBool>,
         close_once: Arc<AtomicBool>,
+        close_after_incr_apply_once: Arc<AtomicBool>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
@@ -4784,6 +4890,7 @@ mod tests {
             flushed,
             wrong_once,
             close_once,
+            close_after_incr_apply_once,
             delay,
             auth_count,
             saw_pipelined,
@@ -5038,6 +5145,16 @@ mod tests {
                                             .lock()
                                             .unwrap()
                                             .insert((namespace, key), new_bytes.clone());
+                                        // Issue #272: the delta is already
+                                        // applied above — closing here
+                                        // instead of replying simulates the
+                                        // reply being lost after the node
+                                        // executed the increment, proving a
+                                        // retry must not resend `i`.
+                                        if close_after_incr_apply_once.swap(false, Ordering::SeqCst)
+                                        {
+                                            return Ok(());
+                                        }
                                         stream
                                             .write_all(
                                                 format!("I {} {}\n", new_bytes.len(), tag(&fields))
@@ -5350,6 +5467,18 @@ mod tests {
         let mut buf = BytesMut::new();
         let ack = read_line(&mut stream, &mut buf).await.unwrap();
         assert_eq!(ack, "On");
+        (stream, buf)
+    }
+
+    /// `connect_and_auth`, but negotiating tagged + retry-capable mode
+    /// (issue #125/#272) — needed to observe a per-request `R` (rather
+    /// than a connection-closing `E`) on a transport failure.
+    async fn connect_and_auth_tagged(proxy: &str) -> (TcpStream, BytesMut) {
+        let mut stream = TcpStream::connect(proxy).await.unwrap();
+        stream.write_all(b"A 1 T R\nx").await.unwrap();
+        let mut buf = BytesMut::new();
+        let ack = read_line(&mut stream, &mut buf).await.unwrap();
+        assert_eq!(ack, "OnT");
         (stream, buf)
     }
 
@@ -6666,6 +6795,51 @@ mod tests {
         assert_eq!(replica.incrs(), 0);
         assert_eq!(primary.entry(b"", b"counter"), Some(b"15".to_vec()));
         assert_eq!(replica.entry(b"", b"counter"), Some(b"15".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn incr_never_replays_once_the_primary_may_have_applied_it() {
+        // Issue #272: the primary applies the delta but the reply is
+        // lost (`close_after_incr_apply_once` — the connection drops
+        // after the store update, before the `I` reply is written). A
+        // naive retry would resend `i` and double-apply the delta; the
+        // fix is to surface an error to the client instead. Proven two
+        // ways: the node's `incrs` counter stops at 1 (no replayed `i`
+        // frame), and the stored value is `10 + 5`, never `10 + 5 + 5`.
+        let (nodes, proxy) = cluster(1).await;
+        let node = &nodes[0];
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+        stream.write_all(b"S 7 2 1\ncounter10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+
+        node.close_after_incr_apply_once
+            .store(true, Ordering::SeqCst);
+        stream.write_all(b"i 0 7 5 2\ncounter").await.unwrap();
+        // A tagged, retry-capable client gets the per-request `R` — a
+        // successful `I` here (or a bare connection close) would mean
+        // the fix regressed: either the double-apply happened silently,
+        // or the caller lost the ability to tell "may have been
+        // applied" from "definitely wasn't".
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 2");
+
+        assert_eq!(
+            node.incrs(),
+            1,
+            "the lost-reply attempt must not be replayed onto the primary"
+        );
+        assert_eq!(
+            node.entry(b"", b"counter"),
+            Some(b"15".to_vec()),
+            "the delta must be applied exactly once"
+        );
+
+        // The connection survived (retry-capable): a fresh INCR still
+        // works and continues from the single applied delta.
+        stream.write_all(b"i 0 7 5 3\ncounter").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2 3");
+        read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
+        assert_eq!(&buf.split_to(2)[..], b"20");
     }
 
     #[tokio::test(flavor = "current_thread")]
