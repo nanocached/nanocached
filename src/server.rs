@@ -4221,43 +4221,31 @@ async fn fetch_roster_once(
     const MAX_ROSTER_ENTRIES: usize = 4096;
     const MAX_NAME_OR_ADDR_LENGTH: usize = 1024;
 
-    let mut stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
+    let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
+    // Buffered so the length-bounded line reads below (`read_line_capped`,
+    // issue #217 — this used to grow a `Vec<u8>` without a cap while
+    // scanning for `\n`, the same class of bug #92 fixed for
+    // `read_heartbeat_ack`) and the fixed-size body `read_exact`s share one
+    // buffer: any bytes `read_line_capped` already buffered past a line's
+    // `\n` are still there for the next read, exactly as `read_heartbeat_ack`
+    // relies on.
+    let mut stream = tokio::io::BufReader::new(stream);
     stream.write_all(b"L\n").await?;
 
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let read_line = |buf: &mut Vec<u8>| -> Option<String> {
-        let position = buf.iter().position(|byte| *byte == b'\n')?;
-        let line: Vec<u8> = buf.drain(..=position).collect();
-        Some(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned())
-    };
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad L response");
 
-    macro_rules! next_line {
-        () => {{
-            loop {
-                if let Some(line) = read_line(&mut buf) {
-                    break line;
-                }
-                let bytes_read = stream.read(&mut chunk).await?;
-                if bytes_read == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "discovery closed mid-response",
-                    ));
-                }
-                buf.extend_from_slice(&chunk[..bytes_read]);
-            }
-        }};
-    }
-
-    let header = next_line!();
-    if header == "B" {
+    let mut line = Vec::new();
+    read_line_capped(&mut stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
+    if line == b"B\n" {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "discovery is in its startup grace",
         ));
     }
-    let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad L response");
+    let header = line
+        .strip_suffix(b"\n")
+        .map(|rest| String::from_utf8_lossy(rest).into_owned())
+        .ok_or_else(bad)?;
     let mut parts = header.strip_prefix("N ").ok_or_else(bad)?.split(' ');
     let count: usize = parts
         .next()
@@ -4273,7 +4261,11 @@ async fn fetch_roster_once(
 
     let mut members = Vec::with_capacity(count);
     for _ in 0..count {
-        let entry_header = next_line!();
+        read_line_capped(&mut stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
+        let entry_header = line
+            .strip_suffix(b"\n")
+            .map(|rest| String::from_utf8_lossy(rest).into_owned())
+            .ok_or_else(bad)?;
         let mut parts = entry_header.split(' ');
         let name_length: usize = parts
             .next()
@@ -4287,17 +4279,8 @@ async fn fetch_roster_once(
             return Err(bad());
         }
         // Body + trailing newline.
-        while buf.len() < name_length + addr_length + 1 {
-            let bytes_read = stream.read(&mut chunk).await?;
-            if bytes_read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "discovery closed mid-entry",
-                ));
-            }
-            buf.extend_from_slice(&chunk[..bytes_read]);
-        }
-        let body: Vec<u8> = buf.drain(..name_length + addr_length + 1).collect();
+        let mut body = vec![0u8; name_length + addr_length + 1];
+        stream.read_exact(&mut body).await?;
         members.push((
             String::from_utf8_lossy(&body[..name_length]).into_owned(),
             String::from_utf8_lossy(&body[name_length..name_length + addr_length]).into_owned(),
@@ -9722,6 +9705,62 @@ mod tests {
         ack.extend_from_slice(&vec![b'x'; 10 * 1024 * 1024]);
         let mut stream = tokio::io::BufReader::new(&ack[..]);
         let error = read_heartbeat_ack(&mut stream).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("size cap"), "entry: got {error}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_once_caps_an_unterminated_line() {
+        // Issue #217: the same class of bug #92 fixed for
+        // `read_heartbeat_ack`, but for the roster fetch `run_decommission`
+        // uses (`L`). A hostile/misconfigured discovery that streams a line
+        // without ever sending `\n` must error on the size cap, not grow
+        // this node's buffer until it OOMs. The size-cap error (vs the
+        // generic "bad L response" one an unbounded read reaches only
+        // after buffering the whole flood) is the proof the read itself
+        // was bounded — 10 MiB here stands in for an unbounded stream.
+        async fn fetch_from(response: Vec<u8>) -> io::Error {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let discovery_addr = listener.local_addr().unwrap().to_string();
+
+            let fake_discovery = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2];
+                let _ = connection.read_exact(&mut request).await; // "L\n"
+                let _ = connection.write_all(&response).await;
+            });
+
+            let node_context = NodeContext {
+                name: "test-node".to_string(),
+                token: "tk-test-node".to_string(),
+                discovery_addr: discovery_addr.clone(),
+                active_migration: Arc::new(Mutex::new(None)),
+                known_ring: Arc::new(Mutex::new(None)),
+                auth_secret: None,
+                tls_connector: None,
+                request_tx: mpsc::channel(1).0,
+                leaving: Arc::new(Mutex::new(None)),
+            };
+
+            let error = fetch_roster_once(&node_context, &discovery_addr)
+                .await
+                .unwrap_err();
+            fake_discovery.abort();
+            error
+        }
+
+        // The header line.
+        let error = fetch_from(vec![b'x'; 10 * 1024 * 1024]).await;
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("size cap"),
+            "header: got {error}"
+        );
+
+        // An entry's length-prefix line, after a well-formed header.
+        let mut response = b"N 1 2\n".to_vec();
+        response.extend_from_slice(&vec![b'x'; 10 * 1024 * 1024]);
+        let error = fetch_from(response).await;
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("size cap"), "entry: got {error}");
     }
