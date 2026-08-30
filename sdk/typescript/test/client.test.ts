@@ -2304,6 +2304,87 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
       await node.close();
     }
   });
+
+  it("getManyBytes decompresses each value when compress is enabled (issue #294)", async () => {
+    // Regression: getManyBytes' single/proxy-mode branch used to put the
+    // raw, marker-prefixed wire bytes straight into the result map,
+    // skipping the decompression getBytes itself applies.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 64,
+      });
+      try {
+        const value = Buffer.from("x".repeat(1000), "utf8");
+        await client.setManyBytes({ a: value });
+
+        const stored = node.store.get("a")!;
+        assert.equal(stored[0], 0x01, "expected the DEFLATE marker byte on the wire");
+        assert.ok(stored.length < value.length, "a highly repetitive value must actually shrink on the wire");
+
+        const values = await client.getManyBytes(["a"]);
+        assert.deepEqual(values.get("a"), value);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getMany decompresses a large string when compress is enabled (issue #294)", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 64,
+      });
+      try {
+        const value = "y".repeat(5000);
+        await client.setMany({ a: value });
+
+        const stored = node.store.get("a")!;
+        assert.equal(stored[0], 0x01, "expected the DEFLATE marker byte on the wire");
+
+        const values = await client.getMany(["a"]);
+        assert.equal(values.get("a"), value);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("round-trips a mixed batch of compressed and below-threshold values (issue #294)", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+        compressionThreshold: 256,
+      });
+      try {
+        const big = "z".repeat(2000);
+        const small = "short";
+        await client.setMany({ big, small });
+
+        assert.equal(node.store.get("big")![0], 0x01, "big value should have compressed on the wire");
+        assert.equal(node.store.get("small")![0], 0x00, "small value should stay below the compression threshold");
+
+        const values = await client.getMany(["big", "small"]);
+        assert.equal(values.get("big"), big);
+        assert.equal(values.get("small"), small);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
 });
 
 describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", () => {
@@ -2686,6 +2767,44 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
         assert.ok(!(error instanceof PartialWrongNodeError));
         return true;
       });
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("decompresses every value in a cluster-mode batch when compress is enabled (issue #294)", async () => {
+    // Regression: multiGetPass — the cluster-mode fan-out getManyBytes
+    // uses once a target is a real ring, not a single node/proxy — used
+    // to splice the raw, marker-prefixed wire bytes into the result map
+    // too.
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      compress: true,
+      compressionThreshold: 64,
+    });
+    try {
+      const values: Record<string, string> = {};
+      const keys: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        const key = `key-${i}`;
+        keys.push(key);
+        values[key] = `value-${i}-`.repeat(50);
+      }
+      await client.setMany(values);
+
+      // At least one owner must have actually compressed a value on the
+      // wire, or this test isn't exercising the decompression path.
+      const compressedSomewhere = cluster.nodes.some(({ mock }) =>
+        keys.some((key) => mock.store.has(key) && mock.store.get(key)![0] === 0x01),
+      );
+      assert.ok(compressedSomewhere, "expected at least one value to compress on the wire");
+
+      const got = await client.getMany(keys);
+      for (const [key, want] of Object.entries(values)) {
+        assert.equal(got.get(key), want);
+      }
     } finally {
       client.close();
       await cluster.close();
