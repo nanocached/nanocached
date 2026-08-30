@@ -408,6 +408,17 @@ possibly-rounded `number`), so a replica can never drift from the primary
 either by re-deriving the increment on its own or by a rounding mismatch,
 even once a counter passes `Number.MAX_SAFE_INTEGER`.
 
+**At-least-once, not exactly-once, on a connection loss.** Unlike
+`get`/`set`/`delete`, `incr`/`decr` are not automatically retried after
+every connection failure: if the primary node dies (or the connection is
+already dead) *before* the request is ever sent, this SDK safely retries
+against a freshly refreshed node list, same as `get`/`set`/`delete`. But
+if the primary actually receives and applies the increment and only its
+reply is lost, replaying it would double-apply the delta — so instead the
+call throws `ConnectionLostError` and is **not** retried. The increment
+may still have happened even though the call failed; a caller that must
+know whether it did should `get()` the counter afterwards.
+
 ## Batched get and set
 
 `getMany`/`getManyBytes` and `setMany`/`setManyBytes` (the `m`/`o`
@@ -513,6 +524,15 @@ an ordinary `set`/`delete` instead, so a replica can never reach a
 different outcome by re-evaluating the same condition against its own
 possibly-different copy. See docs/protocol.html#cas for the wire-level
 spec.
+
+**At-least-once, not exactly-once, on a connection loss.** Same caveat as
+`incr`/`decr`: `putIfAbsent`/`replaceIfPresent`/`replace`/
+`deleteIfMatches` only retry after a connection failure when the request
+is provably known to have never reached the primary. If the primary
+actually applied the write (or delete) and only its reply was lost, the
+call throws `ConnectionLostError` instead of being replayed — replaying
+it would evaluate the condition against the already-changed value and
+could misreport a real success as `false`.
 
 ## API
 

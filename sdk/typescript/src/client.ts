@@ -1203,13 +1203,24 @@ export class NanocachedClient {
    * limiting / approximate counters, never for a durable count (billing,
    * inventory). See README.md's "incr / decr" section for the cluster
    * replication caveat: only the primary owner ever runs the increment,
-   * replicas just receive its literal result. */
+   * replicas just receive its literal result.
+   *
+   * **At-least-once, not exactly-once** (issue #225): unlike get/set/
+   * delete, `incr` is only retried after a connection loss when the
+   * request is provably known to have never reached the primary; if the
+   * primary applied the increment and only its reply was lost, this call
+   * throws `ConnectionLostError` instead of silently retrying (retrying
+   * would double-apply the delta). The increment may still have
+   * happened even though this call failed — a caller that must know
+   * whether it did should `get()` the counter afterwards. See
+   * README.md's "incr / decr" section. */
   async incr(key: string | Uint8Array, delta = 1): Promise<number | null> {
     return this.incrInNamespace(EMPTY_NAMESPACE, key, delta);
   }
 
   /** `incr` with a negated delta — there is no separate wire operation for
-   * decrement, the server (and the wire protocol) only ever sees `i`. */
+   * decrement, the server (and the wire protocol) only ever sees `i`. Same
+   * at-least-once caveat as `incr` on a connection loss (issue #225). */
   async decr(key: string | Uint8Array, delta = 1): Promise<number | null> {
     return this.incrInNamespace(EMPTY_NAMESPACE, key, -delta);
   }
@@ -1221,7 +1232,15 @@ export class NanocachedClient {
    * exception, the same idiom `delete()` already uses for "nothing to
    * act on". See README.md's "Compare-and-set" section for the
    * not-a-distributed-lock caveat: LRU eviction can still reclaim `key`
-   * exactly as it would after a plain `set`. */
+   * exactly as it would after a plain `set`.
+   *
+   * **At-least-once, not exactly-once** (issue #225): like `incr`, this
+   * is only retried after a connection loss when the request is provably
+   * known to have never reached the primary; if the primary applied the
+   * CAS and only its reply was lost, this call throws
+   * `ConnectionLostError` — never silently retries, since replaying it
+   * would evaluate the condition against the already-changed value and
+   * could misreport a real success as `false`. */
   async putIfAbsent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
     return this.casInNamespace(EMPTY_NAMESPACE, key, value, { kind: "absent" }, ttlSeconds);
   }
@@ -1230,7 +1249,8 @@ export class NanocachedClient {
    * — `k` with a `present` condition — stores `value` only if `key`
    * currently holds any (unexpired) value, whatever it is. Resolves
    * `true` if replaced, `false` if the key was absent — a mismatch is a
-   * normal boolean outcome, never an exception. */
+   * normal boolean outcome, never an exception. Same at-least-once
+   * caveat as `putIfAbsent` on a connection loss (issue #225). */
   async replaceIfPresent(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
     return this.casInNamespace(EMPTY_NAMESPACE, key, value, { kind: "present" }, ttlSeconds);
   }
@@ -1250,7 +1270,9 @@ export class NanocachedClient {
    * reconstruction produces byte-identical output to what the server
    * actually stores — exactly as sensitive to encoding as memcached's own
    * value-based CAS, and not guaranteed across languages or compression
-   * settings the way the read-then-write-back path always is. */
+   * settings the way the read-then-write-back path always is. Same
+   * at-least-once caveat as `putIfAbsent` on a connection loss (issue
+   * #225). */
   async replace(key: string | Uint8Array, token: string, newValue: string | Uint8Array, ttlSeconds = 0): Promise<boolean> {
     return this.casInNamespace(EMPTY_NAMESPACE, key, newValue, { kind: "digest", digest: token }, ttlSeconds);
   }
@@ -1259,7 +1281,14 @@ export class NanocachedClient {
    * `x` — deletes `key` only if its current stored bytes hash to exactly
    * `token` (see `contentDigest`/`getWithToken`). Resolves `true` if
    * deleted, `false` on a mismatch or a missing key — never an exception
-   * for either. */
+   * for either.
+   *
+   * **At-least-once, not exactly-once** (issue #225): like `replace`,
+   * this is only retried after a connection loss when the request is
+   * provably known to have never reached the primary; if the primary
+   * applied the delete and only its reply was lost, this call throws
+   * `ConnectionLostError` instead of silently retrying and misreporting
+   * the real success as a mismatch. */
   async deleteIfMatches(key: string | Uint8Array, token: string): Promise<boolean> {
     return this.casDeleteInNamespace(EMPTY_NAMESPACE, key, token);
   }
@@ -1712,10 +1741,12 @@ export class NanocachedClient {
   private async incrInNamespace(namespace: Uint8Array, key: string | Uint8Array, delta: number): Promise<number | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    const result = await this.withWrongNodeRetry(() =>
-      this.target.kind === "cluster"
-        ? this.incrOnOwners(key, namespace, delta)
-        : this.connectionForSingleTarget().then((connection) => connection.incr(key, delta, namespace)),
+    const result = await this.withWrongNodeRetry(
+      () =>
+        this.target.kind === "cluster"
+          ? this.incrOnOwners(key, namespace, delta)
+          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) => connection.incr(key, delta, namespace)),
+      { nonIdempotent: true },
     );
     if (result === null) return null;
     if (!Number.isSafeInteger(result.value)) throw new CounterOutOfRangeError(result.raw.toString("ascii"));
@@ -1745,10 +1776,14 @@ export class NanocachedClient {
     // audit item 3).
     checkKeyAndValue(keyBytes, valueBytes, namespace);
     const outgoing = this.compress ? compressValue(valueBytes, this.compressionThreshold) : valueBytes;
-    return this.withWrongNodeRetry(() =>
-      this.target.kind === "cluster"
-        ? this.casOnOwners(key, namespace, outgoing, cond, ttlSeconds)
-        : this.connectionForSingleTarget().then((connection) => connection.cas(key, outgoing, cond, ttlSeconds, namespace)),
+    return this.withWrongNodeRetry(
+      () =>
+        this.target.kind === "cluster"
+          ? this.casOnOwners(key, namespace, outgoing, cond, ttlSeconds)
+          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
+              connection.cas(key, outgoing, cond, ttlSeconds, namespace),
+            ),
+      { nonIdempotent: true },
     );
   }
 
@@ -1758,10 +1793,12 @@ export class NanocachedClient {
   private async casDeleteInNamespace(namespace: Uint8Array, key: string | Uint8Array, token: string): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
-    return this.withWrongNodeRetry(() =>
-      this.target.kind === "cluster"
-        ? this.casDeleteOnOwners(key, namespace, token)
-        : this.connectionForSingleTarget().then((connection) => connection.casDelete(key, token, namespace)),
+    return this.withWrongNodeRetry(
+      () =>
+        this.target.kind === "cluster"
+          ? this.casDeleteOnOwners(key, namespace, token)
+          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) => connection.casDelete(key, token, namespace)),
+      { nonIdempotent: true },
     );
   }
 
@@ -2121,10 +2158,18 @@ export class NanocachedClient {
    * directly, before any replica is touched — nothing was written, so
    * there is nothing to fan out. A dead/wrong-node primary throws out to
    * `withWrongNodeRetry`, which retries this whole call once against a
-   * freshly refreshed ranking — safe to retry in full, since a failure at
-   * this point (by construction) always precedes ever reaching a replica
-   * write, so no attempt can double-apply the increment. Replica-leg
-   * failures are swallowed exactly like `writeToOwners`'s own
+   * freshly refreshed ranking — but only via its `nonIdempotent` option
+   * (issue #225): a failure here always precedes ever reaching a replica
+   * write, but it does *not* prove the primary's own `i` was never
+   * applied — the primary can apply the increment and then die (or lose
+   * the connection) before its reply reaches this client, in which case
+   * replaying `i` would double-apply it. `nonIdempotent` retries this
+   * call only when the primary connection was provably never written to
+   * (`dialForWrite`/`ConnectionLostError.requestWasSent === false`);
+   * otherwise the `ConnectionLostError` propagates to the caller instead
+   * of being replayed — see its own doc comment, and README.md's "incr /
+   * decr" section for the at-least-once caveat this leaves callers with.
+   * Replica-leg failures are swallowed exactly like `writeToOwners`'s own
    * (stats().replicaWriteFailures, fireAndForgetReplicas-aware) — but
    * because the primary's increment already succeeded and was (at least
    * best-effort) forwarded, its result is always what's returned,
@@ -2146,10 +2191,10 @@ export class NanocachedClient {
   ): Promise<{ value: number; raw: Buffer } | null> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
-      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key", { requestWasSent: false });
     }
 
-    const primaryConnection = await this.memberConnection(primaryName);
+    const primaryConnection = await this.dialForWrite(() => this.memberConnection(primaryName));
     const result = await primaryConnection.incr(key, delta, namespace);
     if (result === null || replicaNames.length === 0) {
       return result === null ? null : { value: result.value, raw: result.raw };
@@ -2216,19 +2261,26 @@ export class NanocachedClient {
    *
    * A dead/wrong-node primary throws out to `withWrongNodeRetry`, which
    * retries this whole call once against a freshly refreshed ranking —
-   * safe to retry in full, since a failure at this point (by construction)
-   * always precedes ever reaching a replica write. Replica-leg failures
-   * are swallowed exactly like `incrOnOwners`'s own
+   * but, like `incrOnOwners`, only via its `nonIdempotent` option (issue
+   * #225): a failure here does not prove the primary's own `k` was never
+   * applied, and replaying a CAS/conditional write that actually
+   * succeeded would evaluate its condition against the already-changed
+   * value and (mis)report a mismatch. `nonIdempotent` retries this call
+   * only when the primary connection was provably never written to
+   * (`dialForWrite`/`ConnectionLostError.requestWasSent === false`);
+   * otherwise the `ConnectionLostError` propagates to the caller instead
+   * of being replayed. Replica-leg failures are swallowed exactly like
+   * `incrOnOwners`'s own
    * (stats().replicaWriteFailures, fireAndForgetReplicas-aware) — the
    * primary's write already succeeded, so its result is always what's
    * returned. */
   private async casOnOwners(key: string | Uint8Array, namespace: Uint8Array, value: Buffer, cond: CasCondition, ttlSeconds: number): Promise<boolean> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
-      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key", { requestWasSent: false });
     }
 
-    const primaryConnection = await this.memberConnection(primaryName);
+    const primaryConnection = await this.dialForWrite(() => this.memberConnection(primaryName));
     const stored = await primaryConnection.cas(key, value, cond, ttlSeconds, namespace);
     if (!stored || replicaNames.length === 0) {
       return stored;
@@ -2284,14 +2336,19 @@ export class NanocachedClient {
    * digest; on success the deletion (not a replayed `x`) is forwarded to
    * the remaining owners as an ordinary `delete`, since a replica
    * evaluating the same digest against its own possibly-different copy
-   * could reach a different outcome. */
+   * could reach a different outcome. Also mirrors `casOnOwners`'s
+   * `withWrongNodeRetry({ nonIdempotent: true })` handling (issue #225):
+   * a dead/wrong-node primary only retries when the connection was
+   * provably never written to, since replaying an `x` that actually
+   * deleted the key would report a mismatch instead of the true
+   * success. */
   private async casDeleteOnOwners(key: string | Uint8Array, namespace: Uint8Array, token: string): Promise<boolean> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
-      throw new ConnectionLostError("nanocached: no owner is reachable for this key");
+      throw new ConnectionLostError("nanocached: no owner is reachable for this key", { requestWasSent: false });
     }
 
-    const primaryConnection = await this.memberConnection(primaryName);
+    const primaryConnection = await this.dialForWrite(() => this.memberConnection(primaryName));
     const deleted = await primaryConnection.casDelete(key, token, namespace);
     if (!deleted || replicaNames.length === 0) {
       return deleted;
@@ -2397,8 +2454,21 @@ export class NanocachedClient {
    * against whichever proxy that lands on, the same shape as the cluster
    * case (`WrongNodeError` itself can't happen against a proxy, which
    * never answers `W`, but the shared connection-error branch still
-   * applies). */
-  private async withWrongNodeRetry<T>(operation: () => Promise<T>): Promise<T> {
+   * applies).
+   *
+   * `nonIdempotent` (issue #225): incr/decr, CAS (replace/putIfAbsent)
+   * and deleteIfMatches are not safe to blanket-retry the way
+   * get/set/delete/clear are — if the primary actually applied the op
+   * and only the reply was lost, replaying it double-applies the
+   * increment, or turns a CAS/conditional delete that actually succeeded
+   * into a reported mismatch. When set, a `ConnectionLostError` only
+   * counts as retryable when `requestWasSent` is provably `false` (the
+   * connection was already dead before this attempt's frame was ever
+   * built — see `ConnectionLostError`'s own doc comment); every other
+   * connection error propagates as-is instead of being retried.
+   * `WrongNodeError` stays retryable regardless: a `W` response means the
+   * node explicitly declined to apply the op, so nothing was written. */
+  private async withWrongNodeRetry<T>(operation: () => Promise<T>, options?: { nonIdempotent?: boolean }): Promise<T> {
     try {
       return await operation();
     } catch (error) {
@@ -2407,10 +2477,37 @@ export class NanocachedClient {
       // forced refresh re-ranks the key onto survivors. The retry window
       // for a dead primary is therefore bounded by discovery's liveness
       // timeout. A second failure after a fresh refresh propagates.
-      const retryable = error instanceof WrongNodeError || isConnectionError(error);
+      const retryable =
+        error instanceof WrongNodeError ||
+        (options?.nonIdempotent
+          ? error instanceof ConnectionLostError && error.requestWasSent === false
+          : isConnectionError(error));
       if (!retryable || this.target.kind === "single") throw error;
       await this.maybeRefreshNodeList({ force: true });
       return await operation();
+    }
+  }
+
+  /** Dials (or reuses) the connection a non-idempotent primary-only write
+   * (incr/cas/casDelete) is about to send its op on — issue #225. Any
+   * connection-shaped failure here (a dead primary, a proxy dial
+   * refused, a member not currently connected, ...) happens strictly
+   * before that op's own frame can ever be built, so it's always safe to
+   * replay via `withWrongNodeRetry`'s `nonIdempotent` option — re-tagged
+   * as `ConnectionLostError` with `requestWasSent: false` so that option
+   * recognizes it as such regardless of what kind of error the dial
+   * itself actually produced (a raw Node system error like ECONNREFUSED,
+   * or a `ConnectionLostError` already). A non-connection failure (e.g.
+   * `AlreadyClosedError`) is left untouched — `withWrongNodeRetry` never
+   * retries those regardless of this option. */
+  private async dialForWrite(dial: () => Promise<Connection>): Promise<Connection> {
+    try {
+      return await dial();
+    } catch (error) {
+      if (!isConnectionError(error)) throw error;
+      if (error instanceof ConnectionLostError && error.requestWasSent === false) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ConnectionLostError(`nanocached: ${message}`, { requestWasSent: false });
     }
   }
 

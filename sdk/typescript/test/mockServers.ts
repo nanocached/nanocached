@@ -50,6 +50,15 @@ export interface MockNode extends MockServerBase {
    * stream desync where every later response answers the previous
    * request. */
   swallowGetOnce(): void;
+  /** Issue #225: applies the next `i` request to the store exactly as
+   * normal, then destroys the connection instead of writing the `I`
+   * reply — the "primary applied it, the ack was lost" shape a
+   * non-idempotent retry must never replay (as opposed to
+   * `dropConnections`, which kills the connection *before* any request
+   * is read at all). */
+  dropAfterIncrOnce(): void;
+  /** `dropAfterIncrOnce`'s CAS (`k`) counterpart (issue #225). */
+  dropAfterCasOnce(): void;
   /** Queue a one-off garbage `V` header for the next G request. */
   answerMalformedValueOnce(): void;
   /** Queue a one-off `V` reply for the next G request whose header is
@@ -319,6 +328,12 @@ export async function startMockNode(
   let incrs = 0;
   let casRequests = 0;
   let casDeleteRequests = 0;
+  // Issue #225: applies the next `i`/`k` request to the store exactly as
+  // normal, then destroys the connection instead of writing the `I`/`S`
+  // reply — the "primary applied it, only the ack was lost" shape a
+  // non-idempotent retry must never replay.
+  let dropAfterIncr = 0;
+  let dropAfterCas = 0;
   let clears = 0;
   let failClearReplies = 0;
   let setDelayMs = 0;
@@ -777,6 +792,16 @@ export async function startMockNode(
             const newValueBytes = Buffer.from(String(BigInt(existingText) + BigInt(delta)), "ascii");
             targetStore.set(key, newValueBytes);
 
+            // Issue #225: the increment above already landed in the
+            // store — dropping the connection here, instead of replying,
+            // is exactly the "applied, ack lost" case a retry must not
+            // replay.
+            if (dropAfterIncr > 0) {
+              dropAfterIncr--;
+              socket.destroy();
+              break;
+            }
+
             const ttlSeconds = ttlsFor(namespace).get(key) ?? 0;
             const ttlField = ttlSeconds > 0 ? ` ${ttlSeconds}` : "";
             socket.write(Buffer.concat([Buffer.from(`I ${newValueBytes.length}${ttlField}${tag}\n`), newValueBytes]));
@@ -843,6 +868,14 @@ export async function startMockNode(
             if (ttlSeconds > 0) ttlsFor(namespace).set(key, ttlSeconds);
             else ttlsFor(namespace).delete(key);
             lastSetTtl = ttlSeconds;
+
+            // Issue #225: same "applied, ack lost" shape as `i` above.
+            if (dropAfterCas > 0) {
+              dropAfterCas--;
+              socket.destroy();
+              break;
+            }
+
             socket.write(`S${tag}\n`);
             break;
           }
@@ -985,6 +1018,12 @@ export async function startMockNode(
     },
     swallowGetOnce: () => {
       swallowedGets++;
+    },
+    dropAfterIncrOnce: () => {
+      dropAfterIncr++;
+    },
+    dropAfterCasOnce: () => {
+      dropAfterCas++;
     },
     answerMalformedValueOnce: () => {
       malformedValueReplies++;
