@@ -3768,8 +3768,13 @@ async fn refan_incr(
 /// the primary just did. Only once the primary's condition holds is the
 /// resulting *value* fanned out to the remaining owners as a plain `Set`
 /// (`fan_out_write_result`, shared with `INCR` — see its own doc
-/// comment). A primary `W` or transport failure re-runs the whole thing
-/// on the refreshed ring (`refan_cas_set`), same as `finish_incr`.
+/// comment). A primary `W` re-runs the whole thing on the refreshed ring
+/// (`refan_cas_set`), same as `finish_incr`. A transport failure only
+/// does the same when the frame provably never reached the wire — like
+/// `INCR`, `k` is not idempotent (its condition can flip between
+/// attempts), so once the frame may have reached the primary, replaying
+/// it risks a double-apply and is surfaced to the client instead (issue
+/// #293, mirrors #272's fix for `INCR`) — see the `Err` arm below.
 async fn finish_cas_set(
     context: &ProxyContext,
     // `(namespace, key)`, grouped to stay under clippy's argument-count
@@ -3793,14 +3798,26 @@ async fn finish_cas_set(
             force_refresh(context).await;
             refan_cas_set(context, address, write, tag, retry_capable).await
         }
-        Err(_) => refan_cas_set(context, address, write, tag, retry_capable).await,
+        // Issue #293: only safe to retry when the frame provably never
+        // reached the backend socket (`request_not_sent`) — same guard
+        // `finish_incr` applies for #272. Once the frame may have
+        // reached the wire, retrying risks a double-apply (e.g.
+        // re-satisfying an "absent" condition against a value the first
+        // attempt already wrote), so this surfaces `Fatal` instead
+        // (softened to a per-request `R` for a retry-capable client —
+        // the client's own choice whether to re-issue the CAS).
+        Err(error) if request_not_sent(&error) => {
+            refan_cas_set(context, address, write, tag, retry_capable).await
+        }
+        Err(_) => Err(Fatal),
         Ok(_) => Err(Fatal),
     }
 }
 
-/// `finish_cas_set`'s retry path for both a primary `W` and a transport
-/// failure: re-fetches the current ring and runs the whole compare-and-set
-/// (primary leg, then the replica fan-out) again via `call`.
+/// `finish_cas_set`'s retry path for both a primary `W` and a
+/// request-not-sent transport failure: re-fetches the current ring and
+/// runs the whole compare-and-set (primary leg, then the replica
+/// fan-out) again via `call`.
 async fn refan_cas_set(
     context: &ProxyContext,
     address: (&[u8], &[u8]),
@@ -3839,7 +3856,8 @@ async fn refan_cas_set(
 /// `x`'s completion — same shape as `finish_cas_set`, but the successful
 /// result is a deletion: fanned out to replicas as a plain `Delete`,
 /// never `x` itself, for the same reason `k`'s result is fanned out as a
-/// plain `Set`.
+/// plain `Set`. Retry-on-transport-failure carries the same #293 guard
+/// as `finish_cas_set` — see its doc comment and the `Err` arm below.
 async fn finish_cas_delete(
     context: &ProxyContext,
     address: (&[u8], &[u8]),
@@ -3860,7 +3878,15 @@ async fn finish_cas_delete(
             force_refresh(context).await;
             refan_cas_delete(context, address, expected_digest, tag, retry_capable).await
         }
-        Err(_) => refan_cas_delete(context, address, expected_digest, tag, retry_capable).await,
+        // Issue #293: same `request_not_sent` guard as `finish_cas_set`
+        // — once the `x` frame may have reached the wire, retrying risks
+        // double-applying the delete (e.g. re-satisfying a digest
+        // condition against a value a concurrent write has since put
+        // back), so this surfaces `Fatal` instead.
+        Err(error) if request_not_sent(&error) => {
+            refan_cas_delete(context, address, expected_digest, tag, retry_capable).await
+        }
+        Err(_) => Err(Fatal),
         Ok(_) => Err(Fatal),
     }
 }
@@ -3893,7 +3919,7 @@ async fn fan_out_delete_result(
 }
 
 /// `finish_cas_delete`'s retry path for both a primary `W` and a
-/// transport failure.
+/// request-not-sent transport failure.
 async fn refan_cas_delete(
     context: &ProxyContext,
     address: (&[u8], &[u8]),
@@ -4768,6 +4794,14 @@ mod tests {
         /// before ever touching the store). Proves a retry after this
         /// must not resend `i` and double-apply the delta.
         close_after_incr_apply_once: Arc<AtomicBool>,
+        /// Issue #293: same idea as `close_after_incr_apply_once`, but
+        /// for the next `k` (CAS set) request — applies it to the store,
+        /// then drops the connection instead of sending the `S`/`N`
+        /// reply. Proves a retry after this must not resend `k` and
+        /// re-evaluate (and possibly re-satisfy) the condition.
+        close_after_cas_set_apply_once: Arc<AtomicBool>,
+        /// Issue #293: same idea, for the next `x` (CAS delete) request.
+        close_after_cas_delete_apply_once: Arc<AtomicBool>,
         get_delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         /// Issue #110: set when a request was already buffered before
@@ -4799,6 +4833,8 @@ mod tests {
                 wrong_node_once: Arc::new(AtomicBool::new(false)),
                 close_once: Arc::new(AtomicBool::new(false)),
                 close_after_incr_apply_once: Arc::new(AtomicBool::new(false)),
+                close_after_cas_set_apply_once: Arc::new(AtomicBool::new(false)),
+                close_after_cas_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
                 saw_pipelined: Arc::new(AtomicBool::new(false)),
@@ -4812,6 +4848,9 @@ mod tests {
             let wrong_once = Arc::clone(&node.wrong_node_once);
             let close_once = Arc::clone(&node.close_once);
             let close_after_incr_apply_once = Arc::clone(&node.close_after_incr_apply_once);
+            let close_after_cas_set_apply_once = Arc::clone(&node.close_after_cas_set_apply_once);
+            let close_after_cas_delete_apply_once =
+                Arc::clone(&node.close_after_cas_delete_apply_once);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
             let saw_pipelined = Arc::clone(&node.saw_pipelined);
@@ -4832,6 +4871,12 @@ mod tests {
                             wrong_once: Arc::clone(&wrong_once),
                             close_once: Arc::clone(&close_once),
                             close_after_incr_apply_once: Arc::clone(&close_after_incr_apply_once),
+                            close_after_cas_set_apply_once: Arc::clone(
+                                &close_after_cas_set_apply_once,
+                            ),
+                            close_after_cas_delete_apply_once: Arc::clone(
+                                &close_after_cas_delete_apply_once,
+                            ),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
                             saw_pipelined: Arc::clone(&saw_pipelined),
@@ -4877,6 +4922,8 @@ mod tests {
         wrong_once: Arc<AtomicBool>,
         close_once: Arc<AtomicBool>,
         close_after_incr_apply_once: Arc<AtomicBool>,
+        close_after_cas_set_apply_once: Arc<AtomicBool>,
+        close_after_cas_delete_apply_once: Arc<AtomicBool>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
         saw_pipelined: Arc<AtomicBool>,
@@ -4906,6 +4953,8 @@ mod tests {
             wrong_once,
             close_once,
             close_after_incr_apply_once,
+            close_after_cas_set_apply_once,
+            close_after_cas_delete_apply_once,
             delay,
             auth_count,
             saw_pipelined,
@@ -5223,6 +5272,14 @@ mod tests {
                         };
                         if condition_holds {
                             store.lock().unwrap().insert((namespace, key), value);
+                            // Issue #293: the store is already updated
+                            // above — closing here instead of replying
+                            // simulates the reply being lost after the
+                            // node executed the CAS, proving a retry
+                            // must not resend `k`.
+                            if close_after_cas_set_apply_once.swap(false, Ordering::SeqCst) {
+                                return Ok(());
+                            }
                             stream
                                 .write_all(format!("S {}\n", tag(&fields)).as_bytes())
                                 .await?;
@@ -5257,6 +5314,12 @@ mod tests {
                             .is_some_and(|value| mock_content_digest(value) == cond);
                         if condition_holds {
                             store.lock().unwrap().remove(&(namespace, key));
+                            // Issue #293: same "applied, then reply
+                            // lost" simulation as the `k` arm above, for
+                            // `x`.
+                            if close_after_cas_delete_apply_once.swap(false, Ordering::SeqCst) {
+                                return Ok(());
+                            }
                             stream
                                 .write_all(format!("D {}\n", tag(&fields)).as_bytes())
                                 .await?;
@@ -6992,6 +7055,252 @@ mod tests {
         assert_eq!(replica.cas_deletes(), 0);
         assert_eq!(primary.entry(b"", b"name"), None);
         assert_eq!(replica.entry(b"", b"name"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_set_never_replays_once_the_primary_may_have_applied_it() {
+        // Issue #293: same proof as
+        // `incr_never_replays_once_the_primary_may_have_applied_it` (#272),
+        // for `k`. The primary applies the CAS but the reply is lost
+        // (`close_after_cas_set_apply_once` — the connection drops after
+        // the store update, before the `S` reply is written). A naive
+        // retry would resend `k` and could double-apply the operation
+        // against a condition that has since changed; the fix surfaces
+        // an error to the client instead. Proven two ways: the node's
+        // `cas_sets` counter stops at 1 (no replayed `k` frame), and the
+        // stored value reflects exactly one application.
+        // R=1: only one of the two nodes owns "name" — determine which
+        // (same reasoning as `a_cas_results_fan_out_never_replays_the_operation_on_a_replica`)
+        // so the close-after-apply knob is armed on whichever one the
+        // ring actually routes the CAS to.
+        let (nodes, proxy) = cluster(1).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            1,
+        );
+        let primary_addr = ring.owners(b"", b"name")[0].clone();
+        let node = if primary_addr == nodes[0].addr {
+            &nodes[0]
+        } else {
+            &nodes[1]
+        };
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+        stream.write_all(b"S 4 5 1\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+
+        let alice_digest = mock_content_digest(b"Alice");
+        node.close_after_cas_set_apply_once
+            .store(true, Ordering::SeqCst);
+        stream
+            .write_all(format!("k 0 4 3 {alice_digest} 2\nnameBob").as_bytes())
+            .await
+            .unwrap();
+        // A tagged, retry-capable client gets the per-request `R` — a
+        // successful `S` here (or a bare connection close) would mean
+        // the fix regressed: either the double-apply happened silently,
+        // or the caller lost the ability to tell "may have been
+        // applied" from "definitely wasn't".
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 2");
+
+        assert_eq!(
+            node.cas_sets(),
+            1,
+            "the lost-reply attempt must not be replayed onto the primary"
+        );
+        assert_eq!(
+            node.entry(b"", b"name"),
+            Some(b"Bob".to_vec()),
+            "the CAS must be applied exactly once"
+        );
+
+        // The connection survived (retry-capable): a fresh CAS still
+        // works and observes the single applied write.
+        let bob_digest = mock_content_digest(b"Bob");
+        stream
+            .write_all(format!("k 0 4 5 {bob_digest} 3\nnameCarol").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 3");
+        assert_eq!(node.entry(b"", b"name"), Some(b"Carol".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_delete_never_replays_once_the_primary_may_have_applied_it() {
+        // Same proof as `cas_set_never_replays_once_the_primary_may_have_applied_it`,
+        // for `x`.
+        let (nodes, proxy) = cluster(1).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            1,
+        );
+        let primary_addr = ring.owners(b"", b"name")[0].clone();
+        let node = if primary_addr == nodes[0].addr {
+            &nodes[0]
+        } else {
+            &nodes[1]
+        };
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+        stream.write_all(b"S 4 5 1\nnameAlice").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+
+        let alice_digest = mock_content_digest(b"Alice");
+        node.close_after_cas_delete_apply_once
+            .store(true, Ordering::SeqCst);
+        stream
+            .write_all(format!("x 0 4 {alice_digest} 2\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 2");
+
+        assert_eq!(
+            node.cas_deletes(),
+            1,
+            "the lost-reply attempt must not be replayed onto the primary"
+        );
+        assert_eq!(
+            node.entry(b"", b"name"),
+            None,
+            "the delete must be applied exactly once"
+        );
+
+        // The connection survived (retry-capable): a fresh write/delete
+        // cycle still works.
+        stream.write_all(b"S 4 3 3\nnameBob").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 3");
+        let bob_digest = mock_content_digest(b"Bob");
+        stream
+            .write_all(format!("x 0 4 {bob_digest} 4\nname").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D 4");
+        assert_eq!(node.entry(b"", b"name"), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_set_retries_in_full_when_the_request_was_never_sent() {
+        // Issue #293: the flip side of
+        // `cas_set_never_replays_once_the_primary_may_have_applied_it`
+        // above — when `pending` fails with the `request_not_sent`
+        // marker (the frame provably never reached the backend's
+        // socket, e.g. `enqueue`'s own dial-backoff fast-fail),
+        // `finish_cas_set` must still retry the whole CAS via
+        // `refan_cas_set`, exactly as `finish_incr` does for #272.
+        // Driving `finish_cas_set` directly with a synthetic
+        // not-sent failure isolates that guard deterministically —
+        // proven by the retry reaching the real node and landing the
+        // write.
+        let node = MockNode::start().await;
+        let ring = Arc::new(RingView::new(
+            vec![("node-a".to_string(), node.addr.clone())],
+            1,
+        ));
+        let context = ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(Some(ring)).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        let pending: PendingReply = PendingReply::failed(not_sent(io::Error::other(
+            "simulated: never reached the wire",
+        )));
+        let outcome = finish_cas_set(
+            &context,
+            (b"", b"name"),
+            (CasCondition::Absent, b"Alice", None),
+            vec![node.addr.clone()],
+            pending,
+            None,
+            false,
+        )
+        .await;
+
+        match outcome {
+            Ok(bytes) => assert_eq!(bytes, respond("S", None)),
+            Err(_) => {
+                panic!("a request_not_sent failure must still retry the CAS, not surface Fatal")
+            }
+        }
+        assert_eq!(node.entry(b"", b"name"), Some(b"Alice".to_vec()));
+        assert_eq!(
+            node.cas_sets(),
+            1,
+            "exactly one `k` frame must reach the node — the retry, not a replay"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cas_delete_retries_in_full_when_the_request_was_never_sent() {
+        // Same proof as `cas_set_retries_in_full_when_the_request_was_never_sent`,
+        // for `x`/`finish_cas_delete`.
+        let node = MockNode::start().await;
+        let ring = Arc::new(RingView::new(
+            vec![("node-a".to_string(), node.addr.clone())],
+            1,
+        ));
+        let context = ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(Some(ring)).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        // Seed the node directly so the CAS delete's digest condition
+        // holds once the retry reaches it.
+        node.store
+            .lock()
+            .unwrap()
+            .insert((b"".to_vec(), b"name".to_vec()), b"Alice".to_vec());
+        let expected_digest = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(b"Alice");
+            let mut digest = [0u8; 16];
+            digest.copy_from_slice(&hash[..16]);
+            digest
+        };
+
+        let pending: PendingReply = PendingReply::failed(not_sent(io::Error::other(
+            "simulated: never reached the wire",
+        )));
+        let outcome = finish_cas_delete(
+            &context,
+            (b"", b"name"),
+            expected_digest,
+            vec![node.addr.clone()],
+            pending,
+            None,
+            false,
+        )
+        .await;
+
+        match outcome {
+            Ok(bytes) => assert_eq!(bytes, respond("D", None)),
+            Err(_) => panic!(
+                "a request_not_sent failure must still retry the CAS delete, not surface Fatal"
+            ),
+        }
+        assert_eq!(node.entry(b"", b"name"), None);
+        assert_eq!(
+            node.cas_deletes(),
+            1,
+            "exactly one `x` frame must reach the node — the retry, not a replay"
+        );
     }
 
     // ── issue #177: concurrent fan-out, dial backoff, failed-primary skip ──
