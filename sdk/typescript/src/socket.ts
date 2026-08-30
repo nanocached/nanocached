@@ -54,6 +54,15 @@ export async function connectSocket(options: ConnectSocketOptions): Promise<Sock
         })
       : netConnect({ host: options.host, port: options.port });
 
+    // Disable Nagle's algorithm (issue #301): every other SDK, the
+    // server, the proxy, and discovery all disable it explicitly — left
+    // on, small request/response frames (the common case for this
+    // protocol) can sit buffered for up to Nagle's own delay before
+    // going out, adding latency this client has no way to work around.
+    // `TLSSocket.setNoDelay` forwards to the underlying plaintext
+    // socket, so this applies on both paths regardless of `tls`.
+    socket.setNoDelay(true);
+
     socket.once("error", onError);
     socket.once(options.tls ? "secureConnect" : "connect", () => {
       clearTimeout(timer);
