@@ -1418,6 +1418,15 @@ impl NanocachedClient {
         self.inner.hedged_reads.lock().await.len()
     }
 
+    /// Number of per-address reconnect-cooldown entries currently held
+    /// (issue #296). Public-but-hidden purely as a test hook to observe
+    /// that a departed proxy's entry does not linger forever after a
+    /// proxy-mode failover swaps the pinned address.
+    #[doc(hidden)]
+    pub async fn reconnect_cooldowns_len(&self) -> usize {
+        self.inner.reconnect_cooldowns.lock().await.len()
+    }
+
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<String>> {
         match self.get_bytes(key).await? {
             Some(bytes) => Ok(Some(decode_utf8_value(bytes)?)),
@@ -3650,14 +3659,35 @@ impl NanocachedClient {
             connection.close();
             return;
         }
-        if let Target::Single {
+        let departed_address = if let Target::Single {
             address: current_address,
             connection: current_connection,
         } = &mut state.target
         {
             current_connection.close();
-            *current_address = address;
+            let departed = std::mem::replace(current_address, address);
             *current_connection = connection;
+            Some(departed)
+        } else {
+            None
+        };
+        drop(state);
+
+        // Issue #296: the address just abandoned by this swap is never
+        // dialed again through this client's own redial path (proxy mode
+        // pins to exactly one address at a time), so a reconnect-cooldown
+        // entry left behind for it — set if the same-address redial that
+        // triggered this failover had failed — would otherwise sit in
+        // `reconnect_cooldowns` forever. `refresh_node_list`'s own prune
+        // never runs here: `maybe_refresh` early-returns for
+        // `Target::Single`, which proxy mode always is. Also covers the
+        // (harmless but tidy) case where the freshly dialed address is
+        // the same one abandoned — direct proxy dials never consult this
+        // map, so an old cooldown entry for it would otherwise linger
+        // despite the address being demonstrably reachable again.
+        if let Some(departed_address) = departed_address {
+            let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
+            cooldowns.remove(&departed_address);
         }
     }
 

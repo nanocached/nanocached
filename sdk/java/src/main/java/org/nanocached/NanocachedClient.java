@@ -3754,6 +3754,7 @@ public final class NanocachedClient implements AutoCloseable {
      * than a second reconnect machine built for this mode.
      */
     private Connection reconnectProxy() {
+        String previousAddress = singleAddress;
         try {
             return dialWithCooldown(singleAddress);
         } catch (RuntimeException sameProxyFailed) {
@@ -3769,6 +3770,20 @@ public final class NanocachedClient implements AutoCloseable {
                 try {
                     Connection connection = dialWithCooldown(proxy.address());
                     singleAddress = proxy.address();
+                    // Issue #296: maybeRefresh's own cooldown prune
+                    // (refreshNodeList) never runs in proxy mode — it
+                    // early-returns while ring stays null forever — so
+                    // the entry armReconnectCooldown left behind for
+                    // previousAddress above (the same-proxy retry that
+                    // just failed) would otherwise sit in
+                    // reconnectCooldowns forever: this client's own
+                    // redial path never dials it again once singleAddress
+                    // has moved on. Only prune when the address actually
+                    // changed; dialWithCooldown already removed
+                    // proxy.address()'s own entry on this successful dial.
+                    if (!previousAddress.equals(singleAddress)) {
+                        reconnectCooldowns.remove(previousAddress);
+                    }
                     return connection;
                 } catch (RuntimeException error) {
                     lastError = error;

@@ -4466,6 +4466,57 @@ class NanocachedClientTest {
     }
 
     @Test
+    void viaProxyReconnectPurgesTheDepartedProxysCooldownEntry() throws Exception {
+        // Issue #296: maybeRefresh's own cooldown prune (refreshNodeList)
+        // never runs in proxy mode -- it early-returns while ring stays
+        // null forever -- so without reconnectProxy's own purge (added
+        // for #296) the failed same-address retry against the dead proxy
+        // below would arm a reconnectCooldowns entry that then sits in
+        // the map forever: that address is never dialed again once
+        // singleAddress has moved on to the survivor. Mirrors
+        // viaProxyReconnectsToASurvivorAfterTheConnectedProxyDies's own
+        // setup.
+        try (MockNode proxyA = new MockNode();
+                MockNode proxyB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()),
+                    new DiscoveredNode("proxy-b", proxyB.address()));
+
+            try (NanocachedClient client =
+                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                client.set("k", "v");
+
+                Field reconnectCooldownsField =
+                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                reconnectCooldownsField.setAccessible(true);
+                Map<?, ?> reconnectCooldowns = (Map<?, ?>) reconnectCooldownsField.get(client);
+                assertTrue(reconnectCooldowns.isEmpty());
+
+                MockNode connected = proxyA.connectionCount.get() > 0 ? proxyA : proxyB;
+                MockNode survivor = connected == proxyA ? proxyB : proxyA;
+                String deadAddress = connected.address();
+                connected.close(); // full teardown -- this address can never come back
+                Thread.sleep(50); // let the failure land
+
+                // Retries the dead proxy first (arming its cooldown entry
+                // on failure), then re-fetches Q and lands on the
+                // survivor -- transparently, within this one call.
+                assertEquals(Optional.empty(), client.get("k2"));
+                assertTrue(survivor.connectionCount.get() >= 1,
+                        "the survivor must have been dialed after reconnect");
+
+                // The swap must have purged the dead proxy's
+                // now-unreachable-forever cooldown entry rather than
+                // leaving it behind.
+                assertTrue(reconnectCooldowns.keySet().stream().noneMatch(deadAddress::equals),
+                        "a departed proxy's reconnect-cooldown entry must not linger "
+                                + "after a proxy-mode failover swap");
+            }
+        }
+    }
+
+    @Test
     void viaProxyIgnoresReadHedgeAfterAndSendsASingleGet() throws Exception {
         try (MockNode proxy = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {

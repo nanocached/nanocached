@@ -3172,6 +3172,21 @@ public sealed class NanocachedClient : IDisposable
             (Connection connection, string newAddress) =
                 await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
             lock (_stateLock) { _singleAddress = newAddress; }
+
+            // Issue #296: MaybeRefreshAsync's own cooldown prune
+            // (RefreshNodeListAsync) never runs in proxy mode — it
+            // early-returns while _ring stays null forever — so the
+            // entry ArmReconnectCooldown left behind for `address` above
+            // (the same-proxy retry that just failed) would otherwise sit
+            // in _reconnectCooldowns forever: this client's own redial
+            // path never dials it again once _singleAddress has moved on.
+            // Unconditional, not gated on newAddress != address:
+            // ConnectToAnyProxyAsync dials candidates directly, bypassing
+            // _reconnectCooldowns entirely, so `address` could in
+            // principle be the very entry that just won this failover —
+            // in which case removing its now-stale cooldown record is
+            // exactly as correct, since it was just proven reachable.
+            _reconnectCooldowns.TryRemove(address, out _);
             return connection;
         }
     }
