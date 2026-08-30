@@ -790,18 +790,25 @@ final class Connection {
     // capped at MAX_VALUE_LENGTH above, but that alone doesn't bound the
     // reply as a whole: a node answering a 400-key multi-get with 400 ×
     // 2 MiB hits would force ~800 MB of allocation from a single reply.
-    // The client's own chunking (NanocachedClient's MAX_BATCH_KEYS, 400)
-    // never asks a single M for more keys than that, so 400 ×
-    // MAX_VALUE_LENGTH bounds any legitimate reply while still catching
-    // a malicious or buggy node. Checked before each readExactly below,
-    // the same way Identify.readNodeEntries tracks totalBytes against
-    // MAX_NODE_LIST_RESPONSE_BYTES — so an oversized claim poisons the
-    // connection before the allocation happens, not after. Mutable only
-    // so a test can shrink it and exercise the bound without actually
-    // moving hundreds of megabytes over a loopback socket, mirroring
-    // NanocachedClient's keepAliveIntervalMillis/
-    // maxInFlightBackgroundReplicaWrites.
-    static volatile long maxMultiGetResponseBytes = 400L * MAX_VALUE_LENGTH;
+    // NanocachedClient's own chunking (MAX_BATCH_KEYS, 400) never asks a
+    // single M for more keys than that, so 400 × MAX_VALUE_LENGTH
+    // (~800 MB) would still be a "faithful to the protocol's own limits"
+    // bound — but it's much too loose a defense: it lets almost the
+    // entire attack in issue #179 through unchanged. A single wire
+    // reply legitimately needing more than 64 MiB is already an
+    // unreasonable shape for one round trip — a real caller batching
+    // that much data can and should ask for it in more, smaller
+    // multi-gets — so this reuses Compression.MAX_DECOMPRESSED_LENGTH's
+    // 64 MiB cap (issue #41, shared with the other five SDKs) instead of
+    // deriving from MAX_BATCH_KEYS × MAX_VALUE_LENGTH. Checked before
+    // each readExactly below, the same way Identify.readNodeEntries
+    // tracks totalBytes against MAX_NODE_LIST_RESPONSE_BYTES — so an
+    // oversized claim poisons the connection before the allocation
+    // happens, not after. Mutable only so a test can shrink it and
+    // exercise the bound without actually moving tens of megabytes over
+    // a loopback socket, mirroring NanocachedClient's
+    // keepAliveIntervalMillis/maxInFlightBackgroundReplicaWrites.
+    static volatile long maxMultiGetResponseBytes = 64L * 1024 * 1024;
 
     // Header/tag lines (the marker line ahead of a V's body, or the whole
     // line for S/D/N/W) are always a handful of bytes in the real
