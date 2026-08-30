@@ -12,7 +12,7 @@ use std::io;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -152,10 +152,25 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// write to a migrating key at once, and each forward can run for up to
 /// `KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT` before it gives up. A
 /// generous fixed capacity keeps a burst of concurrent forwards from
-/// spilling into `spawn_forward`'s drop path under ordinary load, while
-/// still bounding the total number of forward tasks `run` will ever have
-/// in flight — see `spawn_forward` for what happens once it's full.
+/// spilling into `spawn_forward`'s waiter path (see
+/// `MAX_PENDING_FORWARD_WAITERS`) under ordinary load, while still
+/// bounding the total number of forward tasks `run` will ever have in
+/// flight at once.
 const FORWARD_CHANNEL_CAPACITY: usize = 256;
+/// Caps the number of detached "waiter" tasks `spawn_forward` may have
+/// outstanding at once — see `PENDING_FORWARD_WAITERS` and issue #219's
+/// follow-up discussion. A forward that finds `forward_tx` full is never
+/// simply dropped (that would lose the write on the joiner/entrant, the
+/// same class of silent data loss issue #176 fixed for `MultiSet`);
+/// instead a waiter task blocks on the channel's ordinary
+/// `send(...).await` in the background until a slot frees up, so the
+/// connection that triggered the forward still never blocks. This bound
+/// exists only to cap unbounded task/memory growth in the pathological
+/// case where `forward_tx` stays saturated for a long time — past it, a
+/// forward is finally dropped (logged). `4096` is generous relative to
+/// `FORWARD_CHANNEL_CAPACITY` (16x) precisely because dropping here is
+/// the fallback of last resort, not the normal backpressure path.
+const MAX_PENDING_FORWARD_WAITERS: usize = 4096;
 /// How long `run`'s accept loop pauses after an accept error worth
 /// backing off from — see `should_backoff_after_accept_error`.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -376,14 +391,21 @@ struct ConnectionConfig {
     /// `handle_connection` blocked on `send().await`, well after that
     /// connection's own write had already been acked. Splitting the
     /// channel bounds that stall to zero: `spawn_forward` sends with
-    /// `try_send`, never `.await`, so a full `forward_tx` just drops the
-    /// new forward (logged) instead of blocking the caller — consistent
-    /// with `forward_with_retries` already being best-effort (a
-    /// permanently failed forward after `KEY_TRANSFER_ATTEMPTS` is also
-    /// only logged, never propagated to the client, which already sent its
-    /// own response).
+    /// `try_send`, never `.await`, so the connection that triggered a
+    /// forward never blocks on this channel either way.
+    ///
+    /// The guarantee this channel's consumer (and `spawn_forward`) upholds
+    /// is that a forward is never silently dropped just because
+    /// `forward_tx` was momentarily full — see `spawn_forward` and
+    /// `MAX_PENDING_FORWARD_WAITERS` for how a full channel is handled
+    /// without either blocking the caller or losing the write.
     forward_tx: mpsc::Sender<MigrationTask>,
 }
+
+/// Count of `spawn_forward` waiter tasks currently blocked on
+/// `forward_tx.send(...).await`, waiting for a slot `forward_tx`'s
+/// consumer frees up — see `MAX_PENDING_FORWARD_WAITERS`.
+static PENDING_FORWARD_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Hands a per-write forward (`forward_with_retries`, wrapping a `Set`/
 /// `Delete`/`Clear` racing a migration or decommission drain) to `run`'s
@@ -396,20 +418,63 @@ struct ConnectionConfig {
 /// waiting on it is that same connection's ability to read its *next*
 /// request.
 ///
-/// A full channel (or one whose consumer is gone, e.g. `run` mid-shutdown)
-/// drops the forward instead of queuing it. That's a deliberate
-/// best-effort trade-off, not a correctness gap: `forward_with_retries`
-/// already tolerates — and only logs — a forward that never lands after
-/// `KEY_TRANSFER_ATTEMPTS` attempts, because the bulk transfer's own
-/// snapshot and the `forwarding_grace` window are what actually guarantee
-/// the migrating key converges; concurrent-write forwarding only shrinks
-/// the gap during which a stale read is possible.
-fn spawn_forward(config: &ConnectionConfig, task: MigrationTask) {
-    if config.forward_tx.try_send(task).is_err() {
-        eprintln!(
-            "WARN dropped a concurrent write forward for a migrating key: forward_tx is full \
-             or its consumer has shut down"
-        );
+/// **Guarantee**: a forward is never dropped short of
+/// `MAX_PENDING_FORWARD_WAITERS`. Dropping a forward outright on a full
+/// channel would lose that write on the joiner/entrant — the same class
+/// of silent data loss issue #176 fixed for `MultiSet` — which is a much
+/// worse failure than merely delaying it (the old, pre-#219 shared-channel
+/// behavior did exactly that: it stalled the caller rather than dropping,
+/// just on the wrong channel). So a `TrySendError::Full` doesn't drop the
+/// task — it spawns a detached "waiter" that blocks on the channel's
+/// ordinary `send(...).await` in the background, bounded by
+/// `PENDING_FORWARD_WAITERS`/`MAX_PENDING_FORWARD_WAITERS` so a channel
+/// saturated for a long time can't grow waiter tasks (and their captured
+/// `NodeContext`/`Bytes` state) without limit. Only past that bound does a
+/// forward actually get dropped, logged with the key (or clear scope) it
+/// was for.
+///
+/// A `TrySendError::Closed` (the consumer — `run`'s own loop — is gone,
+/// e.g. mid-shutdown past the point `forward_tx` itself is dropped) is
+/// different: nothing will ever drain the channel again regardless of how
+/// long a waiter waited, so that case drops immediately without spawning
+/// one.
+fn spawn_forward(
+    config: &ConnectionConfig,
+    node_context: NodeContext,
+    target: ForwardTarget,
+    write: OwnedForwardedWrite,
+) {
+    // Computed before `write` moves into `forward_with_retries` below —
+    // only actually rendered if the rare drop path at the bottom needs it.
+    let description = write.describe();
+    let task: MigrationTask = Box::pin(forward_with_retries(node_context, target, write));
+
+    match config.forward_tx.try_send(task) {
+        Ok(()) => {}
+        // The consumer (`run`'s own loop) is gone — nothing will ever
+        // drain this channel again regardless of how long a waiter
+        // waited, so there's no point spawning one.
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(task)) => {
+            if PENDING_FORWARD_WAITERS.fetch_add(1, Ordering::SeqCst) < MAX_PENDING_FORWARD_WAITERS
+            {
+                let forward_tx = config.forward_tx.clone();
+                tokio::spawn(async move {
+                    // Best-effort: if the send itself fails (the consumer
+                    // closed the channel while this waiter was queued),
+                    // there's nothing left to do — same as the
+                    // `TrySendError::Closed` case above.
+                    let _ = forward_tx.send(task).await;
+                    PENDING_FORWARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                });
+            } else {
+                PENDING_FORWARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                eprintln!(
+                    "WARN dropped a concurrent write forward for {description}: forward_tx is \
+                     full and {MAX_PENDING_FORWARD_WAITERS} waiters are already queued behind it"
+                );
+            }
+        }
     }
 }
 
@@ -1494,11 +1559,9 @@ async fn handle_clear(
     {
         spawn_forward(
             config,
-            Box::pin(forward_with_retries(
-                node_context.clone(),
-                target,
-                OwnedForwardedWrite::Clear(scope),
-            )),
+            node_context.clone(),
+            target,
+            OwnedForwardedWrite::Clear(scope),
         );
     }
 
@@ -1996,15 +2059,13 @@ async fn handle_connection(
                             if let Some(target) = migration_target_for(node_context, &key) {
                                 spawn_forward(
                                     &config,
-                                    Box::pin(forward_with_retries(
-                                        node_context.clone(),
-                                        target,
-                                        OwnedForwardedWrite::Set {
-                                            key: key.clone(),
-                                            value: value.clone(),
-                                            ttl,
-                                        },
-                                    )),
+                                    node_context.clone(),
+                                    target,
+                                    OwnedForwardedWrite::Set {
+                                        key: key.clone(),
+                                        value: value.clone(),
+                                        ttl,
+                                    },
                                 );
                             }
 
@@ -2012,11 +2073,9 @@ async fn handle_connection(
                             if let Some(target) = leave_target_for(node_context, &key) {
                                 spawn_forward(
                                     &config,
-                                    Box::pin(forward_with_retries(
-                                        node_context.clone(),
-                                        target,
-                                        OwnedForwardedWrite::HandoffSet { key, value, ttl },
-                                    )),
+                                    node_context.clone(),
+                                    target,
+                                    OwnedForwardedWrite::HandoffSet { key, value, ttl },
                                 );
                             }
                         }
@@ -2070,15 +2129,13 @@ async fn handle_connection(
                     // `forward_with_retries`'s own doc comment for why.
                     spawn_forward(
                         &config,
-                        Box::pin(forward_with_retries(
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Set {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                            },
-                        )),
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Set {
+                            key: key.clone(),
+                            value: value.clone(),
+                            ttl,
+                        },
                     );
                 }
 
@@ -2092,15 +2149,13 @@ async fn handle_connection(
                 {
                     spawn_forward(
                         &config,
-                        Box::pin(forward_with_retries(
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffSet {
-                                key: key.clone(),
-                                value: value.clone(),
-                                ttl,
-                            },
-                        )),
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::HandoffSet {
+                            key: key.clone(),
+                            value: value.clone(),
+                            ttl,
+                        },
                     );
                 }
 
@@ -2129,11 +2184,9 @@ async fn handle_connection(
                 {
                     spawn_forward(
                         &config,
-                        Box::pin(forward_with_retries(
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Set { key, value, ttl },
-                        )),
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Set { key, value, ttl },
                     );
                 }
 
@@ -2155,11 +2208,9 @@ async fn handle_connection(
                 {
                     spawn_forward(
                         &config,
-                        Box::pin(forward_with_retries(
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Delete { key },
-                        )),
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Delete { key },
                     );
                 }
 
@@ -2183,11 +2234,9 @@ async fn handle_connection(
                 {
                     spawn_forward(
                         &config,
-                        Box::pin(forward_with_retries(
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::Delete { key: key.clone() },
-                        )),
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::Delete { key: key.clone() },
                     );
                 }
 
@@ -2198,11 +2247,9 @@ async fn handle_connection(
                 {
                     spawn_forward(
                         &config,
-                        Box::pin(forward_with_retries(
-                            node_context.clone(),
-                            target,
-                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                        )),
+                        node_context.clone(),
+                        target,
+                        OwnedForwardedWrite::HandoffDelete { key: key.clone() },
                     );
                 }
 
@@ -2243,15 +2290,13 @@ async fn handle_connection(
                     {
                         spawn_forward(
                             &config,
-                            Box::pin(forward_with_retries(
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::Set {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                },
-                            )),
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Set {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                            },
                         );
                     }
 
@@ -2260,15 +2305,13 @@ async fn handle_connection(
                     {
                         spawn_forward(
                             &config,
-                            Box::pin(forward_with_retries(
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::HandoffSet {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                },
-                            )),
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffSet {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                            },
                         );
                     }
                 }
@@ -2319,15 +2362,13 @@ async fn handle_connection(
                     {
                         spawn_forward(
                             &config,
-                            Box::pin(forward_with_retries(
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::Set {
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    ttl,
-                                },
-                            )),
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Set {
+                                key: key.clone(),
+                                value: value.clone(),
+                                ttl,
+                            },
                         );
                     }
 
@@ -2336,11 +2377,9 @@ async fn handle_connection(
                     {
                         spawn_forward(
                             &config,
-                            Box::pin(forward_with_retries(
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::HandoffSet { key, value, ttl },
-                            )),
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffSet { key, value, ttl },
                         );
                     }
                 }
@@ -2380,11 +2419,9 @@ async fn handle_connection(
                     {
                         spawn_forward(
                             &config,
-                            Box::pin(forward_with_retries(
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::Delete { key: key.clone() },
-                            )),
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::Delete { key: key.clone() },
                         );
                     }
 
@@ -2393,11 +2430,9 @@ async fn handle_connection(
                     {
                         spawn_forward(
                             &config,
-                            Box::pin(forward_with_retries(
-                                node_context.clone(),
-                                target,
-                                OwnedForwardedWrite::HandoffDelete { key: key.clone() },
-                            )),
+                            node_context.clone(),
+                            target,
+                            OwnedForwardedWrite::HandoffDelete { key: key.clone() },
                         );
                     }
                 }
@@ -4946,6 +4981,25 @@ impl OwnedForwardedWrite {
             OwnedForwardedWrite::Clear(_) => "CLEAR",
         }
     }
+
+    /// Names what this write was for, for `spawn_forward`'s WARN when it
+    /// must actually drop a forward past `MAX_PENDING_FORWARD_WAITERS` —
+    /// enough for an operator to tell which entry (or namespace) may now
+    /// be stale on the joiner/entrant.
+    fn describe(&self) -> String {
+        match self {
+            OwnedForwardedWrite::Set { key, .. } | OwnedForwardedWrite::HandoffSet { key, .. } => {
+                format!("{} {key:?}", self.kind())
+            }
+            OwnedForwardedWrite::Delete { key } | OwnedForwardedWrite::HandoffDelete { key } => {
+                format!("{} {key:?}", self.kind())
+            }
+            OwnedForwardedWrite::Clear(ClearScope::Namespace(namespace)) => {
+                format!("CLEAR namespace {namespace:?}")
+            }
+            OwnedForwardedWrite::Clear(ClearScope::All) => "CLEAR (all namespaces)".to_string(),
+        }
+    }
 }
 
 /// The one place a forwarded write touches `ForwardTarget::connection`:
@@ -5845,8 +5899,10 @@ mod tests {
         // already been stored and acked locally, and its `S`/`D` response
         // already written. `spawn_forward` now hands per-write forwards
         // to a dedicated `forward_tx` via `try_send`, never `.await`, so
-        // a full channel just drops the new forward (logged) instead of
-        // blocking the connection that triggered it.
+        // the connection that triggered a forward is never the one
+        // blocked on this channel — see the follow-up below for what a
+        // full channel does instead (spawn a background waiter rather
+        // than drop the forward outright).
         //
         // This fills a tiny `forward_tx` with real `forward_with_retries`
         // calls to a peer that accepts but never responds — genuinely
@@ -5857,7 +5913,10 @@ mod tests {
         // then writes to the same migrating key; before this fix that
         // write's own response would never arrive because
         // `handle_connection` would still be blocked trying to enqueue
-        // its forward.
+        // its forward. See
+        // `a_forward_queued_behind_a_full_channel_still_reaches_the_peer_once_drained`
+        // for proof that this connection's forward isn't lost either —
+        // only this test's own response is under scrutiny here.
         let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stalled_addr = stalled_listener.local_addr().unwrap().to_string();
         let stalled_task = tokio::spawn(async move {
@@ -5907,7 +5966,7 @@ mod tests {
         // A dedicated forward channel, deliberately tiny (capacity 2) and
         // with nothing draining it in this test — the worst case
         // `spawn_forward` must tolerate.
-        let (forward_tx, _forward_rx) = mpsc::channel::<MigrationTask>(2);
+        let (forward_tx, forward_rx) = mpsc::channel::<MigrationTask>(2);
         for name in [b"already-stalled-1".as_slice(), b"already-stalled-2"] {
             forward_tx
                 .try_send(Box::pin(forward_with_retries(
@@ -5965,6 +6024,149 @@ mod tests {
         drop(request_tx);
         cache_task.await.unwrap();
         stalled_task.abort();
+
+        // This connection's own `Set` forward found `forward_tx` already
+        // full too, so `spawn_forward` spawned a background waiter for it
+        // (see `spawn_forward` and `PENDING_FORWARD_WAITERS`) rather than
+        // simply dropping it. Nothing in this test ever drains
+        // `forward_rx`, so that waiter is still blocked on its own
+        // `send(...).await`; dropping the receiver now closes the
+        // channel, which resolves that blocked send with an error and
+        // lets the waiter task finish (decrementing
+        // `PENDING_FORWARD_WAITERS`) instead of leaking for the rest of
+        // this test binary's process.
+        drop(forward_rx);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forward_queued_behind_a_full_channel_still_reaches_the_peer_once_drained() {
+        // Issue #219 follow-up: a full `forward_tx` must not simply drop
+        // the new forward — that would lose the write on the joiner/
+        // entrant, the same class of silent data loss issue #176 fixed
+        // for `MultiSet`. `spawn_forward` instead spawns a detached
+        // "waiter" that blocks on the channel's own `send(...).await`
+        // until a slot frees up. This proves the write is eventually
+        // *delivered* once something (here, standing in for `run`'s own
+        // loop) actually drains the channel — the companion test
+        // `a_full_forward_channel_does_not_block_a_write_on_another_connection`
+        // only proves the caller itself never blocks; it doesn't prove
+        // the forward survives.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0);
+            connection.write_all(b"S\n").await.unwrap();
+            buffer[..bytes_read].to_vec()
+        });
+
+        // Two members, R=2: the joiner is in every key's top-R regardless
+        // of hash, so a `Set` for any key forwards.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: joining_addr.clone(),
+                after_ring,
+                replication: 2,
+                completed_at: None,
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: None,
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: Vec::new(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+        };
+
+        // Capacity 1, occupied by an inert filler that's never polled —
+        // it just holds the one slot until this test explicitly drains
+        // it below, standing in for `run`'s own consumer being busy or
+        // temporarily unavailable.
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(1);
+        forward_tx
+            .try_send(Box::pin(std::future::pending()))
+            .expect("capacity 1, channel starts empty");
+
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+
+        // This `Set` finds `forward_tx` already full, so `spawn_forward`
+        // spawns a waiter for it rather than dropping it.
+        client.write_all(b"S 4 5\nnameAlice").await.unwrap();
+        let expected = b"S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        client.shutdown().await.unwrap();
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+
+        // Give the waiter a chance to actually reach `send(...).await`
+        // and register itself against the still-full channel.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        // Drain the one slot (standing in for `run`'s own loop) — the
+        // inert filler comes out first (FIFO), freeing the slot the
+        // waiter is blocked on.
+        let filler = forward_rx.recv().await.unwrap();
+        drop(filler);
+
+        // The waiter's blocked `send` can now complete; drain again to
+        // get the real forward and run it to actually deliver it to the
+        // peer.
+        let forward = tokio::time::timeout(Duration::from_secs(2), forward_rx.recv())
+            .await
+            .expect("the waiter must eventually enqueue the forward once a slot frees up")
+            .expect("forward_tx's sender is still alive — the waiter task still holds a clone");
+        forward.await;
+
+        let received = joining_task.await.unwrap();
+        assert_eq!(
+            received,
+            set_message(&key(b"name"), b"Alice", None),
+            "a forward queued behind a full channel must still reach the peer once drained, \
+             not be dropped"
+        );
     }
 
     /// Issue #124 helper: one plain HTTP GET, returning (status line,
