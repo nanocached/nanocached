@@ -227,7 +227,20 @@ func open(address string, tlsConfig *tls.Config, deadline time.Time) (net.Conn, 
 			config.ServerName = host
 		}
 	}
-	return tls.DialWithDialer(&dialer, "tcp", address, config)
+	conn, err := tls.DialWithDialer(&dialer, "tcp", address, config)
+	if err != nil {
+		return nil, err
+	}
+	// Same reasoning as the plaintext path above: small request/response
+	// frames pay Nagle's-algorithm latency unless nodelay is set. The
+	// *tls.Conn wraps the raw *net.TCPConn rather than being one, so the
+	// type assertion above can't reach it directly; NetConn() (Go 1.18+,
+	// well under this module's go 1.22 floor) unwraps to the underlying
+	// net.Conn so we can set nodelay on it here too.
+	if tcp, ok := conn.NetConn().(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
+	return conn, nil
 }
 
 // identify runs the `A` handshake on conn. probe (issue #47's echoed

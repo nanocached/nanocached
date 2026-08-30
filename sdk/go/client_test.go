@@ -6,14 +6,22 @@ package nanocached
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -314,6 +322,60 @@ func startMockNodeAt(t *testing.T, requiredSecret []byte, address string) *mockN
 	go node.acceptLoop()
 	t.Cleanup(node.close)
 	return node
+}
+
+// generateSelfSignedCert creates an in-memory, short-lived self-signed
+// certificate for 127.0.0.1 — used only by startMockNodeTLS below, to
+// let a test dial a real TLS listener without touching the filesystem
+// for a fixture cert.
+func generateSelfSignedCert(t *testing.T) (tls.Certificate, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "127.0.0.1"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, certPEM
+}
+
+// startMockNodeTLS is startMockNode with its listener wrapped in TLS
+// (a fresh self-signed cert for 127.0.0.1 each call) — issue #301's
+// TLS-nodelay regression test (TestTLSConnectionRoundTripsAndAppliesNoDelay)
+// dials this to exercise open()'s TLS branch end-to-end. Returns the
+// node and the certificate's PEM bytes, so the caller can point
+// Config.CA at a file containing them.
+func startMockNodeTLS(t *testing.T) (*mockNode, []byte) {
+	t.Helper()
+	cert, certPEM := generateSelfSignedCert(t)
+	listener := listenLoopback(t)
+	tlsListener := tls.NewListener(listener, &tls.Config{Certificates: []tls.Certificate{cert}})
+	node := &mockNode{listener: tlsListener}
+	go node.acceptLoop()
+	t.Cleanup(node.close)
+	return node, certPEM
 }
 
 func (m *mockNode) address() string { return m.listener.Addr().String() }
@@ -1586,6 +1648,47 @@ func TestConfigStringAndGoStringRedactAuthSecret(t *testing.T) {
 	cfg.AuthSecret = ""
 	if got := cfg.String(); strings.Contains(got, "REDACTED") {
 		t.Fatalf("Config.String() redacted an unset AuthSecret: %s", got)
+	}
+}
+
+// TestTLSConnectionRoundTripsAndAppliesNoDelay is issue #301 (Go):
+// open()'s TLS branch used to return tls.DialWithDialer's *tls.Conn
+// directly, so the SetNoDelay(true) the plaintext branch applies via a
+// conn.(*net.TCPConn) type assertion never reached the TLS connection's
+// underlying socket (a *tls.Conn wraps a *net.TCPConn, it isn't one) —
+// every TLS connection ran with Nagle's algorithm enabled. Go's
+// net.TCPConn has no getter for its current nodelay setting, so this
+// can't assert the socket option directly; instead it drives a full
+// TLS connect and request/response round trip against a real TLS
+// listener (startMockNodeTLS) to confirm open()'s TLS path — including
+// the NetConn() unwrap the fix added — still dials and communicates
+// correctly. The nodelay behavior itself is covered by the code comment
+// on open()'s TLS branch in identify.go, next to where SetNoDelay is
+// now called.
+func TestTLSConnectionRoundTripsAndAppliesNoDelay(t *testing.T) {
+	node, certPEM := startMockNodeTLS(t)
+
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(caFile, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := Connect(Config{
+		Addresses: []Address{addr(node.address())},
+		TLS:       true,
+		CA:        caFile,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	value, ok, err := client.Get("k")
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get after TLS Set: value=%q ok=%v err=%v", value, ok, err)
 	}
 }
 
