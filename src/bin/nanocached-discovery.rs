@@ -243,6 +243,27 @@ const MAX_CONNECTIONS_PER_IP: usize = 256;
 /// will refuse to even parse.
 const MAX_REGISTRY_SIZE: usize = 1 << 16;
 
+/// Issue #299: caps how many outbound connect attempts a fan-out over the
+/// registry (`try_begin_next_join` sending `M` to every `Joined` node at
+/// once on join start; `abandon_current_join` sending `X` to every ready
+/// member of `PendingJoin::expected` at once on abandon) may have in
+/// flight at the same time. In a no-auth deployment, `P` registers into
+/// `Joined` gated only by `ANNOUNCE_INSERT_COOLDOWN` (a 2s per-source-IP
+/// cooldown), up to `MAX_REGISTRY_SIZE` (65536) entries — nothing stops an
+/// attacker rotating source IPs from inflating the registry that far.
+/// Without a bound here, the next legitimate `J`/`V` fans a `JoinSet` out
+/// to every one of those entries concurrently, opening that many
+/// simultaneous outbound connects well before `MAX_REGISTRY_SIZE` itself
+/// is the limiting factor — exhausting file descriptors (a typical ulimit
+/// is 1024) long before a real cluster would ever approach that size. This
+/// only throttles how many sends are actually dialing at once (via a
+/// `Semaphore` each spawned task acquires before dialing) — every node is
+/// still contacted and every result is still collected exactly as before;
+/// see "bound everything that waits". Comfortably above any real
+/// migration/abandon fan-out width (a legitimate cluster's node count),
+/// so normal operation never notices it.
+const MAX_FANOUT_CONCURRENCY: usize = 64;
+
 /// Issue #122: bound on registered proxies — a fleet has orders of
 /// magnitude fewer proxies than clients, so this is generous, and it
 /// keeps a secret-holder from growing the proxy map without bound.
@@ -1890,6 +1911,11 @@ async fn try_begin_next_join(
     );
 
     let mut sends = JoinSet::new();
+    // Issue #299: bounds how many of these `M` sends are dialing out at
+    // once — see `MAX_FANOUT_CONCURRENCY`'s own doc comment. Every ready
+    // node is still spawned and still contacted; a permit just gates when
+    // each spawned task's own dial actually starts.
+    let fanout_limit = Arc::new(Semaphore::new(MAX_FANOUT_CONCURRENCY));
 
     for (ready_name, ready_addr) in joined.iter().cloned() {
         let auth_secret = auth_secret.clone();
@@ -1900,8 +1926,13 @@ async fn try_begin_next_join(
         // Every `Joined` node in `joined` was captured with its token in the
         // same lock scope, so this lookup is always present.
         let ready_token = ready_tokens.get(&ready_name).cloned().unwrap_or_default();
+        let fanout_limit = Arc::clone(&fanout_limit);
 
         sends.spawn(async move {
+            let _permit = fanout_limit
+                .acquire_owned()
+                .await
+                .expect("fanout_limit semaphore is never closed");
             let result = send_migrate_with_retry(
                 &ready_token,
                 &ready_name,
@@ -2688,13 +2719,23 @@ async fn abandon_current_join(
     };
 
     let mut sends = JoinSet::new();
+    // Issue #299: bounds how many of these `X` sends are dialing out at
+    // once — see `MAX_FANOUT_CONCURRENCY`'s own doc comment. Every ready
+    // member is still spawned and still contacted; a permit just gates
+    // when each spawned task's own dial actually starts.
+    let fanout_limit = Arc::new(Semaphore::new(MAX_FANOUT_CONCURRENCY));
 
     for (ready_name, ready_addr, ready_token) in ready_addrs {
         let auth_secret = auth_secret.clone();
         let tls_connector = tls_connector.clone();
         let joining_name = pending.joining_name.clone();
+        let fanout_limit = Arc::clone(&fanout_limit);
 
         sends.spawn(async move {
+            let _permit = fanout_limit
+                .acquire_owned()
+                .await
+                .expect("fanout_limit semaphore is never closed");
             let result = send_cancel(
                 &ready_token,
                 &ready_addr,
@@ -7781,6 +7822,82 @@ mod tests {
         let error = result.expect_err("expected the silent node to time the ack read out");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandon_current_join_fans_out_to_more_ready_members_than_the_concurrency_cap() {
+        // Regression for issue #299: MAX_FANOUT_CONCURRENCY bounds how many
+        // of `abandon_current_join`'s `X` (cancel) sends may be dialing
+        // out at once, but every ready member must still be contacted and
+        // the join must still finish being abandoned — not stall, and not
+        // silently drop members once there are more of them than the
+        // concurrency cap allows in flight at once.
+        let member_count = MAX_FANOUT_CONCURRENCY + 20;
+
+        // A port nothing is listening on: every dial fails fast
+        // (connection refused) instead of hanging, so this stays fast even
+        // spread over more than one batch of MAX_FANOUT_CONCURRENCY.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let registry: Registry = Arc::new(RegistryState::default());
+        let mut expected = HashMap::new();
+        {
+            let mut guard = lock(&registry);
+            for i in 0..member_count {
+                let name = format!("ready-{i}");
+                let token = format!("tk-{i}");
+                guard.insert(
+                    name.clone(),
+                    NodeInfo::new(dead_addr.clone(), NodeState::Joined, token.clone()),
+                );
+                expected.insert(name, token);
+            }
+            guard.insert(
+                "joining-node".to_string(),
+                NodeInfo::new(
+                    "127.0.0.1:1".to_string(),
+                    NodeState::Joining,
+                    "tk-joining".to_string(),
+                ),
+            );
+        }
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "joining-node".to_string(),
+            expected,
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            abandon_current_join(
+                &registry,
+                &current_join,
+                &None,
+                &None,
+                2,
+                Instant::now(),
+                "test",
+            ),
+        )
+        .await
+        .expect(
+            "abandon_current_join must still finish with more ready members than \
+             MAX_FANOUT_CONCURRENCY",
+        );
+
+        assert!(
+            lock_current_join(&current_join).is_none(),
+            "the join must be fully abandoned regardless of fan-out batching"
+        );
+        assert!(
+            !lock(&registry).contains_key("joining-node"),
+            "abandon_current_join must still strand the joining node's own entry"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
