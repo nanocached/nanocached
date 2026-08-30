@@ -3141,6 +3141,116 @@ func TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames(t *testing.T) {
 	}
 }
 
+// TestAMultiGetResponseExceedingTheCumulativeByteBoundFailsAndPoisonsTheConnection
+// is a regression for issue #207, a follow-up to #179's Java fix (PR
+// #201): maxValueLength already bounds each individual hit's declared
+// length, but nothing bounded the SUM of every hit's length across one
+// `M` reply — a node answering a batch with many hits each just under
+// that per-value cap could still force hundreds of MB of allocation
+// from a single reply. Shrinks maxMultiGetResponseBytes to 3 and has a
+// raw peer answer a 2-key multi-get with `M 2 2 2\n` (two hits, each
+// declared 2 bytes — 4 total, past the shrunk bound) but sends only the
+// first hit's 2-byte body, never the second: the bound must trip on the
+// length that pushes the running total over it, before that second
+// body is ever read.
+func TestAMultiGetResponseExceedingTheCumulativeByteBoundFailsAndPoisonsTheConnection(t *testing.T) {
+	old := maxMultiGetResponseBytes
+	maxMultiGetResponseBytes = 3
+	t.Cleanup(func() { maxMultiGetResponseBytes = old })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+
+		// The `A` handshake.
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		parts := strings.Fields(header)
+		_ = mustRead(reader, atoiOrPanic(parts[1])) // the secret
+		if _, err := conn.Write([]byte("On\n")); err != nil {
+			return
+		}
+
+		// The `m` request: namespace, then two 1-byte keys.
+		header, err = reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		parts = strings.Fields(header)
+		nsLen := atoiOrPanic(parts[1])
+		count := atoiOrPanic(parts[2])
+		_ = mustRead(reader, nsLen)
+		for i := 0; i < count; i++ {
+			_ = mustRead(reader, atoiOrPanic(parts[3+i]))
+		}
+
+		// Two hits declared 2 bytes each (4 total, past the shrunk
+		// bound of 3), but only the first body is ever sent.
+		_, _ = conn.Write([]byte("M 2 2 2\nxy"))
+	}()
+
+	result, err := connectAndIdentify(listener.Addr().String(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newConnection(result.conn, func() {}, result.tagged, nil)
+	defer conn.close()
+
+	_, err = conn.multiGetNS(nil, [][]byte{[]byte("k1"), []byte("k2")})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("multiGetNS err = %v, want an error containing %q", err, "exceeds")
+	}
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("multiGetNS err = %v, want ErrProtocol", err)
+	}
+	if !conn.isClosed() {
+		t.Fatal("expected the cumulative-bytes bound to have poisoned (closed) the connection")
+	}
+}
+
+// TestAMultiGetResponseJustUnderTheCumulativeByteBoundSucceeds is the
+// complement to the regression above: a reply whose hits sum to just
+// under the (shrunk) bound must round-trip normally — the new bound
+// must never reject a legitimately-sized batch.
+func TestAMultiGetResponseJustUnderTheCumulativeByteBoundSucceeds(t *testing.T) {
+	old := maxMultiGetResponseBytes
+	maxMultiGetResponseBytes = 5
+	t.Cleanup(func() { maxMultiGetResponseBytes = old })
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k1", "ab", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set("k2", "cd", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := client.GetMany([]string{"k1", "k2"})
+	if err != nil {
+		t.Fatalf("GetMany err = %v, want success (hit lengths sum to 4, under the shrunk bound of 5)", err)
+	}
+	if got["k1"] != "ab" || got["k2"] != "cd" {
+		t.Fatalf("GetMany = %v, want {k1:ab, k2:cd}", got)
+	}
+}
+
 // ── batched get/set, cluster (issues #128/#150/#151) ─────────────────
 
 func TestClusterGetManySplitsAcrossOwnersAndReassembles(t *testing.T) {

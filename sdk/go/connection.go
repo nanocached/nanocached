@@ -29,6 +29,19 @@ import (
 // malicious frame, never just a legitimately large value.
 const maxValueLength = 2 * 1024 * 1024
 
+// maxMultiGetResponseBytes bounds the sum of every hit's declared length
+// across one `M` (multi-get) reply (issue #207, a follow-up to #179's
+// Java fix in PR #201). Each individual hit's length is already capped
+// at maxValueLength above, but that alone doesn't bound the reply as a
+// whole: a node answering a 400-key multi-get with 400 x maxValueLength
+// hits would force ~800 MB of allocation from a single reply. Reuses
+// compression.go's maxDecompressedLength figure (issue #41) rather than
+// inventing a new one. A var, not a const, only so a test can shrink it
+// and exercise the bound without actually moving tens of megabytes over
+// a loopback socket — matching requestTimeout/transientRetryDelays'
+// own test-overridable convention above.
+var maxMultiGetResponseBytes int64 = 64 * 1024 * 1024
+
 // maxHeaderLineLength caps a response header line (readLine, shared with
 // identify.go's discovery node-list headers) before it can grow without
 // bound: every real header line (`V <len> <tag>`, `S <tag>`, a discovery
@@ -973,6 +986,15 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 			}
 		}
 		results := make([]multiEntry, count)
+		// totalBytes accumulates every hit's declared length across this
+		// whole reply (issue #207) — the per-token check above already
+		// rejects any single length beyond maxValueLength, but 400 keys
+		// each just under that cap would still force ~800 MB of
+		// allocation from one reply. Checked before the body is
+		// read/allocated, so an oversized claim poisons the connection
+		// on the length that pushes the running total over the bound,
+		// not after however many bytes it would have taken to read it.
+		var totalBytes int64
 		for i, token := range fields[1 : 1+count] {
 			switch token {
 			case "-":
@@ -983,6 +1005,11 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 				length, err := strconv.Atoi(token)
 				if err != nil || length < 0 || length > maxValueLength {
 					return 0, nil, 0, 0, nil, protocolError("invalid multi-get result length in response")
+				}
+				totalBytes += int64(length)
+				if totalBytes > maxMultiGetResponseBytes {
+					return 0, nil, 0, 0, nil, protocolError(fmt.Sprintf(
+						"multi-get response exceeds %d bytes", maxMultiGetResponseBytes))
 				}
 				hit := make([]byte, length)
 				if _, err := readFull(c.reader, hit); err != nil {
@@ -999,6 +1026,14 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	// with the `On`/`OnT` identify reply: identify.go handles that before
 	// a connection exists, and no other request ever answers with a
 	// leading 'O'.
+	//
+	// Unlike `M` above, this loop carries no cumulative-bytes bound
+	// (issue #207, following #179's Java fix): every token is a
+	// fixed-width "S" or "W" with no length-prefixed body to allocate,
+	// so the loop is already O(count) regardless of what count is — and
+	// count itself is already bounded, by wantFields against the header
+	// line's own maxHeaderLineLength cap above, before this loop ever
+	// runs.
 	case 'O':
 		header, err := readLine(c.reader)
 		if err != nil {
