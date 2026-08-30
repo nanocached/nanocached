@@ -1341,6 +1341,27 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task DecrRejectsLongMinValueDeltaWithoutTouchingTheWire()
+    {
+        // issue #182: long.MinValue has no valid positive long negation
+        // (two's complement wraps it back to itself), so a naive -delta
+        // would silently turn Decr(long.MinValue) into an Incr by +2^63
+        // instead of failing. Assert it is rejected before any "i" frame
+        // is sent.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "100");
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => client.DecrAsync("counter", long.MinValue));
+        Assert.Equal(0, node.IncrRequestCount);
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await ns.SetAsync("counter", "100");
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => ns.DecrAsync("counter", long.MinValue));
+        Assert.Equal(0, node.IncrRequestCount);
+    }
+
+    [Fact]
     public async Task IncrFrameIsExactlyTheWireGrammarNamespacedAndAlwaysIncludingNamespaceLength()
     {
         using var node = new MockNode();

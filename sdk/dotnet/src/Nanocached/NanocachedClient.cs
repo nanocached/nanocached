@@ -1666,18 +1666,41 @@ public sealed class NanocachedClient : IDisposable
             .ConfigureAwait(false);
     }
 
-    public Task<long?> DecrAsync(string key, long delta) => IncrAsync(key, -delta);
+    public Task<long?> DecrAsync(string key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
 
     /// <summary>issue #129: <see cref="IncrAsync(byte[], long)"/> with
     /// <paramref name="delta"/> negated — never a different wire op;
-    /// <c>i</c>'s own signed delta already covers decrementing.</summary>
-    public Task<long?> DecrAsync(byte[] key, long delta) => IncrAsync(key, -delta);
+    /// <c>i</c>'s own signed delta already covers decrementing. issue
+    /// #182: delegates the negation to <see cref="NegateDecrDelta"/>,
+    /// which rejects <see cref="long.MinValue"/> rather than silently
+    /// wrapping it back to itself.</summary>
+    public Task<long?> DecrAsync(byte[] key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
 
     internal Task<long?> DecrAsync(byte[] namespaceBytes, string key, long delta) =>
-        IncrAsync(namespaceBytes, key, -delta);
+        IncrAsync(namespaceBytes, key, NegateDecrDelta(delta));
 
     internal Task<long?> DecrAsync(byte[] namespaceBytes, byte[] key, long delta) =>
-        IncrAsync(namespaceBytes, key, -delta);
+        IncrAsync(namespaceBytes, key, NegateDecrDelta(delta));
+
+    /// <summary>issue #182: shared negation guard for every
+    /// <c>DecrAsync</c> overload above. <see cref="long.MinValue"/> has no
+    /// corresponding positive <see cref="long"/> value in two's
+    /// complement (<see cref="long.MaxValue"/> is one short of
+    /// <c>|long.MinValue|</c>), so negating it wraps back to
+    /// <see cref="long.MinValue"/> itself — silently turning a decrement
+    /// into the largest possible increment. Rejecting it client-side,
+    /// before any I/O, mirrors the Java and Rust SDKs' own rejection of
+    /// this value.</summary>
+    private static long NegateDecrDelta(long delta)
+    {
+        if (delta == long.MinValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(delta),
+                "nanocached: decr delta must not be long.MinValue, which has no valid long negation");
+        }
+        return -delta;
+    }
 
     /// <summary>issue #129 — the part that's easy to get subtly wrong: runs
     /// <c>i</c> against the key's PRIMARY owner only, awaits its reply,
