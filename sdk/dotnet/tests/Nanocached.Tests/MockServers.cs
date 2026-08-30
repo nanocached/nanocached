@@ -258,6 +258,22 @@ public sealed class MockNode : IDisposable
     /// doc comment) needs to see a node fail.</summary>
     public void FailClearOnce() => Interlocked.Increment(ref _failClearReplies);
 
+    /// <summary>issue #225: makes the next <c>i</c> request that would
+    /// otherwise succeed apply its increment to the store (mutating state
+    /// exactly as a real node would) and then close the connection
+    /// WITHOUT replying — the "primary already applied it, only the reply
+    /// was lost" case the client's non-idempotent retry guard must never
+    /// replay. Mirrors <see cref="FailClearOnce"/>'s connection-level
+    /// failure injection, but after the mutation instead of before
+    /// it.</summary>
+    public void FailIncrAfterApplyOnce() => Interlocked.Increment(ref _failIncrAfterApplyReplies);
+    private int _failIncrAfterApplyReplies;
+
+    /// <summary>issue #225: the <see cref="FailIncrAfterApplyOnce"/>
+    /// counterpart for <c>k</c> (CAS).</summary>
+    public void FailCasAfterApplyOnce() => Interlocked.Increment(ref _failCasAfterApplyReplies);
+    private int _failCasAfterApplyReplies;
+
     /// <summary>Holds every future G reply for <paramref name="millis"/>
     /// first — for hedged-reads tests proving a caller isn't bounded by a
     /// slow owner (Hedged reads).</summary>
@@ -682,6 +698,16 @@ public sealed class MockNode : IDisposable
                         byte[] updatedBytes = Encoding.ASCII.GetBytes(
                             updated.ToString(CultureInfo.InvariantCulture));
                         Store[storeKey] = updatedBytes;
+                        // issue #225: the increment is already applied to
+                        // Store above — closing here (instead of replying)
+                        // simulates the primary succeeding but the reply
+                        // never reaching the client, the exact case the
+                        // client's non-idempotent retry guard must not
+                        // replay.
+                        if (TakeOne(ref _failIncrAfterApplyReplies))
+                        {
+                            return;
+                        }
                         // TTL is unaffected by an increment — only reported.
                         long ttlSeconds = _ttls.TryGetValue(storeKey, out long ttl) ? ttl : 0;
                         string ttlField = ttlSeconds > 0 ? $" {ttlSeconds}" : "";
@@ -737,6 +763,13 @@ public sealed class MockNode : IDisposable
                         }
                         Store[storeKey] = value;
                         _ttls[storeKey] = ttlSeconds;
+                        // issue #225: same "applied, then close without
+                        // replying" injection as FailIncrAfterApplyOnce,
+                        // for CAS's primary-then-replicate path.
+                        if (TakeOne(ref _failCasAfterApplyReplies))
+                        {
+                            return;
+                        }
                         await Wire.WriteAsync(stream, $"S{tag}\n");
                         break;
                     }

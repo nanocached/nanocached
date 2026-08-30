@@ -1592,6 +1592,85 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task IncrIsRetriedAfterAServerFinBeforeTheRequestWasEverSent()
+    {
+        // issue #225: the connection died BEFORE this Incr's frame could be
+        // written at all (the idle-FIN case, same setup as
+        // TransparentlyReconnectsAfterAServerFin) — nothing reached the
+        // server, so redialing and resending is exactly as safe as it is
+        // for Get/Set/Delete, and the client's built-in retry-once must
+        // still heal it transparently.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "10");
+        node.DropConnections();
+        await Task.Delay(50); // let the FIN land
+
+        Assert.Equal(13, await client.IncrAsync("counter", 3));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task IncrIsNeverReplayedWhenThePrimaryAppliedItButTheReplyWasLost()
+    {
+        // issue #225 — the actual bug: the server received the `i` request,
+        // applied it (mutating its store), and only then closed the
+        // connection instead of replying. A blind redial-and-retry (the
+        // idempotent Get/Set/Delete policy) would double-apply this
+        // increment. The client must instead surface ConnectionLostException
+        // and leave the counter incremented exactly once.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("counter", "10");
+        node.FailIncrAfterApplyOnce();
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync("counter", 3));
+
+        // Exactly one `i` reached the server — proving the client never
+        // attempted a replay.
+        Assert.Equal(1, node.IncrRequestCount);
+        // Reconnects lazily on the next call — the counter was applied
+        // exactly once by the failed attempt above, never replayed.
+        Assert.Equal("13", await client.GetAsync("counter"));
+    }
+
+    [Fact]
+    public async Task IncrThroughTheOuterClusterRetryIsNeverReplayedEither()
+    {
+        // issue #225: in cluster mode (a real ring, unlike the single-mode
+        // tests above), a WrongNodeException OR a ConnectionLostException
+        // out of the primary leg is normally caught by WithClusterRetryAsync,
+        // which force-refreshes the ring and runs the WHOLE operation
+        // again — exactly the right thing for a stale-routing WrongNode,
+        // but exactly the same double-apply risk as the inner
+        // ApplyReconnectingAsync retry if it fired on a
+        // possibly-already-applied Incr too. This proves that OUTER layer
+        // is gated the same way: the primary applies the increment, then
+        // drops the connection instead of replying, and the whole
+        // IncrAsync call must still surface ConnectionLostException without
+        // WithClusterRetryAsync re-running IncrPrimaryThenReplicateAsync
+        // (which would send a second `i` and double-apply it).
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "outer-retry-counter";
+        await client.SetAsync(key, "10");
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        primary.FailIncrAfterApplyOnce();
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.IncrAsync(key, 3));
+
+        // If WithClusterRetryAsync had replayed the whole call, this would
+        // be 2 (and the stored value "16" instead of "13").
+        Assert.Equal(1, primary.IncrRequestCount);
+        Assert.Equal("13", await client.GetAsync(key));
+    }
+
+    [Fact]
     public async Task OnlyThePrimaryEverRunsIncrReplicasReceiveTheResultAsAnOrdinarySet()
     {
         // The single most important test for issue #129: replaying the
@@ -1745,6 +1824,86 @@ public class NanocachedClientTests
 
         Assert.True(await client.ReplaceAsync("k", got.Value.Token, "v2"));
         Assert.Equal("v2", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task ReplaceIsRetriedAfterAServerFinBeforeTheRequestWasEverSent()
+    {
+        // issue #225: same idle-FIN setup as
+        // IncrIsRetriedAfterAServerFinBeforeTheRequestWasEverSent — nothing
+        // reached the server, so the built-in retry-once must still heal
+        // it transparently for CAS too.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v1");
+        string token = NanocachedClient.ContentDigest(Bytes("v1"));
+        node.DropConnections();
+        await Task.Delay(50); // let the FIN land
+
+        Assert.True(await client.ReplaceAsync("k", token, "v2"));
+        Assert.Equal("v2", await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task ReplaceIsNeverReplayedWhenThePrimaryAppliedItButTheReplyWasLost()
+    {
+        // issue #225 — the actual bug, for CAS: the server received the
+        // `k` request, applied it (mutating its store), and only then
+        // closed the connection instead of replying `S`. A blind
+        // redial-and-retry would resend the same digest-conditioned write;
+        // since the stored value already changed, a replay could either
+        // fail as a spurious mismatch or, with a self-matching new value,
+        // silently re-apply — either way the client must not guess. It
+        // must surface ConnectionLostException and leave the value
+        // replaced exactly once.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v1");
+        string token = NanocachedClient.ContentDigest(Bytes("v1"));
+        node.FailCasAfterApplyOnce();
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.ReplaceAsync("k", token, "v2"));
+
+        // Exactly one `k` reached the server — proving the client never
+        // attempted a replay.
+        Assert.Equal(1, node.CasRequestCount);
+        // Reconnects lazily on the next call — the value was replaced
+        // exactly once by the failed attempt above, never replayed.
+        Assert.Equal("v2", await client.GetAsync("k"));
+    }
+
+    [Fact]
+    public async Task ReplaceThroughTheOuterClusterRetryIsNeverReplayedEither()
+    {
+        // issue #225: the CAS counterpart of
+        // IncrThroughTheOuterClusterRetryIsNeverReplayedEither — proves
+        // WithClusterRetryAsync's own force-refresh-and-retry (not just the
+        // inner ApplyReconnectingAsync-style redial) is also gated: the
+        // primary applies the CAS, then drops the connection instead of
+        // replying, and the whole ReplaceAsync call must surface
+        // ConnectionLostException without re-running
+        // CasPrimaryThenReplicateAsync a second time.
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        const string key = "outer-retry-cas";
+        await client.SetAsync(key, "v1");
+        string token = NanocachedClient.ContentDigest(Bytes("v1"));
+        IReadOnlyList<string> owners = OwnersOf(key);
+        MockNode primary = cluster.Nodes[owners[0]];
+        primary.FailCasAfterApplyOnce();
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => client.ReplaceAsync(key, token, "v2"));
+
+        // If WithClusterRetryAsync had replayed the whole call, this would
+        // be 2, and the second (replayed) `k` would fail as a mismatch
+        // against the already-updated stored value.
+        Assert.Equal(1, primary.CasRequestCount);
+        Assert.Equal("v2", await client.GetAsync(key));
     }
 
     [Fact]
