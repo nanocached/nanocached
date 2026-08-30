@@ -142,6 +142,37 @@ everything else (Spring's `SimpleKey` included) through JDK serialization.
 Key bytes must be canonical across every JVM sharing the cache — prefer
 simple keys, or plug in a converter that knows your key type.
 
+## Trust boundary / deserialization
+
+`JdkCacheValueSerializer` (the default `CacheValueSerializer`) deserializes
+every cached value with `ObjectInputStream.readObject()`. That means
+**anyone who can write to this cache's namespace can execute code in the
+process that reads it back** — the same model as Spring Data Redis's JDK
+serializer. "Anyone who can write" is: any holder of the cluster's auth
+secret, or, when no secret is configured, any peer that can reach the
+server at all. This is not specific to nanocached; it's inherent to Java
+object deserialization of untrusted bytes.
+
+Mitigate with all of:
+
+- **TLS + an auth secret** on the `NanocachedClient`, so only trusted
+  processes can write to the namespace at all.
+- **Never share a namespace (or its secret) with an untrusted writer** —
+  namespaces are cheap and isolated (see above), so give each trust
+  domain its own.
+- **A JVM-wide serial filter** (`-Djdk.serialFilter=...`, or
+  `ObjectInputFilter.Config.setSerialFilter(...)`): `JdkCacheValueSerializer`
+  applies it explicitly on every deserialization, so it is honored even on
+  JVMs where `ObjectInputStream` would not otherwise pick it up by
+  default. The constructor overload `JdkCacheValueSerializer(ObjectInputFilter)`
+  lets you supply a filter scoped tighter than the process-wide one (e.g.
+  an allowlist of the value classes this cache actually stores).
+- **Prefer a non-Java serialization format** where the writers aren't
+  fully trusted: implement `CacheValueSerializer` with a JSON library
+  (Jackson, Gson, ...) instead of using `JdkCacheValueSerializer` — JSON
+  deserialization does not construct arbitrary classes the way JDK
+  serialization does.
+
 ## Consistency notes
 
 The wire has single-key get/set/delete and no compare-and-set, so
