@@ -44,6 +44,19 @@ pub enum Error {
     /// A connection-level failure; the client redials lazily on the next
     /// use, and in cluster mode retries once through a node-list refresh.
     ConnectionLost(String),
+    /// Internal-only sibling of [`Self::ConnectionLost`] (issue #225):
+    /// produced solely by `Connection::single_attempt`'s post-write path,
+    /// when the request's frame had already been fully written to the
+    /// socket before the reply was lost — the server may or may not have
+    /// already received and applied it. `get`/`set`/`delete`/`clear`
+    /// (idempotent) fold this back into a plain `ConnectionLost` and keep
+    /// retrying via redial exactly as before; `incr`/`decr`, the CAS
+    /// methods, and `delete_if_matches` (none of which are idempotent)
+    /// use it to skip that retry — replaying them could double-apply an
+    /// effect the server already committed — and surface it to their own
+    /// caller as a plain `ConnectionLost` instead. No public method ever
+    /// returns this variant; if one does, that's a bug.
+    ConnectionLostAfterSend(String),
     /// The server rejected the `A` handshake's secret — either the server
     /// requires one and none was configured, or the configured one is
     /// wrong. Never transient: retrying with the same configuration
@@ -102,6 +115,7 @@ impl fmt::Display for Error {
                 "nanocached: the stored value is not an integer INCR can operate on"
             ),
             Error::ConnectionLost(message)
+            | Error::ConnectionLostAfterSend(message)
             | Error::Protocol(message)
             | Error::Authentication(message)
             | Error::Retryable(message) => write!(f, "{message}"),

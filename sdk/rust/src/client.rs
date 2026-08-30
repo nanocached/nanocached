@@ -2225,6 +2225,20 @@ impl NanocachedClient {
     /// keeps every replica byte-identical to the primary rather than
     /// letting them drift (see `incr_once`'s own doc comment for the full
     /// reasoning).
+    ///
+    /// **At-least-once, not exactly-once, under connection loss** (issue
+    /// #225): `incr`/`decr` are not idempotent — replaying one would
+    /// double-apply `delta` — so unlike `get`/`set`/`delete`, this SDK
+    /// never silently retries an increment whose request had already been
+    /// fully written to the socket when the connection was lost, since
+    /// the server may have already applied it before the reply went
+    /// missing. That case surfaces as a plain `Err(Error::ConnectionLost)`
+    /// rather than a redial-and-retry; only a connection already dead
+    /// *before* this call's request could reach it (the idle-FIN case) is
+    /// retried, since nothing could have been applied yet. On
+    /// `Err(Error::ConnectionLost)`, the counter may or may not have
+    /// actually changed — check with a subsequent `get` if that matters
+    /// to the caller.
     pub async fn incr(&self, key: impl AsRef<[u8]>, delta: i64) -> Result<Option<i64>> {
         self.incr_in(DEFAULT_NAMESPACE, key, delta).await
     }
@@ -2282,7 +2296,7 @@ impl NanocachedClient {
                     connection.incr(namespace, key, delta).await
                 };
                 return Ok(self
-                    .apply_reconnecting(None, &op)
+                    .apply_reconnecting_no_replay(None, &op)
                     .await?
                     .map(|(value, _ttl_seconds)| value));
             }
@@ -2298,8 +2312,9 @@ impl NanocachedClient {
         let primary_op = |connection: Arc<Connection>| async move {
             connection.incr(namespace, key, delta).await
         };
-        let Some((value, ttl_seconds)) =
-            self.apply_reconnecting(Some(primary), &primary_op).await?
+        let Some((value, ttl_seconds)) = self
+            .apply_reconnecting_no_replay(Some(primary), &primary_op)
+            .await?
         else {
             return Ok(None);
         };
@@ -2331,6 +2346,22 @@ impl NanocachedClient {
     /// `put_if_absent` succeed while the first still believes it holds
     /// the lock — a silent double-acquisition CAS cannot detect. See
     /// docs/protocol.html#cas.
+    ///
+    /// **At-least-once, not exactly-once, under connection loss** (issue
+    /// #225): CAS is not idempotent — replaying a `k` that already
+    /// succeeded could report a now-stale condition as a mismatch — so
+    /// unlike `get`/`set`/`delete`, this SDK never silently retries a CAS
+    /// request whose bytes had already been fully written to the socket
+    /// when the connection was lost, since the server may have already
+    /// applied it before the reply went missing. That case surfaces as a
+    /// plain `Err(Error::ConnectionLost)` rather than a redial-and-retry;
+    /// only a connection already dead *before* this call's request could
+    /// reach it (the idle-FIN case) is retried, since nothing could have
+    /// been applied yet. On `Err(Error::ConnectionLost)`, whether the
+    /// write actually happened is unknown — check with a subsequent
+    /// `get`/`get_with_token` if that matters to the caller. This applies
+    /// identically to [`Self::replace_if_present`], [`Self::replace`], and
+    /// [`Self::delete_if_matches`].
     pub async fn put_if_absent(
         &self,
         key: impl AsRef<[u8]>,
@@ -2352,7 +2383,8 @@ impl NanocachedClient {
     /// two-argument `replace(key, value)`. Returns `true` if it was
     /// stored, `false` if the key was absent and nothing changed. See
     /// [`Self::put_if_absent`] for the shared mismatch-is-a-bool and
-    /// not-a-distributed-lock notes, which apply here identically.
+    /// not-a-distributed-lock and at-least-once-under-connection-loss
+    /// notes, which apply here identically.
     pub async fn replace_if_present(
         &self,
         key: impl AsRef<[u8]>,
@@ -2375,7 +2407,8 @@ impl NanocachedClient {
     /// new)`. Returns `true` if it was stored, `false` if the key's
     /// current value (or its absence) didn't match and nothing changed.
     /// See [`Self::put_if_absent`] for the shared mismatch-is-a-bool and
-    /// not-a-distributed-lock notes, which apply here identically.
+    /// not-a-distributed-lock and at-least-once-under-connection-loss
+    /// notes, which apply here identically.
     ///
     /// `expected` accepts a [`CasToken`] from a prior
     /// [`Self::get_with_token`] — always correct, since it hashes the
@@ -2462,7 +2495,7 @@ impl NanocachedClient {
                         .cas_set(namespace, key, value, condition, ttl_seconds)
                         .await
                 };
-                return self.apply_reconnecting(None, &op).await;
+                return self.apply_reconnecting_no_replay(None, &op).await;
             }
             Self::owner_names(&state, namespace, key)
         };
@@ -2478,7 +2511,9 @@ impl NanocachedClient {
                 .cas_set(namespace, key, value, condition, ttl_seconds)
                 .await
         };
-        let stored = self.apply_reconnecting(Some(primary), &primary_op).await?;
+        let stored = self
+            .apply_reconnecting_no_replay(Some(primary), &primary_op)
+            .await?;
         if !stored {
             return Ok(false);
         }
@@ -2497,8 +2532,11 @@ impl NanocachedClient {
     /// [`Error`], exactly like [`Self::delete`]'s own hit/miss
     /// convention. See [`Self::replace`]'s doc comment for `expected`'s
     /// [`CasToken`]-or-raw-digest acceptance and its encoding caveat, and
-    /// [`Self::put_if_absent`]'s for the not-a-distributed-lock note —
-    /// both apply here identically.
+    /// [`Self::put_if_absent`]'s for the not-a-distributed-lock and
+    /// at-least-once-under-connection-loss notes — both apply here
+    /// identically (issue #225): a `Err(Error::ConnectionLost)` from this
+    /// method means the delete may or may not have actually happened, and
+    /// is never silently retried once its request was fully written.
     pub async fn delete_if_matches(
         &self,
         key: impl AsRef<[u8]>,
@@ -2540,7 +2578,7 @@ impl NanocachedClient {
                 let op = |connection: Arc<Connection>| async move {
                     connection.cas_delete(namespace, key, digest).await
                 };
-                return self.apply_reconnecting(None, &op).await;
+                return self.apply_reconnecting_no_replay(None, &op).await;
             }
             Self::owner_names(&state, namespace, key)
         };
@@ -2554,7 +2592,9 @@ impl NanocachedClient {
         let primary_op = |connection: Arc<Connection>| async move {
             connection.cas_delete(namespace, key, digest).await
         };
-        let deleted = self.apply_reconnecting(Some(primary), &primary_op).await?;
+        let deleted = self
+            .apply_reconnecting_no_replay(Some(primary), &primary_op)
+            .await?;
         if !deleted {
             return Ok(false);
         }
@@ -2646,12 +2686,22 @@ impl NanocachedClient {
     /// this retries the operation once more. `WrongNode` is not
     /// special-cased here — a well-behaved proxy never sends one (it owns
     /// every key), so one arriving anyway propagates rather than looping.
+    /// A `ConnectionLostAfterSend` (issue #225) is deliberately excluded
+    /// from every retry branch below — the outer refresh-and-retry this
+    /// method performs would otherwise re-run a non-idempotent operation's
+    /// `operation()` a second time (a *different* replay risk than
+    /// `apply_reconnecting_no_replay`'s own, one layer up) after the
+    /// server may already have applied the first attempt. It falls
+    /// straight to the final arm instead, and — like every other error —
+    /// is downgraded to a plain `ConnectionLost` before returning, so this
+    /// method's own caller-visible error type never depends on which of
+    /// the two variants actually occurred.
     async fn with_cluster_retry<T, F, Fut>(&self, operation: F) -> Result<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        match operation().await {
+        let result = match operation().await {
             Ok(value) => Ok(value),
             Err(Error::ConnectionLost(_)) if self.inner.via_proxy => {
                 self.reconnect_proxy().await;
@@ -2661,13 +2711,15 @@ impl NanocachedClient {
                 let clustered =
                     matches!(self.inner.state.lock().await.target, Target::Cluster { .. });
                 if !clustered {
-                    return Err(error);
+                    Err(error)
+                } else {
+                    self.maybe_refresh(true).await;
+                    operation().await
                 }
-                self.maybe_refresh(true).await;
-                operation().await
             }
             Err(error) => Err(error),
-        }
+        };
+        result.map_err(Self::downgrade_sent_error)
     }
 
     fn owner_names(state: &State, namespace: &[u8], key: &[u8]) -> Vec<String> {
@@ -3125,8 +3177,53 @@ impl NanocachedClient {
     /// (e.g. the server's 60s idle timeout) on I/O, so lazy
     /// reconnect-on-use means the failed request poisons the connection,
     /// the redial replaces it, and the operation runs again. Safe because
-    /// get/set/delete are all idempotent. `slot` is `None` in single mode.
+    /// get/set/delete/clear are all idempotent — replaying one that
+    /// actually reached the server before the reply was lost has no
+    /// observable effect, so this retries on `ConnectionLostAfterSend`
+    /// (issue #225) exactly the same as a plain `ConnectionLost`, and
+    /// downgrades either variant back to a plain `ConnectionLost` before
+    /// returning, so callers never see the internal distinction. `slot` is
+    /// `None` in single mode.
+    ///
+    /// `incr`/`decr`, the CAS methods, and `delete_if_matches` are NOT
+    /// idempotent and must never call this — see
+    /// [`Self::apply_reconnecting_no_replay`].
     async fn apply_reconnecting<T, F, Fut>(&self, slot: Option<&str>, op: &F) -> Result<T>
+    where
+        F: Fn(Arc<Connection>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let result = match op(self.slot_connection(slot).await?).await {
+            Err(Error::ConnectionLost(_)) | Err(Error::ConnectionLostAfterSend(_)) => {
+                op(self.slot_connection(slot).await?).await
+            }
+            outcome => outcome,
+        };
+        result.map_err(Self::downgrade_sent_error)
+    }
+
+    /// As [`Self::apply_reconnecting`], but for the non-idempotent
+    /// operations — `incr`/`decr`, `put_if_absent`/`replace_if_present`/
+    /// `replace`, and `delete_if_matches` (issue #225): replaying one of
+    /// these after the server already applied it would double-apply the
+    /// increment, or report an already-successful CAS as a mismatch. So
+    /// the redial-and-retry only fires for a plain `ConnectionLost` — the
+    /// request's frame was never fully written (the connection was
+    /// already dead, the idle-FIN case), so nothing could have reached the
+    /// server yet, exactly as safe to replay as get/set/delete's own case.
+    /// `ConnectionLostAfterSend` — the frame WAS written and the reply is
+    /// simply unknown — is never replayed: the server may already have
+    /// applied it, so this returns immediately instead. Deliberately
+    /// *not* downgraded to a plain `ConnectionLost` here (unlike
+    /// [`Self::apply_reconnecting`]): `with_cluster_retry`, this method's
+    /// only caller's caller, needs the undowngraded variant to likewise
+    /// skip its own whole-operation retry for the same reason — it
+    /// downgrades back to a plain `ConnectionLost` itself once that
+    /// decision is made, so the caller-visible error type is identical
+    /// either way. This makes these four methods at-least-once (not
+    /// exactly-once) under connection loss, never worse — see their own
+    /// doc comments.
+    async fn apply_reconnecting_no_replay<T, F, Fut>(&self, slot: Option<&str>, op: &F) -> Result<T>
     where
         F: Fn(Arc<Connection>) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
@@ -3134,6 +3231,16 @@ impl NanocachedClient {
         match op(self.slot_connection(slot).await?).await {
             Err(Error::ConnectionLost(_)) => op(self.slot_connection(slot).await?).await,
             outcome => outcome,
+        }
+    }
+
+    /// Collapses the internal [`Error::ConnectionLostAfterSend`] signal
+    /// back into a plain [`Error::ConnectionLost`] — see that variant's
+    /// doc comment. A no-op for every other error, `Ok` included.
+    fn downgrade_sent_error(error: Error) -> Error {
+        match error {
+            Error::ConnectionLostAfterSend(message) => Error::ConnectionLost(message),
+            other => other,
         }
     }
 
