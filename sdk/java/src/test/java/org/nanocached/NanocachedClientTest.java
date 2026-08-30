@@ -3123,6 +3123,65 @@ class NanocachedClientTest {
         }
     }
 
+    // ── multi-get 応答の累積バイト上限 (issue #179) ───────────────────
+
+    @Test
+    void multiGetReplyPoisonsTheConnectionWhenTheCumulativeSizeExceedsTheBound() throws Exception {
+        // Regression (issue #179): each M entry's declared length was
+        // already capped at MAX_VALUE_LENGTH, but nothing bounded the
+        // sum across a reply's many entries — a node answering a
+        // 400-key multi-get with 400 × 2 MiB hits could force ~800 MB
+        // of allocation from a single reply. Shrinks
+        // Connection.maxMultiGetResponseBytes — mutable only so a test
+        // can shrink it, mirroring requestTimeoutMillis — so this test
+        // can trip the bound with a couple of tiny values instead of
+        // actually moving hundreds of megabytes over the loopback
+        // socket.
+        long defaultBound = Connection.maxMultiGetResponseBytes;
+        Connection.maxMultiGetResponseBytes = 3;
+        try (java.net.ServerSocket server = new java.net.ServerSocket(0);
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket serverSocket = server.accept()) {
+            Connection connection = new Connection(clientSocket, false, () -> {});
+            try {
+                java.io.InputStream serverIn = serverSocket.getInputStream();
+                java.io.OutputStream serverOut = serverSocket.getOutputStream();
+                ExecutorService pool = Executors.newSingleThreadExecutor();
+                try {
+                    byte[][] keys = {"a".getBytes(StandardCharsets.UTF_8), "b".getBytes(StandardCharsets.UTF_8)};
+                    Future<List<Connection.MultiEntry>> future =
+                            pool.submit(() -> connection.multiGet(new byte[0], keys));
+
+                    byte[] expectedFrame = "m 0 2 1 1\nab".getBytes(StandardCharsets.US_ASCII);
+                    assertArrayEquals(expectedFrame, serverIn.readNBytes(expectedFrame.length));
+
+                    // Two 2-byte hits: the first alone (2 bytes) is
+                    // within the shrunk 3-byte bound, but the second
+                    // pushes the running total to 4 — over the bound —
+                    // so it must be rejected before its body is ever
+                    // read; only the first entry's body is sent.
+                    serverOut.write("M 2 2 2\n".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.write("xy".getBytes(StandardCharsets.US_ASCII));
+                    serverOut.flush();
+
+                    ExecutionException wrapped = assertThrows(ExecutionException.class, future::get);
+                    assertTrue(wrapped.getCause() instanceof NanocachedException.ConnectionFailed,
+                            String.valueOf(wrapped.getCause()));
+                    assertTrue(wrapped.getCause().getMessage().contains("exceeds"),
+                            wrapped.getCause().getMessage());
+                    assertTrue(connection.isClosed(),
+                            "an oversized multi-get reply must poison the connection");
+                } finally {
+                    pool.shutdown();
+                }
+            } finally {
+                connection.close();
+            }
+        } finally {
+            Connection.maxMultiGetResponseBytes = defaultBound;
+        }
+    }
+
     // ── 応答タグ (echoed response tags) ──────────────────────────────
 
     @Test

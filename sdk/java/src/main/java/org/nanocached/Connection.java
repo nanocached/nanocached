@@ -785,6 +785,24 @@ final class Connection {
     // or malicious frame, never just a legitimately large value.
     private static final int MAX_VALUE_LENGTH = 2 * 1024 * 1024;
 
+    // Bounds the sum of every hit's declared length across one multi-get
+    // ('M') reply (issue #179) — each individual length is already
+    // capped at MAX_VALUE_LENGTH above, but that alone doesn't bound the
+    // reply as a whole: a node answering a 400-key multi-get with 400 ×
+    // 2 MiB hits would force ~800 MB of allocation from a single reply.
+    // The client's own chunking (NanocachedClient's MAX_BATCH_KEYS, 400)
+    // never asks a single M for more keys than that, so 400 ×
+    // MAX_VALUE_LENGTH bounds any legitimate reply while still catching
+    // a malicious or buggy node. Checked before each readExactly below,
+    // the same way Identify.readNodeEntries tracks totalBytes against
+    // MAX_NODE_LIST_RESPONSE_BYTES — so an oversized claim poisons the
+    // connection before the allocation happens, not after. Mutable only
+    // so a test can shrink it and exercise the bound without actually
+    // moving hundreds of megabytes over a loopback socket, mirroring
+    // NanocachedClient's keepAliveIntervalMillis/
+    // maxInFlightBackgroundReplicaWrites.
+    static volatile long maxMultiGetResponseBytes = 400L * MAX_VALUE_LENGTH;
+
     // Header/tag lines (the marker line ahead of a V's body, or the whole
     // line for S/D/N/W) are always a handful of bytes in the real
     // protocol. Without a cap, a malicious or buggy node that streams
@@ -984,6 +1002,7 @@ final class Connection {
                             "nanocached: invalid multi-get header in response", null);
                 }
                 List<MultiEntry> entries = new ArrayList<>(count);
+                long totalBytes = 0;
                 for (int i = 0; i < count; i++) {
                     String token = fields[1 + i];
                     switch (token) {
@@ -994,6 +1013,12 @@ final class Connection {
                             if (length < 0 || length > MAX_VALUE_LENGTH) {
                                 throw new NanocachedException.ConnectionFailed(
                                         "nanocached: invalid multi-get result length in response", null);
+                            }
+                            totalBytes += length;
+                            if (totalBytes > maxMultiGetResponseBytes) {
+                                throw new NanocachedException.ConnectionFailed(
+                                        "nanocached: multi-get response exceeds "
+                                                + maxMultiGetResponseBytes + " bytes", null);
                             }
                             entries.add(MultiEntry.ofHit(readExactly(length)));
                         }
@@ -1009,6 +1034,15 @@ final class Connection {
             // Never confused with the `On`/`OnT` identify reply:
             // Identify.java handles that before a Connection exists, and
             // no other request ever answers with a leading 'O'.
+            //
+            // No maxMultiGetResponseBytes-style cumulative bound is
+            // needed here (issue #179): every ack token is one of two
+            // fixed one-character strings with no length-prefixed body
+            // to read, so this loop's cost is already O(count) and
+            // count is already bounded — this header line's own length
+            // (capped like every other header, see readLine) limits how
+            // many single-character tokens can fit on it in the first
+            // place.
             case 'O' -> {
                 String[] fields = readLine().split(" ");
                 if (fields.length < 1) {
