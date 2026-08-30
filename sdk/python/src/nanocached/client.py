@@ -196,6 +196,58 @@ _MAX_REQUEST_BYTES = 1024 * 1024 - _MAX_REQUEST_HEADER_BYTES
 # own.
 _MAX_BATCH_KEYS = 400
 
+# Issue #222: _MAX_BATCH_KEYS alone bounds a sub-frame's *count* but not
+# its *bytes* — 400 keys with individually-valid-but-large values (each
+# already under _MAX_REQUEST_BYTES on its own) can still sum to an ``o``
+# frame well past the server's 1 MiB MAX_REQUEST_SIZE (src/server.rs),
+# which it rejects outright with no reply, poisoning the whole shared,
+# pipelined connection exactly like an oversized single-key frame does.
+# _batch_chunk_bounds() below tracks cumulative namespace+key(+value)
+# bytes per sub-frame alongside the existing key-count cap so neither
+# bound alone can be exceeded.
+#
+# This per-entry allowance covers the header fields an m/o frame spends
+# on that one entry — <key-length> for m, <key-length> and
+# <value-length> for o — each up to 10 digits plus its separating
+# space, rounded generously up to cover both marker kinds without
+# tracking them separately (mirrors _MAX_REQUEST_HEADER_BYTES' own
+# reasoning, just per entry instead of for the whole header).
+_MAX_MULTI_ENTRY_HEADER_BYTES = 32
+
+
+def _batch_chunk_bounds(
+    namespace: bytes, key_lens: Sequence[int], value_lens: Sequence[int] | None
+) -> list[tuple[int, int]]:
+    """Splits a batch of ``len(key_lens)`` entries into sub-frame
+    ``(start, end)`` bounds honoring both _MAX_BATCH_KEYS and
+    _MAX_REQUEST_BYTES (issue #222): a chunk's cumulative
+    namespace+key(+value)+per-entry-header bytes never exceeds
+    _MAX_REQUEST_BYTES, even though _MAX_BATCH_KEYS individually valid
+    entries could otherwise sum well past it. ``value_lens`` is None for
+    a multi_get (m) batch — only key bytes count — or the per-entry
+    value lengths for a multi_set (o) batch. A single entry always fits
+    alone (each was already validated against _MAX_REQUEST_BYTES by
+    _check_key/_check_key_and_value before this ever runs), so a chunk
+    is only ever split *before* the entry that would overflow it, never
+    leaving an empty chunk behind."""
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    count = 0
+    total = len(namespace)
+    for i, key_len in enumerate(key_lens):
+        entry_bytes = key_len + _MAX_MULTI_ENTRY_HEADER_BYTES
+        if value_lens is not None:
+            entry_bytes += value_lens[i]
+        if count > 0 and (count >= _MAX_BATCH_KEYS or total + entry_bytes > _MAX_REQUEST_BYTES):
+            bounds.append((start, i))
+            start = i
+            count = 0
+            total = len(namespace)
+        total += entry_bytes
+        count += 1
+    bounds.append((start, len(key_lens)))
+    return bounds
+
 
 def _warn(message: str) -> None:
     print(message, file=sys.stderr)
@@ -1010,9 +1062,11 @@ class NanocachedClient:
     # get_many/get_many_bytes/set_many exist because a caller with N keys
     # otherwise pays N round trips — one m/o sub-frame per involved node
     # replaces that with one, transparently chunked into more than one
-    # sub-frame when a batch exceeds _MAX_BATCH_KEYS. A batch never fails
-    # as a whole: every key's outcome (hit/miss/stored/wrong-node) is
-    # independent (docs/protocol.html "m / o — batched get and set").
+    # sub-frame when a batch exceeds _MAX_BATCH_KEYS or would sum past
+    # _MAX_REQUEST_BYTES (issue #222; see _batch_chunk_bounds). A batch
+    # never fails as a whole: every key's outcome (hit/miss/stored/
+    # wrong-node) is independent (docs/protocol.html "m / o — batched
+    # get and set").
     # Both str and bytes keys are accepted, matching every other method
     # on this client — the returned dict is keyed by whichever original
     # object the caller passed, indexed by position rather than by
@@ -1066,8 +1120,9 @@ class NanocachedClient:
         does — there is no ring to refresh against.
 
         Larger batches are transparently split into more than one ``m``
-        sub-frame per owner (_MAX_BATCH_KEYS) — callers never need to
-        think about this. Hedged reads and read repair do not apply to
+        sub-frame per owner, bounded by both _MAX_BATCH_KEYS and
+        _MAX_REQUEST_BYTES (issue #222) — callers never need to think
+        about this. Hedged reads and read repair do not apply to
         batches: hedging's miss sentinel and read repair both assume a
         single value, not a partial-hit roster (Go's and TypeScript's
         ports made the same call)."""
@@ -1122,25 +1177,29 @@ class NanocachedClient:
     ) -> tuple[list[bytes | None | object], BaseException | None]:
         """Issues one or more ``m`` sub-frames for ``keys`` — already
         grouped to one owner (or the single/proxy target) by the caller
-        — splitting into _MAX_BATCH_KEYS-sized chunks so no reply header
-        risks growing unbounded. ``connection_getter`` is a zero-arg
-        async callable returning the Connection to use, called fresh per
-        chunk, so a mid-batch reconnect is handled the same way a
-        single-key get/set is. Always returns len(keys) entries: a chunk
-        that fails outright (a connection-level failure, not a per-key
-        ``W``) leaves the remaining keys' entries at the zero value
-        (None — a clean miss) and that chunk's error is returned
-        alongside — the caller treats that gap as "still needs a
-        retry", exactly like a per-key WrongNode."""
+        — splitting into chunks bounded by both _MAX_BATCH_KEYS and
+        _MAX_REQUEST_BYTES (issue #222; see _batch_chunk_bounds) so
+        neither a chunk's key count nor its cumulative wire bytes can
+        make the reply header (or the request itself) grow unbounded.
+        ``connection_getter`` is a zero-arg async callable returning the
+        Connection to use, called fresh per chunk, so a mid-batch
+        reconnect is handled the same way a single-key get/set is.
+        Always returns len(keys) entries: a chunk that fails outright (a
+        connection-level failure, not a per-key ``W``) leaves the
+        remaining keys' entries at the zero value (None — a clean miss)
+        and that chunk's error is returned alongside — the caller treats
+        that gap as "still needs a retry", exactly like a per-key
+        WrongNode."""
         entries: list[bytes | None | object] = [None] * len(keys)
-        for start in range(0, len(keys), _MAX_BATCH_KEYS):
-            chunk = keys[start : start + _MAX_BATCH_KEYS]
+        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
+        for start, end in bounds:
+            chunk = keys[start:end]
             try:
                 connection = await connection_getter()
                 chunk_entries = await connection.multi_get(chunk, namespace)
             except _SWALLOWABLE_ERRORS as error:
                 return entries, error
-            entries[start : start + len(chunk)] = chunk_entries
+            entries[start:end] = chunk_entries
         return entries, None
 
     async def _multi_get_pass(
@@ -1223,7 +1282,8 @@ class NanocachedClient:
         as set()'s own single-mode behavior does.
 
         Larger batches are transparently split into more than one ``o``
-        sub-frame per node (_MAX_BATCH_KEYS)."""
+        sub-frame per node, bounded by both _MAX_BATCH_KEYS and
+        _MAX_REQUEST_BYTES (issue #222)."""
         await self._set_many(b"", values, ttl_seconds=ttl_seconds)
 
     async def _set_many(
@@ -1290,13 +1350,16 @@ class NanocachedClient:
         """_multi_get_chunked's write-side twin: one or more ``o``
         sub-frames against ``connection_getter`` for keys/values (already
         grouped to one owner, or the single/proxy target), split into
-        _MAX_BATCH_KEYS-sized chunks. Always returns len(keys) entries; a
+        chunks bounded by both _MAX_BATCH_KEYS and _MAX_REQUEST_BYTES
+        (issue #222; see _batch_chunk_bounds) — 400 individually valid
+        key/value pairs can otherwise sum to an ``o`` frame past the
+        server's 1 MiB frame cap. Always returns len(keys) entries; a
         chunk that fails outright leaves the remaining keys' entries at
         the zero value (False) and that chunk's error is returned
         alongside."""
         entries: list[bool | object] = [False] * len(keys)
-        for start in range(0, len(keys), _MAX_BATCH_KEYS):
-            end = start + _MAX_BATCH_KEYS
+        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], [len(value) for value in values])
+        for start, end in bounds:
             try:
                 connection = await connection_getter()
                 chunk_entries = await connection.multi_set(

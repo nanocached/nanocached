@@ -118,6 +118,13 @@ class MockNode:
         # never two).
         self.multi_get_count = 0
         self.multi_set_count = 0
+        # Issue #222: the exact wire size (header line + namespace + key
+        # (+ value) bytes) of every m/o frame received, in send order —
+        # lets a test assert a byte-bound-driven split actually keeps
+        # every sub-frame under the server's 1 MiB cap, not just that
+        # more than one frame went out.
+        self.multi_get_frame_sizes: list[int] = []
+        self.multi_set_frame_sizes: list[int] = []
         self._fail_clear_replies = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
@@ -701,6 +708,7 @@ class MockNode:
                     key_lengths = [int(x) for x in parts[3 : 3 + count]]
                     keys = [await reader.readexactly(length) for length in key_lengths]
                     self.multi_get_count += 1
+                    self.multi_get_frame_sizes.append(len(header) + len(namespace) + sum(key_lengths))
                     if self._silent:
                         continue
                     if self._retryable_replies > 0:
@@ -759,6 +767,9 @@ class MockNode:
                         keys.append(await reader.readexactly(key_len))
                         values.append(await reader.readexactly(value_len))
                     self.multi_set_count += 1
+                    self.multi_set_frame_sizes.append(
+                        len(header) + len(namespace) + sum(key_lengths) + sum(value_lengths)
+                    )
                     if self._silent:
                         continue
                     if self._retryable_replies > 0:
