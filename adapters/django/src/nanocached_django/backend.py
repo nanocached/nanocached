@@ -48,6 +48,14 @@ from nanocached import NanocachedClient
 # this namespace unless the CACHES entry overrides it (issue #105).
 _DEFAULT_NAMESPACE = "django"
 
+# issue #185: how many times _run() re-tries _ensure_started() when a
+# concurrent shutdown()/close() raced it out from under a snapshot of
+# (loop, namespace handle) — see _run()'s own docstring. One retry covers
+# every realistic interleaving (shutdown() only runs on explicit request);
+# a small bound just avoids ever looping forever if something pathological
+# keeps shutting the backend down between every attempt.
+_RUN_RECONNECT_ATTEMPTS = 3
+
 # get_backend_timeout()'s sentinel for "don't cache this": Django's
 # timeout=0 (or a negative timeout) means "expire immediately", but
 # nanocached's wire TTL uses the *opposite* polarity — 0 there means "no
@@ -209,21 +217,50 @@ class NanocachedCache(BaseCache):
         self._namespace_handle = self._client.namespace(self._namespace)
 
     def _run(self, make_coro):
-        """Runs ``make_coro()`` — a zero-argument callable that builds
-        the coroutine to await, e.g.
-        ``lambda: self._namespace_handle.get_bytes(key)`` — on this
-        instance's loop thread and blocks the calling thread for its
-        result. Taking a *callable* rather than an already-built
-        coroutine matters: building the coroutine touches
-        ``self._namespace_handle``, which is only set once
-        ``_ensure_started()`` below has connected, so that has to happen
-        first — a coroutine built by the caller before calling this
-        method would run against a still-``None`` handle.
-        ``run_coroutine_threadsafe`` is the primitive for driving an
-        asyncio object from a different thread than the one running its
-        loop, which is what every sync SPI method here needs."""
-        self._ensure_started()
-        return asyncio.run_coroutine_threadsafe(make_coro(), self._loop).result()
+        """Runs ``make_coro(handle)`` — a one-argument callable that
+        builds the coroutine to await from the namespace handle, e.g.
+        ``lambda handle: handle.get_bytes(key)`` — on this instance's
+        loop thread and blocks the calling thread for its result.
+        Taking a *callable* rather than an already-built coroutine
+        matters: building the coroutine touches the namespace handle,
+        which is only set once ``_ensure_started()`` below has
+        connected, so that has to happen first — a coroutine built by
+        the caller before calling this method would run against a
+        still-``None`` handle. ``run_coroutine_threadsafe`` is the
+        primitive for driving an asyncio object from a different thread
+        than the one running its loop, which is what every sync SPI
+        method here needs.
+
+        issue #185: ``self._loop`` and the namespace handle are
+        snapshotted *together*, under ``_lifecycle_lock``, instead of
+        being read as two separate unguarded attribute accesses (one of
+        them buried inside the caller's ``make_coro``). A concurrent
+        ``shutdown()`` (or ``close()`` with ``CLOSE_ON_REQUEST``) sets
+        both to ``None`` under that same lock, so without this the two
+        reads could straddle a shutdown and hand a coroutine either a
+        ``None`` loop or a ``None`` handle — surfacing as a raw
+        ``AttributeError`` instead of a clean outcome. Snapshotting
+        under the lock also means a caller that arrives while
+        ``_ensure_started()``'s own connect is still in flight (held
+        under the same lock) waits for it to finish rather than racing
+        a still-``None`` handle.
+
+        If the snapshot lands mid-shutdown (``loop``/``handle`` still
+        ``None`` right after ``_ensure_started()`` returns), retrying
+        ``_ensure_started()`` reconnects exactly as it would on first
+        use — bounded by ``_RUN_RECONNECT_ATTEMPTS`` so a pathological
+        caller that keeps shutting the backend down between every
+        attempt fails loudly instead of spinning forever."""
+        for _ in range(_RUN_RECONNECT_ATTEMPTS):
+            self._ensure_started()
+            with self._lifecycle_lock:
+                loop, handle = self._loop, self._namespace_handle
+            if loop is not None and handle is not None:
+                return asyncio.run_coroutine_threadsafe(make_coro(handle), loop).result()
+        raise RuntimeError(
+            "nanocached_django: backend was shut down concurrently with "
+            "this operation and could not reconnect; retry the operation"
+        )
 
     def close(self, **kwargs) -> None:
         """Called by Django after every request (``request_finished`` →
@@ -236,7 +273,13 @@ class NanocachedCache(BaseCache):
     def shutdown(self) -> None:
         """Unconditionally stops the loop thread and closes the client
         (safe to call twice, or before any use); the next cache operation
-        lazily reconnects."""
+        lazily reconnects.
+
+        issue #185: the loop-stop/thread-join/loop-close teardown runs in
+        a ``finally`` so it always happens even if ``client.close()``
+        raises (e.g. the connection was already dead) — before this fix,
+        such a raise skipped the teardown entirely and leaked the loop
+        thread (and whatever socket it still held open)."""
         with self._lifecycle_lock:
             loop, thread, client = self._loop, self._loop_thread, self._client
             self._loop = None
@@ -245,11 +288,13 @@ class NanocachedCache(BaseCache):
             self._namespace_handle = None
         if loop is None:
             return
-        if client is not None:
-            asyncio.run_coroutine_threadsafe(client.close(), loop).result()
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join()
-        loop.close()
+        try:
+            if client is not None:
+                asyncio.run_coroutine_threadsafe(client.close(), loop).result()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join()
+            loop.close()
 
     # ── timeout translation ─────────────────────────────────────────
 
@@ -289,7 +334,7 @@ class NanocachedCache(BaseCache):
         both write, and the later write wins."""
         cache_key = self.make_and_validate_key(key, version=version)
         wire_ttl = self.get_backend_timeout(timeout)
-        existing = self._run(lambda: self._namespace_handle.get_bytes(cache_key))
+        existing = self._run(lambda handle: handle.get_bytes(cache_key))
         if existing is not None:
             return False
         if wire_ttl is _DO_NOT_CACHE:
@@ -298,12 +343,12 @@ class NanocachedCache(BaseCache):
             # backends give a zero/negative timeout (e.g. LocMemCache).
             return True
         encoded = _encode_value(value)
-        self._run(lambda: self._namespace_handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
+        self._run(lambda handle: handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
         return True
 
     def get(self, key, default=None, version=None):
         cache_key = self.make_and_validate_key(key, version=version)
-        raw = self._run(lambda: self._namespace_handle.get_bytes(cache_key))
+        raw = self._run(lambda handle: handle.get_bytes(cache_key))
         if raw is None:
             return default
         return _decode_value(raw)
@@ -312,10 +357,10 @@ class NanocachedCache(BaseCache):
         cache_key = self.make_and_validate_key(key, version=version)
         wire_ttl = self.get_backend_timeout(timeout)
         if wire_ttl is _DO_NOT_CACHE:
-            self._run(lambda: self._namespace_handle.delete(cache_key))
+            self._run(lambda handle: handle.delete(cache_key))
             return
         encoded = _encode_value(value)
-        self._run(lambda: self._namespace_handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
+        self._run(lambda handle: handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
         """get_bytes + re-set with the new timeout — also not atomic (a
@@ -323,27 +368,27 @@ class NanocachedCache(BaseCache):
         pre-touch value); returns False without writing anything if the
         key is already missing."""
         cache_key = self.make_and_validate_key(key, version=version)
-        raw = self._run(lambda: self._namespace_handle.get_bytes(cache_key))
+        raw = self._run(lambda handle: handle.get_bytes(cache_key))
         if raw is None:
             return False
         wire_ttl = self.get_backend_timeout(timeout)
         if wire_ttl is _DO_NOT_CACHE:
-            self._run(lambda: self._namespace_handle.delete(cache_key))
+            self._run(lambda handle: handle.delete(cache_key))
             return True
         # Re-sent as the raw bytes already read back — already encoded
         # (pickled, or a counter's decimal-ASCII form), so there's
         # nothing to gain (and a value round-trip to lose) by decoding
         # and re-encoding it just to change the TTL.
-        self._run(lambda: self._namespace_handle.set(cache_key, raw, ttl_seconds=wire_ttl))
+        self._run(lambda handle: handle.set(cache_key, raw, ttl_seconds=wire_ttl))
         return True
 
     def delete(self, key, version=None):
         cache_key = self.make_and_validate_key(key, version=version)
-        return self._run(lambda: self._namespace_handle.delete(cache_key))
+        return self._run(lambda handle: handle.delete(cache_key))
 
     def has_key(self, key, version=None):
         cache_key = self.make_and_validate_key(key, version=version)
-        return self._run(lambda: self._namespace_handle.get_bytes(cache_key)) is not None
+        return self._run(lambda handle: handle.get_bytes(cache_key)) is not None
 
     def get_many(self, keys, version=None):
         # One wire round trip per involved node (issue #152), via the
@@ -353,7 +398,7 @@ class NanocachedCache(BaseCache):
         cache_keys = {self.make_and_validate_key(key, version=version): key for key in keys}
         if not cache_keys:
             return {}
-        raw = self._run(lambda: self._namespace_handle.get_many_bytes(list(cache_keys)))
+        raw = self._run(lambda handle: handle.get_many_bytes(list(cache_keys)))
         return {cache_keys[cache_key]: _decode_value(value) for cache_key, value in raw.items()}
 
     def set_many(self, data, timeout=DEFAULT_TIMEOUT, version=None):
@@ -370,7 +415,7 @@ class NanocachedCache(BaseCache):
             self.delete_many(data.keys(), version=version)
             return []
         payload = {self.make_and_validate_key(key, version=version): _encode_value(value) for key, value in data.items()}
-        self._run(lambda: self._namespace_handle.set_many(payload, ttl_seconds=wire_ttl))
+        self._run(lambda handle: handle.set_many(payload, ttl_seconds=wire_ttl))
         return []
 
     def delete_many(self, keys, version=None):
@@ -381,7 +426,7 @@ class NanocachedCache(BaseCache):
         """This namespace's CLEAR (issue #106) — never the whole store,
         so other aliases/namespaces sharing a node or cluster are
         untouched. One ``c`` frame per node, fanned out by the SDK."""
-        self._run(lambda: self._namespace_handle.clear())
+        self._run(lambda handle: handle.clear())
 
     def incr(self, key, delta=1, version=None):
         """The SDK's own INCR (issue #129) — atomic on the node that owns
@@ -400,7 +445,7 @@ class NanocachedCache(BaseCache):
         for rate limiting or approximate counts, not for a count that
         must survive (billing, inventory)."""
         cache_key = self.make_and_validate_key(key, version=version)
-        new_value = self._run(lambda: self._namespace_handle.incr(cache_key, delta))
+        new_value = self._run(lambda handle: handle.incr(cache_key, delta))
         if new_value is None:
             raise ValueError(f"Key '{key}' not found")
         return new_value
