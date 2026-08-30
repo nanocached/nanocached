@@ -3785,4 +3785,91 @@ public class TolerantBootstrapTests
         Assert.False(HasMember(client, dead), "departed node still present in members");
         Assert.False(cooldowns.Contains(deadAddress), "cooldown for departed address was not purged");
     }
+
+    [Fact]
+    public async Task RefreshDialsNewlyJoinedNodesConcurrently()
+    {
+        // Issue #227: RefreshNodeListAsync used to await each new node's
+        // dial in a foreach, so under _refreshGate a scale-out of N nodes
+        // serialized N dials. Every newly joined node here answers its
+        // handshake only after a fixed delay; a concurrent refresh
+        // (Task.WhenAll, like OpenClusterAsync) finishes in about one
+        // delay, not N times that.
+        using var seed = new MockNode();
+        using var discovery = new MockDiscovery(new[] { ("seed", seed.Address) }, replication: 1);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", discovery.Port) },
+        });
+
+        const int delayMillis = 300;
+        const int newNodeCount = 5;
+        var joiners = new List<MockNode>();
+        var entries = new List<(string Name, string Address)> { ("seed", seed.Address) };
+        for (int i = 0; i < newNodeCount; i++)
+        {
+            var node = new MockNode();
+            node.DelayAuth(delayMillis);
+            joiners.Add(node);
+            entries.Add(($"joiner-{i}", node.Address));
+        }
+
+        try
+        {
+            discovery.SetNodes(entries);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            await ForceRefreshAsync(client);
+            stopwatch.Stop();
+
+            Assert.True(stopwatch.ElapsedMilliseconds < delayMillis * 2,
+                $"expected concurrent dials to finish in ~{delayMillis}ms, took {stopwatch.ElapsedMilliseconds}ms " +
+                $"(serial dialing of {newNodeCount} nodes would take ~{delayMillis * newNodeCount}ms)");
+
+            for (int i = 0; i < newNodeCount; i++)
+            {
+                Assert.NotNull(GetMemberConnection(client, $"joiner-{i}"));
+            }
+        }
+        finally
+        {
+            foreach (MockNode node in joiners) node.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task RefreshInstallsReachableNewNodesDespiteOneFailingDial()
+    {
+        // A failing dial for one newly discovered node must not prevent
+        // the other newly discovered nodes from being installed: every
+        // dial outcome is gathered first, and only then applied under
+        // the lock — mirroring OpenClusterAsync.
+        using var seed = new MockNode();
+        using var discovery = new MockDiscovery(new[] { ("seed", seed.Address) }, replication: 1);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", discovery.Port) },
+        });
+
+        using var good = new MockNode();
+        // Nobody listens on this address: OpenNodeConnectionAsync throws
+        // ConnectionLostException (a NanocachedException) for it.
+        string badAddress = $"127.0.0.1:{Wire.UnusedPort()}";
+
+        discovery.SetNodes(new[]
+        {
+            ("seed", seed.Address),
+            ("good", good.Address),
+            ("bad", badAddress),
+        });
+
+        long before = client.Stats().RefreshFailures;
+        await ForceRefreshAsync(client);
+
+        Assert.NotNull(GetMemberConnection(client, "good"));
+        Assert.False(HasMember(client, "bad"), "a failing dial must not install a member");
+        Assert.Equal(before + 1, client.Stats().RefreshFailures);
+    }
 }

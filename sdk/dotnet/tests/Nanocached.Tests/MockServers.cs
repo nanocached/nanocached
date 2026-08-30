@@ -128,6 +128,7 @@ public sealed class MockNode : IDisposable
     private int _extraByteOnSetReplies;
     private volatile int _setDelayMillis;
     private volatile int _getDelayMillis;
+    private volatile int _authDelayMillis;
     private volatile bool _silent;
     private long _lastSetTtl;
     private int _namespacedRequestCount;
@@ -245,6 +246,13 @@ public sealed class MockNode : IDisposable
     /// first — for hedged-reads tests proving a caller isn't bounded by a
     /// slow owner (Hedged reads).</summary>
     public void DelayGets(int millis) => _getDelayMillis = millis;
+
+    /// <summary>Holds every future accepted A (auth/identify) reply for
+    /// <paramref name="millis"/> first — issue #227: for tests proving a
+    /// client dialing several newly discovered nodes on a refresh does so
+    /// concurrently (Task.WhenAll) rather than one dial's connect time
+    /// per node.</summary>
+    public void DelayAuth(int millis) => _authDelayMillis = millis;
 
     /// <summary>Makes this node a half-open server from this point on: it
     /// still accepts and completes the A handshake, and still reads every
@@ -368,6 +376,10 @@ public sealed class MockNode : IDisposable
                             ? secret.Length > 0
                             : secret.AsSpan().SequenceEqual(_requiredSecret);
                         tagged = accepted && _supportTags && parts.Length > 2 && parts[2] == "T";
+                        if (accepted && _authDelayMillis > 0)
+                        {
+                            await Task.Delay(_authDelayMillis);
+                        }
                         await Wire.WriteAsync(stream, accepted ? (tagged ? "OnT\n" : "On\n") : "En\n");
                         if (!accepted) return;
                         break;
