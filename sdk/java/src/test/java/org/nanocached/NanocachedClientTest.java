@@ -2814,6 +2814,50 @@ class NanocachedClientTest {
         }
     }
 
+    @org.junit.jupiter.api.AfterEach
+    void resetMaxInFlightHedgeLoserLegs() {
+        NanocachedClient.maxInFlightHedgeLoserLegs = 32;
+    }
+
+    @Test
+    void hedgeLosersFallBackToSynchronousPastTheCap() throws Exception {
+        // Issue #276: with no room under maxInFlightHedgeLoserLegs, the
+        // slow primary's losing leg is joined right here instead of being
+        // left detached in hedgedReads for close() to drain later —
+        // mirroring fireAndForgetReplicasFallsBackToSynchronousPastTheCap
+        // for background replica writes.
+        NanocachedClient.maxInFlightHedgeLoserLegs = 0;
+
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            String primary = owners.get(0);
+            String replica = owners.get(1);
+
+            try (NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
+                client.set("k", "v");
+                cluster.nodes().get(primary).delayGets(300);
+
+                long start = System.nanoTime();
+                Optional<String> value = client.get("k");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(Optional.of("v"), value);
+                assertEquals(1, cluster.nodes().get(replica).getCount.get(),
+                        "the replica should have been hedged to");
+                assertTrue(elapsedMillis >= 300 - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "expected get() to wait for the slow primary's loser leg past the cap, took "
+                                + elapsedMillis + "ms");
+                assertEquals(1, cluster.nodes().get(primary).getCount.get());
+
+                Field hedgedReadsField = NanocachedClient.class.getDeclaredField("hedgedReads");
+                hedgedReadsField.setAccessible(true);
+                Set<?> hedgedReads = (Set<?>) hedgedReadsField.get(client);
+                assertTrue(hedgedReads.isEmpty(),
+                        "the awaited loser must already be gone, not left for close() to drain");
+            }
+        }
+    }
+
     // ── stats() — counters for by-design swallows ──────────────────
 
     @Test

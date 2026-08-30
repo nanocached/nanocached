@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -438,6 +439,23 @@ public final class NanocachedClient implements AutoCloseable {
     // practice.
     private static final int REPLICA_WRITER_POOL_HEADROOM = 16;
 
+    // Hedged reads' losing legs (issue #276), analogous to
+    // maxInFlightBackgroundReplicaWrites above: a losing leg is normally
+    // left running detached in hedgedReads, drained by close() -- with no
+    // bound, a client issuing many concurrent hedged reads against a
+    // slow owner could accumulate an unbounded number of them. Not
+    // permit-gated like backgroundReplicaWritePermits -- a leg must
+    // always be started immediately to race for the read's own answer,
+    // so admission can't be refused -- so this cap instead gates only
+    // whether a read's remaining legs are left detached once the read
+    // has already decided its outcome: past this many concurrently
+    // tracked hedge legs (see resolveLosers), the remaining ones are
+    // joined synchronously right there instead, the same "fall back to
+    // synchronous" shape maxInFlightBackgroundReplicaWrites uses past its
+    // own cap. Mutable only so tests can shrink it, mirroring
+    // maxInFlightBackgroundReplicaWrites.
+    static volatile int maxInFlightHedgeLoserLegs = 32;
+
     // Cap on the throwaway dialer pool openCluster spins up to bootstrap-
     // dial every discovered node concurrently (issue #178). Node counts are
     // only bounded by Identify.MAX_NODE_COUNT (65536) — sizing the pool to
@@ -491,13 +509,16 @@ public final class NanocachedClient implements AutoCloseable {
      * #dialWithCooldown}'s plain single-address redial. See {@link
      * Options#viaProxy}. */
     private final boolean viaProxy;
-    /** Hedge legs still in flight after a read has already returned (the
-     * losers): finished detached on {@link #replicaWriters}, their result
+    /** Every hedge leg currently in flight — including a read's own
+     * winning leg while it's still racing — added by {@link
+     * #startHedgeLeg} and removed on completion; a losing leg (issue
+     * #64) finishes detached on {@link #replicaWriters}, its result
      * discarded, drained by {@link #close()} exactly like {@link
-     * #backgroundReplicaWritePermits}'s writes. Unlike that pool, hedge
-     * legs are not permit-gated — a read may only ever have at most
-     * {@code replication} legs in flight at once, so no separate cap is
-     * needed. */
+     * #backgroundReplicaWritePermits}'s writes. Unlike that pool, a leg
+     * is never refused admission here — it must always be started
+     * immediately to race for its read's own answer — but {@link
+     * #maxInFlightHedgeLoserLegs} (issue #276) still bounds how many can
+     * accumulate: see {@link #resolveLosers}. */
     private final Set<CompletableFuture<?>> hedgedReads = ConcurrentHashMap.newKeySet();
     /** Serializes a hedge leg's "check closed, then register" against
      * {@link #close()}'s "observe the set empty, then stop draining"
@@ -3091,9 +3112,14 @@ public final class NanocachedClient implements AutoCloseable {
     private <T> T readHedged(ConnectionOp<T> op, List<String> names) {
         BlockingQueue<Integer> completions = new LinkedBlockingQueue<>();
         Map<Integer, LegOutcome<T>> results = new ConcurrentHashMap<>();
+        // Every leg started so far, keyed by index, so that once this read
+        // decides its outcome the legs it leaves behind can be resolved
+        // (issue #276) -- see resolveLosers. Plain HashMap: only ever
+        // touched from this method's own thread.
+        Map<Integer, CompletableFuture<Void>> legFutures = new HashMap<>();
 
         int nextIndex = 1;
-        startHedgeLeg(0, names.get(0), op, completions, results);
+        legFutures.put(0, startHedgeLeg(0, names.get(0), op, completions, results));
         int pendingCount = 1;
 
         RuntimeException lastError = null;
@@ -3114,21 +3140,33 @@ public final class NanocachedClient implements AutoCloseable {
             if (index == null) {
                 // Hedge interval elapsed with no answer: one more owner,
                 // without waiting for any leg already in flight.
-                startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results);
+                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results));
                 pendingCount++;
                 nextIndex++;
                 continue;
             }
 
             pendingCount--;
+            // This leg just produced an outcome, so it's already finished
+            // -- discard it from hedgedReads up front (issue #276), before
+            // deciding anything below, exactly as the WrongNode/bug/hit
+            // branches need an accurate count of what's still genuinely in
+            // flight when they call resolveLosers.
+            CompletableFuture<Void> finishedLeg = legFutures.remove(index);
+            if (finishedLeg != null) {
+                hedgedReads.remove(finishedLeg);
+            }
             LegOutcome<T> outcome = results.remove(index);
             if (outcome.wrongNode != null) {
+                resolveLosers(legFutures.values());
                 throw outcome.wrongNode;
             } else if (outcome.bug != null) {
+                resolveLosers(legFutures.values());
                 throw outcome.bug;
             } else if (outcome.failure != null) {
                 lastError = outcome.failure;
             } else if (outcome.value != null || index == 0) {
+                resolveLosers(legFutures.values());
                 return outcome.value;
             } else {
                 replicaMissed = true;
@@ -3138,7 +3176,7 @@ public final class NanocachedClient implements AutoCloseable {
                 // Everything started so far has failed or missed
                 // provisionally: the next owner gets its turn right away,
                 // rather than waiting out another full interval.
-                startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results);
+                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, completions, results));
                 pendingCount++;
                 nextIndex++;
             }
@@ -3148,6 +3186,36 @@ public final class NanocachedClient implements AutoCloseable {
         throw lastError != null
                 ? lastError
                 : new NanocachedException("nanocached: no owner is reachable for this key");
+    }
+
+    /** Issue #276: {@link #readHedged} has already decided its outcome,
+     * with {@code losers} — each already tracked in {@link #hedgedReads}
+     * by {@link #startHedgeLeg} — left running. Normally they're left
+     * exactly as they are: running detached in the background, drained
+     * eventually by {@link #close()}, same as always. But past {@link
+     * #maxInFlightHedgeLoserLegs} concurrently tracked hedge legs
+     * (checked against {@link #hedgedReads}, which still counts every
+     * leg in {@code losers} at this point, plus any other concurrent
+     * hedged read's own in-flight legs) — so a client issuing many
+     * concurrent hedged reads against a slow owner can't accumulate an
+     * unbounded number of background legs — this read instead joins them
+     * right here before returning, the same "fall back to synchronous"
+     * shape {@link #backgroundReplicaWritePermits} uses past its own
+     * cap. Outcomes are ignored either way: a loser's result was never
+     * going to be used. */
+    private void resolveLosers(Collection<CompletableFuture<Void>> losers) {
+        if (losers.isEmpty() || hedgedReads.size() < maxInFlightHedgeLoserLegs) {
+            return;
+        }
+        for (CompletableFuture<Void> future : losers) {
+            hedgedReads.remove(future);
+            try {
+                future.join();
+            } catch (RuntimeException ignored) {
+                // A losing leg's own failure is irrelevant now -- this
+                // read already decided its outcome via a different leg.
+            }
+        }
     }
 
     /** Starts one hedge leg against {@code names.get(index)} (via {@code
@@ -3161,8 +3229,11 @@ public final class NanocachedClient implements AutoCloseable {
      * while it's blocked waiting on an earlier leg, which a queue gives
      * for free and a bare future does not. The future itself exists only
      * so {@link #hedgedReads}/{@link #drainHedgedReads} can still block
-     * {@link #close()} until this leg — win or lose — actually finishes. */
-    private <T> void startHedgeLeg(int index, String name, ConnectionOp<T> op,
+     * {@link #close()} until this leg — win or lose — actually finishes.
+     * Also returned directly, so {@link #readHedged} can join it itself
+     * via {@link #resolveLosers} past {@link #maxInFlightHedgeLoserLegs}
+     * (issue #276) without waiting on {@link #close()}. */
+    private <T> CompletableFuture<Void> startHedgeLeg(int index, String name, ConnectionOp<T> op,
             BlockingQueue<Integer> completions, Map<Integer, LegOutcome<T>> results) {
         Runnable task = () -> {
             LegOutcome<T> outcome;
@@ -3204,6 +3275,7 @@ public final class NanocachedClient implements AutoCloseable {
             CompletableFuture<Void> future = started;
             hedgedReads.add(future);
             future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
+            return future;
         }
     }
 
