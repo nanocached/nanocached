@@ -18,6 +18,7 @@ import {
 import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
+import { MULTI_GET_TUNING } from "../src/protocol.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -2225,6 +2226,63 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
           assert.ok(error instanceof WrongNodeError);
           assert.equal((error as PartialWrongNodeError<Map<string, string>>).partialValues.get("b"), "2");
         }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient getManyBytes cumulative response size bound (issue #207)", () => {
+  // MULTI_GET_TUNING exists only so these tests can shrink it, mirroring
+  // REQUEST_TIMEOUT_TUNING above.
+  const defaultMaxResponseBytes = MULTI_GET_TUNING.maxResponseBytes;
+  afterEach(() => {
+    MULTI_GET_TUNING.maxResponseBytes = defaultMaxResponseBytes;
+  });
+
+  it("rejects and poisons the connection when a reply's combined hit bytes exceed the bound", async () => {
+    // Regression for issue #207 (follow-up to issue #179/PR #201, the
+    // Java fix): the per-value length cap alone doesn't bound an `M`
+    // reply's total size — a node could still answer a multi-get with
+    // many maximally-sized hits and force a huge allocation from one
+    // reply. Same poison-then-redial contract as the other desync
+    // regressions above (e.g. "a malformed value length poisons the
+    // connection and the next request redials").
+    const node = await startMockNode();
+    try {
+      MULTI_GET_TUNING.maxResponseBytes = 3;
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.setManyBytes({ a: Buffer.from([1, 2]), b: Buffer.from([3, 4]) }); // combined 4 bytes > bound of 3
+
+        await assert.rejects(client.getManyBytes(["a", "b"]), /multi-get response exceeds 3 bytes/);
+
+        // The poisoned connection is replaced lazily; the next request
+        // transparently redials.
+        assert.deepEqual(await client.getBytes("a"), Buffer.from([1, 2]));
+        assert.equal(node.connectionCount(), 2);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("still resolves normally when a reply's combined hit bytes sit right at the bound", async () => {
+    const node = await startMockNode();
+    try {
+      MULTI_GET_TUNING.maxResponseBytes = 4;
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.setManyBytes({ a: Buffer.from([1, 2]), b: Buffer.from([3, 4]) }); // combined exactly 4 bytes
+
+        const values = await client.getManyBytes(["a", "b"]);
+        assert.deepEqual(values.get("a"), Buffer.from([1, 2]));
+        assert.deepEqual(values.get("b"), Buffer.from([3, 4]));
       } finally {
         client.close();
       }

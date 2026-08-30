@@ -487,6 +487,17 @@ const LF = 0x0a;
 // header than this can never complete anyway (see parseMultiHeader).
 const MAX_MULTI_HEADER_LENGTH = 4096;
 
+// Bounds the SUM of every hit's declared length across one `M` reply
+// (issue #207, follow-up to the Java fix's issue #179/PR #201). Each
+// individual hit length is already capped at MAX_VALUE_LENGTH above, but
+// that alone doesn't bound the reply as a whole: a node answering a
+// 400-key multi-get with 400 x MAX_VALUE_LENGTH (2 MiB) hits would force
+// ~800 MB of allocation from a single reply. Reuses the 64 MiB figure
+// MAX_DECOMPRESSED_LENGTH (compression.ts) already established as "far
+// above any realistic cache value/reply". Exported as a mutable object
+// only so tests can shrink it, mirroring REQUEST_TIMEOUT_TUNING.
+export const MULTI_GET_TUNING = { maxResponseBytes: 64 * 1024 * 1024 };
+
 // Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
 // bare `Number(field)` also accepts scientific notation ("1e2"), leading
 // whitespace (" 5"), and a leading sign ("+5"), any of which would parse a
@@ -741,7 +752,9 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
     // whole header is parsed before any body byte is read, so the
     // total body length is known up front — see peekMultiFrameLength,
     // which Connection uses to bound its own incomplete-frame backstop
-    // for exactly this reason.
+    // for exactly this reason, and MULTI_GET_TUNING below, which rejects
+    // a roster whose declared total already exceeds a sane bound before
+    // ever waiting for (or allocating) that body (issue #207).
     case MARKER_MULTI: {
       const header = parseMultiHeader(buf, tagged);
       if (header === null) return null;
@@ -760,6 +773,14 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
         }
         hitLengths[i] = length;
         bodyLength += length;
+        // Checked as soon as the running total crosses the bound — while
+        // the header is still being read, before ever waiting for (let
+        // alone allocating) the oversized body itself (issue #207).
+        if (bodyLength > MULTI_GET_TUNING.maxResponseBytes) {
+          throw new NanocachedError(
+            `nanocached: multi-get response exceeds ${MULTI_GET_TUNING.maxResponseBytes} bytes (connection desynced)`,
+          );
+        }
       }
 
       const bodyStart = header.headerEnd + 1;
@@ -787,7 +808,11 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
     // `O` — batched set's reply (issues #150/#151): `O <n>
     // <result-1>...<result-n>[ <tag>]\n` — no body, unlike `M`'s hit
     // values (a set has nothing to echo back). Each token is "S"
-    // (stored) or "W" (wrong node).
+    // (stored) or "W" (wrong node). No MULTI_GET_TUNING-style cumulative
+    // bound needed here (issue #207, #179): every token is a fixed-width
+    // single character with no length-prefixed body, so this map is
+    // already O(count) and count is already bounded by parseMultiHeader
+    // rejecting an overlong header line (MAX_MULTI_HEADER_LENGTH).
     case MARKER_MULTI_ACK: {
       const header = parseMultiHeader(buf, tagged);
       if (header === null) return null;
