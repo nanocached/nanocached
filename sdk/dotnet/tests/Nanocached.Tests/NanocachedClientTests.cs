@@ -1097,6 +1097,41 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task GetManyBytesAsyncHandlesAFullBatchHitHeavyMultiGetHeaderOverTheOldHeaderLineCap()
+    {
+        // Regression for issue #273: Connection.MaxHeaderLineLength used to
+        // be 1024, but an `M` reply's header carries one length token per
+        // requested key on its single line. A full MaxBatchKeys (400)
+        // multi-get where every key hits therefore packs 400 tokens onto
+        // one line — here each ~500-byte value's token (" 500", 4 bytes)
+        // alone sums past 1024 (400 x 4 = 1600, plus the "M 400" prefix),
+        // which used to trip ReadLineAsync's old cap partway through a
+        // perfectly valid reply and poison the connection with
+        // ConnectionLostException. This must round-trip cleanly instead.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        var rng = new Random(273);
+        var values = new Dictionary<string, byte[]>();
+        for (int i = 0; i < 400; i++)
+        {
+            var bytes = new byte[500];
+            rng.NextBytes(bytes);
+            values[$"k{i}"] = bytes;
+        }
+
+        await client.SetManyBytesAsync(values);
+
+        Dictionary<string, byte[]> roundTripped = await client.GetManyBytesAsync(values.Keys.ToList());
+
+        Assert.Equal(values.Count, roundTripped.Count);
+        foreach ((string key, byte[] expected) in values)
+        {
+            Assert.Equal(expected, roundTripped[key]);
+        }
+    }
+
+    [Fact]
     public async Task SetManyBytesAsyncSplitsByCumulativeBytesWhenIndividuallyValidPairsSumPastTheCap()
     {
         // Regression for issue #222: batch chunking used to split a
