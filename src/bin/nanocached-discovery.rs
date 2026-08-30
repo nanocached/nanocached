@@ -2109,14 +2109,27 @@ async fn write_all_timed(
 /// connection, which is a fixed number of bytes). Bails out past
 /// `MAX_ACK_LINE_LENGTH` rather than growing `line` without bound on a
 /// desynced or malicious peer.
+///
+/// The deadline is computed once, before the loop, and every per-byte read
+/// is raced against that same `Instant` via `timeout_at` — not against a
+/// fresh `io_timeout` window each time. A peer that drips the ack one byte
+/// at a time, each byte arriving just under `io_timeout` apart, would
+/// otherwise never trip a per-read `timeout()`, turning a bounded read into
+/// an effectively unbounded one; because `send_migrate`/`send_cancel` are
+/// awaited by `sweep_expired` — the sole task doing liveness eviction and
+/// migration-timeout reaping — that would freeze it for as long as the
+/// trickle continues.
 const MAX_ACK_LINE_LENGTH: usize = 64;
 
 async fn read_line_timed(stream: &mut ClientStream, io_timeout: Duration) -> io::Result<String> {
+    let deadline = Instant::now() + io_timeout;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
 
     loop {
-        read_exact_timed(stream, &mut byte, io_timeout).await?;
+        timeout_at(deadline, stream.read_exact(&mut byte))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "ack read timed out"))??;
         if byte[0] == b'\n' {
             break;
         }
@@ -8588,6 +8601,51 @@ mod tests {
         expected.extend_from_slice(b"joining-node");
         expected.extend_from_slice(b"127.0.0.1:9");
         assert_eq!(*received.lock().unwrap(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_line_timed_fails_within_the_overall_deadline_against_a_trickling_peer() {
+        // Regression for issue #216: read_line_timed used to call
+        // read_exact_timed once per byte, re-arming a fresh io_timeout
+        // window on every single-byte read instead of racing the whole
+        // line against one deadline. A peer that drips the ack slower than
+        // the per-byte timeout but faster than the overall timeout would
+        // never trip that per-byte timeout at all, making the doc
+        // comment's "bounded overall" claim false. Here the peer sends the
+        // 4-byte "A 0\n" ack 150ms apart (600ms total) against a 200ms
+        // io_timeout: the fix must fail out around 200ms, not succeed
+        // around 600ms.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let node_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for byte in b"A 0\n" {
+                stream.write_all(&[*byte]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        });
+
+        let io_timeout = Duration::from_millis(200);
+        let mut stream = connect_client_stream(&address, None).await.unwrap();
+
+        let started = Instant::now();
+        let result = read_line_timed(&mut stream, io_timeout).await;
+        let elapsed = started.elapsed();
+
+        node_task.abort();
+
+        let error = result.expect_err("expected the trickling peer to time out overall");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "failed suspiciously fast ({elapsed:?}) — is this actually exercising the trickle?"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "expected the read to fail close to io_timeout (~200ms), took {elapsed:?} instead — \
+             the per-byte re-arm bug would let this keep succeeding past 600ms"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
