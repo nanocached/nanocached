@@ -68,11 +68,21 @@ internal sealed class Connection
     internal static long MaxMultiGetResponseBytes = 64L * 1024 * 1024;
 
     // Header/tag lines (the marker line ahead of a V's body, or the whole
-    // line for S/D/N/W) are always a handful of bytes in the real
-    // protocol. Without a cap, a malicious or buggy node that streams
-    // bytes with no '\n' would grow ReadLineAsync's StringBuilder without
-    // bound, gated only by RequestTimeout rather than failing fast.
-    private const int MaxHeaderLineLength = 1024;
+    // line for S/D/N/W) are usually just a handful of bytes, but an `M`
+    // reply's header carries one length token per requested key on this
+    // same single line — a full MaxBatchKeys (400, NanocachedClient.cs)
+    // multi-get where every key hits packs 400 tokens, each at worst a
+    // decimal byte length up to MaxValueLength's own digit count plus its
+    // separating space (len("2097152")+1 = 8 bytes): 400*8 = 3200 bytes,
+    // which the old 1024 cap tripped on a perfectly valid reply, poisoning
+    // the connection with ConnectionLostException (issue #273). 4096
+    // leaves comfortable headroom above that 3200-byte worst case while
+    // still bounding a malicious or buggy node that streams bytes with no
+    // '\n' from growing ReadLineAsync's StringBuilder without bound,
+    // gated only by RequestTimeout rather than failing fast. Matches the
+    // Go/Rust/TypeScript/Java SDKs' equivalent constant (Go's
+    // maxHeaderLineLength, connection.go:54, derives it the same way).
+    private const int MaxHeaderLineLength = 4096;
 
     /// <summary>Bounds how long the connection may go without progress
     /// while requests are outstanding (issue #42) — each response must
