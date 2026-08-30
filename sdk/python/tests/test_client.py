@@ -863,6 +863,26 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_close_awaits_the_keepalive_task_leaving_nothing_pending(self):
+        # Issue #189: close() cancelled the keepalive task but never
+        # gathered it (unlike _redials/_refresh_task/
+        # _background_replica_writes/_hedged_reads) — a loop torn down
+        # right after close() could log "Task was destroyed but it is
+        # pending!" for it. Assert the task itself is both finished and
+        # gone from asyncio.all_tasks() by the time close() returns.
+        node = await MockNode().start()
+        try:
+            self._client_module._KEEPALIVE_INTERVAL = 0.02
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            await wait_for(lambda: node.get_count >= 1, "a keep-alive ping")
+            keepalive_task = client._keepalive_task
+            self.assertIsNotNone(keepalive_task)
+            await client.close()
+            self.assertTrue(keepalive_task.done())
+            self.assertNotIn(keepalive_task, asyncio.all_tasks())
+        finally:
+            await node.close()
+
 
 class RequestTimeoutTests(unittest.IsolatedAsyncioTestCase):
     # The progress-based request timeout (issue #42); the module-level
@@ -2314,6 +2334,49 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(elapsed, 0.3)
             finally:
                 await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_close_still_drains_a_replica_leg_orphaned_by_a_cancelled_write(self):
+        # Issue #189: the CancelledError path above (previous test) used
+        # to re-raise immediately without registering the still-running
+        # synchronous replica leg anywhere, leaving it a true orphan —
+        # nothing referenced it, so close()'s _teardown() could yank the
+        # connection out from under a write that was already on its way
+        # to succeeding. It must instead land on the replica, same as if
+        # the cancellation had never happened, with close() waiting for
+        # it via the same background-replica-write pool fire_and_forget
+        # dispatch uses.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            primary, replica = self.owners_of("k")
+            nodes[primary].delay_sets(0.3)
+            nodes[replica].delay_sets(0.08)
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(client.set("k", "v"), timeout=0.05)
+
+            # The replica leg is still in flight at this point (0.08s
+            # hasn't elapsed) with nothing awaiting it yet — before the
+            # fix this raced _teardown() below and warned "Task was
+            # destroyed but it is pending!" once the loop tore down.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                await client.close()
+                # Give a torn-down connection's socket-close callbacks
+                # (and any leftover task destruction) a chance to run and
+                # emit their warning before it's checked below.
+                await asyncio.sleep(0)
+
+            self.assertIn(
+                b"k",
+                nodes[replica].store,
+                "close() tore down the connection before the orphaned replica leg finished",
+            )
+            self.assertNotIn("destroyed", captured.getvalue())
         finally:
             await discovery.close()
             for node in nodes.values():
