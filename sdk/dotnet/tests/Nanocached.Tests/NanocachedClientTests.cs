@@ -3455,6 +3455,51 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ReadHedgeFallsBackToSynchronousPastTheLoserLegCap()
+    {
+        // issue #276: MaxInFlightHedgeLoserLegs=0 means ResolveHedgeLosersAsync's
+        // "_hedgedReads.Count < cap" check can never pass, so the losing
+        // replica leg can never be left detached — the read must await it
+        // synchronously before returning, the same "fall back to
+        // synchronous" shape MaxInFlightBackgroundReplicaWrites uses past
+        // its own cap (FireAndForgetReplicasFallsBackToSynchronousPastTheCap
+        // above).
+        int defaultCap = NanocachedClient.MaxInFlightHedgeLoserLegs;
+        NanocachedClient.MaxInFlightHedgeLoserLegs = 0;
+        try
+        {
+            using Cluster cluster = StartCluster(replication: 2);
+            IReadOnlyList<string> owners = OwnersOf("k");
+            string primary = owners[0], replica = owners[1];
+
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+            {
+                Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+                ReadHedgeAfter = TimeSpan.FromMilliseconds(20),
+            });
+            await client.SetAsync("k", "v");
+            cluster.Nodes[primary].DelayGets(60);
+            cluster.Nodes[replica].DelayGets(250);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            string? value = await client.GetAsync("k");
+            stopwatch.Stop();
+
+            Assert.Equal("v", value);
+            Assert.True(stopwatch.ElapsedMilliseconds >= 250 - HedgeTimingToleranceMillis,
+                $"elapsed {stopwatch.ElapsedMilliseconds}ms should have waited out the replica's own 250ms delay past the cap, not returned as soon as the primary answered at ~60ms");
+            // The synchronously-awaited leg was pulled out of _hedgedReads
+            // before being awaited, and never re-added, so nothing is left
+            // for Close() to drain.
+            Assert.Empty(HedgedReads(client));
+        }
+        finally
+        {
+            NanocachedClient.MaxInFlightHedgeLoserLegs = defaultCap;
+        }
+    }
+
+    [Fact]
     public async Task HedgeLegRacingCloseIsRefusedNotRegistered()
     {
         // Issue #91: a read that passed its own _closed check can reach
