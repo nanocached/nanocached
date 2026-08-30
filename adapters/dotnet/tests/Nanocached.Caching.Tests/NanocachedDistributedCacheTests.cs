@@ -132,6 +132,41 @@ public sealed class NanocachedDistributedCacheTests
     }
 
     [Fact]
+    public async Task Extreme_sliding_expiration_does_not_wrap_the_persisted_TTL_on_renewal()
+    {
+        // Regression for issue #304: Envelope.ToBytes() used to cast
+        // SlidingSeconds (a `long`) down to `uint` with no range check,
+        // wrapping any value past uint.MaxValue seconds (~136 years). 2^32
+        // seconds is one past that — before the fix, this would wrap to
+        // exactly 0 in the persisted envelope, so the *next* renewal would
+        // write wire TTL 0 ("no expiry") instead of anything resembling the
+        // caller's actual sliding window.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "eon"u8.ToArray();
+        var extremeSliding = TimeSpan.FromSeconds(4_294_967_296); // uint.MaxValue + 1
+
+        await cache.SetAsync(
+            "eon", new byte[] { 1 },
+            new DistributedCacheEntryOptions { SlidingExpiration = extremeSliding });
+
+        // The immediate write isn't limited by the envelope's 4-byte field —
+        // it sends the caller's real, uncapped requested TTL as-is.
+        MockNode.Entry? afterSet = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
+        Assert.NotNull(afterSet);
+        Assert.Equal(4_294_967_296L, afterSet!.TtlSeconds);
+
+        // A Get() renews the sliding window from the *persisted* envelope,
+        // which is now clamped to uint.MaxValue rather than wrapped.
+        await cache.GetAsync("eon");
+
+        MockNode.Entry? afterGet = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
+        Assert.NotNull(afterGet);
+        Assert.Equal(uint.MaxValue, (uint)afterGet!.TtlSeconds);
+    }
+
+    [Fact]
     public async Task Refresh_of_a_missing_key_is_a_no_op()
     {
         using var node = new MockNode();

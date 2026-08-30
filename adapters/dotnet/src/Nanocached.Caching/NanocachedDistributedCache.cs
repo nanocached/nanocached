@@ -261,7 +261,21 @@ public class NanocachedDistributedCache : IDistributedCache
         {
             var bytes = new byte[EnvelopeHeaderLength + Payload.Length];
             bytes[0] = EnvelopeVersion;
-            BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(1, 4), (uint)SlidingSeconds);
+            // SlidingSeconds is a `long` (CeilSeconds(TimeSpan) — and
+            // TimeSpan.SlidingExpiration can be nearly 922 billion seconds),
+            // but the envelope's own wire field is only 4 bytes wide. An
+            // unchecked `(uint)SlidingSeconds` cast silently wraps for any
+            // value past ~136 years (issue #304), corrupting what a later
+            // Get/Refresh renewal reads back into an arbitrary — often much
+            // shorter, sometimes exactly 0 ("no expiry") — sliding window.
+            // Clamp to uint.MaxValue instead: SlidingSeconds is never
+            // negative (0 = no sliding window, or CeilSeconds' result,
+            // which floors at 1), so only the upper bound needs guarding.
+            // This only bounds what a *future* renewal recomputes from —
+            // the immediate SetAsync call below already used the caller's
+            // real, uncapped SlidingSeconds for this write's own wire TTL.
+            uint slidingSecondsWire = SlidingSeconds > uint.MaxValue ? uint.MaxValue : (uint)SlidingSeconds;
+            BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(1, 4), slidingSecondsWire);
             BinaryPrimitives.WriteInt64BigEndian(bytes.AsSpan(5, 8), AbsoluteUnixSeconds);
             Payload.CopyTo(bytes.AsSpan(EnvelopeHeaderLength));
             return bytes;
