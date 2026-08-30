@@ -217,7 +217,13 @@ const DefaultReconnectCooldown = time.Second
 // namespaces; issue #228 folded namespace length into this bound
 // alongside key and value, matching client.py's _check_key/
 // _check_key_and_value, client.rs's validate_key/validate_key_and_value,
-// and NanocachedClient.java's validateKey/validateKeyAndValue).
+// and NanocachedClient.java's validateKey/validateKeyAndValue). Also the
+// per-sub-frame byte budget multiGetChunked/multiSetChunked enforce
+// (issue #222): validateKey/validateKeyAndValue only bound one
+// namespace+key(+value) at a time, never the sum across a whole `m`/`o`
+// batch, so a batch of individually valid pairs could otherwise add up
+// to a multi-megabyte sub-frame that the server can only reject by
+// closing the connection outright (see maxBatchKeys).
 const maxRequestBytes = 1024*1024 - 256
 
 // maxBatchKeys bounds how many keys GetMany/GetManyBytes/SetMany/
@@ -230,7 +236,11 @@ const maxRequestBytes = 1024*1024 - 256
 // byte length up to maxValueLength's own digit count plus its
 // separating space (len("2097152")+1 = 8 bytes). 400*8 = 3200 bytes
 // leaves comfortable headroom under 4 KiB even with a trailing tag
-// field, well before this constant would ever need revisiting.
+// field, well before this constant would ever need revisiting. A chunk
+// can still end before reaching this key count: multiGetChunked/
+// multiSetChunked also cut a sub-frame short as soon as the next entry
+// would push its cumulative wire size past maxRequestBytes (issue #222)
+// — large keys/values hit that bound long before 400 keys would.
 const maxBatchKeys = 400
 
 // validateKey rejects an empty key, or a namespace+key pair that alone
@@ -1210,21 +1220,74 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 	return values, nil
 }
 
+// multiFrameHeaderSlack conservatively bounds the `m`/`o` header bytes
+// that aren't already counted per entry by multiGetEntryCost/
+// multiSetEntryCost below: the marker+space, decimal namespace-length
+// and entry-count fields (at most 3 digits each — maxBatchKeys caps the
+// count at 400), an optional TTL (up to 11 bytes: a space plus a
+// negative int64's worst case), the optional tag field (a space plus up
+// to 10 digits for a uint32), and the trailing newline. 64 bytes leaves
+// comfortable headroom over that worst case (issue #222).
+const multiFrameHeaderSlack = 64
+
+// decimalDigits returns how many bytes strconv.AppendInt would write
+// for a non-negative n, without actually building the string — used to
+// size a chunk's header honestly (batch chunking's cumulative-bytes
+// bound, issue #222) to match appendMultiGetFrame/appendMultiSetFrame's
+// own decimal length fields.
+func decimalDigits(n int) int {
+	digits := 1
+	for n >= 10 {
+		n /= 10
+		digits++
+	}
+	return digits
+}
+
+// multiGetEntryCost is the wire bytes one more key adds to an `m` frame
+// per appendMultiGetFrame: a separating space, that key's decimal
+// length field, and the key bytes themselves.
+func multiGetEntryCost(key []byte) int {
+	return 1 + decimalDigits(len(key)) + len(key)
+}
+
+// multiSetEntryCost is multiGetEntryCost's write-side twin, matching
+// appendMultiSetFrame: two separating spaces, the key's and value's
+// decimal length fields, and the key and value bytes themselves.
+func multiSetEntryCost(key, value []byte) int {
+	return 2 + decimalDigits(len(key)) + decimalDigits(len(value)) + len(key) + len(value)
+}
+
 // multiGetChunked issues one or more `m` sub-frames against slot for
 // keys — already grouped to one owner (or the single/proxy target) by
-// the caller — splitting into maxBatchKeys-sized chunks (batch
-// chunking) so no reply header risks exceeding maxHeaderLineLength.
-// Always returns len(keys) entries: a chunk that fails outright (a
-// connection-level failure, not a per-key `W`) leaves its keys' entries
-// at the zero value (a clean miss) and that chunk's error is returned
-// alongside — the caller treats that gap as "still needs a retry",
-// exactly like a per-key WrongNode.
+// the caller — splitting into sub-frames bounded by both maxBatchKeys
+// and maxRequestBytes (batch chunking, issue #222): a chunk stops
+// growing as soon as either the next key would push its count past
+// maxBatchKeys or its cumulative wire size (namespace, once, plus each
+// included key's multiGetEntryCost, plus multiFrameHeaderSlack) past
+// maxRequestBytes, so no reply header risks exceeding
+// maxHeaderLineLength and no request frame risks the server's own
+// MAX_REQUEST_SIZE. A chunk's first key is always included regardless
+// of the byte budget — validateKey already guarantees any single
+// namespace+key fits under maxRequestBytes on its own. Always returns
+// len(keys) entries: a chunk that fails outright (a connection-level
+// failure, not a per-key `W`) leaves its keys' entries at the zero
+// value (a clean miss) and that chunk's error is returned alongside —
+// the caller treats that gap as "still needs a retry", exactly like a
+// per-key WrongNode.
 func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) ([]multiEntry, error) {
 	entries := make([]multiEntry, len(keys))
-	for start := 0; start < len(keys); start += maxBatchKeys {
-		end := start + maxBatchKeys
-		if end > len(keys) {
-			end = len(keys)
+	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
+	for start := 0; start < len(keys); {
+		end := start
+		total := 0
+		for end < len(keys) && end-start < maxBatchKeys {
+			cost := multiGetEntryCost(keys[end])
+			if end > start && total+cost > budget {
+				break
+			}
+			total += cost
+			end++
 		}
 		var chunkEntries []multiEntry
 		err := c.applyReconnecting(slot, func(conn *connection) error {
@@ -1236,6 +1299,7 @@ func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (
 			return entries, err
 		}
 		copy(entries[start:end], chunkEntries)
+		start = end
 	}
 	return entries, nil
 }
@@ -1446,16 +1510,26 @@ func (c *Client) setManyNS(namespace []byte, values map[string][]byte, ttlSecond
 
 // multiSetChunked is multiGetChunked's write-side twin: one or more `o`
 // sub-frames against slot for keys/values (already grouped to one
-// owner, or the single/proxy target), split into maxBatchKeys-sized
-// chunks. Always returns len(keys) entries; a chunk that fails outright
-// leaves its keys' entries at the zero value and that chunk's error is
-// returned alongside.
+// owner, or the single/proxy target), split into sub-frames bounded by
+// both maxBatchKeys and maxRequestBytes the same way (batch chunking,
+// issue #222), using multiSetEntryCost in place of multiGetEntryCost so
+// the cumulative byte tracking also counts each value. Always returns
+// len(keys) entries; a chunk that fails outright leaves its keys'
+// entries at the zero value and that chunk's error is returned
+// alongside.
 func (c *Client) multiSetChunked(slot string, namespace []byte, keys, values [][]byte, ttlSeconds int64) ([]multiEntry, error) {
 	entries := make([]multiEntry, len(keys))
-	for start := 0; start < len(keys); start += maxBatchKeys {
-		end := start + maxBatchKeys
-		if end > len(keys) {
-			end = len(keys)
+	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
+	for start := 0; start < len(keys); {
+		end := start
+		total := 0
+		for end < len(keys) && end-start < maxBatchKeys {
+			cost := multiSetEntryCost(keys[end], values[end])
+			if end > start && total+cost > budget {
+				break
+			}
+			total += cost
+			end++
 		}
 		var chunkEntries []multiEntry
 		err := c.applyReconnecting(slot, func(conn *connection) error {
@@ -1467,6 +1541,7 @@ func (c *Client) multiSetChunked(slot string, namespace []byte, keys, values [][
 			return entries, err
 		}
 		copy(entries[start:end], chunkEntries)
+		start = end
 	}
 	return entries, nil
 }

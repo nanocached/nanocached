@@ -142,6 +142,15 @@ type mockNode struct {
 	// instead of naming a single key inside a batch.
 	multiWrongNodeKey  atomic.Value // string
 	multiWrongNodeLeft atomic.Int32
+	// mFrameSizes/oFrameSizes record the total wire bytes (header line,
+	// including its trailing newline, plus namespace plus every key's
+	// and value's bytes) of every `m`/`o` frame this node has received,
+	// in arrival order — issue #222's cumulative-bytes chunking tests
+	// use these to assert each sub-frame actually stayed under the
+	// server's own 1 MiB request cap, not just under maxBatchKeys.
+	frameSizesMu sync.Mutex
+	mFrameSizes  []int
+	oFrameSizes  []int
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -240,6 +249,21 @@ func (m *mockNode) iRequestsReceived() int32 { return m.iCount.Load() }
 // either.
 func (m *mockNode) kRequestsReceived() int32 { return m.kCount.Load() }
 func (m *mockNode) xRequestsReceived() int32 { return m.xCount.Load() }
+
+// mFrameSizesSeen/oFrameSizesSeen return, in arrival order, the total
+// wire bytes of every `m`/`o` frame this node has received so far
+// (issue #222's cumulative-bytes chunking tests).
+func (m *mockNode) mFrameSizesSeen() []int {
+	m.frameSizesMu.Lock()
+	defer m.frameSizesMu.Unlock()
+	return append([]int(nil), m.mFrameSizes...)
+}
+
+func (m *mockNode) oFrameSizesSeen() []int {
+	m.frameSizesMu.Lock()
+	defer m.frameSizesMu.Unlock()
+	return append([]int(nil), m.oFrameSizes...)
+}
 
 // mockDigestHex computes the same content digest hex a real
 // nanocached-node evaluates a `k`/`x` <cond> digest against
@@ -621,9 +645,15 @@ func (m *mockNode) serve(conn net.Conn) {
 			count := atoiOrPanic(parts[2])
 			namespace := string(mustRead(reader, nsLen))
 			keys := make([]string, count)
+			frameBytes := len(header) + nsLen
 			for i := 0; i < count; i++ {
-				keys[i] = string(mustRead(reader, atoiOrPanic(parts[3+i])))
+				keyLen := atoiOrPanic(parts[3+i])
+				keys[i] = string(mustRead(reader, keyLen))
+				frameBytes += keyLen
 			}
+			m.frameSizesMu.Lock()
+			m.mFrameSizes = append(m.mFrameSizes, frameBytes)
+			m.frameSizesMu.Unlock()
 			if m.silent.Load() {
 				continue
 			}
@@ -676,12 +706,17 @@ func (m *mockNode) serve(conn net.Conn) {
 				ttlBase++
 			}
 			hasTTL := len(parts) > ttlBase
+			frameBytes := len(header) + nsLen
 			for i := 0; i < count; i++ {
 				keyLen := atoiOrPanic(parts[3+2*i])
 				valLen := atoiOrPanic(parts[3+2*i+1])
 				keys[i] = string(mustRead(reader, keyLen))
 				values[i] = mustRead(reader, valLen)
+				frameBytes += keyLen + valLen
 			}
+			m.frameSizesMu.Lock()
+			m.oFrameSizes = append(m.oFrameSizes, frameBytes)
+			m.frameSizesMu.Unlock()
 			if m.silent.Load() {
 				continue
 			}
@@ -3251,6 +3286,123 @@ func TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames(t *testing.T) {
 	for key, want := range values {
 		if got[key] != want {
 			t.Fatalf("GetMany[%q] = %q, want %q", key, got[key], want)
+		}
+	}
+}
+
+// TestSetManyBytesSplitsByCumulativeBytesEvenUnderMaxBatchKeys is issue
+// #222's regression: 20 keys is far under maxBatchKeys (400), so before
+// the cumulative-bytes bound this would have gone out as a single `o`
+// sub-frame — but each individually-valid 150 KiB value pushes the
+// batch's total wire size to roughly 3 MiB, well past the server's own
+// 1 MiB request cap (src/server.rs's MAX_REQUEST_SIZE). Asserts the
+// chunker splits on bytes alone, every resulting `o` sub-frame actually
+// measured off the wire stays under 1 MiB, and every value still round-
+// trips through GetManyBytes.
+func TestSetManyBytesSplitsByCumulativeBytesEvenUnderMaxBatchKeys(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const (
+		total       = 20
+		valueLength = 150 * 1024 // 150 KiB; individually well under maxRequestBytes
+	)
+	values := make(map[string][]byte, total)
+	keys := make([]string, total)
+	for i := 0; i < total; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		keys[i] = key
+		value := bytes.Repeat([]byte{byte(i)}, valueLength)
+		values[key] = value
+	}
+
+	if err := client.SetManyBytes(values, 0); err != nil {
+		t.Fatalf("SetManyBytes err = %v", err)
+	}
+
+	sizes := node.oFrameSizesSeen()
+	if len(sizes) < 2 {
+		t.Fatalf("oFrameSizesSeen = %v (%d sub-frames), want more than 1 — "+
+			"%d keys is under maxBatchKeys=%d, so only the cumulative-bytes "+
+			"bound should have forced a split", sizes, len(sizes), total, maxBatchKeys)
+	}
+	for i, size := range sizes {
+		if size >= 1024*1024 {
+			t.Errorf("o sub-frame %d = %d bytes, want under 1 MiB", i, size)
+		}
+	}
+
+	got, err := client.GetManyBytes(keys)
+	if err != nil {
+		t.Fatalf("GetManyBytes err = %v", err)
+	}
+	if len(got) != total {
+		t.Fatalf("GetManyBytes returned %d keys, want %d", len(got), total)
+	}
+	for key, want := range values {
+		if !bytes.Equal(got[key], want) {
+			t.Fatalf("GetManyBytes[%q] did not round-trip (got %d bytes, want %d)", key, len(got[key]), len(want))
+		}
+	}
+}
+
+// TestGetManyBytesWithLargeKeysSplitsByCumulativeBytes is
+// TestSetManyBytesSplitsByCumulativeBytesEvenUnderMaxBatchKeys's
+// read-side twin: an `m` sub-frame carries no values, only keys, so it
+// takes individually-valid large *keys* (rather than large values) to
+// push a small-count batch's cumulative wire size past the server's own
+// 1 MiB request cap. 12 keys is far under maxBatchKeys (400), but each
+// 100 KiB key pushes the total past 1 MiB.
+func TestGetManyBytesWithLargeKeysSplitsByCumulativeBytes(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const (
+		total   = 12
+		keySize = 100 * 1024 // 100 KiB; individually well under maxRequestBytes
+	)
+	keys := make([]string, total)
+	values := make(map[string][]byte, total)
+	for i := 0; i < total; i++ {
+		key := fmt.Sprintf("%0100d-", i) + strings.Repeat("k", keySize)
+		keys[i] = key
+		values[key] = []byte(fmt.Sprintf("value-%d", i))
+		if err := client.SetBytes(key, values[key], 0); err != nil {
+			t.Fatalf("SetBytes(%d) err = %v", i, err)
+		}
+	}
+
+	got, err := client.GetManyBytes(keys)
+	if err != nil {
+		t.Fatalf("GetManyBytes err = %v", err)
+	}
+
+	sizes := node.mFrameSizesSeen()
+	if len(sizes) < 2 {
+		t.Fatalf("mFrameSizesSeen = %v (%d sub-frames), want more than 1 — "+
+			"%d keys is under maxBatchKeys=%d, so only the cumulative-bytes "+
+			"bound should have forced a split", sizes, len(sizes), total, maxBatchKeys)
+	}
+	for i, size := range sizes {
+		if size >= 1024*1024 {
+			t.Errorf("m sub-frame %d = %d bytes, want under 1 MiB", i, size)
+		}
+	}
+
+	if len(got) != total {
+		t.Fatalf("GetManyBytes returned %d keys, want %d", len(got), total)
+	}
+	for key, want := range values {
+		if !bytes.Equal(got[key], want) {
+			t.Fatalf("GetManyBytes[%q] = %q, want %q", key, got[key], want)
 		}
 	}
 }
