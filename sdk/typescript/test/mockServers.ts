@@ -95,6 +95,16 @@ export interface MockNode extends MockServerBase {
   /** How many `o` (batched set, issues #150/#151) requests this server
    * has ever received. */
   multiSetCount(): number;
+  /** Each `m` frame's wire body size received so far — namespace length
+   * plus the sum of every key length in that one frame — in receipt
+   * order. Lets a test assert the SDK's byte-bound batch chunking
+   * (issue #222) actually kept every sub-frame under the cap, not just
+   * that it split into more than one. */
+  multiGetFrameBytes(): number[];
+  /** `multiGetFrameBytes`'s write-side twin: each `o` frame's wire body
+   * size (namespace length plus every key's and every value's length in
+   * that frame) received so far, in receipt order. */
+  multiSetFrameBytes(): number[];
   /** Makes every `m`/`o` roster containing `key` answer just that key
    * `W`, for the next `times` such requests (consumed one per match,
    * across as many separate `m`/`o` calls as it takes) — the batched
@@ -314,6 +324,10 @@ export async function startMockNode(
   // Batched get/set (issues #128/#150/#151).
   let multiGets = 0;
   let multiSets = 0;
+  // Per-frame wire body sizes (issue #222), in receipt order — see
+  // multiGetFrameBytes/multiSetFrameBytes above.
+  const multiGetFrameBytes: number[] = [];
+  const multiSetFrameBytes: number[] = [];
   // multiWrongNodeKey/multiWrongNodeLeft: when multiWrongNodeKey is set,
   // every `m`/`o` roster containing that exact key answers just that key
   // `W`, for as long as multiWrongNodeLeft has budget left (consumed one
@@ -558,6 +572,7 @@ export async function startMockNode(
             }
             buffer = buffer.subarray(cursor);
             multiGets++;
+            multiGetFrameBytes.push(namespaceLength + totalKeyLength);
 
             if (silent) break;
 
@@ -628,6 +643,7 @@ export async function startMockNode(
             }
             buffer = buffer.subarray(cursor);
             multiSets++;
+            multiSetFrameBytes.push(namespaceLength + totalBodyLength);
 
             if (silent) break;
 
@@ -965,6 +981,8 @@ export async function startMockNode(
     clearCount: () => clears,
     multiGetCount: () => multiGets,
     multiSetCount: () => multiSets,
+    multiGetFrameBytes: () => [...multiGetFrameBytes],
+    multiSetFrameBytes: () => [...multiSetFrameBytes],
     answerMultiWrongNodeTimes: (key, times) => {
       multiWrongNodeKey = key;
       multiWrongNodeLeft += times;
