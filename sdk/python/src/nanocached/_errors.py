@@ -73,6 +73,34 @@ class NotNumericError(NanocachedError):
         )
 
 
+class ConnectionLostError(NanocachedError, ConnectionError):
+    """A request's connection failed *after* its frame was already fully
+    written to the socket (issue #225) — write()/drain() returned
+    normally, so the server may have received and applied it before the
+    reply was lost (a dropped/crashed connection, the server closing
+    mid-response, a malformed or misaligned reply, ...). Distinct from
+    the ordinary (plain ``ConnectionError``) case where the request was
+    never sent at all — the connection was already dead (an idle FIN),
+    the dial itself failed, or the write/drain call raised outright —
+    which is always safe to redial and resend.
+
+    get/set/delete/clear/get_many/set_many treat this exactly like any
+    other connection failure and transparently retry after a redial:
+    they're idempotent (or, for clear, already a no-op when repeated),
+    so resending is always safe either way. incr/decr and the CAS
+    operations (replace()/replace_if_present()/put_if_absent()/
+    delete_if_matches()) are not: replaying an already-applied ``i``
+    would double the increment, and replaying an already-applied ``k``/
+    ``x`` would misreport a just-succeeded CAS as a mismatch. Their own
+    retry wrapper (NanocachedClient._with_wrong_node_retry,
+    replay_safe=False) therefore lets this subclass escape instead of
+    retrying — see each of those methods' own docstring for the
+    resulting at-least-once caveat."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
 class RetryableError(NanocachedError):
     """A single request was answered ``R`` (issue #125) three times
     running — the connection's bounded transient-retry budget (2 retries,

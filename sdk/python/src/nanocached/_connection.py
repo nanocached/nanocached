@@ -22,7 +22,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 
-from ._errors import NanocachedError, NotNumericError, RetryableError, WrongNodeError
+from ._errors import ConnectionLostError, NanocachedError, NotNumericError, RetryableError, WrongNodeError
 
 # The server's own request cap is 1 MiB; this constant doubles that as
 # headroom, so a claimed length beyond it is definitely a corrupt or
@@ -226,6 +226,30 @@ class _MultiWrongNode:
 WRONG_NODE = _MultiWrongNode()
 
 
+class _PendingSlot:
+    """One pipelined request's entry in ``Connection._pending`` (request
+    pipelining) — the tag its request was sent under (None on an
+    untagged connection), the future callers await, and whether this
+    slot's own frame has finished being written (issue #225): ``sent``
+    starts False and flips to True only once ``_send()``'s
+    ``writer.write()``/``await writer.drain()`` for THIS request returns
+    without raising, all still inside the write lock's critical section
+    — so it can never be read half-updated by a concurrent ``_poison()``
+    (asyncio is single-threaded; the flip and every read of it are both
+    synchronous). ``_poison()`` uses it to tell "this request never left
+    the client" (``sent`` still False — always safe to retry) apart from
+    "this request reached the wire and may have reached the server
+    before the reply was lost" (``sent`` True — see
+    Connection._error_for)."""
+
+    __slots__ = ("tag", "future", "sent")
+
+    def __init__(self, future: "asyncio.Future[tuple[bytes, _ResponsePayload]]") -> None:
+        self.tag: int | None = None
+        self.future = future
+        self.sent = False
+
+
 class Connection:
     def __init__(
         self,
@@ -257,9 +281,7 @@ class Connection:
         # Each slot pairs the future with the tag its request was sent
         # under (None on an untagged connection) — the expected echo
         # _read_loop checks the response against before handing it out.
-        self._pending: deque[
-            tuple[int | None, asyncio.Future[tuple[bytes, _ResponsePayload]]]
-        ] = deque()
+        self._pending: deque[_PendingSlot] = deque()
         self._closed = False
         self._last_used = time.monotonic()
         self._on_close = on_close
@@ -477,11 +499,32 @@ class Connection:
         pending = list(self._pending)
         self._pending.clear()
         self._writer.close()
-        for _tag, future in pending:
-            if not future.cancelled():
-                future.set_exception(error)
+        for slot in pending:
+            if not slot.future.cancelled():
+                slot.future.set_exception(self._error_for(slot, error))
         if self._on_close is not None:
             self._on_close()
+
+    @staticmethod
+    def _error_for(slot: _PendingSlot, error: Exception) -> Exception:
+        """Non-idempotent replay guard (issue #225): a slot whose frame
+        had already been fully written (``slot.sent``) when the
+        connection died might have reached and been applied by the
+        server — only the reply was lost, a malformed reply, or a later
+        pipelined request's own failure. Wrapping ``error`` as
+        ConnectionLostError for that slot only (an unwritten slot behind
+        it in the pipeline keeps the plain ``error``, unchanged) lets
+        incr/CAS/delete_if_matches's own retry wrapper
+        (NanocachedClient._with_wrong_node_retry, replay_safe=False) tell
+        it apart from a request that never left this client at all and
+        never replay it. get/set/delete/clear don't check for the
+        distinction, so ConnectionLostError being a plain ConnectionError
+        subclass keeps them behaving exactly as before either way."""
+        if slot.sent and not isinstance(error, ConnectionLostError):
+            wrapped = ConnectionLostError(str(error))
+            wrapped.__cause__ = error
+            return wrapped
+        return error
 
     def _arm_deadline(self) -> None:
         self._clear_deadline()
@@ -565,7 +608,9 @@ class Connection:
             # orphaned slot and desync the stream.
             tag = self._claim_tag() if self._tagged else None
             frame = build(tag)
-            self._pending.append((tag, future))
+            slot = _PendingSlot(future)
+            slot.tag = tag
+            self._pending.append(slot)
             # Armed only on the empty→non-empty transition: arming on
             # *every* request would let a continuous stream of new
             # requests push the deadline forever ahead of a server that
@@ -588,6 +633,15 @@ class Connection:
                 # one request.
                 self._poison(ConnectionError("nanocached: connection failed: cancelled mid-write"))
                 raise
+            else:
+                # Non-idempotent replay guard (issue #225): only flips
+                # once write()+drain() for THIS frame has actually
+                # returned — see _PendingSlot and _error_for. Anything
+                # that fails this request from here on (a dead read
+                # loop, a timeout, another pipelined request's own write
+                # failing) means the request may already have reached
+                # the server, so it must never be silently resent.
+                slot.sent = True
 
         # If cancelled here, the write already fully completed — the
         # response is still coming from the server and must still be
@@ -642,7 +696,8 @@ class Connection:
                 )
                 return
 
-            expected_tag, future = self._pending.popleft()
+            slot = self._pending.popleft()
+            expected_tag, future = slot.tag, slot.future
 
             # Progress-based deadline (see _request): a dispatched
             # response is progress, so the next-oldest request gets a
@@ -682,8 +737,9 @@ class Connection:
     # ConnectionLostError. Every raise in this pair mirrors that split:
     # a malformed frame is this SDK's own protocol violation
     # (NanocachedError), not a transport-level failure (builtin
-    # ConnectionError, this SDK's analog of the TypeScript SDK's
-    # ConnectionLostError — see errors.ts's own doc comment on that
+    # ConnectionError — or, once the failed request's own frame was
+    # already fully written, this SDK's narrower ConnectionLostError
+    # subclass, issue #225 — see errors.ts's own doc comment on that
     # parity), even though both are equally poisoning and equally
     # swallowable by the retry layer (_SWALLOWABLE_ERRORS covers both).
     async def _read_one_response(

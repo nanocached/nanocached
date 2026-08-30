@@ -155,6 +155,11 @@ class MockNode:
         # requests (G/S/D/g/s/d/c/F) with `R` (tagged correctly) instead
         # of their normal reply — see answer_retryable().
         self._retryable_replies = 0
+        # issue #225: apply the next i/k request's effect, then close the
+        # connection without ever sending its reply — see
+        # apply_and_drop_next_incr()/apply_and_drop_next_cas_set().
+        self._drop_next_incr_reply = False
+        self._drop_next_cas_set_reply = False
         self._get_delay = 0.0
         self._gets_delay = 0.0
         self._set_delay = 0.0
@@ -230,6 +235,25 @@ class MockNode:
         item 5), as opposed to answer_missing_tag_once's missing-field
         desync above."""
         self._invalid_tag_value_replies += 1
+
+    def apply_and_drop_next_incr(self) -> None:
+        """Fully reads and applies the next `i` request — the stored
+        counter is bumped exactly as it would be for a normal reply — but
+        then closes the connection instead of ever sending the `I`
+        response (issue #225): simulates the primary completing the
+        increment while the reply is lost in transit, so a test can
+        prove the client raises ConnectionLostError instead of blindly
+        redialing and resending it (which would double-apply the
+        delta)."""
+        self._drop_next_incr_reply = True
+
+    def apply_and_drop_next_cas_set(self) -> None:
+        """Same as apply_and_drop_next_incr() but for the next matching
+        `k` request (issue #225): the value is stored exactly as a normal
+        `S` reply would leave it, then the connection is closed instead
+        of ever answering — for replace()/put_if_absent()/
+        replace_if_present()."""
+        self._drop_next_cas_set_reply = True
 
     def answer_retryable(self, times: int = 1) -> None:
         """Answers the next ``times`` data requests (G/S/D/g/s/d/c/F,
@@ -624,6 +648,14 @@ class MockNode:
                     new_bytes = str(new_value).encode()
                     self._set_entry(namespace, key, new_bytes)
                     ttl = self.entry_ttl.get((namespace, key), 0)
+                    if self._drop_next_incr_reply:
+                        # issue #225: the increment above already landed
+                        # in self.store/self.ns_store — only the reply is
+                        # withheld, closing the connection exactly as a
+                        # crashed/dropped connection would.
+                        self._drop_next_incr_reply = False
+                        writer.close()
+                        return
                     ttl_field = b" %d" % ttl if ttl else b""
                     writer.write(b"I %d%b%b\n%b" % (len(new_bytes), ttl_field, tag_suffix, new_bytes))
                     await writer.drain()
@@ -663,6 +695,14 @@ class MockNode:
                     if matches:
                         self._set_entry(namespace, key, value)
                         self.entry_ttl[(namespace, key)] = ttl_for_entry
+                        if self._drop_next_cas_set_reply:
+                            # issue #225: the store above already landed
+                            # — only the reply is withheld, closing the
+                            # connection exactly as a crashed/dropped
+                            # connection would.
+                            self._drop_next_cas_set_reply = False
+                            writer.close()
+                            return
                         writer.write(b"S" + tag_suffix + b"\n")
                     else:
                         writer.write(b"N" + tag_suffix + b"\n")

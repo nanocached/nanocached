@@ -41,7 +41,13 @@ from dataclasses import dataclass
 from ._compression import compress_value, decompress_value
 from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection
 from ._digest import content_digest
-from ._errors import AlreadyClosedError, NanocachedError, PartialWrongNodeError, WrongNodeError
+from ._errors import (
+    AlreadyClosedError,
+    ConnectionLostError,
+    NanocachedError,
+    PartialWrongNodeError,
+    WrongNodeError,
+)
 from ._hashring import HashRing
 from ._identify import (
     ClusterTarget,
@@ -1464,12 +1470,25 @@ class NanocachedClient:
         README.md's "Counters" section for the cluster-replication
         caveat: only the primary owner ever runs the increment, so a
         replica can never drift onto a different counter value than the
-        one the primary actually holds."""
+        one the primary actually holds.
+
+        At-least-once on a lost connection (issue #225): unlike get/set/
+        delete, incr is never transparently retried once its request has
+        actually reached the wire — if the primary applies the increment
+        but the connection dies before its reply arrives, resending it
+        would double-apply the delta, so this raises ConnectionLostError
+        instead (a ConnectionError subclass) and leaves the counter at
+        whatever the primary actually reached. A connection that died
+        *before* the request was ever sent (e.g. an idle FIN) still
+        redials and retries transparently, exactly as get/set/delete do
+        — only a write that may have already landed is left for the
+        caller to decide whether to retry."""
         return await self._incr(b"", key, delta)
 
     async def decr(self, key: str | bytes, delta: int = 1) -> int | None:
         """``incr(key, -delta)`` (issue #129) — decr never sends a
-        separate wire op; see incr()."""
+        separate wire op; see incr(), including its at-least-once caveat
+        on a lost connection (issue #225)."""
         return await self.incr(key, -delta)
 
     async def _incr(self, namespace: bytes, key: str | bytes, delta: int) -> int | None:
@@ -1481,7 +1500,7 @@ class NanocachedClient:
         _check_delta(delta)
         await self._before_operation()
         return await self._with_wrong_node_retry(
-            lambda: self._incr_write(namespace, key_bytes, delta)
+            lambda: self._incr_write(namespace, key_bytes, delta), replay_safe=False
         )
 
     async def _incr_write(self, namespace: bytes, key: bytes, delta: int) -> int | None:
@@ -1568,7 +1587,9 @@ class NanocachedClient:
         lazily expired) — the ``A``-conditioned ``k``, aka
         ``add``/``putIfAbsent``. Returns ``True`` if stored, ``False`` if
         the key already existed. ``ttl_seconds`` means exactly what it
-        means for set() (0 = no expiry)."""
+        means for set() (0 = no expiry). See replace()'s docstring for
+        the at-least-once caveat on a lost connection (issue #225), which
+        applies here too."""
         return await self._cas_set(b"", key, value, CAS_ABSENT, ttl_seconds)
 
     async def replace_if_present(
@@ -1577,7 +1598,9 @@ class NanocachedClient:
         """Stores ``value`` only if ``key`` currently holds any (unexpired)
         value, whatever it is — the ``P``-conditioned ``k``, the
         two-argument ``replace(key, value)``. Returns ``True`` if
-        replaced, ``False`` if the key was absent."""
+        replaced, ``False`` if the key was absent. See replace()'s
+        docstring for the at-least-once caveat on a lost connection
+        (issue #225), which applies here too."""
         return await self._cas_set(b"", key, value, CAS_PRESENT, ttl_seconds)
 
     async def replace(
@@ -1596,7 +1619,18 @@ class NanocachedClient:
         CAS, and not guaranteed at all once client-side compression
         differs between the writer and whoever built the token. Returns
         ``True`` if replaced, ``False`` on any mismatch (key absent, or
-        its current value doesn't match ``token``)."""
+        its current value doesn't match ``token``).
+
+        At-least-once on a lost connection (issue #225): like incr(),
+        this is never transparently retried once its request has
+        actually reached the wire — if the primary applies the CAS but
+        the connection dies before its reply arrives, resending it could
+        misreport an already-successful CAS as a mismatch (the digest no
+        longer matches its own new value), so this raises
+        ConnectionLostError instead (a ConnectionError subclass). A
+        connection that died before the request was ever sent still
+        redials and retries transparently, exactly as get/set/delete
+        do."""
         return await self._cas_set(b"", key, new_value, _check_token(token), ttl_seconds)
 
     async def delete_if_matches(self, key: str | bytes, token: str) -> bool:
@@ -1605,7 +1639,8 @@ class NanocachedClient:
         two-argument ``remove(key, old)``. Returns ``True`` if deleted,
         ``False`` on any mismatch (key absent, or its current value
         doesn't match ``token``) — see replace()'s docstring for where
-        ``token`` comes from."""
+        ``token`` comes from, and for the at-least-once caveat on a lost
+        connection (issue #225), which applies here too."""
         return await self._cas_delete(b"", key, token)
 
     async def _cas_set(
@@ -1626,7 +1661,8 @@ class NanocachedClient:
             _check_key_and_value(key_bytes, value_bytes, namespace)
         await self._before_operation()
         return await self._with_wrong_node_retry(
-            lambda: self._cas_set_write(namespace, key_bytes, value_bytes, cond, ttl_seconds)
+            lambda: self._cas_set_write(namespace, key_bytes, value_bytes, cond, ttl_seconds),
+            replay_safe=False,
         )
 
     async def _cas_set_write(
@@ -1679,7 +1715,7 @@ class NanocachedClient:
         cond = _check_token(token)
         await self._before_operation()
         return await self._with_wrong_node_retry(
-            lambda: self._cas_delete_write(namespace, key_bytes, cond)
+            lambda: self._cas_delete_write(namespace, key_bytes, cond), replay_safe=False
         )
 
     async def _cas_delete_write(self, namespace: bytes, key: bytes, cond: bytes) -> bool:
@@ -1916,16 +1952,32 @@ class NanocachedClient:
             raise AlreadyClosedError()
         await self._maybe_refresh()
 
-    async def _with_wrong_node_retry(self, operation):
+    async def _with_wrong_node_retry(self, operation, *, replay_safe: bool = True):
+        """Connection-level failures (and `W`) retry once, after a forced
+        node-list refresh: the usual cause is a node death that discovery
+        has since noticed, so the refresh re-ranks the key onto
+        survivors. The retry window for a dead primary is therefore
+        bounded by discovery's liveness timeout. A second failure after a
+        fresh refresh propagates, and single-node/proxy mode (no ring to
+        refresh from) never retries at all.
+
+        ``replay_safe`` (issue #225): True (the default — get/set/delete/
+        clear/get_many/set_many all use it) means ``operation`` may be
+        safely resent no matter why it failed, because those ops are
+        idempotent (or, for clear, already a no-op repeated). incr/CAS/
+        delete_if_matches pass False: a ConnectionLostError means
+        ``operation``'s own request had already been fully written to
+        the wire when the connection died, so the server may have
+        already applied it — resending would double an increment or
+        misreport an already-successful CAS as a mismatch — so it
+        escapes here unretried instead. A plain (non-Lost) ConnectionError
+        or WrongNodeError means the request never reached the server at
+        all either way, so it retries regardless of ``replay_safe``."""
         try:
             return await operation()
-        except (WrongNodeError, ConnectionError, OSError):
-            # Connection-level failures retry the same way `W` does: the
-            # usual cause is a node death that discovery has since noticed,
-            # so a forced refresh re-ranks the key onto survivors. The
-            # retry window for a dead primary is therefore bounded by
-            # discovery's liveness timeout. A second failure after a fresh
-            # refresh propagates.
+        except (WrongNodeError, ConnectionError, OSError) as error:
+            if not replay_safe and isinstance(error, ConnectionLostError):
+                raise
             if self._ring is None:
                 raise
             await self._maybe_refresh(force=True)
