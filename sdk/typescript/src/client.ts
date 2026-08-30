@@ -2869,6 +2869,15 @@ export class NanocachedClient {
       this.target = { kind: "proxy", connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++), address: proxy.address };
       this.nodeUrls = [proxy.address];
       this.lastNodeListFetch = Date.now();
+      // In proxy mode `target.address` is the only address this client
+      // ever dials, so reconnectCooldowns should hold at most that one
+      // entry at a time — without this, every proxy this client is ever
+      // swapped away from (issue #296) leaks its cooldown entry forever
+      // in a churning proxy fleet, the same leak refreshNodeList already
+      // prunes for departed cluster members.
+      for (const address of this.reconnectCooldowns.keys()) {
+        if (address !== proxy.address) this.reconnectCooldowns.delete(address);
+      }
       return;
     }
 
