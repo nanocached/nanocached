@@ -3889,6 +3889,31 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
+/// Whether `error` (from a failed `listener.accept()`) looks like the
+/// process (EMFILE) or the whole system (ENFILE) being out of file
+/// descriptors — the two accept() failures where retrying immediately
+/// would spin the accept loop hot instead of recovering (see
+/// `ACCEPT_ERROR_BACKOFF`). EMFILE/ENFILE share the same numeric errno on
+/// every Unix this project targets (Linux, macOS/BSD), so this hardcodes
+/// them rather than pulling in a `libc` dependency for two integers.
+/// Mirrors the node's and discovery's own copy of this check (no
+/// shared-modules policy).
+#[cfg(unix)]
+fn is_fd_exhaustion_error(error: &io::Error) -> bool {
+    const EMFILE: i32 = 24;
+    const ENFILE: i32 = 23;
+    matches!(error.raw_os_error(), Some(EMFILE) | Some(ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion_error(_error: &io::Error) -> bool {
+    false
+}
+
+/// Backoff after an accept() failure recognized by
+/// `is_fd_exhaustion_error` — same value as the node's and discovery's.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 /// Issue #124: minimal, dependency-free HTTP responder for Prometheus
 /// text-format metrics and orchestrator probes. `/readyz` answers `503`
 /// until the first roster fetch has landed — a proxy with no ring view
@@ -3902,8 +3927,18 @@ async fn run_metrics_server(
     max_connections: usize,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                // Issue #184: an unadorned `continue` here would
+                // busy-loop this task hot under EMFILE/ENFILE instead of
+                // backing off, making recovery harder right when file
+                // descriptors are already scarce.
+                if is_fd_exhaustion_error(&error) {
+                    sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
         let context = Arc::clone(&context);
         let permits = Arc::clone(&permits);
@@ -4103,6 +4138,27 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_is_detected_for_emfile_and_enfile() {
+        // Issue #184: the metrics accept loop used to `continue` on any
+        // accept() error with no backoff, busy-looping under EMFILE/
+        // ENFILE — matches the node's and discovery's own copy of this
+        // check (`is_fd_exhaustion`/`is_fd_exhaustion_error`).
+        assert!(is_fd_exhaustion_error(&io::Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_fd_exhaustion_error(&io::Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn fd_exhaustion_is_not_reported_for_other_accept_errors() {
+        // ECONNABORTED is a recoverable per-connection failure, not one
+        // that means the process is out of descriptors — it shouldn't
+        // trigger the backoff.
+        assert!(!is_fd_exhaustion_error(&io::Error::from(
+            io::ErrorKind::ConnectionAborted
+        )));
+    }
 
     #[test]
     fn auth_secret_comes_from_nanocached_auth_secret() {

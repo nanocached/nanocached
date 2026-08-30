@@ -1560,8 +1560,19 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
 /// keep the port internal.
 async fn run_metrics_server(listener: TcpListener, registry: Registry, list_ready_at: Instant) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                // Issue #184: mirrors `run`'s own accept loop above — an
+                // unadorned `continue` here would busy-loop this task hot
+                // under EMFILE/ENFILE instead of backing off, making
+                // recovery harder right when file descriptors are already
+                // scarce.
+                if is_fd_exhaustion_error(&error) {
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {
