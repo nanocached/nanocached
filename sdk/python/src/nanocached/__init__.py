@@ -8,6 +8,7 @@ from ._digest import content_digest
 from ._errors import (
     AlreadyClosedError,
     AuthenticationError,
+    ConnectionLostError,
     DiscoveryBusyError,
     NanocachedError,
     NotNumericError,
@@ -23,6 +24,7 @@ __all__ = [
     "AlreadyClosedError",
     "AuthenticationError",
     "ClientStats",
+    "ConnectionLostError",
     "DecompressionError",
     "DiscoveredNode",
     "DiscoveryBusyError",

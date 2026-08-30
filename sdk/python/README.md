@@ -176,6 +176,19 @@ rather than replaying the increment on them, so a replica can never drift
 onto a value the primary doesn't itself hold (e.g. from an earlier
 dropped replica write, or the replica separately evicting the key).
 
+**At-least-once on a lost connection.** Unlike `get`/`set`/`delete`,
+`incr`/`decr` are never transparently retried once their request has
+actually reached the wire: if the primary applies the increment but the
+connection dies before its reply comes back, resending it would
+double-apply the delta. In that specific case the call raises
+`ConnectionLostError` (a `ConnectionError` subclass) instead of silently
+retrying, and the counter is left at whatever the primary actually
+reached — it's up to the caller to decide whether to retry. A connection
+that died *before* the request was ever sent (e.g. the server's idle
+timeout closing it between calls) still redials and retries
+transparently, exactly like `get`/`set`/`delete` — only a request that
+may have already landed on the server is treated differently.
+
 ## Batched get and set
 
 `get_many`/`get_many_bytes` and `set_many` (the `m`/`o` frames) fetch or
@@ -275,6 +288,15 @@ same condition against its own possibly-different copy could reach a
 different outcome than the primary just did. See
 [`docs/protocol.html#cas`](../../docs/protocol.html#cas) for the wire
 format and the digest algorithm.
+
+**At-least-once on a lost connection.** Like `incr`/`decr`, none of
+these four are transparently retried once their request has actually
+reached the wire: if the primary applies the CAS but the connection dies
+before its reply comes back, resending it could misreport an
+already-successful CAS as a mismatch. In that specific case the call
+raises `ConnectionLostError` (a `ConnectionError` subclass) instead of
+silently retrying — see incr/decr's own caveat above, which applies here
+identically.
 
 ## Fire-and-forget replica writes
 

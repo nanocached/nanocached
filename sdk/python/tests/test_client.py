@@ -12,6 +12,7 @@ from nanocached import (
     AlreadyClosedError,
     AuthenticationError,
     ClientStats,
+    ConnectionLostError,
     DecompressionError,
     DiscoveryBusyError,
     HashRing,
@@ -1524,6 +1525,42 @@ class IncrReplicationTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_lost_reply_after_the_primary_applies_the_increment_is_not_retried_via_ring_refresh(self):
+        # issue #225: _with_wrong_node_retry is the *only* retry layer
+        # incr() has — it both redials/reconnects and, in cluster mode,
+        # refreshes the ring and resends. A `W` (test above) always
+        # retries there; a ConnectionLostError must not, or the
+        # refresh-and-retry would resend `i` to the primary a second
+        # time and double the delta.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "counter"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            await client.set(key, "10")
+            primary.incr_count = 0
+            replica.incr_count = 0
+
+            # The primary fully applies this increment, then closes the
+            # connection instead of ever answering.
+            primary.apply_and_drop_next_incr()
+            with self.assertRaises(ConnectionLostError):
+                await client.incr(key, 5)
+
+            # Applied exactly once: a ring-refresh-and-retry would have
+            # sent a second `i` (incr_count == 2) and left the primary at
+            # 20, not 15 — the replica must also never see an `i` at all.
+            self.assertEqual(primary.incr_count, 1)
+            self.assertEqual(replica.incr_count, 0)
+            self.assertEqual(primary.store[key.encode()], b"15")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class ContentDigestTests(unittest.TestCase):
     # Compare-and-set (issue #141): docs/protocol.html "k / x" is the
@@ -1866,6 +1903,99 @@ class CasTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
 
 
+class NonIdempotentReplayTests(unittest.IsolatedAsyncioTestCase):
+    # issue #225: incr()/replace() (and the rest of the CAS family) must
+    # never be blindly replayed after a redial the way get/set/delete
+    # are — only when the connection died *before* the request's own
+    # frame was ever written is a retry safe (the idle-FIN case below);
+    # once write()+drain() has returned, the primary may already have
+    # applied the request and only the reply was lost, so the client
+    # raises ConnectionLostError instead of resending it.
+
+    async def asyncSetUp(self):
+        self.node = await MockNode().start()
+
+    async def asyncTearDown(self):
+        await self.node.close()
+
+    async def connect(self, **kwargs):
+        return await NanocachedClient.connect([("127.0.0.1", self.node.port)], **kwargs)
+
+    async def test_incr_redials_and_retries_when_the_connection_was_already_dead(self):
+        # The idle-FIN case: the connection was already gone before incr()
+        # even tried to use it (nothing was ever sent), so the usual
+        # lazy-redial-and-retry still applies, exactly like get/set/delete.
+        client = await self.connect()
+        try:
+            await client.set("counter", "10")
+            self.node.drop_connections()
+            await wait_for(
+                lambda: client._single is not None and client._single.closed,
+                "the client to see the FIN",
+            )
+            self.assertEqual(await client.incr("counter", 5), 15)
+            self.assertEqual(self.node.connection_count, 2)
+            self.assertEqual(self.node.incr_count, 1)
+        finally:
+            await client.close()
+
+    async def test_incr_raises_connection_lost_instead_of_replaying_an_applied_increment(self):
+        client = await self.connect()
+        try:
+            await client.set("counter", "10")
+            # The node fully applies this increment, then closes the
+            # connection instead of ever answering — the reply, not the
+            # request, is what gets lost.
+            self.node.apply_and_drop_next_incr()
+            with self.assertRaises(ConnectionLostError):
+                await client.incr("counter", 5)
+            # Applied exactly once: a blind retry would have sent a
+            # second `i` and landed on 20, not 15.
+            self.assertEqual(await client.get("counter"), "15")
+            self.assertEqual(self.node.incr_count, 1)
+        finally:
+            await client.close()
+
+    async def test_replace_redials_and_retries_when_the_connection_was_already_dead(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "original")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, token = result
+            self.node.drop_connections()
+            await wait_for(
+                lambda: client._single is not None and client._single.closed,
+                "the client to see the FIN",
+            )
+            self.assertTrue(await client.replace("k", token, "new"))
+            self.assertEqual(await client.get("k"), "new")
+            self.assertEqual(self.node.connection_count, 2)
+            self.assertEqual(self.node.cas_set_count, 1)
+        finally:
+            await client.close()
+
+    async def test_replace_raises_connection_lost_instead_of_replaying_an_applied_cas(self):
+        client = await self.connect()
+        try:
+            await client.set("k", "original")
+            result = await client.get_with_token("k")
+            assert result is not None
+            _, token = result
+            # The node fully applies this replace, then closes the
+            # connection instead of ever answering `S` — a blind retry
+            # would re-evaluate the (now stale) token against the new
+            # value and misreport the already-successful CAS as a
+            # mismatch (`False`) instead of raising.
+            self.node.apply_and_drop_next_cas_set()
+            with self.assertRaises(ConnectionLostError):
+                await client.replace("k", token, "new")
+            self.assertEqual(await client.get("k"), "new")
+            self.assertEqual(self.node.cas_set_count, 1)
+        finally:
+            await client.close()
+
+
 class CasTaggedTests(unittest.IsolatedAsyncioTestCase):
     # Compare-and-set (issue #141): the S/N/D decode path on a tagged
     # connection (echoed response tags) — see CasTests above for the
@@ -2093,6 +2223,42 @@ class CasReplicationTests(unittest.IsolatedAsyncioTestCase):
             primary.answer_wrong_node_once()
             with self.assertRaises(WrongNodeError):
                 await client.put_if_absent(key, "v2")
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_lost_reply_after_the_primary_applies_the_cas_is_not_retried_via_ring_refresh(self):
+        # issue #225: see IncrReplicationTests' own version of this test
+        # — _with_wrong_node_retry is the only retry layer replace() has,
+        # and a ConnectionLostError must skip its ring-refresh-and-retry
+        # entirely, or a stale token re-evaluated against the value the
+        # primary already stored would misreport the just-succeeded CAS
+        # as a mismatch instead of raising.
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        try:
+            key = "cas-key"
+            primary_name, replica_name = self.owners_of(key)
+            primary, replica = nodes[primary_name], nodes[replica_name]
+
+            await client.set(key, "original")
+            result = await client.get_with_token(key)
+            assert result is not None
+            _, token = result
+            primary.cas_set_count = 0
+            replica.cas_set_count = 0
+
+            # The primary fully applies this replace, then closes the
+            # connection instead of ever answering `S`.
+            primary.apply_and_drop_next_cas_set()
+            with self.assertRaises(ConnectionLostError):
+                await client.replace(key, token, "new")
+
+            self.assertEqual(primary.cas_set_count, 1)
+            self.assertEqual(replica.cas_set_count, 0)
+            self.assertEqual(primary.store[key.encode()], b"new")
         finally:
             await client.close()
             await discovery.close()
