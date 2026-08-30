@@ -2797,11 +2797,14 @@ async fn dispatch_request(
         // Issue #150: group keys by primary owner — this is the one
         // dispatch shape that splits a single client frame across
         // multiple backend sub-frames (every other op resolves to
-        // exactly one key's worth of backend traffic). Primary only, no
-        // replica reads — matches `Request::Get`'s own primary-first
-        // reads. A failed or `W` sub-batch gets one bounded
-        // refresh-and-retry in `finish_multi_get`/`retry_multi_get`,
-        // mirroring `finish_get`/`retry_get_on`'s existing shape.
+        // exactly one key's worth of backend traffic). The first pass is
+        // primary only, matching `Request::Get`'s own primary-first
+        // first attempt in `finish_get`. A failed or `W` sub-batch gets
+        // one bounded refresh-and-retry in
+        // `finish_multi_get`/`retry_multi_get`; issue #221 made that
+        // retry fall through the remaining owners (replicas) exactly
+        // like `retry_get_on` does for single-key `Get`, instead of
+        // giving up after the fresh primary alone.
         Request::MultiGet { namespace, keys } => {
             let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
             let mut missing = Vec::new();
@@ -3074,15 +3077,25 @@ async fn finish_multi_get(
     Ok(respond_multi(&entries, tag))
 }
 
-/// Issue #150: the one bounded refresh-and-retry pass for keys the first
-/// pass left inconclusive — mirrors `finish_get`'s "a single
-/// refresh-and-reroute, not a loop." Retried keys are regrouped by their
+/// Issue #150/#221: the one bounded refresh-and-retry pass for keys the
+/// first pass left inconclusive — mirrors `finish_get`'s "a single
+/// refresh-and-reroute, not a loop," but, like `retry_get_on`, that one
+/// reroute can still fall through every remaining owner for a key, not
+/// just its fresh primary. Retried keys are first regrouped by their
 /// *fresh* top owner (which can differ per key even though they shared a
 /// primary before the refresh — a stale ring can be wrong about more
-/// than one key's placement at once) and dispatched via `.call`, same
-/// transparent-redial reasoning as `retry_get_on`/`refan_write`. Fills
-/// every position in `retry_positions` — with a real result or a final
-/// `WrongNode` — so the caller never sees a gap.
+/// than one key's placement at once). A key whose fresh-primary attempt
+/// transport-fails, or comes back `W` (that owner's own view says it
+/// isn't responsible — "unknown here," not a miss, same reading
+/// `retry_get_on` gives a non-final `WrongNode`), moves on to the next
+/// owner in its ranking; a real `Value`/`Miss` is trusted immediately and
+/// never retried further, matching `retry_get_on`'s trust of a replica's
+/// `NotFound`. Each rank (primary, first replica, second replica, ...)
+/// gets exactly one dispatched attempt per still-unresolved key, bounded
+/// by that key's own owner count — the replication factor — so this
+/// can't loop indefinitely. Fills every position in `retry_positions` —
+/// with a real result or a final `WrongNode` once every owner is
+/// exhausted — so the caller never sees a gap.
 async fn retry_multi_get(
     context: &ProxyContext,
     namespace: &[u8],
@@ -3099,52 +3112,80 @@ async fn retry_multi_get(
         return;
     };
 
-    let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+    let mut owners_by_position: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut unresolved: Vec<usize> = Vec::new();
     for &position in retry_positions {
         let key = &keys[position];
-        let mut owners = ring.owners(namespace, key).into_iter();
-        let Some(primary) = owners.next() else {
+        let owners = ring.owners(namespace, key);
+        if owners.is_empty() {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
             continue;
-        };
-
-        if let Some(group) = groups.iter_mut().find(|(owner, ..)| *owner == primary) {
-            group.1.push(position);
-            group.2.push(key.clone());
-        } else {
-            groups.push((primary, vec![position], vec![key.clone()]));
         }
+        owners_by_position.insert(position, owners);
+        unresolved.push(position);
     }
 
-    // Issue #177: fan the regrouped retry out to every owner
-    // concurrently, same reasoning as the first pass in `dispatch_request`.
-    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = groups
-        .iter()
-        .map(|(owner, _, group_keys)| {
-            let fut = context.backends.call(
-                context,
-                owner,
-                frame_multi_get(namespace, group_keys),
-                Expect::Multi,
-            );
-            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
-        })
-        .collect();
-    let replies = join_all(futs).await;
+    let mut rank = 0;
+    while !unresolved.is_empty() {
+        let mut groups: Vec<(String, Vec<usize>, Vec<Bytes>)> = Vec::new();
+        let mut still_unresolved = Vec::new();
 
-    for ((_, group_positions, _), reply) in groups.into_iter().zip(replies) {
-        match reply {
-            Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
-                for (position, entry) in group_positions.into_iter().zip(results) {
-                    entries[position] = Some(entry);
-                }
-            }
-            _ => {
-                for position in group_positions {
+        for position in unresolved {
+            let owner = match owners_by_position[&position].get(rank) {
+                Some(owner) => owner.clone(),
+                None => {
+                    // Every owner for this key has now been tried once.
                     entries[position] = Some(ProxyMultiEntry::WrongNode);
+                    continue;
                 }
+            };
+            let key = keys[position].clone();
+            if let Some(group) = groups.iter_mut().find(|(addr, ..)| *addr == owner) {
+                group.1.push(position);
+                group.2.push(key);
+            } else {
+                groups.push((owner, vec![position], vec![key]));
             }
         }
+
+        if groups.is_empty() {
+            break;
+        }
+
+        // Issue #177: fan this rank's regrouped retry out to every owner
+        // concurrently, same reasoning as the first pass in
+        // `dispatch_request`.
+        let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = groups
+            .iter()
+            .map(|(owner, _, group_keys)| {
+                let fut = context.backends.call(
+                    context,
+                    owner,
+                    frame_multi_get(namespace, group_keys),
+                    Expect::Multi,
+                );
+                Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+            })
+            .collect();
+        let replies = join_all(futs).await;
+
+        for ((_, group_positions, _), reply) in groups.into_iter().zip(replies) {
+            match reply {
+                Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
+                    for (position, entry) in group_positions.into_iter().zip(results) {
+                        if matches!(entry, ProxyMultiEntry::WrongNode) {
+                            still_unresolved.push(position);
+                        } else {
+                            entries[position] = Some(entry);
+                        }
+                    }
+                }
+                _ => still_unresolved.extend(group_positions),
+            }
+        }
+
+        unresolved = still_unresolved;
+        rank += 1;
     }
 }
 
@@ -5566,6 +5607,89 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 W");
         read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
         assert_eq!(&buf.split_to(1)[..], b"v");
+    }
+
+    // Issue #221: multi-get replica fallback — `retry_multi_get` used to
+    // give up as soon as the (freshly refreshed) primary failed, instead
+    // of falling through to a replica the way `retry_get_on` does for
+    // single-key `Get`.
+
+    async fn dead_primary_live_replica_cluster() -> (MockNode, String, String, String) {
+        let live = MockNode::start().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let discovery = start_mock_discovery(
+            vec![
+                ("node-live".to_string(), live.addr.clone()),
+                ("node-dead".to_string(), dead_addr.clone()),
+            ],
+            2,
+        )
+        .await;
+        let proxy = start_proxy(&discovery, None, 64).await;
+
+        let ring = RingView::new(
+            vec![
+                ("node-live".to_string(), live.addr.clone()),
+                ("node-dead".to_string(), dead_addr.clone()),
+            ],
+            2,
+        );
+        let mut key = None;
+        for index in 0..32u8 {
+            let candidate = format!("key-{index}");
+            if ring.owners(b"", candidate.as_bytes())[0] == dead_addr {
+                key = Some(candidate);
+                break;
+            }
+        }
+        let key = key.expect("no key primaried by the dead node");
+
+        (live, dead_addr, proxy, key)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_falls_back_to_a_replica_when_the_primary_is_down() {
+        // R=2, primary unreachable: a live replica holding the value
+        // must still answer the multi-get, same as a single `Get` of the
+        // same key already does via `retry_get_on`.
+        let (live, _dead_addr, proxy, key) = dead_primary_live_replica_cluster().await;
+
+        // The replica already holds the value (e.g. replicated before
+        // the primary died) — inserted directly, since a `Set` routed
+        // through the dead primary would itself fail via the proxy.
+        live.store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), key.as_bytes().to_vec()), b"v".to_vec());
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        let frame = format!("m 0 1 {}\n{key}", key.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 1 1");
+        read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+        assert_eq!(&buf.split_to(1)[..], b"v");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_get_replica_miss_matches_single_get_after_a_down_primary() {
+        // Same dead-primary/live-replica shape, but neither node holds
+        // the key: the replica's `NotFound` must be trusted as a real
+        // miss (`-`), not degraded to `WrongNode` — the same answer a
+        // single `Get` of the same key gives in this situation.
+        let (_live, _dead_addr, proxy, key) = dead_primary_live_replica_cluster().await;
+
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        let frame = format!("m 0 1 {}\n{key}", key.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 1 -");
+
+        let frame = format!("G {}\n{key}", key.len());
+        stream.write_all(frame.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
     }
 
     // Issue #150: multi-set through the proxy.
