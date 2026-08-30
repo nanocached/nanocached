@@ -21,6 +21,8 @@ pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 pub use client::NODE_LIST_STALE_AFTER_MS;
 pub use client::{Namespace, NanocachedClient, Options, Stats};
 #[doc(hidden)]
+pub use connection::MAX_MULTI_GET_RESPONSE_BYTES;
+#[doc(hidden)]
 pub use connection::REQUEST_TIMEOUT_MS;
 pub use error::{Error, Result};
 pub use hash_ring::HashRing;

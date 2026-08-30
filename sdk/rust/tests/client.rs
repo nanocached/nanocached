@@ -2341,6 +2341,84 @@ async fn get_many_bytes_round_trips_raw_byte_values() {
 }
 
 #[tokio::test]
+async fn get_many_rejects_a_reply_whose_cumulative_bytes_exceed_the_bound() {
+    // Regression for issue #207 (follow-up to #179, fixed for Java in PR
+    // #201): MAX_VALUE_LENGTH bounds each entry's own declared length,
+    // but not an `M` reply's cumulative size — a node answering a large
+    // multi-get with many near-max-size hits could still force hundreds
+    // of MB of allocation from a single reply. Shrink the hidden bound so
+    // two small hits trip it, instead of moving tens of MB over loopback
+    // to prove the same thing.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("a", "xy", 0).await.unwrap();
+    client.set("b", "zz", 0).await.unwrap();
+
+    let default_bound = nanocached::MAX_MULTI_GET_RESPONSE_BYTES.load(Ordering::SeqCst);
+    nanocached::MAX_MULTI_GET_RESPONSE_BYTES.store(3, Ordering::SeqCst);
+
+    // "a"'s 2-byte body alone is within the shrunk 3-byte bound (running
+    // total 2), but "b"'s pushes the running total to 4 — over the bound
+    // — so the client must reject before ever reading "b"'s body off the
+    // wire.
+    let result = client.get_many(&["a", "b"]).await;
+    nanocached::MAX_MULTI_GET_RESPONSE_BYTES.store(default_bound, Ordering::SeqCst);
+
+    match result {
+        Err(Error::Protocol(message)) => {
+            assert!(
+                message.contains("exceeds"),
+                "err = {message}, want a cumulative-bound error"
+            );
+        }
+        other => panic!("get_many() = {other:?}, want a Protocol error"),
+    }
+
+    // The desync poisons the connection; the next request transparently
+    // redials rather than reusing the desynced stream (mirrors
+    // a_malformed_value_length_poisons_the_connection_and_retries_transparently).
+    let value = client.get("a").await.unwrap();
+    assert_eq!(value, Some("xy".to_string()));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_many_succeeds_when_cumulative_bytes_are_within_the_bound() {
+    // The bound-not-tripped counterpart to
+    // get_many_rejects_a_reply_whose_cumulative_bytes_exceed_the_bound:
+    // proves the check doesn't reject a reply merely because it's close
+    // to the (shrunk) bound.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("a", "xy", 0).await.unwrap();
+    client.set("b", "z", 0).await.unwrap();
+
+    let default_bound = nanocached::MAX_MULTI_GET_RESPONSE_BYTES.load(Ordering::SeqCst);
+    nanocached::MAX_MULTI_GET_RESPONSE_BYTES.store(3, Ordering::SeqCst);
+
+    // "a" (2 bytes) + "b" (1 byte) = 3, exactly at the shrunk bound —
+    // not over it.
+    let result = client.get_many(&["a", "b"]).await;
+    nanocached::MAX_MULTI_GET_RESPONSE_BYTES.store(default_bound, Ordering::SeqCst);
+
+    assert_eq!(
+        result.unwrap(),
+        HashMap::from([
+            ("a".to_string(), "xy".to_string()),
+            ("b".to_string(), "z".to_string()),
+        ])
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
 async fn get_many_rejects_an_empty_key_list() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
