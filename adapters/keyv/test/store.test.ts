@@ -91,6 +91,64 @@ describe("nanocached-keyv, through Keyv's own API", () => {
         await node.close();
       }
     });
+
+    it("an explicit ttl of 0, sent straight to the store, also sends 0 (no expiry) on the wire", async () => {
+      const node = await startMockNode();
+      try {
+        const store = await connectStore(node);
+        try {
+          await store.set("k", "v", 0);
+          assert.equal(node.lastSetTtl(), 0);
+        } finally {
+          await store.disconnect();
+        }
+      } finally {
+        await node.close();
+      }
+    });
+  });
+
+  describe('negative ttl means "already expired" (issue #300)', () => {
+    // Keyv itself never passes a negative ttl through `Keyv.set()` (a
+    // negative `Date.now() + ttl` deadline is nonsensical at that level),
+    // so these go straight at the store — same level `Keyv` itself calls
+    // `KeyvStoreAdapter.set()` at, and the level a `cache-manager` v6+
+    // app's own negative timeout would actually reach this adapter from.
+    it("set() with a negative ttl does not write, and deletes an existing entry", async () => {
+      const node = await startMockNode();
+      try {
+        const store = await connectStore(node);
+        try {
+          await store.set("k", "stale", 60_000);
+          assert.equal(await store.get("k"), "stale");
+
+          await store.set("k", "should-not-land", -1);
+
+          assert.equal(await store.get("k"), undefined);
+          assert.equal(node.store("keyv").has("k"), false);
+        } finally {
+          await store.disconnect();
+        }
+      } finally {
+        await node.close();
+      }
+    });
+
+    it("set() with a negative ttl is a no-op (not a write) when the key was never set", async () => {
+      const node = await startMockNode();
+      try {
+        const store = await connectStore(node);
+        try {
+          await store.set("never-set", "v", -1000);
+          assert.equal(await store.get("never-set"), undefined);
+          assert.equal(node.store("keyv").has("never-set"), false);
+        } finally {
+          await store.disconnect();
+        }
+      } finally {
+        await node.close();
+      }
+    });
   });
 
   describe("has()/getMany()/deleteMany() — omitted here, correct via Keyv's own fallbacks", () => {

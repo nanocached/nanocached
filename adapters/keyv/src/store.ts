@@ -60,7 +60,22 @@ export interface NanocachedKeyvStoreConfig {
 // itself resolved "no ttl configured anywhere" (observed directly against
 // keyv 5.6.0 — its internal `set()` passes `null`, not `undefined`, in
 // that case), so both are treated identically.
-function wireTtlSeconds(ttlMs: number | null | undefined): number {
+//
+// A *negative* ttl is different from 0/null/undefined: it means "this
+// entry is already expired" (issue #300) — verified against keyv 5.6.0,
+// which normalizes only `ttl === 0` to `undefined` and passes negative
+// ttls through untouched, relying on its own client-side
+// `expires = Date.now() + ttl` (already in the past) to hide the entry.
+// Mapping a negative ttl to wire TTL 0 here — as this function used to —
+// would write an *immortal* entry to nanocached that Keyv's expiry check
+// then hides forever: an unreclaimable server-side storage leak. So an
+// explicit negative ttl short-circuits to `DO_NOT_CACHE` before the
+// 0/null/undefined fallback, same policy as the cache-manager v5 store's
+// `resolveTtlSeconds` and the Django adapter's `_DO_NOT_CACHE`.
+const DO_NOT_CACHE = Symbol("nanocached-keyv: do not write, delete instead");
+
+function wireTtlSeconds(ttlMs: number | null | undefined): number | typeof DO_NOT_CACHE {
+  if (ttlMs !== null && ttlMs !== undefined && ttlMs < 0) return DO_NOT_CACHE;
   if (ttlMs === null || ttlMs === undefined || ttlMs <= 0) return 0;
   return Math.ceil(ttlMs / 1000);
 }
@@ -122,7 +137,16 @@ export class NanocachedKeyvStore implements KeyvStoreAdapter {
   }
 
   async set(key: string, value: unknown, ttl?: number | null): Promise<void> {
-    await this.ns.set(key, value as string, wireTtlSeconds(ttl));
+    const wireTtl = wireTtlSeconds(ttl);
+    // Issue #300: a negative ttl means "already expired" — don't write an
+    // immortal entry Keyv's own client-side expiry check will just hide
+    // forever; delete whatever's there instead, so a stale value can't be
+    // served.
+    if (wireTtl === DO_NOT_CACHE) {
+      await this.ns.delete(key);
+      return;
+    }
+    await this.ns.set(key, value as string, wireTtl);
   }
 
   async delete(key: string): Promise<boolean> {

@@ -58,7 +58,24 @@ export interface NanocachedStoreConfig extends Config {
 // back to the store's configured default" rule cache-manager stores
 // generally follow (ttl 0 is indistinguishable from "not passed" here,
 // matching the Redis store's own handling of Milliseconds).
-function resolveTtlSeconds(ttlMs: Milliseconds | undefined, defaultTtlMs: Milliseconds | undefined): number {
+//
+// A *negative* per-call ttl is different from 0/absent: it means "this
+// entry is already expired" (issue #300), same semantic the Django
+// adapter's `_DO_NOT_CACHE` gives `timeout <= 0`. Mapping it to wire TTL
+// 0 — as this function used to, since `ttlMs > 0` is false for negatives
+// too — would silently write an *immortal* entry instead: an
+// unreclaimable server-side storage leak. So an explicit negative call
+// ttl is checked first and short-circuits straight to `DO_NOT_CACHE`,
+// bypassing the configured default entirely (mirroring how Django's
+// `get_backend_timeout` only consults `default_timeout` when the caller
+// passed nothing at all, not when it passed an explicit negative).
+const DO_NOT_CACHE = Symbol("nanocached-cache-manager: do not write, delete instead");
+
+function resolveTtlSeconds(
+  ttlMs: Milliseconds | undefined,
+  defaultTtlMs: Milliseconds | undefined,
+): number | typeof DO_NOT_CACHE {
+  if (ttlMs !== undefined && ttlMs < 0) return DO_NOT_CACHE;
   const effectiveMs = ttlMs !== undefined && ttlMs > 0 ? ttlMs : defaultTtlMs;
   if (effectiveMs === undefined || effectiveMs <= 0) return 0;
   return Math.ceil(effectiveMs / 1000);
@@ -114,7 +131,15 @@ export class NanocachedStore implements Store {
     // means for this store — writing it would be indistinguishable from
     // writing nothing (matching the Redis store's own convention).
     if (data === undefined) return;
-    await this.ns.set(key, JSON.stringify(data), resolveTtlSeconds(ttl, this.defaultTtlMs));
+    const wireTtl = resolveTtlSeconds(ttl, this.defaultTtlMs);
+    // Issue #300: a negative ttl means "already expired" — don't write an
+    // immortal entry the framework will just keep hiding forever; delete
+    // whatever's there instead, so a stale value can't be served.
+    if (wireTtl === DO_NOT_CACHE) {
+      await this.ns.delete(key);
+      return;
+    }
+    await this.ns.set(key, JSON.stringify(data), wireTtl);
   }
 
   async del(key: string): Promise<void> {
@@ -147,13 +172,23 @@ export class NanocachedStore implements Store {
    * entry, matching `setMany`'s own single-TTL-per-call signature.
    * `undefined` values are skipped, same no-op convention as `set`. */
   async mset(entries: Array<[string, unknown]>, ttl?: Milliseconds): Promise<void> {
+    const wireTtl = resolveTtlSeconds(ttl, this.defaultTtlMs);
+    // Issue #300: same "already expired" handling as set() — one ttl
+    // applies to the whole batch (mset's own signature), so a negative
+    // ttl deletes every entry the call would otherwise have written.
+    if (wireTtl === DO_NOT_CACHE) {
+      const keys = entries.filter(([, value]) => value !== undefined).map(([key]) => key);
+      if (keys.length === 0) return;
+      await this.mdel(...keys);
+      return;
+    }
     const values: Record<string, string> = {};
     for (const [key, value] of entries) {
       if (value === undefined) continue;
       values[key] = JSON.stringify(value);
     }
     if (Object.keys(values).length === 0) return;
-    await this.ns.setMany(values, resolveTtlSeconds(ttl, this.defaultTtlMs));
+    await this.ns.setMany(values, wireTtl);
   }
 
   /** Client-side loop over `del`, concurrently. */
