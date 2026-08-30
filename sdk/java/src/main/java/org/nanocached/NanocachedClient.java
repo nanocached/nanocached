@@ -2330,6 +2330,17 @@ public final class NanocachedClient implements AutoCloseable {
     // than throwing — OptionalLong is that convention's long-typed
     // counterpart. `decr` is never a separate wire op — see {@link
     // #decr(byte[], long)}.
+    //
+    // AT-LEAST-ONCE CAVEAT (issue #225): incr/decr is not idempotent, so
+    // unlike get/set/delete it is never blindly replayed after a
+    // connection failure. If the primary applies the increment but the
+    // connection drops before its reply arrives, this throws
+    // NanocachedException.ConnectionFailed — leaving the caller unable to
+    // tell "definitely not applied" from "applied, but the ack was lost"
+    // — rather than silently resending the delta and risking a double
+    // increment. A redial-and-retry only ever happens when the request
+    // never reached the wire in the first place (e.g. the connection was
+    // already dead from an idle timeout), which is always safe.
 
     public OptionalLong incr(String key, long delta) {
         return incr(key.getBytes(StandardCharsets.UTF_8), delta);
@@ -2363,7 +2374,9 @@ public final class NanocachedClient implements AutoCloseable {
      * the wire (see {@link Connection#incr}). {@code delta} is the
      * (non-negative in spirit, but unchecked beyond this) amount to
      * subtract; {@code Long.MIN_VALUE} is rejected since two's complement
-     * has no positive value to negate it to. */
+     * has no positive value to negate it to. Not idempotent — see this
+     * section's own doc comment (issue #225) for the at-least-once
+     * caveat on a lost reply. */
     public OptionalLong decr(byte[] key, long delta) {
         if (delta == Long.MIN_VALUE) {
             throw new IllegalArgumentException(
@@ -2387,7 +2400,8 @@ public final class NanocachedClient implements AutoCloseable {
     OptionalLong incr(byte[] namespace, byte[] key, long delta) {
         validateKey(namespace, key);
         beforeOperation();
-        Connection.IncrResult result = withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta));
+        Connection.IncrResult result =
+                withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta), false);
         return result == null ? OptionalLong.empty() : OptionalLong.of(result.value());
     }
 
@@ -2404,6 +2418,19 @@ public final class NanocachedClient implements AutoCloseable {
     // caller's acquire and its release. k/x are atomic against concurrent
     // requests on the node that owns the key, the same guarantee INCR
     // makes and no stronger.
+    //
+    // AT-LEAST-ONCE CAVEAT (issue #225): none of putIfAbsent/
+    // replaceIfPresent/replace/deleteIfMatches is idempotent, so — unlike
+    // get/set/delete — none is blindly replayed after a connection
+    // failure. If the primary applies the store/delete but the connection
+    // drops before its reply arrives, these throw
+    // NanocachedException.ConnectionFailed instead of resending the
+    // request: a blind resend of `k`/`x` after a lost reply would
+    // re-evaluate <cond> against the value it just wrote, almost always
+    // reporting an already-succeeded op as a mismatch (`false`). A
+    // redial-and-retry only ever happens when the request never reached
+    // the wire in the first place (e.g. the connection was already dead
+    // from an idle timeout), which is always safe.
 
     public boolean putIfAbsent(String key, String value) {
         return putIfAbsent(key, value, 0L);
@@ -2423,7 +2450,9 @@ public final class NanocachedClient implements AutoCloseable {
      * stored: {@code false} means the key already existed and nothing
      * changed. {@code ttlSeconds == 0} means no expiry, same as {@link
      * #set(byte[], byte[], long)}. See this section's own doc comment for
-     * why this is not a distributed lock. */
+     * why this is not a distributed lock, and for the at-least-once
+     * caveat (issue #225) on a lost reply — not idempotent, so never
+     * blindly retried after a connection failure. */
     public boolean putIfAbsent(byte[] key, byte[] value, long ttlSeconds) {
         return putIfAbsent(EMPTY_NAMESPACE, key, value, ttlSeconds);
     }
@@ -2452,7 +2481,9 @@ public final class NanocachedClient implements AutoCloseable {
      * any (unexpired) value, whatever it is — the {@code P}-conditioned
      * {@code k}, the two-argument {@code replace(key, value)}. Returns
      * whether it was stored: {@code false} means the key was absent and
-     * nothing changed. {@code ttlSeconds == 0} means no expiry. */
+     * nothing changed. {@code ttlSeconds == 0} means no expiry. Not
+     * idempotent — see this section's own doc comment for the
+     * at-least-once caveat (issue #225) on a lost reply. */
     public boolean replaceIfPresent(byte[] key, byte[] value, long ttlSeconds) {
         return replaceIfPresent(EMPTY_NAMESPACE, key, value, ttlSeconds);
     }
@@ -2493,6 +2524,9 @@ public final class NanocachedClient implements AutoCloseable {
      * true within one client sharing one serializer/compressor, not
      * guaranteed across languages with client-side compression enabled.
      *
+     * <p>Not idempotent — see this section's own doc comment for the
+     * at-least-once caveat (issue #225) on a lost reply.
+     *
      * @throws IllegalArgumentException if {@code token} isn't a
      * well-formed 32-character lowercase hex digest */
     public boolean replace(byte[] key, String token, byte[] newValue, long ttlSeconds) {
@@ -2526,7 +2560,8 @@ public final class NanocachedClient implements AutoCloseable {
         // decompress it.
         byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
-        return withWrongNodeRetry(() -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond));
+        return withWrongNodeRetry(
+                () -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond), false);
     }
 
     public boolean deleteIfMatches(String key, String token) {
@@ -2538,7 +2573,9 @@ public final class NanocachedClient implements AutoCloseable {
      * {@code remove(key, old)}. Returns whether it was removed: {@code
      * false} means a mismatch or a missing key, not an exception. See
      * {@link #replace(byte[], String, byte[], long)}'s doc for the same
-     * token-reconstruction caveat.
+     * token-reconstruction caveat, and the CAS section's own doc comment
+     * for the at-least-once caveat (issue #225) on a lost reply — not
+     * idempotent, so never blindly retried after a connection failure.
      *
      * @throws IllegalArgumentException if {@code token} isn't a
      * well-formed 32-character lowercase hex digest */
@@ -2552,7 +2589,7 @@ public final class NanocachedClient implements AutoCloseable {
         validateToken(token);
         validateKey(namespace, key);
         beforeOperation();
-        return withWrongNodeRetry(() -> casDeletePrimaryThenReplicate(namespace, key, token));
+        return withWrongNodeRetry(() -> casDeletePrimaryThenReplicate(namespace, key, token), false);
     }
 
     /**
@@ -2814,19 +2851,47 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Runs the operation; on a {@code W} answer (stale routing) <em>or</em>
-     * a connection-level failure that exhausted the current ranking (e.g.
-     * the key's primary died), forces a node-list refresh and retries the
-     * whole operation once against the fresh ranking. The retry window for
-     * a dead node is therefore bounded by discovery's liveness timeout —
-     * once discovery drops the node, the refreshed ranking routes around
-     * it. A second failure after a fresh refresh propagates.
+     * As {@link #withWrongNodeRetry(java.util.function.Supplier, boolean)}
+     * with {@code retryConnectionFailure} true — every idempotent caller
+     * (get/set/delete/clear).
      */
     private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation) {
+        return withWrongNodeRetry(operation, true);
+    }
+
+    /**
+     * Runs the operation; on a {@code W} answer (stale routing) <em>or</em>,
+     * when {@code retryConnectionFailure}, a connection-level failure that
+     * exhausted the current ranking (e.g. the key's primary died), forces
+     * a node-list refresh and retries the whole operation once against
+     * the fresh ranking. The retry window for a dead node is therefore
+     * bounded by discovery's liveness timeout — once discovery drops the
+     * node, the refreshed ranking routes around it. A second failure
+     * after a fresh refresh propagates. {@code W} is always retried this
+     * way regardless of {@code retryConnectionFailure}: it's a
+     * well-formed reply proving the primary applied nothing, so it carries
+     * no idempotency concern.
+     *
+     * <p>INCR/CAS/delete-if-matches (issue #225) pass {@code
+     * retryConnectionFailure} false: by the time a {@code
+     * ConnectionFailed} reaches here for one of those, {@link
+     * #applyReconnectingNonIdempotent} has already redialed and retried
+     * it once for the one case that's safe (the request never reached the
+     * wire) — reaching here at all means the primary may already have
+     * applied it, and resending the whole operation, possibly to that
+     * very same primary if discovery hasn't yet dropped it, risks
+     * double-applying a non-idempotent op. So this must not retry it
+     * again; the caller sees {@code ConnectionFailed} instead.
+     */
+    private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation, boolean retryConnectionFailure) {
         try {
             return operation.get();
-        } catch (NanocachedException.WrongNode | NanocachedException.ConnectionFailed error) {
+        } catch (NanocachedException.WrongNode error) {
             if (ring == null) throw error;
+            maybeRefresh(true);
+            return operation.get();
+        } catch (NanocachedException.ConnectionFailed error) {
+            if (ring == null || !retryConnectionFailure) throw error;
             maybeRefresh(true);
             return operation.get();
         }
@@ -2847,14 +2912,51 @@ public final class NanocachedClient implements AutoCloseable {
      * doesn't learn about a peer FIN (e.g. the server's 60s idle timeout)
      * until an I/O call fails — so lazy reconnect-on-use here means: the
      * failed request poisons the connection, {@code source} redials, and
-     * the operation runs again. Safe because get/set/delete are all
-     * idempotent.
+     * the operation runs again. Safe because get/set/delete/clear are all
+     * idempotent — replaying one after a redial can never change the
+     * outcome the caller sees beyond what a lost-and-retried request
+     * always risks (e.g. two sets racing), which is inherent to the
+     * protocol, not something this retry adds.
+     *
+     * <p>NOT used for INCR/CAS/delete-if-matches (issue #225) — those
+     * aren't idempotent, so blindly resending after <em>any</em>
+     * connection failure could double-apply an INCR or report an
+     * already-succeeded CAS as a mismatch, if the primary actually
+     * applied the op and only its reply was lost. See {@link
+     * #applyReconnectingNonIdempotent} instead.
      */
     private <T> T applyReconnecting(
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         try {
             return op.apply(source.get());
         } catch (NanocachedException.ConnectionFailed retryable) {
+            return op.apply(source.get());
+        }
+    }
+
+    /**
+     * As {@link #applyReconnecting}, but for {@code op}s that are
+     * <em>not</em> idempotent — {@code i}/{@code k}/{@code x} (INCR, CAS,
+     * delete-if-matches, issue #225). {@link
+     * NanocachedException.ConnectionFailed#notSent()} is what tells apart
+     * the one case where a redial-and-retry is still safe from every case
+     * where it isn't: {@code true} means this connection was already
+     * known dead — the idle-FIN case {@link #applyReconnecting}'s own doc
+     * describes — before {@code op}'s frame ever touched the wire, so
+     * nothing was sent and retrying once, exactly like {@link
+     * #applyReconnecting} always does, is exactly as safe here. Anything
+     * else — the write itself failing partway, a request timeout, or the
+     * reply simply never arriving after a successful write — leaves the
+     * request's fate genuinely unknown (the primary may well have applied
+     * it), so this surfaces {@link NanocachedException.ConnectionFailed}
+     * to the caller instead of ever resending it.
+     */
+    private <T> T applyReconnectingNonIdempotent(
+            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+        try {
+            return op.apply(source.get());
+        } catch (NanocachedException.ConnectionFailed retryable) {
+            if (!retryable.notSent()) throw retryable;
             return op.apply(source.get());
         }
     }
@@ -3207,15 +3309,21 @@ public final class NanocachedClient implements AutoCloseable {
      * result is fanned out to the remaining owners via {@link
      * #replicateIncrResult} before being returned. {@link
      * #withWrongNodeRetry} already wraps a call to this whole method (see
-     * {@link #incr(byte[], byte[], long)}) and retries it on a {@code
-     * W}/dead primary — since replication only ever runs after the
+     * {@link #incr(byte[], byte[], long)}) and retries it on {@code W}
+     * (stale routing) — since replication only ever runs after the
      * primary leg above has already returned successfully, that retry
      * only ever re-runs the primary leg again (a second, freshly routed
-     * primary attempt), never a duplicate replica fan-out.
+     * primary attempt), never a duplicate replica fan-out. It is NOT
+     * retried on {@code ConnectionFailed} (issue #225 —
+     * {@code retryConnectionFailure} false): INCR isn't idempotent, so
+     * the primary leg below already owns the only safe retry, via {@link
+     * #applyReconnectingNonIdempotent}; see its doc for why a redial is
+     * safe only when the request never reached the wire.
      */
     private Connection.IncrResult incrPrimaryThenReplicate(byte[] namespace, byte[] key, long delta) {
         if (ring == null) {
-            return applyReconnecting(this::singleConnection, connection -> connection.incr(namespace, key, delta));
+            return applyReconnectingNonIdempotent(
+                    this::singleConnection, connection -> connection.incr(namespace, key, delta));
         }
 
         List<String> names = ownerNames(namespace, key);
@@ -3223,7 +3331,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        Connection.IncrResult result = applyReconnecting(
+        Connection.IncrResult result = applyReconnectingNonIdempotent(
                 () -> memberConnection(names.get(0)), connection -> connection.incr(namespace, key, delta));
         if (result == null) return null;
 
@@ -3334,14 +3442,19 @@ public final class NanocachedClient implements AutoCloseable {
      * same {@code value}/{@code ttlSeconds} just written to the primary,
      * before returning {@code true}. {@link #withWrongNodeRetry} already
      * wraps a call to this whole method (see {@link #cas}) and retries it
-     * on a {@code W}/dead primary — since replication only ever runs
+     * on {@code W} (stale routing) — since replication only ever runs
      * after the primary leg above has already returned successfully, that
      * retry only ever re-runs the primary leg again, never a duplicate
-     * replica fan-out. */
+     * replica fan-out. It is NOT retried on {@code ConnectionFailed}
+     * (issue #225 — {@code retryConnectionFailure} false): a CAS store
+     * isn't idempotent (a successful-but-unacknowledged store must not be
+     * replayed only to be reported as a mismatch), so the primary leg
+     * below already owns the only safe retry, via {@link
+     * #applyReconnectingNonIdempotent}. */
     private boolean casPrimaryThenReplicate(
             byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
         if (ring == null) {
-            return applyReconnecting(
+            return applyReconnectingNonIdempotent(
                     this::singleConnection, connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
         }
 
@@ -3350,7 +3463,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        boolean stored = applyReconnecting(() -> memberConnection(names.get(0)),
+        boolean stored = applyReconnectingNonIdempotent(() -> memberConnection(names.get(0)),
                 connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
         if (!stored) return false;
 
@@ -3365,10 +3478,16 @@ public final class NanocachedClient implements AutoCloseable {
      * #casPrimaryThenReplicate}, but for {@code x}/{@code remove(key,
      * old)}: a success's replica leg is an ordinary (unconditional)
      * delete, since the primary's own successful digest match already
-     * proved the key existed. */
+     * proved the key existed. As {@link #casPrimaryThenReplicate}, not
+     * retried on {@code ConnectionFailed} by {@link #withWrongNodeRetry}
+     * (issue #225): a successful-but-unacknowledged delete must not be
+     * replayed only to be reported as a mismatch/missing key, so the
+     * primary leg below already owns the only safe retry, via {@link
+     * #applyReconnectingNonIdempotent}. */
     private boolean casDeletePrimaryThenReplicate(byte[] namespace, byte[] key, String cond) {
         if (ring == null) {
-            return applyReconnecting(this::singleConnection, connection -> connection.casDelete(namespace, key, cond));
+            return applyReconnectingNonIdempotent(
+                    this::singleConnection, connection -> connection.casDelete(namespace, key, cond));
         }
 
         List<String> names = ownerNames(namespace, key);
@@ -3376,7 +3495,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        boolean deleted = applyReconnecting(
+        boolean deleted = applyReconnectingNonIdempotent(
                 () -> memberConnection(names.get(0)), connection -> connection.casDelete(namespace, key, cond));
         if (!deleted) return false;
 

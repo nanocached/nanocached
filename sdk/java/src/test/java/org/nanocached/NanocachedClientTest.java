@@ -490,6 +490,47 @@ class NanocachedClientTest {
         }
     }
 
+    // issue #225: INCR is not idempotent, so unlike get/set/delete the
+    // built-in redial-and-retry must never resend it once its bytes may
+    // already have reached the server. These two tests cover the two
+    // outcomes the fix distinguishes.
+
+    @Test
+    void incrIsRetriedAfterRedialWhenTheConnectionWasAlreadyDead() throws Exception {
+        // The connection dies (mirrors the server's own idle timeout, see
+        // transparentlyReconnectsAfterAServerFin) before this call's `i`
+        // frame is ever written — nothing was sent, so the client's
+        // lazy-reconnect-on-use redials and retries transparently, same
+        // as get/set/delete.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("counter", "10");
+                node.dropConnections();
+                Thread.sleep(50); // let the FIN land
+                assertEquals(java.util.OptionalLong.of(15), client.incr("counter", 5));
+                assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void incrAppliedButAcknowledgementLostIsNeverReplayed() throws Exception {
+        // The primary reads the `i` request and applies it, but the
+        // connection dies before its `I` reply arrives — the request
+        // definitely reached the server, so a blind retry here would
+        // double-apply the increment. The client must surface
+        // ConnectionFailed instead of resending it, and the counter must
+        // have moved exactly once.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("counter", "10");
+                node.dropReplyAfterNextIncr();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.incr("counter", 5));
+                assertEquals(Optional.of("15"), client.get("counter"));
+            }
+        }
+    }
+
     // ── Compare-and-set (issue #141) ───────────────────────────────
 
     // The pinned cross-language digest vector (docs/protocol.html#cas):
@@ -640,6 +681,46 @@ class NanocachedClientTest {
                         tenant.getWithToken("k").orElseThrow().token()));
                 assertEquals(Optional.empty(), tenant.get("k"));
                 assertEquals(Optional.of("default-value"), client.get("k"));
+            }
+        }
+    }
+
+    // issue #225: same coverage as incrIsRetriedAfterRedialWhenTheConnectionWasAlreadyDead/
+    // incrAppliedButAcknowledgementLostIsNeverReplayed above, for `k`
+    // (CAS store) — replace/putIfAbsent/replaceIfPresent all share the
+    // same casPrimaryThenReplicate driver.
+
+    @Test
+    void replaceIsRetriedAfterRedialWhenTheConnectionWasAlreadyDead() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v1");
+                String token = client.getWithToken("k").orElseThrow().token();
+                node.dropConnections();
+                Thread.sleep(50); // let the FIN land
+                assertTrue(client.replace("k", token, "v2"));
+                assertEquals(Optional.of("v2"), client.get("k"));
+                assertEquals(2, node.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
+    void replaceAppliedButAcknowledgementLostIsNeverReplayed() throws Exception {
+        // The primary applies the store but the connection dies before
+        // its `S` reply arrives. A blind retry would resend `k` with the
+        // *old* token, which the just-written value no longer matches —
+        // reporting an already-succeeded replace as a mismatch (`false`).
+        // The client must surface ConnectionFailed instead, and the
+        // value must have been written exactly once.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("k", "v1");
+                String token = client.getWithToken("k").orElseThrow().token();
+                node.dropReplyAfterNextCasSet();
+                assertThrows(NanocachedException.ConnectionFailed.class,
+                        () -> client.replace("k", token, "v2"));
+                assertEquals(Optional.of("v2"), client.get("k"));
             }
         }
     }
@@ -1981,6 +2062,40 @@ class NanocachedClientTest {
                 // replica-write-failure counter (a completely separate
                 // mechanism) must not have moved either.
                 assertEquals(replicaWriteFailuresBefore, client.stats().replicaWriteFailures());
+            }
+        }
+    }
+
+    @Test
+    void incrAppliedButAcknowledgementLostIsNeverReplayedByTheOuterWrongNodeRetry() throws Exception {
+        // issue #225: applyReconnectingNonIdempotent's own redial-and-
+        // retry isn't the only layer that could double-apply INCR — the
+        // outer withWrongNodeRetry (which refreshes the ring and re-runs
+        // the WHOLE incr call on a W or a dead primary) must also refuse
+        // to retry once a ConnectionFailed reaches it, since by then the
+        // primary may already have applied the op. This is a cluster (2
+        // owners, replication 2) counterpart of the single-node
+        // incrAppliedButAcknowledgementLostIsNeverReplayed above,
+        // specifically targeting that outer layer rather than the inner
+        // one.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                String key = "shared-counter";
+                client.set(key, "10");
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                MockNode primary = cluster.nodes().get(owners.get(0));
+                String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
+
+                primary.dropReplyAfterNextIncr();
+                assertThrows(NanocachedException.ConnectionFailed.class, () -> client.incr(key, 5));
+
+                // The outer withWrongNodeRetry must not have re-run
+                // incrPrimaryThenReplicate: only the one `i` frame the
+                // primary already applied, never a second one — and the
+                // value it holds reflects exactly one +5, not two.
+                assertEquals(1, primary.incrCount.get(),
+                        "the primary must receive exactly one `i` frame, not a replayed one");
+                assertEquals("15", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
             }
         }
     }

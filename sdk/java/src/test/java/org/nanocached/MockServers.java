@@ -122,6 +122,15 @@ final class MockServers {
         private volatile long setDelayMillis = 0;
         private volatile long getDelayMillis = 0;
         private volatile boolean failSets = false;
+        /** issue #225: one-off flags that make the next `i`/`k` frame
+         * apply normally (mutating the store, exactly like a real answer
+         * would) but close the connection instead of ever writing a
+         * reply — regression coverage for "the primary applied the op,
+         * only the ack was lost": the client must throw connection-lost
+         * rather than resend the request, and the effect must have
+         * landed exactly once. */
+        private final AtomicInteger dropReplyAfterIncr = new AtomicInteger();
+        private final AtomicInteger dropReplyAfterCasSet = new AtomicInteger();
         /** One-off connection resets queued for the next `c`/`F` frame(s)
          * (issue #106), mirroring {@link #wrongNodeReplies}/{@link
          * #takeWrongNode()} rather than {@link #failSets}'s permanent
@@ -340,6 +349,36 @@ final class MockServers {
          * hook of the same name. */
         void goSilentAfterHandshake() {
             silent = true;
+        }
+
+        /** issue #225: apply (and count) the next `i` request as usual,
+         * but close the connection instead of replying — see {@link
+         * #dropReplyAfterIncr}. */
+        void dropReplyAfterNextIncr() {
+            dropReplyAfterIncr.incrementAndGet();
+        }
+
+        private boolean takeDropReplyAfterIncr() {
+            while (true) {
+                int pending = dropReplyAfterIncr.get();
+                if (pending == 0) return false;
+                if (dropReplyAfterIncr.compareAndSet(pending, pending - 1)) return true;
+            }
+        }
+
+        /** issue #225: apply (and count) the next `k` request as usual,
+         * but close the connection instead of replying — see {@link
+         * #dropReplyAfterCasSet}. */
+        void dropReplyAfterNextCasSet() {
+            dropReplyAfterCasSet.incrementAndGet();
+        }
+
+        private boolean takeDropReplyAfterCasSet() {
+            while (true) {
+                int pending = dropReplyAfterCasSet.get();
+                if (pending == 0) return false;
+                if (dropReplyAfterCasSet.compareAndSet(pending, pending - 1)) return true;
+            }
         }
 
         /** Server-side FIN on every open connection, like the idle timeout. */
@@ -695,6 +734,11 @@ final class MockServers {
                             }
                             byte[] updatedValue = Long.toString(updated).getBytes(StandardCharsets.US_ASCII);
                             namespacedPut(ns, key, updatedValue);
+                            if (takeDropReplyAfterIncr()) {
+                                // issue #225: applied, but the ack never
+                                // arrives — the connection just dies here.
+                                return;
+                            }
                             Long ttl = namespacedTtl(ns, key);
                             String ttlField = ttl == null ? "" : " " + ttl;
                             out.write(("I " + updatedValue.length + ttlField + tagSuffix + "\n")
@@ -745,6 +789,12 @@ final class MockServers {
                             if (matches) {
                                 namespacedPut(ns, key, value);
                                 namespacedPutTtl(ns, key, ttlSeconds);
+                                if (takeDropReplyAfterCasSet()) {
+                                    // issue #225: applied, but the ack
+                                    // never arrives — the connection just
+                                    // dies here.
+                                    return;
+                                }
                                 out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));

@@ -141,6 +141,14 @@ expiry reclaim it like any other entry. Good for rate limiting and
 approximate counters; not for durable counts (billing, inventory, or
 anything you can't afford to silently lose to eviction).
 
+**Not idempotent — at-least-once, not exactly-once, on a lost reply.**
+Unlike `get`/`set`/`delete`, `incr`/`decr` is never blindly resent after
+a connection failure: if the connection dies after the primary already
+applied the delta but before its reply arrived, the SDK throws
+`NanocachedException.ConnectionFailed` rather than risk applying the
+delta twice. See [Reconnect and keep-alive](#reconnect-and-keep-alive)
+for the full rule (issue #225).
+
 In a cluster, only the primary owner runs the increment; the replicas
 receive the primary's literal resulting value (and TTL) as an ordinary
 `set` rather than replaying the increment themselves, so a replica that
@@ -261,6 +269,18 @@ never by replaying the conditioned op — the same rule `incr` follows and
 for the same reason. See [`docs/protocol.html#cas`](../../docs/protocol.html#cas)
 for the wire-level details.
 
+**Not idempotent — at-least-once, not exactly-once, on a lost reply**,
+the same caveat `incr`/`decr` carries and for the same reason: a blind
+resend after the primary already applied the store/delete would
+re-evaluate the condition against the value it just wrote, almost always
+reporting an already-succeeded call as a mismatch (`false`) instead of
+the `true` it actually was. So none of `putIfAbsent`/`replaceIfPresent`/
+`replace`/`deleteIfMatches` is retried after a connection failure that
+happens once the request may have reached the server — they throw
+`NanocachedException.ConnectionFailed` instead. See
+[Reconnect and keep-alive](#reconnect-and-keep-alive) for the full rule
+(issue #225).
+
 ## Fire-and-forget replica writes
 
 Off by default. `set`/`delete` normally wait for every replica leg to
@@ -337,8 +357,19 @@ drained by `close()`.
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (all
-operations are idempotent).
+restart, a network blip) redials and retries once transparently — but
+**only when the dead connection had genuinely never sent the request**
+(e.g. it had already gone idle-timed-out before this call began). For
+`get`/`set`/`delete`/`clear`, which are idempotent, that is the only case
+that matters. `incr`/`decr`/`putIfAbsent`/`replaceIfPresent`/`replace`/
+`deleteIfMatches` are **not** idempotent: if the connection instead dies
+*after* the request reached the server — the primary applied it but the
+reply was lost — the SDK does not resend it (that would double-apply an
+INCR, or report an already-succeeded CAS/delete-if-matches as a
+mismatch); it throws `NanocachedException.ConnectionFailed` instead,
+leaving the caller unable to tell "definitely not applied" from
+"applied, but the ack was lost" — at-least-once, not exactly-once,
+and not something this SDK smooths over (issue #225).
 
 `connect()` itself tolerates a node that discovery still lists but that
 can't be reached — typically one that just died and hasn't been evicted
