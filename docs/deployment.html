@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Deployment — nanocached</title>
-<meta name="description" content="Run nanocached on a single EC2 instance, on ECS or on EKS: network setup, metrics for autoscaling, readiness probes, and graceful scale-in via SIGTERM.">
+<meta name="description" content="Verified nanocached deployments: a single node on EC2, and an autoscaled multi-AZ cluster on ECS Fargate and on EKS — network, IAM, secrets, probes, and graceful scale-in via SIGTERM.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="icon" href="favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
@@ -30,11 +30,14 @@
 <main>
 
 <h1>Deployment</h1>
-<p class="lede">A complete single-instance deployment on EC2 first —
-network, security groups, IAM, systemd — then everything an
-orchestrator needs to scale nanocached in both directions: Prometheus
-metrics to act on, probes to route around instances that aren't ready,
-and a SIGTERM-driven drain so scale-in never loses data.</p>
+<p class="lede">Three verified deployments, each built from an empty
+account and torn down again: a <a href="#ec2">single node on EC2</a>
+(network, security groups, IAM, systemd), and a replicated, autoscaled,
+multi-AZ cluster on <a href="#ecs">ECS Fargate</a> and on <a
+href="#eks">EKS</a>. First, what every orchestrator needs from
+nanocached: probes to route around instances that aren't ready,
+metrics to scale on, and a SIGTERM-driven drain so scale-in never
+loses data.</p>
 
 <h2 id="ops">The operations endpoint</h2>
 <p>Each binary takes <code>--metrics-port &lt;port&gt;</code> and serves
@@ -54,7 +57,7 @@ do protocol handshakes) — bind it to an internal interface and don't
 expose it outside the task network. Omitting the flag disables the
 endpoint entirely.</p>
 
-<h2>Metrics to scale on</h2>
+<h2 id="metrics">Metrics to scale on</h2>
 <p><strong>Nodes</strong> scale on the memory watermark. Sum
 <code>nanocached_node_memory_used_bytes</code> over the fleet, divide by
 the summed <code>nanocached_node_memory_max_bytes</code>, and target a
@@ -78,7 +81,7 @@ give request and error rates.</p>
 counters — not scaling signals, but the first thing to graph when a
 scale event misbehaves.</p>
 
-<h2>Graceful scale-in</h2>
+<h2 id="graceful-scale-in">Graceful scale-in</h2>
 <p>Scale-in terminates instances that are <em>not</em> dead, and
 orchestrators signal that with SIGTERM followed by SIGKILL after a
 grace period. Both server binaries treat SIGTERM as "drain, then
@@ -229,11 +232,11 @@ Requires=docker.service
 
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f nanocached-node
-ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node:0.3.0
+ExecStartPre=/usr/bin/docker pull ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af
 ExecStart=/usr/bin/docker run --rm --name nanocached-node \
   --network host \
   --env-file /etc/nanocached/env \
-  ghcr.io/nanocached/nanocached-node:0.3.0 \
+  ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af \
   --host 0.0.0.0 --port 8356 --metrics-port 9356 \
   --max-memory 1073741824
 ExecStop=/usr/bin/docker stop -t 30 nanocached-node
@@ -257,11 +260,27 @@ systemctl enable --now nanocached-node</code></pre>
   the kernel, Docker and the per-connection buffers the rest. Scale it
   with the instance; the <a href="capacity-planner.html">capacity
   planner</a> turns a hit-rate target into a number.</li>
-  <li><b>The image tag</b> — pinned to a version so an instance
-  replacement can't silently pick up a different build.</li>
+  <li><b>The image</b> — pinned by digest so an instance replacement
+  can't silently pick up a different build. The digest above is the
+  <code>latest</code> build this guide was verified with; the
+  <code>0.3.0</code> release tag predates <code>--metrics-port</code>
+  and <code>--drain-timeout</code> and will refuse this command line.
+  <code>docker buildx imagetools inspect
+  ghcr.io/nanocached/nanocached-node:latest</code> prints the current
+  digest when you want to move.</li>
 </ul>
-<p>Launch it, plus a throwaway client in the app group to verify from:</p>
-<pre><code>AMI_ID=$(aws ssm get-parameter \
+<p>Launch it, plus a throwaway client in the app group to verify from.
+The client's user-data installs the <a href="sdks.html">Python
+SDK</a> — Amazon Linux 2023's default <code>python3</code> is 3.9, so
+it installs 3.11 alongside:</p>
+<pre><code>cat &gt; client-user-data.sh &lt;&lt;'EOF'
+#!/bin/bash
+set -euo pipefail
+dnf install -y python3.11 python3.11-pip
+python3.11 -m pip install nanocached==0.3.0
+EOF
+
+AMI_ID=$(aws ssm get-parameter \
   --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
   --query Parameter.Value --output text)
 
@@ -273,7 +292,7 @@ NODE_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
 
 CLIENT_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.micro \
   --subnet-id $SUBNET_ID --security-group-ids $APP_SG \
-  --iam-instance-profile Name=$NAME-ec2 \
+  --iam-instance-profile Name=$NAME-ec2 --user-data file://client-user-data.sh \
   --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-client}]" \
   --query 'Instances[0].InstanceId' --output text)
 
@@ -292,38 +311,47 @@ for a shell, or <code>aws ssm send-command</code> as below):</p>
     "curl -s -o /dev/null -w healthz=%{http_code}\\\\n http://127.0.0.1:9356/healthz",
     "curl -s -o /dev/null -w readyz=%{http_code}\\\\n http://127.0.0.1:9356/readyz"]'
 # active / healthz=200 / readyz=200</code></pre>
-<p>From the client — the same smoke test as <a
-href="getting-started.html">getting started</a>, with the <code>A</code>
-frame in front because a secret is set. Amazon Linux 2023 has no
-<code>nc</code> by default, so use Python:</p>
-<pre><code>python3 - &lt;&lt;PY
-import socket
-s = socket.create_connection(("$NODE_IP", 8356), timeout=5)
-s.sendall(b"A 9\nchange-meS 4 5\nnameAliceG 4\nname"); s.shutdown(socket.SHUT_WR)
-buf = b""
-while (c := s.recv(4096)): buf += c
-print(buf)
-PY
-# b'On\nS\nV 5\nAlice'   — authenticated, stored, read back
-curl -s http://$NODE_IP:9356/metrics | grep -v '^#' | head -3
-# nanocached_node_memory_used_bytes 109
+<p>From the client, the smoke test is the SDK doing the three
+operations, then trying the wrong secret. Save it as
+<code>smoke.py</code> (substitute the node's private IP) and run it
+with <code>python3.11 smoke.py</code> over Session Manager:</p>
+<pre><code>import asyncio
+from nanocached import NanocachedClient, AuthenticationError
+
+NODE = [("10.0.0.212", 8356)]
+
+async def main():
+    async with await NanocachedClient.connect(NODE, auth_secret="change-me") as c:
+        await c.set("greeting", "hello", ttl_seconds=60)
+        print("get      ->", await c.get("greeting"))      # hello
+        print("delete   ->", await c.delete("greeting"))   # True
+        print("get again->", await c.get("greeting"))      # None
+    try:
+        await NanocachedClient.connect(NODE, auth_secret="wrong")
+    except AuthenticationError as e:
+        print("wrong secret ->", type(e).__name__)      # AuthenticationError
+
+asyncio.run(main())</code></pre>
+<pre><code>curl -s http://$NODE_IP:9356/metrics | grep -v '^#' | head -3
+# nanocached_node_memory_used_bytes 0
 # nanocached_node_memory_max_bytes 1073741824
-# nanocached_node_entries 1</code></pre>
-<p>Two negative checks are worth running once, because they are what
-the security groups are for: the same <code>G</code> without a
-preceding <code>A</code> gets <code>En</code> and a closed connection,
-and from anywhere outside the security group — your laptop, say —
-both ports refuse:</p>
+# nanocached_node_entries 0</code></pre>
+<p>One more negative check is worth running once, because it is what
+the security groups are for: from anywhere outside the app group —
+your laptop, say — both ports refuse:</p>
 <pre><code>NODE_PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $NODE_ID \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 nc -z -w 5 $NODE_PUBLIC_IP 8356 || echo "8356 blocked (expected)"
 nc -z -w 5 $NODE_PUBLIC_IP 9356 || echo "9356 blocked (expected)"</code></pre>
 <p>Finally, <code>systemctl restart nanocached-node</code> on the node:
-<code>/readyz</code> answered 200 again within 4&nbsp;s. Note that a
+<code>/readyz</code> answered 200 again within a second (the image is
+already local). Logs are <code>journalctl -u nanocached-node</code> —
+the container's stderr goes straight to the journal. Note that a
 standalone node has nobody to hand its entries to, so a restart is a
 cold cache — that is the trade-off this shape makes, and the reason to
-graduate to the clustered ECS/EKS shapes below once an empty cache after
-a restart is no longer acceptable.</p>
+graduate to the clustered <a href="#ecs">ECS</a> / <a
+href="#eks">EKS</a> shapes below once an empty cache after a restart is
+no longer acceptable.</p>
 
 <h3>Teardown</h3>
 <p>The reverse order — instances first (a security group can't be
@@ -349,49 +377,657 @@ aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
 aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
 aws ec2 delete-subnet --subnet-id $SUBNET_ID
 aws ec2 delete-vpc --vpc-id $VPC_ID</code></pre>
-<p>Because everything carried the <code>Project=nanocached</code> tag,
-<code>aws resourcegroupstaggingapi get-resources --tag-filters
-Key=Project,Values=nanocached</code> is the check that nothing is left
-billing.</p>
+<p>Confirm nothing is left: <code>aws ec2 describe-vpcs --filters
+Name=isDefault,Values=false</code> and <code>aws ec2 describe-instances
+--filters Name=instance-state-name,Values=running</code> should both
+come back empty, and <code>aws iam get-role --role-name
+nanocached-ec2</code> should say <code>NoSuchEntity</code>. (Terminated
+instances stay visible to the tagging API for about an hour; that is
+display, not billing.)</p>
 
-<h2>EKS / Kubernetes</h2>
-<pre><code>containers:
-  - name: nanocached-node
-    image: ghcr.io/nanocached/nanocached-node:latest
-    args: ["--host", "0.0.0.0", "--discovery", "disc-0.disc:8357,disc-1.disc:8357",
-           "--drain-timeout", "20", "--metrics-port", "9356"]
-    ports:
-      - containerPort: 8356
-      - containerPort: 9356
-    readinessProbe:
-      httpGet: { path: /readyz, port: 9356 }
-    livenessProbe:
-      httpGet: { path: /healthz, port: 9356 }
-terminationGracePeriodSeconds: 45   # > drain-timeout + margin</code></pre>
-<p>No <code>preStop</code> hook is needed — the SIGTERM Kubernetes sends
-<em>is</em> the drain trigger. For autoscaling on the memory watermark,
-feed <code>/metrics</code> to your HPA through the Prometheus adapter or
-KEDA; the proxy tier can scale on plain CPU or on
-<code>client_connections</code> the same way. Run discovery as a
-StatefulSet with stable DNS names — every node must list the same
-discovery addresses in the same order.</p>
+<h2 id="ecs">Cluster on ECS (Fargate, multi-AZ)</h2>
+<p>A replicated cluster that scales itself: one discovery task and a
+node service of two to four tasks, spread across two availability
+zones, on Fargate. Discovery gets a stable name through Cloud Map
+private DNS; nodes find it by that name, join the ring, and hand their
+entries off on the way out when the autoscaler removes them. Target
+tracking on CPU grows and shrinks the node service — the memory
+watermark is the better signal (<a href="#metrics">above</a>) but
+needs a metrics pipeline, which is its own guide. Every command below
+was run in this order against a real account, including a scale-out
+and scale-in under load, then torn down with the commands at the
+end.</p>
+<p>What the pieces are for: two subnets in two zones so a zone loss
+costs at most half the ring (R=2 means the surviving copy of every key
+is elsewhere); one security group for the cluster's own traffic and the
+same <code>nanocached-app</code> label as the EC2 guide for clients; the
+auth secret in Parameter Store, pulled into the tasks by the execution
+role so it appears in no task definition; a health check on
+<code>/readyz</code> so the scheduler only routes to nodes that have
+joined; and <code>stopTimeout</code> sized to the drain.</p>
 
-<h2>ECS</h2>
-<p>The same shape: set <code>stopTimeout</code> on the container
-definition (default is 30&nbsp;s — raise it if you raise
-<code>--drain-timeout</code>), point the task health check at
-<code>/readyz</code>, and scrape <code>/metrics</code> with the
-CloudWatch agent or ADOT collector to drive target-tracking policies.
-Service Connect / Cloud Map gives discovery its stable addresses.</p>
-<pre><code>"containerDefinitions": [{
-  "name": "nanocached-node",
-  "command": ["--host", "0.0.0.0", "--discovery", "disc.internal:8357",
-              "--drain-timeout", "20", "--metrics-port", "9356"],
-  "stopTimeout": 45,
-  "healthCheck": {
-    "command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9356/readyz || exit 1"]
-  }
+<pre><code>export AWS_REGION=us-east-1
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+NAME=nanocached
+TAG="{Key=Project,Value=$NAME}"</code></pre>
+
+<h3>Network</h3>
+<pre><code>VPC_ID=$(aws ec2 create-vpc --cidr-block 10.1.0.0/16 \
+  --tag-specifications "ResourceType=vpc,Tags=[$TAG]" --query Vpc.VpcId --output text)
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-support
+aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames   # Cloud Map needs both
+
+SUBNET_A=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.1.0.0/24 \
+  --availability-zone ${AWS_REGION}a \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG]" --query Subnet.SubnetId --output text)
+SUBNET_B=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.1.1.0/24 \
+  --availability-zone ${AWS_REGION}b \
+  --tag-specifications "ResourceType=subnet,Tags=[$TAG]" --query Subnet.SubnetId --output text)
+for s in $SUBNET_A $SUBNET_B; do
+  aws ec2 modify-subnet-attribute --subnet-id $s --map-public-ip-on-launch
+done
+
+IGW_ID=$(aws ec2 create-internet-gateway \
+  --tag-specifications "ResourceType=internet-gateway,Tags=[$TAG]" \
+  --query InternetGateway.InternetGatewayId --output text)
+aws ec2 attach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+RTB_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=route-table,Tags=[$TAG]" --query RouteTable.RouteTableId --output text)
+aws ec2 create-route --route-table-id $RTB_ID --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+for s in $SUBNET_A $SUBNET_B; do
+  aws ec2 associate-route-table --route-table-id $RTB_ID --subnet-id $s
+done</code></pre>
+<p>Public subnets with <code>assignPublicIp=ENABLED</code> on the
+services is how the tasks pull their image and reach Parameter Store
+and CloudWatch without a NAT gateway; nothing inbound uses those
+addresses (the security group sees to that). Private subnets behind a
+NAT gateway or VPC endpoints work identically — set
+<code>assignPublicIp=DISABLED</code>.</p>
+
+<h3>Security groups</h3>
+<pre><code>APP_SG=$(aws ec2 create-security-group --group-name $NAME-app \
+  --description "nanocached clients" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+CLUSTER_SG=$(aws ec2 create-security-group --group-name $NAME-cluster \
+  --description "nanocached cluster tasks" --vpc-id $VPC_ID \
+  --tag-specifications "ResourceType=security-group,Tags=[$TAG]" --query GroupId --output text)
+
+aws ec2 authorize-security-group-ingress --group-id $CLUSTER_SG --ip-permissions \
+  "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$CLUSTER_SG,Description=node/discovery traffic within the cluster}]" \
+  "IpProtocol=tcp,FromPort=8356,ToPort=8357,UserIdGroupPairs=[{GroupId=$APP_SG,Description=data + discovery from app tier}]" \
+  "IpProtocol=tcp,FromPort=9356,ToPort=9357,IpRanges=[{CidrIp=10.1.0.0/16,Description=operations endpoints from inside the VPC}]"</code></pre>
+<p>The cluster group refers to itself: nodes heartbeat to discovery on
+8357 and hand entries to each other on 8356. Clients need both ports
+too — they fetch the roster from discovery and then talk to nodes
+directly.</p>
+
+<h3>The auth secret</h3>
+<pre><code>aws ssm put-parameter --name /$NAME/auth-secret --type SecureString \
+  --value change-me --tags Key=Project,Value=$NAME</code></pre>
+<p>Both task definitions reference this parameter in
+<code>secrets</code>; ECS resolves it at task start and injects it as
+<code>NANOCACHED_AUTH_SECRET</code>. To rotate it, put a new value and
+force a new deployment of both services (<code>aws ecs update-service
+--force-new-deployment</code>) — nodes and discovery must agree.</p>
+
+<h3>IAM</h3>
+<p>The execution role is what ECS itself uses to pull the image, write
+logs and read the secret — the tasks have no role of their own, since
+nanocached calls no AWS API. The instance role is for the throwaway
+client below, as in the EC2 guide.</p>
+<pre><code>aws iam create-role --role-name $NAME-ecs-execution --tags Key=Project,Value=$NAME \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name $NAME-ecs-execution \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam put-role-policy --role-name $NAME-ecs-execution --policy-name read-auth-secret \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",
+    \"Action\":\"ssm:GetParameters\",
+    \"Resource\":\"arn:aws:ssm:$AWS_REGION:$ACCOUNT:parameter/$NAME/auth-secret\"}]}"
+
+aws iam create-role --role-name $NAME-ec2 --tags Key=Project,Value=$NAME \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam create-instance-profile --instance-profile-name $NAME-ec2
+aws iam add-role-to-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
+sleep 15</code></pre>
+
+<h3>Cloud Map, cluster, logs</h3>
+<pre><code>NS_OP=$(aws servicediscovery create-private-dns-namespace --name $NAME.local --vpc $VPC_ID \
+  --tag Key=Project,Value=$NAME --query OperationId --output text)
+until [ "$(aws servicediscovery get-operation --operation-id $NS_OP \
+  --query Operation.Status --output text)" = SUCCESS ]; do sleep 5; done
+NS_ID=$(aws servicediscovery get-operation --operation-id $NS_OP \
+  --query 'Operation.Targets.NAMESPACE' --output text)
+DISC_SD_ARN=$(aws servicediscovery create-service --name disc --namespace-id $NS_ID \
+  --dns-config "RoutingPolicy=MULTIVALUE,DnsRecords=[{Type=A,TTL=5}]" \
+  --health-check-custom-config FailureThreshold=1 \
+  --tags Key=Project,Value=$NAME --query Service.Arn --output text)
+
+aws ecs create-cluster --cluster-name $NAME --tags key=Project,value=$NAME
+aws logs create-log-group --log-group-name /ecs/$NAME --tags Project=$NAME
+aws logs put-retention-policy --log-group-name /ecs/$NAME --retention-in-days 7</code></pre>
+<p>Discovery is therefore <code>disc.nanocached.local:8357</code> from
+anywhere in the VPC. A 5-second TTL keeps a discovery restart short
+for the nodes' heartbeats; the custom health check lets ECS withdraw
+the record the moment the task stops.</p>
+
+<h3>Task definitions</h3>
+<p><code>td-discovery.json</code>:</p>
+<pre><code>[{
+  "name": "nanocached-discovery",
+  "image": "ghcr.io/nanocached/nanocached-discovery@sha256:879595cd9513073c38ddf2ab970a839f7359e3094b6148854dd72d19b0123231",
+  "essential": true,
+  "command": ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
+              "--metrics-port", "9357"],
+  "secrets": [{"name": "NANOCACHED_AUTH_SECRET",
+               "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/nanocached/auth-secret"}],
+  "portMappings": [{"containerPort": 8357}, {"containerPort": 9357}],
+  "healthCheck": {"command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9357/healthz || exit 1"],
+                  "interval": 10, "timeout": 5, "retries": 3, "startPeriod": 30},
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/nanocached",
+                       "awslogs-region": "us-east-1", "awslogs-stream-prefix": "discovery"}}
 }]</code></pre>
+<p><code>td-node.json</code>:</p>
+<pre><code>[{
+  "name": "nanocached-node",
+  "image": "ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af",
+  "essential": true,
+  "command": ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc.nanocached.local:8357",
+              "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"],
+  "secrets": [{"name": "NANOCACHED_AUTH_SECRET",
+               "valueFrom": "arn:aws:ssm:us-east-1:123456789012:parameter/nanocached/auth-secret"}],
+  "portMappings": [{"containerPort": 8356}, {"containerPort": 9356}],
+  "stopTimeout": 45,
+  "healthCheck": {"command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:9356/readyz || exit 1"],
+                  "interval": 10, "timeout": 5, "retries": 3, "startPeriod": 120},
+  "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/nanocached",
+                       "awslogs-region": "us-east-1", "awslogs-stream-prefix": "node"}}
+}]</code></pre>
+<p>Substitute your account ID in the two <code>valueFrom</code> ARNs.
+The choices that matter:</p>
+<ul>
+  <li><b>Discovery's health check is <code>/healthz</code>, the node's
+  is <code>/readyz</code>.</b> Discovery refuses roster queries for its
+  first 15&nbsp;s (startup grace); a <code>/readyz</code> check with a
+  30&nbsp;s <code>startPeriod</code> would still pass, but liveness is
+  what the scheduler needs from it. A node is only useful once it has
+  joined, and <code>/readyz</code> says exactly that.</li>
+  <li><b><code>startPeriod: 120</code></b> on the node. Joining is
+  staged — discovery admits one node at a time, and each join hands
+  entries over first — so under a scale-out of several tasks the last
+  one can legitimately spend a minute or two not-ready. A short start
+  period makes ECS kill and replace healthy joiners.</li>
+  <li><b><code>stopTimeout: 45</code> against <code>--drain-timeout
+  20</code></b>: the drain must finish before ECS sends SIGKILL (see
+  <a href="#graceful-scale-in">sizing the stop grace</a>).</li>
+  <li><b><code>--max-memory 536870912</code></b> (512&nbsp;MiB) in a
+  1&nbsp;GiB task. Fargate kills a task that exceeds its memory
+  reservation; the cache budget must leave room for connection
+  buffers and the handoff's in-flight copies.</li>
+  <li><b>Images pinned by digest</b>, as in the EC2 guide; these are the
+  <code>latest</code> builds this guide was verified with.</li>
+</ul>
+<pre><code>EXEC_ARN=arn:aws:iam::$ACCOUNT:role/$NAME-ecs-execution
+aws ecs register-task-definition --family $NAME-discovery --network-mode awsvpc \
+  --requires-compatibilities FARGATE --cpu 256 --memory 512 --execution-role-arn $EXEC_ARN \
+  --tags key=Project,value=$NAME --container-definitions file://td-discovery.json
+aws ecs register-task-definition --family $NAME-node --network-mode awsvpc \
+  --requires-compatibilities FARGATE --cpu 512 --memory 1024 --execution-role-arn $EXEC_ARN \
+  --tags key=Project,value=$NAME --container-definitions file://td-node.json</code></pre>
+
+<h3>Services</h3>
+<pre><code>NETCFG="awsvpcConfiguration={subnets=[$SUBNET_A,$SUBNET_B],securityGroups=[$CLUSTER_SG],assignPublicIp=ENABLED}"
+
+aws ecs create-service --cluster $NAME --service-name discovery \
+  --task-definition $NAME-discovery --desired-count 1 --launch-type FARGATE \
+  --network-configuration "$NETCFG" --service-registries registryArn=$DISC_SD_ARN \
+  --tags key=Project,value=$NAME
+aws ecs wait services-stable --cluster $NAME --services discovery
+
+# services-stable returns before the Cloud Map record exists — wait for it
+until [ "$(aws servicediscovery discover-instances --namespace-name $NAME.local \
+  --service-name disc --health-status HEALTHY --query 'length(Instances)' --output text)" -ge 1 ]
+do sleep 5; done
+
+aws ecs create-service --cluster $NAME --service-name node \
+  --task-definition $NAME-node --desired-count 2 --launch-type FARGATE \
+  --network-configuration "$NETCFG" --tags key=Project,value=$NAME
+aws ecs wait services-stable --cluster $NAME --services node</code></pre>
+<p>The wait on <code>discover-instances</code> is not decoration. In
+verification, <code>services-stable</code> came back 40&nbsp;s before
+the DNS record did, and without the wait one of the two first node
+tasks started, looked up <code>disc.nanocached.local</code>, got
+<em>Name does not resolve</em>, and kept getting it every 5&nbsp;s for
+over three minutes — while the other task, and every task launched
+later, resolved it at once. The health check caught it
+(<code>failed container health checks</code> in the service events)
+and ECS replaced the task, which joined normally; but that is a
+self-healing detour, not a start. With the wait, both tasks resolved
+the name on their first try and were healthy inside a minute. A
+service launched across two subnets is placed across both zones by
+default; <code>describe-tasks</code> shows
+<code>availabilityZone</code> per task if you want to see it.</p>
+
+<h3>Autoscaling</h3>
+<pre><code>aws application-autoscaling register-scalable-target --service-namespace ecs \
+  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
+  --min-capacity 2 --max-capacity 4 --tags Project=$NAME
+aws application-autoscaling put-scaling-policy --service-namespace ecs \
+  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
+  --policy-name $NAME-node-cpu --policy-type TargetTrackingScaling \
+  --target-tracking-scaling-policy-configuration '{
+    "TargetValue": 30.0,
+    "PredefinedMetricSpecification": {"PredefinedMetricType": "ECSServiceAverageCPUUtilization"},
+    "ScaleOutCooldown": 60, "ScaleInCooldown": 60}'</code></pre>
+<p>Target tracking creates two CloudWatch alarms. The scale-out alarm
+fires after 3 minutes above target; the scale-in alarm needs 15
+consecutive minutes below 90% of it — that asymmetry is built in and
+is why the cooldowns above are short. <code>min-capacity 2</code> is
+the floor for R=2 to mean anything; a 30% target is low so the
+verification below triggers quickly — pick yours from the
+<a href="capacity-planner.html">capacity planner</a> and the metrics
+section.</p>
+
+<h3>Verifying</h3>
+<p>A throwaway client in the app group, as in the EC2 guide (same
+<code>client-user-data.sh</code>):</p>
+<pre><code>AMI_ID=$(aws ssm get-parameter \
+  --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+  --query Parameter.Value --output text)
+CLIENT_ID=$(aws ec2 run-instances --image-id $AMI_ID --instance-type t3.small \
+  --subnet-id $SUBNET_A --security-group-ids $APP_SG \
+  --iam-instance-profile Name=$NAME-ec2 --user-data file://client-user-data.sh \
+  --tag-specifications "ResourceType=instance,Tags=[$TAG,{Key=Name,Value=$NAME-client}]" \
+  --query 'Instances[0].InstanceId' --output text)</code></pre>
+<p>The smoke test is the EC2 one with discovery as the address — the
+SDK sees from the handshake that it is talking to a discovery server,
+fetches the roster and connects to the nodes itself:</p>
+<pre><code>DISC = [("disc.nanocached.local", 8357)]
+
+async with await NanocachedClient.connect(DISC, auth_secret="change-me") as c:
+    print(c.replication)                                 # 2
+    await c.set("greeting", "hello", ttl_seconds=60)
+    print(await c.get("greeting"))                       # hello
+    print(await c.delete("greeting"))                    # True
+# and NanocachedClient.connect(DISC, auth_secret="wrong") raises AuthenticationError</code></pre>
+<p>Discovery's own metrics say how many nodes are in the ring, and
+they are the thing to watch during the scaling steps below:</p>
+<pre><code>DISC_IP=$(getent hosts disc.nanocached.local | awk '{print $1}')
+curl -s http://$DISC_IP:9357/metrics | grep ^nanocached_discovery_members
+# nanocached_discovery_members 2</code></pre>
+<p><b>Scale-out.</b> Seed 20,000 entries, then run a mixed read/write
+load from the client (24 connections was 8,600&nbsp;ops/s against two
+tasks and pushed their CPU to 31%). The alarm tripped after three
+minutes over target; the third task started, had the two members hand
+it its share of the ring (<code>migration completed … sent 6726
+keys</code> in their logs) and was promoted seven seconds after
+launch; a fourth followed one cooldown later. The load saw 0 misses, 0
+corrupt reads and 0 errors across 3.9 million operations while the
+ring went from two to four.</p>
+<p><b>Scale-in.</b> Stop the load and wait: the service went 4 → 3 →
+2 sixteen and eighteen minutes later. Each leaver's log is the drain
+this whole guide is built around:</p>
+<pre><code>INFO shutdown signal received — decommissioning (budget 20s)
+INFO decommission: handed off 9914 entr(ies)
+INFO decommission: forwarding window open for 12s
+INFO decommission finished — shutting down</code></pre>
+<p>and discovery's shows <code>node left the cluster</code> rather than
+an eviction. Both leavers exited 0 inside the 45&nbsp;s stop timeout,
+one from each zone (the scheduler keeps the survivors balanced), and a
+read of all 20,000 seeded keys afterwards found every one of them.</p>
+<p>The same check with the drain broken is instructive: this guide's
+first run hit a bug in which an authenticated node could not fetch the
+roster on the way out (<a
+href="https://github.com/nanocached/nanocached/issues/171">#171</a>,
+fixed in the images pinned above). The leavers exited 0 on time, ECS
+was satisfied, and 2,736 of the 20,000 keys were gone. Watch the
+leaver's log, not just the exit code.</p>
+<p><b>Logs.</b> Everything each task writes is in one log group,
+prefixed by service:</p>
+<pre><code>aws logs tail /ecs/$NAME --since 10m --format short
+aws logs filter-log-events --log-group-name /ecs/$NAME \
+  --log-stream-name-prefix node/ --filter-pattern '"decommission"'</code></pre>
+
+<h3>Teardown</h3>
+<pre><code>aws application-autoscaling delete-scaling-policy --service-namespace ecs \
+  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount \
+  --policy-name $NAME-node-cpu
+aws application-autoscaling deregister-scalable-target --service-namespace ecs \
+  --resource-id service/$NAME/node --scalable-dimension ecs:service:DesiredCount
+
+for s in node discovery; do
+  aws ecs update-service --cluster $NAME --service $s --desired-count 0
+  aws ecs delete-service --cluster $NAME --service $s --force
+done
+aws ecs wait services-inactive --cluster $NAME --services node discovery
+aws ec2 terminate-instances --instance-ids $CLIENT_ID
+
+for arn in $(aws ecs list-task-definitions --family-prefix $NAME- --query taskDefinitionArns --output text); do
+  aws ecs deregister-task-definition --task-definition $arn
+  aws ecs delete-task-definitions --task-definitions $arn
+done
+aws ecs delete-cluster --cluster $NAME
+
+SD_ID=${DISC_SD_ARN##*/}
+for inst in $(aws servicediscovery list-instances --service-id $SD_ID --query 'Instances[].Id' --output text); do
+  aws servicediscovery deregister-instance --service-id $SD_ID --instance-id $inst
+done
+aws servicediscovery delete-service --id $SD_ID
+aws servicediscovery delete-namespace --id $NS_ID
+aws logs delete-log-group --log-group-name /ecs/$NAME
+aws ssm delete-parameter --name /$NAME/auth-secret
+
+aws iam delete-role-policy --role-name $NAME-ecs-execution --policy-name read-auth-secret
+aws iam detach-role-policy --role-name $NAME-ecs-execution \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+aws iam delete-role --role-name $NAME-ecs-execution
+aws iam remove-role-from-instance-profile --instance-profile-name $NAME-ec2 --role-name $NAME-ec2
+aws iam delete-instance-profile --instance-profile-name $NAME-ec2
+aws iam detach-role-policy --role-name $NAME-ec2 \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+aws iam delete-role --role-name $NAME-ec2
+
+aws ec2 wait instance-terminated --instance-ids $CLIENT_ID
+# stopped tasks' ENIs linger for a minute or two; the security group can't go until they have
+until [ "$(aws ec2 describe-network-interfaces --filters Name=vpc-id,Values=$VPC_ID \
+  --query 'length(NetworkInterfaces)' --output text)" = 0 ]; do sleep 5; done
+aws ec2 delete-security-group --group-id $CLUSTER_SG
+aws ec2 delete-security-group --group-id $APP_SG
+for a in $(aws ec2 describe-route-tables --route-table-ids $RTB_ID \
+  --query 'RouteTables[0].Associations[?!Main].RouteTableAssociationId' --output text); do
+  aws ec2 disassociate-route-table --association-id $a
+done
+aws ec2 delete-route-table --route-table-id $RTB_ID
+aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID
+aws ec2 delete-subnet --subnet-id $SUBNET_A
+aws ec2 delete-subnet --subnet-id $SUBNET_B
+aws ec2 delete-vpc --vpc-id $VPC_ID</code></pre>
+<p>Confirm: <code>aws ecs describe-clusters --clusters nanocached</code>
+reports <code>INACTIVE</code>, <code>aws servicediscovery
+list-namespaces</code> no longer lists <code>nanocached.local</code>
+(the delete is asynchronous — give it half a minute),
+<code>describe-log-groups</code>, <code>get-parameter</code> and
+<code>get-role</code> for the names above all come back not found, and
+there is no non-default VPC.</p>
+
+<h2 id="eks">Cluster on EKS (multi-AZ)</h2>
+<p>The same cluster as the ECS guide — one discovery, two to four nodes
+across two zones, autoscaled on CPU — expressed in Kubernetes objects,
+on an EKS cluster that <code>eksctl</code> builds from one config file
+(VPC, subnets in two zones, security groups, IAM roles, control plane,
+a managed node group). Discovery's stable address is a
+<code>ClusterIP</code> Service; a <code>HorizontalPodAutoscaler</code>
+grows and shrinks the node Deployment; the drain on scale-in is the
+SIGTERM Kubernetes already sends. Every command was run in this order
+against a real account, including a scale-out and scale-in under load,
+then torn down with the commands at the end.</p>
+
+<h3>The cluster</h3>
+<p><code>eks-cluster.yaml</code>:</p>
+<pre><code>apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: nanocached
+  region: us-east-1
+  version: "1.33"
+  tags: {Project: nanocached}
+availabilityZones: [us-east-1a, us-east-1b]
+vpc:
+  nat:
+    gateway: Disable          # nodes sit in public subnets; nothing needs a NAT
+managedNodeGroups:
+  - name: ng-1
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    volumeSize: 20
+    privateNetworking: false
+    ssh: {allow: false}
+    tags: {Project: nanocached}</code></pre>
+<pre><code>eksctl create cluster -f eks-cluster.yaml     # about 22 minutes
+kubectl get nodes -L topology.kubernetes.io/zone
+# ip-192-168-4-4.ec2.internal    Ready   us-east-1a
+# ip-192-168-48-48.ec2.internal  Ready   us-east-1b</code></pre>
+<p>Two worker nodes, one per zone, is the minimum for the zone spread
+below to mean anything. The node group is pinned at two because the
+HPA scales <em>pods</em>; four 1&nbsp;GiB node pods fit on two
+<code>t3.medium</code>s with room for discovery and the system pods.
+Growing the pod ceiling past that means either bigger instances or a
+cluster autoscaler for the node group — a separate decision. The
+cluster's own security groups already allow all traffic between pods
+and nothing from outside: the worker nodes have public IPs (for image
+pulls and the control plane) but no inbound rule reaches them, and
+neither 8356 nor 9356 answers from the internet.</p>
+<p><code>eksctl</code> also installs the <code>metrics-server</code>
+EKS add-on, which is what the HPA reads. Don't apply the upstream
+<code>components.yaml</code> on top of it — that overwrites the
+add-on's Service selector, the Metrics API goes dark (<code>unable to
+fetch metrics from resource</code> in the HPA's events), and the fix is
+to delete and re-create the add-on.</p>
+
+<h3>The workload</h3>
+<p><code>nanocached.yaml</code> — everything in one namespace:</p>
+<pre><code>apiVersion: v1
+kind: Namespace
+metadata:
+  name: nanocached
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nanocached-auth
+  namespace: nanocached
+type: Opaque
+stringData:
+  NANOCACHED_AUTH_SECRET: change-me
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discovery
+  namespace: nanocached
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: nanocached-discovery}
+  template:
+    metadata:
+      labels: {app: nanocached-discovery}
+    spec:
+      containers:
+        - name: discovery
+          image: ghcr.io/nanocached/nanocached-discovery@sha256:879595cd9513073c38ddf2ab970a839f7359e3094b6148854dd72d19b0123231
+          args: ["--host", "0.0.0.0", "--port", "8357", "--replication-factor", "2",
+                 "--metrics-port", "9357"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8357, name: discovery}
+            - {containerPort: 9357, name: ops}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: disc
+  namespace: nanocached
+spec:
+  selector: {app: nanocached-discovery}
+  ports:
+    - {name: discovery, port: 8357, targetPort: discovery}
+    - {name: ops, port: 9357, targetPort: ops}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node
+  namespace: nanocached
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: nanocached-node}
+  template:
+    metadata:
+      labels: {app: nanocached-node}
+    spec:
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: {app: nanocached-node}
+      containers:
+        - name: node
+          image: ghcr.io/nanocached/nanocached-node@sha256:6881b0f1ba9122e59f7377694162eebacaf7257ba29dabd590858f23092378af
+          args: ["--host", "0.0.0.0", "--port", "8356", "--discovery", "disc:8357",
+                 "--drain-timeout", "20", "--metrics-port", "9356", "--max-memory", "536870912"]
+          envFrom:
+            - secretRef: {name: nanocached-auth}
+          ports:
+            - {containerPort: 8356, name: data}
+            - {containerPort: 9356, name: ops}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+            failureThreshold: 36        # 3 minutes of not-ready before it counts
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 500m, memory: 1Gi}
+            limits: {memory: 1Gi}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: node
+  namespace: nanocached
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: node}
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 30}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{type: Pods, value: 1, periodSeconds: 60}]
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies: [{type: Pods, value: 1, periodSeconds: 120}]</code></pre>
+<p>The choices that matter, beyond those the ECS guide already
+explains (<code>/healthz</code> for discovery's liveness and
+<code>/readyz</code> for the node's readiness, a memory budget that
+leaves room under the limit, images pinned by digest):</p>
+<ul>
+  <li><b><code>disc:8357</code></b> is the Service name, resolvable the
+  moment it is created. Node pods that start before discovery is
+  ready see <em>Connection refused</em> (the Service has no endpoints
+  until discovery's readiness probe passes), retry every 5&nbsp;s and
+  join as soon as it does — no ordering step is needed, unlike Cloud
+  Map on ECS.</li>
+  <li><b><code>topologySpreadConstraints</code></b> on zone with
+  <code>DoNotSchedule</code>: with R=2, both copies of a key in one
+  zone is the failure mode this prevents. Two, three and four pods
+  were placed 1/1, 2/1 and 2/2 across the zones in verification.</li>
+  <li><b><code>terminationGracePeriodSeconds: 45</code></b> against
+  <code>--drain-timeout 20</code>, as on ECS. No <code>preStop</code>
+  hook: the SIGTERM is the drain.</li>
+  <li><b>Readiness <code>failureThreshold: 36</code></b> (three
+  minutes) plays the role ECS's <code>startPeriod</code> does — a
+  joiner waiting its turn in a staged join is not-ready but not
+  broken. Liveness stays at the default threshold; a process that
+  stops answering <code>/healthz</code> should be restarted.</li>
+  <li><b><code>resources.requests.cpu</code></b> is what the HPA's
+  percentage is <em>of</em>; without a request the HPA has nothing
+  to compute. The <code>behavior</code> block scales one pod per
+  minute up and one per two minutes down, after two minutes below
+  target — deliberately faster than the defaults (which wait five
+  minutes to scale down) so the verification fits in a coffee break;
+  the defaults are the safer production choice.</li>
+  <li><b>The Secret</b> is <code>envFrom</code>, so the auth secret
+  becomes <code>NANOCACHED_AUTH_SECRET</code> without appearing in
+  the pod spec. Rotating it is <code>kubectl apply</code> of the new
+  value and a <code>rollout restart</code> of both Deployments.</li>
+</ul>
+<pre><code>kubectl apply -f nanocached.yaml
+kubectl -n nanocached rollout status deploy/discovery
+kubectl -n nanocached rollout status deploy/node
+kubectl -n nanocached get pods -o wide
+# discovery-…   1/1  Running   ip-192-168-4-4.ec2.internal
+# node-…-76v5m  1/1  Running   ip-192-168-48-48.ec2.internal
+# node-…-rs7kp  1/1  Running   ip-192-168-4-4.ec2.internal
+kubectl -n nanocached get hpa node
+# NAME   REFERENCE         TARGETS       MINPODS   MAXPODS   REPLICAS
+# node   Deployment/node   cpu: 0%/30%   2         4         2</code></pre>
+<p>Discovery's roster metric, from inside the cluster:</p>
+<pre><code>kubectl -n nanocached run curl --rm -it --image=curlimages/curl --restart=Never -- \
+  -s http://disc:9357/metrics | grep ^nanocached_discovery_members
+# nanocached_discovery_members 2</code></pre>
+
+<h3>Verifying</h3>
+<p>A client pod with the Python SDK stands in for the application:</p>
+<pre><code>kubectl -n nanocached run client --image=python:3.11-slim --restart=Never -- \
+  sh -c "pip install -q nanocached==0.3.0 && sleep 7200"
+kubectl -n nanocached cp smoke.py client:/tmp/smoke.py    # the EC2 smoke test with DISC = [("disc", 8357)]
+kubectl -n nanocached exec client -- python /tmp/smoke.py
+# 2 / hello / True / None / AuthenticationError</code></pre>
+<p><b>Scale-out.</b> With 20,000 seeded entries and the same mixed load
+as the ECS run (24 connections, 7,000&nbsp;ops/s against two pods),
+the HPA went to three pods 53&nbsp;s after the load started and to
+four a minute later (the one-pod-per-minute policy). Each new pod
+joined through the staged handoff and was promoted within seconds;
+the load saw 0 misses, 0 corrupt reads and 0 errors across 3.0
+million operations.</p>
+<p><b>Scale-in.</b> Two minutes after CPU fell below target the HPA
+removed one pod, and another two minutes later (<code>kubectl describe
+hpa node</code> lists each <code>SuccessfulRescale</code> with its
+reason). Each leaver's log — capture it with <code>kubectl logs -f</code>
+<em>before</em> the scale-in, because a deleted pod's log goes with
+it — was the drain:</p>
+<pre><code>INFO shutdown signal received — decommissioning (budget 20s)
+INFO decommission: handed off 10005 entr(ies)
+INFO decommission: forwarding window open for 12s
+INFO decommission finished — shutting down</code></pre>
+<p>Discovery logged <code>node left the cluster</code> for both, the two
+survivors were one per zone, and all 20,000 entries were still
+readable afterwards.</p>
+<p><b>Logs</b> are the ordinary <code>kubectl logs</code>:</p>
+<pre><code>kubectl -n nanocached logs deploy/discovery
+kubectl -n nanocached logs -l app=nanocached-node --prefix | grep decommission</code></pre>
+
+<h3>Teardown</h3>
+<pre><code>kubectl delete namespace nanocached
+eksctl delete cluster --name nanocached --region us-east-1 --wait     # about 12 minutes</code></pre>
+<p><code>eksctl</code> removes its two CloudFormation stacks and with
+them the VPC, security groups, IAM roles and the OIDC provider.
+Confirm with <code>aws eks list-clusters</code> (empty), <code>aws
+cloudformation list-stacks --stack-status-filter CREATE_COMPLETE
+DELETE_FAILED</code> (no <code>eksctl-nanocached-*</code>),
+<code>aws ec2 describe-vpcs --filters Name=isDefault,Values=false</code>
+(empty) and <code>aws iam list-roles --query
+'Roles[?starts_with(RoleName,`eksctl-nanocached`)]'</code> (empty). If
+the create ever fails part-way, the cluster stack is left with
+termination protection on — <code>aws cloudformation
+update-termination-protection --no-enable-termination-protection
+--stack-name eksctl-nanocached-cluster</code> before deleting it.</p>
 
 <h2>Verifying a deployment</h2>
 <p>The repository ships runnable scale-in scenarios under

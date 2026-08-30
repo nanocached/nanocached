@@ -117,9 +117,9 @@ forwarding concurrent writes while clients catch up — all within
 does the same for its role: deregister from discovery, finish in-flight
 requests, exit. `--metrics-port` on any binary serves Prometheus-format
 `/metrics` plus `/healthz` and `/readyz` probes. See the
-[deployment guide](https://nanocached.org/deployment.html) for a
-verified single-node EC2 setup and for wiring this into ECS/EKS
-autoscaling.
+[deployment guide](https://nanocached.org/deployment.html) for three
+verified setups: a single node on EC2, and an autoscaled multi-AZ
+cluster on ECS Fargate and on EKS.
 
 ### Authentication
 
