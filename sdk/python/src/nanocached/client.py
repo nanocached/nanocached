@@ -1778,9 +1778,20 @@ class NanocachedClient:
         # any, is retrieved here instead of surfacing later as an
         # "exception was never retrieved" warning with nothing left to
         # report it to.
+        #
+        # The keepalive task is gathered here too (issue #189): unlike
+        # the redial/refresh tasks it IS cancelled just above, but that
+        # cancel() only schedules the cancellation — nothing before this
+        # ever awaited the task itself, so without this it stayed
+        # pending past close() and the loop teardown that usually follows
+        # could log "Task was destroyed but it is pending". gather()'s
+        # return_exceptions=True absorbs the resulting CancelledError the
+        # same way it absorbs a redial/refresh failure above.
         pending = list(self._redials.values())
         if self._refresh_task is not None:
             pending.append(self._refresh_task)
+        if self._keepalive_task is not None:
+            pending.append(self._keepalive_task)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
@@ -2053,7 +2064,22 @@ class NanocachedClient:
             # The caller gave up on this call (asyncio.wait_for, task
             # cancellation): propagate right away instead of first
             # waiting on every synchronous replica leg below — those
-            # finish on their own, and swallow their own failures.
+            # finish on their own, and swallow their own failures. But
+            # leaving replica_tasks as pure orphans here would break
+            # close()'s drain contract (issue #189): they are already-
+            # running asyncio Tasks that nothing else references, so a
+            # leg that would have succeeded can instead get its
+            # connection yanked out from under it by _teardown() once
+            # close() runs. Hand them to the same background-replica-
+            # write pool close() already drains via
+            # _drain_tasks(self._background_replica_writes) — exactly as
+            # if fire-and-forget dispatch had picked them up in the
+            # first place (_dispatch_replica_writes above) — so close()
+            # still waits for them instead of poisoning a write that was
+            # already on its way to succeeding.
+            for replica_task in replica_tasks:
+                self._background_replica_writes.add(replica_task)
+                replica_task.add_done_callback(self._background_replica_writes.discard)
             raise
         except BaseException as error:  # noqa: BLE001 - decided below, not swallowed
             result = None
