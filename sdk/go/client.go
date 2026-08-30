@@ -203,17 +203,21 @@ const DefaultCompressionThreshold = 256
 // Config.ReconnectCooldown is left at zero.
 const DefaultReconnectCooldown = time.Second
 
-// maxRequestBytes bounds key+value size before any network I/O. The
-// server's own request cap (src/server.rs's MAX_REQUEST_SIZE) is 1 MiB
-// for the *entire* frame — header line plus key plus value; a request
-// over that limit is rejected by simply closing the connection without a
-// response, which poisons whatever else is pipelined behind it on that
-// same connection. This reserves 256 bytes of headroom for the header
-// itself (marker byte, decimal lengths, an optional TTL, echoed response tags's tag
-// field, spaces, the trailing newline — always comfortably under this
-// even for the largest fields), so a key+value that clears maxRequestBytes
-// is guaranteed to fit under the server's own cap (issue #47 audit item
-// G1).
+// maxRequestBytes bounds namespace+key+value size before any network
+// I/O. The server's own request cap (src/server.rs's MAX_REQUEST_SIZE)
+// is 1 MiB for the *entire* frame — header line plus namespace plus key
+// plus value; a request over that limit is rejected by simply closing
+// the connection without a response, which poisons whatever else is
+// pipelined behind it on that same connection. This reserves 256 bytes
+// of headroom for the header itself (marker byte, decimal lengths, an
+// optional TTL, echoed response tags's tag field, spaces, the trailing
+// newline — always comfortably under this even for the largest fields),
+// so a namespace+key+value that clears maxRequestBytes is guaranteed to
+// fit under the server's own cap (issue #47 audit item G1; issue #105
+// namespaces; issue #228 folded namespace length into this bound
+// alongside key and value, matching client.py's _check_key/
+// _check_key_and_value, client.rs's validate_key/validate_key_and_value,
+// and NanocachedClient.java's validateKey/validateKeyAndValue).
 const maxRequestBytes = 1024*1024 - 256
 
 // maxBatchKeys bounds how many keys GetMany/GetManyBytes/SetMany/
@@ -229,43 +233,81 @@ const maxRequestBytes = 1024*1024 - 256
 // field, well before this constant would ever need revisiting.
 const maxBatchKeys = 400
 
-// validateKey rejects an empty key, or one that alone already exceeds
-// maxRequestBytes, before any network I/O: the server has no way to
-// answer either shape except by closing the connection outright, silently
-// poisoning every other request already pipelined on that connection.
-// The size bound matters here specifically because GetBytes and Delete
-// call validateKey directly (they have no value to combine it with, unlike
-// validateKeyAndValue) — without it, an oversized key on GET/DELETE would
-// sail past client-side validation and only be caught by the server
-// slamming the connection shut (issue #47 audit item G1 follow-up; matches
-// protocol.ts's checkKey and client.py's _check_key, which both fold this
-// bound into the key-only validator rather than leaving it to the
-// key+value check alone). Matches the style of the ttlSeconds < 0 check in
-// SetBytes.
-func validateKey(key string) error {
+// validateKey rejects an empty key, or a namespace+key pair that alone
+// already exceeds maxRequestBytes, before any network I/O: the server
+// has no way to answer either shape except by closing the connection
+// outright, silently poisoning every other request already pipelined on
+// that connection. The size bound matters here specifically because
+// getRawNS/deleteNS/incrNS/deleteIfMatchesNS and getManyNS's per-key loop
+// call validateKey directly (they have no value to combine it with,
+// unlike validateKeyAndValue) — without it, an oversized namespace+key on
+// GET/DELETE/INCR/DECR/DeleteIfMatches/GetMany would sail past
+// client-side validation and only be caught by the server slamming the
+// connection shut (issue #47 audit item G1 follow-up; issue #228 folded
+// the namespace in, matching client.py's _check_key, client.rs's
+// validate_key, and NanocachedClient.java's validateKey, which all fold
+// namespace into the key-only validator rather than leaving it to the
+// key+value check alone). A nil/empty namespace costs nothing here,
+// keeping this byte-identical to the pre-namespace check for
+// namespace-less callers. Matches the style of the ttlSeconds < 0 check
+// in SetBytes.
+func validateKey(namespace []byte, key string) error {
 	if len(key) == 0 {
 		return invalidArgument("nanocached: key must not be empty")
 	}
-	if len(key) > maxRequestBytes {
+	total := len(namespace) + len(key)
+	if total > maxRequestBytes {
+		if len(namespace) == 0 {
+			// Keeps the pre-namespace message unchanged for the common,
+			// namespace-less case.
+			return invalidArgument(fmt.Sprintf(
+				"nanocached: key exceeds maxRequestBytes (%d bytes), got %d bytes",
+				maxRequestBytes, len(key)))
+		}
 		return invalidArgument(fmt.Sprintf(
-			"nanocached: key exceeds maxRequestBytes (%d bytes), got %d bytes",
-			maxRequestBytes, len(key)))
+			"nanocached: namespace (%d bytes) + key (%d bytes) exceeds maxRequestBytes (%d bytes)",
+			len(namespace), len(key), maxRequestBytes))
 	}
 	return nil
 }
 
 // validateKeyAndValue is validateKey plus a maxRequestBytes bound on
-// len(key)+valueLen — anything past it can never fit the server's own
-// request cap, so failing fast here is strictly better than sending a
-// frame the server can only reject by silently closing the connection.
-func validateKeyAndValue(key string, valueLen int) error {
-	if err := validateKey(key); err != nil {
+// len(namespace)+len(key)+valueLen — anything past it can never fit the
+// server's own request cap, so failing fast here is strictly better than
+// sending a frame the server can only reject by silently closing the
+// connection.
+func validateKeyAndValue(namespace []byte, key string, valueLen int) error {
+	if err := validateKey(namespace, key); err != nil {
 		return err
 	}
-	if len(key)+valueLen > maxRequestBytes {
+	total := len(namespace) + len(key) + valueLen
+	if total > maxRequestBytes {
+		if len(namespace) == 0 {
+			return invalidArgument(fmt.Sprintf(
+				"nanocached: key (%d bytes) + value (%d bytes) exceeds the %d-byte request limit",
+				len(key), valueLen, maxRequestBytes))
+		}
 		return invalidArgument(fmt.Sprintf(
-			"nanocached: key (%d bytes) + value (%d bytes) exceeds the %d-byte request limit",
-			len(key), valueLen, maxRequestBytes))
+			"nanocached: namespace (%d bytes) + key (%d bytes) + value (%d bytes) exceeds the %d-byte request limit",
+			len(namespace), len(key), valueLen, maxRequestBytes))
+	}
+	return nil
+}
+
+// validateNamespaceForClear is clearNS's own bound (issue #106): a clear
+// frame carries no key or value, only the namespace, so unlike
+// validateKey/validateKeyAndValue there is nothing to sum it against —
+// the namespace alone just needs to fit under the server's own request
+// cap, same rationale as those two (issue #47 audit item G1 follow-up;
+// issue #228; matches client.py's _check_namespace, client.rs's
+// validate_namespace_for_clear, and NanocachedClient.java's
+// validateNamespace). A nil/empty namespace always passes, matching
+// clearNS's own "clears the default namespace, never rejected" rule.
+func validateNamespaceForClear(namespace []byte) error {
+	if len(namespace) > maxRequestBytes {
+		return invalidArgument(fmt.Sprintf(
+			"nanocached: namespace exceeds maxRequestBytes (%d bytes), got %d bytes",
+			maxRequestBytes, len(namespace)))
 	}
 	return nil
 }
@@ -896,7 +938,7 @@ func (c *Client) getBytesNS(namespace []byte, key string) (value []byte, ok bool
 // itself hashes, since the server never decompresses (value compression)
 // — never from the decompressed value getBytesNS goes on to return.
 func (c *Client) getRawNS(namespace []byte, key string) (raw []byte, ok bool, err error) {
-	if err := validateKey(key); err != nil {
+	if err := validateKey(namespace, key); err != nil {
 		return nil, false, err
 	}
 	if err := c.beforeOperation(); err != nil {
@@ -1007,7 +1049,7 @@ func (c *Client) SetBytes(key string, value []byte, ttlSeconds int64) error {
 // comment; the same internal (namespace, key) entry point a *Namespace
 // handle's SetBytes forwards to.
 func (c *Client) setBytesNS(namespace []byte, key string, value []byte, ttlSeconds int64) error {
-	if err := validateKeyAndValue(key, len(value)); err != nil {
+	if err := validateKeyAndValue(namespace, key, len(value)); err != nil {
 		return err
 	}
 	if ttlSeconds < 0 {
@@ -1041,7 +1083,7 @@ func (c *Client) Delete(key string) (existed bool, err error) {
 // the same internal (namespace, key) entry point a *Namespace handle's
 // Delete forwards to.
 func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error) {
-	if err := validateKey(key); err != nil {
+	if err := validateKey(namespace, key); err != nil {
 		return false, err
 	}
 	if err := c.beforeOperation(); err != nil {
@@ -1114,7 +1156,7 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 	}
 	keyBytes := make([][]byte, len(keys))
 	for i, key := range keys {
-		if err := validateKey(key); err != nil {
+		if err := validateKey(namespace, key); err != nil {
 			return nil, err
 		}
 		keyBytes[i] = []byte(key)
@@ -1355,7 +1397,7 @@ func (c *Client) setManyNS(namespace []byte, values map[string][]byte, ttlSecond
 	keyBytes := make([][]byte, 0, len(values))
 	valueBytes := make([][]byte, 0, len(values))
 	for key, value := range values {
-		if err := validateKeyAndValue(key, len(value)); err != nil {
+		if err := validateKeyAndValue(namespace, key, len(value)); err != nil {
 			return err
 		}
 		keys = append(keys, key)
@@ -1626,7 +1668,7 @@ func negateDecrDelta(delta int64) (int64, error) {
 // entry point a *Namespace handle's Incr/Decr forward to, mirroring
 // getBytesNS/setBytesNS/deleteNS.
 func (c *Client) incrNS(namespace []byte, key string, delta int64) (value int64, ok bool, err error) {
-	if err := validateKey(key); err != nil {
+	if err := validateKey(namespace, key); err != nil {
 		return 0, false, err
 	}
 	if err := c.beforeOperation(); err != nil {
@@ -1709,8 +1751,14 @@ func parseIncrValue(raw []byte) (int64, error) {
 // internal entry point a *Namespace handle's Clear forwards to (issue
 // #106). A nil/empty namespace clears the default namespace; it is never
 // rejected, matching getBytesNS/setBytesNS/deleteNS's own namespace("")
-// rule.
+// rule. A namespace so large it alone would exceed maxRequestBytes is
+// rejected client-side (issue #228) — a clear frame carries no key, so
+// unlike validateKey/validateKeyAndValue there is nothing else to bound
+// it against.
 func (c *Client) clearNS(namespace []byte) error {
+	if err := validateNamespaceForClear(namespace); err != nil {
+		return err
+	}
 	if err := c.beforeOperation(); err != nil {
 		return err
 	}

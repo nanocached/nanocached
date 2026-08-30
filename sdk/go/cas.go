@@ -185,7 +185,7 @@ func (c *Client) replaceNS(namespace []byte, key string, token CasToken, newValu
 // validation and value compression mirror setBytesNS exactly, then cas
 // (below) drives the actual routing.
 func (c *Client) casNS(namespace []byte, key string, value []byte, cond string, ttlSeconds int64) (bool, error) {
-	if err := validateKeyAndValue(key, len(value)); err != nil {
+	if err := validateKeyAndValue(namespace, key, len(value)); err != nil {
 		return false, err
 	}
 	if ttlSeconds < 0 {
@@ -271,7 +271,7 @@ func (c *Client) DeleteIfMatches(key string, token CasToken) (bool, error) {
 // (namespace, key) entry point a *Namespace handle's own DeleteIfMatches
 // forwards to.
 func (c *Client) deleteIfMatchesNS(namespace []byte, key string, token CasToken) (bool, error) {
-	if err := validateKey(key); err != nil {
+	if err := validateKey(namespace, key); err != nil {
 		return false, err
 	}
 	if err := c.beforeOperation(); err != nil {
