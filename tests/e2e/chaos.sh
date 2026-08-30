@@ -84,7 +84,7 @@ check=$(tmo 300 docker run --rm --network $NET -v "$E:/w" -w /w e2e-client pytho
 echo "=== check: $check"
 echo "=== discovery: abandoned=$(docker logs $P-disc 2>&1 | grep -c 'join abandoned') evicted=$(docker logs $P-disc 2>&1 | grep -ci 'evict')"
 warns $P-disc "${live[@]}"
-for f in "$L"/$P-n*.log; do [ -f "$f" ] && { echo "== $(basename "$f")"; grep -i "warn\|error\|panic" "$f" | sed 's/[0-9.]*:[0-9]*/X/g' | sort | uniq -c | sort -rn | head -5; }; done
+for f in "$L"/"$P"-n*.log; do [ -f "$f" ] && { echo "== $(basename "$f")"; grep -i "warn\|error\|panic" "$f" | sed 's/[0-9.]*:[0-9]*/X/g' | sort | uniq -c | sort -rn | head -5; }; done
 echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean"; fail=1; }
 echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: load saw corrupt reads"; fail=1; }
 echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses"; fail=1; }
