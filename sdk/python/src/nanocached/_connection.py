@@ -368,10 +368,18 @@ class Connection:
         WRONG_NODE for that key's own ``W``. Unlike get(), there is no
         whole-frame ``W`` to raise — a batch never fails as a whole — so
         any marker other than ``M`` is a desync, exactly like clear()'s
-        own stance."""
+        own stance. A well-formed ``M`` whose entry count doesn't match
+        ``len(keys)`` is a desync too (issue #181): a slice assignment
+        onto the roster would silently shift every later key's value
+        onto the wrong key instead of raising."""
         marker, entries = await self._request(lambda tag: _encode_multi_get(keys, tag, namespace))
         if marker == b"M":
             assert entries is not None
+            if len(entries) != len(keys):
+                raise self._desync(
+                    "nanocached: multi-get reply has "
+                    f"{len(entries)} entries for {len(keys)} keys (connection desynced)"
+                )
             return entries  # type: ignore[return-value]
         raise self._mismatch(marker)
 
@@ -382,12 +390,18 @@ class Connection:
         ``keys``/``values`` under one shared TTL (issues
         #128/#150/#151) and returns one roster entry per key, in request
         order: ``True`` for stored, or WRONG_NODE for that key's own
-        ``W`` — see multi_get()."""
+        ``W`` — see multi_get(). Same entry-count desync check as
+        multi_get() (issue #181)."""
         marker, entries = await self._request(
             lambda tag: _encode_multi_set(keys, values, ttl_seconds, tag, namespace)
         )
         if marker == b"O":
             assert entries is not None
+            if len(entries) != len(keys):
+                raise self._desync(
+                    "nanocached: multi-set reply has "
+                    f"{len(entries)} entries for {len(keys)} keys (connection desynced)"
+                )
             return entries  # type: ignore[return-value]
         raise self._mismatch(marker)
 
@@ -420,9 +434,17 @@ class Connection:
         # inherent limitation of matching-by-order pipelining shared with
         # the TypeScript SDK's Connection (request pipelining), not
         # something this SDK introduces.
-        error = ConnectionError(
+        return self._desync(
             f"nanocached: response {marker!r} does not match the request (connection desynced)"
         )
+
+    def _desync(self, message: str) -> ConnectionError:
+        # Shared by _mismatch (wrong marker) and multi_get/multi_set's own
+        # entry-count check (issue #181): either way the response stream
+        # can no longer be trusted to line up with requests, so poison the
+        # connection exactly like _mismatch does and return a
+        # ConnectionError for the caller to raise.
+        error = ConnectionError(message)
         self._poison(error)
         return error
 
