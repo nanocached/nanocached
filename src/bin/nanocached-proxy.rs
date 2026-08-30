@@ -2972,14 +2972,22 @@ async fn finish_get(
         Ok(_) | Err(_) => {}
     }
 
-    // The ordered primary attempt failed outright: fall through the
-    // remaining owners.
-    // The full owner list, primary included: the shared connection may
-    // simply have been idle-closed by the node, and `call`'s transparent
-    // redial recovers that without failing the client (issue #110 — a
-    // long-lived shared connection makes this the common case, not the
-    // rare one).
-    retry_get_on(context, namespace, key, owners, tag).await
+    // The ordered primary attempt failed outright: try the remaining
+    // owners *first* (issue #177) — a black-holed primary shouldn't
+    // cost another full `UPSTREAM_IO_TIMEOUT` before a live replica
+    // even gets a chance. The primary is still retried last rather than
+    // dropped, in case this was merely an idle-closed shared connection
+    // recovering via `call`'s own transparent redial (issue #110 — a
+    // long-lived shared connection makes that the common case, not the
+    // rare one); by the time it's retried it also falls within
+    // `enqueue`'s dial backoff window, so a genuinely dead primary fails
+    // that last attempt fast instead of costing a second full timeout.
+    let mut retry_owners = owners;
+    if !retry_owners.is_empty() {
+        let failed_primary = retry_owners.remove(0);
+        retry_owners.push(failed_primary);
+    }
+    retry_get_on(context, namespace, key, retry_owners, tag).await
 }
 
 async fn retry_get_on(
