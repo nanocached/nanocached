@@ -83,6 +83,35 @@ var (
 	ErrRetryable = errors.New("nanocached: request failed transiently and retries were exhausted")
 )
 
+// errRequestNotSent marks an ErrConnectionLost/ErrProtocol failure that
+// happened before this request's bytes were fully handed to the
+// connection's socket (issue #225) — either the connection was already
+// closed when the attempt started (the idle-FIN case: a peer FIN a
+// socket only learns about on I/O, so the request never had a chance),
+// or its Write() call itself returned an error. Go's net.Conn.Write has
+// an all-or-error contract (no silent partial write on success), and a
+// partial/failed write can never hand the server a complete, parseable
+// frame — so the server could not have executed the request either way,
+// which makes replaying it after a redial safe.
+//
+// Always joined onto the underlying error via notSent below, so a caller
+// matching on ErrConnectionLost/ErrProtocol alone sees no behavior
+// change at all — only applyNonIdempotent (client.go) inspects this
+// marker directly, to decide whether Incr/Decr/PutIfAbsent/
+// ReplaceIfPresent/Replace/DeleteIfMatches may be resent. Once a
+// request's Write() has returned successfully, any later failure (the
+// reply never arriving, the connection closing mid-read) is deliberately
+// NOT marked: the server may already have received and executed a
+// complete frame by then, so resending a non-idempotent request could
+// double-apply it — see connection.go's attemptRequest.
+var errRequestNotSent = errors.New("nanocached: request was not sent")
+
+// notSent marks err with errRequestNotSent via errors.Join — preserving
+// every errors.Is/As target err already carries, only adding the marker.
+func notSent(err error) error {
+	return errors.Join(err, errRequestNotSent)
+}
+
 func connectionLost(context string, cause error) error {
 	if cause != nil {
 		return errors.Join(ErrConnectionLost, errors.New(context+": "+cause.Error()))
