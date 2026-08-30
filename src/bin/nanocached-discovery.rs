@@ -77,6 +77,29 @@
 //!                             to disagree with what most of the cluster
 //!                             learned elsewhere.
 //!
+//!   T <name-length> <token-length>\n<name><token>   Issue #295: a
+//!                             self-authenticated roster fetch for an
+//!                             already-registered node (`name`/`token`
+//!                             are checked against the registry the same
+//!                             way `H`'s are — a mismatch closes the
+//!                             connection with no response). Response:
+//!                             `N <count> <replication>\n` followed by
+//!                             `count` entries, each `<name-length>
+//!                             <addr-length> <token-length>\n<name><addr>
+//!                             <token>\n`, for EVERY registered node
+//!                             regardless of state (`Waiting`/`Joining`/
+//!                             `Joined`) — unlike `L`, deliberately
+//!                             including each node's own token, since the
+//!                             caller has already proven itself a
+//!                             registered node, not merely a
+//!                             shared-secret-holding client (see
+//!                             `NodeInfo::token`'s doc comment). Used by a
+//!                             decommissioning node and by
+//!                             eviction-triggered re-replication to
+//!                             authorize the `U`/`u` frames they send —
+//!                             see `src/server.rs`'s `Command::HandoffSet::
+//!                             token`.
+//!
 //!   J <name-length> <port> <token-length>\n<name><token>   Ask to join
 //!                             (staged node join), declaring the node's own name
 //!                             (node identity decoupled from address), the port it serves on (the
@@ -1281,6 +1304,20 @@ enum DiscoveryCommand {
         port: u16,
         token: String,
     },
+    /// Issue #295: a registered node fetching the roster *with* every
+    /// member's own membership token — `name`/`token` self-identify the
+    /// requester (checked the same way `Heartbeat`'s are, token-checked
+    /// like every node-identifying command), proving it's a genuinely
+    /// registered node and not merely a shared-secret-holding client,
+    /// before discovery hands back anything it wouldn't put in the
+    /// public `L` (see `NodeInfo::token`'s doc comment). Used by a
+    /// decommissioning node to authorize its drain-out `U`/`u` frames,
+    /// and by eviction-triggered re-replication — see
+    /// `src/server.rs`'s `fetch_roster_once`.
+    NodeRoster {
+        name: String,
+        token: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1409,6 +1446,22 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
 
             let _ = input.split_to(header_end + 1);
             Ok(DiscoveryCommand::ListProxies)
+        }
+
+        b"T" => {
+            let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let name_length = parse_length(name_length)?;
+            let token_length = parse_length(token_length)?;
+            let (name, token) =
+                parse_two_string_fields(input, header_end, name_length, token_length)?;
+
+            Ok(DiscoveryCommand::NodeRoster { name, token })
         }
 
         b"H" => {
@@ -3977,6 +4030,71 @@ async fn handle_connection(
                 if response.first() == Some(&b'B') {
                     return Ok(());
                 }
+                continue;
+            }
+            Ok(DiscoveryCommand::NodeRoster { name, token }) => {
+                // Issue #295: self-authenticate the requester first,
+                // exactly like `Heartbeat` — a node presenting a name/
+                // token this registry doesn't recognize as matching gets
+                // nothing back, silently (no response written, connection
+                // closed by the `Err` below): unlike `NodeLeave`/`Complete`
+                // (idempotent no-ops for a stale/unknown name), a
+                // mismatch here specifically means "not a genuinely
+                // registered node", so there is nothing safe to answer.
+                let authenticated = {
+                    let reg = lock(&registry);
+                    reg.get(&name).is_some_and(|info| {
+                        constant_time_eq(info.token.as_bytes(), token.as_bytes())
+                    })
+                };
+                if !authenticated {
+                    eprintln!(
+                        "WARN rejected T from {peer_ip}: {name} is not a registered node (or \
+                         presented the wrong token)"
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "T carried an unrecognized name or the wrong membership token",
+                    ));
+                }
+
+                if Instant::now() < config.list_ready_at {
+                    // Same startup-grace withholding as `L`/`H` — a
+                    // partial registry mid-restart must not be served as
+                    // if it were complete.
+                    write_response(&mut stream, b"B\n").await?;
+                    return Ok(());
+                }
+
+                // Issue #295: unlike `L` (client-facing, `Joined`-only,
+                // token-free — see `NodeInfo::token`'s doc comment), this
+                // lists EVERY registered node regardless of state
+                // (`Waiting`/`Joining`/`Joined`) with its address *and*
+                // token — a `Joining` node (e.g. the joiner an in-flight
+                // `M` names) is a legitimate target for the caller's
+                // `U`/`u` frames just as much as an already-`Joined` one.
+                // No replication-factor voting/refusal here (unlike `L`):
+                // this is an internal, already-authenticated, comparatively
+                // rare call (decommission, eviction re-replication), not
+                // the hot client-routing path that protection guards.
+                let entries: Vec<(String, String, String)> = {
+                    let reg = lock(&registry);
+                    reg.iter()
+                        .map(|(name, info)| {
+                            (name.clone(), info.address.clone(), info.token.clone())
+                        })
+                        .collect()
+                };
+                let mut response = format!("N {} {}\n", entries.len(), config.replication);
+                for (entry_name, addr, entry_token) in &entries {
+                    response.push_str(&format!(
+                        "{} {} {}\n{entry_name}{addr}{entry_token}\n",
+                        entry_name.len(),
+                        addr.len(),
+                        entry_token.len()
+                    ));
+                }
+                write_response(&mut stream, response.as_bytes()).await?;
                 continue;
             }
             Ok(DiscoveryCommand::NodeLeave { name, token }) => {

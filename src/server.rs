@@ -578,6 +578,11 @@ struct LeaveState {
     replication: usize,
     /// name → address for every member, to dial entrants.
     addresses: HashMap<String, String>,
+    /// Issue #295: name → membership token for every member, so a
+    /// concurrent write forwarded to an entrant (`leave_target_for`) can
+    /// authorize its `U`/`u` the same way the bulk drain-out's own sends
+    /// do — see `Command::HandoffSet::token`.
+    tokens: HashMap<String, String>,
     /// One shared forwarding connection per entrant address, reused by
     /// every concurrent write forwarded during the drain (mirrors
     /// `ActiveMigration::forward_connection`).
@@ -1656,6 +1661,7 @@ fn route_clear(node_context: &NodeContext, scope: &ClearScope) -> ClearRoute {
     ClearRoute::Forward(ForwardTarget {
         addr: active.joining_addr.clone(),
         connection: Arc::clone(&active.forward_connection),
+        token: active.joining_token.clone(),
     })
 }
 
@@ -1762,6 +1768,7 @@ async fn handle_connection(
                     token,
                     joining_name,
                     joining_addr,
+                    joining_token,
                     joined,
                     replication,
                 },
@@ -1823,6 +1830,7 @@ async fn handle_connection(
                     Arc::clone(&node_context.active_migration),
                     joining_name.clone(),
                     joining_addr.clone(),
+                    joining_token.clone(),
                     Arc::clone(&after_ring),
                     replication,
                     &joined,
@@ -1887,13 +1895,6 @@ async fn handle_connection(
                 )
                 .await?;
 
-                // Issue #266: `joined` (with addresses) plus the
-                // joiner's own — `run_migration`'s own join-flip
-                // re-replication trigger reuses this instead of a fresh
-                // `L` fetch (see its own doc comment).
-                let mut addresses: HashMap<String, String> = joined.into_iter().collect();
-                addresses.insert(joining_name.clone(), joining_addr.clone());
-
                 // Handed to `run`'s own loop rather than spawned here
                 // directly, so it ends up tracked by `connection_tasks` —
                 // see `ConnectionConfig::migration_tx`. If the receiving
@@ -1908,12 +1909,12 @@ async fn handle_connection(
                         node_context,
                         joining_name,
                         joining_addr,
+                        joining_token,
                         replication,
                         before_ring,
                         after_ring,
                         migration_guard,
                         keys_snapshot,
-                        addresses,
                     )))
                     .await;
 
@@ -2231,9 +2232,41 @@ async fn handle_connection(
                     value,
                     ttl,
                     if_absent,
+                    token,
                 },
                 tag,
             )) => {
+                let Some(node_context) = config.node_context.clone() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "received U but this node isn't configured with a discovery server",
+                    ));
+                };
+
+                // Issue #295: `U` skips the wrong-node check below by
+                // design (see this arm's own doc comment), so without
+                // this it's the only thing standing between "any
+                // shared-secret client" and "write any key here,
+                // regardless of ring ownership" — the same gap `M`/`X`
+                // close with their own `token` check (see
+                // `Command::HandoffSet::token`'s doc comment). Same
+                // rejection shape as `M`'s.
+                if !constant_time_eq(token.as_bytes(), node_context.token.as_bytes()) {
+                    eprintln!(
+                        "WARN rejected U from {address}: membership token mismatch \
+                         (sender is not a legitimate handoff source for this node)"
+                    );
+                    write_response(
+                        &mut stream,
+                        &encode_response(&Response::MigrationRejected, tag),
+                    )
+                    .await?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "U carried the wrong membership token",
+                    ));
+                }
+
                 // Issue #124: a decommissioning peer handing this node an
                 // entry it is about to own — stored without the
                 // wrong-node check (ownership becomes true when the
@@ -2248,6 +2281,7 @@ async fn handle_connection(
                         value: value.clone(),
                         ttl,
                         if_absent,
+                        token,
                     },
                 )
                 .await?;
@@ -2276,13 +2310,43 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok((Command::HandoffDelete { key }, tag)) => {
+            Ok((Command::HandoffDelete { key, token }, tag)) => {
+                let Some(node_context) = config.node_context.clone() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "received u but this node isn't configured with a discovery server",
+                    ));
+                };
+
+                // Issue #295: same authorization gap and fix as `U` —
+                // see that arm's own comment.
+                if !constant_time_eq(token.as_bytes(), node_context.token.as_bytes()) {
+                    eprintln!(
+                        "WARN rejected u from {address}: membership token mismatch \
+                         (sender is not a legitimate handoff source for this node)"
+                    );
+                    write_response(
+                        &mut stream,
+                        &encode_response(&Response::MigrationRejected, tag),
+                    )
+                    .await?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "u carried the wrong membership token",
+                    ));
+                }
+
                 // Issue #124: a decommissioning peer forwarding a client's
                 // delete for a key this node is about to own — applied
                 // without the wrong-node check, same reasoning as `U`.
-                let response =
-                    execute_command(&request_tx, Command::HandoffDelete { key: key.clone() })
-                        .await?;
+                let response = execute_command(
+                    &request_tx,
+                    Command::HandoffDelete {
+                        key: key.clone(),
+                        token,
+                    },
+                )
+                .await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 // If this node is itself mid-join-handoff for the key,
@@ -3448,6 +3512,15 @@ type KnownRing = Arc<Mutex<Option<Arc<Membership>>>>;
 struct ActiveMigration {
     joining_name: String,
     joining_addr: String,
+    /// Issue #295: the joining node's own membership token, carried by
+    /// the `M` that started this handoff (`Command::Migrate::
+    /// joining_token`) — what this node presents on any `U`/`u` it needs
+    /// to send the joiner (a concurrent client write forwarded via
+    /// `migration_target_for`, or issue #266's own re-replication loop in
+    /// `run_migration`), so the joiner can tell it apart from an ordinary
+    /// shared-secret client forging a handoff frame (see
+    /// `Command::HandoffSet::token`).
+    joining_token: String,
     after_ring: Arc<HashRing>,
     /// Client-side replication: discovery's replication factor, carried by the `M` that
     /// started this handoff — membership in the joining node's copy set
@@ -3680,10 +3753,12 @@ impl MigrationGuard {
     // slot can produce an idempotent re-ack or a rejection instead of a
     // guard — see `MigrationOutcome`.
     #[allow(clippy::new_ret_no_self)]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         slot: Arc<Mutex<Option<ActiveMigration>>>,
         joining_name: String,
         joining_addr: String,
+        joining_token: String,
         after_ring: Arc<HashRing>,
         replication: usize,
         joined: &[(String, String)],
@@ -3755,6 +3830,7 @@ impl MigrationGuard {
         *guard = Some(ActiveMigration {
             joining_name,
             joining_addr,
+            joining_token,
             after_ring,
             replication,
             completed_at: None,
@@ -3990,15 +4066,16 @@ async fn run_migration(
     node_context: NodeContext,
     joining_name: String,
     joining_addr: String,
+    // Issue #295: the joiner's own membership token (`Command::Migrate::
+    // joining_token`) — presented on every `U`/`u` this node sends the
+    // joiner below, so it can tell this handoff apart from a forged
+    // shared-secret frame (see `Command::HandoffSet::token`).
+    joining_token: String,
     replication: usize,
     before_ring: HashRing,
     after_ring: Arc<HashRing>,
     migration_guard: MigrationGuard,
     keys: Option<Vec<Key>>,
-    // Issue #266: the `M`'s own roster addresses (`joined`), plus the
-    // joiner's own — reused by this function's own join-flip
-    // re-replication trigger below instead of a fresh `L` fetch.
-    addresses: HashMap<String, String>,
 ) {
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 
@@ -4081,6 +4158,7 @@ async fn run_migration(
                 value: &value,
                 ttl,
                 if_absent: true,
+                token: &joining_token,
             },
         )
         .await;
@@ -4191,20 +4269,60 @@ async fn run_migration(
     // instead, and trigger the same re-replication an eviction would
     // have if it dropped one. Deliberately after `report_complete`
     // above: this must never delay the `C` report, and by this point the
-    // migration is unambiguously done. `addresses` reuses what the `M`
-    // already carried (plus the joiner's own) rather than a fresh `L`
-    // fetch, and goes through the same channel/supersede/shutdown
-    // machinery as an eviction-triggered run — see
-    // `run_superseding_rereplication`'s doc comment.
+    // migration is unambiguously done.
+    //
+    // Issue #295: `run_rereplication` needs a membership token per target
+    // it may send `U`/`u` to (see `Command::HandoffSet::token`), and the
+    // `M` that started this handoff only ever carries the *joiner's* own
+    // token (`joining_token`) — a target that turns out to be one of the
+    // OTHER `joined` members is a real, expected outcome here (this
+    // trigger fires because THIS node's own belief was stale, so the
+    // promoted owner for a given key is just as likely to be an existing
+    // member as the joiner). So, unlike the old "reuse what `M` already
+    // carried" shortcut, this now pays for the same `fetch_roster_once`
+    // (issue #295: self-authenticated, tokens included) fetch
+    // `spawn_or_supersede_rereplication` does — a failure here just skips
+    // this trigger (logged), same as that function's own failure
+    // handling: the next ring-changing event retries.
     if let Some(previous_membership) = pre_completion_ring {
         let previous_ring = Arc::clone(&previous_membership.ring);
         if ring_dropped_a_member(&previous_ring, &after_ring) {
+            let (addresses, tokens): (HashMap<String, String>, HashMap<String, String>) =
+                match timeout(
+                    OUTBOUND_IO_TIMEOUT,
+                    fetch_roster_once(&node_context, &node_context.discovery_addr),
+                )
+                .await
+                {
+                    Ok(Ok((members, _replication))) => members
+                        .into_iter()
+                        .map(|(name, addr, token)| ((name.clone(), addr), (name, token)))
+                        .unzip(),
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "WARN re-replication: fetching the roster with addresses for the \
+                             join-flip trigger failed: {error} — giving up; a later ring \
+                             change will retrigger it if the cluster is still \
+                             under-replicated"
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "WARN re-replication: fetching the roster with addresses for the \
+                             join-flip trigger timed out — giving up; a later ring change will \
+                             retrigger it if the cluster is still under-replicated"
+                        );
+                        return;
+                    }
+                };
             let task: RereplicationTask = Box::pin(run_superseding_rereplication(
                 node_context.clone(),
                 previous_ring,
                 Arc::clone(&after_ring),
                 replication,
                 addresses,
+                tokens,
                 node_context.shutdown_rx.clone(),
             ));
             if node_context.rereplication_tx.send(task).await.is_err() {
@@ -4296,6 +4414,7 @@ async fn transfer_with_retries(
                 value,
                 ttl,
                 if_absent,
+                token,
             } => timeout(
                 OUTBOUND_IO_TIMEOUT,
                 ForwardedWrite::HandoffSet {
@@ -4303,6 +4422,7 @@ async fn transfer_with_retries(
                     value,
                     ttl: *ttl,
                     if_absent: *if_absent,
+                    token,
                 }
                 .send(active_stream),
             )
@@ -4313,9 +4433,9 @@ async fn transfer_with_retries(
                     "outbound handoff set timed out",
                 ))
             }),
-            ForwardedWrite::HandoffDelete { key } => timeout(
+            ForwardedWrite::HandoffDelete { key, token } => timeout(
                 OUTBOUND_IO_TIMEOUT,
-                ForwardedWrite::HandoffDelete { key }.send(active_stream),
+                ForwardedWrite::HandoffDelete { key, token }.send(active_stream),
             )
             .await
             .unwrap_or_else(|_| {
@@ -4485,15 +4605,15 @@ async fn run_decommission(
     };
     let (members, replication) = roster;
     let self_name = node_context.name.clone();
-    if !members.iter().any(|(name, _)| *name == self_name) {
+    if !members.iter().any(|(name, _, _)| *name == self_name) {
         // Not a member (already expired, or never joined): nothing to
         // hand off.
         send_leave(&node_context, &discovery_addrs).await;
         return;
     }
-    let survivors: Vec<(String, String)> = members
+    let survivors: Vec<(String, String, String)> = members
         .iter()
-        .filter(|(name, _)| *name != self_name)
+        .filter(|(name, _, _)| *name != self_name)
         .cloned()
         .collect();
     if survivors.is_empty() {
@@ -4503,12 +4623,21 @@ async fn run_decommission(
     }
 
     let before_ring = Arc::new(HashRing::new(
-        members.iter().map(|(name, _)| name.clone()).collect(),
+        members.iter().map(|(name, _, _)| name.clone()).collect(),
     ));
     let after_ring = Arc::new(HashRing::new(
-        survivors.iter().map(|(name, _)| name.clone()).collect(),
+        survivors.iter().map(|(name, _, _)| name.clone()).collect(),
     ));
-    let addresses: HashMap<String, String> = members.iter().cloned().collect();
+    let addresses: HashMap<String, String> = members
+        .iter()
+        .map(|(name, addr, _)| (name.clone(), addr.clone()))
+        .collect();
+    // Issue #295: name -> membership token, one per entrant `leave_target_for`
+    // may need to authorize a `U`/`u` to — see `Command::HandoffSet::token`.
+    let tokens: HashMap<String, String> = members
+        .iter()
+        .map(|(name, _, token)| (name.clone(), token.clone()))
+        .collect();
 
     *node_context
         .leaving
@@ -4518,6 +4647,7 @@ async fn run_decommission(
         after_ring: Arc::clone(&after_ring),
         replication,
         addresses: addresses.clone(),
+        tokens: tokens.clone(),
         connections: Mutex::new(HashMap::new()),
     });
 
@@ -4557,6 +4687,9 @@ async fn run_decommission(
         let Some(addr) = addresses.get(&entrant) else {
             continue;
         };
+        let Some(entrant_token) = tokens.get(&entrant) else {
+            continue;
+        };
 
         // Live re-peek, same reasoning as the join transfer: a client
         // write racing this key's turn must win.
@@ -4580,7 +4713,7 @@ async fn run_decommission(
             let Some(stream) = streams.get_mut(addr) else {
                 continue;
             };
-            match send_handoff_set(stream, &key, &value, ttl, false).await {
+            match send_handoff_set(stream, &key, &value, ttl, false, entrant_token).await {
                 Ok(()) => {
                     delivered = true;
                     break;
@@ -4662,12 +4795,25 @@ async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
 /// put-if-absent semantics instead of an unconditional overwrite — set by
 /// re-replication after an eviction, never by an ordinary decommission
 /// handoff (`send_handoff_set`'s callers pass `false`).
-fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>, if_absent: bool) -> Vec<u8> {
+///
+/// Issue #295: `token` is the receiving node's own membership token (see
+/// `Command::HandoffSet::token`) — carried as `<token-len>` in the header
+/// and leads the body (before `namespace`/`key`/`value`), same ordering
+/// as `X`'s `<token><joining_name>`, so the receiver can verify it before
+/// touching anything else.
+fn handoff_message(
+    key: &Key,
+    value: &[u8],
+    ttl: Option<Duration>,
+    if_absent: bool,
+    token: &str,
+) -> Vec<u8> {
     let mut header = format!(
-        "U {} {} {}",
+        "U {} {} {} {}",
         key.namespace.len(),
         key.name.len(),
-        value.len()
+        value.len(),
+        token.len()
     );
     if let Some(ttl) = ttl {
         header.push_str(&format!(" {}", ttl.as_secs()));
@@ -4677,6 +4823,7 @@ fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>, if_absent: bo
     }
     header.push('\n');
     let mut message = header.into_bytes();
+    message.extend_from_slice(token.as_bytes());
     message.extend_from_slice(&key.namespace);
     message.extend_from_slice(&key.name);
     message.extend_from_slice(value);
@@ -4684,9 +4831,17 @@ fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>, if_absent: bo
 }
 
 /// The `u` frame (issue #124) — `delete_message`'s namespaced shape with
-/// the handoff letter, mirroring `handoff_message` for `U`.
-fn handoff_delete_message(key: &Key) -> Vec<u8> {
-    let mut message = format!("u {} {}\n", key.namespace.len(), key.name.len()).into_bytes();
+/// the handoff letter, mirroring `handoff_message` for `U`, including its
+/// issue #295 `token` field and body ordering.
+fn handoff_delete_message(key: &Key, token: &str) -> Vec<u8> {
+    let mut message = format!(
+        "u {} {} {}\n",
+        key.namespace.len(),
+        key.name.len(),
+        token.len()
+    )
+    .into_bytes();
+    message.extend_from_slice(token.as_bytes());
     message.extend_from_slice(&key.namespace);
     message.extend_from_slice(&key.name);
     message
@@ -4698,10 +4853,11 @@ async fn send_handoff_set(
     value: &[u8],
     ttl: Option<Duration>,
     if_absent: bool,
+    token: &str,
 ) -> io::Result<()> {
     timeout(OUTBOUND_IO_TIMEOUT, async {
         stream
-            .write_all(&handoff_message(key, value, ttl, if_absent))
+            .write_all(&handoff_message(key, value, ttl, if_absent, token))
             .await?;
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
@@ -4717,13 +4873,16 @@ async fn send_handoff_set(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handoff transfer timed out"))?
 }
 
-/// Issue #124: an `L` fetch for the decommission — `known_ring` holds
-/// names only, and the drain needs addresses to dial entrants. Bounded
-/// parse mirroring the SDKs'/harness's.
+/// Issue #124: a roster-with-addresses fetch for the decommission —
+/// `known_ring` holds names only, and the drain needs addresses to dial
+/// entrants. Issue #295: also needs every survivor's own membership
+/// token, to authorize the `U`/`u` frames the drain sends them (see
+/// `Command::HandoffSet::token`) — `fetch_roster_once` carries both.
+/// Bounded parse mirroring the SDKs'/harness's.
 async fn fetch_roster_for_leave(
     node_context: &NodeContext,
     discovery_addrs: &[String],
-) -> io::Result<(Vec<(String, String)>, usize)> {
+) -> io::Result<(Vec<(String, String, String)>, usize)> {
     let mut last_error = io::Error::other("no discovery replicas configured");
 
     for addr in discovery_addrs {
@@ -4733,7 +4892,7 @@ async fn fetch_roster_for_leave(
             Err(_) => {
                 last_error = io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("L fetch from {addr} timed out"),
+                    format!("T fetch from {addr} timed out"),
                 )
             }
         }
@@ -4742,12 +4901,24 @@ async fn fetch_roster_for_leave(
     Err(last_error)
 }
 
+/// Issue #295: `T <name-len> <token-len>\n<name><token>` — a
+/// self-authenticated roster fetch, unlike the public, client-facing `L`
+/// (which deliberately never carries tokens — see `NodeInfo::token`'s
+/// doc comment in `nanocached-discovery`). This node presents its own
+/// name+token (the same credential `H`/`C` already use) to prove to
+/// discovery it's a genuinely registered node, not merely a
+/// shared-secret-holding client; only then does discovery hand back every
+/// registered node's address *and* token. The two callers
+/// (`fetch_roster_for_leave`'s decommission drain, and
+/// `spawn_or_supersede_rereplication`'s eviction-triggered re-replication)
+/// both need those tokens to authorize the `U`/`u` frames they may send —
+/// see `Command::HandoffSet::token`.
 async fn fetch_roster_once(
     node_context: &NodeContext,
     addr: &str,
-) -> io::Result<(Vec<(String, String)>, usize)> {
+) -> io::Result<(Vec<(String, String, String)>, usize)> {
     const MAX_ROSTER_ENTRIES: usize = 4096;
-    const MAX_NAME_OR_ADDR_LENGTH: usize = 1024;
+    const MAX_NAME_ADDR_OR_TOKEN_LENGTH: usize = 1024;
 
     let stream = connect_and_authenticate(node_context, addr, AuthPeer::Discovery).await?;
     // Buffered so the length-bounded line reads below (`read_line_capped`,
@@ -4758,9 +4929,17 @@ async fn fetch_roster_once(
     // `\n` are still there for the next read, exactly as `read_heartbeat_ack`
     // relies on.
     let mut stream = tokio::io::BufReader::new(stream);
-    stream.write_all(b"L\n").await?;
+    let mut request = format!(
+        "T {} {}\n",
+        node_context.name.len(),
+        node_context.token.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(node_context.name.as_bytes());
+    request.extend_from_slice(node_context.token.as_bytes());
+    stream.write_all(&request).await?;
 
-    let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad L response");
+    let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad T response");
 
     let mut line = Vec::new();
     read_line_capped(&mut stream, MAX_ROSTER_LINE_LEN, &mut line).await?;
@@ -4803,15 +4982,26 @@ async fn fetch_roster_once(
             .next()
             .and_then(|part| part.parse().ok())
             .ok_or_else(bad)?;
-        if name_length > MAX_NAME_OR_ADDR_LENGTH || addr_length > MAX_NAME_OR_ADDR_LENGTH {
+        let token_length: usize = parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .ok_or_else(bad)?;
+        if name_length > MAX_NAME_ADDR_OR_TOKEN_LENGTH
+            || addr_length > MAX_NAME_ADDR_OR_TOKEN_LENGTH
+            || token_length > MAX_NAME_ADDR_OR_TOKEN_LENGTH
+        {
             return Err(bad());
         }
         // Body + trailing newline.
-        let mut body = vec![0u8; name_length + addr_length + 1];
+        let mut body = vec![0u8; name_length + addr_length + token_length + 1];
         stream.read_exact(&mut body).await?;
         members.push((
             String::from_utf8_lossy(&body[..name_length]).into_owned(),
             String::from_utf8_lossy(&body[name_length..name_length + addr_length]).into_owned(),
+            String::from_utf8_lossy(
+                &body[name_length + addr_length..name_length + addr_length + token_length],
+            )
+            .into_owned(),
         ));
     }
 
@@ -5016,6 +5206,10 @@ async fn run_superseding_rereplication(
     after_ring: Arc<HashRing>,
     replication: usize,
     addresses: HashMap<String, String>,
+    // Issue #295: name -> membership token, one per `addresses` entry
+    // this run genuinely has a token for — see `Command::HandoffSet::
+    // token` and `run_rereplication`'s own doc comment.
+    tokens: HashMap<String, String>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let state = Arc::new(ActiveRereplication {
@@ -5037,6 +5231,7 @@ async fn run_superseding_rereplication(
         &after_ring,
         replication,
         &addresses,
+        &tokens,
         &state.abort_requested,
         &mut shutdown_rx,
     )
@@ -5068,13 +5263,16 @@ async fn spawn_or_supersede_rereplication(
     after: Arc<Membership>,
     shutdown_rx: watch::Receiver<bool>,
 ) {
-    let addresses: HashMap<String, String> = match timeout(
+    let (addresses, tokens): (HashMap<String, String>, HashMap<String, String>) = match timeout(
         OUTBOUND_IO_TIMEOUT,
         fetch_roster_once(&node_context, &discovery_addr),
     )
     .await
     {
-        Ok(Ok((members, _replication))) => members.into_iter().collect(),
+        Ok(Ok((members, _replication))) => members
+            .into_iter()
+            .map(|(name, addr, token)| ((name.clone(), addr), (name, token)))
+            .unzip(),
         Ok(Err(error)) => {
             eprintln!(
                 "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
@@ -5102,6 +5300,7 @@ async fn spawn_or_supersede_rereplication(
         after_ring,
         after.replication,
         addresses,
+        tokens,
         shutdown_rx,
     )
     .await;
@@ -5115,12 +5314,23 @@ async fn spawn_or_supersede_rereplication(
 /// this can never regress a newer client write that raced it. Returns
 /// once every key has been considered, `abort_requested` is set (a
 /// superseding ring change), or shutdown lands.
+///
+/// Issue #295: a target this node has no membership token for (missing
+/// from `tokens`) is skipped exactly like a target with no address —
+/// counted in `skipped`, not sent to. Both callers (`spawn_or_supersede_
+/// rereplication`'s eviction trigger and `run_migration`'s own join-flip
+/// trigger) fetch a token for every target up front (`fetch_roster_once`,
+/// issue #295), so this is a defensive fallback for a target that
+/// dropped out of the registry between that fetch and this send, not the
+/// expected common case.
+#[allow(clippy::too_many_arguments)]
 async fn run_rereplication(
     node_context: &NodeContext,
     before_ring: &HashRing,
     after_ring: &HashRing,
     replication: usize,
     addresses: &HashMap<String, String>,
+    tokens: &HashMap<String, String>,
     abort_requested: &AtomicBool,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
@@ -5157,6 +5367,10 @@ async fn run_rereplication(
                 skipped += 1;
                 continue;
             };
+            let Some(token) = tokens.get(&target) else {
+                skipped += 1;
+                continue;
+            };
 
             let mut delivered = false;
             for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
@@ -5180,7 +5394,7 @@ async fn run_rereplication(
                 let Some(stream) = streams.get_mut(addr) else {
                     continue;
                 };
-                match send_handoff_set(stream, &key, &value, ttl, true).await {
+                match send_handoff_set(stream, &key, &value, ttl, true, token).await {
                     Ok(()) => {
                         delivered = true;
                         break;
@@ -5510,6 +5724,13 @@ async fn send_set(
 struct ForwardTarget {
     addr: String,
     connection: Arc<AsyncMutex<Option<ClientStream>>>,
+    /// Issue #295: the target's own membership token — carried on any
+    /// `U`/`u` this forward sends (see `Command::HandoffSet::token`).
+    /// Unused for a plain `Set`/`Delete` forward (`migration_target_for`'s
+    /// join-side target also serves those), but always populated:
+    /// `migration_target_for` sources it from `ActiveMigration::
+    /// joining_token`, `leave_target_for` from `LeaveState::tokens`.
+    token: String,
 }
 
 /// Bounded by `FORWARD_TIMEOUT` as a single whole — see that constant's
@@ -5568,11 +5789,16 @@ enum ForwardedWrite<'a> {
         value: &'a [u8],
         ttl: Option<Duration>,
         if_absent: bool,
+        /// Issue #295: the receiving node's own membership token — see
+        /// `Command::HandoffSet::token`.
+        token: &'a str,
     },
     /// Issue #124: the decommission's forwarded delete (`u`), same
     /// wrong-node reasoning as `HandoffSet`.
     HandoffDelete {
         key: &'a Key,
+        /// Issue #295: see `HandoffSet::token` above.
+        token: &'a str,
     },
     Clear(&'a ClearScope),
 }
@@ -5619,9 +5845,10 @@ impl ForwardedWrite<'_> {
                 value,
                 ttl,
                 if_absent,
+                token,
             } => {
                 stream
-                    .write_all(&handoff_message(key, value, ttl, if_absent))
+                    .write_all(&handoff_message(key, value, ttl, if_absent, token))
                     .await?;
 
                 let mut ack = [0u8; 2];
@@ -5635,8 +5862,10 @@ impl ForwardedWrite<'_> {
                 }
                 Ok(())
             }
-            ForwardedWrite::HandoffDelete { key } => {
-                stream.write_all(&handoff_delete_message(key)).await?;
+            ForwardedWrite::HandoffDelete { key, token } => {
+                stream
+                    .write_all(&handoff_delete_message(key, token))
+                    .await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -5738,6 +5967,9 @@ impl OwnedForwardedWrite {
                         // A concurrent client write must win unconditionally —
                         // see `ForwardedWrite::HandoffSet`'s own doc comment.
                         if_absent: false,
+                        // Issue #295: `target`'s own token, not this
+                        // node's — see `Command::HandoffSet::token`.
+                        token: &target.token,
                     },
                 )
                 .await
@@ -5746,7 +5978,10 @@ impl OwnedForwardedWrite {
                 forward_on_shared_connection(
                     node_context,
                     target,
-                    ForwardedWrite::HandoffDelete { key },
+                    ForwardedWrite::HandoffDelete {
+                        key,
+                        token: &target.token,
+                    },
                 )
                 .await
             }
@@ -6010,6 +6245,7 @@ fn migration_target_for(node_context: &NodeContext, key: &Key) -> Option<Forward
         .map(|active| ForwardTarget {
             addr: active.joining_addr.clone(),
             connection: Arc::clone(&active.forward_connection),
+            token: active.joining_token.clone(),
         })
 }
 
@@ -6027,6 +6263,7 @@ fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarg
     let leave = leaving.as_ref()?;
     let entrant = leave.entrant_for(key, &node_context.name)?;
     let addr = leave.addresses.get(&entrant)?.clone();
+    let token = leave.tokens.get(&entrant)?.clone();
 
     let connection = {
         let mut connections = leave
@@ -6040,7 +6277,11 @@ fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarg
         )
     };
 
-    Some(ForwardTarget { addr, connection })
+    Some(ForwardTarget {
+        addr,
+        connection,
+        token,
+    })
 }
 
 /// Forwards a client's `D` for `key` to `target`, mirroring
@@ -6429,6 +6670,7 @@ mod tests {
         let target = ForwardTarget {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-target".to_string(),
         };
 
         let forward_task = tokio::spawn(async move {
@@ -6518,6 +6760,7 @@ mod tests {
         let target = ForwardTarget {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-target".to_string(),
         };
 
         set_on_joining_node(&node_context, &target, &key(b"name"), b"Alice", None)
@@ -6592,6 +6835,7 @@ mod tests {
         let target = Arc::new(ForwardTarget {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-target".to_string(),
         });
 
         let first_forward = tokio::spawn({
@@ -6667,6 +6911,7 @@ mod tests {
         let target = ForwardTarget {
             addr: joining_addr,
             connection: Arc::new(AsyncMutex::new(None)),
+            token: "tok-target".to_string(),
         };
 
         // If this never retried, the joining task would hang forever
@@ -6744,6 +6989,7 @@ mod tests {
             active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
                 joining_name: "joiner-0".to_string(),
                 joining_addr: stalled_addr.clone(),
+                joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
                 completed_at: None,
@@ -6777,6 +7023,7 @@ mod tests {
                     ForwardTarget {
                         addr: stalled_addr.clone(),
                         connection: Arc::new(AsyncMutex::new(None)),
+                        token: "tok-target".to_string(),
                     },
                     OwnedForwardedWrite::Set {
                         key: key(name),
@@ -6881,6 +7128,7 @@ mod tests {
             active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
                 joining_name: "joiner-0".to_string(),
                 joining_addr: joining_addr.clone(),
+                joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
                 completed_at: None,
@@ -8079,6 +8327,7 @@ mod tests {
             active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
                 joining_name: "joiner-0".to_string(),
                 joining_addr: "127.0.0.1:9".to_string(),
+                joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
                 completed_at: None,
@@ -8186,8 +8435,10 @@ mod tests {
                     b'S' => (fields[0] + fields[1], b"S\n"),
                     b's' => (fields[0] + fields[1] + fields[2], b"S\n"),
                     // Issue #266: `run_migration`'s own bulk transfer,
-                    // sent as a put-if-absent handoff.
-                    b'U' => (fields[0] + fields[1] + fields[2], b"S\n"),
+                    // sent as a put-if-absent handoff. Issue #295: the
+                    // body now leads with `<token-len>` bytes of token
+                    // too (`fields[3]`).
+                    b'U' => (fields[0] + fields[1] + fields[2] + fields[3], b"S\n"),
                     b'c' => (fields[0], b"C\n"),
                     b'F' => (0, b"C\n"),
                     other => panic!("unexpected frame {other}"),
@@ -8269,6 +8520,7 @@ mod tests {
             Arc::clone(&node_context.active_migration),
             "joiner-0".to_string(),
             joining_addr.clone(),
+            "tok-joiner-0".to_string(),
             Arc::clone(&after_ring),
             2,
             &joined,
@@ -8294,12 +8546,12 @@ mod tests {
             node_context.clone(),
             "joiner-0".to_string(),
             joining_addr.clone(),
+            "tok-joiner-0".to_string(),
             2,
             before_ring,
             after_ring,
             migration_guard,
             keys,
-            HashMap::new(),
         )
         .await;
 
@@ -8377,8 +8629,12 @@ mod tests {
             shutdown_rx,
         ));
 
+        // Issue #295: `U`'s token must match this node's own
+        // (`node_context.token`, "tk-self") to pass the new
+        // authorization check before the wrong-node bypass is even
+        // reached.
         client
-            .write_all(b"S 4 5\nnameAliceU 0 4 5\nnameAliceG 4\nname")
+            .write_all(b"S 4 5\nnameAliceU 0 4 5 7\ntk-selfnameAliceG 4\nname")
             .await
             .unwrap();
         client.shutdown().await.unwrap();
@@ -8440,8 +8696,12 @@ mod tests {
 
         // Store via U first so there is something to delete, then:
         // D → W (not owner), u → D (deleted anyway), u again → N (gone).
+        // Issue #295: both `U` and `u` must carry this node's own token
+        // ("tk-self") to pass authorization.
         client
-            .write_all(b"U 0 4 5\nnameAliceD 4\nnameu 0 4\nnameu 0 4\nname")
+            .write_all(
+                b"U 0 4 5 7\ntk-selfnameAliceD 4\nnameu 0 4 7\ntk-selfnameu 0 4 7\ntk-selfname",
+            )
             .await
             .unwrap();
         client.shutdown().await.unwrap();
@@ -8452,6 +8712,178 @@ mod tests {
         assert_eq!(response, expected);
 
         connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_set_with_the_wrong_token_is_rejected_and_stores_nothing() {
+        // Issue #295: mirrors `migrate_command_with_the_wrong_token_is_
+        // rejected_and_transfers_nothing` for `U`. `U`/`u` skip the
+        // wrong-node check by design (see their own doc comments), so
+        // without a membership-token check any shared-secret client could
+        // forge one to write a key here regardless of ring ownership. A
+        // wrong token must be rejected outright: nothing stored, and —
+        // since this node is itself mid-join-handoff for the key, which
+        // would otherwise also forward it to the joiner — nothing
+        // forwarded either.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        // A fake joining node: nothing must ever connect to it — a
+        // rejected `U` must never reach `migration_target_for`'s forward.
+        let joiner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joiner_addr = joiner_listener.local_addr().unwrap().to_string();
+        let joiner_connected = Arc::new(AtomicBool::new(false));
+        let joiner_flag = Arc::clone(&joiner_connected);
+        let joiner_task = tokio::spawn(async move {
+            if joiner_listener.accept().await.is_ok() {
+                joiner_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        // R=2 over {test-node, joiner-0} — every key is owned by both, so
+        // `migration_target_for` would forward regardless of which key is
+        // used, if a rejected `U` ever reached that far.
+        let mut active_migration = test_active_migration(Some(Instant::now()));
+        active_migration.joining_addr = joiner_addr;
+        let node_context = NodeContext {
+            name: "test-node".to_string(),
+            token: "tk-self".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(active_migration))),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+
+        // Wrong token ("tk-not-mine" instead of "tk-self").
+        client
+            .write_all(b"U 0 4 5 11\ntk-not-minenameAlice")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"R\n");
+
+        // The connection closes on rejection — same as `M`'s.
+        assert!(connection_task.await.unwrap().is_err());
+
+        drop(forward_relay);
+        // Give any (wrongly) spawned forward a chance to dial out.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !joiner_connected.load(Ordering::SeqCst),
+            "a rejected U must never forward to the joiner"
+        );
+        joiner_task.abort();
+
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: key(b"name") }).await,
+            Response::NotFound
+        );
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_delete_with_the_wrong_token_is_rejected_and_deletes_nothing() {
+        // Issue #295: same proof as `handoff_set_with_the_wrong_token_is_
+        // rejected_and_stores_nothing`, for `u`.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        let node_context = NodeContext {
+            name: "self".to_string(),
+            token: "tk-self".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx: mpsc::channel(1).0,
+            },
+            shutdown_rx,
+        ));
+
+        // Wrong token ("tk-not-mine" instead of "tk-self").
+        client
+            .write_all(b"u 0 4 11\ntk-not-minename")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"R\n");
+        assert!(connection_task.await.unwrap().is_err());
+
+        assert_eq!(
+            send_command(&request_tx, Command::Get { key: key(b"name") }).await,
+            Response::Value(Bytes::from_static(b"Alice")),
+            "the key must survive a rejected u"
+        );
+
         drop(request_tx);
         cache_task.await.unwrap();
     }
@@ -8502,6 +8934,7 @@ mod tests {
             active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
                 joining_name: "joiner-0".to_string(),
                 joining_addr: joining_addr.clone(),
+                joining_token: "tok-joiner-0".to_string(),
                 after_ring,
                 replication: 2,
                 completed_at: None,
@@ -8617,6 +9050,8 @@ mod tests {
 
         let mut addresses = HashMap::new();
         addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
 
         let node_context = NodeContext {
             name: "leaver".to_string(),
@@ -8632,6 +9067,7 @@ mod tests {
                 after_ring,
                 replication: 1,
                 addresses,
+                tokens,
                 connections: Mutex::new(HashMap::new()),
             }))),
             active_rereplication: Arc::new(Mutex::new(None)),
@@ -8695,8 +9131,10 @@ mod tests {
             2,
             "both owned keys must forward to the entrant"
         );
-        let expected_a = format!("U 0 {} 2\n{name_a}v1", name_a.len()).into_bytes();
-        let expected_b = format!("U 0 {} 2\n{name_b}v2", name_b.len()).into_bytes();
+        // Issue #295: the entrant's own token ("tok-peer") now leads the
+        // body.
+        let expected_a = format!("U 0 {} 2 8\ntok-peer{name_a}v1", name_a.len()).into_bytes();
+        let expected_b = format!("U 0 {} 2 8\ntok-peer{name_b}v2", name_b.len()).into_bytes();
         assert!(frames.contains(&expected_a));
         assert!(frames.contains(&expected_b));
     }
@@ -8723,6 +9161,7 @@ mod tests {
             after_ring: Arc::clone(&after),
             replication: 2,
             addresses: HashMap::new(),
+            tokens: HashMap::new(),
             connections: Mutex::new(HashMap::new()),
         };
 
@@ -9076,6 +9515,45 @@ mod tests {
                                 );
                             }
                             let _ = stream.write_all(&response).await;
+                        } else if let Some(rest) = line.strip_prefix("T ") {
+                            // Issue #295: `fetch_roster_once`'s
+                            // self-authenticated roster+token fetch — this
+                            // fake doesn't bother validating the presented
+                            // name/token (nothing to check it against
+                            // here), just consumes the body and answers
+                            // with the roster, tokens included.
+                            let lengths: Vec<usize> = rest
+                                .split(' ')
+                                .map(|field| field.parse().unwrap())
+                                .collect();
+                            let need = lengths[0] + lengths[1];
+                            while buf.len() < need {
+                                let Ok(bytes_read) = stream.read(&mut chunk).await else {
+                                    return;
+                                };
+                                if bytes_read == 0 {
+                                    return;
+                                }
+                                buf.extend_from_slice(&chunk[..bytes_read]);
+                            }
+                            let _: Vec<u8> = buf.drain(..need).collect();
+                            let entries = [
+                                ("leaver", "127.0.0.1:1", "tok-leaver"),
+                                ("peer", peer_addr.as_str(), "tok-peer"),
+                            ];
+                            let mut response = format!("N {} 1\n", entries.len()).into_bytes();
+                            for (name, addr, token) in entries {
+                                response.extend_from_slice(
+                                    format!(
+                                        "{} {} {}\n{name}{addr}{token}\n",
+                                        name.len(),
+                                        addr.len(),
+                                        token.len()
+                                    )
+                                    .as_bytes(),
+                                );
+                            }
+                            let _ = stream.write_all(&response).await;
                         } else if line.starts_with("V ") {
                             let lengths: Vec<usize> = line
                                 .split(' ')
@@ -9234,7 +9712,8 @@ mod tests {
                             continue;
                         }
                         assert!(header.starts_with("U "), "unexpected frame {header:?}");
-                        let body_length = fields[0] + fields[1] + fields[2];
+                        // Issue #295: `fields[3]` is `<token-len>`.
+                        let body_length = fields[0] + fields[1] + fields[2] + fields[3];
                         let frame_end = header_end + 1 + body_length;
                         while buf.len() < frame_end {
                             let mut chunk = [0u8; 1024];
@@ -9350,6 +9829,7 @@ mod tests {
             Arc::clone(&node_context.active_migration),
             "joiner-0".to_string(),
             joining_addr.clone(),
+            "tok-joiner-0".to_string(),
             Arc::clone(&after_ring),
             2,
             &joined,
@@ -9363,12 +9843,12 @@ mod tests {
             node_context.clone(),
             "joiner-0".to_string(),
             joining_addr.clone(),
+            "tok-joiner-0".to_string(),
             2,
             before_ring,
             after_ring,
             migration_guard,
             keys,
-            HashMap::new(),
         )
         .await;
 
@@ -9376,8 +9856,10 @@ mod tests {
         // (issue #266) — in whatever order `list_keys` happened to
         // return them, so checked as independent substrings rather than
         // one fixed concatenation.
-        let expected_key0 = handoff_message(&key(b"key-0"), b"primary-copy", None, true);
-        let expected_key3 = handoff_message(&key(b"key-3"), b"replica-copy", None, true);
+        let expected_key0 =
+            handoff_message(&key(b"key-0"), b"primary-copy", None, true, "tok-joiner-0");
+        let expected_key3 =
+            handoff_message(&key(b"key-3"), b"replica-copy", None, true, "tok-joiner-0");
         let received = joining_received.lock().unwrap().clone();
         assert!(
             received
@@ -9553,14 +10035,46 @@ mod tests {
         let joining_addr = joining_listener.local_addr().unwrap().to_string();
         let (_joiner_frames, joining_task) = spawn_recording_joiner(joining_listener);
 
-        // Fake discovery: expects the `C` completion report.
+        // Fake discovery: expects the `C` completion report, then (issue
+        // #295) the join-flip trigger's own `T` roster+token fetch — a
+        // fresh connection, answered with node-y's (and joiner-w's)
+        // address and a token, so `run_rereplication` can authorize its
+        // `U … A` to node-y.
         let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let y_addr_for_discovery = y_addr.clone();
+        let joining_addr_for_discovery = joining_addr.clone();
         let discovery_task = tokio::spawn(async move {
             let (mut connection, _) = discovery_listener.accept().await.unwrap();
             let mut buffer = [0u8; 256];
             let _ = connection.read(&mut buffer).await.unwrap();
             connection.write_all(b"A\n").await.unwrap();
+            drop(connection);
+
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            let entries = [
+                ("node-y", y_addr_for_discovery.as_str(), "tok-node-y"),
+                (
+                    "joiner-w",
+                    joining_addr_for_discovery.as_str(),
+                    "tok-joiner-w",
+                ),
+            ];
+            let mut response = format!("N {} 2\n", entries.len()).into_bytes();
+            for (name, addr, token) in entries {
+                response.extend_from_slice(
+                    format!(
+                        "{} {} {}\n{name}{addr}{token}\n",
+                        name.len(),
+                        addr.len(),
+                        token.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+            connection.write_all(&response).await.unwrap();
         });
 
         let (rereplication_tx, mut rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
@@ -9601,6 +10115,7 @@ mod tests {
             Arc::clone(&node_context.active_migration),
             "joiner-w".to_string(),
             joining_addr.clone(),
+            "tok-joiner-w".to_string(),
             Arc::clone(&after_ring),
             replication,
             &joined,
@@ -9608,21 +10123,18 @@ mod tests {
         )
         .unwrap_new();
 
-        let mut addresses: HashMap<String, String> = joined.into_iter().collect();
-        addresses.insert("joiner-w".to_string(), joining_addr.clone());
-
         let keys = list_keys(&request_tx).await;
 
         run_migration(
             node_context.clone(),
             "joiner-w".to_string(),
             joining_addr,
+            "tok-joiner-w".to_string(),
             replication,
             before_ring,
             after_ring,
             migration_guard,
             keys,
-            addresses,
         )
         .await;
 
@@ -9642,17 +10154,19 @@ mod tests {
         let mut sent_keys: Vec<Key> = frames
             .iter()
             .map(|frame| {
+                // Issue #295: body now leads with `<token-len>` bytes of
+                // token before `<ns><key><value>`.
                 let header_end = frame.iter().position(|byte| *byte == b'\n').unwrap();
                 let header = String::from_utf8(frame[..header_end].to_vec()).unwrap();
                 let mut fields = header.split(' ').skip(1);
                 let ns_len: usize = fields.next().unwrap().parse().unwrap();
                 let key_len: usize = fields.next().unwrap().parse().unwrap();
-                let body_start = header_end + 1;
+                let _val_len: usize = fields.next().unwrap().parse().unwrap();
+                let token_len: usize = fields.next().unwrap().parse().unwrap();
+                let ns_start = header_end + 1 + token_len;
                 Key::new(
-                    Bytes::copy_from_slice(&frame[body_start..body_start + ns_len]),
-                    Bytes::copy_from_slice(
-                        &frame[body_start + ns_len..body_start + ns_len + key_len],
-                    ),
+                    Bytes::copy_from_slice(&frame[ns_start..ns_start + ns_len]),
+                    Bytes::copy_from_slice(&frame[ns_start + ns_len..ns_start + ns_len + key_len]),
                 )
             })
             .collect();
@@ -9709,6 +10223,7 @@ mod tests {
             active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
                 joining_name: "joiner-0".to_string(),
                 joining_addr: "127.0.0.1:9".to_string(),
+                joining_token: "tok-joiner-0".to_string(),
                 after_ring: Arc::clone(&after_ring),
                 replication: 2,
                 completed_at: Some(Instant::now()),
@@ -9844,6 +10359,7 @@ mod tests {
             Arc::clone(&node_context.active_migration),
             "joiner-1".to_string(),
             "127.0.0.1:10".to_string(),
+            "tok-joiner-1".to_string(),
             Arc::new(HashRing::new(vec![
                 "ready-node".to_string(),
                 "other-node".to_string(),
@@ -9966,6 +10482,7 @@ mod tests {
         *node_context.active_migration.lock().unwrap() = Some(ActiveMigration {
             joining_name: "joiner-0".to_string(),
             joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
             after_ring: Arc::new(HashRing::new(vec![
                 "ready-node".to_string(),
                 "joiner-0".to_string(),
@@ -9999,6 +10516,7 @@ mod tests {
         let slot = Arc::new(Mutex::new(Some(ActiveMigration {
             joining_name: "joiner-0".to_string(),
             joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
             after_ring: Arc::new(HashRing::new(vec![
                 "ready-node".to_string(),
                 "joiner-0".to_string(),
@@ -10024,6 +10542,7 @@ mod tests {
             Arc::clone(&slot),
             "joiner-1".to_string(),
             "127.0.0.1:10".to_string(),
+            "tok-joiner-1".to_string(),
             after_ring,
             2,
             &[],
@@ -10045,6 +10564,7 @@ mod tests {
         let slot = Arc::new(Mutex::new(Some(ActiveMigration {
             joining_name: "joiner-0".to_string(),
             joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
             after_ring: Arc::new(HashRing::new(vec![
                 "ready-node".to_string(),
                 "joiner-0".to_string(),
@@ -10070,6 +10590,7 @@ mod tests {
             Arc::clone(&slot),
             "joiner-1".to_string(),
             "127.0.0.1:10".to_string(),
+            "tok-joiner-1".to_string(),
             after_ring,
             2,
             &[],
@@ -10186,16 +10707,19 @@ mod tests {
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
 
         client.write_all(&migrate_message).await.unwrap();
 
@@ -10212,7 +10736,7 @@ mod tests {
 
         // Issue #266: run_migration's own bulk transfer now sends a
         // put-if-absent `U … A`, not a plain `S` — see its doc comment.
-        let expected_set = handoff_message(&key(b"name"), b"Alice", None, true);
+        let expected_set = handoff_message(&key(b"name"), b"Alice", None, true, joining_token);
         assert_eq!(*joining_received.lock().unwrap(), expected_set);
         assert_eq!(
             *discovery_received.lock().unwrap(),
@@ -10306,16 +10830,19 @@ mod tests {
 
         let joining_name = "joiner-107";
         let wrong_token = "tk-not-mine";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             attacker_addr.len(),
+            joining_token.len(),
             wrong_token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(wrong_token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(attacker_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
         client.write_all(&migrate_message).await.unwrap();
 
         // The node rejects with `R\n` (MigrationRejected) and closes the
@@ -10433,16 +10960,19 @@ mod tests {
 
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
 
         client.write_all(&migrate_message).await.unwrap();
         let mut ack = [0u8; 4];
@@ -10470,7 +11000,7 @@ mod tests {
         joining_task.await.unwrap();
         // Issue #266: run_migration's own bulk transfer now sends a
         // put-if-absent `U … A`, not a plain `S` — see its doc comment.
-        let expected_set = handoff_message(&key(b"name"), b"Alice", None, true);
+        let expected_set = handoff_message(&key(b"name"), b"Alice", None, true, joining_token);
         assert_eq!(
             *joining_received.lock().unwrap(),
             expected_set,
@@ -10548,16 +11078,19 @@ mod tests {
 
         let first_joining_addr = "127.0.0.1:1";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-a";
         let mut first_migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             "joiner-a".len(),
             first_joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         first_migrate_message.extend_from_slice(token.as_bytes());
         first_migrate_message.extend_from_slice(b"joiner-a");
         first_migrate_message.extend_from_slice(first_joining_addr.as_bytes());
+        first_migrate_message.extend_from_slice(joining_token.as_bytes());
 
         client.write_all(&first_migrate_message).await.unwrap();
         let mut first_ack = [0u8; 4];
@@ -10565,16 +11098,19 @@ mod tests {
         assert_eq!(&first_ack, b"A 0\n");
 
         let second_joining_addr = "127.0.0.1:2";
+        let second_joining_token = "tok-joiner-b";
         let mut second_migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             "joiner-b".len(),
             second_joining_addr.len(),
+            second_joining_token.len(),
             token.len()
         )
         .into_bytes();
         second_migrate_message.extend_from_slice(token.as_bytes());
         second_migrate_message.extend_from_slice(b"joiner-b");
         second_migrate_message.extend_from_slice(second_joining_addr.as_bytes());
+        second_migrate_message.extend_from_slice(second_joining_token.as_bytes());
 
         // Only once the first handoff has reported `C` (its slot is
         // stamped completed before that report goes out).
@@ -10599,6 +11135,7 @@ mod tests {
         ActiveMigration {
             joining_name: "joiner-0".to_string(),
             joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
             after_ring: Arc::new(HashRing::new(vec![
                 "ready-node".to_string(),
                 "joiner-0".to_string(),
@@ -10628,6 +11165,7 @@ mod tests {
             Arc::clone(slot),
             "joiner-1".to_string(),
             "127.0.0.1:10".to_string(),
+            "tok-joiner-1".to_string(),
             Arc::new(HashRing::new(vec![
                 "ready-node".to_string(),
                 "joiner-1".to_string(),
@@ -10834,16 +11372,19 @@ mod tests {
         // R=1, so the sender is displaced: "name" is marked dead once sent.
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
         client.write_all(&migrate_message).await.unwrap();
         let mut ack = [0u8; 4];
         client.read_exact(&mut ack).await.unwrap();
@@ -10988,16 +11529,19 @@ mod tests {
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
 
         client.write_all(&migrate_message).await.unwrap();
 
@@ -11170,16 +11714,19 @@ mod tests {
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
 
         client.write_all(&migrate_message).await.unwrap();
 
@@ -11196,8 +11743,8 @@ mod tests {
 
         // Issue #266: run_migration's own bulk transfer now sends a
         // put-if-absent `U … A`, not a plain `S` — see its doc comment.
-        let expected_name = handoff_message(&key(b"name"), b"Alice", None, true);
-        let expected_age = handoff_message(&key(b"age"), b"30", None, true);
+        let expected_name = handoff_message(&key(b"name"), b"Alice", None, true, joining_token);
+        let expected_age = handoff_message(&key(b"age"), b"30", None, true, joining_token);
         let received = joining_received.lock().unwrap().clone();
         assert!(
             received
@@ -11299,16 +11846,19 @@ mod tests {
         // ("name", "age") — the transfer set must be non-empty.
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
+        let joining_token = "tok-joiner-107";
         let mut migrate_message = format!(
-            "M {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {}\n",
             joining_name.len(),
             joining_addr.len(),
+            joining_token.len(),
             token.len()
         )
         .into_bytes();
         migrate_message.extend_from_slice(token.as_bytes());
         migrate_message.extend_from_slice(joining_name.as_bytes());
         migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
 
         client.write_all(&migrate_message).await.unwrap();
 
@@ -11481,6 +12031,7 @@ mod tests {
         ActiveMigration {
             joining_name: "joiner-0".to_string(),
             joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner-0".to_string(),
             after_ring: Arc::new(HashRing::new(vec![
                 "test-node".to_string(),
                 "joiner-0".to_string(),
@@ -11906,15 +12457,23 @@ mod tests {
                         Some(())
                     }
 
-                    fn roster_response(members: &[(&str, &str)], replication: usize) -> Vec<u8> {
+                    // Issue #295: `T`'s roster-with-tokens response shape
+                    // — `<name-len> <addr-len> <token-len>\n<name><addr>
+                    // <token>\n` per entry, unlike the token-free `L`.
+                    fn roster_response(
+                        members: &[(&str, &str, &str)],
+                        replication: usize,
+                    ) -> Vec<u8> {
                         let mut response =
                             format!("N {} {replication}\n", members.len()).into_bytes();
-                        for (name, addr) in members {
+                        for (name, addr, token) in members {
                             response.extend_from_slice(
-                                format!("{} {}\n", name.len(), addr.len()).as_bytes(),
+                                format!("{} {} {}\n", name.len(), addr.len(), token.len())
+                                    .as_bytes(),
                             );
                             response.extend_from_slice(name.as_bytes());
                             response.extend_from_slice(addr.as_bytes());
+                            response.extend_from_slice(token.as_bytes());
                             response.push(b'\n');
                         }
                         response
@@ -11938,10 +12497,26 @@ mod tests {
                         return;
                     };
 
-                    if header == "L" {
+                    if let Some(rest) = header.strip_prefix("T ") {
+                        // Issue #295: `T <name-len> <token-len>\n<name>
+                        // <token>` — the self-authenticated roster+token
+                        // fetch `fetch_roster_once` sends in place of `L`.
+                        // This fake doesn't bother validating the
+                        // presented identity (there's nothing to check it
+                        // against here), just consumes the body and
+                        // answers with the roster.
+                        let mut fields = rest.split(' ');
+                        let name_len: usize = fields.next().unwrap().parse().unwrap();
+                        let token_len: usize = fields.next().unwrap().parse().unwrap();
+                        if read_body(&mut connection, &mut buf, &mut chunk, name_len + token_len)
+                            .await
+                            .is_none()
+                        {
+                            return;
+                        }
                         let members = [
-                            (self_name, "127.0.0.1:1"),
-                            (survivor_name, survivor_addr.as_str()),
+                            (self_name, "127.0.0.1:1", "tok-self"),
+                            (survivor_name, survivor_addr.as_str(), "tok-survivor"),
                         ];
                         let _ = connection
                             .write_all(&roster_response(&members, replication))
@@ -12044,8 +12619,11 @@ mod tests {
                         let ns_len: usize = fields.next().unwrap().parse().unwrap();
                         let key_len: usize = fields.next().unwrap().parse().unwrap();
                         let val_len: usize = fields.next().unwrap().parse().unwrap();
+                        // Issue #295: `<token-len>` — the body now leads
+                        // with that many bytes of token too.
+                        let token_len: usize = fields.next().unwrap().parse().unwrap();
                         let has_absent = header.ends_with(" A");
-                        let body_len = ns_len + key_len + val_len;
+                        let body_len = ns_len + key_len + val_len + token_len;
                         let frame_end = header_end + 1 + body_len;
                         while buf.len() < frame_end {
                             let mut chunk = [0u8; 1024];
@@ -12201,18 +12779,20 @@ mod tests {
         let mut sent_keys: Vec<Key> = frames
             .iter()
             .map(|frame| {
-                // `U <ns-len> <key-len> <val-len> [ttl] A\n<ns><key><value>`
+                // Issue #295: `U <ns-len> <key-len> <val-len> <token-len>
+                // [ttl] A\n<token><ns><key><value>` — the body now leads
+                // with `token`.
                 let header_end = frame.iter().position(|byte| *byte == b'\n').unwrap();
                 let header = String::from_utf8(frame[..header_end].to_vec()).unwrap();
                 let mut fields = header.split(' ').skip(1);
                 let ns_len: usize = fields.next().unwrap().parse().unwrap();
                 let key_len: usize = fields.next().unwrap().parse().unwrap();
-                let body_start = header_end + 1;
+                let _val_len: usize = fields.next().unwrap().parse().unwrap();
+                let token_len: usize = fields.next().unwrap().parse().unwrap();
+                let ns_start = header_end + 1 + token_len;
                 Key::new(
-                    Bytes::copy_from_slice(&frame[body_start..body_start + ns_len]),
-                    Bytes::copy_from_slice(
-                        &frame[body_start + ns_len..body_start + ns_len + key_len],
-                    ),
+                    Bytes::copy_from_slice(&frame[ns_start..ns_start + ns_len]),
+                    Bytes::copy_from_slice(&frame[ns_start + ns_len..ns_start + ns_len + key_len]),
                 )
             })
             .collect();
@@ -12299,6 +12879,7 @@ mod tests {
             Arc::clone(&ring_b),
             2,
             HashMap::new(),
+            HashMap::new(),
             node_context.shutdown_rx.clone(),
         ));
 
@@ -12317,6 +12898,7 @@ mod tests {
             Arc::clone(&ring_a),
             Arc::clone(&ring_b),
             2,
+            HashMap::new(),
             HashMap::new(),
             node_context.shutdown_rx.clone(),
         ));

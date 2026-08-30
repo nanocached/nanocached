@@ -173,37 +173,52 @@ pub enum Command {
     UnmarkMigrated {
         key: Key,
     },
-    /// `U <ns-len> <key-len> <val-len> [ttl] [A] [tag]\n<ns><key><value>`
-    /// (issue #124, cluster-internal like `M`/`X`): a decommissioning
-    /// node handing one of its entries to the key's post-leave owner, or
-    /// (issue #266) a survivor re-replicating a key to the owner an
-    /// eviction promoted. Executes as `Set`, unless the trailing `A`
-    /// token (put-if-absent, same "content, not position, disambiguates
-    /// it" idiom as `k`'s `<cond>`) is present, in which case it executes
-    /// as set-if-absent instead — re-replication runs after the fact and
-    /// must not clobber a newer client write that raced it, so it asks
-    /// for absent semantics; an ordinary decommission handoff never sets
-    /// `A`, since nothing else could have written to an entrant that
-    /// doesn't own the key yet. Either way the difference from `Set` is
-    /// in the connection handler, which skips the wrong-node check — the
-    /// receiver becomes this key's owner only once discovery publishes
-    /// the post-change roster, which by design happens *after* the
-    /// transfer — and the receiver acks `S\n` either way: a key already
-    /// present under `A` is a success for the sender, not a conflict.
+    /// `U <ns-len> <key-len> <val-len> <token-len> [ttl] [A] [tag]\n
+    /// <token><ns><key><value>` (issue #124, cluster-internal like
+    /// `M`/`X`): a decommissioning node handing one of its entries to the
+    /// key's post-leave owner, or (issue #266) a survivor re-replicating
+    /// a key to the owner an eviction promoted. Executes as `Set`, unless
+    /// the trailing `A` token (put-if-absent, same "content, not
+    /// position, disambiguates it" idiom as `k`'s `<cond>`) is present,
+    /// in which case it executes as set-if-absent instead —
+    /// re-replication runs after the fact and must not clobber a newer
+    /// client write that raced it, so it asks for absent semantics; an
+    /// ordinary decommission handoff never sets `A`, since nothing else
+    /// could have written to an entrant that doesn't own the key yet.
+    /// Either way the difference from `Set` is in the connection handler,
+    /// which skips the wrong-node check — the receiver becomes this
+    /// key's owner only once discovery publishes the post-change roster,
+    /// which by design happens *after* the transfer — and the receiver
+    /// acks `S\n` either way: a key already present under `A` is a
+    /// success for the sender, not a conflict.
+    ///
+    /// `token` (issue #295) is *this receiving node's own* membership
+    /// token, same "the shared secret only proves cluster membership, not
+    /// that the sender is entitled to skip the wrong-node check" reasoning
+    /// `Migrate::token`'s doc comment gives for `M` — without it any
+    /// shared-secret client could forge `U` to write a key here this node
+    /// doesn't actually own. It leads the body (before `namespace`/`key`/
+    /// `value`, same as `X`'s `<token><joining_name>`) so the connection
+    /// handler can verify it before acting.
     HandoffSet {
         key: Key,
         value: Bytes,
         ttl: Option<Duration>,
         if_absent: bool,
+        token: String,
     },
-    /// `u <ns-len> <key-len> [tag]\n<ns><key>` (issue #124,
-    /// cluster-internal like `U`): a decommissioning node forwarding a
-    /// concurrent client delete to the key's post-leave owner. Executes
-    /// exactly as `Delete`; the connection handler skips the wrong-node
-    /// check for the same reason it does for `U` — the receiver owns the
-    /// key only once the post-leave roster publishes.
+    /// `u <ns-len> <key-len> <token-len> [tag]\n<token><ns><key>` (issue
+    /// #124, cluster-internal like `U`): a decommissioning node
+    /// forwarding a concurrent client delete to the key's post-leave
+    /// owner. Executes exactly as `Delete`; the connection handler skips
+    /// the wrong-node check for the same reason it does for `U` — the
+    /// receiver owns the key only once the post-leave roster publishes.
+    ///
+    /// `token` (issue #295) is this receiving node's own membership
+    /// token, same reasoning and body ordering as `HandoffSet::token`.
     HandoffDelete {
         key: Key,
+        token: String,
     },
     /// Internal-only (issue #124): the metrics endpoint's snapshot
     /// request — never produced by `parse()`, constructed by the metrics
@@ -236,10 +251,26 @@ pub enum Command {
     /// Per-node membership tokens's "tokens are never sent back out" invariant: the token in
     /// an `M` is the *recipient's* own token (which it already holds and no
     /// client knows), never some other node's.
+    ///
+    /// `joining_token` (issue #295) is the *joining* node's own membership
+    /// token — discovery already holds it from the joiner's own `J`/`P`,
+    /// the same way it holds every registered node's. Unlike `token`
+    /// above, this genuinely is "some other node's" token, but handing it
+    /// to THIS specific receiving node is a deliberate, narrow exception
+    /// to Per-node membership tokens's "never sent back out" invariant: discovery is
+    /// granting this ready node a scoped, time-boxed trust relationship
+    /// with the joiner for the one purpose of authorizing the `U`/`u`
+    /// frames this handoff (and any issue #266 re-replication onto the
+    /// joiner) may need to send it (see `Command::HandoffSet::token`) —
+    /// not a broadcast of the joiner's token to anyone who merely learns
+    /// its name (`L` still lists names only). Stored on this node's
+    /// `ActiveMigration` for that handoff's duration, never persisted or
+    /// forwarded elsewhere.
     Migrate {
         token: String,
         joining_name: String,
         joining_addr: String,
+        joining_token: String,
         joined: Vec<(String, String)>,
         replication: usize,
     },
@@ -325,6 +356,11 @@ impl Command {
                 value,
                 ttl,
                 if_absent,
+                // Verified by the connection handler before this ever
+                // reaches `execute` (see `Command::HandoffSet::token`'s
+                // doc comment) — nothing left for the cache actor to do
+                // with it.
+                token: _,
             } => {
                 if if_absent {
                     // Issue #266: re-replication after an eviction — must
@@ -345,7 +381,13 @@ impl Command {
                 Response::Stored
             }
 
-            Self::Delete { key } | Self::HandoffDelete { key } => {
+            Self::Delete { key }
+            | Self::HandoffDelete {
+                key,
+                // Verified by the connection handler before this ever
+                // reaches `execute` — see `Command::HandoffDelete::token`.
+                token: _,
+            } => {
                 if cache.delete(&key) {
                     Response::Deleted
                 } else {
@@ -555,8 +597,8 @@ fn parse_with_mode(
         // one extra leading `<namespace-length>` field and the namespace
         // bytes lead the body. A length of 0 addresses the default
         // namespace, same as the uppercase form.
-        b"G" | b"D" | b"g" | b"d" | b"u" => {
-            let namespaced = command == b"g" || command == b"d" || command == b"u";
+        b"G" | b"D" | b"g" | b"d" => {
+            let namespaced = command == b"g" || command == b"d";
             let namespace_length = if namespaced {
                 parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?
             } else {
@@ -588,8 +630,6 @@ fn parse_with_mode(
             }
 
             let is_get = command == b"G" || command == b"g";
-            // Resolved before the body is consumed, same dance as `is_get`.
-            let handoff = command == b"u";
 
             let frame = input.split_to(key_end).freeze();
             let key = Key::new(
@@ -600,13 +640,64 @@ fn parse_with_mode(
             Ok((
                 if is_get {
                     Command::Get { key }
-                } else if handoff {
-                    Command::HandoffDelete { key }
                 } else {
                     Command::Delete { key }
                 },
                 tag,
             ))
+        }
+
+        // `u <ns-len> <key-len> <token-len> [tag]\n<token><ns><key>` (issue
+        // #124, cluster-internal): always namespaced (a leading
+        // `<ns-len>`, same as `d`) — `u` has no unnamespaced legacy form.
+        // Issue #295: carries `<token-len>` and leads the body with
+        // `token`, same "check it before touching the rest" ordering as
+        // `X`'s `<token><joining_name>` — see `Command::HandoffDelete::
+        // token`'s doc comment.
+        b"u" => {
+            let namespace_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let tag = parse_trailing_tag(&mut parts, tagged)?;
+
+            if parts.next().is_some() {
+                return Err(ParseError::InvalidLength);
+            }
+
+            let namespace_length = parse_length(namespace_length)?;
+            let key_length = parse_length(key_length)?;
+            let token_length = parse_length(token_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
+            if token_length == 0 {
+                return Err(ParseError::EmptyField);
+            }
+
+            let token_start = header_end + 1;
+            let namespace_start = token_start
+                .checked_add(token_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < key_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(key_end).freeze();
+            let token = decode_field(&frame, token_start, token_length)?;
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
+
+            Ok((Command::HandoffDelete { key, token }, tag))
         }
 
         // Issue #128 measurement prototype: `m <ns-len> <n>
@@ -979,11 +1070,10 @@ fn parse_with_mode(
             Ok((Command::ClearAll, tag))
         }
 
-        b"S" | b"s" | b"U" => {
+        b"S" | b"s" => {
             // Resolved before the body is consumed (`command` borrows the
             // buffer) — same dance as `G`/`D`'s `is_get`.
-            let handoff = command == b"U";
-            let namespace_length = if command == b"s" || command == b"U" {
+            let namespace_length = if command == b"s" {
                 parse_length(parts.next().ok_or(ParseError::InvalidLength)?)?
             } else {
                 0
@@ -992,17 +1082,11 @@ fn parse_with_mode(
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
             // Every field after `<value-len>`, in wire order: `[<ttl>]
-            // [A] [<tag>]`. `A` (issue #266's put-if-absent handoff) only
-            // ever appears for `U`; `S`/`s` have at most `[<ttl>]
             // [<tag>]`. Collected up front — capped, so a frame with
             // extra fields errors here rather than silently reading
             // `parts` past what a human wrote — then peeled back to
-            // front: the tag is always last in tagged mode, and `A` is a
-            // literal token distinguishable from a numeric ttl by its
-            // content (same "content, not position, disambiguates it"
-            // idiom as `k`'s `<cond>`), so it doesn't need a fixed slot
-            // the way `tagged` gives the tag one.
-            let max_trailing = if handoff { 3 } else { 2 };
+            // front: the tag is always last in tagged mode.
+            let max_trailing = 2;
             let mut trailing: Vec<&[u8]> = Vec::with_capacity(max_trailing);
             for part in parts.by_ref() {
                 trailing.push(part);
@@ -1016,11 +1100,6 @@ fn parse_with_mode(
             } else {
                 None
             };
-
-            let if_absent = handoff && trailing.last().copied() == Some(b"A".as_slice());
-            if if_absent {
-                trailing.pop();
-            }
 
             if trailing.len() > 1 {
                 return Err(ParseError::InvalidLength);
@@ -1069,17 +1148,118 @@ fn parse_with_mode(
             );
             let value = frame.slice(key_end..value_end);
 
-            let request = if handoff {
+            Ok((Command::Set { key, value, ttl }, tag))
+        }
+
+        // `U <ns-len> <key-len> <val-len> <token-len> [ttl] [A] [tag]\n
+        // <token><ns><key><value>` (issue #124, cluster-internal): always
+        // namespaced — `U` has no unnamespaced legacy form, same as `u`.
+        // Issue #295: carries `<token-len>` and leads the body with
+        // `token` (before `ns`/`key`/`value`), same ordering as `X`'s
+        // `<token><joining_name>` — see `Command::HandoffSet::token`'s
+        // doc comment.
+        b"U" => {
+            let namespace_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+
+            // Every field after `<token-len>`, in wire order: `[<ttl>]
+            // [A] [<tag>]`. Collected up front — capped, same reasoning
+            // as `S`/`s`'s own trailing-field collection — then peeled
+            // back to front: the tag is always last in tagged mode, and
+            // `A` (issue #266's put-if-absent handoff) is a literal token
+            // distinguishable from a numeric ttl by its content (same
+            // "content, not position, disambiguates it" idiom as `k`'s
+            // `<cond>`), so it doesn't need a fixed slot the way `tagged`
+            // gives the tag one.
+            let max_trailing = 3;
+            let mut trailing: Vec<&[u8]> = Vec::with_capacity(max_trailing);
+            for part in parts.by_ref() {
+                trailing.push(part);
+                if trailing.len() > max_trailing {
+                    return Err(ParseError::InvalidLength);
+                }
+            }
+
+            let tag = if tagged {
+                Some(parse_tag(trailing.pop().ok_or(ParseError::InvalidLength)?)?)
+            } else {
+                None
+            };
+
+            let if_absent = trailing.last().copied() == Some(b"A".as_slice());
+            if if_absent {
+                trailing.pop();
+            }
+
+            if trailing.len() > 1 {
+                return Err(ParseError::InvalidLength);
+            }
+            let ttl = trailing.pop();
+
+            let namespace_length = parse_length(namespace_length)?;
+            let key_length = parse_length(key_length)?;
+            let value_length = parse_length(value_length)?;
+            let token_length = parse_length(token_length)?;
+
+            if key_length == 0 {
+                return Err(ParseError::EmptyKey);
+            }
+            if token_length == 0 {
+                return Err(ParseError::EmptyField);
+            }
+
+            let ttl = match ttl {
+                Some(ttl) => {
+                    let seconds = parse_length(ttl)?;
+                    let seconds = u64::try_from(seconds).map_err(|_| ParseError::InvalidLength)?;
+
+                    Some(Duration::from_secs(seconds))
+                }
+                None => None,
+            };
+
+            let token_start = header_end + 1;
+
+            let namespace_start = token_start
+                .checked_add(token_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            let key_start = namespace_start
+                .checked_add(namespace_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            let key_end = key_start
+                .checked_add(key_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            let value_end = key_end
+                .checked_add(value_length)
+                .ok_or(ParseError::InvalidLength)?;
+
+            if input.len() < value_end {
+                return Err(ParseError::Incomplete);
+            }
+
+            let frame = input.split_to(value_end).freeze();
+            let token = decode_field(&frame, token_start, token_length)?;
+            let key = Key::new(
+                frame.slice(namespace_start..key_start),
+                frame.slice(key_start..key_end),
+            );
+            let value = frame.slice(key_end..value_end);
+
+            Ok((
                 Command::HandoffSet {
                     key,
                     value,
                     ttl,
                     if_absent,
-                }
-            } else {
-                Command::Set { key, value, ttl }
-            };
-            Ok((request, tag))
+                    token,
+                },
+                tag,
+            ))
         }
 
         b"X" => {
@@ -1128,6 +1308,7 @@ fn parse_with_mode(
         b"M" => {
             let joining_name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joining_addr_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            let joining_token_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joined_count = parts.next().ok_or(ParseError::InvalidLength)?;
             let replication = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
@@ -1138,6 +1319,7 @@ fn parse_with_mode(
 
             let joining_name_length = parse_length(joining_name_length)?;
             let joining_addr_length = parse_length(joining_addr_length)?;
+            let joining_token_length = parse_length(joining_token_length)?;
             let joined_count = parse_length(joined_count)?;
             let replication = parse_length(replication)?;
             let token_length = parse_length(token_length)?;
@@ -1155,6 +1337,7 @@ fn parse_with_mode(
                     token_length,
                     joining_name_length,
                     joining_addr_length,
+                    joining_token_length,
                     joined_count,
                     replication,
                 },
@@ -1172,6 +1355,9 @@ struct MigrateHeader {
     token_length: usize,
     joining_name_length: usize,
     joining_addr_length: usize,
+    /// Issue #295: the joining node's own token's length — see
+    /// `Command::Migrate::joining_token`'s doc comment.
+    joining_token_length: usize,
     joined_count: usize,
     replication: usize,
 }
@@ -1195,16 +1381,26 @@ fn parse_migrate(
         token_length,
         joining_name_length,
         joining_addr_length,
+        joining_token_length,
         joined_count,
         replication,
     } = header;
 
-    if token_length == 0 || joining_name_length == 0 || joining_addr_length == 0 {
+    if token_length == 0
+        || joining_name_length == 0
+        || joining_addr_length == 0
+        || joining_token_length == 0
+    {
         return Err(ParseError::EmptyField);
     }
 
-    // Body layout: `<token><joining_name><joining_addr><entries>` — the
-    // token leads so the connection handler can verify it before acting.
+    // Body layout: `<token><joining_name><joining_addr><joining_token>
+    // <entries>` — the (receiving node's own) token leads so the
+    // connection handler can verify it before acting; `joining_token`
+    // (issue #295) sits after the fixed `joining_name`/`joining_addr`
+    // pair, still ahead of the variable-length `entries` roster, so it
+    // stays a plain fixed-offset field unaffected by `entries`' own
+    // resumable scan below.
     let token_start = header_end + 1;
     let joining_name_start = token_start
         .checked_add(token_length)
@@ -1212,8 +1408,11 @@ fn parse_migrate(
     let joining_addr_start = joining_name_start
         .checked_add(joining_name_length)
         .ok_or(ParseError::InvalidLength)?;
-    let mut cursor = joining_addr_start
+    let joining_token_start = joining_addr_start
         .checked_add(joining_addr_length)
+        .ok_or(ParseError::InvalidLength)?;
+    let mut cursor = joining_token_start
+        .checked_add(joining_token_length)
         .ok_or(ParseError::InvalidLength)?;
 
     if input.len() < cursor {
@@ -1273,6 +1472,7 @@ fn parse_migrate(
     let token = decode_field(&frame, token_start, token_length)?;
     let joining_name = decode_field(&frame, joining_name_start, joining_name_length)?;
     let joining_addr = decode_field(&frame, joining_addr_start, joining_addr_length)?;
+    let joining_token = decode_field(&frame, joining_token_start, joining_token_length)?;
 
     let mut joined = Vec::with_capacity(joined_count);
     for (name_start, name_length, addr_start, addr_length) in entry_spans {
@@ -1285,6 +1485,7 @@ fn parse_migrate(
         token,
         joining_name,
         joining_addr,
+        joining_token,
         joined,
         replication,
     })
@@ -1834,7 +2035,7 @@ mod tests {
 
     #[test]
     fn parses_a_migrate_command_with_no_joined_nodes() {
-        let mut input = buf(b"M 6 14 0 2 5\ntok-bnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 5 0 2 5\ntok-bnode-b127.0.0.1:8357tok-j");
 
         assert_eq!(
             parse(&mut input),
@@ -1842,6 +2043,7 @@ mod tests {
                 token: "tok-b".to_string(),
                 joining_name: "node-b".to_string(),
                 joining_addr: "127.0.0.1:8357".to_string(),
+                joining_token: "tok-j".to_string(),
                 joined: Vec::new(),
                 replication: 2,
             })
@@ -1852,7 +2054,7 @@ mod tests {
     #[test]
     fn parses_a_migrate_command_with_joined_nodes_and_consumes_only_that_frame() {
         let mut input = buf(
-            b"M 6 14 2 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
+            b"M 6 14 5 2 2 5\ntok-bnode-b127.0.0.1:8357tok-j6 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358G 1\nx",
         );
 
         assert_eq!(
@@ -1861,6 +2063,7 @@ mod tests {
                 token: "tok-b".to_string(),
                 joining_name: "node-b".to_string(),
                 joining_addr: "127.0.0.1:8357".to_string(),
+                joining_token: "tok-j".to_string(),
                 joined: vec![
                     ("node-a".to_string(), "127.0.0.1:8356".to_string()),
                     ("node-c".to_string(), "127.0.0.1:8358".to_string()),
@@ -1873,7 +2076,8 @@ mod tests {
 
     #[test]
     fn parse_leaves_a_migrate_command_untouched_when_a_joined_entry_is_incomplete() {
-        let original = b"M 6 14 1 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0".to_vec();
+        let original =
+            b"M 6 14 5 1 2 5\ntok-bnode-b127.0.0.1:8357tok-j6 14\nnode-a127.0.0".to_vec();
         let mut input = BytesMut::from(&original[..]);
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
@@ -1885,7 +2089,8 @@ mod tests {
         // Feed a frame one byte at a time and check (a) the result equals
         // the one-shot parse, (b) each retry only re-scans from the last
         // fully-buffered entry, never from entry #1.
-        let frame = b"M 6 14 3 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\n\
+        let frame =
+            b"M 6 14 5 3 2 5\ntok-bnode-b127.0.0.1:8357tok-j6 14\nnode-a127.0.0.1:83566 14\n\
                       node-c127.0.0.1:83586 14\nnode-d127.0.0.1:8359G 1\nx";
         let mut expected = BytesMut::from(&frame[..]);
         let expected = parse(&mut expected).unwrap();
@@ -1936,7 +2141,7 @@ mod tests {
             entry_spans: vec![(0, 0, 0, 0)],
         };
         let mut input = buf(
-            b"M 6 14 2 2 5\ntok-bnode-b127.0.0.1:83576 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358",
+            b"M 6 14 5 2 2 5\ntok-bnode-b127.0.0.1:8357tok-j6 14\nnode-a127.0.0.1:83566 14\nnode-c127.0.0.1:8358",
         );
 
         let (command, _) = parse_resumable(&mut input, false, &mut progress).unwrap();
@@ -1946,14 +2151,23 @@ mod tests {
 
     #[test]
     fn rejects_an_empty_joining_name_in_migrate() {
-        let mut input = buf(b"M 0 14 0 2 5\ntok-b127.0.0.1:8357");
+        let mut input = buf(b"M 0 14 5 0 2 5\ntok-b127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
 
     #[test]
     fn rejects_an_empty_token_in_migrate() {
-        let mut input = buf(b"M 6 14 0 2 0\nnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 5 0 2 0\nnode-b127.0.0.1:8357");
+
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+    }
+
+    #[test]
+    fn rejects_an_empty_joining_token_in_migrate() {
+        // Issue #295: `joining_token` gets the same empty-field rejection
+        // as `token`/`joining_name`/`joining_addr`.
+        let mut input = buf(b"M 6 14 0 0 2 5\ntok-bnode-b127.0.0.1:8357");
 
         assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
@@ -1965,7 +2179,7 @@ mod tests {
         // would request terabytes and abort the process). With the joining
         // node's own fields present but no entries buffered, this must simply
         // report `Incomplete` — cheaply, without touching that huge number.
-        let mut input = buf(b"M 6 14 999999999999 2 5\ntok-bnode-b127.0.0.1:8357");
+        let mut input = buf(b"M 6 14 5 999999999999 2 5\ntok-bnode-b127.0.0.1:8357tok-j");
 
         assert_eq!(parse(&mut input), Err(ParseError::Incomplete));
     }
@@ -2463,10 +2677,11 @@ mod tests {
 
     #[test]
     fn parses_handoff_set_and_delete() {
-        // Issue #124: `U`/`u` share `s`/`d`'s namespaced shape and map to
-        // the handoff variants (the connection handler skips the
-        // wrong-node check for them).
-        let mut input = buf(b"U 5 4 5 30\nusersnameAlice");
+        // Issue #124: `U`/`u` share `s`/`d`'s namespaced shape (plus,
+        // issue #295, a leading `<token-len>`/`<token>`) and map to the
+        // handoff variants (the connection handler skips the wrong-node
+        // check for them, but verifies `token` first).
+        let mut input = buf(b"U 5 4 5 5 30\ntok-husersnameAlice");
         assert_eq!(
             parse(&mut input),
             Ok(Command::HandoffSet {
@@ -2474,18 +2689,31 @@ mod tests {
                 value: Bytes::from_static(b"Alice"),
                 ttl: Some(Duration::from_secs(30)),
                 if_absent: false,
+                token: "tok-h".to_string(),
             })
         );
         assert!(input.is_empty());
 
-        let mut input = buf(b"u 5 4\nusersname");
+        let mut input = buf(b"u 5 4 5\ntok-husersname");
         assert_eq!(
             parse(&mut input),
             Ok(Command::HandoffDelete {
                 key: namespaced(b"users", b"name"),
+                token: "tok-h".to_string(),
             })
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn rejects_an_empty_token_in_handoff_set_and_delete() {
+        // Issue #295: `token` gets the same empty-field rejection as
+        // `key`.
+        let mut input = buf(b"U 5 4 5 0\nusersnameAlice");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
+
+        let mut input = buf(b"u 5 4 0\nusersname");
+        assert_eq!(parse(&mut input), Err(ParseError::EmptyField));
     }
 
     #[test]
@@ -2493,7 +2721,7 @@ mod tests {
         // Issue #266: `U`'s optional put-if-absent marker, in every
         // position it can legally appear — with and without a ttl, and
         // (in tagged mode) with and without one.
-        let mut input = buf(b"U 5 4 5 A\nusersnameAlice");
+        let mut input = buf(b"U 5 4 5 5 A\ntok-husersnameAlice");
         assert_eq!(
             parse(&mut input),
             Ok(Command::HandoffSet {
@@ -2501,10 +2729,11 @@ mod tests {
                 value: Bytes::from_static(b"Alice"),
                 ttl: None,
                 if_absent: true,
+                token: "tok-h".to_string(),
             })
         );
 
-        let mut input = buf(b"U 5 4 5 30 A\nusersnameAlice");
+        let mut input = buf(b"U 5 4 5 5 30 A\ntok-husersnameAlice");
         assert_eq!(
             parse(&mut input),
             Ok(Command::HandoffSet {
@@ -2512,6 +2741,7 @@ mod tests {
                 value: Bytes::from_static(b"Alice"),
                 ttl: Some(Duration::from_secs(30)),
                 if_absent: true,
+                token: "tok-h".to_string(),
             })
         );
 
@@ -2536,6 +2766,7 @@ mod tests {
                 value: Bytes::from_static(b"first"),
                 ttl: None,
                 if_absent: true,
+                token: "tok-h".to_string(),
             }
             .execute(&mut cache),
             Response::Stored
@@ -2549,6 +2780,7 @@ mod tests {
                 value: Bytes::from_static(b"stale"),
                 ttl: None,
                 if_absent: true,
+                token: "tok-h".to_string(),
             }
             .execute(&mut cache),
             Response::Stored
