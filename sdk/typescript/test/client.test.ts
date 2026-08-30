@@ -2802,6 +2802,163 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
   });
 });
 
+describe("fire-and-forget replica leg errors surface when the primary also fails (issue #188)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("set(): a genuine bug on the fire-and-forget replica leg surfaces once the primary fails too", async () => {
+    // Regression: writeToOwners' fire-and-forget branch pushed a resolved
+    // placeholder into synchronousReplicaWrites instead of the real leg
+    // promise, so a non-network error (a programming bug, not a dead
+    // replica) from a background replica leg vanished completely even
+    // when the primary write failed and the call had to reject with
+    // *something* anyway.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const key = "boom-key";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      // Establish real connections to both owners first...
+      await client.set(key, "v");
+
+      // ...then stub the primary's connection to fail the way a dead
+      // connection ordinarily would, and the replica's to simulate a bug
+      // in this SDK's own code (a TypeError, not a network-class error).
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "set", () => Promise.reject(new ConnectionLostError("primary connection lost")));
+      mock.method(replicaConnection, "set", () => {
+        throw new TypeError("injected programming bug");
+      });
+
+      await assert.rejects(client.set(key, "v2"), (error: unknown) => {
+        assert.ok(error instanceof TypeError, `expected the replica leg's TypeError to surface, got ${error}`);
+        return true;
+      });
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("set(): an ordinary connection failure on the fire-and-forget replica leg stays silent, even when the primary fails too", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const key = "boom-key-2";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.set(key, "v");
+
+      // NanocachedError rather than ConnectionLostError here: the latter
+      // is retryable (withWrongNodeRetry forces a refresh and retries
+      // the whole set() once — isConnectionError), which would run this
+      // whole scenario twice and muddy the assertions below. A plain
+      // NanocachedError is swallowable (see isSwallowable) but not
+      // connection-shaped, so it propagates on the first attempt only —
+      // still a fully representative "ordinary, expected failure".
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "set", () => Promise.reject(new NanocachedError("primary connection lost")));
+      mock.method(replicaConnection, "set", () => Promise.reject(new NanocachedError("replica connection lost")));
+
+      await assert.rejects(client.set(key, "v2"), (error: unknown) => {
+        assert.ok(
+          error instanceof NanocachedError && /primary connection lost/.test(error.message),
+          `expected the primary's own error, got ${error}`,
+        );
+        return true;
+      });
+      assert.equal(
+        client.stats().replicaWriteFailures,
+        1,
+        "the replica's ordinary connection failure must still be counted as a swallow",
+      );
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("setMany(): a genuine bug on a fire-and-forget pure-replica leg surfaces once a primary-holding leg fails too", async () => {
+    // Same regression as above, for multiSetPass's fire-and-forget
+    // pure-replica legs: a single key at replication 2 makes the
+    // replica-owning node's whole leg pure-replica (it holds no primary
+    // key at all), so it's fire-and-forget-eligible on its own.
+    //
+    // Unlike writeToOwners, an ordinary (swallowable) failure on a
+    // primary-holding leg never throws in multiSetPass — it's folded
+    // into the returned retry list instead (see runLeg's own catch), so
+    // it can't stand in for "the primary leg fails" here. The primary's
+    // own leg is given a distinct programming bug (RangeError) instead,
+    // just to force Promise.all(legs) to reject — the assertion below is
+    // that the pure-replica leg's own bug (TypeError) is what actually
+    // surfaces, not the primary leg's.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const key = "boom-key";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      await client.setMany({ [key]: "v" });
+
+      const primaryConnection = (client as any).target.members.get(primary.name).connection;
+      const replicaConnection = (client as any).target.members.get(replica.name).connection;
+      mock.method(primaryConnection, "multiSet", () => {
+        throw new RangeError("injected primary-leg programming bug");
+      });
+      mock.method(replicaConnection, "multiSet", () => {
+        throw new TypeError("injected pure-replica-leg programming bug");
+      });
+
+      await assert.rejects(client.setMany({ [key]: "v2" }), (error: unknown) => {
+        assert.ok(error instanceof TypeError, `expected the pure-replica leg's TypeError to surface, got ${error}`);
+        return true;
+      });
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+});
+
 describe("NanocachedClient read repair (read repair)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
