@@ -297,6 +297,55 @@ export function encodeClearAll(tag?: number): Buffer {
   return toAscii(`F${tagField(tag)}\n`);
 }
 
+// m/o's header grows with the number of entries — every extra key (`m`)
+// or key+value pair (`o`) adds its own decimal length field(s) plus
+// separating space(s) to the header line, unlike every fixed-shape
+// single-key command above. Bounding a batch's *total* wire size by
+// namespace+key(+value) bytes alone (as the running totals below used
+// to) silently ignores that growth: MAX_BATCH_KEYS (client.ts) worth of
+// entries can add several KiB of header the client never budgeted for,
+// on top of a payload already sitting right at MAX_REQUEST_BYTES — the
+// same no-reply, poisoned-connection rejection checkKey/checkKeyAndValue
+// exist to prevent in the first place (issue #222).
+//
+// multiGetEntryCost/multiSetEntryCost below size one entry's *honest*
+// contribution — its length field(s), the space(s) separating them, and
+// the key/value bytes themselves — matching the `lengths`/`lengthFields`
+// construction each encoder does a few lines down exactly. Exported so
+// NanocachedClient's batch chunking (client.ts's `nextChunkEnd`) can
+// budget a sub-frame the same way the encoder itself does, instead of by
+// key/value bytes alone.
+function decimalDigits(n: number): number {
+  return String(n).length;
+}
+
+// The `m`/`o` header bytes no entry's own cost accounts for: the marker
+// and its space, the namespace-length and entry-count decimal fields
+// (each capped at MAX_BATCH_KEYS' own digit count — client.ts never
+// batches more than 400 entries), an optional TTL field (`o` only, up to
+// 11 bytes: a space plus a couple of headroom digits over ttlSeconds'
+// realistic range), an optional tag field (a space plus up to 10 digits
+// for a u32), and the trailing LF. 64 bytes leaves comfortable headroom
+// over that worst case — mirrors the Go SDK's identically-derived
+// multiFrameHeaderSlack (sdk/go/client.go).
+export const MULTI_FRAME_HEADER_SLACK = 64;
+
+// One more key's honest wire cost in an `m` frame (issue #222): a
+// separating space, that key's decimal length field, and the key bytes
+// themselves — exactly what `lengths`/the header construction below adds
+// per key.
+export function multiGetEntryCost(key: Uint8Array): number {
+  return 1 + decimalDigits(key.length) + key.length;
+}
+
+// multiGetEntryCost's write-side twin (issue #222), matching
+// `lengthFields`/the header construction below: two separating spaces,
+// the key's and value's decimal length fields, and the key and value
+// bytes themselves.
+export function multiSetEntryCost(key: Uint8Array, value: Uint8Array): number {
+  return 2 + decimalDigits(key.length) + decimalDigits(value.length) + key.length + value.length;
+}
+
 // m/o — batched get/set (issues #128/#150/#151, docs/protocol.html#multi):
 // n keys under one round trip through the cache instead of n independent
 // get/set calls. Always namespaced, same class as i/k/x above — there is
@@ -312,15 +361,17 @@ export function encodeMultiGet(keys: readonly Uint8Array[], tag?: number, namesp
   // Per-key checkKey catches an empty key or one key alone too large;
   // the running total below catches what per-key checking alone would
   // miss — many small keys whose sum still can't fit the server's own
-  // per-request cap.
-  let total = namespace.length;
+  // per-request cap. Uses multiGetEntryCost (issue #222), not raw key
+  // bytes, so this bound is honest about the header each key also adds —
+  // see multiGetEntryCost/MULTI_FRAME_HEADER_SLACK above.
+  let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
   for (const key of keys) {
     checkKey(key, namespace);
-    total += key.length;
+    total += multiGetEntryCost(key);
   }
   if (total > MAX_REQUEST_BYTES) {
     throw new RangeError(
-      `nanocached: namespace and keys together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+      `nanocached: namespace and keys together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
     );
   }
 
@@ -346,16 +397,19 @@ export function encodeMultiSet(
     throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
   }
 
-  let total = namespace.length;
+  // Uses multiSetEntryCost (issue #222), not raw key+value bytes, so
+  // this bound is honest about the two header fields each pair also
+  // adds — see multiSetEntryCost/MULTI_FRAME_HEADER_SLACK above.
+  let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
   const lengthFields: string[] = new Array(keys.length);
   for (let i = 0; i < keys.length; i++) {
     checkKeyAndValue(keys[i], values[i], namespace);
-    total += keys[i].length + values[i].length;
+    total += multiSetEntryCost(keys[i], values[i]);
     lengthFields[i] = ` ${keys[i].length} ${values[i].length}`;
   }
   if (total > MAX_REQUEST_BYTES) {
     throw new RangeError(
-      `nanocached: namespace, keys and values together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+      `nanocached: namespace, keys and values together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
     );
   }
 

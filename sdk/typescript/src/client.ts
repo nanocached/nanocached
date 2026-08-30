@@ -12,6 +12,9 @@ import {
   contentDigest,
   EMPTY_NAMESPACE,
   MAX_REQUEST_BYTES,
+  multiGetEntryCost,
+  multiSetEntryCost,
+  MULTI_FRAME_HEADER_SLACK,
   type CasCondition,
   type MultiAckEntry,
   type MultiEntry,
@@ -329,18 +332,20 @@ const NODE_LIST_STALE_AFTER_MS = 30_000;
 export const MAX_BATCH_KEYS = 400;
 
 // Batch chunking's byte bound (issue #222): finds the largest run starting
-// at `start` — at most MAX_BATCH_KEYS entries — whose namespace plus
-// per-entry wire cost (`entryBytes`, key length for `m`, key+value length
-// for `o`) still fits protocol.ts's MAX_REQUEST_BYTES, mirroring
-// encodeMultiGet/encodeMultiSet's own "total" bound exactly so a chunk
-// built this way can never trip the encoder's RangeError. A single entry
-// always fits by itself — checkKey/checkKeyAndValue already validated
-// every entry eagerly, before chunking ever starts (see
-// getManyBytesInNamespace/setManyInNamespace) — so a run is never empty
-// and this always makes progress.
+// at `start` — at most MAX_BATCH_KEYS entries — whose namespace, plus
+// protocol.ts's own MULTI_FRAME_HEADER_SLACK, plus per-entry wire cost
+// (`entryBytes` — protocol.ts's multiGetEntryCost for `m`, multiSetEntryCost
+// for `o`, both already honest about the header field(s) each entry adds,
+// not just its key/value bytes) still fits protocol.ts's MAX_REQUEST_BYTES.
+// This mirrors encodeMultiGet/encodeMultiSet's own "total" bound exactly,
+// entry cost and header slack alike, so a chunk built this way can never
+// trip the encoder's RangeError. A single entry always fits by itself —
+// checkKey/checkKeyAndValue already validated every entry eagerly, before
+// chunking ever starts (see getManyBytesInNamespace/setManyInNamespace) —
+// so a run is never empty and this always makes progress.
 function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entryBytes: (index: number) => number): number {
   let end = start;
-  let total = namespace.length;
+  let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
   while (end < count && end - start < MAX_BATCH_KEYS) {
     const next = total + entryBytes(end);
     if (end > start && next > MAX_REQUEST_BYTES) break;
@@ -1461,7 +1466,7 @@ export class NanocachedClient {
   ): Promise<MultiEntry[]> {
     const entries: MultiEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => keyBytes[i].length);
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
       const connection = await connectionFor();
       const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
       for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
@@ -1566,7 +1571,7 @@ export class NanocachedClient {
   ): Promise<MultiAckEntry[]> {
     const entries: MultiAckEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => keyBytes[i].length + valueBytes[i].length);
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]));
       const connection = await connectionFor();
       const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
       for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];

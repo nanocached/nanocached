@@ -95,15 +95,18 @@ export interface MockNode extends MockServerBase {
   /** How many `o` (batched set, issues #150/#151) requests this server
    * has ever received. */
   multiSetCount(): number;
-  /** Each `m` frame's wire body size received so far — namespace length
-   * plus the sum of every key length in that one frame — in receipt
-   * order. Lets a test assert the SDK's byte-bound batch chunking
-   * (issue #222) actually kept every sub-frame under the cap, not just
-   * that it split into more than one. */
+  /** Each `m` frame's total wire size received so far — the header line
+   * (marker, namespace/count/key-length fields, trailing LF) plus
+   * namespace plus every key's bytes, i.e. exactly the bytes the real
+   * server's own per-request cap (src/server.rs's MAX_REQUEST_SIZE)
+   * applies to — in receipt order. Lets a test assert the SDK's
+   * byte-bound batch chunking (issue #222) actually kept every
+   * sub-frame under that cap, header overhead included, not just that
+   * it split into more than one. */
   multiGetFrameBytes(): number[];
-  /** `multiGetFrameBytes`'s write-side twin: each `o` frame's wire body
-   * size (namespace length plus every key's and every value's length in
-   * that frame) received so far, in receipt order. */
+  /** `multiGetFrameBytes`'s write-side twin: each `o` frame's total wire
+   * size (header line plus namespace plus every key's and every value's
+   * bytes) received so far, in receipt order. */
   multiSetFrameBytes(): number[];
   /** Makes every `m`/`o` roster containing `key` answer just that key
    * `W`, for the next `times` such requests (consumed one per match,
@@ -572,7 +575,12 @@ export async function startMockNode(
             }
             buffer = buffer.subarray(cursor);
             multiGets++;
-            multiGetFrameBytes.push(namespaceLength + totalKeyLength);
+            // The full wire frame — header line (bodyStart already
+            // includes its trailing LF) plus namespace plus every key —
+            // not just the body, so issue #222's tests can assert the
+            // real per-request bytes the server's own 1 MiB cap applies
+            // to, header overhead included.
+            multiGetFrameBytes.push(bodyStart + namespaceLength + totalKeyLength);
 
             if (silent) break;
 
@@ -643,7 +651,10 @@ export async function startMockNode(
             }
             buffer = buffer.subarray(cursor);
             multiSets++;
-            multiSetFrameBytes.push(namespaceLength + totalBodyLength);
+            // multiGetFrameBytes' write-side twin — see its own comment
+            // above for why this is the header-inclusive wire size, not
+            // just the body.
+            multiSetFrameBytes.push(bodyStart + namespaceLength + totalBodyLength);
 
             if (silent) break;
 
