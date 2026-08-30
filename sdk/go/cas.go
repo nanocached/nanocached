@@ -122,7 +122,11 @@ func (c *Client) getBytesWithTokenNS(namespace []byte, key string) (value []byte
 // expiry, negative is rejected.
 //
 // See the package-level compare-and-set doc comment above for the "not a
-// distributed lock" eviction caveat.
+// distributed lock" eviction caveat, and DeleteIfMatches' own doc comment
+// for the at-least-once caveat every `k`/`x`-backed method here shares
+// (issue #225): a connection failure after the request may have reached
+// the primary is never silently retried, since PutIfAbsent/
+// ReplaceIfPresent/Replace/DeleteIfMatches are not idempotent.
 func (c *Client) PutIfAbsent(key string, value []byte, ttlSeconds int64) (bool, error) {
 	return c.putIfAbsentNS(nil, key, value, ttlSeconds)
 }
@@ -204,7 +208,7 @@ func (c *Client) casNS(namespace []byte, key string, value []byte, cond string, 
 	}
 	keyBytes := []byte(key)
 	var stored bool
-	err := c.withClusterRetry(func() error {
+	err := c.withClusterRetryNonIdempotent(func() error {
 		s, casErr := c.cas(namespace, keyBytes, outgoing, cond, wireTTL)
 		stored = s
 		return casErr
@@ -238,13 +242,13 @@ func (c *Client) cas(namespace, key []byte, value []byte, cond string, wireTTL i
 
 	var primaryErr error
 	if single {
-		primaryErr = c.applyReconnecting("", primaryOp)
+		primaryErr = c.applyNonIdempotent("", primaryOp)
 	} else {
 		names := c.ownerNames(namespace, key)
 		if len(names) == 0 {
 			return false, connectionLost("no owner is reachable for this key", nil)
 		}
-		primaryErr = c.applyReconnecting(names[0], primaryOp)
+		primaryErr = c.applyNonIdempotent(names[0], primaryOp)
 		if primaryErr == nil && stored {
 			wg := c.fanReplicas(names[1:], func(conn *connection) error {
 				return conn.setNS(namespace, key, value, wireTTL)
@@ -263,6 +267,21 @@ func (c *Client) cas(namespace, key []byte, value []byte, cond string, wireTTL i
 // two-argument remove(key, old). Returns true if it deleted the key,
 // false on a digest mismatch (including an already-missing key) — never
 // an error on its own, the same idiom Delete's existed return uses.
+//
+// DeleteIfMatches — and PutIfAbsent/ReplaceIfPresent/Replace above — are
+// at-least-once, not exactly-once (issue #225): `k`/`x`, unlike Get/Set/
+// Delete, are not idempotent — a k/x that already succeeded, replayed,
+// would compare against the value/absence it itself just wrote and come
+// back reporting a mismatch even though the original call did succeed.
+// So a connection failure is only retried transparently (via a redial)
+// when the request provably never reached the server — e.g. a
+// connection that went idle and was closed by the server before this
+// call reused it. Once the request may have reached the primary, a
+// connection failure is returned as ErrConnectionLost instead of being
+// silently retried; the caller cannot tell from that alone whether the
+// operation was applied, and must decide whether to retry (risking a
+// false mismatch on the next call, or a double-delete) or treat the
+// outcome as unknown.
 func (c *Client) DeleteIfMatches(key string, token CasToken) (bool, error) {
 	return c.deleteIfMatchesNS(nil, key, token)
 }
@@ -280,7 +299,7 @@ func (c *Client) deleteIfMatchesNS(namespace []byte, key string, token CasToken)
 	keyBytes := []byte(key)
 	digest := token.Hex()
 	var deleted bool
-	err := c.withClusterRetry(func() error {
+	err := c.withClusterRetryNonIdempotent(func() error {
 		d, delErr := c.deleteIfMatches(namespace, keyBytes, digest)
 		deleted = d
 		return delErr
@@ -309,13 +328,13 @@ func (c *Client) deleteIfMatches(namespace, key []byte, digest string) (bool, er
 
 	var primaryErr error
 	if single {
-		primaryErr = c.applyReconnecting("", primaryOp)
+		primaryErr = c.applyNonIdempotent("", primaryOp)
 	} else {
 		names := c.ownerNames(namespace, key)
 		if len(names) == 0 {
 			return false, connectionLost("no owner is reachable for this key", nil)
 		}
-		primaryErr = c.applyReconnecting(names[0], primaryOp)
+		primaryErr = c.applyNonIdempotent(names[0], primaryOp)
 		if primaryErr == nil && deleted {
 			wg := c.fanReplicas(names[1:], func(conn *connection) error {
 				_, delErr := conn.deleteNS(namespace, key)

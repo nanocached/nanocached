@@ -258,6 +258,18 @@ replaying could let a replica drift from the primary (e.g. after a
 dropped earlier replica write), while forwarding the literal result keeps
 every replica byte-identical to it.
 
+**`Incr`/`Decr` are at-least-once, not exactly-once** (issue #225).
+Unlike `Get`/`Set`/`Delete`, INCR is not idempotent, so it is never
+silently resent once the request may have already reached the primary: a
+connection failure at that point is returned as `ErrConnectionLost`
+instead of being retried, since retrying could apply `delta` twice. The
+transparent redial-and-retry described above only ever replays a request
+that provably never reached the server in the first place (e.g. the
+connection went idle and the server closed it before this call reused
+it) — so a caller that sees `ErrConnectionLost` from `Incr`/`Decr` cannot
+tell whether the increment took effect, and must decide for itself
+whether to retry (risking a double-apply) or treat the result as unknown.
+
 ## Batched get and set
 
 `GetMany`/`GetManyBytes` and `SetMany`/`SetManyBytes` (the `m`/`o`
@@ -352,6 +364,18 @@ by replaying `k`/`x` on a replica, which could otherwise evaluate the
 same condition against its own possibly-different copy and reach a
 different outcome.
 
+**These four calls are at-least-once, not exactly-once** (issue #225),
+the same caveat `Incr`/`Decr` carry. `k`/`x` are not idempotent —
+replaying a `k`/`x` that already succeeded would re-evaluate the
+condition against the value/absence it itself just wrote and report a
+mismatch even though the original call did succeed — so once a request
+may have reached the primary, a connection failure comes back as
+`ErrConnectionLost` rather than being silently retried. The transparent
+redial-and-retry (see "Reconnect and keep-alive" below) only ever replays
+a request that provably never reached the server at all. A caller that
+sees `ErrConnectionLost` from any of these four cannot tell whether the
+operation was applied, and must decide for itself whether to retry.
+
 See [`docs/protocol.html#cas`](../../docs/protocol.html#cas) for the wire
 protocol.
 
@@ -361,8 +385,12 @@ protocol.
 its connections warm automatically, pinging any connection that real
 traffic has left idle for 30 seconds — so an idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
-restart, a network blip) redials and retries once transparently (all
-operations are idempotent).
+restart, a network blip) redials and retries once transparently, *when
+that is safe*: for `Get`/`Set`/`Delete`/`Clear`/`ClearAll`/the batched
+get-set calls, which are all idempotent, it always is. `Incr`/`Decr` and
+the compare-and-set calls are not idempotent, so they get a narrower
+guarantee — see "Incr and Decr" and "Compare-and-set" above for the
+at-least-once caveat that applies to them instead.
 
 An address whose redial just failed is treated as still down for
 `Config.ReconnectCooldown` (default `DefaultReconnectCooldown`, 1 second):

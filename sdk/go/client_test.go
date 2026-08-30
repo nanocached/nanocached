@@ -129,6 +129,15 @@ type mockNode struct {
 	// Set/Delete).
 	kCount atomic.Int32
 	xCount atomic.Int32
+	// applyThenCloseLeft (issue #225): the next N `i`/`k`/`x` requests are
+	// applied to the store exactly like normal (the increment lands, the
+	// CAS store/delete happens), then the connection is closed instead of
+	// a reply being written — "the primary executed the request but the
+	// client never learned the outcome", as opposed to swallowLeft's "no
+	// reply, connection stays open" (which times out rather than
+	// surfacing ErrConnectionLost). Consumed by whichever of i/k/x
+	// arrives next, on any connection to this node.
+	applyThenCloseLeft atomic.Int32
 	// mCount/oCount count every `m`/`o` (batched get/set, issues
 	// #128/#150/#151) frame this node has received.
 	mCount atomic.Int32
@@ -249,6 +258,11 @@ func (m *mockNode) iRequestsReceived() int32 { return m.iCount.Load() }
 // either.
 func (m *mockNode) kRequestsReceived() int32 { return m.kCount.Load() }
 func (m *mockNode) xRequestsReceived() int32 { return m.xCount.Load() }
+
+// applyThenCloseTimes queues n one-off "apply, then close instead of
+// replying" outcomes (issue #225) for the next n `i`/`k`/`x` requests
+// this node receives, on any connection.
+func (m *mockNode) applyThenCloseTimes(n int32) { m.applyThenCloseLeft.Add(n) }
 
 // mFrameSizesSeen/oFrameSizesSeen return, in arrival order, the total
 // wire bytes of every `m`/`o` frame this node has received so far
@@ -804,6 +818,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			nextBytes := []byte(strconv.FormatInt(next, 10))
 			m.store.Store(sk, nextBytes)
+			if m.takeOne(&m.applyThenCloseLeft) { // issue #225: applied, reply lost
+				return
+			}
 			ttlField := ""
 			if ttl, ok := m.ttls.Load(sk); ok {
 				ttlField = fmt.Sprintf(" %d", ttl.(int64))
@@ -874,6 +891,9 @@ func (m *mockNode) serve(conn net.Conn) {
 				m.ttls.Store(sk, int64(atoiOrPanic(parts[5])))
 			} else {
 				m.ttls.Delete(sk)
+			}
+			if m.takeOne(&m.applyThenCloseLeft) { // issue #225: applied, reply lost
+				return
 			}
 			if _, err := conn.Write([]byte("S" + tagSuffix + "\n")); err != nil {
 				return
@@ -5054,6 +5074,73 @@ func TestIncrOnANonNumericStoredValueReturnsErrNotNumeric(t *testing.T) {
 	}
 }
 
+// TestIncrRetriesTransparentlyWhenTheRequestWasNeverSent covers issue
+// #225's "not sent" half: a connection that died before this Incr's `i`
+// frame was ever written (the idle-FIN case — a socket only learns of a
+// peer FIN on I/O) is safe to redial and retry exactly like Get/Set/
+// Delete already do, since nothing was applied by the failed attempt.
+// Mirrors TestTransparentlyReconnectsAfterAServerFin's own
+// dropConnections-then-sleep idiom.
+func TestIncrRetriesTransparentlyWhenTheRequestWasNeverSent(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("counter", "10", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.dropConnections()
+	time.Sleep(50 * time.Millisecond) // let the FIN land
+
+	value, ok, err := client.Incr("counter", 5)
+	if err != nil || !ok || value != 15 {
+		t.Fatalf("Incr after FIN = %d, %v, %v, want 15, true, nil", value, ok, err)
+	}
+	if node.connectionCount.Load() != 2 {
+		t.Fatalf("connections = %d, want 2 (the dead one, then a redial)", node.connectionCount.Load())
+	}
+	if node.iRequestsReceived() != 1 {
+		t.Fatalf("iRequestsReceived = %d, want 1 (the retry must not double-send)", node.iRequestsReceived())
+	}
+}
+
+// TestIncrDoesNotReplayOnceTheRequestMayHaveBeenApplied covers issue
+// #225's "sent" half: once the primary has actually run the increment,
+// losing the reply must NOT resend `i` — that would double-apply delta.
+// applyThenCloseTimes makes the mock apply the increment to its store and
+// then close the connection instead of replying, reproducing "the
+// primary executed the request but the client never learned the
+// outcome". Incr must surface ErrConnectionLost (not retry), and a
+// subsequent Get must show delta was applied exactly once.
+func TestIncrDoesNotReplayOnceTheRequestMayHaveBeenApplied(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("counter", "10", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.applyThenCloseTimes(1)
+
+	if _, _, err := client.Incr("counter", 5); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Incr err = %v, want ErrConnectionLost", err)
+	}
+	if node.iRequestsReceived() != 1 {
+		t.Fatalf("iRequestsReceived = %d, want 1 (must not be resent)", node.iRequestsReceived())
+	}
+
+	value, ok, err := client.Get("counter")
+	if err != nil || !ok || value != "15" {
+		t.Fatalf("Get after the lost reply = %q, %v, %v, want \"15\", true, nil (applied exactly once)", value, ok, err)
+	}
+}
+
 // TestDecrSendsTheNegatedDelta confirms Decr is a thin wrapper: it must
 // never send a separate wire opcode, only Incr with delta negated (issue
 // #129's spec).
@@ -5287,6 +5374,68 @@ func TestPutIfAbsentStoresOnlyWhenTheKeyIsAbsent(t *testing.T) {
 	}
 	if got, _ := node.storedValue("k"); got != "first" {
 		t.Fatalf("stored value changed to %q, want unchanged %q", got, "first")
+	}
+}
+
+// TestPutIfAbsentRetriesTransparentlyWhenTheRequestWasNeverSent is CAS's
+// analogue of TestIncrRetriesTransparentlyWhenTheRequestWasNeverSent
+// (issue #225): a connection that died before this PutIfAbsent's `k`
+// frame was ever written is safe to redial and retry — nothing was
+// applied by the failed attempt.
+func TestPutIfAbsentRetriesTransparentlyWhenTheRequestWasNeverSent(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("warmup", "1", 0); err != nil {
+		t.Fatal(err)
+	}
+	node.dropConnections()
+	time.Sleep(50 * time.Millisecond) // let the FIN land
+
+	stored, err := client.PutIfAbsent("lock", []byte("worker-a"), 0)
+	if err != nil || !stored {
+		t.Fatalf("PutIfAbsent after FIN = %v, %v, want true, nil", stored, err)
+	}
+	if node.connectionCount.Load() != 2 {
+		t.Fatalf("connections = %d, want 2 (the dead one, then a redial)", node.connectionCount.Load())
+	}
+	if node.kRequestsReceived() != 1 {
+		t.Fatalf("kRequestsReceived = %d, want 1 (the retry must not double-send)", node.kRequestsReceived())
+	}
+}
+
+// TestPutIfAbsentDoesNotReplayOnceTheRequestMayHaveBeenApplied is CAS's
+// analogue of TestIncrDoesNotReplayOnceTheRequestMayHaveBeenApplied
+// (issue #225): once the primary has actually stored the value, losing
+// the reply must NOT resend `k` — a resent PutIfAbsent would find the
+// key it itself just stored and wrongly report a mismatch, even though
+// the original call actually succeeded. PutIfAbsent must surface
+// ErrConnectionLost, and a subsequent GetBytes must show the value was
+// stored exactly once.
+func TestPutIfAbsentDoesNotReplayOnceTheRequestMayHaveBeenApplied(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	node.applyThenCloseTimes(1)
+
+	if _, err := client.PutIfAbsent("lock", []byte("worker-a"), 0); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("PutIfAbsent err = %v, want ErrConnectionLost", err)
+	}
+	if node.kRequestsReceived() != 1 {
+		t.Fatalf("kRequestsReceived = %d, want 1 (must not be resent)", node.kRequestsReceived())
+	}
+
+	value, ok, err := client.GetBytes("lock")
+	if err != nil || !ok || string(value) != "worker-a" {
+		t.Fatalf("GetBytes after the lost reply = %q, %v, %v, want \"worker-a\", true, nil (applied exactly once)", value, ok, err)
 	}
 }
 

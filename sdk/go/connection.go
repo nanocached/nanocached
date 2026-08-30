@@ -725,6 +725,16 @@ func (c *connection) request(build func(tag uint32) []byte) (byte, []byte, int64
 // attemptRequest is a single request/response round trip — request's
 // retry-on-`R` loop body. See request for the retry semantics built on
 // top of this.
+//
+// Issue #225: every failure this returns is classified as either
+// "definitely not sent" (errRequestNotSent, via notSent below — the
+// connection was already closed before this attempt even tried to
+// write, or the Write() call itself failed) or "possibly sent" (the
+// frame was handed to the socket successfully and some later failure —
+// no reply, a desynced/malformed response — lost the outcome). Only
+// applyNonIdempotent (client.go) reads this distinction; every other
+// caller of request()/attemptRequest still just sees ErrConnectionLost/
+// ErrProtocol exactly as before.
 func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte, int64, []multiEntry, error) {
 	resultCh := make(chan roundTripResult, 1)
 
@@ -735,7 +745,11 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 		if err == nil {
 			err = connectionLost("connection is closed", nil)
 		}
-		return 0, nil, 0, nil, err
+		// This attempt's frame was never written — regardless of what
+		// originally poisoned the connection (which may itself have been
+		// a "possibly sent" failure for a DIFFERENT, earlier request),
+		// THIS request never got a chance to reach the wire.
+		return 0, nil, 0, nil, notSent(err)
 	}
 	c.lastUsed = time.Now()
 	tag := c.nextTag
@@ -759,9 +773,17 @@ func (c *connection) attemptRequest(build func(tag uint32) []byte) (byte, []byte
 	if writeErr != nil {
 		err := connectionLost("connection failed", writeErr)
 		c.poison(err)
-		return 0, nil, 0, nil, err
+		// The Write() call itself failed: no complete frame reached the
+		// server, so it could not have executed this request. Safe to
+		// retry after a redial.
+		return 0, nil, 0, nil, notSent(err)
 	}
 
+	// From here on the frame was fully handed to the socket — Write()'s
+	// all-or-error contract means the server may already have received
+	// and acted on it. result.err (poisoned by readLoop, a mismatch, or a
+	// tag desync) is therefore surfaced WITHOUT the notSent marker: a
+	// non-idempotent caller must not replay it.
 	result := <-resultCh
 	if result.err != nil {
 		return 0, nil, 0, nil, result.err

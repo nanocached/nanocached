@@ -1709,6 +1709,18 @@ func (c *Client) runMultiSetLeg(
 // replicas receive the primary's literal resulting value (as an ordinary
 // Set) rather than replaying the increment themselves — see incr's own
 // doc comment for why.
+//
+// Incr/Decr are at-least-once, not exactly-once (issue #225): unlike
+// Get/Set/Delete, INCR is not idempotent, so it is never resent once its
+// request may have reached the primary — a connection failure at that
+// point returns ErrConnectionLost instead of silently retrying, since
+// resending could double-apply delta. The request is only retried
+// (transparently, via a redial) when it provably never left this
+// process — e.g. a connection that went idle and was closed by the
+// server before this call reused it. A caller that gets
+// ErrConnectionLost from Incr/Decr cannot tell whether the increment was
+// applied; the caller must decide whether to retry (accepting a possible
+// double-apply) or treat the outcome as unknown.
 func (c *Client) Incr(key string, delta int64) (value int64, ok bool, err error) {
 	return c.incrNS(nil, key, delta)
 }
@@ -1750,7 +1762,7 @@ func (c *Client) incrNS(namespace []byte, key string, delta int64) (value int64,
 		return 0, false, err
 	}
 	keyBytes := []byte(key)
-	err = c.withClusterRetry(func() error {
+	err = c.withClusterRetryNonIdempotent(func() error {
 		v, o, incrErr := c.incr(namespace, keyBytes, delta)
 		value, ok = v, o
 		return incrErr
@@ -1787,13 +1799,13 @@ func (c *Client) incr(namespace, key []byte, delta int64) (value int64, ok bool,
 
 	var primaryErr error
 	if single {
-		primaryErr = c.applyReconnecting("", primaryOp)
+		primaryErr = c.applyNonIdempotent("", primaryOp)
 	} else {
 		names := c.ownerNames(namespace, key)
 		if len(names) == 0 {
 			return 0, false, connectionLost("no owner is reachable for this key", nil)
 		}
-		primaryErr = c.applyReconnecting(names[0], primaryOp)
+		primaryErr = c.applyNonIdempotent(names[0], primaryOp)
 		if primaryErr == nil && ok {
 			wg := c.fanReplicas(names[1:], func(conn *connection) error {
 				return conn.setNS(namespace, key, raw, ttlSeconds)
@@ -2146,9 +2158,49 @@ func (c *Client) beforeOperation() error {
 // whole operation once against the fresh ranking. The retry window for a
 // dead node is therefore bounded by discovery's liveness timeout. A
 // second failure after a fresh refresh propagates.
+//
+// Only for an idempotent operation (Get/Set/Delete/Clear/batched
+// get-set) — replaying the whole operation, `i`/`k`/`x` included, is not
+// safe; see withClusterRetryNonIdempotent below (issue #225).
 func (c *Client) withClusterRetry(operation func() error) error {
 	err := operation()
 	if err == nil || (!errors.Is(err, ErrWrongNode) && !errors.Is(err, ErrConnectionLost)) {
+		return err
+	}
+	c.mu.Lock()
+	clustered := c.ring != nil
+	c.mu.Unlock()
+	if !clustered {
+		return err
+	}
+	c.maybeRefresh(true)
+	return operation()
+}
+
+// withClusterRetryNonIdempotent is withClusterRetry's counterpart for
+// Incr/Decr, PutIfAbsent/ReplaceIfPresent/Replace, and DeleteIfMatches
+// (issue #225). A stale-routing failure (ErrWrongNode) is retried exactly
+// like withClusterRetry's own — the primary flatly rejected the request
+// without acting on it, so nothing was applied and replaying after a
+// refresh is safe. A connection-level failure (ErrConnectionLost) only
+// retries the whole operation — which re-picks the primary from a
+// refreshed ranking and would resend `i`/`k`/`x` — when it is also
+// marked errRequestNotSent: applyNonIdempotent already gave the request
+// one safe redial-and-retry at the connection layer, so an
+// ErrConnectionLost still carrying that marker here means even the
+// retried attempt never reached the wire (e.g. the redial itself
+// failed), and trying again after a full node-list refresh remains safe.
+// Once the marker is gone — the request may have reached and been
+// executed by the primary — retrying here would risk exactly the same
+// double-apply this whole issue is about, so it is surfaced as-is.
+func (c *Client) withClusterRetryNonIdempotent(operation func() error) error {
+	err := operation()
+	if err == nil {
+		return err
+	}
+	retryable := errors.Is(err, ErrWrongNode) ||
+		(errors.Is(err, ErrConnectionLost) && errors.Is(err, errRequestNotSent))
+	if !retryable {
 		return err
 	}
 	c.mu.Lock()
@@ -2178,8 +2230,14 @@ func (c *Client) ownerNames(namespace, key []byte) []string {
 // on a connection-level failure: a socket only learns of a peer FIN (e.g.
 // the server's 60s idle timeout) on I/O, so lazy reconnect-on-use means
 // the failed request poisons the connection, the redial replaces it, and
-// the operation runs again. Safe because Get/Set/Delete are idempotent.
-// slot is "" in single mode.
+// the operation runs again. Safe because Get/Set/Delete (and Clear/
+// ClearAll, and the multi-get/multi-set chunks) are idempotent — op may
+// genuinely run twice against the server. slot is "" in single mode.
+//
+// Do NOT use this for a non-idempotent op (Incr/Decr, PutIfAbsent/
+// ReplaceIfPresent/Replace, DeleteIfMatches) — see applyNonIdempotent
+// below (issue #225), which retries only when the request provably never
+// reached the server.
 //
 // A malformed/unexpected response frame (ErrProtocol) poisons the
 // connection exactly the same way a genuine I/O failure does (see
@@ -2194,6 +2252,39 @@ func (c *Client) applyReconnecting(slot string, op func(*connection) error) erro
 	}
 	if err := op(conn); err != nil {
 		if !errors.Is(err, ErrConnectionLost) && !errors.Is(err, ErrProtocol) {
+			return err
+		}
+		conn, redialErr := c.slotConnection(slot)
+		if redialErr != nil {
+			return redialErr
+		}
+		return op(conn)
+	}
+	return nil
+}
+
+// applyNonIdempotent is applyReconnecting's counterpart for Incr/Decr,
+// PutIfAbsent/ReplaceIfPresent/Replace, and DeleteIfMatches (issue #225):
+// their `i`/`k`/`x` frames are not safe to resend once the server may
+// already have executed them — a resent increment would double-apply its
+// delta, and a resent CAS that had already succeeded would come back as
+// a mismatch. It retries via redial exactly like applyReconnecting
+// (covering the same idle-FIN case its doc comment describes), but ONLY
+// when connection.attemptRequest classified the failure as
+// errRequestNotSent (see errors.go) — the request's bytes never left
+// this process, so the server never had a chance to run it. Once a
+// request's frame has actually been written, any later failure
+// (ErrConnectionLost or ErrProtocol) is returned to the caller as-is:
+// the operation may already be applied at the primary, so this
+// deliberately does not retry — see Incr/Replace/DeleteIfMatches' own
+// doc comments for the resulting at-least-once caveat.
+func (c *Client) applyNonIdempotent(slot string, op func(*connection) error) error {
+	conn, err := c.slotConnection(slot)
+	if err != nil {
+		return err
+	}
+	if err := op(conn); err != nil {
+		if !errors.Is(err, errRequestNotSent) {
 			return err
 		}
 		conn, redialErr := c.slotConnection(slot)
