@@ -86,11 +86,24 @@ public class NanocachedDistributedCache : IDistributedCache
         Envelope envelope = Envelope.Parse(raw);
         if (envelope.SlidingSeconds == 0) return envelope.Payload; // fixed TTL (or none) — nothing to renew
 
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (envelope.IsPastAbsoluteExpiry(now))
+        {
+            // Issue #233: an absolute expiry already in the past (clock
+            // skew, or this node just hasn't reclaimed it yet) must not
+            // be floored to a 1-second TTL and resurrected by the
+            // sliding renewal below — treat it as expired instead, the
+            // same miss this call would answer once eviction actually
+            // catches up.
+            await _namespace.DeleteAsync(keyBytes).ConfigureAwait(false);
+            return null;
+        }
+
         // Sliding expiration: re-set with the recomputed TTL before
         // returning — awaited, never fire-and-forget (shared spec), so a
         // caller that awaits this call can rely on the renewal having
         // actually reached the wire.
-        long wireTtl = envelope.WireTtlSeconds(DateTimeOffset.UtcNow);
+        long wireTtl = envelope.WireTtlSeconds(now);
         await _namespace.SetAsync(keyBytes, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
         return envelope.Payload;
     }
@@ -131,7 +144,17 @@ public class NanocachedDistributedCache : IDistributedCache
         // skip the round trip rather than re-set identical content.
         if (envelope.SlidingSeconds == 0) return;
 
-        long wireTtl = envelope.WireTtlSeconds(DateTimeOffset.UtcNow);
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (envelope.IsPastAbsoluteExpiry(now))
+        {
+            // Issue #233: see GetAsync's identical check — an already-past
+            // absolute expiry must not be floored to a 1-second TTL and
+            // resurrected by this refresh.
+            await _namespace.DeleteAsync(keyBytes).ConfigureAwait(false);
+            return;
+        }
+
+        long wireTtl = envelope.WireTtlSeconds(now);
         await _namespace.SetAsync(keyBytes, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
     }
 
@@ -245,13 +268,29 @@ public class NanocachedDistributedCache : IDistributedCache
         }
 
         /// <summary>
+        /// Whether this envelope's absolute expiry has already passed as
+        /// of <paramref name="now"/> — <c>false</c> when there is no
+        /// absolute expiry at all. Callers renewing a sliding window
+        /// (<see cref="NanocachedDistributedCache.GetAsync"/>/<see cref="NanocachedDistributedCache.RefreshAsync"/>)
+        /// must check this <em>before</em> calling <see cref="WireTtlSeconds"/>
+        /// (issue #233): that method's own floor exists for a sub-second-but-still-future
+        /// remainder, not for "already past", and would otherwise turn an
+        /// expired entry into a fresh 1-second TTL instead of the miss it
+        /// should be.
+        /// </summary>
+        internal bool IsPastAbsoluteExpiry(DateTimeOffset now) =>
+            AbsoluteUnixSeconds > 0 && DateTimeOffset.FromUnixTimeSeconds(AbsoluteUnixSeconds) <= now;
+
+        /// <summary>
         /// The wire TTL (whole seconds) for this envelope's next write:
         /// the sliding window when only that is set, the remaining time to
         /// the absolute expiry when only that is set, or the smaller of
         /// the two when both are — matching a real sliding+absolute cache
         /// entry, which expires at whichever limit is hit first. 0 (no
         /// TTL — nanocached's "lives until evicted/removed") when neither
-        /// is set.
+        /// is set. Callers with a sliding window must rule out
+        /// <see cref="IsPastAbsoluteExpiry"/> first — see its own doc
+        /// comment.
         /// </summary>
         internal long WireTtlSeconds(DateTimeOffset now)
         {

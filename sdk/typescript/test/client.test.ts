@@ -1262,23 +1262,25 @@ describe("onData's fatal paths route through poison() (issue #187)", () => {
     }
   });
 
-  it("a frame that grows past the size cap without ever completing marks the connection closed synchronously", async () => {
-    // Regression: onData's oversize-frame branch (the backstop covering
-    // a value body that never assembles into a parseable frame, issue
-    // #12 follow-up) also called socket.destroy() directly instead of
-    // poison() — same synchronous-isClosed() gap as the parse-failure
-    // branch above. Exercised via onData directly: MAX_RESPONSE_FRAME_LENGTH
-    // is sized for exactly one maximally-sized `V` frame, so no chunk
-    // sequence a real server could trickle ever reaches this backstop
-    // without first tripping one of tryParseResponse's own smaller,
-    // per-field header-length checks (parseTtlSeconds on an `I`
-    // response's TTL field is the one exception — unlike the tag field,
-    // it has no digit-count cap — but only if the whole oversize header
-    // arrives already assembled, which real chunked delivery won't
-    // produce deterministically).
+  it("an oversized ttl field marks the connection closed synchronously (issue #233)", async () => {
+    // Regression, updated for issue #233: this used to be a giant,
+    // still-incomplete `I` frame reaching onData's oversize-frame
+    // backstop (the one covering a value body that never assembles into
+    // a parseable frame, issue #12 follow-up) — parseTtlSeconds' TTL
+    // field was, at the time, the *only* per-field header check without
+    // a digit-count cap of its own (unlike the tag field), so it was the
+    // one way to grow a single already-assembled buffer straight past
+    // MAX_RESPONSE_FRAME_LENGTH. Issue #233 closed that gap: every
+    // per-field check now has a bound at least as tight as the frame as
+    // a whole, so this exact byte sequence no longer reaches the
+    // backstop at all — it fails parseTtlSeconds' own bound instead,
+    // taking onData's *other* fatal path (the parse-failure branch the
+    // sibling test above already covers generally). Kept here, re-aimed
+    // at that branch, specifically for this byte sequence: still the
+    // same synchronous-isClosed()-before-'close' guarantee that matters,
+    // still poison() rather than a direct destroy().
     const { createServer, connect } = await import("node:net");
     const { Connection } = await import("../src/connection.js");
-    const { MAX_RESPONSE_FRAME_LENGTH } = await import("../src/protocol.js");
 
     const serverSockets: import("node:net").Socket[] = [];
     const server = createServer((socket) => {
@@ -1294,25 +1296,17 @@ describe("onData's fatal paths route through poison() (issue #187)", () => {
       const request = connection.get("k");
 
       // An untagged `I <len> <ttl>` header whose TTL digit string alone
-      // is already past MAX_RESPONSE_FRAME_LENGTH, delivered as one
-      // frame: a valid, unbounded-length TTL field followed by its own
-      // terminating LF, then nothing else — genuinely still incomplete
-      // (the declared 5-byte value never arrives) but already past the
-      // whole-frame backstop by construction.
-      const oversizeTtl = "9".repeat(MAX_RESPONSE_FRAME_LENGTH);
+      // is already well past Number.MAX_SAFE_INTEGER's digit count —
+      // exactly the shape that used to grow the buffer unchecked.
+      const oversizeTtl = "9".repeat(64);
       const frame = Buffer.from(`I 5 ${oversizeTtl}\n`, "ascii");
 
-      // Fed directly to onData in one call: real socket delivery chunks
-      // a buffer this large across many 'data' events, and the header's
-      // own (much smaller) incomplete-terminator threshold would reject
-      // it long before this much ever accumulates — see the comment
-      // above.
       (connection as unknown as { onData(chunk: Buffer): void }).onData(frame);
 
       // True immediately after the synchronous onData() call returns —
       // no 'close' event has had any chance to fire yet.
       assert.equal(connection.isClosed(), true, "isClosed() must flip synchronously within the onData() call itself");
-      await assert.rejects(request, /exceeds maximum size/);
+      await assert.rejects(request, /invalid ttl in response/);
     } finally {
       for (const s of serverSockets) s.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -3115,6 +3109,46 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
       // close() resolves only after the in-flight replica write finished.
       await client.close();
       assert.ok(replica.mock.store.has("k"), "close() resolved before the background replica write finished");
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("close() drains incr()'s fire-and-forget replica leg too (issue #233)", async () => {
+    // incrOnOwners forwards the primary's result to replicas as an
+    // ordinary set() (see its doc comment), so it goes through the exact
+    // same fireAndForgetReplicas/backgroundReplicaWrites machinery as a
+    // plain set() — this pins that its background leg promise is the
+    // real one (tracked for close()'s drain), not a discarded
+    // placeholder (issue #233: incrOnOwners/casOnOwners/casDeleteOnOwners
+    // used to swap the real leg promise for a resolved one, mirroring the
+    // bug #188 fixed for writeToOwners).
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      fireAndForgetReplicas: true,
+    });
+    try {
+      const { replica } = cluster.ownerOf("k");
+      // incr() on a missing key answers `N` and never touches a replica
+      // at all (see incrOnOwners's own early return) — seed a numeric
+      // value first (undelayed) so the increment itself actually
+      // succeeds and reaches the replica-forwarding path this test means
+      // to exercise; only *then* slow the replica down, so the seed
+      // write's own replica leg doesn't also get caught by the delay.
+      await client.set("k", "10");
+      replica.mock.delaySets(80);
+
+      await client.incr("k", 1);
+      await client.close();
+      // The seed write above already left "k" on the replica, so mere
+      // presence wouldn't prove the delayed incr-forward landed — the
+      // *value* must be the incremented one.
+      assert.equal(
+        replica.mock.store.get("k")?.toString(),
+        "11",
+        "close() resolved before incr()'s background replica write finished",
+      );
     } finally {
       await cluster.close();
     }

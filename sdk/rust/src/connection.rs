@@ -10,6 +10,7 @@
 //! order always matches the order their frames actually hit the wire.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -568,11 +569,14 @@ impl Connection {
     /// batch rather than per key. `entries[i]` answers
     /// `keys[i]`/`values[i]`, in request order; see [`Self::multi_get`]
     /// for the same "only a desynced roster is an error" stance.
-    pub(crate) async fn multi_set(
+    /// Generic over the key/value byte container (issue #233) — see
+    /// [`crate::client::NanocachedClient::multi_set_chunked`]'s own doc
+    /// comment for why.
+    pub(crate) async fn multi_set<B: AsRef<[u8]>>(
         &self,
         namespace: &[u8],
-        keys: &[Vec<u8>],
-        values: &[Vec<u8>],
+        keys: &[B],
+        values: &[B],
         ttl_seconds: u64,
     ) -> Result<Vec<MultiEntry>> {
         match self
@@ -1000,11 +1004,14 @@ fn encode_cas_delete(namespace: &[u8], key: &[u8], digest: [u8; 16], tag: Option
 /// `encode_cas_set`.
 fn encode_multi_get(namespace: &[u8], keys: &[Vec<u8>], tag: Option<u32>) -> Vec<u8> {
     let mut header = format!("m {} {}", namespace.len(), keys.len());
+    // Issue #233: `write!` straight into `header` instead of a per-key
+    // `format!` + `push_str` (an extra `String` allocated and thrown away
+    // per key).
     for key in keys {
-        header.push_str(&format!(" {}", key.len()));
+        let _ = write!(header, " {}", key.len());
     }
     if let Some(tag) = tag {
-        header.push_str(&format!(" {tag}"));
+        let _ = write!(header, " {tag}");
     }
     header.push('\n');
     let mut frame = header.into_bytes();
@@ -1020,29 +1027,31 @@ fn encode_multi_get(namespace: &[u8], keys: &[Vec<u8>], tag: Option<u32>) -> Vec
 /// [<ttl-seconds>][ <tag>]\n<namespace><key-1><value-1>...<key-n><value-n>`.
 /// The optional TTL sits ahead of the tag, same convention `encode_set`'s
 /// own `[ttl] [tag]` uses.
-fn encode_multi_set(
+fn encode_multi_set<B: AsRef<[u8]>>(
     namespace: &[u8],
-    keys: &[Vec<u8>],
-    values: &[Vec<u8>],
+    keys: &[B],
+    values: &[B],
     ttl_seconds: u64,
     tag: Option<u32>,
 ) -> Vec<u8> {
     let mut header = format!("o {} {}", namespace.len(), keys.len());
+    // Issue #233: `write!` straight into `header` instead of a per-key
+    // `format!` + `push_str`.
     for (key, value) in keys.iter().zip(values) {
-        header.push_str(&format!(" {} {}", key.len(), value.len()));
+        let _ = write!(header, " {} {}", key.as_ref().len(), value.as_ref().len());
     }
     if ttl_seconds != 0 {
-        header.push_str(&format!(" {ttl_seconds}"));
+        let _ = write!(header, " {ttl_seconds}");
     }
     if let Some(tag) = tag {
-        header.push_str(&format!(" {tag}"));
+        let _ = write!(header, " {tag}");
     }
     header.push('\n');
     let mut frame = header.into_bytes();
     frame.extend_from_slice(namespace);
     for (key, value) in keys.iter().zip(values) {
-        frame.extend_from_slice(key);
-        frame.extend_from_slice(value);
+        frame.extend_from_slice(key.as_ref());
+        frame.extend_from_slice(value.as_ref());
     }
     frame
 }

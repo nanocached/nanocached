@@ -2018,8 +2018,13 @@ async fn handle_connection(
                     // Kept for the forwarding loop below — `owned_keys`/
                     // `owned_values` are moved into the `Command::MultiSet`
                     // call, and `Bytes::clone` is a cheap refcount bump.
-                    let forward_names = owned_keys.clone();
-                    let forward_values = owned_values.clone();
+                    // Issue #233: skip the clone entirely when there's no
+                    // `node_context` to forward through — the loop below
+                    // never runs in that case.
+                    let forward = config
+                        .node_context
+                        .is_some()
+                        .then(|| (owned_keys.clone(), owned_values.clone()));
 
                     let response = execute_command(
                         &request_tx,
@@ -2045,6 +2050,8 @@ async fn handle_connection(
                     // (`execute` only ever answers `Stored` for an owned
                     // key, but check anyway rather than assume it).
                     if let Some(node_context) = &config.node_context {
+                        let (forward_names, forward_values) =
+                            forward.expect("node_context.is_some() implies forward is Some");
                         for ((name, value), result) in forward_names
                             .into_iter()
                             .zip(forward_values)
@@ -4081,6 +4088,36 @@ async fn drain_pending_clears(
 /// (the process is exiting either way; clean membership beats a
 /// liveness-timeout ghost), degrading to today's crash semantics for
 /// the untransferred remainder.
+/// Issue #233: how `run_decommission`'s transfer loop disposes of one key
+/// — extracted so the deadline-vs-ownership ordering has a unit test that
+/// doesn't need a full network harness. A key this node never owned is
+/// never this node's handoff to miss, so it must be filtered out *before*
+/// the deadline check, not after — otherwise a drain that overruns its
+/// budget inflates `left_behind` with keys that were always someone
+/// else's responsibility.
+#[derive(Debug, PartialEq, Eq)]
+enum DecommissionKeyOutcome {
+    NotOwned,
+    DeadlinePassed,
+    Owned,
+}
+
+fn classify_decommission_key(
+    key: &Key,
+    before_ring: &HashRing,
+    self_name: &str,
+    replication: usize,
+    deadline_passed: bool,
+) -> DecommissionKeyOutcome {
+    if !before_ring.is_owner(key, self_name, replication) {
+        return DecommissionKeyOutcome::NotOwned;
+    }
+    if deadline_passed {
+        return DecommissionKeyOutcome::DeadlinePassed;
+    }
+    DecommissionKeyOutcome::Owned
+}
+
 async fn run_decommission(
     node_context: NodeContext,
     discovery_addrs: Vec<String>,
@@ -4172,12 +4209,19 @@ async fn run_decommission(
     let mut left_behind = 0usize;
 
     for key in keys {
-        if Instant::now() >= deadline {
-            left_behind += 1;
-            continue;
-        }
-        if !before_ring.is_owner(&key, &self_name, replication) {
-            continue;
+        match classify_decommission_key(
+            &key,
+            &before_ring,
+            &self_name,
+            replication,
+            Instant::now() >= deadline,
+        ) {
+            DecommissionKeyOutcome::NotOwned => continue,
+            DecommissionKeyOutcome::DeadlinePassed => {
+                left_behind += 1;
+                continue;
+            }
+            DecommissionKeyOutcome::Owned => {}
         }
         let Some(entrant) = after_ring
             .owners(&key, replication)
@@ -7908,6 +7952,43 @@ mod tests {
             }
         }
         assert!(promoted > 0, "the sample must exercise owned keys");
+    }
+
+    #[test]
+    fn a_classify_decommission_key_filters_ownership_before_deadline() {
+        // Issue #233: a key this node never owned must classify as
+        // `NotOwned` even once the deadline has passed — not
+        // `DeadlinePassed` — otherwise `left_behind` counts keys that
+        // were never this node's handoff to miss.
+        let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
+        let owned_key = (0..200u32)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .find(|key| before.is_owner(key, "leaver", 1))
+            .expect("the sample must contain an owned key");
+        let unowned_key = (0..200u32)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .find(|key| !before.is_owner(key, "leaver", 1))
+            .expect("the sample must contain an unowned key");
+
+        // Not owned: `NotOwned` regardless of the deadline.
+        assert_eq!(
+            classify_decommission_key(&unowned_key, &before, "leaver", 1, false),
+            DecommissionKeyOutcome::NotOwned
+        );
+        assert_eq!(
+            classify_decommission_key(&unowned_key, &before, "leaver", 1, true),
+            DecommissionKeyOutcome::NotOwned
+        );
+
+        // Owned: `Owned` before the deadline, `DeadlinePassed` after.
+        assert_eq!(
+            classify_decommission_key(&owned_key, &before, "leaver", 1, false),
+            DecommissionKeyOutcome::Owned
+        );
+        assert_eq!(
+            classify_decommission_key(&owned_key, &before, "leaver", 1, true),
+            DecommissionKeyOutcome::DeadlinePassed
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

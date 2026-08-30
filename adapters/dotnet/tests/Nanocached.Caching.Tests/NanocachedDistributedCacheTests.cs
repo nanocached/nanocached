@@ -185,6 +185,62 @@ public sealed class NanocachedDistributedCacheTests
         Assert.InRange(entry!.TtlSeconds, 1, 5);
     }
 
+    [Fact]
+    public async Task Get_treats_an_already_past_absolute_expiry_as_a_miss_and_deletes_it()
+    {
+        // Regression for issue #233: a sliding-window entry whose
+        // absolute expiry has already passed used to be floored to a
+        // fresh 1-second TTL and resurrected by Get's renew-on-read
+        // instead of being treated as expired — CeilSeconds' floor
+        // exists for a sub-second-but-still-future remainder, not for
+        // "already past". The mock never enforces TTL expiry itself (see
+        // its own doc comment), so the stale envelope is still sitting
+        // there for this Get to actually observe as past-due, wall
+        // clock included.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "stale-absolute"u8.ToArray();
+
+        await cache.SetAsync(
+            "stale-absolute", new byte[] { 1 },
+            new DistributedCacheEntryOptions
+            {
+                SlidingExpiration = TimeSpan.FromSeconds(30),
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds(150),
+            });
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+
+        byte[]? value = await cache.GetAsync("stale-absolute");
+
+        Assert.Null(value);
+        Assert.Null(node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key));
+    }
+
+    [Fact]
+    public async Task Refresh_treats_an_already_past_absolute_expiry_as_a_miss_and_deletes_it()
+    {
+        // Same regression as the Get test above, for Refresh's identical
+        // renewal path.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "stale-absolute-refresh"u8.ToArray();
+
+        await cache.SetAsync(
+            "stale-absolute-refresh", new byte[] { 1 },
+            new DistributedCacheEntryOptions
+            {
+                SlidingExpiration = TimeSpan.FromSeconds(30),
+                AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds(150),
+            });
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+
+        await cache.RefreshAsync("stale-absolute-refresh");
+
+        Assert.Null(node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key));
+    }
+
     // ── Absolute expiration ─────────────────────────────────────────
 
     [Fact]

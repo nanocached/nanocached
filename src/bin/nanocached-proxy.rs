@@ -134,6 +134,14 @@ const MAX_REQUEST_SIZE: usize = 1_048_576;
 /// default mirrors the node's `MAX_CONNECTIONS`.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 
+/// Issue #233: metrics/health/ready connections accepted at once — a
+/// small, fixed cap dedicated to the metrics listener, independent of
+/// `--max-connections` (that semaphore is only read here for the
+/// `nanocached_proxy_client_connections` gauge, it never governs this
+/// listener). A scrape storm or a stuck orchestrator probe on this port
+/// shouldn't be able to spawn an unbounded number of tasks.
+const METRICS_MAX_CONNECTIONS: usize = 16;
+
 /// Client connections idle longer than this are closed — the node's own
 /// idle policy, mirrored so a proxy hop doesn't change lifecycle
 /// expectations (SDK keep-alives flow through and reset it).
@@ -4115,11 +4123,13 @@ async fn run(
     if let Some(port) = args.metrics_port {
         let metrics_listener = TcpListener::bind((args.host.as_str(), port)).await?;
         println!("INFO metrics endpoint listening on {}:{port}", args.host);
+        let metrics_permits = Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS));
         tokio::spawn(run_metrics_server(
             metrics_listener,
             Arc::clone(&context),
             Arc::clone(&permits),
             args.max_connections,
+            metrics_permits,
         ));
     }
 
@@ -4198,12 +4208,16 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// until the first roster fetch has landed — a proxy with no ring view
 /// would answer clients `B`, so keep it out of rotation until then.
 /// Unauthenticated by design (operational telemetry; keep the port
-/// internal).
+/// internal). Issue #233: `metrics_permits` bounds this listener's own
+/// concurrent connections (`METRICS_MAX_CONNECTIONS`) — separate from
+/// `permits`/`max_connections`, which this only reads for the client
+/// connection gauge.
 async fn run_metrics_server(
     listener: TcpListener,
     context: Arc<ProxyContext>,
     permits: Arc<Semaphore>,
     max_connections: usize,
+    metrics_permits: Arc<Semaphore>,
 ) {
     loop {
         let stream = match listener.accept().await {
@@ -4219,9 +4233,20 @@ async fn run_metrics_server(
                 continue;
             }
         };
+
+        // Issue #233: this listener has no client-listener-style busy
+        // reply — cap it with its own small semaphore instead, dropping
+        // the connection outright once it's exhausted rather than
+        // spawning an unbounded number of handler tasks.
+        let Ok(metrics_permit) = Arc::clone(&metrics_permits).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+
         let context = Arc::clone(&context);
         let permits = Arc::clone(&permits);
         tokio::spawn(async move {
+            let _metrics_permit = metrics_permit;
             let _ = timeout(
                 Duration::from_secs(5),
                 serve_metrics_connection(stream, context, permits, max_connections),
@@ -6212,6 +6237,7 @@ mod tests {
             Arc::clone(&context),
             Arc::clone(&permits),
             8,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
         ));
 
         let (status, body) = http_get(&addr, "/metrics").await;
@@ -6245,6 +6271,72 @@ mod tests {
             .unwrap();
         let (status, _) = http_get(&addr, "/readyz").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_listener_caps_its_own_concurrent_connections() {
+        // Issue #233: the metrics listener has no client-listener-style
+        // busy reply, so it needs its own connection cap — a scrape
+        // storm shouldn't be able to spawn an unbounded number of
+        // handler tasks. With the cap exhausted, a new connection must
+        // be dropped rather than answered.
+        let (ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(4);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: ring_rx,
+            refresh_now: refresh_tx,
+            drain: drain_rx,
+            backends: SharedBackends::new(),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        });
+        drop(ring_tx);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let metrics_permits = Arc::new(Semaphore::new(1));
+        // Hold the listener's only permit, as if one scrape were already
+        // in flight.
+        let held = Arc::clone(&metrics_permits).try_acquire_owned().unwrap();
+        tokio::spawn(run_metrics_server(
+            listener,
+            Arc::clone(&context),
+            Arc::new(Semaphore::new(8)),
+            8,
+            metrics_permits,
+        ));
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        // Some platforms (macOS observed) answer a close of a socket that
+        // still has this test's unread request bytes sitting in its
+        // kernel buffer with a TCP RST instead of a clean FIN — either
+        // way, nothing was ever answered.
+        match stream.read_to_end(&mut response).await {
+            Ok(read) => assert_eq!(read, 0, "got a response: {response:?}"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ),
+                "unexpected read error over the metrics cap: {error}"
+            ),
+        }
+        assert!(
+            response.is_empty(),
+            "over the metrics cap, the connection must be dropped with no response, got {response:?}"
+        );
+
+        drop(held);
+        // Once the permit is free again, a scrape gets answered normally.
         let (status, _) = http_get(&addr, "/healthz").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
     }
@@ -6333,6 +6425,7 @@ mod tests {
             Arc::clone(&context),
             Arc::new(Semaphore::new(4)),
             4,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
         ));
 
         let (status, _) = http_get(&addr, "/readyz").await;

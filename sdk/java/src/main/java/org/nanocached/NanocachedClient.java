@@ -2261,16 +2261,44 @@ public final class NanocachedClient implements AutoCloseable {
             legs.add(submitReplicaWrite(leg));
         }
 
+        // Always drain every leg, even after one has already failed —
+        // same stance multiGetPass takes (issue #230); see
+        // drainLegsKeepingFirstBug's own doc comment for issue #233.
+        RuntimeException legBug = drainLegsKeepingFirstBug(legs);
+        if (legBug != null) throw legBug;
+        return retry;
+    }
+
+    /** Drains every leg in {@code legs}, keeping only the <em>first</em>
+     * bug to rethrow to the caller and reporting every additional leg's
+     * bug via {@link #reportBackgroundWriteBug} instead of discarding it
+     * — the shared stance {@link #multiSetPass} and {@link
+     * #clearFanOutOnce} both take, mirroring {@link #multiGetPass}'s own
+     * equivalent loop (issue #230). Issue #233: both callers used to just
+     * overwrite a single tracked bug on every failing leg in turn, so
+     * only the LAST leg's bug ever reached the caller and every earlier
+     * one vanished without even being counted. Package-private rather
+     * than private so a test can drive it directly with synthetic legs,
+     * without needing a real bug to escape a network round trip (every
+     * protocol-level failure this SDK produces is already wrapped as a
+     * {@link NanocachedException} and caught well before here — a
+     * genuine, uncaught bug is by definition not reproducible that way).
+     * Returns the first bug, or {@code null} if every leg succeeded. */
+    RuntimeException drainLegsKeepingFirstBug(List<CompletableFuture<Void>> legs) {
         RuntimeException legBug = null;
         for (CompletableFuture<Void> pending : legs) {
             try {
                 pending.join();
             } catch (CompletionException wrapped) {
-                legBug = unwrapReplicaBug(wrapped);
+                RuntimeException bug = unwrapReplicaBug(wrapped);
+                if (legBug == null) {
+                    legBug = bug;
+                } else {
+                    reportBackgroundWriteBug(bug);
+                }
             }
         }
-        if (legBug != null) throw legBug;
-        return retry;
+        return legBug;
     }
 
     /** Dispatches one owner's {@code o} sub-batch (via {@link
@@ -3596,9 +3624,9 @@ public final class NanocachedClient implements AutoCloseable {
      * than throwing — {@link #fanOutClear} decides whether that's grounds
      * for a refresh-and-retry or a final error. A connection-level
      * failure counts as a failure here; a genuine programming bug is not
-     * caught and propagates once every leg has been joined, mirroring
-     * {@link #write}'s replicaBug handling via {@link
-     * #unwrapReplicaBug}. */
+     * caught, and the first one propagates once every leg has been
+     * joined ({@link #drainLegsKeepingFirstBug}), mirroring {@link
+     * #write}'s replicaBug handling via {@link #unwrapReplicaBug}. */
     private Set<String> clearFanOutOnce(List<String> names, byte[] namespace) {
         Set<String> failed = ConcurrentHashMap.newKeySet();
         List<CompletableFuture<Void>> futures = new ArrayList<>(names.size());
@@ -3615,14 +3643,8 @@ public final class NanocachedClient implements AutoCloseable {
             }));
         }
 
-        RuntimeException bug = null;
-        for (CompletableFuture<Void> future : futures) {
-            try {
-                future.join();
-            } catch (CompletionException wrapped) {
-                bug = unwrapReplicaBug(wrapped);
-            }
-        }
+        // See drainLegsKeepingFirstBug's own doc comment (issue #233).
+        RuntimeException bug = drainLegsKeepingFirstBug(futures);
         if (bug != null) throw bug;
         return failed;
     }

@@ -1,6 +1,7 @@
 use crate::cache::CacheStats;
 use crate::key::Key;
 use bytes::Bytes;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 /// Issue #129: `Response::Incremented`'s optional `<ttl-seconds>` header
@@ -154,8 +155,7 @@ fn encode_multi(entries: &[MultiEntry], tag: Option<u32>) -> Vec<u8> {
     for entry in entries {
         match entry {
             MultiEntry::Value(value) => {
-                header.push(' ');
-                header.push_str(&value.len().to_string());
+                let _ = write!(header, " {}", value.len());
                 values_len += value.len();
             }
             MultiEntry::Miss => header.push_str(" -"),
@@ -164,8 +164,7 @@ fn encode_multi(entries: &[MultiEntry], tag: Option<u32>) -> Vec<u8> {
     }
 
     if let Some(tag) = tag {
-        header.push(' ');
-        header.push_str(&tag.to_string());
+        let _ = write!(header, " {tag}");
     }
     header.push('\n');
 
@@ -196,8 +195,7 @@ fn encode_multi_ack(entries: &[MultiAckEntry], tag: Option<u32>) -> Vec<u8> {
     }
 
     if let Some(tag) = tag {
-        header.push(' ');
-        header.push_str(&tag.to_string());
+        let _ = write!(header, " {tag}");
     }
     header.push('\n');
 
