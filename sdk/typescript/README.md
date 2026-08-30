@@ -394,13 +394,19 @@ real datastore for that.
 `delta` must be a safe integer (`Number.isInteger` and within
 `±(2^53 - 1)`) — unlike the wire protocol's own signed 64-bit range, a JS
 `number` can't exactly represent every value out that far, so this SDK
-validates and round-trips only the safe range and rejects the rest with a
-`RangeError`; the counter value returned is parsed back the same way and
-carries the same caveat for very large counts.
+validates `delta` up front and rejects an unsafe one with a `RangeError`.
+The *returned* counter value is checked the same way: if applying `delta`
+pushes the counter past `Number.MAX_SAFE_INTEGER`, `incr`/`decr` reject
+with `CounterOutOfRangeError` instead of silently handing back a rounded
+`number` — the increment itself still happened (nothing is undone), only
+the value returned from that particular call is refused.
 
 In a cluster, only the primary owner ever runs the increment — replicas
-receive its literal result as an ordinary `set` instead, so a replica can
-never drift from the primary by re-deriving the increment on its own.
+receive its literal result as an ordinary `set` instead, using the exact
+digit bytes the primary answered with (never a value re-derived from the
+possibly-rounded `number`), so a replica can never drift from the primary
+either by re-deriving the increment on its own or by a rounding mismatch,
+even once a counter passes `Number.MAX_SAFE_INTEGER`.
 
 ## Batched get and set
 
@@ -523,8 +529,9 @@ spec.
 - `client.delete(key)` — resolves `boolean` (whether the key existed)
 - `client.incr(key, delta = 1)` / `client.decr(key, delta = 1)` — resolves
   `number | null` (`null` on a miss); throws `NotNumericError` if the
-  stored value isn't an integer `incr` can operate on; see
-  [`incr`/`decr`](#incr--decr) above
+  stored value isn't an integer `incr` can operate on, or
+  `CounterOutOfRangeError` if the new counter exceeds
+  `Number.MAX_SAFE_INTEGER`; see [`incr`/`decr`](#incr--decr) above
 - `client.getMany(keys)` — resolves `Map<string, string>`, missing keys
   simply absent; `client.getManyBytes(keys)` — resolves `Map<string,
   Buffer>`; see [Batched get and set](#batched-get-and-set) above
@@ -574,8 +581,8 @@ Every error the SDK itself raises — `AlreadyClosedError`,
 `getMany`/`getManyBytes` when a batch is still partially wrong-node
 after one refresh — see [Batched get and set](#batched-get-and-set)),
 `ConnectionLostError`, `RetryableError`,
-`NotNumericError`, `DecompressionError`, `DiscoveryBusyError`, and
-protocol/auth failures —
+`NotNumericError`, `CounterOutOfRangeError`, `DecompressionError`,
+`DiscoveryBusyError`, and protocol/auth failures —
 extends the exported `NanocachedError` base class, so `error instanceof
 NanocachedError` distinguishes an expected nanocached failure from
 everything else. Node system errors from the socket itself

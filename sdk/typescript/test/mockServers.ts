@@ -730,7 +730,12 @@ export async function startMockNode(
               break;
             }
 
-            const newValueBytes = Buffer.from(String(Number(existingText) + delta), "ascii");
+            // BigInt, not `Number(existingText) + delta`: a test seeding
+            // `existingText` past 2^53 (issue #224) needs this mock to
+            // compute the exact i64 sum the real server would, not one
+            // already rounded by the mock's own arithmetic before it ever
+            // reaches the client under test.
+            const newValueBytes = Buffer.from(String(BigInt(existingText) + BigInt(delta)), "ascii");
             targetStore.set(key, newValueBytes);
 
             const ttlSeconds = ttlsFor(namespace).get(key) ?? 0;

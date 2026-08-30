@@ -6,6 +6,7 @@ import {
   AuthenticationError,
   ConnectionLostError,
   contentDigest,
+  CounterOutOfRangeError,
   DecompressionError,
   DiscoveryBusyError,
   NanocachedClient,
@@ -1558,6 +1559,50 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
       await node.close();
     }
   });
+
+  it("returns a number right up to Number.MAX_SAFE_INTEGER, then rejects with CounterOutOfRangeError past it (issue #224)", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("counter", String(Number.MAX_SAFE_INTEGER - 1));
+        assert.equal(await client.incr("counter"), Number.MAX_SAFE_INTEGER);
+
+        // One past MAX_SAFE_INTEGER (2^53, still exactly representable as
+        // a double but not a "safe" integer) must reject rather than
+        // silently hand back a value that isn't necessarily what the
+        // server actually stored.
+        await assert.rejects(client.incr("counter"), CounterOutOfRangeError);
+        // The increment itself still happened — the throw only refuses to
+        // report the value back to this call.
+        assert.equal(node.store.get("counter")?.toString("ascii"), String(Number.MAX_SAFE_INTEGER + 1));
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("rejects with CounterOutOfRangeError at 2^53+1 without rounding the stored value", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const twoToThe53 = 2n ** 53n;
+        await client.set("counter", twoToThe53.toString());
+        await assert.rejects(client.incr("counter"), CounterOutOfRangeError);
+        // The exact digits the server stored (2^53 + 1) must be intact —
+        // not `String(Number("...53"))`, which would round back down to
+        // 2^53 (JS's ties-to-even rule on the first unsafe integer).
+        assert.equal(node.store.get("counter")?.toString("ascii"), (twoToThe53 + 1n).toString());
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
 });
 
 describe("NanocachedClient compare-and-set against a single node (issue #141)", () => {
@@ -2052,6 +2097,38 @@ describe("NanocachedClient incr/decr cluster replication (issue #129) — primar
       assert.equal(replica.mock.incrCount(), 0);
       assert.equal(replica.mock.lastCommand(), "S");
       assert.equal(replica.mock.store.get(key)?.toString("ascii"), "7");
+    } finally {
+      client.close();
+      await cluster.close();
+    }
+  });
+
+  it("forwards the primary's exact digit bytes to the replica past Number.MAX_SAFE_INTEGER, and rejects the caller with CounterOutOfRangeError (issue #224)", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-replicates-exact-digits-past-2-53";
+      const { primary, replica } = cluster.ownerOf(key);
+
+      // 2^53: exactly representable as a double, but one past it is not —
+      // incrementing by 1 lands on 2^53 + 1 (9007199254740993), which
+      // `String(Number("9007199254740993"))` rounds back down to
+      // "9007199254740992" (JS's ties-to-even rule). Before this fix, a
+      // buggy replica forward would send that rounded string instead of
+      // the primary's actual result.
+      const twoToThe53 = 2n ** 53n;
+      await client.set(key, twoToThe53.toString());
+      const expected = (twoToThe53 + 1n).toString();
+
+      await assert.rejects(client.incr(key), CounterOutOfRangeError);
+
+      assert.equal(primary.mock.incrCount(), 1, "primary must receive exactly one `i` frame");
+      assert.equal(replica.mock.incrCount(), 0, "replica must never receive an `i` frame");
+      assert.equal(replica.mock.lastCommand(), "S", "replica must receive the result as a set");
+      // The critical assertion: both copies hold the primary's exact
+      // digit bytes, never a value rounded through a JS `number`.
+      assert.equal(primary.mock.store.get(key)?.toString("ascii"), expected);
+      assert.equal(replica.mock.store.get(key)?.toString("ascii"), expected);
     } finally {
       client.close();
       await cluster.close();

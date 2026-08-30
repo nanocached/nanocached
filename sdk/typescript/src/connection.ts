@@ -113,6 +113,25 @@ export class NotNumericError extends NanocachedError {
   }
 }
 
+/** Thrown by incr/decr (issue #224) when the counter's new value, after
+ * applying `delta`, falls outside `±Number.MAX_SAFE_INTEGER` — the wire
+ * protocol's counter is a full signed 64-bit integer, but a JS `number`
+ * can only represent integers exactly up to 2^53 - 1. Returning a rounded
+ * `number` past that point would silently misreport the counter (and,
+ * before this fix, corrupt replicas that re-encoded the rounded value —
+ * see `NanocachedClient`'s `incrOnOwners`, which now forwards the exact
+ * digit bytes received from the primary instead). The write itself always
+ * still succeeds and is still replicated byte-exact; only the value
+ * handed back from this call is unrepresentable as a `number`. */
+export class CounterOutOfRangeError extends NanocachedError {
+  constructor(raw: string) {
+    super(
+      `nanocached: counter value ${raw} exceeds the safe integer range (±${Number.MAX_SAFE_INTEGER}) and cannot be returned as a number — the write itself succeeded and was replicated exactly`,
+    );
+    this.name = "CounterOutOfRangeError";
+  }
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -209,17 +228,28 @@ export class Connection {
    * default namespace, matching `namespace`'s own default here). Returns
    * `null` on a miss, matching `get`'s own miss convention; throws
    * `NotNumericError` when the stored value isn't INCR's counter grammar
-   * (or applying `delta` would overflow). The returned `value` is the new
-   * counter, decimal-parsed; `ttlSeconds` is the entry's remaining TTL,
-   * present only when it has one. This is the single-node primitive only —
-   * `NanocachedClient` is what turns a successful primary increment into a
-   * cluster-wide, drift-free write by forwarding the literal result to
-   * replicas as an ordinary `set`, never replaying `i` there (see its own
-   * doc comment). */
-  async incr(key: string | Uint8Array, delta: number, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<{ value: number; ttlSeconds?: number } | null> {
+   * (or applying `delta` would overflow). `value` is the new counter,
+   * decimal-parsed as a `number` — imprecisely once it passes
+   * `Number.MAX_SAFE_INTEGER` (issue #224), which is why `raw` is also
+   * returned alongside it: the exact ASCII digit bytes this node answered
+   * with, unrounded, for a caller that needs to forward them byte-exact
+   * rather than trust the parsed `number`. `ttlSeconds` is the entry's
+   * remaining TTL, present only when it has one. This is the single-node
+   * primitive only — `NanocachedClient` is what turns a successful
+   * primary increment into a cluster-wide, drift-free write by forwarding
+   * `raw` to replicas as an ordinary `set` (never `String(value)`, which
+   * would re-round it), never replaying `i` there (see its own doc
+   * comment); it's also what decides whether `value` is safe to hand back
+   * to its own caller, throwing `CounterOutOfRangeError` when it isn't. */
+  async incr(
+    key: string | Uint8Array,
+    delta: number,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<{ value: number; raw: Buffer; ttlSeconds?: number } | null> {
     const response = await this.send((tag) => encodeIncr(toBytes(key), delta, tag, namespace));
     if (response.kind === "incremented") {
-      return { value: Number((response.value ?? Buffer.alloc(0)).toString("ascii")), ttlSeconds: response.ttlSeconds };
+      const raw = response.value ?? Buffer.alloc(0);
+      return { value: Number(raw.toString("ascii")), raw, ttlSeconds: response.ttlSeconds };
     }
     if (response.kind === "notFound") return null;
     if (response.kind === "notNumeric") throw new NotNumericError();
