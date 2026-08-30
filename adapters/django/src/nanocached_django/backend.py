@@ -48,6 +48,29 @@ from nanocached import NanocachedClient
 # this namespace unless the CACHES entry overrides it (issue #105).
 _DEFAULT_NAMESPACE = "django"
 
+# issue #231: every other adapter exposes at least tls/ca/compress, but
+# this one only ever read NAMESPACE/SECRET/CLOSE_ON_REQUEST, leaving a
+# Django deployment stuck on plaintext with no way to opt into TLS,
+# compression, fire-and-forget replication, read repair, hedged reads or
+# a non-default reconnect cooldown. Maps each upper-case OPTIONS key onto
+# the NanocachedClient.connect() keyword it forwards to — see that
+# method's signature (sdk/python/src/nanocached/client.py) for what each
+# one does and its type/default. Deliberately does *not* include
+# ``via_proxy``: that flag changes which roster connect() fetches
+# (proxies vs. nodes) rather than tuning an established connection, and
+# LOCATION already tells this backend which addresses it was given, so
+# there's no Django-level concept it would attach to.
+_CONNECT_OPTION_KWARGS: dict[str, str] = {
+    "TLS": "tls",
+    "CA": "ca",
+    "COMPRESS": "compress",
+    "COMPRESSION_THRESHOLD": "compression_threshold",
+    "FIRE_AND_FORGET_REPLICAS": "fire_and_forget_replicas",
+    "READ_REPAIR": "read_repair",
+    "READ_HEDGE_AFTER": "read_hedge_after",
+    "RECONNECT_COOLDOWN": "reconnect_cooldown",
+}
+
 # issue #185: how many times _run() re-tries _ensure_started() when a
 # concurrent shutdown()/close() raced it out from under a snapshot of
 # (loop, namespace handle) — see _run()'s own docstring. One retry covers
@@ -151,6 +174,15 @@ class NanocachedCache(BaseCache):
         # touched alias after every request, so real teardown there is
         # opt-in, django-redis-style.
         self._close_on_request = bool(options.get("CLOSE_ON_REQUEST", False))
+        # issue #231: only the OPTIONS keys actually present are forwarded
+        # to connect() — a key this CACHES entry never mentions must leave
+        # the SDK's own default in force, not silently pass e.g.
+        # ``compress=False`` where connect() already defaults to that.
+        self._connect_kwargs = {
+            kwarg: options[option_key]
+            for option_key, kwarg in _CONNECT_OPTION_KWARGS.items()
+            if option_key in options
+        }
 
         # The sync/async bridge's state — all None until _ensure_started()
         # first runs (lazily, on the first cache operation, not here:
@@ -213,6 +245,7 @@ class NanocachedCache(BaseCache):
         self._client = await NanocachedClient.connect(
             self._addresses,
             auth_secret=self._secret,
+            **self._connect_kwargs,
         )
         self._namespace_handle = self._client.namespace(self._namespace)
 

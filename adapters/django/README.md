@@ -46,6 +46,14 @@ CACHES = {
         "OPTIONS": {
             "NAMESPACE": "django",   # default "django"
             "SECRET": "...",         # optional; passed to connect() as auth_secret
+            "TLS": True,             # optional; connect() tls, default False
+            "CA": "/path/ca.pem",    # optional; connect() ca, only meaningful with TLS
+            "COMPRESS": True,        # optional; connect() compress, default False
+            "COMPRESSION_THRESHOLD": 512,     # optional; connect() compression_threshold
+            "FIRE_AND_FORGET_REPLICAS": True, # optional; connect() fire_and_forget_replicas
+            "READ_REPAIR": True,              # optional; connect() read_repair
+            "READ_HEDGE_AFTER": 0.05,         # optional; connect() read_hedge_after (seconds)
+            "RECONNECT_COOLDOWN": 1.0,        # optional; connect() reconnect_cooldown (seconds)
         },
         "TIMEOUT": 300,               # Django's own key, honored as usual
         "KEY_PREFIX": "...",
@@ -59,6 +67,19 @@ servers fronting a cluster — same as `NanocachedClient.connect()`, this
 backend doesn't need to be told which; it finds out from the server's own
 handshake. A `LOCATION` list is one address per entry; a single string may
 also carry more than one address separated by `,`/`;`.
+
+`TLS`/`CA`/`COMPRESS`/`COMPRESSION_THRESHOLD`/`FIRE_AND_FORGET_REPLICAS`/
+`READ_REPAIR`/`READ_HEDGE_AFTER`/`RECONNECT_COOLDOWN` are forwarded
+straight through to the matching `NanocachedClient.connect()` keyword
+(`tls`, `ca`, `compress`, `compression_threshold`,
+`fire_and_forget_replicas`, `read_repair`, `read_hedge_after`,
+`reconnect_cooldown` — see that method's docstring for what each one
+does) — each is optional and, when the OPTIONS entry omits it, the SDK's
+own default is what actually takes effect, not some second default
+chosen by this backend. `CA` is a filesystem path to a CA bundle and only
+matters when `TLS` is also true. `READ_HEDGE_AFTER` and
+`RECONNECT_COOLDOWN` are seconds (`float`); everything else here is a
+`bool` except `COMPRESSION_THRESHOLD`, an `int` byte count.
 
 ## The sync/async bridge
 
