@@ -17,6 +17,15 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+/// Mirrors sdk/rust/src/connection.rs's MAX_VALUE_LENGTH — a declared
+/// per-value length beyond this is corrupt or hostile, never a
+/// legitimate value from this benchmark's own value-size argument.
+const MAX_VALUE_LEN: usize = 2 * 1024 * 1024;
+
+/// Mirrors sdk/rust/src/connection.rs's MAX_MULTI_GET_RESPONSE_BYTES —
+/// bounds an `M` reply's hit bodies summed across the whole reply.
+const MAX_MULTI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 fn usage() -> ! {
     eprintln!(
         "usage:\n  \
@@ -149,6 +158,10 @@ async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut 
 
     if let Some(length) = line.strip_prefix("V ") {
         let length: usize = length.parse().expect("bad value length");
+        assert!(
+            length <= MAX_VALUE_LEN,
+            "V length {length} exceeds sanity cap {MAX_VALUE_LEN}"
+        );
         let mut value = vec![0u8; length];
         reader.read_exact(&mut value).await.expect("read value");
         true
@@ -181,11 +194,19 @@ async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mu
             "-" | "W" => {}
             length => {
                 let length: usize = length.parse().expect("bad M roster length");
+                assert!(
+                    length <= MAX_VALUE_LEN,
+                    "M entry length {length} exceeds sanity cap {MAX_VALUE_LEN}"
+                );
                 total_bytes += length;
                 hits += 1;
             }
         }
     }
+    assert!(
+        total_bytes <= MAX_MULTI_RESPONSE_BYTES,
+        "M reply total {total_bytes} exceeds sanity cap {MAX_MULTI_RESPONSE_BYTES}"
+    );
 
     let mut body = vec![0u8; total_bytes];
     reader.read_exact(&mut body).await.expect("read M values");
