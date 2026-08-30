@@ -249,6 +249,11 @@ export async function startMockNode(
      * node that comes back on the address discovery already advertised
      * (issue #67 tests). */
     port?: number;
+    /** Delay every `A` reply (accept or reject) by `ms` — a node that's
+     * slow to answer identify, not merely slow to reply to G/S/D (issue
+     * #226: refreshNodeList must dial several such nodes concurrently, not
+     * one after another). */
+    authDelayMs?: number;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -368,8 +373,15 @@ export async function startMockNode(
                 ? secret.length > 0
                 : secret.equals(Buffer.from(options.requiredSecret, "utf8"));
             tagged = accepted && options.supportTags === true && parts[2] === "T";
-            socket.write(accepted ? (tagged ? "OnT\n" : "On\n") : "En\n");
-            if (!accepted) socket.end();
+            const sendAuthReply = () => {
+              socket.write(accepted ? (tagged ? "OnT\n" : "On\n") : "En\n");
+              if (!accepted) socket.end();
+            };
+            if (options.authDelayMs !== undefined && options.authDelayMs > 0) {
+              setTimeout(sendAuthReply, options.authDelayMs);
+            } else {
+              sendAuthReply();
+            }
             break;
           }
 

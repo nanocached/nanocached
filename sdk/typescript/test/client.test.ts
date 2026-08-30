@@ -4749,3 +4749,91 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 });
+
+describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #226)", () => {
+  // refreshNodeList must dial every newly listed node concurrently, the
+  // way connect()'s own bootstrap dial already does (issue #67) — not one
+  // at a time in a for...of loop, which would stall every waiting
+  // get/set/delete (maybeRefreshNodeList shares this one in-flight
+  // promise) for up to N x the per-node dial time during a scale-out or a
+  // mass rejoin after a partition heals.
+
+  it("dials several slow-to-accept new nodes concurrently, not one at a time", async () => {
+    const bootNode = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
+    const authDelayMs = 200;
+    const newNodeCount = 4;
+    const newNodes = await Promise.all(
+      Array.from({ length: newNodeCount }, () => startMockNode({ authDelayMs })),
+    );
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        discovery.setNodes([
+          { name: "boot", address: bootNode.address },
+          ...newNodes.map((node, i) => ({ name: `new-${i}`, address: node.address })),
+        ]);
+
+        const start = Date.now();
+        // Forces a fresh refresh against the now-larger discovery response
+        // (same direct-call pattern the other refreshNodeList tests use).
+        await (client as any).refreshNodeList();
+        const elapsed = Date.now() - start;
+
+        // Sequential dialing would take at least newNodeCount * authDelayMs
+        // (800ms here); concurrent dialing takes about one dial's worth
+        // regardless of how many new nodes joined at once.
+        assert.ok(
+          elapsed < authDelayMs * 2,
+          `refresh took ${elapsed}ms — expected close to one dial (${authDelayMs}ms), not ${newNodeCount} serial dials`,
+        );
+
+        const members = (client as any).target.members as Map<string, { connection: unknown }>;
+        assert.equal(members.size, newNodeCount + 1);
+        for (let i = 0; i < newNodeCount; i++) {
+          assert.ok(members.get(`new-${i}`)?.connection !== null, `new-${i} was not installed with a live connection`);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), bootNode.close(), ...newNodes.map((node) => node.close())]);
+    }
+  });
+
+  it("one failing dial does not prevent the other new nodes from being installed", async () => {
+    const bootNode = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const deadPort = await unusedPort();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        assert.equal(client.stats().refreshFailures, 0);
+        discovery.setNodes([
+          { name: "boot", address: bootNode.address },
+          { name: "node-a", address: nodeA.address },
+          { name: "dead", address: `127.0.0.1:${deadPort}` },
+          { name: "node-b", address: nodeB.address },
+        ]);
+
+        await (client as any).refreshNodeList();
+
+        // The unreachable new node is counted and skipped — it never even
+        // gets a placeholder member (unlike connect()'s tolerant bootstrap,
+        // issue #67, a refresh just leaves it out and retries later) — but
+        // the two reachable new nodes dialed alongside it are still
+        // installed.
+        assert.equal(client.stats().refreshFailures, 1);
+        const members = (client as any).target.members as Map<string, { connection: unknown }>;
+        assert.ok(members.get("node-a")?.connection !== null, "node-a was not installed");
+        assert.ok(members.get("node-b")?.connection !== null, "node-b was not installed");
+        assert.ok(!members.has("dead"), "the unreachable node should not appear in members at all");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), bootNode.close(), nodeA.close(), nodeB.close()]);
+    }
+  });
+});
