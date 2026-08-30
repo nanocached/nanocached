@@ -626,6 +626,13 @@ struct RegistryState {
     /// from, so it travels wherever the registry does — no plumbing
     /// through `ConnectionConfig`/`handle_connection`.
     heartbeat_ack: Mutex<Option<CachedAck>>,
+    /// The `L` response, cached the same way and keyed off the same
+    /// `generation` (issue #298): `L` renders exactly the same
+    /// `roster_snapshot` (the `Joined` set, addresses, and
+    /// `reported_replication` votes) that `cached_heartbeat_ack` already
+    /// invalidates on every relevant mutation, so no separate bump is
+    /// needed here — see `cached_list_response`.
+    list_cache: Mutex<Option<CachedList>>,
 }
 
 impl Default for RegistryState {
@@ -637,6 +644,7 @@ impl Default for RegistryState {
             joins_abandoned_total: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             heartbeat_ack: Mutex::new(None),
+            list_cache: Mutex::new(None),
         }
     }
 }
@@ -666,6 +674,21 @@ struct CachedAck {
     generation: u64,
     replication: usize,
     ack: Arc<[u8]>,
+}
+
+/// The cached `L` response and the `generation` it was built at (issue
+/// #298) — `CachedAck`'s sibling for `RegistryState::list_cache`. `L`
+/// renders `roster_snapshot`'s `Joined` set/addresses and the
+/// `reported_replication` vote tally, exactly what `generation` already
+/// tracks for `CachedAck`, so the two share one invalidation signal. The
+/// refuse decision (`B\n`) is folded into `response`, same as `CachedAck`
+/// folds its withheld-roster case into `ack`; the `list_ready_at` startup
+/// grace is time-, not membership-gated, so it stays outside the cache and
+/// is handled by the caller.
+struct CachedList {
+    generation: u64,
+    replication: usize,
+    response: Arc<[u8]>,
 }
 
 /// Tracks the single in-progress join (staged node join: only one node moves
@@ -3225,6 +3248,11 @@ impl RosterSnapshot {
     }
 }
 
+// Issue #298: no non-test caller needs the unlocked convenience form any
+// more — `cached_heartbeat_ack` and `cached_list_response` both already
+// hold the registry lock when they build a snapshot, so they call
+// `roster_snapshot_locked` directly. Kept for tests, which don't.
+#[cfg(test)]
 fn roster_snapshot(registry: &Registry, replication: usize) -> RosterSnapshot {
     roster_snapshot_locked(&lock(registry), replication)
 }
@@ -3341,6 +3369,132 @@ fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
         });
     }
     ack
+}
+
+/// The `L` response: `N <count> <replication>\n` then one `<name-len>
+/// <addr-len>\n<name><addr>\n` per `Joined` node — `build_heartbeat_ack`'s
+/// sibling for `L`'s own `N` tag (see its doc comment; the two share the
+/// same per-entry layout, so an SDK parses either the same way).
+fn build_list_response(nodes: &[(String, String)], replication: usize) -> Vec<u8> {
+    let mut response = format!("N {} {}\n", nodes.len(), replication).into_bytes();
+    for (name, addr) in nodes {
+        response.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
+        response.extend_from_slice(name.as_bytes());
+        response.extend_from_slice(addr.as_bytes());
+        response.push(b'\n');
+    }
+    response
+}
+
+/// The `L` response, cached and rebuilt only when the registry's
+/// `generation` has moved since the last build (issue #298) —
+/// `cached_heartbeat_ack`'s sibling for `L`. Before this, every `L` re-ran
+/// the vote tally and re-serialized the roster (`roster_snapshot`) per
+/// request — O(registry) work with none of #61's excuse (every `H`
+/// fanning the roster out on a timer); here it was simply paid again on
+/// every single `L` call. `L` renders exactly the same `roster_snapshot`
+/// state `cached_heartbeat_ack` already invalidates on — the `Joined`
+/// set, addresses, and `reported_replication` votes — so this reuses
+/// `RegistryState::generation` rather than needing its own bump call
+/// sites. `Q` (`ListProxies`) is unaffected and needs none either: it
+/// renders the entirely separate `proxies` map, never `roster_snapshot`
+/// (see `ProxyInfo`'s doc comment — "never affect `L`/`H`"), so a proxy
+/// `Y` announce correctly leaves this cache alone.
+///
+/// The refuse case (issue #30's amended majority check, a bare `B\n`) is
+/// folded into the cached bytes, same as `cached_heartbeat_ack` folds its
+/// own withheld-roster case into `ack`; the caller tells the two apart by
+/// the leading byte (`B` vs `N`) rather than this returning a separate
+/// flag. The dissenting-vote WARN logging the un-cached handler used to
+/// do on every request now fires only on an actual rebuild — a cache hit
+/// skips it exactly as it skips re-tallying the vote in the first place.
+fn cached_list_response(registry: &Registry, replication: usize) -> Arc<[u8]> {
+    let generation = registry.generation.load(Ordering::Relaxed);
+    {
+        let cached = registry
+            .list_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = cached.as_ref()
+            && current.generation == generation
+            && current.replication == replication
+        {
+            return Arc::clone(&current.response);
+        }
+    }
+
+    // Rebuild: read the generation under the registry lock so it matches
+    // the roster this snapshot serializes (a concurrent bump lands either
+    // fully before or fully after this critical section) — mirrors
+    // `cached_heartbeat_ack`.
+    let snapshot;
+    let built_generation;
+    {
+        let guard = lock(registry);
+        built_generation = registry.generation.load(Ordering::Relaxed);
+        snapshot = roster_snapshot_locked(&guard, replication);
+    }
+
+    // Issue #30 (amended, HIGH-severity follow-up): see the module docs'
+    // `L` entry and `RosterSnapshot::refuse`'s own doc comment for why
+    // replication-factor disagreement gets a strict-majority vote rather
+    // than refusing on any dissent. Logged here, on rebuild only, rather
+    // than on every request as the un-cached handler used to.
+    if !snapshot.dissenting.is_empty() {
+        if snapshot.refuse() {
+            eprintln!(
+                "WARN refusing L: {} of {} voting Joined nodes report a \
+                 replication factor different from this replica's own \
+                 --replication-factor {} (a strict majority) — dissenting: {} — \
+                 discovery replicas have drifted out of alignment; the operator \
+                 must align --replication-factor across every replica (see \
+                 Discovery HA)",
+                snapshot.dissenting.len(),
+                snapshot.dissenting.len() + snapshot.agreeing,
+                replication,
+                snapshot.dissenting.join(", ")
+            );
+        } else {
+            // Logged on rebuild rather than rate-limited or deduplicated
+            // against a remembered dissenter set: simpler, and with the
+            // cache in place a persistent single dissenter now logs only
+            // as often as membership actually changes, not per `L` call.
+            eprintln!(
+                "WARN L served despite {} of {} voting Joined nodes reporting a \
+                 replication factor different from this replica's own \
+                 --replication-factor {} — not yet a strict majority, so still \
+                 served, but worth investigating: {}",
+                snapshot.dissenting.len(),
+                snapshot.dissenting.len() + snapshot.agreeing,
+                replication,
+                snapshot.dissenting.join(", ")
+            );
+        }
+    }
+
+    let response: Arc<[u8]> = if snapshot.refuse() {
+        Arc::from(b"B\n".as_slice())
+    } else {
+        Arc::from(build_list_response(&snapshot.nodes, replication).as_slice())
+    };
+
+    let mut cached = registry
+        .list_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Only advance the cache — a concurrent rebuild that already stored a
+    // newer generation for this same replication must not be overwritten
+    // with this older one.
+    if cached.as_ref().is_none_or(|current| {
+        current.replication != replication || current.generation <= built_generation
+    }) {
+        *cached = Some(CachedList {
+            generation: built_generation,
+            replication,
+            response: Arc::clone(&response),
+        });
+    }
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3769,57 +3923,19 @@ async fn handle_connection(
                 // then serve, which would otherwise let a `B\n`-worthy
                 // state be served as a valid `N` list (or vice versa) for
                 // one request.
-                let RosterSnapshot {
-                    agreeing,
-                    dissenting,
-                    nodes,
-                } = roster_snapshot(&registry, config.replication);
-                // A tie does not refuse: strictly more dissenters than
-                // agreers is required, so e.g. 1-vs-1 (or 0-vs-0, the
-                // common case) is served.
-                let refuse = dissenting.len() > agreeing;
-                if !dissenting.is_empty() {
-                    if refuse {
-                        eprintln!(
-                            "WARN refusing L: {} of {} voting Joined nodes report a \
-                             replication factor different from this replica's own \
-                             --replication-factor {} (a strict majority) — dissenting: {} — \
-                             discovery replicas have drifted out of alignment; the operator \
-                             must align --replication-factor across every replica (see \
-                             Discovery HA)",
-                            dissenting.len(),
-                            dissenting.len() + agreeing,
-                            config.replication,
-                            dissenting.join(", ")
-                        );
-                    } else {
-                        // Logged per request rather than rate-limited or
-                        // deduplicated against a remembered dissenter set:
-                        // simpler, and a persistent single dissenter — the
-                        // expected case this branch exists for — logs no
-                        // more often than `L` itself is called, which is
-                        // not a hot path.
-                        eprintln!(
-                            "WARN L served despite {} of {} voting Joined nodes reporting a \
-                             replication factor different from this replica's own \
-                             --replication-factor {} — not yet a strict majority, so still \
-                             served, but worth investigating: {}",
-                            dissenting.len(),
-                            dissenting.len() + agreeing,
-                            config.replication,
-                            dissenting.join(", ")
-                        );
-                    }
-                }
-                if refuse {
-                    write_response(&mut stream, b"B\n").await?;
+                //
+                // Issue #298: this used to re-run the vote tally and
+                // re-serialize the roster on every single `L`; both now
+                // come from `cached_list_response`, rebuilt only when
+                // membership actually changes — see its own doc comment.
+                // Its cached bytes fold in the refuse decision, so the
+                // leading byte (`B` vs `N`) is all that's left to check
+                // here to preserve this handler's `B\n`-then-close shape.
+                let response = cached_list_response(&registry, config.replication);
+                write_response(&mut stream, &response).await?;
+                if response.first() == Some(&b'B') {
                     return Ok(());
                 }
-                let mut response = format!("N {} {}\n", nodes.len(), config.replication);
-                for (name, addr) in &nodes {
-                    response.push_str(&format!("{} {}\n{name}{addr}\n", name.len(), addr.len()));
-                }
-                write_response(&mut stream, response.as_bytes()).await?;
                 continue;
             }
             Ok(DiscoveryCommand::NodeLeave { name, token }) => {
@@ -5153,6 +5269,171 @@ mod tests {
             );
         }
         assert_eq!(&*cached_heartbeat_ack(&registry, 2), b"A\n");
+    }
+
+    #[test]
+    fn cached_list_response_matches_a_fresh_render_and_reuses_the_buffer_until_the_generation_moves()
+     {
+        // Issue #298: `cached_list_response` is `cached_heartbeat_ack`'s
+        // sibling for `L` — mirrors that test exactly. The cache must hand
+        // back the very same buffer while membership is unchanged, the
+        // cached bytes must match a fresh `roster_snapshot` render, and a
+        // membership change plus its generation bump must force a rebuild.
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "node-a".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk-a", Some(2)),
+            );
+            guard.insert(
+                "node-b".to_string(),
+                joined_node_reporting("127.0.0.1:9002", "tk-b", Some(2)),
+            );
+        }
+
+        let first = cached_list_response(&registry, 2);
+        let second = cached_list_response(&registry, 2);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged membership must reuse the cached buffer, not rebuild it"
+        );
+        assert_eq!(
+            &*first,
+            build_list_response(&roster_snapshot(&registry, 2).nodes, 2).as_slice()
+        );
+        assert!(first.starts_with(b"N 2 2\n"));
+
+        // A membership change (a new Joined node) plus its generation bump
+        // forces a rebuild: a different buffer reflecting the new roster.
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "node-c".to_string(),
+                joined_node_reporting("127.0.0.1:9003", "tk-c", Some(2)),
+            );
+        }
+        bump_roster(&registry);
+        let third = cached_list_response(&registry, 2);
+        assert!(
+            !Arc::ptr_eq(&second, &third),
+            "a membership change must invalidate the cache"
+        );
+        assert!(third.starts_with(b"N 3 2\n"));
+    }
+
+    #[test]
+    fn cached_list_response_folds_in_the_refuse_decision() {
+        // The withheld-roster case (a strict dissenting majority → bare
+        // `B\n`, issue #30) is baked into the cached bytes, so a cache hit
+        // never has to recompute it — `cached_heartbeat_ack`'s equivalent
+        // test, for `L`'s own refusal byte.
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "agree".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk", Some(2)),
+            );
+            guard.insert(
+                "dissent-0".to_string(),
+                joined_node_reporting("127.0.0.1:9002", "tk", Some(1)),
+            );
+            guard.insert(
+                "dissent-1".to_string(),
+                joined_node_reporting("127.0.0.1:9003", "tk", Some(1)),
+            );
+        }
+        assert_eq!(&*cached_list_response(&registry, 2), b"B\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn l_cache_is_invalidated_by_a_join_promotion_an_announce_and_a_leave() {
+        // Issue #298: exercises the three real mutation paths that must
+        // each invalidate the `L` cache — a staged join's promotion
+        // (`promote_to_joined`, the join-completion call site), `P`
+        // (announce, which lands straight in `Joined` with no staged-join
+        // machinery — see `DiscoveryCommand::Announce`), and `V` (leave) —
+        // driven through the real connection handler rather than a manual
+        // `bump_roster` call, so this fails if any of those handlers ever
+        // stops bumping the generation this cache relies on.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let config = || ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+        };
+
+        assert_eq!(&*cached_list_response(&registry, 2), b"N 0 2\n");
+
+        // Join: a node promoted straight via `promote_to_joined`, the same
+        // call `try_begin_next_join` makes once a staged join hands off to
+        // nobody (an empty-registry join, exactly this case) or completes.
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:9001".to_string(),
+                NodeState::Joining,
+                "tk-node-a".to_string(),
+            ),
+        );
+        promote_to_joined(&registry, "node-a");
+        assert_eq!(
+            &*cached_list_response(&registry, 2),
+            b"N 1 2\n6 14\nnode-a127.0.0.1:9001\n",
+            "the join promotion must invalidate the cache"
+        );
+
+        // Announce: `P` for a brand-new name, over a real connection.
+        let (mut announcer, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        announcer
+            .write_all(b"P 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        announcer.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"R\n");
+        assert!(
+            cached_list_response(&registry, 2).starts_with(b"N 2 2\n"),
+            "the announce must invalidate the cache (order of the two nodes is unspecified)"
+        );
+
+        // Leave: `V` for the join-promoted node above.
+        let (mut leaver, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config(),
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        leaver.write_all(b"V 6 9\nnode-atk-node-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        leaver.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"R\n");
+        assert_eq!(
+            &*cached_list_response(&registry, 2),
+            b"N 1 2\n6 14\nnode-b127.0.0.1:9002\n",
+            "the leave must invalidate the cache"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
