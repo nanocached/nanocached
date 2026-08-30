@@ -163,6 +163,15 @@ const MAX_BACKEND_IN_FLIGHT: usize = 256;
 /// is strictly arrival-ordered.
 const BACKEND_QUEUE_DEPTH: usize = 256;
 
+/// Issue #177: how long `SharedBackends::enqueue` remembers a failed
+/// dial to one address before it will try dialing that address again.
+/// Within this window a fresh `enqueue`/`call` fails immediately with
+/// the address's last-known-bad status instead of re-dialing and paying
+/// another full `UPSTREAM_IO_TIMEOUT` — a black-holed node's repeat
+/// traffic should cost one timeout, not one per request. Cleared the
+/// instant a dial to that address succeeds.
+const DIAL_BACKOFF: Duration = Duration::from_secs(1);
+
 /// How many responses one client connection may have outstanding (the
 /// reader stops parsing new requests once this many are undelivered) —
 /// both the per-client in-flight cap and the per-client share bound on
@@ -2192,6 +2201,10 @@ struct SharedBackends {
     /// clone can be moved into `run_backend`, which does that decrement
     /// itself.
     dialed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Issue #177: when an address's last dial attempt failed, and how
+    /// long ago — `enqueue` fails fast against `DIAL_BACKOFF` instead of
+    /// re-dialing. Cleared on the next successful dial to that address.
+    dial_failures: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl SharedBackends {
@@ -2199,6 +2212,7 @@ impl SharedBackends {
         Self {
             slots: std::sync::Mutex::new(HashMap::new()),
             dialed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dial_failures: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2208,6 +2222,34 @@ impl SharedBackends {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(slots.entry(addr.to_string()).or_default())
+    }
+
+    /// Issue #177: whether `addr`'s most recent dial attempt failed
+    /// within the last `DIAL_BACKOFF`.
+    fn dial_recently_failed(&self, addr: &str) -> bool {
+        let failures = self
+            .dial_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures
+            .get(addr)
+            .is_some_and(|at| at.elapsed() < DIAL_BACKOFF)
+    }
+
+    fn note_dial_failure(&self, addr: &str) {
+        let mut failures = self
+            .dial_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures.insert(addr.to_string(), std::time::Instant::now());
+    }
+
+    fn note_dial_success(&self, addr: &str) {
+        let mut failures = self
+            .dial_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures.remove(addr);
     }
 
     /// Enqueues one tag-checked request on `addr`'s shared connection
@@ -2227,6 +2269,14 @@ impl SharedBackends {
         frame: Bytes,
         expect: Expect,
     ) -> PendingReply {
+        // Issue #177: a fast-fail check before even touching the
+        // per-address slot lock — a black-holed address that just
+        // failed shouldn't make every concurrent caller queue up behind
+        // the lock only to hit the same backoff once they get it.
+        if self.dial_recently_failed(addr) {
+            return PendingReply::failed(dial_backoff_error(addr));
+        }
+
         let slot = self.slot(addr);
 
         // Two passes: a cached handle whose task has exited (the node's
@@ -2240,6 +2290,16 @@ impl SharedBackends {
                 match guard.as_ref() {
                     Some(handle) => handle.clone(),
                     None => {
+                        // Recheck under the lock: another task may have
+                        // just recorded a failure (or a success) for
+                        // this address while we were waiting for it —
+                        // this is what bounds concurrent first-dialers
+                        // of a dead address to one real dial, the rest
+                        // fail fast on the recheck instead of each
+                        // paying their own `UPSTREAM_IO_TIMEOUT`.
+                        if self.dial_recently_failed(addr) {
+                            return PendingReply::failed(dial_backoff_error(addr));
+                        }
                         match BackendHandle::connect(
                             addr,
                             &context.secret,
@@ -2253,9 +2313,13 @@ impl SharedBackends {
                                 *guard = Some(handle.clone());
                                 self.dialed
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.note_dial_success(addr);
                                 handle
                             }
-                            Err(error) => return PendingReply::failed(error),
+                            Err(error) => {
+                                self.note_dial_failure(addr);
+                                return PendingReply::failed(error);
+                            }
                         }
                     }
                 }
@@ -2312,6 +2376,17 @@ impl SharedBackends {
             Err(_) => self.enqueue(context, addr, frame, expect).await.await,
         }
     }
+}
+
+/// Issue #177: the error `enqueue` fails fast with while `addr` is
+/// within its dial backoff window — a black-holed node's second and
+/// later requests in the same short window shouldn't each pay another
+/// `UPSTREAM_IO_TIMEOUT` finding that out for themselves.
+fn dial_backoff_error(addr: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("backend at {addr} is in dial backoff after a recent failure"),
+    )
 }
 
 /// A reply still in flight on a backend connection.
