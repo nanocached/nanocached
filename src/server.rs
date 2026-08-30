@@ -4955,6 +4955,32 @@ fn rereplication_targets(
         .collect()
 }
 
+/// Issue #275: installs `state` into `slot` and hands back whatever
+/// occupied it a moment ago, both under one lock acquisition — the fix
+/// for the check-then-act race `run_superseding_rereplication` used to
+/// have, where reading the previous occupant and writing the new one
+/// were two separate lock acquisitions with an `.await` in between.
+/// Two triggers landing in that window could both read the same
+/// `previous`, both wait on its `done`, and then both install
+/// themselves — the loser's run would keep going untracked, with
+/// nothing left pointing at it to abort.
+///
+/// Doing the swap atomically instead makes every trigger claim the slot
+/// the instant it runs, with no window in which two callers can observe
+/// the same occupant: whichever of two racing callers reaches the lock
+/// first becomes the other's `previous`, so the two chain — the second
+/// waits on the first's `done`, not on some third run's — rather than
+/// racing. That preserves the at-most-one-running invariant for any
+/// number of concurrent triggers, since each new state can only ever be
+/// superseded by the one state that actually swapped it out.
+fn take_over_rereplication_slot(
+    slot: &Arc<Mutex<Option<Arc<ActiveRereplication>>>>,
+    state: &Arc<ActiveRereplication>,
+) -> Option<Arc<ActiveRereplication>> {
+    let mut slot = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    slot.replace(Arc::clone(state))
+}
+
 /// Issue #266: shared core for both re-replication trigger sites —
 /// supersedes (aborts, then waits briefly for) any re-replication
 /// already in flight for an earlier ring change (at most one runs at a
@@ -4973,6 +4999,17 @@ fn rereplication_targets(
 /// join-flip trigger (which already has the addresses from the `M` it
 /// just handled, plus the joiner's own, and runs only after its own
 /// transfer has completed — so neither of those two steps applies there).
+///
+/// Issue #275: the install (`take_over_rereplication_slot`) happens
+/// *before* the wait on the previous occupant's `done`, not after — see
+/// that function's doc comment for why this ordering is what keeps
+/// concurrent triggers from racing to install their state. The
+/// completion guard below (`Arc::ptr_eq` against `slot`'s current
+/// occupant) still does the right thing under this scheme: by the time
+/// this run finishes, a later trigger may already have swapped its own
+/// state in, in which case `slot` no longer points at `state` and this
+/// is correctly a no-op — clearing would otherwise erase a successor's
+/// still-active state out from under it.
 async fn run_superseding_rereplication(
     node_context: NodeContext,
     before_ring: Arc<HashRing>,
@@ -4981,11 +5018,11 @@ async fn run_superseding_rereplication(
     addresses: HashMap<String, String>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let previous = node_context
-        .active_rereplication
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+    let state = Arc::new(ActiveRereplication {
+        abort_requested: AtomicBool::new(false),
+        done: AtomicBool::new(false),
+    });
+    let previous = take_over_rereplication_slot(&node_context.active_rereplication, &state);
     if let Some(previous) = previous {
         previous.abort_requested.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
@@ -4993,15 +5030,6 @@ async fn run_superseding_rereplication(
             sleep(Duration::from_millis(100)).await;
         }
     }
-
-    let state = Arc::new(ActiveRereplication {
-        abort_requested: AtomicBool::new(false),
-        done: AtomicBool::new(false),
-    });
-    *node_context
-        .active_rereplication
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
 
     run_rereplication(
         &node_context,
@@ -12195,6 +12223,234 @@ mod tests {
 
         drop(request_tx);
         cache_task.await.unwrap();
+    }
+
+    /// Issue #275 test helper: a fake cache task that answers every
+    /// `ListEntries` request with an empty key list, except the first
+    /// one, which it holds open (notifying `first_list_seen` that it
+    /// has arrived, then blocking on `release_first_list`) so a test
+    /// can deterministically observe a `run_rereplication` mid-flight —
+    /// wedged inside its very first `.await` — without any timing-based
+    /// sleep.
+    async fn fake_cache_that_pauses_the_first_list(
+        mut request_rx: mpsc::Receiver<CacheRequest>,
+        first_list_seen: Arc<tokio::sync::Notify>,
+        release_first_list: Arc<tokio::sync::Notify>,
+    ) {
+        let mut first = true;
+        while let Some(request) = request_rx.recv().await {
+            if matches!(request.command, Command::ListEntries) && first {
+                first = false;
+                first_list_seen.notify_one();
+                release_first_list.notified().await;
+            }
+            let _ = request.response_tx.send(Response::Keys(Vec::new()));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_superseding_trigger_chains_behind_the_run_it_displaces_instead_of_racing_it() {
+        // Issue #275 regression, end to end. The old
+        // `run_superseding_rereplication` read `active_rereplication`
+        // and installed its own state in two separate lock
+        // acquisitions with an `.await` in between — two triggers
+        // landing in that window could both read the same `previous`
+        // and race to install, leaving the loser's run executing with
+        // nothing left pointing at it to abort.
+        //
+        // This drives the fixed function through exactly that
+        // scenario: the first run is deliberately wedged inside its
+        // own `list_keys` call (which can only happen *after* it has
+        // installed its state — the install is synchronous and
+        // precedes every `.await` in the function), then a second
+        // trigger runs concurrently. It must find the first run's own
+        // state as `previous` (proven by observing it signal that
+        // state's `abort_requested`), install its own state in the
+        // same slot, and only then wait — never race the first trigger
+        // to install.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let first_list_seen = Arc::new(tokio::sync::Notify::new());
+        let release_first_list = Arc::new(tokio::sync::Notify::new());
+        let cache_task = tokio::spawn(fake_cache_that_pauses_the_first_list(
+            request_rx,
+            Arc::clone(&first_list_seen),
+            Arc::clone(&release_first_list),
+        ));
+
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let mut node_context = test_node_context(
+            "n1",
+            "tk-n1",
+            Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx;
+
+        let ring_a = Arc::new(HashRing::new(vec!["n1".to_string(), "n2".to_string()]));
+        let ring_b = Arc::new(HashRing::new(vec![
+            "n1".to_string(),
+            "n2".to_string(),
+            "n3".to_string(),
+        ]));
+
+        let first = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&ring_a),
+            Arc::clone(&ring_b),
+            2,
+            HashMap::new(),
+            node_context.shutdown_rx.clone(),
+        ));
+
+        // The first run can only reach here after installing its own
+        // state in the slot.
+        first_list_seen.notified().await;
+        let first_state = node_context
+            .active_rereplication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the first run should have installed its state by now");
+
+        let second = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&ring_a),
+            Arc::clone(&ring_b),
+            2,
+            HashMap::new(),
+            node_context.shutdown_rx.clone(),
+        ));
+
+        // Let the second trigger run up to (and into) its own wait —
+        // on this single-threaded runtime, yielding gives it the
+        // chance to install its state and signal the first run's
+        // `abort_requested` before we inspect either.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            first_state.abort_requested.load(Ordering::SeqCst),
+            "the second trigger must have found the first run's own state as its `previous` \
+             and signalled it to abort — not raced past it to install its own state \
+             independently"
+        );
+        let current = node_context.active_rereplication.lock().unwrap().clone();
+        assert!(
+            current.is_some() && !Arc::ptr_eq(current.as_ref().unwrap(), &first_state),
+            "the second trigger must have already taken over the slot with its own state"
+        );
+
+        release_first_list.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+
+        assert!(
+            first_state.done.load(Ordering::SeqCst),
+            "the superseded first run must still complete and mark itself done"
+        );
+        assert!(
+            node_context.active_rereplication.lock().unwrap().is_none(),
+            "the slot must be cleared once the last (second, winning) run finishes"
+        );
+
+        drop(node_context);
+        cache_task.await.unwrap();
+    }
+
+    #[test]
+    fn take_over_rereplication_slot_never_hands_the_same_previous_to_two_callers() {
+        // Issue #275 regression, at the primitive itself: the bug was
+        // that reading the slot's previous occupant and writing the
+        // new one were two separate lock acquisitions, so two callers
+        // racing in that window could both read the same `previous`.
+        // Fire many real, concurrently-running OS threads at
+        // `take_over_rereplication_slot` and confirm no two of them
+        // are ever handed the same `previous` to chain behind — each
+        // caller's `previous` must be either genuinely absent (at most
+        // once, for whichever caller's swap happens first) or a
+        // distinct predecessor no other caller also saw.
+        let slot: Arc<Mutex<Option<Arc<ActiveRereplication>>>> = Arc::new(Mutex::new(None));
+
+        const CALLERS: usize = 32;
+        let states: Vec<Arc<ActiveRereplication>> = (0..CALLERS)
+            .map(|_| {
+                Arc::new(ActiveRereplication {
+                    abort_requested: AtomicBool::new(false),
+                    done: AtomicBool::new(false),
+                })
+            })
+            .collect();
+
+        let barrier = Arc::new(std::sync::Barrier::new(CALLERS));
+        let handles: Vec<_> = states
+            .iter()
+            .cloned()
+            .map(|state| {
+                let slot = Arc::clone(&slot);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    take_over_rereplication_slot(&slot, &state)
+                })
+            })
+            .collect();
+
+        let previous: Vec<Option<Arc<ActiveRereplication>>> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        let none_count = previous.iter().filter(|entry| entry.is_none()).count();
+        assert_eq!(
+            none_count, 1,
+            "exactly one caller should see an empty slot; got {none_count} — two callers raced \
+             to read the same (missing) previous"
+        );
+
+        for (i, a) in previous.iter().enumerate() {
+            let Some(a) = a else { continue };
+            for (j, b) in previous.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let Some(b) = b else { continue };
+                assert!(
+                    !Arc::ptr_eq(a, b),
+                    "two callers were both handed the same previous state — the exact issue \
+                     #275 race: both would abort/wait on it and then race to install their own \
+                     state"
+                );
+            }
+        }
+
+        for previous in previous.iter().flatten() {
+            assert!(
+                states.iter().any(|state| Arc::ptr_eq(state, previous)),
+                "a caller was handed a previous state that was never installed by this test"
+            );
+        }
+
+        let never_previous = states
+            .iter()
+            .filter(|state| {
+                !previous
+                    .iter()
+                    .any(|entry| entry.as_ref().is_some_and(|prev| Arc::ptr_eq(prev, state)))
+            })
+            .count();
+        assert_eq!(
+            never_previous, 1,
+            "exactly one installed state should remain unclaimed as anyone's previous — the \
+             winner still occupying the slot"
+        );
+        let remaining = slot.lock().unwrap();
+        assert!(
+            remaining
+                .as_ref()
+                .is_some_and(|current| states.iter().any(|state| Arc::ptr_eq(state, current))),
+            "the slot should still hold one of this test's states"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
