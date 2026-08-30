@@ -192,6 +192,28 @@ once the rollout finishes; nothing needs a manual fix-up. If a rolling
 deploy of this adapter's version must never error on an `int` key, drain
 or version-bump that key's namespace instead of upgrading it in place.
 
+## Trust boundary / deserialization
+
+Values (other than plain `int`, see "Counter storage" above) are read
+back with `pickle.loads()` — the Django convention, and the same model as
+Django's own memcached backend. That means **anyone who can write to this
+cache's namespace can execute code in the process that reads it back** —
+any holder of the cluster's auth secret, or, when no secret is
+configured, any peer that can reach the server at all. This is inherent
+to `pickle.loads()` on untrusted bytes, not specific to nanocached.
+
+Mitigate with all of:
+
+- **`OPTIONS.TLS` + `OPTIONS.SECRET`**, so only trusted processes can
+  write to the namespace at all.
+- **Never share a namespace (or its secret) with an untrusted writer** —
+  `OPTIONS.NAMESPACE` is cheap and isolated (see above), so give each
+  trust domain its own alias/namespace rather than reusing one across
+  services with different trust levels.
+- There is no pluggable serializer in this backend today; where writers
+  aren't fully trusted, isolate this cache's namespace to trusted writers
+  only rather than relying on the pickle stream itself for safety.
+
 ## Requirements
 
 Python 3.11+, Django 4.2+, `nanocached` (Python SDK) 0.3+, a nanocached

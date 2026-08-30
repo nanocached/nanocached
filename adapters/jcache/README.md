@@ -148,6 +148,36 @@ protocol doesn't report server-side LRU evictions to the client.
 unconditional TTL-refresh write — a concurrent writer landing between the
 two could, rarely, be clobbered back to the value this `get()` observed.
 
+## Trust boundary / deserialization
+
+Values cross the wire as bytes and come back through
+`ObjectInputStream.readObject()` (plain JDK serialization, like
+`nanocached-spring`'s default). That means **anyone who can write to this
+cache's namespace can execute code in the process that reads it back** —
+any holder of the cluster's auth secret, or, when no secret is
+configured, any peer that can reach the server at all. This is inherent
+to Java object deserialization of untrusted bytes, not specific to
+nanocached.
+
+Mitigate with all of:
+
+- **TLS + an auth secret** on the connection (`nanocached.tls` /
+  `nanocached.secret` in the `Properties` passed to `getCacheManager`),
+  so only trusted processes can write to the namespace at all.
+- **Never share a namespace (or its secret) with an untrusted writer** —
+  give each trust domain its own namespace/`CacheManager`.
+- **A JVM-wide serial filter**: `-Djdk.serialFilter=...`, or
+  `ObjectInputFilter.Config.setSerialFilter(...)` set once before this
+  module deserializes anything. Deserialization here applies that filter
+  explicitly on every `ObjectInputStream`, so it is honored even on JVMs
+  where `ObjectInputStream` would not otherwise pick it up by default.
+
+There is currently no pluggable `CacheValueSerializer` equivalent in this
+module (see `nanocached-spring`'s, which this one could grow if a
+non-Java-serialization format is needed here too) — for now, a JVM-wide
+serial filter is the only mitigation available without forking this
+module.
+
 ## Requirements
 
 Java 17+, `javax.cache:cache-api:1.1.1`, nanocached server ≥ the release
