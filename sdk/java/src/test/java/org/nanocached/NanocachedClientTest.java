@@ -2013,11 +2013,12 @@ class NanocachedClientTest {
         // to just overwrite a single tracked "legBug" variable on every
         // failing leg in turn, so only the LAST leg's bug ever reached the
         // caller and every earlier one vanished without even being
-        // counted — unlike multiGetPass (issue #230), which always drains
-        // every leg and reports every bug past the first via
-        // reportBackgroundWriteBug. Both now share
-        // drainLegsKeepingFirstBug, exercised directly here with
-        // synthetic failing legs: every real protocol-level failure this
+        // counted — unlike multiGetPass (issue #230), which always drained
+        // every leg and reported every bug past the first via
+        // reportBackgroundWriteBug, even before this method existed. All
+        // three now share drainLegsKeepingFirstBug (multiGetPass's own
+        // duplicate loop was folded in as part of issue #277), exercised
+        // directly here with synthetic failing legs: every real protocol-level failure this
         // SDK produces is already wrapped as a NanocachedException and
         // caught well before this method ever sees it, so a genuine,
         // uncaught bug isn't reproducible by feeding a real server bad
@@ -2450,6 +2451,43 @@ class NanocachedClientTest {
             for (Thread thread : threads) thread.join(5_000);
 
             assertTrue(unexpected.isEmpty(), "unexpected exception(s): " + unexpected);
+        }
+    }
+
+    @Test
+    void multiGetFallsBackToInlineExecutionWhenReplicaWritersIsShutDownWithoutClosingTheClient() throws Exception {
+        // Regression for issue #277: multiGetPass used to submit each
+        // owner-group leg straight to replicaWriters via a raw
+        // CompletableFuture.supplyAsync, bypassing submitReplicaWrite —
+        // the helper every other replicaWriters call site relies on to
+        // catch RejectedExecutionException and fall back to running the
+        // leg inline. close()'s own shutdown of replicaWriters is only
+        // ever raced probabilistically (see
+        // closeRacingConcurrentWritesNeverThrowsARawExecutorException's
+        // set() equivalent above), so this reproduces the exact race
+        // deterministically instead: shut replicaWriters down directly,
+        // without going through close() (so beforeOperation()'s `closed`
+        // check still passes and getMany() actually reaches
+        // multiGetPass). Before the fix, this raised a raw
+        // RejectedExecutionException past the public API; the fix must
+        // instead run the leg synchronously on this thread and return the
+        // normal result.
+        try (Cluster cluster = startCluster(2);
+                NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            client.set("k", "v");
+
+            Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
+            replicaWritersField.setAccessible(true);
+            ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
+            replicaWriters.shutdown();
+            assertTrue(replicaWriters.isShutdown());
+
+            // No try/catch here on purpose: any exception at all — not
+            // just a RejectedExecutionException specifically — fails this
+            // test, since the fix's whole point is that getMany() returns
+            // normally instead of throwing anything.
+            Map<String, String> values = client.getMany(List.of("k"));
+            assertEquals(Map.of("k", "v"), values);
         }
     }
 

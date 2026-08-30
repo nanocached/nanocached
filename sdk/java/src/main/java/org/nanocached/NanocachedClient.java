@@ -1882,7 +1882,10 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         Map<String, List<Integer>> groups = new LinkedHashMap<>();
-        List<Integer> retry = new ArrayList<>();
+        // Thread-safe: runMultiGetLeg mutates this directly from whichever
+        // replicaWriters thread runs its leg, one leg per owner running
+        // concurrently — mirrors multiSetPass's own retry list.
+        List<Integer> retry = Collections.synchronizedList(new ArrayList<>());
         for (int idx : indices) {
             List<String> owners = ownerNames(namespace, keyBytes[idx]);
             if (owners.isEmpty()) {
@@ -1892,50 +1895,46 @@ public final class NanocachedClient implements AutoCloseable {
             groups.computeIfAbsent(owners.get(0), name -> new ArrayList<>()).add(idx);
         }
 
-        List<CompletableFuture<List<Integer>>> legs = new ArrayList<>(groups.size());
+        List<CompletableFuture<Void>> legs = new ArrayList<>(groups.size());
         for (Map.Entry<String, List<Integer>> group : groups.entrySet()) {
             String owner = group.getKey();
             List<Integer> groupIndices = group.getValue();
-            legs.add(CompletableFuture.supplyAsync(
-                    () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values), replicaWriters));
+            Runnable leg = () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values, retry);
+            // issue #277: routed through submitReplicaWrite (rather than a
+            // raw CompletableFuture.supplyAsync onto replicaWriters, as
+            // this used to be) so a leg racing close() past
+            // replicaWriters.shutdown() runs inline instead of leaking a
+            // raw RejectedExecutionException out of this public API —
+            // same fallback every other replicaWriters call site already
+            // relies on.
+            legs.add(submitReplicaWrite(leg));
         }
         // Always drain every leg, even after one has already failed: a leg
         // that fails fast (e.g. a decompression error escaping
         // runMultiGetLeg) must not leave later legs un-joined, hiding a
         // second, independent bug — the same stance write()'s replica legs
-        // and multiSetPass's owner legs already take. Only the first
-        // failure is rethrown; any additional leg's bug is still
-        // counted/logged via reportBackgroundWriteBug rather than vanishing
-        // silently (issue #230).
-        RuntimeException legBug = null;
-        for (CompletableFuture<List<Integer>> leg : legs) {
-            try {
-                retry.addAll(leg.join());
-            } catch (CompletionException wrapped) {
-                RuntimeException bug = unwrapReplicaBug(wrapped);
-                if (legBug == null) {
-                    legBug = bug;
-                } else {
-                    reportBackgroundWriteBug(bug);
-                }
-            }
-        }
+        // and multiSetPass's owner legs already take; see
+        // drainLegsKeepingFirstBug's own doc comment for issue #233.
+        RuntimeException legBug = drainLegsKeepingFirstBug(legs);
         if (legBug != null) throw legBug;
         return retry;
     }
 
     /** One owner group's {@code m} exchange, run on {@link
-     * #replicaWriters} by {@link #multiGetPass}: a connection-level
-     * failure retries the whole group (indistinguishable from a
-     * possibly-idle-closed connection, same stance {@link
-     * #applyReconnecting}'s own callers take elsewhere); a per-key {@code
-     * W} retries just that key; a hit is spliced into {@code values}
-     * (decompression failures propagate, aborting the batch immediately —
-     * never fed into the retry pass, since they're a client-side {@code
-     * compress} mismatch, not a routing outcome). */
-    private List<Integer> runMultiGetLeg(
+     * #replicaWriters} by {@link #multiGetPass} (via {@link
+     * #submitReplicaWrite}): a connection-level failure retries the whole
+     * group (indistinguishable from a possibly-idle-closed connection,
+     * same stance {@link #applyReconnecting}'s own callers take
+     * elsewhere); a per-key {@code W} retries just that key; a hit is
+     * spliced into {@code values} (decompression failures propagate,
+     * aborting the batch immediately — never fed into the retry pass,
+     * since they're a client-side {@code compress} mismatch, not a
+     * routing outcome). {@code retry} must already be a thread-safe list
+     * — this runs concurrently with every other owner's leg, mirroring
+     * {@link #runMultiSetLeg}. */
+    private void runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
-            byte[][] keyBytes, byte[][] values) {
+            byte[][] keyBytes, byte[][] values, List<Integer> retry) {
         byte[][] groupKeys = new byte[groupIndices.size()][];
         for (int i = 0; i < groupIndices.size(); i++) {
             groupKeys[i] = keyBytes[groupIndices.get(i)];
@@ -1945,10 +1944,10 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             entries = multiGetChunked(() -> memberConnection(owner), namespace, groupKeys);
         } catch (NanocachedException connectionFailure) {
-            return new ArrayList<>(groupIndices);
+            retry.addAll(groupIndices);
+            return;
         }
 
-        List<Integer> retry = new ArrayList<>();
         for (int i = 0; i < groupIndices.size(); i++) {
             int idx = groupIndices.get(i);
             Connection.MultiEntry entry = entries.get(i);
@@ -1958,7 +1957,6 @@ public final class NanocachedClient implements AutoCloseable {
                 values[idx] = maybeDecompress(entry.value());
             }
         }
-        return retry;
     }
 
     public void set(String key, String value) {
@@ -2293,9 +2291,11 @@ public final class NanocachedClient implements AutoCloseable {
     /** Drains every leg in {@code legs}, keeping only the <em>first</em>
      * bug to rethrow to the caller and reporting every additional leg's
      * bug via {@link #reportBackgroundWriteBug} instead of discarding it
-     * — the shared stance {@link #multiSetPass} and {@link
-     * #clearFanOutOnce} both take, mirroring {@link #multiGetPass}'s own
-     * equivalent loop (issue #230). Issue #233: both callers used to just
+     * — the shared stance {@link #multiGetPass}, {@link #multiSetPass},
+     * and {@link #clearFanOutOnce} all take (issue #230; {@link
+     * #multiGetPass} used to have its own duplicate equivalent loop,
+     * folded into this shared helper as part of issue #277's
+     * submitReplicaWrite routing). Issue #233: both callers used to just
      * overwrite a single tracked bug on every failing leg in turn, so
      * only the LAST leg's bug ever reached the caller and every earlier
      * one vanished without even being counted. Package-private rather
