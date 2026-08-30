@@ -224,6 +224,26 @@ public sealed class NanocachedClient : IDisposable
     // Python/Java SDKs use.
     private const int MaxBatchKeys = 400;
 
+    // issue #222: MaxBatchKeys alone bounds a sub-frame's key COUNT, not
+    // its byte size — ValidateKey/ValidateKeyAndValue only check one pair
+    // at a time, so 400 individually-valid pairs (e.g. 400 x 5 KiB values)
+    // can still sum past MaxRequestBytes once packed into one `m`/`o`
+    // frame. The server enforces MAX_REQUEST_SIZE on the whole frame
+    // (request_is_too_large, src/server.rs) and just closes the
+    // connection with no response, turning what should be a clear
+    // validation error into a confusing ConnectionLost/WrongNode. This is
+    // the per-entry allowance for the `m`/`o` header's decimal length
+    // field(s) for one key (`MultiGetHeaderAllowance`) — " <key-len>" — or
+    // one key and one value (`MultiSetHeaderAllowance`) — " <key-len>
+    // <value-len>" — used below to track a running byte total per
+    // sub-frame alongside the key count. 12 bytes per length field is
+    // generous headroom (leading space + up to 10 decimal digits, more
+    // than int.MaxValue ever needs, plus one spare byte) — deliberately
+    // not tight, since undercounting here reproduces the exact bug this
+    // fixes.
+    private const int MultiGetHeaderAllowance = 12;
+    private const int MultiSetHeaderAllowance = 24;
+
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
     // Reserved by the SDKs so a real application key can never collide
     // with it: a GET refreshes the pinged key's server-side LRU recency,
@@ -1021,8 +1041,9 @@ public sealed class NanocachedClient : IDisposable
     // m/o — see docs/protocol.html#multi. Every requested key's owner is
     // still resolved via HashRing/OwnerNames, exactly like a single
     // GetBytesAsync/SetAsync: GetManyBytesAsync groups keys by primary
-    // owner and issues one `m` sub-frame per owner (batch chunking
-    // splits an over-MaxBatchKeys group further); SetManyBytesAsync
+    // owner and issues one `m` sub-frame per owner (batch chunking splits
+    // an over-MaxBatchKeys or over-MaxRequestBytes group further, issue
+    // #222); SetManyBytesAsync
     // groups by every owner across every rank, since one batch's keys
     // can place the same node as primary for one key and a replica for
     // another. A batch never fails as a whole (docs/protocol.html#multi):
@@ -1083,7 +1104,8 @@ public sealed class NanocachedClient : IDisposable
     ///
     /// <para>Larger batches are transparently split into more than one
     /// <c>m</c> sub-frame per owner (batch chunking, see
-    /// <see cref="MaxBatchKeys"/>) — callers never need to think about
+    /// <see cref="MaxBatchKeys"/> and, issue #222,
+    /// <see cref="MaxRequestBytes"/>) — callers never need to think about
     /// this.</para></summary>
     public Task<Dictionary<string, byte[]>> GetManyBytesAsync(IReadOnlyList<string> keys) =>
         GetManyBytesAsync(EmptyNamespace, keys);
@@ -1147,16 +1169,28 @@ public sealed class NanocachedClient : IDisposable
     /// <summary>Issues one or more <c>m</c> sub-frames against
     /// <paramref name="slot"/>'s connection (<c>null</c> for the
     /// single/proxy target) — already grouped to one owner by the caller
-    /// — splitting into <see cref="MaxBatchKeys"/>-sized chunks (batch
-    /// chunking) so no reply header risks exceeding the wire's header
-    /// bound.</summary>
+    /// — splitting so a sub-frame never exceeds <see cref="MaxBatchKeys"/>
+    /// keys OR (issue #222) <see cref="MaxRequestBytes"/> of cumulative
+    /// namespace+key wire bytes (batch chunking), whichever comes first.
+    /// A single key always fits on its own — <see cref="ValidateKey"/>
+    /// already guarantees that — so the byte bound only ever closes a
+    /// chunk early, never drops an entry.</summary>
     private async Task<List<Connection.MultiEntry>> MultiGetChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
-        for (int start = 0; start < keys.Length; start += MaxBatchKeys)
+        int start = 0;
+        while (start < keys.Length)
         {
-            int end = Math.Min(start + MaxBatchKeys, keys.Length);
+            long total = namespaceBytes.Length + MultiGetHeaderAllowance + keys[start].Length;
+            int end = start + 1;
+            while (end < keys.Length && end - start < MaxBatchKeys)
+            {
+                long next = MultiGetHeaderAllowance + keys[end].Length;
+                if (total + next > MaxRequestBytes) break;
+                total += next;
+                end++;
+            }
             ArraySegment<byte[]> chunk = new(keys, start, end - start);
             List<Connection.MultiEntry> chunkEntries = await ApplyReconnectingAsync(
                 slot, connection => connection.MultiGetAsync(namespaceBytes, chunk)).ConfigureAwait(false);
@@ -1164,6 +1198,7 @@ public sealed class NanocachedClient : IDisposable
             {
                 entries[i] = chunkEntries[i - start];
             }
+            start = end;
         }
         return entries;
     }
@@ -1372,7 +1407,8 @@ public sealed class NanocachedClient : IDisposable
     ///
     /// <para>Larger batches are transparently split into more than one
     /// <c>o</c> sub-frame per node (batch chunking, see
-    /// <see cref="MaxBatchKeys"/>).</para></summary>
+    /// <see cref="MaxBatchKeys"/> and, issue #222,
+    /// <see cref="MaxRequestBytes"/>).</para></summary>
     public Task SetManyBytesAsync(IReadOnlyDictionary<string, byte[]> values, long ttlSeconds = 0) =>
         SetManyBytesAsync(EmptyNamespace, values, ttlSeconds);
 
@@ -1429,15 +1465,28 @@ public sealed class NanocachedClient : IDisposable
 
     /// <summary><see cref="MultiGetChunkedAsync"/>'s write-side twin: one
     /// or more <c>o</c> sub-frames against <paramref name="slot"/>'s
-    /// connection, split into <see cref="MaxBatchKeys"/>-sized chunks the
-    /// same way.</summary>
+    /// connection, split so a sub-frame never exceeds
+    /// <see cref="MaxBatchKeys"/> pairs OR (issue #222)
+    /// <see cref="MaxRequestBytes"/> of cumulative namespace+key+value
+    /// wire bytes, the same way — a single pair always fits on its own,
+    /// since <see cref="ValidateKeyAndValue"/> already guarantees
+    /// that.</summary>
     private async Task<List<Connection.MultiEntry>> MultiSetChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys, byte[][] values, long ttlSeconds)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
-        for (int start = 0; start < keys.Length; start += MaxBatchKeys)
+        int start = 0;
+        while (start < keys.Length)
         {
-            int end = Math.Min(start + MaxBatchKeys, keys.Length);
+            long total = namespaceBytes.Length + MultiSetHeaderAllowance + keys[start].Length + values[start].Length;
+            int end = start + 1;
+            while (end < keys.Length && end - start < MaxBatchKeys)
+            {
+                long next = MultiSetHeaderAllowance + keys[end].Length + values[end].Length;
+                if (total + next > MaxRequestBytes) break;
+                total += next;
+                end++;
+            }
             ArraySegment<byte[]> keyChunk = new(keys, start, end - start);
             ArraySegment<byte[]> valueChunk = new(values, start, end - start);
             List<Connection.MultiEntry> chunkEntries = await ApplyReconnectingAsync(
@@ -1447,6 +1496,7 @@ public sealed class NanocachedClient : IDisposable
             {
                 entries[idx] = chunkEntries[idx - start];
             }
+            start = end;
         }
         return entries;
     }
