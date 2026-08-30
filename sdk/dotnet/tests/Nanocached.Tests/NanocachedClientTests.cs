@@ -1026,6 +1026,76 @@ public class NanocachedClientTests
             () => client.SetManyAsync(new Dictionary<string, string> { ["a"] = "1" }));
     }
 
+    [Fact]
+    public async Task MultiGetResponseExceedingTheCumulativeByteBoundPoisonsTheConnection()
+    {
+        // Regression for issue #207 (follow-up to #179, fixed for Java in
+        // PR #201): each M entry's own declared length is already bounded
+        // by MaxValueLength, but nothing used to bound the SUM of entry
+        // sizes across an entire reply — a node answering a 400-key
+        // multi-get with 400 x 2 MiB hits could force hundreds of MB of
+        // allocation from one reply. Shrinking the internal bound to 3
+        // bytes lets this trip it over a loopback socket instead of moving
+        // tens of MB: "a" is a 2-byte hit (running total 2, within bound),
+        // "b" is another 2-byte hit (running total 4, over bound) — the
+        // client must reject before ever reading "b"'s body off the wire.
+        long defaultBound = Connection.MaxMultiGetResponseBytes;
+        Connection.MaxMultiGetResponseBytes = 3;
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+            await client.SetAsync("a", "xy");
+            await client.SetAsync("b", "zw");
+
+            // The client's retry layer redials once after the first
+            // failure (ApplyReconnectingAsync); the redialed connection
+            // hits the same oversized reply from the same store contents,
+            // so this settles as a ConnectionLostException either way —
+            // matching ARequestToAHalfOpenServerFailsWithinTheTimeoutInsteadOfHanging's
+            // reasoning for a bound that keeps tripping on redial.
+            var error = await Assert.ThrowsAsync<ConnectionLostException>(
+                () => client.GetManyAsync(new[] { "a", "b" }));
+            Assert.Contains("exceeds", error.Message);
+
+            // Both the original and the redialed connection attempt got
+            // poisoned by the same desync, one connection each.
+            Assert.Equal(2, node.ConnectionCount);
+        }
+        finally
+        {
+            Connection.MaxMultiGetResponseBytes = defaultBound;
+        }
+    }
+
+    [Fact]
+    public async Task MultiGetResponseJustUnderTheCumulativeByteBoundStillSucceeds()
+    {
+        // Companion to MultiGetResponseExceedingTheCumulativeByteBoundPoisonsTheConnection:
+        // a reply whose cumulative size stays under the (shrunk) bound
+        // must round-trip normally, proving the check doesn't reject
+        // legitimate replies.
+        long defaultBound = Connection.MaxMultiGetResponseBytes;
+        Connection.MaxMultiGetResponseBytes = 5;
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+            await client.SetAsync("a", "xy");
+            await client.SetAsync("b", "zw");
+
+            Dictionary<string, string> values = await client.GetManyAsync(new[] { "a", "b" });
+            Assert.Equal(new Dictionary<string, string> { ["a"] = "xy", ["b"] = "zw" }, values);
+            Assert.Equal(1, node.ConnectionCount);
+        }
+        finally
+        {
+            Connection.MaxMultiGetResponseBytes = defaultBound;
+        }
+    }
+
     // ── クラスタと複製 ────────────────────────────────────────────
 
     private sealed record Cluster(

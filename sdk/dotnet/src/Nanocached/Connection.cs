@@ -52,6 +52,21 @@ internal sealed class Connection
     // or malicious frame, never just a legitimately large value.
     private const int MaxValueLength = 2 * 1024 * 1024;
 
+    // issue #207 (follow-up to #179, fixed for Java in PR #201): each M
+    // entry's own declared length is already bounded above by
+    // MaxValueLength, but nothing bounded the SUM of entry sizes across an
+    // entire multi-get reply — a node answering a 400-key request with 400
+    // x 2 MiB hits would still force ~800 MiB of allocation from a single
+    // reply. Checked in the M decode loop before each entry's body is
+    // read, so an oversized running total is caught before the
+    // allocation/read happens, not after. Same 64 MiB figure as
+    // Compression's own decompression cap (issue #41), not derived from
+    // batch-size x per-value-cap: a wire reply legitimately needing more
+    // than that in one round trip is unreasonable — callers should batch
+    // smaller. Mutable only so tests can shrink it without moving tens of
+    // MB over a loopback socket, mirroring RequestTimeout.
+    internal static long MaxMultiGetResponseBytes = 64L * 1024 * 1024;
+
     // Header/tag lines (the marker line ahead of a V's body, or the whole
     // line for S/D/N/W) are always a handful of bytes in the real
     // protocol. Without a cap, a malicious or buggy node that streams
@@ -1079,6 +1094,11 @@ internal sealed class Connection
                     throw new ConnectionLostException("nanocached: invalid multi-get header in response");
                 }
                 var entries = new List<MultiEntry>(count);
+                // issue #207: running total of every hit's declared length
+                // seen so far this reply — bounds the reply as a whole,
+                // not just each individual entry (MaxValueLength, checked
+                // just below, only bounds one entry at a time).
+                long totalBytes = 0;
                 for (int i = 0; i < count; i++)
                 {
                     string token = fields[1 + i];
@@ -1097,6 +1117,18 @@ internal sealed class Connection
                             throw new ConnectionLostException(
                                 "nanocached: invalid multi-get result length in response");
                         }
+                        // issue #207: checked BEFORE allocating/reading
+                        // this entry's body — a claim that would push the
+                        // cumulative total over the bound must poison the
+                        // connection before the over-large read happens,
+                        // not after.
+                        totalBytes += length;
+                        if (totalBytes > MaxMultiGetResponseBytes)
+                        {
+                            throw new ConnectionLostException(
+                                $"nanocached: multi-get response exceeds {MaxMultiGetResponseBytes} bytes "
+                                + "(connection desynced)");
+                        }
                         var hit = new byte[length];
                         await _stream.ReadExactlyAsync(hit).ConfigureAwait(false);
                         entries.Add(MultiEntry.Hit(hit));
@@ -1108,6 +1140,13 @@ internal sealed class Connection
             // issue #151: `O <n> <result-1> ... <result-n>[ <tag>]\n` — no
             // body, unlike M's hit values (a set has nothing to echo
             // back). Each token is "S" (stored) or "W" (wrong node).
+            //
+            // issue #207: unlike M, no cumulative-bytes bound is needed
+            // here — an O reply carries no bodies at all, just one
+            // fixed-width token per key on this single header line, so its
+            // decode cost is already O(count), and count is already
+            // bounded by MaxHeaderLineLength capping the line this whole
+            // roster lives on.
             case (byte)'O':
             {
                 string[] fields = (await ReadLineAsync().ConfigureAwait(false)).Split(' ');
