@@ -15,6 +15,12 @@ async fn main() {
     let options = Options::new().addresses(addresses);
 
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 4 {
+        eprintln!(
+            "usage: nanotest <write|read> <label> <count>\n\naddresses via NANOTEST_ADDRESSES (\"host:port,host:port\")"
+        );
+        std::process::exit(2);
+    }
     let (cmd, label) = (args[1].as_str(), args[2].as_str());
     let count: usize = args[3].parse().expect("bad count");
 
@@ -64,5 +70,5 @@ async fn main() {
         }
     }
 
-    client.close();
+    client.close().await;
 }
