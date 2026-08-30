@@ -2438,6 +2438,7 @@ export class NanocachedClient {
       }
     }
 
+    const newNodes: DiscoveredNode[] = [];
     for (const node of identified.nodes) {
       const existing = members.get(node.name);
       if (existing) {
@@ -2446,43 +2447,75 @@ export class NanocachedClient {
         existing.address = node.address;
         continue;
       }
-
-      try {
-        const nodeIdentified = await connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
-
-        if (nodeIdentified.kind !== "node") {
-          // Discovery returned an address that no longer identifies as a
-          // cache node — skip it silently, same as any other failure to
-          // connect here (see the doc comment above), and count it in
-          // stats().refreshFailures.
-          this.refreshFailures++;
-          continue;
-        }
-
-        if (this.closed) {
-          // close() ran while we were dialing (issue #10): installing this
-          // socket now would leak it — nothing will ever close it again.
-          nodeIdentified.socket.destroy();
-          return;
-        }
-
-        trackOpenTarget(this.url, [nodeIdentified.socket]);
-        members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged, () => this.transientRetries++) });
-      } catch (error) {
-        // Connecting to this new node failed — skip it silently and retry
-        // on the next refresh (see the doc comment above), counted in
-        // stats().refreshFailures. An actual programming bug
-        // (isSwallowable) still propagates.
-        if (!isSwallowable(error)) throw error;
-        this.refreshFailures++;
-      }
+      newNodes.push(node);
     }
 
+    // Dial every newly listed node concurrently, not one at a time (issue
+    // #226) — sequentially here stalls every waiting get/set/delete
+    // (maybeRefreshNodeList shares this one in-flight promise) for up to
+    // N × connect timeout during a scale-out or a mass rejoin after a
+    // partition heals, exactly the bug #67 already fixed for connect()'s
+    // bootstrap dial (see the Promise.all there). Promise.allSettled, not
+    // Promise.all, since one node's dial failing must not lose track of
+    // the others' outcomes — every new node here is tolerated
+    // individually (see the doc comment above), never fatal on its own to
+    // the whole refresh.
+    const dialResults = await Promise.allSettled(
+      newNodes.map((node) =>
+        connectAndIdentify({ ...splitHostPort(node.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca }),
+      ),
+    );
+
     if (this.closed) {
-      // Same race, caught at commit time: close() already tore down the
-      // members it knew about; anything newly opened here must die too.
-      for (const member of members.values()) member.connection?.close();
+      // close() ran while we were dialing (issue #10): installing any of
+      // these sockets now would leak them — nothing will ever close them
+      // again.
+      for (const result of dialResults) {
+        if (result.status === "fulfilled" && result.value.kind === "node") result.value.socket.destroy();
+      }
       return;
+    }
+
+    // A genuine programming bug surfacing from one of the dials
+    // (isSwallowable) still propagates, exactly as it always has — but
+    // first destroy every socket this round of concurrent dials opened,
+    // so aborting the whole refresh here doesn't leak sockets that a
+    // sequential dial never would have opened concurrently with the one
+    // that failed hard.
+    const hardFailure = dialResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected" && !isSwallowable(result.reason),
+    );
+    if (hardFailure) {
+      for (const result of dialResults) {
+        if (result.status === "fulfilled" && result.value.kind === "node") result.value.socket.destroy();
+      }
+      throw hardFailure.reason;
+    }
+
+    for (let i = 0; i < newNodes.length; i++) {
+      const node = newNodes[i];
+      const result = dialResults[i];
+
+      if (result.status === "rejected") {
+        // Connecting to this new node failed — skip it silently and retry
+        // on the next refresh (see the doc comment above), counted in
+        // stats().refreshFailures.
+        this.refreshFailures++;
+        continue;
+      }
+
+      const nodeIdentified = result.value;
+      if (nodeIdentified.kind !== "node") {
+        // Discovery returned an address that no longer identifies as a
+        // cache node — skip it silently, same as any other failure to
+        // connect here (see the doc comment above), and count it in
+        // stats().refreshFailures.
+        this.refreshFailures++;
+        continue;
+      }
+
+      trackOpenTarget(this.url, [nodeIdentified.socket]);
+      members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged, () => this.transientRetries++) });
     }
 
     this.target = {
