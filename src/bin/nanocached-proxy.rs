@@ -116,6 +116,7 @@
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -140,7 +141,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Every backend/discovery I/O interaction is bounded by this, so one
 /// hung upstream can't pin a driver task forever.
+#[cfg(not(test))]
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Issue #177: shrunk under test so the black-hole/dial-backoff tests
+/// (which pay this out in real wall-clock time — `tokio::time::pause`'s
+/// auto-advance isn't reliable once a real, permanently-unresponsive
+/// socket is in the mix) run in milliseconds instead of seconds.
+/// Comfortably above every mock node's own injected `get_delay` (the
+/// largest in this suite is 200ms), so existing delay-based tests are
+/// unaffected.
+#[cfg(test)]
+const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// How often the roster is re-fetched in the background. `W` answers
 /// force an immediate refresh regardless, so this only bounds how stale
@@ -161,6 +172,15 @@ const MAX_BACKEND_IN_FLIGHT: usize = 256;
 /// of a shared backend than its own in-flight allowance, and admission
 /// is strictly arrival-ordered.
 const BACKEND_QUEUE_DEPTH: usize = 256;
+
+/// Issue #177: how long `SharedBackends::enqueue` remembers a failed
+/// dial to one address before it will try dialing that address again.
+/// Within this window a fresh `enqueue`/`call` fails immediately with
+/// the address's last-known-bad status instead of re-dialing and paying
+/// another full `UPSTREAM_IO_TIMEOUT` — a black-holed node's repeat
+/// traffic should cost one timeout, not one per request. Cleared the
+/// instant a dial to that address succeeds.
+const DIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// How many responses one client connection may have outstanding (the
 /// reader stops parsing new requests once this many are undelivered) —
@@ -1581,7 +1601,11 @@ enum NodeReply {
 }
 
 struct BackendRequest {
-    frame: Vec<u8>,
+    /// Issue #177: `Bytes`, not `Vec<u8>` — a write/clear fanned out to
+    /// several owners shares this one buffer across every replica leg's
+    /// `BackendRequest` (a cheap refcount bump), instead of each leg
+    /// carrying its own deep copy of the payload.
+    frame: Bytes,
     expect: Expect,
     reply: oneshot::Sender<io::Result<NodeReply>>,
 }
@@ -1783,7 +1807,7 @@ async fn run_backend(
 /// send order, and with it their tag, is known).
 const TAG_PLACEHOLDER: &str = "{tag}";
 
-fn substitute_tag(frame: Vec<u8>, tag: u32) -> Vec<u8> {
+fn substitute_tag(frame: Bytes, tag: u32) -> Bytes {
     let header_end = frame
         .iter()
         .position(|byte| *byte == b'\n')
@@ -1794,7 +1818,7 @@ fn substitute_tag(frame: Vec<u8>, tag: u32) -> Vec<u8> {
     let mut framed = header.into_bytes();
     framed.push(b'\n');
     framed.extend_from_slice(&frame[header_end + 1..]);
-    framed
+    framed.into()
 }
 
 async fn read_reply<S: AsyncRead + Unpin>(
@@ -2005,7 +2029,7 @@ async fn read_reply<S: AsyncRead + Unpin>(
 
 // ─── backend frame builders (proxy → node, always tagged) ────────────
 
-fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+fn frame_get(namespace: &[u8], key: &[u8]) -> Bytes {
     let mut frame = if namespace.is_empty() {
         format!("G {} {TAG_PLACEHOLDER}\n", key.len()).into_bytes()
     } else {
@@ -2013,13 +2037,13 @@ fn frame_get(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     };
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
 /// Issue #128 measurement prototype: one sub-frame per owner, carrying
 /// only that owner's slice of the original request's keys — see
 /// `dispatch_request`'s `Request::MultiGet` arm.
-fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
+fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Bytes {
     let key_lengths: String = keys.iter().map(|key| format!(" {}", key.len())).collect();
     let mut frame = format!(
         "m {} {}{key_lengths} {TAG_PLACEHOLDER}\n",
@@ -2031,19 +2055,14 @@ fn frame_multi_get(namespace: &[u8], keys: &[Bytes]) -> Vec<u8> {
     for key in keys {
         frame.extend_from_slice(key);
     }
-    frame
+    frame.into()
 }
 
 /// Issue #150: one sub-frame per involved owner *address* — see
 /// `dispatch_request`'s `Request::MultiSet` arm for why grouping is by
 /// address rather than by rank (a batch's keys can put the same node in
 /// different roles). One shared `ttl` for the whole frame.
-fn frame_multi_set(
-    namespace: &[u8],
-    keys: &[Bytes],
-    values: &[Bytes],
-    ttl: Option<u64>,
-) -> Vec<u8> {
+fn frame_multi_set(namespace: &[u8], keys: &[Bytes], values: &[Bytes], ttl: Option<u64>) -> Bytes {
     let mut lengths = String::new();
     for (key, value) in keys.iter().zip(values) {
         lengths.push_str(&format!(" {} {}", key.len(), value.len()));
@@ -2060,10 +2079,10 @@ fn frame_multi_set(
         frame.extend_from_slice(key);
         frame.extend_from_slice(value);
     }
-    frame
+    frame.into()
 }
 
-fn frame_set(namespace: &[u8], key: &[u8], value: &[u8], ttl: Option<u64>) -> Vec<u8> {
+fn frame_set(namespace: &[u8], key: &[u8], value: &[u8], ttl: Option<u64>) -> Bytes {
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let mut frame = if namespace.is_empty() {
         format!(
@@ -2084,10 +2103,10 @@ fn frame_set(namespace: &[u8], key: &[u8], value: &[u8], ttl: Option<u64>) -> Ve
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame.extend_from_slice(value);
-    frame
+    frame.into()
 }
 
-fn frame_delete(namespace: &[u8], key: &[u8]) -> Vec<u8> {
+fn frame_delete(namespace: &[u8], key: &[u8]) -> Bytes {
     let mut frame = if namespace.is_empty() {
         format!("D {} {TAG_PLACEHOLDER}\n", key.len()).into_bytes()
     } else {
@@ -2095,12 +2114,12 @@ fn frame_delete(namespace: &[u8], key: &[u8]) -> Vec<u8> {
     };
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
 /// Issue #129: always the lowercase, namespaced `i` — `INCR` has no
 /// uppercase legacy form (see `Request::Incr`'s doc comment).
-fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Vec<u8> {
+fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Bytes {
     let mut frame = format!(
         "i {} {} {delta} {TAG_PLACEHOLDER}\n",
         namespace.len(),
@@ -2109,7 +2128,7 @@ fn frame_incr(namespace: &[u8], key: &[u8], delta: i64) -> Vec<u8> {
     .into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
 /// Issue #141: `<cond>`'s wire form for the outgoing `k`/`x` frame — the
@@ -2130,7 +2149,7 @@ fn frame_cas_set(
     condition: CasCondition,
     value: &[u8],
     ttl: Option<u64>,
-) -> Vec<u8> {
+) -> Bytes {
     let cond = cas_condition_field(condition);
     let ttl_field = ttl.map(|ttl| format!(" {ttl}")).unwrap_or_default();
     let mut frame = format!(
@@ -2143,11 +2162,11 @@ fn frame_cas_set(
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
     frame.extend_from_slice(value);
-    frame
+    frame.into()
 }
 
 /// Issue #141: always the lowercase, namespaced `x`.
-fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> Vec<u8> {
+fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> Bytes {
     let cond = cas_condition_field(CasCondition::Digest(expected_digest));
     let mut frame = format!(
         "x {} {} {cond} {TAG_PLACEHOLDER}\n",
@@ -2157,17 +2176,17 @@ fn frame_cas_delete(namespace: &[u8], key: &[u8], expected_digest: [u8; 16]) -> 
     .into_bytes();
     frame.extend_from_slice(namespace);
     frame.extend_from_slice(key);
-    frame
+    frame.into()
 }
 
-fn frame_clear(namespace: &[u8]) -> Vec<u8> {
+fn frame_clear(namespace: &[u8]) -> Bytes {
     let mut frame = format!("c {} {TAG_PLACEHOLDER}\n", namespace.len()).into_bytes();
     frame.extend_from_slice(namespace);
-    frame
+    frame.into()
 }
 
-fn frame_clear_all() -> Vec<u8> {
-    format!("F {TAG_PLACEHOLDER}\n").into_bytes()
+fn frame_clear_all() -> Bytes {
+    format!("F {TAG_PLACEHOLDER}\n").into_bytes().into()
 }
 
 // ─── request drivers ─────────────────────────────────────────────────
@@ -2192,6 +2211,10 @@ struct SharedBackends {
     /// clone can be moved into `run_backend`, which does that decrement
     /// itself.
     dialed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Issue #177: when an address's last dial attempt failed, and how
+    /// long ago — `enqueue` fails fast against `DIAL_BACKOFF` instead of
+    /// re-dialing. Cleared on the next successful dial to that address.
+    dial_failures: std::sync::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 impl SharedBackends {
@@ -2199,6 +2222,7 @@ impl SharedBackends {
         Self {
             slots: std::sync::Mutex::new(HashMap::new()),
             dialed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            dial_failures: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2208,6 +2232,34 @@ impl SharedBackends {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(slots.entry(addr.to_string()).or_default())
+    }
+
+    /// Issue #177: whether `addr`'s most recent dial attempt failed
+    /// within the last `DIAL_BACKOFF`.
+    fn dial_recently_failed(&self, addr: &str) -> bool {
+        let failures = self
+            .dial_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures
+            .get(addr)
+            .is_some_and(|at| at.elapsed() < DIAL_BACKOFF)
+    }
+
+    fn note_dial_failure(&self, addr: &str) {
+        let mut failures = self
+            .dial_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures.insert(addr.to_string(), std::time::Instant::now());
+    }
+
+    fn note_dial_success(&self, addr: &str) {
+        let mut failures = self
+            .dial_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        failures.remove(addr);
     }
 
     /// Enqueues one tag-checked request on `addr`'s shared connection
@@ -2224,9 +2276,17 @@ impl SharedBackends {
         &self,
         context: &ProxyContext,
         addr: &str,
-        frame: Vec<u8>,
+        frame: Bytes,
         expect: Expect,
     ) -> PendingReply {
+        // Issue #177: a fast-fail check before even touching the
+        // per-address slot lock — a black-holed address that just
+        // failed shouldn't make every concurrent caller queue up behind
+        // the lock only to hit the same backoff once they get it.
+        if self.dial_recently_failed(addr) {
+            return PendingReply::failed(dial_backoff_error(addr));
+        }
+
         let slot = self.slot(addr);
 
         // Two passes: a cached handle whose task has exited (the node's
@@ -2240,6 +2300,16 @@ impl SharedBackends {
                 match guard.as_ref() {
                     Some(handle) => handle.clone(),
                     None => {
+                        // Recheck under the lock: another task may have
+                        // just recorded a failure (or a success) for
+                        // this address while we were waiting for it —
+                        // this is what bounds concurrent first-dialers
+                        // of a dead address to one real dial, the rest
+                        // fail fast on the recheck instead of each
+                        // paying their own `UPSTREAM_IO_TIMEOUT`.
+                        if self.dial_recently_failed(addr) {
+                            return PendingReply::failed(dial_backoff_error(addr));
+                        }
                         match BackendHandle::connect(
                             addr,
                             &context.secret,
@@ -2253,9 +2323,13 @@ impl SharedBackends {
                                 *guard = Some(handle.clone());
                                 self.dialed
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.note_dial_success(addr);
                                 handle
                             }
-                            Err(error) => return PendingReply::failed(error),
+                            Err(error) => {
+                                self.note_dial_failure(addr);
+                                return PendingReply::failed(error);
+                            }
                         }
                     }
                 }
@@ -2300,7 +2374,7 @@ impl SharedBackends {
         &self,
         context: &ProxyContext,
         addr: &str,
-        frame: Vec<u8>,
+        frame: Bytes,
         expect: Expect,
     ) -> io::Result<NodeReply> {
         let first = self
@@ -2314,6 +2388,17 @@ impl SharedBackends {
     }
 }
 
+/// Issue #177: the error `enqueue` fails fast with while `addr` is
+/// within its dial backoff window — a black-holed node's second and
+/// later requests in the same short window shouldn't each pay another
+/// `UPSTREAM_IO_TIMEOUT` finding that out for themselves.
+fn dial_backoff_error(addr: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("backend at {addr} is in dial backoff after a recent failure"),
+    )
+}
+
 /// A reply still in flight on a backend connection.
 type PendingReply = Pin<Box<dyn std::future::Future<Output = io::Result<NodeReply>> + Send>>;
 
@@ -2325,6 +2410,46 @@ impl PendingReplyExt for PendingReply {
     fn failed(error: io::Error) -> PendingReply {
         Box::pin(async move { Err(error) })
     }
+}
+
+/// Issue #177: runs every future in `futs` concurrently on the current
+/// task and returns their outputs in the same order as `futs` — a tiny
+/// local `join_all`, since the crate carries no `futures` dependency.
+/// Every fan-out site below (a write/clear/multi-set batch's per-owner
+/// `enqueue`/`call`) used to run these one at a time in a `for` loop, so
+/// one address that was slow to dial (or is being black-holed) delayed
+/// issuing the request to every other owner behind it in the loop —
+/// `tokio::spawn` isn't an option here since these futures borrow
+/// `context`/`addr`/... with a lifetime shorter than `'static`, so this
+/// polls them all in place instead of spawning them onto the runtime.
+async fn join_all<'a, T>(futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>) -> Vec<T> {
+    let len = futs.len();
+    let mut slots: Vec<Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>> =
+        futs.into_iter().map(Some).collect();
+    let mut outputs: Vec<Option<T>> = (0..len).map(|_| None).collect();
+    let mut remaining = len;
+    std::future::poll_fn(move |cx| {
+        for i in 0..len {
+            if let Some(fut) = slots[i].as_mut()
+                && let Poll::Ready(value) = fut.as_mut().poll(cx)
+            {
+                outputs[i] = Some(value);
+                slots[i] = None;
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(
+                outputs
+                    .iter_mut()
+                    .map(|value| value.take().unwrap())
+                    .collect(),
+            )
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// The current ring, or `None` before the first successful fetch.
@@ -2701,20 +2826,22 @@ async fn dispatch_request(
                 return result_rx;
             }
 
-            let mut pending = Vec::with_capacity(groups.len());
-            for (owner, _, group_keys) in &groups {
-                pending.push(
-                    context
-                        .backends
-                        .enqueue(
-                            &context,
-                            owner,
-                            frame_multi_get(&namespace, group_keys),
-                            Expect::Multi,
-                        )
-                        .await,
-                );
-            }
+            // Issue #177: every group's `enqueue` (including whatever
+            // dial it takes) runs concurrently — a slow-to-dial owner
+            // must not delay issuing the request to the others.
+            let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = groups
+                .iter()
+                .map(|(owner, _, group_keys)| {
+                    let fut = context.backends.enqueue(
+                        &context,
+                        owner,
+                        frame_multi_get(&namespace, group_keys),
+                        Expect::Multi,
+                    );
+                    Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+                })
+                .collect();
+            let pending = join_all(futs).await;
             let positions: Vec<Vec<usize>> = groups
                 .into_iter()
                 .map(|(_, positions, _)| positions)
@@ -2767,28 +2894,29 @@ async fn dispatch_request(
                 return result_rx;
             }
 
-            let mut pending = Vec::with_capacity(groups.len());
-            for (owner, legs) in &groups {
-                let group_keys: Vec<Bytes> = legs
-                    .iter()
-                    .map(|(position, _)| keys[*position].clone())
-                    .collect();
-                let group_values: Vec<Bytes> = legs
-                    .iter()
-                    .map(|(position, _)| values[*position].clone())
-                    .collect();
-                pending.push(
-                    context
-                        .backends
-                        .enqueue(
-                            &context,
-                            owner,
-                            frame_multi_set(&namespace, &group_keys, &group_values, ttl),
-                            Expect::MultiAck,
-                        )
-                        .await,
-                );
-            }
+            // Issue #177: same concurrent fan-out as `MultiGet` above —
+            // one slow-to-dial owner must not delay the other groups.
+            let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = groups
+                .iter()
+                .map(|(owner, legs)| {
+                    let group_keys: Vec<Bytes> = legs
+                        .iter()
+                        .map(|(position, _)| keys[*position].clone())
+                        .collect();
+                    let group_values: Vec<Bytes> = legs
+                        .iter()
+                        .map(|(position, _)| values[*position].clone())
+                        .collect();
+                    let fut = context.backends.enqueue(
+                        &context,
+                        owner,
+                        frame_multi_set(&namespace, &group_keys, &group_values, ttl),
+                        Expect::MultiAck,
+                    );
+                    Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+                })
+                .collect();
+            let pending = join_all(futs).await;
             let groups_legs: Vec<Vec<(usize, bool)>> =
                 groups.into_iter().map(|(_, legs)| legs).collect();
 
@@ -2854,14 +2982,22 @@ async fn finish_get(
         Ok(_) | Err(_) => {}
     }
 
-    // The ordered primary attempt failed outright: fall through the
-    // remaining owners.
-    // The full owner list, primary included: the shared connection may
-    // simply have been idle-closed by the node, and `call`'s transparent
-    // redial recovers that without failing the client (issue #110 — a
-    // long-lived shared connection makes this the common case, not the
-    // rare one).
-    retry_get_on(context, namespace, key, owners, tag).await
+    // The ordered primary attempt failed outright: try the remaining
+    // owners *first* (issue #177) — a black-holed primary shouldn't
+    // cost another full `UPSTREAM_IO_TIMEOUT` before a live replica
+    // even gets a chance. The primary is still retried last rather than
+    // dropped, in case this was merely an idle-closed shared connection
+    // recovering via `call`'s own transparent redial (issue #110 — a
+    // long-lived shared connection makes that the common case, not the
+    // rare one); by the time it's retried it also falls within
+    // `enqueue`'s dial backoff window, so a genuinely dead primary fails
+    // that last attempt fast instead of costing a second full timeout.
+    let mut retry_owners = owners;
+    if !retry_owners.is_empty() {
+        let failed_primary = retry_owners.remove(0);
+        retry_owners.push(failed_primary);
+    }
+    retry_get_on(context, namespace, key, retry_owners, tag).await
 }
 
 async fn retry_get_on(
@@ -2980,17 +3116,23 @@ async fn retry_multi_get(
         }
     }
 
-    for (owner, group_positions, group_keys) in groups {
-        let reply = context
-            .backends
-            .call(
+    // Issue #177: fan the regrouped retry out to every owner
+    // concurrently, same reasoning as the first pass in `dispatch_request`.
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = groups
+        .iter()
+        .map(|(owner, _, group_keys)| {
+            let fut = context.backends.call(
                 context,
-                &owner,
-                frame_multi_get(namespace, &group_keys),
+                owner,
+                frame_multi_get(namespace, group_keys),
                 Expect::Multi,
-            )
-            .await;
+            );
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    let replies = join_all(futs).await;
 
+    for ((_, group_positions, _), reply) in groups.into_iter().zip(replies) {
         match reply {
             Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
                 for (position, entry) in group_positions.into_iter().zip(results) {
@@ -3142,25 +3284,30 @@ async fn retry_multi_set(
         }
     }
 
-    for (owner, legs) in groups {
-        let group_keys: Vec<Bytes> = legs
-            .iter()
-            .map(|(position, _)| keys[*position].clone())
-            .collect();
-        let group_values: Vec<Bytes> = legs
-            .iter()
-            .map(|(position, _)| values[*position].clone())
-            .collect();
-        let reply = context
-            .backends
-            .call(
+    // Issue #177: same concurrent fan-out as `retry_multi_get` above.
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = groups
+        .iter()
+        .map(|(owner, legs)| {
+            let group_keys: Vec<Bytes> = legs
+                .iter()
+                .map(|(position, _)| keys[*position].clone())
+                .collect();
+            let group_values: Vec<Bytes> = legs
+                .iter()
+                .map(|(position, _)| values[*position].clone())
+                .collect();
+            let fut = context.backends.call(
                 context,
-                &owner,
+                owner,
                 frame_multi_set(namespace, &group_keys, &group_values, ttl),
                 Expect::MultiAck,
-            )
-            .await;
+            );
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    let replies = join_all(futs).await;
 
+    for ((_, legs), reply) in groups.into_iter().zip(replies) {
         match reply {
             Ok(NodeReply::MultiAck(results)) if results.len() == legs.len() => {
                 for ((position, is_primary), result) in legs.into_iter().zip(results) {
@@ -3184,8 +3331,9 @@ async fn retry_multi_set(
     }
 }
 
-/// Enqueues a write/delete on every owner, primary first, in one ordered
-/// pass; returns the pending replies (primary first).
+/// Enqueues a write/delete on every owner concurrently (issue #177: one
+/// owner slow to dial must not delay the others); returns the pending
+/// replies in owner order, primary first.
 async fn enqueue_write(
     context: &ProxyContext,
     ring: &RingView,
@@ -3195,23 +3343,23 @@ async fn enqueue_write(
 ) -> Vec<PendingReply> {
     let owners = ring.owners(namespace, key);
     let (frame, expect) = write_frame(namespace, key, write);
-    let mut pending = Vec::with_capacity(owners.len());
-    for addr in &owners {
-        pending.push(
-            context
+    let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = owners
+        .iter()
+        .map(|addr| {
+            let fut = context
                 .backends
-                .enqueue(context, addr, frame.clone(), expect)
-                .await,
-        );
-    }
-    pending
+                .enqueue(context, addr, frame.clone(), expect);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+        })
+        .collect();
+    join_all(futs).await
 }
 
 fn write_frame(
     namespace: &[u8],
     key: &[u8],
     write: Option<(&Bytes, Option<u64>)>,
-) -> (Vec<u8>, Expect) {
+) -> (Bytes, Expect) {
     match write {
         Some((value, ttl)) => (frame_set(namespace, key, value, ttl), Expect::Stored),
         None => (frame_delete(namespace, key), Expect::Deleted),
@@ -3286,12 +3434,18 @@ async fn refan_write(
     let Some((primary, replicas)) = owners.split_first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
-    for addr in replicas {
-        if let Err(error) = context
-            .backends
-            .call(context, addr, frame.clone(), expect)
-            .await
-        {
+    // Issue #177: every replica leg's `call` runs concurrently — a
+    // black-holed replica must not delay the others, or delay reaching
+    // the primary below.
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = replicas
+        .iter()
+        .map(|addr| {
+            let fut = context.backends.call(context, addr, frame.clone(), expect);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    for (addr, result) in replicas.iter().zip(join_all(futs).await) {
+        if let Err(error) = result {
             eprintln!("WARN replica write to {addr} failed: {error}");
         }
     }
@@ -3363,17 +3517,20 @@ async fn fan_out_write_result(
     ttl: Option<u64>,
     replicas: &[String],
 ) {
-    for addr in replicas {
-        if let Err(error) = context
-            .backends
-            .call(
-                context,
-                addr,
-                frame_set(namespace, key, value, ttl),
-                Expect::Stored,
-            )
-            .await
-        {
+    // Issue #177: concurrent, same reasoning as `refan_write`'s replica
+    // loop.
+    let frame = frame_set(namespace, key, value, ttl);
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = replicas
+        .iter()
+        .map(|addr| {
+            let fut = context
+                .backends
+                .call(context, addr, frame.clone(), Expect::Stored);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    for (addr, result) in replicas.iter().zip(join_all(futs).await) {
+        if let Err(error) = result {
             eprintln!("WARN replica incr-result write to {addr} failed: {error}");
         }
     }
@@ -3531,12 +3688,19 @@ async fn fan_out_delete_result(
     key: &[u8],
     replicas: &[String],
 ) {
-    for addr in replicas {
-        if let Err(error) = context
-            .backends
-            .call(context, addr, frame_delete(namespace, key), Expect::Deleted)
-            .await
-        {
+    // Issue #177: concurrent, same reasoning as `fan_out_write_result`.
+    let frame = frame_delete(namespace, key);
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = replicas
+        .iter()
+        .map(|addr| {
+            let fut = context
+                .backends
+                .call(context, addr, frame.clone(), Expect::Deleted);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    for (addr, result) in replicas.iter().zip(join_all(futs).await) {
+        if let Err(error) = result {
             eprintln!("WARN replica cas-delete-result write to {addr} failed: {error}");
         }
     }
@@ -3588,15 +3752,21 @@ async fn enqueue_clear(
         Some(namespace) => frame_clear(namespace),
         None => frame_clear_all(),
     };
-    let mut pending = Vec::new();
-    for addr in ring.all_addresses() {
-        let reply = context
-            .backends
-            .enqueue(context, &addr, frame.clone(), Expect::Cleared)
-            .await;
-        pending.push((addr, reply));
-    }
-    pending
+    let addrs = ring.all_addresses();
+    // Issue #177: fan out to every member concurrently — a single slow
+    // or black-holed member must not delay `enqueue` to the rest of the
+    // cluster on a `Clear`/`FlushAll`.
+    let futs: Vec<Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>> = addrs
+        .iter()
+        .map(|addr| {
+            let fut = context
+                .backends
+                .enqueue(context, addr, frame.clone(), Expect::Cleared);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = PendingReply> + Send + '_>>
+        })
+        .collect();
+    let replies = join_all(futs).await;
+    addrs.into_iter().zip(replies).collect()
 }
 
 /// `c`/`F`'s completion: every member must ack. Any failure forces one
@@ -3624,16 +3794,21 @@ async fn finish_clear(
         Some(namespace) => frame_clear(namespace),
         None => frame_clear_all(),
     };
-    let mut all_ok = true;
-    for addr in ring.all_addresses() {
-        all_ok &= matches!(
-            context
+    // Issue #177: concurrent, same reasoning as `enqueue_clear`.
+    let addrs = ring.all_addresses();
+    let futs: Vec<Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>> = addrs
+        .iter()
+        .map(|addr| {
+            let fut = context
                 .backends
-                .call(context, &addr, frame.clone(), Expect::Cleared)
-                .await,
-            Ok(NodeReply::Cleared)
-        );
-    }
+                .call(context, addr, frame.clone(), Expect::Cleared);
+            Box::pin(fut) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect();
+    let all_ok = join_all(futs)
+        .await
+        .into_iter()
+        .all(|result| matches!(result, Ok(NodeReply::Cleared)));
     if all_ok {
         Ok(respond("C", tag))
     } else {
@@ -5066,6 +5241,51 @@ mod tests {
         (stream, buf)
     }
 
+    /// Issue #177: a node that accepts a connection and then answers
+    /// nothing at all — never even completing the auth handshake. Unlike
+    /// a dropped listener (`dead_node_cluster`, connection *refused* —
+    /// fails instantly), this is a genuine black hole: the dial only
+    /// fails once `BackendHandle::connect`'s own `UPSTREAM_IO_TIMEOUT`
+    /// elapses.
+    async fn serve_black_hole(stream: TcpStream) {
+        let _stream = stream;
+        std::future::pending::<()>().await;
+    }
+
+    async fn start_black_hole_node() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_black_hole(stream));
+            }
+        });
+        addr
+    }
+
+    /// A `ProxyContext` with no live discovery/refresher behind it — for
+    /// tests that drive `SharedBackends`/the request drivers directly
+    /// (`enqueue_write`, `finish_get`, ...) rather than through a full
+    /// proxy listener.
+    fn bare_context() -> ProxyContext {
+        let (_ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(1);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: ring_rx,
+            refresh_now: refresh_tx,
+            backends: SharedBackends::new(),
+            drain: drain_rx,
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     // ── end-to-end ───────────────────────────────────────────────────
 
     /// Issue #125: a roster whose only node is a dead address — every
@@ -6206,5 +6426,120 @@ mod tests {
         assert_eq!(replica.cas_deletes(), 0);
         assert_eq!(primary.entry(b"", b"name"), None);
         assert_eq!(replica.entry(b"", b"name"), None);
+    }
+
+    // ── issue #177: concurrent fan-out, dial backoff, failed-primary skip ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_black_holed_owners_do_not_serialize_the_write_fan_out() {
+        // Before issue #177's fix, `enqueue_write` dialed each owner one
+        // at a time (`for addr in &owners { backends.enqueue(..).await
+        // }`), so two black-holed owners in the same write cost two
+        // full `UPSTREAM_IO_TIMEOUT`s back to back. Concurrent fan-out
+        // bounds the whole batch to about one.
+        let healthy = MockNode::start().await;
+        let black_hole_a = start_black_hole_node().await;
+        let black_hole_b = start_black_hole_node().await;
+        let ring = RingView::new(
+            vec![
+                ("healthy".to_string(), healthy.addr.clone()),
+                ("black-a".to_string(), black_hole_a),
+                ("black-b".to_string(), black_hole_b),
+            ],
+            3,
+        );
+        let context = bare_context();
+        let value = Bytes::from_static(b"value");
+
+        let start = std::time::Instant::now();
+        let pending = enqueue_write(&context, &ring, b"", b"key", Some((&value, None))).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(pending.len(), 3);
+        // At least one timeout really elapsed (rules out a false pass
+        // from something returning instantly)...
+        assert!(elapsed >= UPSTREAM_IO_TIMEOUT, "elapsed {elapsed:?}");
+        // ...but nowhere near two, which is what the sequential bug
+        // would have cost with two black-holed owners.
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
+            "elapsed {elapsed:?} looks serialized, not concurrent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_enqueue_to_a_recently_failed_address_fails_fast() {
+        // Issue #177: `enqueue` used to re-dial inline with no memory of
+        // a prior failure, so a black-holed address cost every caller
+        // its own full `UPSTREAM_IO_TIMEOUT`. Within `DIAL_BACKOFF` of
+        // the first failure, a second attempt should fail immediately.
+        let black_hole = start_black_hole_node().await;
+        let context = bare_context();
+        let frame = frame_get(b"", b"key");
+
+        let start = std::time::Instant::now();
+        let first = context
+            .backends
+            .enqueue(&context, &black_hole, frame.clone(), Expect::Value)
+            .await
+            .await;
+        let first_elapsed = start.elapsed();
+        assert!(first.is_err());
+        assert!(
+            first_elapsed >= UPSTREAM_IO_TIMEOUT,
+            "the first dial should pay the full timeout: {first_elapsed:?}"
+        );
+
+        let start = std::time::Instant::now();
+        let second = context
+            .backends
+            .enqueue(&context, &black_hole, frame, Expect::Value)
+            .await
+            .await;
+        let second_elapsed = start.elapsed();
+        assert!(second.is_err());
+        assert!(
+            second_elapsed < DIAL_BACKOFF,
+            "the second attempt should fail fast from the backoff window: {second_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_get_with_a_dead_primary_falls_over_to_the_replica_within_one_timeout() {
+        // Issue #177: `retry_get_on` used to retry the primary that just
+        // failed *before* trying any replica, so a black-holed primary
+        // could cost up to three timeouts before a live replica ever
+        // answered. It should now cost about one.
+        let replica = MockNode::start().await;
+        replica
+            .store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), b"key".to_vec()), b"value".to_vec());
+        let dead_primary = start_black_hole_node().await;
+        let context = bare_context();
+        let owners = vec![dead_primary.clone(), replica.addr.clone()];
+
+        let start = std::time::Instant::now();
+        let pending = context
+            .backends
+            .enqueue(
+                &context,
+                &dead_primary,
+                frame_get(b"", b"key"),
+                Expect::Value,
+            )
+            .await;
+        let result = finish_get(&context, b"", b"key", owners, pending, None).await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Ok(reply) => assert_eq!(reply, respond_value(b"value", None)),
+            Err(Fatal) => panic!("expected the replica's value, got a fatal error"),
+        }
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
+            "elapsed {elapsed:?} suggests the dead primary was retried before the replica"
+        );
     }
 }
