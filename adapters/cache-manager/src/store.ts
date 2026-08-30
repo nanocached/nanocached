@@ -64,7 +64,7 @@ function resolveTtlSeconds(ttlMs: Milliseconds | undefined, defaultTtlMs: Millis
   return Math.ceil(effectiveMs / 1000);
 }
 
-/** Thrown by `keys()`/`ttl()` — see `NanocachedStore` for why. */
+/** Thrown by `keys()` — see `NanocachedStore` for why. */
 export class NotSupportedError extends Error {
   constructor(operation: string) {
     super(
@@ -171,9 +171,23 @@ export class NanocachedStore implements Store {
   }
 
   /** The wire has no TTL-readback operation (a `V` response carries the
-   * value, never its remaining expiry) — same reasoning as `keys()`. */
+   * value, never its remaining expiry) — same reasoning as `keys()`.
+   * Unlike `keys()`, though, this one is a required `Store` member that
+   * `cache-manager`'s own `wrap()` calls *unconditionally and uncaught*
+   * whenever a `refreshThreshold` is configured (issue #274) — throwing
+   * here would turn every cache hit into a thrown error the moment a
+   * caller opts into refresh-ahead, which is worse than just not
+   * supporting refresh-ahead.
+   *
+   * So this always answers `-1` — the exact sentinel `wrap()` already
+   * treats as "unknown/no TTL" (`remainingTtl !== -1 && remainingTtl <
+   * refreshThresholdConfig`, cache-manager's own `caching.js`): with `-1`
+   * that condition is always false, so the background-refresh branch
+   * never runs, for any `refreshThreshold` value. Net effect: refresh-ahead
+   * silently degrades to plain read-through caching instead of crashing —
+   * documented in the README under "Semantics". */
   async ttl(_key: string): Promise<number> {
-    throw new NotSupportedError("ttl");
+    return -1;
   }
 
   /** Closes the underlying SDK client. cache-manager never closes a
