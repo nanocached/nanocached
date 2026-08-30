@@ -95,6 +95,19 @@ export interface MockNode extends MockServerBase {
   /** How many `o` (batched set, issues #150/#151) requests this server
    * has ever received. */
   multiSetCount(): number;
+  /** Each `m` frame's total wire size received so far — the header line
+   * (marker, namespace/count/key-length fields, trailing LF) plus
+   * namespace plus every key's bytes, i.e. exactly the bytes the real
+   * server's own per-request cap (src/server.rs's MAX_REQUEST_SIZE)
+   * applies to — in receipt order. Lets a test assert the SDK's
+   * byte-bound batch chunking (issue #222) actually kept every
+   * sub-frame under that cap, header overhead included, not just that
+   * it split into more than one. */
+  multiGetFrameBytes(): number[];
+  /** `multiGetFrameBytes`'s write-side twin: each `o` frame's total wire
+   * size (header line plus namespace plus every key's and every value's
+   * bytes) received so far, in receipt order. */
+  multiSetFrameBytes(): number[];
   /** Makes every `m`/`o` roster containing `key` answer just that key
    * `W`, for the next `times` such requests (consumed one per match,
    * across as many separate `m`/`o` calls as it takes) — the batched
@@ -319,6 +332,10 @@ export async function startMockNode(
   // Batched get/set (issues #128/#150/#151).
   let multiGets = 0;
   let multiSets = 0;
+  // Per-frame wire body sizes (issue #222), in receipt order — see
+  // multiGetFrameBytes/multiSetFrameBytes above.
+  const multiGetFrameBytes: number[] = [];
+  const multiSetFrameBytes: number[] = [];
   // multiWrongNodeKey/multiWrongNodeLeft: when multiWrongNodeKey is set,
   // every `m`/`o` roster containing that exact key answers just that key
   // `W`, for as long as multiWrongNodeLeft has budget left (consumed one
@@ -570,6 +587,12 @@ export async function startMockNode(
             }
             buffer = buffer.subarray(cursor);
             multiGets++;
+            // The full wire frame — header line (bodyStart already
+            // includes its trailing LF) plus namespace plus every key —
+            // not just the body, so issue #222's tests can assert the
+            // real per-request bytes the server's own 1 MiB cap applies
+            // to, header overhead included.
+            multiGetFrameBytes.push(bodyStart + namespaceLength + totalKeyLength);
 
             if (silent) break;
 
@@ -640,6 +663,10 @@ export async function startMockNode(
             }
             buffer = buffer.subarray(cursor);
             multiSets++;
+            // multiGetFrameBytes' write-side twin — see its own comment
+            // above for why this is the header-inclusive wire size, not
+            // just the body.
+            multiSetFrameBytes.push(bodyStart + namespaceLength + totalBodyLength);
 
             if (silent) break;
 
@@ -977,6 +1004,8 @@ export async function startMockNode(
     clearCount: () => clears,
     multiGetCount: () => multiGets,
     multiSetCount: () => multiSets,
+    multiGetFrameBytes: () => [...multiGetFrameBytes],
+    multiSetFrameBytes: () => [...multiSetFrameBytes],
     answerMultiWrongNodeTimes: (key, times) => {
       multiWrongNodeKey = key;
       multiWrongNodeLeft += times;

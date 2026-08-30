@@ -19,7 +19,7 @@ import {
 import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
-import { MULTI_GET_TUNING } from "../src/protocol.js";
+import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -2302,6 +2302,138 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
           assert.ok(error instanceof PartialWrongNodeError);
           assert.ok(error instanceof WrongNodeError);
           assert.equal((error as PartialWrongNodeError<Map<string, string>>).partialValues.get("b"), "2");
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", () => {
+  // Regression for issue #222: MAX_BATCH_KEYS alone bounds a batch by key
+  // count, but a batch of individually-valid pairs can still sum well past
+  // MAX_REQUEST_BYTES (the server's own per-request cap) while staying far
+  // under MAX_BATCH_KEYS by count — e.g. 400 keys x 5 KiB values. Sending
+  // that as one `o`/`m` frame would make the real server (src/server.rs's
+  // request_is_too_large) drop the connection with no reply at all, which
+  // the SDK would otherwise see as a misleading ConnectionLost/WrongNode.
+
+  it("splits a setManyBytes batch of individually valid pairs whose cumulative bytes exceed MAX_REQUEST_BYTES into several o sub-frames, each within the cap", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const count = 50;
+        const valueSize = 50_000; // each pair, alone, is nowhere near MAX_REQUEST_BYTES
+        assert.ok(count < MAX_BATCH_KEYS, "count alone must not explain the split");
+        assert.ok(count * valueSize > MAX_REQUEST_BYTES, "cumulative bytes must exceed the cap");
+
+        const values: Record<string, Uint8Array> = {};
+        const keys: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const key = `key-${i}`;
+          keys.push(key);
+          values[key] = Buffer.alloc(valueSize, i % 256);
+        }
+
+        await client.setManyBytes(values);
+        assert.ok(node.multiSetCount() > 1, "expected more than one o sub-frame");
+        for (const frameBytes of node.multiSetFrameBytes()) {
+          assert.ok(frameBytes <= MAX_REQUEST_BYTES, `sub-frame of ${frameBytes} bytes exceeds MAX_REQUEST_BYTES`);
+        }
+
+        const got = await client.getManyBytes(keys);
+        assert.equal(got.size, count);
+        for (const key of keys) {
+          assert.deepEqual(got.get(key), values[key]);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("splits a getMany call over large keys whose cumulative bytes exceed MAX_REQUEST_BYTES into several m sub-frames, each within the cap", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const count = 50;
+        const keySize = 25_000; // each key, alone, is nowhere near MAX_REQUEST_BYTES
+        assert.ok(count < MAX_BATCH_KEYS, "count alone must not explain the split");
+        assert.ok(count * keySize > MAX_REQUEST_BYTES, "cumulative bytes must exceed the cap");
+
+        const values: Record<string, string> = {};
+        const keys: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const key = `${"k".repeat(keySize)}-${i}`;
+          keys.push(key);
+          values[key] = `value-${i}`;
+        }
+        await client.setMany(values);
+
+        const got = await client.getMany(keys);
+        assert.ok(node.multiGetCount() > 1, "expected more than one m sub-frame");
+        for (const frameBytes of node.multiGetFrameBytes()) {
+          assert.ok(frameBytes <= MAX_REQUEST_BYTES, `sub-frame of ${frameBytes} bytes exceeds MAX_REQUEST_BYTES`);
+        }
+        assert.equal(got.size, count);
+        for (const key of keys) {
+          assert.equal(got.get(key), values[key]);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("splits exactly MAX_BATCH_KEYS entries near MAX_REQUEST_BYTES into o sub-frames each still under 1 MiB, once their own header fields are counted honestly", async () => {
+    // Regression for the follow-up to issue #222: bounding a sub-frame by
+    // namespace+key+value bytes alone (ignoring the header field(s) each
+    // entry itself adds — " <keyLen> <valLen>" per entry for `o`) isn't
+    // honest enough once a batch actually reaches MAX_BATCH_KEYS. Sized so
+    // the raw namespace+key+value total sits *under* MAX_REQUEST_BYTES
+    // (1,048,290 <= 1,048,320) at exactly MAX_BATCH_KEYS (400) entries —
+    // a chunker that ignored per-entry header cost would have judged this
+    // batch as fitting in one `o` frame — yet the real wire frame (header
+    // line included) comes to ~1,051,098 bytes, over the server's actual
+    // 1 MiB request cap. multiSetEntryCost/MULTI_FRAME_HEADER_SLACK
+    // (protocol.ts) must therefore still force a split here.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const count = MAX_BATCH_KEYS; // 400 — the split can't be explained by key count alone
+        const valueSize = 2614;
+
+        const values: Record<string, Uint8Array> = {};
+        const keys: string[] = [];
+        let rawTotal = 0;
+        for (let i = 0; i < count; i++) {
+          const key = `key-${i}`;
+          keys.push(key);
+          values[key] = Buffer.alloc(valueSize, i % 256);
+          rawTotal += Buffer.byteLength(key, "utf8") + valueSize;
+        }
+        assert.ok(rawTotal <= MAX_REQUEST_BYTES, "raw namespace+key+value bytes alone must still fit — the header is what pushes this over");
+
+        await client.setManyBytes(values);
+        assert.ok(node.multiSetCount() > 1, "expected more than one o sub-frame despite fitting MAX_BATCH_KEYS and raw MAX_REQUEST_BYTES");
+        for (const frameBytes of node.multiSetFrameBytes()) {
+          assert.ok(frameBytes < 1024 * 1024, `sub-frame of ${frameBytes} bytes exceeds the server's 1 MiB request cap`);
+        }
+
+        const got = await client.getManyBytes(keys);
+        assert.equal(got.size, count);
+        for (const key of keys) {
+          assert.deepEqual(got.get(key), values[key]);
         }
       } finally {
         client.close();

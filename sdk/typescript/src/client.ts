@@ -6,7 +6,19 @@ import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue } from "./compression.js";
 import { NanocachedError } from "./errors.js";
-import { checkKey, checkKeyAndValue, contentDigest, EMPTY_NAMESPACE, type CasCondition, type MultiAckEntry, type MultiEntry } from "./protocol.js";
+import {
+  checkKey,
+  checkKeyAndValue,
+  contentDigest,
+  EMPTY_NAMESPACE,
+  MAX_REQUEST_BYTES,
+  multiGetEntryCost,
+  multiSetEntryCost,
+  MULTI_FRAME_HEADER_SLACK,
+  type CasCondition,
+  type MultiAckEntry,
+  type MultiEntry,
+} from "./protocol.js";
 
 export { ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, WrongNodeError } from "./connection.js";
 export { NanocachedError } from "./errors.js";
@@ -311,7 +323,37 @@ const NODE_LIST_STALE_AFTER_MS = 30_000;
 // own derivation comment) — matches the Go SDK's identically-derived
 // maxBatchKeys (sdk/go/client.go). Exported only so tests can assert
 // against it directly, mirroring FIRE_AND_FORGET_TUNING/KEEPALIVE_TUNING.
+//
+// A key count bound alone isn't enough, though (issue #222): MAX_BATCH_KEYS
+// individually-valid pairs can still sum past the server's own per-request
+// cap (a 400-key batch of 5 KiB values is nowhere near 400 keys but is
+// well over 1 MiB). nextChunkEnd below adds the missing cumulative-bytes
+// bound on top of this one.
 export const MAX_BATCH_KEYS = 400;
+
+// Batch chunking's byte bound (issue #222): finds the largest run starting
+// at `start` — at most MAX_BATCH_KEYS entries — whose namespace, plus
+// protocol.ts's own MULTI_FRAME_HEADER_SLACK, plus per-entry wire cost
+// (`entryBytes` — protocol.ts's multiGetEntryCost for `m`, multiSetEntryCost
+// for `o`, both already honest about the header field(s) each entry adds,
+// not just its key/value bytes) still fits protocol.ts's MAX_REQUEST_BYTES.
+// This mirrors encodeMultiGet/encodeMultiSet's own "total" bound exactly,
+// entry cost and header slack alike, so a chunk built this way can never
+// trip the encoder's RangeError. A single entry always fits by itself —
+// checkKey/checkKeyAndValue already validated every entry eagerly, before
+// chunking ever starts (see getManyBytesInNamespace/setManyInNamespace) —
+// so a run is never empty and this always makes progress.
+function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entryBytes: (index: number) => number): number {
+  let end = start;
+  let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
+  while (end < count && end - start < MAX_BATCH_KEYS) {
+    const next = total + entryBytes(end);
+    if (end > start && next > MAX_REQUEST_BYTES) break;
+    total = next;
+    end++;
+  }
+  return end;
+}
 
 // Tracks, per connect() target (not per instance — there's no `close()` yet
 // to hook into), how many live sockets are still open for it. Purely a
@@ -1297,8 +1339,9 @@ export class NanocachedClient {
    * against.
    *
    * Larger batches are transparently split into more than one `m`
-   * sub-frame per owner (batch chunking, see MAX_BATCH_KEYS) —
-   * callers never need to think about this. */
+   * sub-frame per owner (batch chunking, see MAX_BATCH_KEYS and, for
+   * the cumulative-bytes bound alongside it, MAX_REQUEST_BYTES /
+   * `nextChunkEnd`) — callers never need to think about this. */
   async getManyBytes(keys: readonly string[]): Promise<Map<string, Buffer>> {
     return this.getManyBytesInNamespace(EMPTY_NAMESPACE, keys);
   }
@@ -1409,23 +1452,25 @@ export class NanocachedClient {
 
   /** Issues one or more `m` sub-frames against whatever `connectionFor`
    * resolves to — already grouped to one owner (or the single/proxy
-   * target) by the caller — splitting into MAX_BATCH_KEYS-sized chunks
-   * (batch chunking) so no reply header risks exceeding
-   * protocol.ts's MAX_MULTI_HEADER_LENGTH. `connectionFor` is called
-   * fresh for every chunk (not resolved once up front), so a mid-batch
-   * reconnect is handled exactly the way a single-key get/set handles
-   * one today. */
+   * target) by the caller — splitting into chunks bounded by both
+   * MAX_BATCH_KEYS and MAX_REQUEST_BYTES (batch chunking, issue #222,
+   * see `nextChunkEnd`) so no reply header risks exceeding protocol.ts's
+   * MAX_MULTI_HEADER_LENGTH, and no request frame risks exceeding the
+   * server's own per-request cap. `connectionFor` is called fresh for
+   * every chunk (not resolved once up front), so a mid-batch reconnect
+   * is handled exactly the way a single-key get/set handles one today. */
   private async multiGetChunked(
     connectionFor: () => Promise<Connection>,
     namespace: Uint8Array,
     keyBytes: readonly Buffer[],
   ): Promise<MultiEntry[]> {
     const entries: MultiEntry[] = new Array(keyBytes.length);
-    for (let start = 0; start < keyBytes.length; start += MAX_BATCH_KEYS) {
-      const end = Math.min(start + MAX_BATCH_KEYS, keyBytes.length);
+    for (let start = 0; start < keyBytes.length; ) {
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
       const connection = await connectionFor();
       const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
       for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+      start = end;
     }
     return entries;
   }
@@ -1468,7 +1513,9 @@ export class NanocachedClient {
    * `setBytes`' own single-mode behavior does.
    *
    * Larger batches are transparently split into more than one `o`
-   * sub-frame per node (batch chunking, see MAX_BATCH_KEYS). */
+   * sub-frame per node (batch chunking, see MAX_BATCH_KEYS and, for
+   * the cumulative-bytes bound alongside it, MAX_REQUEST_BYTES /
+   * `nextChunkEnd`). */
   async setManyBytes(values: Record<string, Uint8Array>, ttlSeconds = 0): Promise<void> {
     return this.setManyInNamespace(EMPTY_NAMESPACE, values, ttlSeconds);
   }
@@ -1510,8 +1557,11 @@ export class NanocachedClient {
   }
 
   /** multiGetChunked's write-side twin: one or more `o` sub-frames
-   * against whatever `connectionFor` resolves to, split into
-   * MAX_BATCH_KEYS-sized chunks the same way. */
+   * against whatever `connectionFor` resolves to, chunked by both
+   * MAX_BATCH_KEYS and MAX_REQUEST_BYTES the same way (issue #222,
+   * `nextChunkEnd`) — a chunk's namespace + every key's and every
+   * value's bytes together must fit MAX_REQUEST_BYTES, mirroring
+   * encodeMultiSet's own bound. */
   private async multiSetChunked(
     connectionFor: () => Promise<Connection>,
     namespace: Uint8Array,
@@ -1520,11 +1570,12 @@ export class NanocachedClient {
     ttlSeconds: number,
   ): Promise<MultiAckEntry[]> {
     const entries: MultiAckEntry[] = new Array(keyBytes.length);
-    for (let start = 0; start < keyBytes.length; start += MAX_BATCH_KEYS) {
-      const end = Math.min(start + MAX_BATCH_KEYS, keyBytes.length);
+    for (let start = 0; start < keyBytes.length; ) {
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]));
       const connection = await connectionFor();
       const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
       for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+      start = end;
     }
     return entries;
   }
