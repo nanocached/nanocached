@@ -2000,8 +2000,18 @@ class NanocachedClient:
                 pending.add(start(next_index))
                 next_index += 1
                 continue
+            # issue #229: asyncio.wait(FIRST_COMPLETED) can return more
+            # than one finished task in `done` (e.g. the primary and a
+            # hedge leg failing in the same event-loop tick). Discard all
+            # of them from self._hedged_reads up front, before deciding
+            # the outcome below — a decisive outcome returns/raises from
+            # inside the loop, which would otherwise skip the discard for
+            # any task after the one that decided it, leaking it in
+            # _hedged_reads until close() and counting it against
+            # _MAX_INFLIGHT_HEDGE_LOSER_LEGS.
             for task in done:
                 self._hedged_reads.discard(task)
+            for task in done:
                 index = legs[task]
                 try:
                     value = task.result()
