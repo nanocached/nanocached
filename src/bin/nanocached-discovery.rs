@@ -3777,7 +3777,9 @@ async fn handle_connection(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     match proxies.get(&name) {
-                        Some(existing) if existing.token == token => {
+                        Some(existing)
+                            if constant_time_eq(existing.token.as_bytes(), token.as_bytes()) =>
+                        {
                             proxies.remove(&name);
                             Ok(true)
                         }
@@ -3820,7 +3822,9 @@ async fn handle_connection(
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let at_capacity = proxies.len() >= MAX_PROXY_ENTRIES;
                     match proxies.get_mut(&name) {
-                        Some(existing) if existing.token == token => {
+                        Some(existing)
+                            if constant_time_eq(existing.token.as_bytes(), token.as_bytes()) =>
+                        {
                             existing.address = addr;
                             existing.last_seen = Instant::now();
                             true
