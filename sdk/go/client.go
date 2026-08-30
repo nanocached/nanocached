@@ -41,6 +41,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -1590,9 +1591,29 @@ func (c *Client) Incr(key string, delta int64) (value int64, ok bool, err error)
 }
 
 // Decr is Incr with delta negated — a thin convenience wrapper; it sends
-// exactly the same `i` wire opcode as Incr, never a separate one.
+// exactly the same `i` wire opcode as Incr, never a separate one. Returns
+// ErrInvalidArgument (issue #182) for delta == math.MinInt64, which has
+// no valid int64 negation — see negateDecrDelta.
 func (c *Client) Decr(key string, delta int64) (value int64, ok bool, err error) {
-	return c.incrNS(nil, key, -delta)
+	negated, err := negateDecrDelta(delta)
+	if err != nil {
+		return 0, false, err
+	}
+	return c.incrNS(nil, key, negated)
+}
+
+// negateDecrDelta negates delta for Decr (shared by *Client and
+// *Namespace), rejecting math.MinInt64 (issue #182): two's complement has
+// no positive int64 large enough to represent |math.MinInt64|
+// (math.MaxInt64 is one short), so negating it silently wraps back to
+// math.MinInt64 itself — turning a decrement into the largest possible
+// increment instead of failing loudly. Caught here, before any I/O,
+// mirroring the Java and Rust SDKs' own rejection of this value.
+func negateDecrDelta(delta int64) (int64, error) {
+	if delta == math.MinInt64 {
+		return 0, invalidArgument("nanocached: decr delta must not be math.MinInt64, which has no valid int64 negation")
+	}
+	return -delta, nil
 }
 
 // incrNS is Incr scoped to namespace — the internal (namespace, key)
@@ -1899,7 +1920,11 @@ func (n *Namespace) Incr(key string, delta int64) (value int64, ok bool, err err
 
 // Decr is Incr with delta negated, within this namespace. See Client.Decr.
 func (n *Namespace) Decr(key string, delta int64) (value int64, ok bool, err error) {
-	return n.client.incrNS(n.namespace, key, -delta)
+	negated, err := negateDecrDelta(delta)
+	if err != nil {
+		return 0, false, err
+	}
+	return n.client.incrNS(n.namespace, key, negated)
 }
 
 // Clear drops every entry in this namespace across every node (issue
