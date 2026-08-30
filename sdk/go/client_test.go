@@ -294,10 +294,7 @@ func startMockNode(t *testing.T, requiredSecret []byte) *mockNode {
 
 func startMockNodeOpts(t *testing.T, requiredSecret []byte, opts mockNodeOpts) *mockNode {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	node := &mockNode{listener: listener, requiredSecret: requiredSecret, opts: opts}
 	go node.acceptLoop()
 	t.Cleanup(node.close)
@@ -1090,10 +1087,7 @@ type mockDiscovery struct {
 
 func startMockDiscovery(t *testing.T, nodes []discoveredNode, replication int) *mockDiscovery {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	discovery := &mockDiscovery{listener: listener, replication: replication, nodes: nodes}
 	go discovery.acceptLoop()
 	t.Cleanup(func() { _ = listener.Close() })
@@ -1218,15 +1212,43 @@ func atoiOrPanic(s string) int {
 	return n
 }
 
+// reservedPorts holds every address unusedPort has handed out (issue
+// #255). The kernel assigns ephemeral ports pseudo-randomly, so a mock
+// node started right after unusedPort released its listener could be
+// given that very port — turning the "unreachable" node into a live one
+// and failing the test in a way that never reproduces locally.
+// listenLoopback consults this set so a reserved port is never reused
+// by a mock server for the rest of the process.
+var reservedPorts sync.Map
+
+// unusedPort returns a loopback address nothing listens on, and that no
+// mock server started through listenLoopback will ever bind for the rest
+// of the process.
 func unusedPort(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	address := listener.Addr().String()
 	_ = listener.Close()
+	reservedPorts.Store(address, struct{}{})
 	return address
+}
+
+// listenLoopback binds a fresh 127.0.0.1 port for a mock server, skipping
+// any port unusedPort has reserved (see reservedPorts).
+func listenLoopback(t *testing.T) net.Listener {
+	t.Helper()
+	for attempt := 0; attempt < 100; attempt++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, reserved := reservedPorts.Load(listener.Addr().String()); !reserved {
+			return listener
+		}
+		_ = listener.Close()
+	}
+	t.Fatal("could not find a loopback port that unusedPort has not reserved")
+	return nil
 }
 
 func waitFor(t *testing.T, condition func() bool, what string) {
@@ -2349,10 +2371,7 @@ func TestConnectingToASilentServerFailsWithinTheDeadline(t *testing.T) {
 	// A server that accepts the TCP connection but never answers the
 	// handshake (a blackholed address behaves the same way) must fail the
 	// connect within the deadline instead of hanging.
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	defer listener.Close()
 	go func() {
 		for {
@@ -2369,7 +2388,7 @@ func TestConnectingToASilentServerFailsWithinTheDeadline(t *testing.T) {
 	defer func() { connectDeadline = original }()
 
 	started := time.Now()
-	_, err = Connect(Config{Addresses: []Address{addr(listener.Addr().String())}})
+	_, err := Connect(Config{Addresses: []Address{addr(listener.Addr().String())}})
 	if !errors.Is(err, ErrConnectionLost) {
 		t.Fatalf("Connect against a silent server = %v, want ErrConnectionLost", err)
 	}
@@ -2807,10 +2826,7 @@ func TestSteadyNewRequestsDoNotPostponeHalfOpenDetection(t *testing.T) {
 // in rust/tests/client.rs). readLine's maxHeaderLineLength cap must
 // fail the request instead.
 func TestAnUnterminatedResponseHeaderFailsInsteadOfGrowingWithoutBound(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	defer listener.Close()
 	// Loops accepting connections (mirrors mockNode.acceptLoop): every
 	// connection gets the same treatment, so the client's built-in
@@ -3444,10 +3460,7 @@ func TestAMultiGetResponseExceedingTheCumulativeByteBoundFailsAndPoisonsTheConne
 	maxMultiGetResponseBytes = 3
 	t.Cleanup(func() { maxMultiGetResponseBytes = old })
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	listener := listenLoopback(t)
 	defer listener.Close()
 	go func() {
 		conn, err := listener.Accept()
