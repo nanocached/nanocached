@@ -1488,6 +1488,78 @@ class NanocachedClientTest {
         }
     }
 
+    // ── bootstrap dialer pool cap ────────────────────────────────
+
+    @Test
+    void capsTheBootstrapDialerPoolRegardlessOfNodeCount() throws Exception {
+        // Regression (issue #178): openCluster used to size its dialer
+        // pool to nodes.size() with no cap — the only bound on a
+        // discovery reply's node count is Identify.MAX_NODE_COUNT
+        // (65536), so a large or malicious reply could make bootstrap
+        // try to spawn tens of thousands of native threads. Uses more
+        // "silent" addresses (accept the TCP connection, never answer —
+        // see failsOverPastASilentAddressInsteadOfHangingForever) than
+        // the cap, so every dial blocks for the full identify read
+        // timeout: that gives this test a wide, deterministic window in
+        // which to sample how many "nanocached-bootstrap-dial" threads
+        // are alive at once, instead of racing a fast-failing dial.
+        int nodeCount = 20; // > the 16-thread cap (MAX_BOOTSTRAP_DIALER_THREADS)
+        List<java.net.ServerSocket> silentServers = new ArrayList<>();
+        List<DiscoveredNode> nodes = new ArrayList<>();
+        try {
+            for (int i = 0; i < nodeCount; i++) {
+                java.net.ServerSocket silent = new java.net.ServerSocket(0);
+                silentServers.add(silent);
+                Thread acceptor = new Thread(() -> {
+                    try {
+                        while (true) silent.accept();
+                    } catch (java.io.IOException ignored) {
+                        // Server socket closed.
+                    }
+                }, "test-silent-accept-" + i);
+                acceptor.setDaemon(true);
+                acceptor.start();
+                nodes.add(new DiscoveredNode(NAMES.get(0) + "-" + i, "127.0.0.1:" + silent.getLocalPort()));
+            }
+
+            try (MockDiscovery discovery = new MockDiscovery(nodes, 1)) {
+                java.util.concurrent.atomic.AtomicInteger maxObserved =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                Thread sampler = new Thread(() -> {
+                    while (!Thread.currentThread().isInterrupted()) {
+                        long alive = Thread.getAllStackTraces().keySet().stream()
+                                .filter(t -> t.getName().equals("nanocached-bootstrap-dial"))
+                                .count();
+                        maxObserved.updateAndGet(current -> (int) Math.max(current, alive));
+                        try {
+                            Thread.sleep(2);
+                        } catch (InterruptedException interrupted) {
+                            return;
+                        }
+                    }
+                }, "test-thread-sampler");
+                sampler.setDaemon(true);
+                sampler.start();
+                try {
+                    // Every node is silent, so bootstrap can't reach any
+                    // of them — it's expected to fail once every dial
+                    // has timed out; that failure isn't what's under
+                    // test here, only how many dialer threads it took.
+                    assertThrows(RuntimeException.class, () -> connect("127.0.0.1", discovery.port()));
+                } finally {
+                    sampler.interrupt();
+                    sampler.join();
+                }
+
+                assertTrue(maxObserved.get() > 0, "test never observed a dialer thread running");
+                assertTrue(maxObserved.get() <= 16,
+                        "bootstrap dialer pool must never exceed its cap, observed " + maxObserved.get());
+            }
+        } finally {
+            for (java.net.ServerSocket silent : silentServers) silent.close();
+        }
+    }
+
     // ── クラスタと複製 ────────────────────────────────────────────
 
     private record Cluster(Map<String, MockNode> nodes, MockDiscovery discovery)

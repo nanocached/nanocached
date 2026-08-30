@@ -428,6 +428,18 @@ public final class NanocachedClient implements AutoCloseable {
     // practice.
     private static final int REPLICA_WRITER_POOL_HEADROOM = 16;
 
+    // Cap on the throwaway dialer pool openCluster spins up to bootstrap-
+    // dial every discovered node concurrently (issue #178). Node counts are
+    // only bounded by Identify.MAX_NODE_COUNT (65536) — sizing the pool to
+    // nodes.size() directly lets a large or malicious discovery reply make
+    // the client try to spawn tens of thousands of native threads and die
+    // with OutOfMemoryError: unable to create native thread. Dials are I/O-
+    // bound (each one is a short connect-and-identify, individually bounded
+    // by Identify.CONNECT_TIMEOUT_MS), so a small fixed pool still dials a
+    // huge cluster promptly — it just does it in waves instead of all at
+    // once.
+    private static final int MAX_BOOTSTRAP_DIALER_THREADS = 16;
+
     // Tracks, per connect() target (not per instance — mirrors
     // sdk/typescript/src/client.ts's openTargets), how many open sockets
     // this process still holds for a given "host:port". Purely a
@@ -920,12 +932,13 @@ public final class NanocachedClient implements AutoCloseable {
 
     /**
      * Dials every node discovery listed, concurrently, on a short-lived
-     * pool sized to the node count — {@link #replicaWriters} doesn't
-     * exist yet at this point, since building it needs {@link #replication}
-     * from this same cluster response, so bootstrap dialing gets its own
-     * throwaway executor rather than reusing it. Every dial still honors
-     * the same per-dial connect timeout as any other identify exchange
-     * (see {@code Identify.CONNECT_TIMEOUT_MS}).
+     * pool capped at {@link #MAX_BOOTSTRAP_DIALER_THREADS} —
+     * {@link #replicaWriters} doesn't exist yet at this point, since
+     * building it needs {@link #replication} from this same cluster
+     * response, so bootstrap dialing gets its own throwaway executor
+     * rather than reusing it. Every dial still honors the same per-dial
+     * connect timeout as any other identify exchange (see
+     * {@code Identify.CONNECT_TIMEOUT_MS}).
      *
      * <p>A node that can't be reached (issue #67: typically one that just
      * died and discovery hasn't evicted yet — its liveness window is
@@ -950,7 +963,7 @@ public final class NanocachedClient implements AutoCloseable {
         List<DiscoveredNode> nodes = cluster.nodes();
 
         ExecutorService dialers = Executors.newFixedThreadPool(
-                Math.max(1, nodes.size()), runnable -> {
+                Math.max(1, Math.min(nodes.size(), MAX_BOOTSTRAP_DIALER_THREADS)), runnable -> {
                     Thread thread = new Thread(runnable, "nanocached-bootstrap-dial");
                     thread.setDaemon(true);
                     return thread;
