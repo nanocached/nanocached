@@ -1626,6 +1626,7 @@ async fn handle_connection(
                     Arc::clone(&after_ring),
                     replication,
                     &joined,
+                    &node_context.known_ring,
                 ) {
                     MigrationOutcome::New { guard, restore } => {
                         // Issue #62: before the key snapshot below, so
@@ -3296,6 +3297,13 @@ impl MigrationGuard {
     /// completed slot that no client `GET`/`SET` has touched since (the
     /// only other place that lazily clears it) would wrongly block the
     /// very next join.
+    ///
+    /// Issue #218: an abandoned previous handoff (`!previous_confirmed`
+    /// below) also reverts `known_ring` to its `pre_completion_ring`, the
+    /// same way the explicit `X` path (`abandon_migration`) does — guarded
+    /// by the same `Arc::ptr_eq` check so a newer membership update isn't
+    /// clobbered. Without it, `wrong_node` would keep routing to the
+    /// phantom joiner until the next heartbeat's `adopt_membership`.
     // Returns `MigrationOutcome`, not `Self`, on purpose: reserving the
     // slot can produce an idempotent re-ack or a rejection instead of a
     // guard — see `MigrationOutcome`.
@@ -3307,6 +3315,7 @@ impl MigrationGuard {
         after_ring: Arc<HashRing>,
         replication: usize,
         joined: &[(String, String)],
+        known_ring: &KnownRing,
     ) -> MigrationOutcome {
         let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
@@ -3315,6 +3324,7 @@ impl MigrationGuard {
         }
 
         let mut restore = Vec::new();
+        let mut abandoned_known_ring: Option<(Arc<HashRing>, Option<Arc<Membership>>)> = None;
         if let Some(existing) = guard.as_ref() {
             if existing.joining_name == joining_name {
                 // Same-name retry: re-ack idempotently once the original
@@ -3355,6 +3365,10 @@ impl MigrationGuard {
                     .any(|(name, _)| *name == existing.joining_name);
             if !previous_confirmed {
                 restore = existing.marked_keys.clone();
+                abandoned_known_ring = Some((
+                    Arc::clone(&existing.after_ring),
+                    existing.pre_completion_ring.clone(),
+                ));
                 eprintln!(
                     "WARN previous handoff to {} was abandoned (not in the roster M for \
                      {joining_name} carries); restoring {} dead copies",
@@ -3382,6 +3396,20 @@ impl MigrationGuard {
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
+
+        // Locked only after the slot lock above is dropped — never both at
+        // once (matches `abandon_migration`'s ordering).
+        if let Some((after_ring, pre_completion_ring)) = abandoned_known_ring {
+            let mut known_ring_guard = known_ring
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if known_ring_guard
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.ring, &after_ring))
+            {
+                *known_ring_guard = pre_completion_ring;
+            }
+        }
 
         MigrationOutcome::New {
             guard: Self {
@@ -6975,6 +7003,7 @@ mod tests {
             Arc::clone(&after_ring),
             2,
             &joined,
+            &node_context.known_ring,
         )
         .unwrap_new();
 
@@ -7831,6 +7860,7 @@ mod tests {
             Arc::clone(&after_ring),
             2,
             &joined,
+            &node_context.known_ring,
         )
         .unwrap_new();
 
@@ -8088,6 +8118,62 @@ mod tests {
     }
 
     #[test]
+    fn migration_guard_new_reverts_known_ring_for_an_implicitly_abandoned_handoff() {
+        // Issue #218: same scenario as `abandoning_a_completed_join_reverts_known_ring`,
+        // but discovered *implicitly* — a new `M` for a different joiner (J2)
+        // arrives whose roster lacks the previous joiner (J1), instead of an
+        // explicit `X`. `MigrationGuard::new` must revert `known_ring` to the
+        // pre-completion snapshot exactly like `abandon_migration` does,
+        // otherwise `wrong_node` keeps routing to the phantom J1 until the
+        // next heartbeat's `adopt_membership`.
+        let (node_context, after_ring, pre_completion_ring) =
+            completed_unconfirmed_context(&["key-3"]);
+
+        // `M` for joiner-1: the roster lists only ready-node, so joiner-0
+        // (the previous, completed-but-unconfirmed joiner) is missing —
+        // that handoff was abandoned.
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        let outcome = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-1".to_string(),
+            "127.0.0.1:10".to_string(),
+            Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "other-node".to_string(),
+                "joiner-1".to_string(),
+            ])),
+            2,
+            &joined,
+            &node_context.known_ring,
+        );
+
+        let _guard = match outcome {
+            MigrationOutcome::New { restore, guard } => {
+                assert_eq!(restore, vec![key(b"key-3")]);
+                guard
+            }
+            _ => panic!("expected a new guard"),
+        };
+
+        // known_ring is back to the pre-join snapshot, not still pointing at
+        // joiner-0's abandoned post-join ring.
+        assert!(Arc::ptr_eq(
+            node_context.known_ring.lock().unwrap().as_ref().unwrap(),
+            &pre_completion_ring,
+        ));
+        assert!(!Arc::ptr_eq(
+            &node_context
+                .known_ring
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ring,
+            &after_ring,
+        ));
+    }
+
+    #[test]
     fn heartbeat_message_declares_the_name_length_before_the_name() {
         assert_eq!(
             heartbeat_message("some-name", Some(2), "tk-some-name"),
@@ -8223,6 +8309,7 @@ mod tests {
             "ready-node".to_string(),
             "joiner-1".to_string(),
         ]));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
         let outcome = MigrationGuard::new(
             Arc::clone(&slot),
             "joiner-1".to_string(),
@@ -8230,6 +8317,7 @@ mod tests {
             after_ring,
             2,
             &[],
+            &known_ring,
         );
 
         assert!(
@@ -8267,6 +8355,7 @@ mod tests {
             "ready-node".to_string(),
             "joiner-1".to_string(),
         ]));
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
         let outcome = MigrationGuard::new(
             Arc::clone(&slot),
             "joiner-1".to_string(),
@@ -8274,6 +8363,7 @@ mod tests {
             after_ring,
             2,
             &[],
+            &known_ring,
         );
 
         assert!(
@@ -8802,6 +8892,7 @@ mod tests {
     fn new_guard_for_joiner_1(
         slot: &Arc<Mutex<Option<ActiveMigration>>>,
         joined: &[(String, String)],
+        known_ring: &KnownRing,
     ) -> MigrationOutcome {
         MigrationGuard::new(
             Arc::clone(slot),
@@ -8813,6 +8904,7 @@ mod tests {
             ])),
             2,
             joined,
+            known_ring,
         )
     }
 
@@ -8826,9 +8918,10 @@ mod tests {
             ("ready-node".to_string(), "127.0.0.1:1".to_string()),
             ("joiner-0".to_string(), "127.0.0.1:9".to_string()),
         ];
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
 
         // Kept alive: dropping an uncompleted guard clears the slot.
-        let _guard = match new_guard_for_joiner_1(&slot, &joined) {
+        let _guard = match new_guard_for_joiner_1(&slot, &joined, &known_ring) {
             MigrationOutcome::New { restore, guard } => {
                 assert!(restore.is_empty());
                 guard
@@ -8850,8 +8943,9 @@ mod tests {
             "dead-a", "dead-b",
         ]))));
         let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
 
-        let _guard = match new_guard_for_joiner_1(&slot, &joined) {
+        let _guard = match new_guard_for_joiner_1(&slot, &joined, &known_ring) {
             MigrationOutcome::New { restore, guard } => {
                 assert_eq!(restore, vec![key(b"dead-a"), key(b"dead-b")]);
                 guard
