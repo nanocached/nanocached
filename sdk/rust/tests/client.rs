@@ -5569,6 +5569,62 @@ async fn via_proxy_reconnect_re_fetches_the_roster_and_lands_on_the_survivor() {
 }
 
 #[tokio::test]
+async fn via_proxy_reconnect_purges_the_departed_proxys_cooldown_entry() {
+    // Issue #296: maybe_refresh's own cooldown prune (refresh_node_list)
+    // never runs in proxy mode — it early-returns for Target::Single,
+    // which via_proxy always is — so without reconnect_proxy's own purge
+    // (added for #296) the failed same-address redial against proxy_a
+    // below would arm a reconnect-cooldown entry for it that then sits
+    // in the map forever: proxy_a is never dialed again once the pinned
+    // address swaps to proxy_b. Mirrors
+    // via_proxy_reconnect_re_fetches_the_roster_and_lands_on_the_survivor's
+    // own setup.
+    let proxy_a = MockNode::start().await;
+    let proxy_b = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    assert_eq!(client.reconnect_cooldowns_len().await, 0);
+
+    // Kill the connected proxy and update the roster to the survivor
+    // only, so the reconnect this next call drives can only possibly
+    // land on proxy_b.
+    proxy_a.stop();
+    discovery.set_proxies(vec![("proxy-b".to_string(), proxy_b.address())]);
+
+    // apply_reconnecting's own same-address redial against proxy_a fails
+    // first (arming its cooldown entry); that ConnectionLost then drives
+    // with_cluster_retry's via_proxy branch to re-fetch `Q` and swap onto
+    // proxy_b via reconnect_proxy.
+    assert_eq!(client.get("k").await.unwrap(), None);
+
+    // The swap must have purged proxy_a's now-unreachable-forever
+    // cooldown entry rather than leaving it behind.
+    assert_eq!(
+        client.reconnect_cooldowns_len().await,
+        0,
+        "a departed proxy's reconnect-cooldown entry must not linger \
+         after a proxy-mode failover swap"
+    );
+
+    client.close().await;
+    discovery.stop();
+    proxy_b.stop();
+}
+
+#[tokio::test]
 async fn via_proxy_ignores_read_hedge_after_and_sends_a_single_get() {
     // Hedging is inert in proxy mode (Options::via_proxy's own doc
     // comment): Target::Single short-circuits before the hedge path ever

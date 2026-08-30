@@ -3865,6 +3865,60 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ViaProxyReconnectPurgesTheDepartedProxysCooldownEntry()
+    {
+        // Issue #296: MaybeRefreshAsync's own cooldown prune
+        // (RefreshNodeListAsync) never runs in ViaProxy mode — it
+        // early-returns while _ring stays null forever — so without
+        // DialProxyWithFailoverAsync's own purge (added for #296) the
+        // failed same-address retry against the dead proxy below would
+        // arm a _reconnectCooldowns entry that then sits in the map
+        // forever: that address is never dialed again once
+        // _singleAddress has moved on to the survivor. Mirrors
+        // ViaProxyReconnectsThroughAFreshQFetchWhenTheConnectedProxyDies's
+        // own setup.
+        var proxyA = new MockNode();
+        var proxyB = new MockNode();
+        var proxies = new Dictionary<string, MockNode> { ["proxy-a"] = proxyA, ["proxy-b"] = proxyB };
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-a", proxyA.Address), ("proxy-b", proxyB.Address) });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+        await client.SetAsync("k", "v");
+
+        FieldInfo cooldownsField = typeof(NanocachedClient)
+            .GetField("_reconnectCooldowns", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var cooldowns = (System.Collections.IDictionary)cooldownsField.GetValue(client)!;
+        Assert.Empty(cooldowns);
+
+        string connectedAddress = GetSingleAddress(client);
+        MockNode connected = proxies.Values.Single(p => p.Address == connectedAddress);
+        MockNode survivor = proxies.Values.Single(p => p.Address != connectedAddress);
+        try
+        {
+            connected.Dispose();
+            await Task.Delay(50); // let the FIN land
+
+            // Retries the dead proxy first (arming its cooldown entry on
+            // failure), then re-fetches Q and lands on the survivor —
+            // transparently, within this one call.
+            await client.SetAsync("k2", "v2");
+            Assert.Equal(survivor.Address, GetSingleAddress(client));
+
+            // The swap must have purged the dead proxy's
+            // now-unreachable-forever cooldown entry rather than leaving
+            // it behind.
+            Assert.False(cooldowns.Contains(connectedAddress),
+                "a departed proxy's reconnect-cooldown entry must not linger after a proxy-mode failover swap");
+        }
+        finally
+        {
+            survivor.Dispose();
+        }
+    }
+
+    [Fact]
     public async Task ViaProxyIgnoresReadHedgeAfterSinceThereIsNoReplicaToHedgeTo()
     {
         using var proxy = new MockNode();
