@@ -371,6 +371,16 @@ public final class NanocachedClient implements AutoCloseable {
     // 4-digit length pair) is ~4000 bytes, comfortably under that cap
     // with room for the count/tag fields — same value the Go and
     // TypeScript SDKs use.
+    //
+    // This is a key-count ceiling only. multiGetChunked/multiSetChunked
+    // (issue #222) also track cumulative namespace+key(+value) bytes —
+    // plus each entry's own length-field header overhead — against
+    // MAX_REQUEST_BYTES and start a new sub-frame before that would be
+    // exceeded, so a batch of individually valid (validateKeyAndValue-
+    // checked) pairs can never sum past the server's MAX_REQUEST_SIZE:
+    // 400 keys x 5 KiB values would otherwise pack a single ~2 MiB `o`
+    // frame the server drops the connection over with no response
+    // (request_is_too_large, src/server.rs) rather than answer.
     private static final int MAX_BATCH_KEYS = 400;
 
     public static Options builder() {
@@ -1768,22 +1778,68 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** Issues one or more {@code m} sub-frames against whatever {@code
      * connectionFor} resolves to — already grouped to one owner (or the
-     * single/proxy target) by the caller — splitting into {@link
-     * #MAX_BATCH_KEYS}-sized chunks (batch chunking) so no reply header
-     * risks exceeding {@link Connection#MAX_HEADER_LINE_LENGTH}. */
+     * single/proxy target) by the caller — splitting into sub-frames
+     * bounded by both {@link #MAX_BATCH_KEYS} keys (so no reply header
+     * risks exceeding {@link Connection#MAX_HEADER_LINE_LENGTH}) and
+     * {@link #MAX_REQUEST_BYTES} of cumulative wire size (issue #222), so
+     * a batch of individually valid keys can't sum past the server's
+     * MAX_REQUEST_SIZE frame cap. A single key always fits one sub-frame
+     * by itself — {@link #validateKey} already rejected anything that
+     * wouldn't. */
     private List<Connection.MultiEntry> multiGetChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
-        for (int start = 0; start < keys.length; start += MAX_BATCH_KEYS) {
-            int end = Math.min(start + MAX_BATCH_KEYS, keys.length);
+        int start = 0;
+        while (start < keys.length) {
+            int end = multiGetChunkEnd(namespace.length, keys, start);
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries = applyReconnecting(
                     connectionFor, connection -> connection.multiGet(namespace, chunk));
             for (int i = start; i < end; i++) {
                 entries.set(i, chunkEntries.get(i - start));
             }
+            start = end;
         }
         return entries;
+    }
+
+    /** {@code multiGetChunked}'s byte-budgeted chunk boundary: grows
+     * {@code end} past {@code start} while the next key both keeps the
+     * chunk under {@link #MAX_BATCH_KEYS} keys and keeps the {@code m}
+     * frame {@code Connection.buildMultiGetFrame} would build for
+     * {@code keys[start..end)} — namespace once, plus each key's body
+     * bytes and its {@code " <key-len>"} header field
+     * ({@link #multiGetEntryWireBytes}) — under {@link
+     * #MAX_REQUEST_BYTES}. Always advances by at least one key: a single
+     * key's own contribution can never overflow the budget on its own
+     * (see {@link #validateKey}). */
+    private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start) {
+        int end = start + 1;
+        long frameBytes = namespaceLength + multiGetEntryWireBytes(keys[start]);
+        while (end < keys.length && end - start < MAX_BATCH_KEYS) {
+            long next = frameBytes + multiGetEntryWireBytes(keys[end]);
+            if (next > MAX_REQUEST_BYTES) break;
+            frameBytes = next;
+            end++;
+        }
+        return end;
+    }
+
+    /** One key's contribution to an {@code m} frame's wire size: its body
+     * bytes plus the {@code " <key-len>"} header field
+     * {@code Connection.buildMultiGetFrame} writes for it (a leading
+     * space plus that length's decimal digit count — see {@link
+     * #decimalDigits}). */
+    private static long multiGetEntryWireBytes(byte[] key) {
+        return key.length + 1L + decimalDigits(key.length);
+    }
+
+    /** How many decimal digits {@code length}'s text form costs on the
+     * wire — shared by {@link #multiGetEntryWireBytes} and {@link
+     * #multiSetEntryWireBytes} to size each entry's {@code " <n>"}
+     * header field(s) honestly rather than guessing a fixed width. */
+    private static int decimalDigits(int length) {
+        return Integer.toString(length).length();
     }
 
     /** One pass of {@link #getManyBytes(byte[], byte[][])}'s cluster routing:
@@ -2068,13 +2124,18 @@ public final class NanocachedClient implements AutoCloseable {
 
     /** {@link #multiGetChunked}'s write-side twin: one or more {@code o}
      * sub-frames against whatever {@code connectionFor} resolves to,
-     * split into {@link #MAX_BATCH_KEYS}-sized chunks the same way. */
+     * split the same way by both {@link #MAX_BATCH_KEYS} keys and {@link
+     * #MAX_REQUEST_BYTES} of cumulative wire size (issue #222) — a batch
+     * of individually valid (per {@link #validateKeyAndValue}) pairs
+     * can't sum past the server's MAX_REQUEST_SIZE frame cap. A single
+     * pair always fits one sub-frame by itself. */
     private List<Connection.MultiEntry> multiSetChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace,
             byte[][] keys, byte[][] values, Long ttlSeconds) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
-        for (int start = 0; start < keys.length; start += MAX_BATCH_KEYS) {
-            int end = Math.min(start + MAX_BATCH_KEYS, keys.length);
+        int start = 0;
+        while (start < keys.length) {
+            int end = multiSetChunkEnd(namespace.length, keys, values, start);
             byte[][] keyChunk = Arrays.copyOfRange(keys, start, end);
             byte[][] valueChunk = Arrays.copyOfRange(values, start, end);
             List<Connection.MultiEntry> chunkEntries = applyReconnecting(
@@ -2082,8 +2143,44 @@ public final class NanocachedClient implements AutoCloseable {
             for (int i = start; i < end; i++) {
                 entries.set(i, chunkEntries.get(i - start));
             }
+            start = end;
         }
         return entries;
+    }
+
+    /** {@code multiSetChunked}'s byte-budgeted chunk boundary — {@link
+     * #multiGetChunkEnd}'s write-side twin: grows {@code end} past
+     * {@code start} while the next pair keeps the chunk under {@link
+     * #MAX_BATCH_KEYS} keys and keeps the {@code o} frame {@code
+     * Connection.buildMultiSetFrame} would build for {@code
+     * keys[start..end)}/{@code values[start..end)} — namespace once,
+     * plus each pair's body bytes and its {@code " <key-len> <value-
+     * len>"} header fields ({@link #multiSetEntryWireBytes}) — under
+     * {@link #MAX_REQUEST_BYTES}. Always advances by at least one pair:
+     * a single pair's own contribution can never overflow the budget on
+     * its own (see {@link #validateKeyAndValue}). The shared TTL field
+     * (at most one {@code " <ttl>"}, present or not for the whole frame)
+     * isn't tracked per entry — its handful of bytes are covered by
+     * {@link #MAX_REQUEST_BYTES}'s existing 256-byte headroom below the
+     * server's actual 1 MiB cap. */
+    private static int multiSetChunkEnd(int namespaceLength, byte[][] keys, byte[][] values, int start) {
+        int end = start + 1;
+        long frameBytes = namespaceLength + multiSetEntryWireBytes(keys[start], values[start]);
+        while (end < keys.length && end - start < MAX_BATCH_KEYS) {
+            long next = frameBytes + multiSetEntryWireBytes(keys[end], values[end]);
+            if (next > MAX_REQUEST_BYTES) break;
+            frameBytes = next;
+            end++;
+        }
+        return end;
+    }
+
+    /** One pair's contribution to an {@code o} frame's wire size: its key
+     * and value body bytes plus the {@code " <key-len> <value-len>"}
+     * header fields {@code Connection.buildMultiSetFrame} writes for it
+     * (see {@link #decimalDigits}). */
+    private static long multiSetEntryWireBytes(byte[] key, byte[] value) {
+        return key.length + value.length + 2L + decimalDigits(key.length) + decimalDigits(value.length);
     }
 
     /** One owner's key/isPrimary membership across one {@link

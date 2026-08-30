@@ -340,6 +340,80 @@ class NanocachedClientTest {
         }
     }
 
+    // ── multi-get/multi-set request cumulative byte bound (issue #222) ──
+
+    @Test
+    void setManyBytesSplitsAByteOversizedBatchIntoSeveralSubFrames() throws Exception {
+        // Regression (issue #222): multiSetChunked split purely by key
+        // count (MAX_BATCH_KEYS), so a handful of individually valid
+        // pairs — each comfortably under MAX_REQUEST_BYTES alone — could
+        // still sum past it in one `o` frame. 7 x 300 KB values is
+        // ~2.1 MB, well past the server's ~1 MiB MAX_REQUEST_SIZE, which
+        // would otherwise make the server drop the connection with no
+        // response (request_is_too_large, src/server.rs).
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int pairCount = 7;
+                byte[][] keys = new byte[pairCount][];
+                byte[][] values = new byte[pairCount][];
+                for (int i = 0; i < pairCount; i++) {
+                    keys[i] = ("k" + i).getBytes(StandardCharsets.UTF_8);
+                    values[i] = new byte[300_000];
+                    java.util.Arrays.fill(values[i], (byte) i);
+                }
+
+                client.setManyBytes(keys, values);
+
+                assertTrue(node.multiSetCount.get() > 1,
+                        "a batch summing past MAX_REQUEST_BYTES must split into more than one `o` frame, got "
+                                + node.multiSetCount.get());
+                for (int bodyBytes : node.multiSetFrameBodyBytes) {
+                    assertTrue(bodyBytes < 1024 * 1024,
+                            "each `o` sub-frame's body must stay under the server's 1 MiB frame cap, got "
+                                    + bodyBytes);
+                }
+
+                for (int i = 0; i < pairCount; i++) {
+                    assertArrayEquals(values[i], client.getBytes(keys[i]).orElseThrow());
+                }
+            }
+        }
+    }
+
+    @Test
+    void getManySplitsABatchOfByteOversizedKeysIntoSeveralSubFrames() throws Exception {
+        // getMany's counterpart to the setManyBytes regression above:
+        // multiGetChunked split purely by key count too, so a handful of
+        // individually valid but large keys could sum past
+        // MAX_REQUEST_BYTES in one `m` frame.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int pairCount = 7;
+                List<String> keys = new ArrayList<>();
+                java.util.Map<String, String> expected = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < pairCount; i++) {
+                    String key = "k" + i + "-" + "x".repeat(300_000);
+                    String value = "v" + i;
+                    client.set(key, value);
+                    keys.add(key);
+                    expected.put(key, value);
+                }
+
+                Map<String, String> values = client.getMany(keys);
+                assertEquals(expected, values);
+
+                assertTrue(node.multiGetCount.get() > 1,
+                        "a batch of keys summing past MAX_REQUEST_BYTES must split into more than one `m` frame, got "
+                                + node.multiGetCount.get());
+                for (int bodyBytes : node.multiGetFrameBodyBytes) {
+                    assertTrue(bodyBytes < 1024 * 1024,
+                            "each `m` sub-frame's body must stay under the server's 1 MiB frame cap, got "
+                                    + bodyBytes);
+                }
+            }
+        }
+    }
+
     // ── INCR/DECR (issue #129) ────────────────────────────────────
 
     @Test

@@ -68,6 +68,15 @@ final class MockServers {
         final AtomicInteger multiGetCount = new AtomicInteger();
         /** Counts every `o` (multi-set, issue #151) frame received. */
         final AtomicInteger multiSetCount = new AtomicInteger();
+        /** Every `m` frame's body byte count (namespace + every key's
+         * bytes, header line excluded) in receipt order (issue #222) —
+         * lets a test prove request chunking really did keep each
+         * sub-frame under the server's MAX_REQUEST_SIZE rather than just
+         * counting how many sub-frames arrived. */
+        final List<Integer> multiGetFrameBodyBytes = new CopyOnWriteArrayList<>();
+        /** As {@link #multiGetFrameBodyBytes}, for `o` (issue #222):
+         * namespace + every key's and value's bytes. */
+        final List<Integer> multiSetFrameBodyBytes = new CopyOnWriteArrayList<>();
         /** Counts every `g`/`s`/`d` frame received — never incremented by
          * `G`/`S`/`D`. Lets a test prove the empty (default) namespace
          * really does send the legacy frame, not `g 0 ...`/etc (issue
@@ -780,13 +789,18 @@ final class MockServers {
                         // routing table could be stale for the entire
                         // group at once).
                         case "m" -> {
-                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            int nsLen = Integer.parseInt(parts[1]);
+                            String ns = keyOf(in.readNBytes(nsLen));
                             int n = Integer.parseInt(parts[2]);
                             String[] keys = new String[n];
+                            int bodyBytes = nsLen;
                             for (int i = 0; i < n; i++) {
-                                keys[i] = keyOf(in.readNBytes(Integer.parseInt(parts[3 + i])));
+                                int keyLen = Integer.parseInt(parts[3 + i]);
+                                bodyBytes += keyLen;
+                                keys[i] = keyOf(in.readNBytes(keyLen));
                             }
                             multiGetCount.incrementAndGet();
+                            multiGetFrameBodyBytes.add(bodyBytes);
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
@@ -817,13 +831,16 @@ final class MockServers {
                             out.flush();
                         }
                         case "o" -> {
-                            String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            int nsLen = Integer.parseInt(parts[1]);
+                            String ns = keyOf(in.readNBytes(nsLen));
                             int n = Integer.parseInt(parts[2]);
                             int[] keyLens = new int[n];
                             int[] valueLens = new int[n];
+                            int bodyBytes = nsLen;
                             for (int i = 0; i < n; i++) {
                                 keyLens[i] = Integer.parseInt(parts[3 + i * 2]);
                                 valueLens[i] = Integer.parseInt(parts[4 + i * 2]);
+                                bodyBytes += keyLens[i] + valueLens[i];
                             }
                             int fixedFieldCount = 3 + n * 2;
                             int ttlFieldCount = parts.length - fixedFieldCount - (tagged ? 1 : 0);
@@ -835,6 +852,7 @@ final class MockServers {
                                 values[i] = in.readNBytes(valueLens[i]);
                             }
                             multiSetCount.incrementAndGet();
+                            multiSetFrameBodyBytes.add(bodyBytes);
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
