@@ -18,6 +18,8 @@ pub use client::KEEPALIVE_INTERVAL_MS;
 #[doc(hidden)]
 pub use client::MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES;
 #[doc(hidden)]
+pub use client::MAX_INFLIGHT_HEDGE_LOSER_LEGS;
+#[doc(hidden)]
 pub use client::NODE_LIST_STALE_AFTER_MS;
 pub use client::{Namespace, NanocachedClient, Options, Stats};
 #[doc(hidden)]

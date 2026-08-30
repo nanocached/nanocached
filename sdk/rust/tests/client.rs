@@ -4446,6 +4446,102 @@ async fn finished_hedge_legs_are_reaped_instead_of_accumulating() {
 }
 
 #[tokio::test]
+async fn hedge_losers_fall_back_to_synchronous_past_the_cap() {
+    // Issue #276: hedged_reads had no bound, unlike
+    // background_replica_permits — a losing leg was always left detached.
+    // Below the cap (the default here) a decisive primary answer returns
+    // immediately, leaving the slower replica leg running in the
+    // background; past MAX_INFLIGHT_HEDGE_LOSER_LEGS, read_hedged instead
+    // awaits its own remaining leg synchronously before returning, so the
+    // call takes as long as the slower leg.
+    const REPLICA_DELAY_MS: usize = 200;
+    let replica_delay = Duration::from_millis(REPLICA_DELAY_MS as u64);
+
+    // Phase 1: default cap — the read returns as soon as the primary
+    // answers, well before the replica's delay elapses.
+    {
+        let (nodes, discovery) = start_cluster(2).await;
+        let client = NanocachedClient::connect(
+            options(discovery.port).read_hedge_after(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+
+        client.set("k", "v", 0).await.unwrap();
+        let owners = owners_of("k");
+        node_by_name(&nodes, &owners[0])
+            .state
+            .gets_delay_ms
+            .store(50, Ordering::SeqCst);
+        node_by_name(&nodes, &owners[1])
+            .state
+            .gets_delay_ms
+            .store(REPLICA_DELAY_MS, Ordering::SeqCst);
+
+        let start = tokio::time::Instant::now();
+        let value = client.get("k").await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(value, Some("v".to_string()));
+        assert!(
+            elapsed < replica_delay - HEDGE_TIMING_TOLERANCE,
+            "below the cap, the read should return once the primary answers \
+             instead of waiting for the slower replica leg: elapsed = {elapsed:?}"
+        );
+
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+
+    // Phase 2: cap forced to 1 — hedged_reads already holds this read's
+    // own two legs (primary + replica) by the time the primary decides,
+    // so the replica leg is drained synchronously instead of detached.
+    {
+        let default_cap = nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
+        nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(1, Ordering::SeqCst);
+
+        let (nodes, discovery) = start_cluster(2).await;
+        let client = NanocachedClient::connect(
+            options(discovery.port).read_hedge_after(Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(default_cap, Ordering::SeqCst);
+
+        client.set("k", "v", 0).await.unwrap();
+        let owners = owners_of("k");
+        node_by_name(&nodes, &owners[0])
+            .state
+            .gets_delay_ms
+            .store(50, Ordering::SeqCst);
+        node_by_name(&nodes, &owners[1])
+            .state
+            .gets_delay_ms
+            .store(REPLICA_DELAY_MS, Ordering::SeqCst);
+
+        let start = tokio::time::Instant::now();
+        let value = client.get("k").await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(value, Some("v".to_string()));
+        assert!(
+            elapsed >= replica_delay - HEDGE_TIMING_TOLERANCE,
+            "past the cap, the read should wait for the replica leg instead \
+             of leaving it detached: elapsed = {elapsed:?}"
+        );
+
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
 async fn read_hedge_after_rejects_a_zero_duration() {
     let result = NanocachedClient::connect(
         Options::new()
