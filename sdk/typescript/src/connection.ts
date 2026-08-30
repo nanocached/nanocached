@@ -70,11 +70,33 @@ export class WrongNodeError extends NanocachedError {
 /** A connection-level failure: the socket died (or was already dead) out
  * from under a request. In cluster mode the client treats this like `W` —
  * refresh the node list and retry once — since the usual cause is a node
- * death that discovery has since noticed. */
+ * death that discovery has since noticed. That blanket retry is only safe
+ * for idempotent requests (get/set/delete/clear/multiGet/multiSet):
+ * replaying incr/decr, CAS (replace/putIfAbsent) or deleteIfMatches can
+ * double-apply the write, or turn a CAS that actually succeeded into a
+ * reported mismatch, if the request had already reached the server and
+ * only the reply was lost (issue #225). `requestWasSent` distinguishes
+ * the two cases so `NanocachedClient`'s non-idempotent call sites can
+ * retry only when it's provably `false`. */
 export class ConnectionLostError extends NanocachedError {
-  constructor(message: string) {
+  /** Whether the request this error is rejecting had already begun being
+   * written to the socket. `false` only for the one case where `Connection`
+   * rejects before ever calling `socket.write()` — the connection was
+   * already closed when the call was made, so the frame for *this*
+   * specific request definitely never reached the wire, and replaying it
+   * is always safe. Defaults to `true` (the conservative "may have been
+   * applied" assumption) for every other path: a `socket.write()` failure
+   * partway through the frame, and an ordinary close/timeout/mismatch/tag
+   * desync discovered after the frame was already handed to the socket —
+   * none of those can prove the server never received (and acted on) the
+   * bytes, so this stays `true` there even though the exact boundary
+   * between "definitely sent" and "ambiguous" isn't tracked separately. */
+  readonly requestWasSent: boolean;
+
+  constructor(message: string, options?: { requestWasSent?: boolean }) {
     super(message);
     this.name = "ConnectionLostError";
+    this.requestWasSent = options?.requestWasSent ?? true;
   }
 }
 
@@ -436,7 +458,21 @@ export class Connection {
 
   private sendOnce(build: (tag: number | undefined) => Buffer): Promise<ParsedResponse> {
     if (this.closed) {
-      return Promise.reject(this.lastError ?? new ConnectionLostError("nanocached: connection is closed"));
+      // Issue #225: nothing was ever written for *this* call — this
+      // branch returns before ever building a frame or touching the
+      // socket — so it's always safe to replay, regardless of what
+      // killed the connection (a previous request's failure, an
+      // idle-FIN the server sent before this call was even made, ...).
+      // Wrapped fresh with requestWasSent: false rather than reusing
+      // `this.lastError` as-is, so this classification never depends on
+      // which error the connection happened to die with.
+      const cause = this.lastError;
+      return Promise.reject(
+        new ConnectionLostError(
+          cause ? `nanocached: connection is closed: ${cause.message}` : "nanocached: connection is closed",
+          { requestWasSent: false },
+        ),
+      );
     }
     this.lastUsed = Date.now();
 
@@ -609,8 +645,30 @@ export class Connection {
   private onClose(): void {
     this.closed = true;
     this.clearRequestTimer();
-    const error = this.lastError ?? new ConnectionLostError("nanocached: connection closed");
+    const error = this.closeError();
     const waiters = this.pending.splice(0);
     for (const waiter of waiters) waiter.reject(error);
+  }
+
+  /** The error used to reject every waiter still pending when the socket
+   * closes. Every one of these waiters already had its frame handed to
+   * `socket.write()` before this fires — a request that never got that
+   * far is rejected synchronously by `sendOnce`'s own closed-at-entry
+   * check (`requestWasSent: false`) and never reaches `pending` at all —
+   * so none of these can be proven not to have reached the server;
+   * always a `ConnectionLostError` at its default `requestWasSent: true`
+   * (issue #225). `lastError` may already be a `ConnectionLostError` from
+   * `poison()` (a mismatch, a request timeout, a write failure, ...) —
+   * used as-is — or a raw socket error Node's own 'error' event recorded
+   * via `onError` without going through `poison()` first (e.g. a bare
+   * ECONNRESET on read) — wrapped here so every caller checking
+   * `requestWasSent` sees a `ConnectionLostError`, never a raw
+   * `NodeJS.ErrnoException` that would otherwise skip that check
+   * entirely and risk being replayed. */
+  private closeError(): Error {
+    const cause = this.lastError;
+    if (cause === null) return new ConnectionLostError("nanocached: connection closed");
+    if (cause instanceof ConnectionLostError) return cause;
+    return new ConnectionLostError(`nanocached: connection closed: ${cause.message}`);
   }
 }

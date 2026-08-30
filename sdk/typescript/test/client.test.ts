@@ -2852,6 +2852,137 @@ describe("NanocachedClient compare-and-set cluster replication (issue #141) — 
   });
 });
 
+describe("NanocachedClient non-idempotent retry on connection loss (issue #225)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+
+    return {
+      nodes,
+      discovery,
+      ownerOf(key: string) {
+        const ring = new HashRing(names);
+        const [primary, replica] = ring.owners(Buffer.from(key), 2);
+        return {
+          primary: nodes.find(({ name }) => name === primary)!,
+          replica: nodes.find(({ name }) => name === replica)!,
+        };
+      },
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("incr: retries and succeeds when the primary connection died before the request could ever be written", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-redial-before-write";
+      const { primary } = cluster.ownerOf(key);
+      await client.set(key, "10");
+
+      // The connection dies with nothing outstanding — the FIN lands
+      // before `incr` is ever attempted, exactly like a server's idle
+      // timeout. `sendOnce`'s closed-at-entry check fires: the frame for
+      // this call is never built, so the whole call is provably safe to
+      // replay.
+      primary.mock.dropConnections();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+
+      assert.equal(await client.incr(key, 5), 15, "incr must redial and succeed instead of surfacing the dead connection");
+      assert.equal(primary.mock.incrCount(), 1, "only the redialed attempt should ever reach the primary");
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("incr: routes around a dead primary once discovery drops it, same as set/delete", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-redial-dead-primary";
+      const { primary, replica } = cluster.ownerOf(key);
+      await client.set(key, "10");
+
+      // Unlike the previous test, the primary is gone for good and
+      // discovery has already re-ranked the key onto the replica — this
+      // exercises `dialForWrite` wrapping a genuine dial failure (not
+      // `sendOnce`'s closed-at-entry branch) as safe to retry.
+      await primary.mock.close();
+      cluster.discovery.setNodes([{ name: replica.name, address: replica.mock.address }]);
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+
+      assert.equal(await client.incr(key, 5), 15);
+      assert.equal(replica.mock.incrCount(), 1);
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("incr: does not replay through the outer withWrongNodeRetry when the primary applied it and only the reply was lost", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "incr-applied-ack-lost";
+      const { primary } = cluster.ownerOf(key);
+      await client.set(key, "10");
+
+      // The primary reads and applies the `i`, then the connection dies
+      // before the `I` reply is written — the request was, by
+      // construction, already handed to the socket, so
+      // `ConnectionLostError.requestWasSent` defaults to `true` and the
+      // outer `withWrongNodeRetry({ nonIdempotent: true })` must not
+      // replay the whole call.
+      primary.mock.dropAfterIncrOnce();
+      await assert.rejects(client.incr(key, 5), ConnectionLostError);
+
+      assert.equal(primary.mock.incrCount(), 1, "the increment must never be replayed");
+      // Applied exactly once — asserted via a subsequent get, on a fresh
+      // (redialed) connection, exactly as the issue's acceptance test
+      // describes.
+      assert.equal(await client.get(key), "15");
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+
+  it("replace: does not replay through the outer withWrongNodeRetry when the primary applied it and only the reply was lost", async () => {
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      const key = "replace-applied-ack-lost";
+      const { primary } = cluster.ownerOf(key);
+      await client.set(key, "v1");
+      const { token } = (await client.getWithToken(key))!;
+
+      // Same shape as the incr test above, for `k` (CAS) instead of `i`.
+      primary.mock.dropAfterCasOnce();
+      await assert.rejects(client.replace(key, token, "v2"), ConnectionLostError);
+
+      assert.equal(primary.mock.casCount(), 1, "the CAS must never be replayed");
+      // Applied exactly once (not reported as a mismatch by a replay) —
+      // asserted via a subsequent read, on a fresh connection.
+      assert.equal(await client.get(key), "v2");
+    } finally {
+      client.close();
+      await cluster.close().catch(() => {});
+    }
+  });
+});
+
 describe("NanocachedClient fire-and-forget replica writes (fire-and-forget replica writes)", () => {
   const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
 
