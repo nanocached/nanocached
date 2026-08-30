@@ -3117,14 +3117,12 @@ fn adopt_membership(
         // window now instead of letting it lapse. The slot's marks were
         // released to the sweep at confirmation, so taking it is exactly
         // what the grace expiring would have done.
-        if joiner_evicted {
-            if let Some(taken) = slot.take() {
-                println!(
-                    "INFO joiner {} evicted by discovery at {discovery_addr}; closing its \
-                     forwarding window early",
-                    taken.joining_name
-                );
-            }
+        if joiner_evicted && let Some(taken) = slot.take() {
+            println!(
+                "INFO joiner {} evicted by discovery at {discovery_addr}; closing its \
+                 forwarding window early",
+                taken.joining_name
+            );
         }
         pending
     };
