@@ -6250,10 +6250,7 @@ mod tests {
         }
 
         // Refresh to a ring that no longer includes A.
-        let ring = RingView::new(
-            vec![("other".to_string(), "127.0.0.1:1".to_string())],
-            1,
-        );
+        let ring = RingView::new(vec![("other".to_string(), "127.0.0.1:1".to_string())], 1);
         context.backends.prune(&ring);
 
         {
@@ -6454,7 +6451,7 @@ mod tests {
             ring: ring_rx,
             refresh_now: refresh_tx,
             drain: drain_rx,
-            backends: SharedBackends::new(),
+            backends: Arc::new(SharedBackends::new()),
             requests_total: std::sync::atomic::AtomicU64::new(0),
             upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         });
