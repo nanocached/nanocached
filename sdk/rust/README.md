@@ -129,6 +129,18 @@ replica that missed an earlier write (or evicted the key on its own)
 converges to the primary's exact value instead of drifting from replaying
 the increment independently.
 
+**At-least-once, not exactly-once, under connection loss.** `incr`/`decr`
+are not idempotent — replaying one would double-apply `delta` — so unlike
+`get`/`set`/`delete`, this SDK never silently retries an increment whose
+request had already been fully written to the socket when the connection
+was lost: the server may have already applied it before the reply went
+missing, and that surfaces as a plain `Err(Error::ConnectionLost)` rather
+than a redial-and-retry. Only a connection already dead *before* the call
+even reached it (the idle-FIN case, e.g. the server's 60s idle timeout) is
+retried, since nothing could have been applied yet. On
+`Err(Error::ConnectionLost)`, whether the counter actually changed is
+unknown — check with a subsequent `get` if that matters.
+
 ## Batched get and set
 
 `get_many`/`get_many_bytes` and `set_many`/`set_many_bytes` (the `m`/`o`
@@ -221,6 +233,18 @@ In a cluster, only the key's primary owner ever evaluates the condition;
 on success, replicas receive the literal result as an ordinary `set`/
 `delete`, mirroring `incr`'s own replication rule above. See
 `docs/protocol.html#cas` for the full wire spec.
+
+**At-least-once, not exactly-once, under connection loss.** CAS is not
+idempotent — replaying a request that already succeeded could report a
+now-stale condition as a mismatch — so, exactly like `incr`/`decr` above,
+this SDK never silently retries a `put_if_absent`/`replace_if_present`/
+`replace`/`delete_if_matches` request whose bytes had already been fully
+written to the socket when the connection was lost. That surfaces as a
+plain `Err(Error::ConnectionLost)` instead of a redial-and-retry, and
+whether the write actually happened is unknown — check with a subsequent
+`get`/`get_with_token` if that matters. Only a connection already dead
+before the call reached it is retried, since nothing could have been
+applied yet.
 
 ## Namespaces
 

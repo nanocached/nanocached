@@ -134,6 +134,14 @@ struct NodeState {
     /// `multi_get_frame_bytes`'s `o`-frame twin (namespace plus every key
     /// and value, issue #222).
     multi_set_frame_bytes: Mutex<Vec<usize>>,
+    /// Issue #225: apply the next `i` normally (the store really does
+    /// reflect the new value) but then close the connection instead of
+    /// replying — the request was fully written and received, so unlike
+    /// a connection that was already dead before the request, this must
+    /// never be silently replayed.
+    hang_after_incr: AtomicUsize,
+    /// As `hang_after_incr`, for `k` (compare-and-set store, issue #141).
+    hang_after_cas_set: AtomicUsize,
 }
 
 struct MockNode {
@@ -496,6 +504,16 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                                         .lock()
                                         .unwrap()
                                         .insert(composite, namespace);
+                                    if take_one(&state.hang_after_incr) {
+                                        // Issue #225: applied above — the
+                                        // store already reflects the new
+                                        // value — but the reply is
+                                        // swallowed. `single_attempt`'s
+                                        // `write_all` already returned
+                                        // `Ok`, so the client must not
+                                        // replay this increment.
+                                        return;
+                                    }
                                     let ttl = state.incr_ttl_seconds.load(Ordering::SeqCst);
                                     let mut frame = if ttl > 0 {
                                         format!("I {} {ttl}{tag_suffix}\n", new_bytes.len())
@@ -549,6 +567,12 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                             .lock()
                             .unwrap()
                             .insert(composite, namespace);
+                        if take_one(&state.hang_after_cas_set) {
+                            // Issue #225: applied above, then the reply is
+                            // swallowed — see `hang_after_incr`'s doc
+                            // comment for the same reasoning.
+                            return;
+                        }
                         format!("S{tag_suffix}\n")
                     } else {
                         format!("N{tag_suffix}\n")
@@ -1346,6 +1370,120 @@ async fn get_with_token_hashes_the_raw_wire_bytes_not_the_decompressed_value() {
 
     writer.close().await;
     raw_reader.close().await;
+    node.stop();
+}
+
+// ── issue #225: incr/CAS/delete_if_matches are not idempotent ────────
+
+#[tokio::test]
+async fn incr_retries_via_redial_when_the_connection_was_already_dead() {
+    // The idle-FIN case `apply_reconnecting`'s doc comment describes: the
+    // connection dies (here, the node stops) before this call's `incr`
+    // ever tries to write anything on it. By the time `incr` runs,
+    // `is_closed()` is already true (the sleep below gives the read task
+    // time to notice the FIN), so `single_attempt` rejects it up front
+    // without writing a byte — provably safe to retry via redial, exactly
+    // like get/set/delete's own retry (mirrors
+    // `disable_reconnect_cooldown_redials_immediately`'s own setup).
+    let node = MockNode::start().await;
+    let port = node.port;
+    let client = NanocachedClient::connect(options(port).disable_reconnect_cooldown())
+        .await
+        .unwrap();
+    client.set("hits", "10", 0).await.unwrap();
+
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A fresh listener on the same port stands in for "the node is back".
+    let revived = MockNode::start_on_port(port).await;
+    revived
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"hits".to_vec(), b"10".to_vec());
+
+    // The connection this client already had open is dead; `incr` still
+    // succeeds because the redial-and-retry fires for a request that was
+    // never actually sent.
+    assert_eq!(client.incr("hits", 1).await.unwrap(), Some(11));
+    assert_eq!(revived.state.incrs.load(Ordering::SeqCst), 1);
+
+    client.close().await;
+    revived.stop();
+}
+
+#[tokio::test]
+async fn incr_is_not_replayed_once_the_request_was_already_sent() {
+    // The actual bug (issue #225): the server reads the `i` request and
+    // applies it, but the connection dies before the reply arrives.
+    // Replaying the increment would double-apply `delta`; this asserts it
+    // is applied exactly once, and that the caller sees a plain
+    // `ConnectionLost` rather than a silently "successful" retry.
+    let node = MockNode::start_with(NodeState {
+        hang_after_incr: AtomicUsize::new(1),
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("hits", "10", 0).await.unwrap();
+    let result = client.incr("hits", 1).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+    assert_eq!(
+        node.state.incrs.load(Ordering::SeqCst),
+        1,
+        "the swallowed request must not have been replayed"
+    );
+
+    // The increment DID land on the server (applied before the reply was
+    // swallowed) — a fresh request confirms it happened exactly once, not
+    // zero or two times.
+    assert_eq!(client.get("hits").await.unwrap(), Some("11".to_string()));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn cas_set_is_not_replayed_once_the_request_was_already_sent() {
+    // As `incr_is_not_replayed_once_the_request_was_already_sent`, for
+    // `replace` (the `k` frame, issue #141): the server applies the store
+    // and then swallows the reply. Replaying it here would be silently
+    // harmless for `replace`'s own idempotent *effect* (the same value
+    // would just be written twice) — but the caller still must not get a
+    // fabricated `Ok` out of a request whose actual answer was lost, and
+    // a differently-shaped CAS (e.g. one racing another writer) could
+    // otherwise report an already-applied change as a mismatch.
+    let node = MockNode::start_with(NodeState {
+        hang_after_cas_set: AtomicUsize::new(1),
+        ..NodeState::default()
+    })
+    .await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    client.set("name", "Alice", 0).await.unwrap();
+    let (_, token) = client.get_with_token("name").await.unwrap().unwrap();
+
+    let result = client.replace("name", token, "Bob", 0).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
+    );
+    assert_eq!(
+        node.state.cas_sets.load(Ordering::SeqCst),
+        1,
+        "the swallowed request must not have been replayed"
+    );
+
+    // The store DID happen before the reply was swallowed.
+    assert_eq!(client.get("name").await.unwrap(), Some("Bob".to_string()));
+
+    client.close().await;
     node.stop();
 }
 
@@ -3075,6 +3213,80 @@ async fn incr_replicates_the_result_never_the_operation() {
         Some("S 4 1 45"),
         "the replica's set should carry the incr's own TTL (45s), key-len 4, value-len 1"
     );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn cluster_retry_does_not_replay_incr_once_the_request_was_already_sent() {
+    // Issue #225's outer-layer half: `with_cluster_retry` (in `incr_in`)
+    // refreshes the ring and re-runs the *whole* `incr_once` on
+    // `WrongNode`/`ConnectionLost`, one layer above
+    // `apply_reconnecting_no_replay`'s own redial-and-retry. Without its
+    // own gate, that outer retry would re-run `incr_once` — hitting the
+    // same primary again — even after the primary had already applied the
+    // first attempt and only its reply was lost, double-applying `delta`.
+    // The primary here applies the increment, then drops the reply
+    // exactly like `incr_is_not_replayed_once_the_request_was_already_sent`'s
+    // single-node case; this asserts the same guarantee survives the
+    // cluster/refresh-and-retry layer.
+    let owners = owners_of("hits");
+    let primary_name = owners[0].clone();
+
+    let primary_state = NodeState {
+        hang_after_incr: AtomicUsize::new(1),
+        ..NodeState::default()
+    };
+    primary_state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"hits".to_vec(), b"10".to_vec());
+    let primary = MockNode::start_with(primary_state).await;
+    let replica = MockNode::start().await;
+
+    let nodes = if primary_name == NAMES[0] {
+        vec![
+            (NAMES[0].to_string(), primary),
+            (NAMES[1].to_string(), replica),
+        ]
+    } else {
+        vec![
+            (NAMES[0].to_string(), replica),
+            (NAMES[1].to_string(), primary),
+        ]
+    };
+    let listed = nodes
+        .iter()
+        .map(|(name, node)| (name.clone(), node.address()))
+        .collect();
+    let discovery = MockDiscovery::start(listed, 2).await;
+
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    let result = client.incr("hits", 1).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost (no outer retry), got {result:?}"
+    );
+
+    let primary_node = node_by_name(&nodes, &primary_name);
+    assert_eq!(
+        primary_node.state.incrs.load(Ordering::SeqCst),
+        1,
+        "with_cluster_retry must not re-run incr_once against the primary \
+         once the request it lost the reply to had already been sent"
+    );
+
+    // The increment DID land — a fresh get (redialing to the same
+    // primary) confirms it happened exactly once, not zero or two times.
+    assert_eq!(client.get("hits").await.unwrap(), Some("11".to_string()));
 
     client.close().await;
     discovery.stop();

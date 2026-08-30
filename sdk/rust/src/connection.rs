@@ -732,12 +732,31 @@ impl Connection {
             }
         }
 
+        // Everything past this point runs only once `write_all` above has
+        // returned `Ok` — the frame is fully on the wire, so any failure
+        // from here on can no longer be reported as "never sent" (issue
+        // #225): `apply_reconnecting_no_replay`'s non-idempotent callers
+        // (incr/decr, CAS, delete_if_matches) key off exactly this
+        // distinction to decide whether redialing and replaying `op` could
+        // double-apply an effect the server already committed.
         match rx.await {
             Ok(Ok(raw)) => Ok(raw),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(Error::ConnectionLost(
+            Ok(Err(error)) => Err(Self::mark_sent(error)),
+            Err(_) => Err(Error::ConnectionLostAfterSend(
                 "nanocached: connection is closed".to_string(),
             )),
+        }
+    }
+
+    /// Reclassifies a plain [`Error::ConnectionLost`] as
+    /// [`Error::ConnectionLostAfterSend`] — see that variant's doc comment.
+    /// Any other error (a tag-mismatch/desync `Protocol`, say) is already
+    /// never replayed by `apply_reconnecting`/`apply_reconnecting_no_replay`
+    /// regardless of this distinction, so it passes through unchanged.
+    fn mark_sent(error: Error) -> Error {
+        match error {
+            Error::ConnectionLost(message) => Error::ConnectionLostAfterSend(message),
+            other => other,
         }
     }
 
