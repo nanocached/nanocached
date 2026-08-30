@@ -354,10 +354,10 @@ public sealed class NanocachedClient : IDisposable
     // cancelling mid-write could desync a connection (see Connection's own
     // doc comment on why no CancellationToken ever reaches the stream) —
     // left to finish detached, and drained by Close() exactly like
-    // _backgroundReplicaPermits' pool is. Unlike that pool this one is
-    // unbounded: a hedge leg count is already bounded by a key's own
-    // replication factor, not by how many reads are concurrently in
-    // flight, so there is no cap to enforce here.
+    // _backgroundReplicaPermits' pool is. Bounded at
+    // MaxInFlightHedgeLoserLegs (issue #276): past that many concurrently
+    // detached legs, ReadHedgedAsync awaits its own remaining losers
+    // synchronously instead of leaving them detached here.
     private readonly ConcurrentDictionary<Task, byte> _hedgedReads = new();
     // Serializes a hedge leg's "check _closed, then register" (StartLeg)
     // against Close()'s "observe the set empty, then stop draining" (issue
@@ -2817,9 +2817,12 @@ public sealed class NanocachedClient : IDisposable
             catch (WrongNodeException)
             {
                 // Remaining legs are already tracked in _hedgedReads (added
-                // when started, above) — nothing more to do before this
-                // propagates exactly as ReadAsync's own WrongNodeException
-                // does.
+                // when started, above); issue #276: past
+                // MaxInFlightHedgeLoserLegs concurrently detached legs,
+                // leave the rest awaited synchronously here instead before
+                // this propagates exactly as ReadAsync's own
+                // WrongNodeException does.
+                await ResolveHedgeLosersAsync(pending).ConfigureAwait(false);
                 throw;
             }
             catch (Exception error) when (error is NanocachedException)
@@ -2838,6 +2841,7 @@ public sealed class NanocachedClient : IDisposable
 
             if (value is not null || index == 0)
             {
+                await ResolveHedgeLosersAsync(pending).ConfigureAwait(false);
                 return value;
             }
 
@@ -2854,6 +2858,43 @@ public sealed class NanocachedClient : IDisposable
 
         if (replicaMissed) return default!;
         throw lastError ?? new ConnectionLostException("nanocached: no owner is reachable for this key");
+    }
+
+    /// <summary>issue #276: <paramref name="tasks"/> is this read's own
+    /// remaining legs once it has already decided its outcome via a
+    /// different leg — normally left running detached in
+    /// <see cref="_hedgedReads"/> for <see cref="Close"/> to eventually
+    /// drain (they're already registered there, added by
+    /// <c>StartLeg</c>, and self-remove via their own continuation). But
+    /// past <see cref="MaxInFlightHedgeLoserLegs"/> concurrently detached
+    /// legs — checked against <see cref="_hedgedReads"/>, which still
+    /// counts <paramref name="tasks"/> themselves at this point — the
+    /// rest are pulled out of the registry and awaited right here
+    /// instead, the same "fall back to synchronous" shape
+    /// <see cref="MaxInFlightBackgroundReplicaWrites"/> uses past its own
+    /// cap, so a client issuing many concurrent hedged reads against a
+    /// slow owner can't accumulate unbounded background legs. Outcomes
+    /// are ignored either way: a loser's result was never going to be
+    /// used.</summary>
+    private async Task ResolveHedgeLosersAsync<T>(HashSet<Task<T>> tasks)
+    {
+        if (tasks.Count == 0) return;
+        if (_hedgedReads.Count < MaxInFlightHedgeLoserLegs) return;
+        foreach (Task<T> task in tasks)
+        {
+            _hedgedReads.TryRemove(task, out _);
+        }
+        await Task.WhenAll(tasks.Select(async task =>
+        {
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Ignored — see doc comment above.
+            }
+        })).ConfigureAwait(false);
     }
 
     private async Task<T> WriteAsync<T>(byte[] namespaceBytes, byte[] key, Func<Connection, Task<T>> op)
@@ -3393,6 +3434,20 @@ public sealed class NanocachedClient : IDisposable
     // mirroring KeepAliveInterval. Read once per constructor call, so
     // tests must set it before ConnectAsync().
     internal static int MaxInFlightBackgroundReplicaWrites = 32;
+
+    // Hedged reads (Hedged reads), amended by issue #276: bounds how many
+    // losing hedge legs may be left running detached in _hedgedReads at
+    // once — past the cap, ReadHedgedAsync awaits the remaining losers
+    // synchronously right there instead of leaving them detached, the
+    // same "fall back to synchronous" shape MaxInFlightBackgroundReplicaWrites
+    // uses past its own cap. Checked against _hedgedReads directly (not a
+    // separate SemaphoreSlim, since legs must always be started for
+    // correctness — only whether a decided read's losers stay detached is
+    // gated) — a client issuing many concurrent hedged reads against a
+    // slow owner can't accumulate unbounded background legs. Internal and
+    // mutable only so tests can shrink it, mirroring
+    // MaxInFlightBackgroundReplicaWrites.
+    internal static int MaxInFlightHedgeLoserLegs = 32;
 
 
     private void StartKeepAlive()
