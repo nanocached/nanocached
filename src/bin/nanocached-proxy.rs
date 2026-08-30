@@ -141,7 +141,17 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Every backend/discovery I/O interaction is bounded by this, so one
 /// hung upstream can't pin a driver task forever.
+#[cfg(not(test))]
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Issue #177: shrunk under test so the black-hole/dial-backoff tests
+/// (which pay this out in real wall-clock time — `tokio::time::pause`'s
+/// auto-advance isn't reliable once a real, permanently-unresponsive
+/// socket is in the mix) run in milliseconds instead of seconds.
+/// Comfortably above every mock node's own injected `get_delay` (the
+/// largest in this suite is 200ms), so existing delay-based tests are
+/// unaffected.
+#[cfg(test)]
+const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// How often the roster is re-fetched in the background. `W` answers
 /// force an immediate refresh regardless, so this only bounds how stale
@@ -5231,6 +5241,51 @@ mod tests {
         (stream, buf)
     }
 
+    /// Issue #177: a node that accepts a connection and then answers
+    /// nothing at all — never even completing the auth handshake. Unlike
+    /// a dropped listener (`dead_node_cluster`, connection *refused* —
+    /// fails instantly), this is a genuine black hole: the dial only
+    /// fails once `BackendHandle::connect`'s own `UPSTREAM_IO_TIMEOUT`
+    /// elapses.
+    async fn serve_black_hole(stream: TcpStream) {
+        let _stream = stream;
+        std::future::pending::<()>().await;
+    }
+
+    async fn start_black_hole_node() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_black_hole(stream));
+            }
+        });
+        addr
+    }
+
+    /// A `ProxyContext` with no live discovery/refresher behind it — for
+    /// tests that drive `SharedBackends`/the request drivers directly
+    /// (`enqueue_write`, `finish_get`, ...) rather than through a full
+    /// proxy listener.
+    fn bare_context() -> ProxyContext {
+        let (_ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, _refresh_rx) = mpsc::channel(1);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: ring_rx,
+            refresh_now: refresh_tx,
+            backends: SharedBackends::new(),
+            drain: drain_rx,
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     // ── end-to-end ───────────────────────────────────────────────────
 
     /// Issue #125: a roster whose only node is a dead address — every
@@ -6371,5 +6426,120 @@ mod tests {
         assert_eq!(replica.cas_deletes(), 0);
         assert_eq!(primary.entry(b"", b"name"), None);
         assert_eq!(replica.entry(b"", b"name"), None);
+    }
+
+    // ── issue #177: concurrent fan-out, dial backoff, failed-primary skip ──
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_black_holed_owners_do_not_serialize_the_write_fan_out() {
+        // Before issue #177's fix, `enqueue_write` dialed each owner one
+        // at a time (`for addr in &owners { backends.enqueue(..).await
+        // }`), so two black-holed owners in the same write cost two
+        // full `UPSTREAM_IO_TIMEOUT`s back to back. Concurrent fan-out
+        // bounds the whole batch to about one.
+        let healthy = MockNode::start().await;
+        let black_hole_a = start_black_hole_node().await;
+        let black_hole_b = start_black_hole_node().await;
+        let ring = RingView::new(
+            vec![
+                ("healthy".to_string(), healthy.addr.clone()),
+                ("black-a".to_string(), black_hole_a),
+                ("black-b".to_string(), black_hole_b),
+            ],
+            3,
+        );
+        let context = bare_context();
+        let value = Bytes::from_static(b"value");
+
+        let start = std::time::Instant::now();
+        let pending = enqueue_write(&context, &ring, b"", b"key", Some((&value, None))).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(pending.len(), 3);
+        // At least one timeout really elapsed (rules out a false pass
+        // from something returning instantly)...
+        assert!(elapsed >= UPSTREAM_IO_TIMEOUT, "elapsed {elapsed:?}");
+        // ...but nowhere near two, which is what the sequential bug
+        // would have cost with two black-holed owners.
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
+            "elapsed {elapsed:?} looks serialized, not concurrent"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_enqueue_to_a_recently_failed_address_fails_fast() {
+        // Issue #177: `enqueue` used to re-dial inline with no memory of
+        // a prior failure, so a black-holed address cost every caller
+        // its own full `UPSTREAM_IO_TIMEOUT`. Within `DIAL_BACKOFF` of
+        // the first failure, a second attempt should fail immediately.
+        let black_hole = start_black_hole_node().await;
+        let context = bare_context();
+        let frame = frame_get(b"", b"key");
+
+        let start = std::time::Instant::now();
+        let first = context
+            .backends
+            .enqueue(&context, &black_hole, frame.clone(), Expect::Value)
+            .await
+            .await;
+        let first_elapsed = start.elapsed();
+        assert!(first.is_err());
+        assert!(
+            first_elapsed >= UPSTREAM_IO_TIMEOUT,
+            "the first dial should pay the full timeout: {first_elapsed:?}"
+        );
+
+        let start = std::time::Instant::now();
+        let second = context
+            .backends
+            .enqueue(&context, &black_hole, frame, Expect::Value)
+            .await
+            .await;
+        let second_elapsed = start.elapsed();
+        assert!(second.is_err());
+        assert!(
+            second_elapsed < DIAL_BACKOFF,
+            "the second attempt should fail fast from the backoff window: {second_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_get_with_a_dead_primary_falls_over_to_the_replica_within_one_timeout() {
+        // Issue #177: `retry_get_on` used to retry the primary that just
+        // failed *before* trying any replica, so a black-holed primary
+        // could cost up to three timeouts before a live replica ever
+        // answered. It should now cost about one.
+        let replica = MockNode::start().await;
+        replica
+            .store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), b"key".to_vec()), b"value".to_vec());
+        let dead_primary = start_black_hole_node().await;
+        let context = bare_context();
+        let owners = vec![dead_primary.clone(), replica.addr.clone()];
+
+        let start = std::time::Instant::now();
+        let pending = context
+            .backends
+            .enqueue(
+                &context,
+                &dead_primary,
+                frame_get(b"", b"key"),
+                Expect::Value,
+            )
+            .await;
+        let result = finish_get(&context, b"", b"key", owners, pending, None).await;
+        let elapsed = start.elapsed();
+
+        match result {
+            Ok(reply) => assert_eq!(reply, respond_value(b"value", None)),
+            Err(Fatal) => panic!("expected the replica's value, got a fatal error"),
+        }
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
+            "elapsed {elapsed:?} suggests the dead primary was retried before the replica"
+        );
     }
 }
