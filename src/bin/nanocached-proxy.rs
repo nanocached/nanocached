@@ -4419,7 +4419,22 @@ async fn serve(
         };
         let (stream, peer) = match accepted {
             Ok(accepted) => accepted,
-            Err(error) => return Err(error),
+            Err(error) => {
+                // Issue #271: this used to be `return Err(error)`, tearing
+                // down the whole proxy process on any accept() failure —
+                // most of which (ECONNABORTED: the peer reset before the
+                // handshake completed; EMFILE/ENFILE: transient resource
+                // pressure) are recoverable and say nothing about this
+                // listener's own health. Log and keep serving instead;
+                // only a backoff (fd exhaustion specifically) changes the
+                // loop's pace, never its continuation — matches the
+                // metrics accept loop and discovery's accept loop.
+                eprintln!("WARN accept failed: {error}");
+                if is_fd_exhaustion_error(&error) {
+                    sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+                continue;
+            }
         };
         let _ = stream.set_nodelay(true);
 
