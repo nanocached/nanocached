@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.management.ManagementFactory;
 import java.net.URI;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -154,6 +155,88 @@ class NanocachedCacheTest {
         cache.put("a", "1");
         assertFalse(cache.remove("a", "stale"));
         assertEquals("1", cache.get("a"));
+    }
+
+    // ── replace(k,old,new) / remove(k,old) compare by equals(), not a
+    //    re-serialized digest (issue #186) ──────────────────────────
+    //
+    // A HashMap's serialized form isn't canonical: java.util.HashMap
+    // writes its internal table's bucket count ahead of its entries, so
+    // two HashMaps that are equals()-equal (same key/value pairs) but
+    // built with different initial capacities serialize to different
+    // bytes even though nothing about their contents differs. Before
+    // issue #186's fix, replace/remove built the CAS token from a
+    // digest of ValueCodec.serialize(oldValue) and compared it
+    // byte-for-byte against what was actually stored — so passing an
+    // equals()-equal HashMap with a different capacity than the one
+    // that was put() silently failed the CAS (a no-op) even though
+    // JSR-107 specifies equals() semantics here, not "identical wire
+    // bytes".
+
+    @Test
+    void threeArgReplaceSucceedsWhenTheOldValueIsEqualButNotIdenticallySerialized() {
+        MutableConfiguration<String, HashMap<String, String>> config = new MutableConfiguration<>();
+        config.setTypes(String.class, (Class<HashMap<String, String>>) (Class<?>) HashMap.class);
+        config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+        Cache<String, HashMap<String, String>> mapCache = manager.createCache("map-widgets", config);
+
+        HashMap<String, String> stored = new HashMap<>();
+        stored.put("x", "1");
+        stored.put("y", "2");
+        stored.put("z", "3");
+        mapCache.put("a", stored);
+
+        HashMap<String, String> equalButDifferentCapacity = new HashMap<>(1024);
+        equalButDifferentCapacity.put("x", "1");
+        equalButDifferentCapacity.put("y", "2");
+        equalButDifferentCapacity.put("z", "3");
+        assertEquals(stored, equalButDifferentCapacity);
+
+        HashMap<String, String> replacement = new HashMap<>();
+        replacement.put("w", "4");
+        assertTrue(mapCache.replace("a", equalButDifferentCapacity, replacement));
+        assertEquals(replacement, mapCache.get("a"));
+    }
+
+    @Test
+    void twoArgRemoveSucceedsWhenTheOldValueIsEqualButNotIdenticallySerialized() {
+        MutableConfiguration<String, HashMap<String, String>> config = new MutableConfiguration<>();
+        config.setTypes(String.class, (Class<HashMap<String, String>>) (Class<?>) HashMap.class);
+        config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+        Cache<String, HashMap<String, String>> mapCache = manager.createCache("map-widgets-remove", config);
+
+        HashMap<String, String> stored = new HashMap<>();
+        stored.put("x", "1");
+        stored.put("y", "2");
+        stored.put("z", "3");
+        mapCache.put("a", stored);
+
+        HashMap<String, String> equalButDifferentCapacity = new HashMap<>(1024);
+        equalButDifferentCapacity.put("x", "1");
+        equalButDifferentCapacity.put("y", "2");
+        equalButDifferentCapacity.put("z", "3");
+        assertEquals(stored, equalButDifferentCapacity);
+
+        assertTrue(mapCache.remove("a", equalButDifferentCapacity));
+        assertFalse(mapCache.containsKey("a"));
+    }
+
+    @Test
+    void threeArgReplaceRetriesAfterAOneShotCasMismatchAndStillSucceeds() {
+        cache.put("a", "1");
+        node.forceCasMismatchOnce.set(true);
+        assertTrue(cache.replace("a", "1", "2"));
+        assertEquals("2", cache.get("a"));
+        assertTrue(node.casSetCount.get() >= 2, "a forced mismatch must cause a retry");
+    }
+
+    @Test
+    void twoArgRemoveRetriesAfterAOneShotCasMismatchAndStillSucceeds() {
+        cache.put("a", "1");
+        node.forceCasMismatchOnce.set(true);
+        assertTrue(cache.remove("a", "1"));
+        assertFalse(cache.containsKey("a"));
+        assertTrue(node.casDeleteCount.get() >= 2, "a forced mismatch must cause a retry");
     }
 
     // ── getAndPut / getAndReplace / getAndRemove — CAS retry loops ──

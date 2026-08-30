@@ -109,18 +109,29 @@ users.removeAll();                                    // maps to CLEAR
 
 ## Atomicity
 
-`putIfAbsent`, `replace(k,old,new)`, and `remove(k,old)` map straight onto
-the SDK's `putIfAbsent`/`replace`/`deleteIfMatches` (issue #141) — a
+`putIfAbsent` maps straight onto the SDK's `putIfAbsent` (issue #141) — a
 single conditional wire round trip, genuinely atomic.
 
-`getAndPut`, `getAndReplace`, and `getAndRemove` have no single atomic
-wire primitive, so each is a bounded compare-and-set retry loop: read a
-token (`getWithToken`), attempt the conditioned write, and retry on a
-concurrent change, up to 10 attempts. Under pathological sustained
-contention on one key, the loop gives up CAS and falls back to a single
-unconditional write/delete so the call still makes progress — the
-"previous value" it returns in that case may be stale by the time the
-overwrite lands.
+`getAndPut`, `getAndReplace`, `getAndRemove`, `replace(k,old,new)`, and
+`remove(k,old)` have no single atomic wire primitive that compares by
+`equals()`, so each is a bounded compare-and-set retry loop: read the
+current value and the digest it was read with (`getWithToken`), compare
+(for the two CAS-condition ops, against the caller's `oldValue` via
+`equals()` — not a digest of `oldValue`'s own re-serialized form, which
+would fail for a value that's `equals()`-equal but not canonically
+serialized, e.g. a `HashMap` built in a different insertion order;
+issue #186), attempt the conditioned write with the digest that read
+observed, and retry on a concurrent change, up to 10 attempts.
+
+Under pathological sustained contention on one key, `getAndPut` and
+`getAndReplace` give up CAS and fall back to a single unconditional
+write so the call still makes progress — the "previous value" they
+return in that case may be stale by the time the overwrite lands.
+`replace(k,old,new)` and `remove(k,old)` do not: their whole contract
+*is* the comparison, so an unconditional fallback would silently
+violate it — exhausting the retry budget there just means the call
+reports failure (JSR-107 doesn't require these to eventually succeed
+under contention).
 
 ## Statistics
 
