@@ -17,7 +17,7 @@ import {
   WrongNodeError,
 } from "../src/index.js";
 import { HashRing } from "../src/hashRing.js";
-import { FIRE_AND_FORGET_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
+import { FIRE_AND_FORGET_TUNING, HEDGE_READ_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
@@ -3516,6 +3516,10 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
     return [value, Date.now() - start];
   }
 
+  afterEach(() => {
+    HEDGE_READ_TUNING.maxLoserLegs = 32;
+  });
+
   it("rejects a non-positive readHedgeAfterMs", async () => {
     for (const bad of [0, -1]) {
       await assert.rejects(
@@ -3548,6 +3552,49 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       await client.close();
       assert.equal((client as any).hedgedReads.size, 0);
       assert.equal(primary.mock.getCount(), 1);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it("falls back to synchronous past the loser-leg in-flight cap (issue #276)", async () => {
+    HEDGE_READ_TUNING.maxLoserLegs = 2;
+
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readHedgeAfterMs: 50,
+    });
+    try {
+      await client.set("k", "v");
+      const { primary, replica } = cluster.ownerOf("k");
+      // The replica answers immediately; the primary is slow enough that
+      // each concurrent get() hedges to the replica and then leaves the
+      // primary's leg pending as a loser once the replica's hit decides
+      // the read.
+      primary.mock.delayGets(150);
+
+      const elapsed = await Promise.all(
+        Array.from({ length: 3 }, async () => {
+          const [value, ms] = await timed(client.get("k"));
+          assert.equal(value, "v");
+          return ms;
+        }),
+      );
+
+      assert.ok(
+        elapsed.some((ms) => ms >= 150 - TIMING_TOLERANCE_MS),
+        `expected at least one call to fall back to synchronous, got ${elapsed}`,
+      );
+      assert.ok(
+        elapsed.some((ms) => ms < 150),
+        `expected at least one call to return fast, got ${elapsed}`,
+      );
+      assert.equal(replica.mock.getCount(), 3, "every call should have hedged to the replica");
+
+      await client.close();
+      assert.equal((client as any).hedgedReads.size, 0);
+      assert.equal(primary.mock.getCount(), 3);
     } finally {
       await cluster.close();
     }

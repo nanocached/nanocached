@@ -232,6 +232,17 @@ const READ_REPAIR_TTL_SECONDS = 60;
  * KEEPALIVE_TUNING. */
 export const FIRE_AND_FORGET_TUNING = { maxInFlight: 32 };
 
+/** Bounds how many hedged-read losing legs a single client may have
+ * running in the background at once (issue #276), analogous to
+ * FIRE_AND_FORGET_TUNING above but tracked against `hedgedReads` — a
+ * separate pool, not shared with `backgroundReplicaWrites`. Once the cap
+ * is reached, a further losing leg is awaited synchronously right there
+ * (readHedged's resolveLosers) instead of being left detached, the same
+ * "fall back to synchronous" shape FIRE_AND_FORGET_TUNING's cap uses. A
+ * mutable object only so tests can shrink it, mirroring
+ * FIRE_AND_FORGET_TUNING. */
+export const HEDGE_READ_TUNING = { maxLoserLegs: 32 };
+
 /** Keep-alive is always on and internal (issue #27): every interval, a
  * lightweight request goes out on each connection real traffic has left
  * idle for at least that long, so the server's 60s idle timeout never
@@ -1922,9 +1933,12 @@ export class NanocachedClient {
    *
    * The losing legs are never cancelled — there is nothing to cancel a
    * pending Promise with, and doing so would risk poisoning a connection
-   * mid-request anyway — they are left to finish detached in
+   * mid-request anyway — they are normally left to finish detached in
    * `hedgedReads`, their outcome retrieved (so nothing surfaces as an
-   * unhandled rejection), and drained by close(). */
+   * unhandled rejection), and drained by close(). Past
+   * HEDGE_READ_TUNING.maxLoserLegs concurrently tracked legs, though, the
+   * decided read's own losers are awaited synchronously right here
+   * instead (issue #276) — see resolveLosers below. */
   private async readHedged<T>(
     op: (connection: Connection) => Promise<T>,
     names: string[],
@@ -1966,6 +1980,27 @@ export class NanocachedClient {
       return outcome;
     };
 
+    // issue #276: `losers` are legs still pending once this read has
+    // decided its answer. Normally they're simply left running — already
+    // registered in `hedgedReads` by start() above — for close() to
+    // eventually drain, same as always. But past
+    // HEDGE_READ_TUNING.maxLoserLegs concurrently tracked legs (checked
+    // against `hedgedReads`, which still counts `losers` themselves at
+    // this point), the losers are removed from `hedgedReads` and awaited
+    // right here instead — the same "fall back to synchronous" shape
+    // FIRE_AND_FORGET_TUNING's cap uses — so a client issuing many
+    // concurrent hedged reads against a slow owner can't accumulate
+    // unbounded background legs. Outcomes are ignored either way: a
+    // loser's result was never going to be used.
+    const resolveLosers = async (losers: Array<{ promise: Promise<Outcome>; index: number }>): Promise<void> => {
+      if (losers.length === 0) return;
+      if (this.hedgedReads.size < HEDGE_READ_TUNING.maxLoserLegs) return;
+      for (const loser of losers) {
+        this.hedgedReads.delete(loser.promise as Promise<unknown>);
+      }
+      await Promise.allSettled(losers.map((loser) => loser.promise));
+    };
+
     let pending: Array<{ promise: Promise<Outcome>; index: number }> = [{ promise: start(0), index: 0 }];
     let nextIndex = 1;
     let lastError: unknown = null;
@@ -2000,9 +2035,13 @@ export class NanocachedClient {
       pending = pending.filter((leg) => leg.index !== winner.index);
 
       if (!winner.ok) {
-        if (winner.error instanceof WrongNodeError) throw winner.error;
+        if (winner.error instanceof WrongNodeError) {
+          await resolveLosers(pending);
+          throw winner.error;
+        }
         lastError = winner.error;
       } else if (winner.value !== null || winner.index === 0) {
+        await resolveLosers(pending);
         return winner.value;
       } else {
         // A replica miss is provisional — it may simply lack the copy.
