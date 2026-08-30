@@ -2237,35 +2237,58 @@ class NanocachedClient:
                     stale.close()
                 del self._members[name]
 
+        new_nodes = []
         for node in cluster.nodes:
             existing = self._members.get(node.name)
             if existing is not None:
                 existing.address = node.address
                 continue
+            new_nodes.append(node)
+
+        async def dial(node: DiscoveredNode):
             try:
                 node_host, node_port = split_host_port(node.address)
                 target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
-                if not isinstance(target, NodeTarget):
-                    # Refresh is opportunistic/best-effort and must never
-                    # fail the caller's operation (client-side replication's
-                    # eventual-consistency model) — this node is just
-                    # skipped, counted in stats().refresh_failures.
-                    self._refresh_failures += 1
-                    continue
-                if self._closed:
-                    # close() ran while we were dialing (issue #10):
-                    # installing this socket now would leak it.
-                    target.writer.close()
-                    return
-                self._members[node.name] = _Member(
-                    node.address, self._new_connection(target.reader, target.writer, target.tagged)
-                )
-            except _SWALLOWABLE_ERRORS:
-                # Same rationale as above: never fail the caller over a
-                # refresh-time connect failure. A genuine programming
-                # error (anything outside _SWALLOWABLE_ERRORS) still
-                # propagates.
+            except _SWALLOWABLE_ERRORS as error:
+                # Same rationale as _fetch_node_list: never fail the
+                # caller over a refresh-time connect failure. A genuine
+                # programming error (anything outside _SWALLOWABLE_ERRORS)
+                # still propagates and fails this refresh.
+                return node, error
+            return node, target
+
+        # Dialed concurrently, like _open_cluster (issue #190) — a
+        # sequential loop here meant several nodes joining at once, with
+        # one of them slow or unreachable, stalled every operation
+        # waiting on _before_operation()'s refresh for up to
+        # N * dial timeout. A failed/slow dial of one node must not delay
+        # installing the others, mirrored from _open_cluster's own
+        # per-node outcome handling below.
+        outcomes = await asyncio.gather(*(dial(node) for node in new_nodes))
+
+        if self._closed:
+            # close() ran while we were dialing (issue #10): installing
+            # any of these sockets now would leak them, so every one that
+            # did connect is closed instead, none of them installed.
+            for _, outcome in outcomes:
+                if isinstance(outcome, NodeTarget):
+                    outcome.writer.close()
+            return
+
+        for node, outcome in outcomes:
+            if isinstance(outcome, Exception):
                 self._refresh_failures += 1
+                continue
+            if not isinstance(outcome, NodeTarget):
+                # Refresh is opportunistic/best-effort and must never fail
+                # the caller's operation (client-side replication's
+                # eventual-consistency model) — this node is just
+                # skipped, counted in stats().refresh_failures.
+                self._refresh_failures += 1
+                continue
+            self._members[node.name] = _Member(
+                node.address, self._new_connection(outcome.reader, outcome.writer, outcome.tagged)
+            )
 
         if self._closed:
             self._teardown()

@@ -143,6 +143,11 @@ class MockNode:
         self._get_delay = 0.0
         self._gets_delay = 0.0
         self._set_delay = 0.0
+        # Node-list refresh dialing new nodes (issue #190): holds the
+        # handshake's own `On`/`OnT`/`En` reply, so a test can prove a
+        # slow-to-accept node no longer stalls a refresh's dial of every
+        # other new node behind it.
+        self._auth_delay = 0.0
         self._silent = False
         self.last_set_ttl = 0
         self._server: asyncio.Server | None = None
@@ -253,6 +258,14 @@ class MockNode:
         isn't blocked on a slow replica leg (fire-and-forget replica writes)."""
         self._set_delay = seconds
 
+    def delay_next_auth(self, seconds: float) -> None:
+        """Hold the next connection's `A` handshake reply — simulates a
+        newly-joined node that is slow to accept/authenticate, so a test
+        can prove a node-list refresh dials new nodes concurrently
+        (issue #190) instead of letting one slow dial stall every other
+        new node behind it."""
+        self._auth_delay = seconds
+
     def go_silent_after_handshake(self) -> None:
         """Makes this node a half-open server from this point on: it
         still accepts and completes the ``A`` handshake, and still reads
@@ -340,6 +353,9 @@ class MockNode:
                         else secret == self.required_secret
                     )
                     tagged = accepted and self.support_tags and len(parts) > 2 and parts[2] == b"T"
+                    if self._auth_delay > 0:
+                        delay, self._auth_delay = self._auth_delay, 0.0
+                        await asyncio.sleep(delay)
                     writer.write(b"OnT\n" if tagged else (b"On\n" if accepted else b"En\n"))
                     await writer.drain()
                     if not accepted:
