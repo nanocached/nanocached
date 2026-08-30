@@ -10,7 +10,7 @@
 //! order always matches the order their frames actually hit the wire.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,25 @@ const MAX_VALUE_LENGTH: usize = 2 * 1024 * 1024;
 /// on the client (issue #47 audit item R2, mirrors `MAX_VALUE_LENGTH`'s
 /// rationale for the `V` body).
 const MAX_HEADER_LINE_LENGTH: usize = 4 * 1024;
+
+/// Bounds an `M` (multi-get, issue #151) reply's hit bodies summed across
+/// the whole reply. Each entry's own declared length is already rejected
+/// above `MAX_VALUE_LENGTH`, but that alone doesn't bound the reply as a
+/// whole (issue #207, follow-up to #179's per-value fix): a node
+/// answering a several-hundred-key multi-get with every entry near the
+/// per-value cap could still force hundreds of MB of allocation from a
+/// single reply. 64 MiB, matching `compression.rs`'s own
+/// `MAX_DECOMPRESSED_LENGTH` — a wire reply legitimately needing more
+/// than that in one round trip is unreasonable; callers should batch
+/// smaller rather than pushing this cap up. `O` (multi-set) acks carry no
+/// bodies at all — just fixed single-character tokens on one header line
+/// that's already bounded by `MAX_HEADER_LINE_LENGTH` — so they need no
+/// equivalent cumulative bound. Public-but-hidden purely as a test hook,
+/// mirroring `REQUEST_TIMEOUT_MS` below — read fresh on every `M` reply
+/// rather than once at connect, so a test that lowers it should restore
+/// it immediately after the one call it means to affect.
+#[doc(hidden)]
+pub static MAX_MULTI_GET_RESPONSE_BYTES: AtomicUsize = AtomicUsize::new(64 * 1024 * 1024);
 
 /// Bounds a request's full round trip (write + wait for its matched
 /// response), in milliseconds: without it, a half-open server that
@@ -1331,6 +1350,15 @@ async fn read_one_response(
 
             let mut entries = Vec::with_capacity(count);
             if marker == b'M' {
+                // issue #207: each entry's own `length` is already capped
+                // above by MAX_VALUE_LENGTH, but the reply as a whole
+                // isn't — track the running total of every hit body this
+                // reply has claimed so far, and reject before allocating
+                // or reading a body that would push it past
+                // MAX_MULTI_GET_RESPONSE_BYTES (see that static's own doc
+                // comment).
+                let mut total_bytes: usize = 0;
+                let max_response_bytes = MAX_MULTI_GET_RESPONSE_BYTES.load(Ordering::SeqCst);
                 for token in result_tokens {
                     match *token {
                         "-" => entries.push(MultiEntry::Miss),
@@ -1346,6 +1374,12 @@ async fn read_one_response(
                                             .to_string(),
                                     )
                                 })?;
+                            total_bytes = total_bytes.saturating_add(length);
+                            if total_bytes > max_response_bytes {
+                                return Err(Error::Protocol(format!(
+                                    "nanocached: multi-get response exceeds {max_response_bytes} bytes"
+                                )));
+                            }
                             let mut value = vec![0u8; length];
                             read_half.read_exact(&mut value).await?;
                             entries.push(MultiEntry::Hit(value));
@@ -1353,6 +1387,11 @@ async fn read_one_response(
                     }
                 }
             } else {
+                // `O` (multi-set) acks carry no bodies — just "S"/"W"
+                // tokens on this one already-length-bounded header line
+                // (MAX_HEADER_LINE_LENGTH), so `count` itself is already
+                // bounded and there's nothing analogous to `M`'s
+                // cumulative-bytes check to add here (issue #207).
                 for token in result_tokens {
                     match *token {
                         "S" => entries.push(MultiEntry::Stored),
