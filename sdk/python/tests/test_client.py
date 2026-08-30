@@ -755,6 +755,49 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await node.close()
 
+    async def test_refresh_dials_newly_discovered_nodes_concurrently(self):
+        # Issue #190: _refresh_node_list used to dial every newly
+        # discovered node in a sequential `for` loop, unlike
+        # _open_cluster's own concurrent bootstrap dial — several nodes
+        # joining at once, more than one of them slow to accept, stalled
+        # every operation waiting on _before_operation()'s refresh for
+        # roughly the SUM of their dial times instead of the max.
+        existing = await MockNode().start()
+        new_a = await MockNode().start()
+        new_b = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], existing.address)]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                delay = 0.12
+                new_a.delay_next_auth(delay)
+                new_b.delay_next_auth(delay)
+                discovery.nodes = [
+                    (NAMES[0], existing.address),
+                    ("new-a", new_a.address),
+                    ("new-b", new_b.address),
+                ]
+
+                start = asyncio.get_running_loop().time()
+                await client._maybe_refresh(force=True)
+                elapsed = asyncio.get_running_loop().time() - start
+
+                # Concurrent dialing takes roughly `delay` (the max of the
+                # two); a sequential loop would take roughly `2 * delay`
+                # (the sum) — the threshold sits well between the two.
+                self.assertLess(elapsed, delay * 1.5)
+                self.assertIn("new-a", client._members)
+                self.assertIn("new-b", client._members)
+                self.assertIsNotNone(client._members["new-a"].connection)
+                self.assertIsNotNone(client._members["new-b"].connection)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await existing.close()
+            await new_a.close()
+            await new_b.close()
+
 
 class IdentifyMalformedResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_unterminated_node_list_header_fails_promptly(self):
