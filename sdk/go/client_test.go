@@ -4391,6 +4391,66 @@ func TestADeadPrimaryFailsOverImmediatelyWhenHedgingIsOn(t *testing.T) {
 	}
 }
 
+func TestHedgedReadFallsBackToSynchronousPastTheCap(t *testing.T) {
+	// issue #276: a hedged read's losing leg is normally left running
+	// detached (drained by Close()); mirrors
+	// TestFireAndForgetReplicasFallsBackToSynchronousPastTheCap's shape
+	// (shrink the cap, delay the loser, assert on elapsed time) but
+	// exercises maxInFlightHedgeReadLosers/hedgedReadsInFlight instead of
+	// maxInFlightBackgroundReplicaWrites/backgroundReplicaSem, and uses
+	// sequential rather than concurrent calls: a hedge leg can't be
+	// deferred before it starts (unlike a replica write), so the decision
+	// this cap governs happens once per read, at the moment its winner is
+	// chosen — sequential calls make that decision point deterministic
+	// instead of racing concurrent callers against each other.
+	original := maxInFlightHedgeReadLosers
+	defer func() { maxInFlightHedgeReadLosers = original }()
+
+	runOnce := func(capN int, primaryDelay time.Duration) time.Duration {
+		maxInFlightHedgeReadLosers = capN
+		nodes, discovery := startCluster(t, 2)
+		client, err := Connect(Config{
+			Addresses:      []Address{addr(discovery.address())},
+			ReadHedgeAfter: 20 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+
+		if err := client.Set("k", "v", 0); err != nil {
+			t.Fatal(err)
+		}
+		primary := ownersOf("k")[0]
+		nodes[primary].delayGets(primaryDelay)
+
+		start := time.Now()
+		value, ok, err := client.Get("k")
+		elapsed := time.Since(start)
+		if err != nil || !ok || value != "v" {
+			t.Fatalf("Get = %q, %v, %v", value, ok, err)
+		}
+		return elapsed
+	}
+
+	// Well under the cap: the losing primary leg is left running detached
+	// (a generous cap of 3 tolerates hedgedReadsInFlight still counting
+	// the just-finished replica leg for a moment after it answers, since
+	// its own decrement races the decision below), so the read returns as
+	// soon as the replica answers, without waiting for the primary.
+	if elapsed := runOnce(3, 300*time.Millisecond); elapsed >= 300*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("under the cap: elapsed = %v, want well under the primary's 300ms delay (the loser leg should be left running detached)", elapsed)
+	}
+
+	// At the cap: the pending primary leg alone already meets it (issue
+	// #276's finishHedge counts pending legs against hedgedReadsInFlight
+	// before deciding whether to leave them running), so the read must
+	// instead block draining it before returning.
+	if elapsed := runOnce(1, 150*time.Millisecond); elapsed < 150*time.Millisecond-hedgeTimingTolerance {
+		t.Fatalf("at the cap: elapsed = %v, want at least the primary's 150ms delay (should fall back to a synchronous wait)", elapsed)
+	}
+}
+
 func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) bool {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
