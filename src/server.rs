@@ -3082,7 +3082,7 @@ fn adopt_membership(
         let mut slot = active_migration
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match slot.as_mut() {
+        let (pending, joiner_evicted) = match slot.as_mut() {
             Some(active) => {
                 let joiner_listed = members.contains(&active.joining_name);
                 // Issue #62: the roster naming the joiner is discovery's
@@ -3102,10 +3102,31 @@ fn adopt_membership(
                 // forwarding window that outlives the join must not hide
                 // that eviction (the doc comment above), so only an
                 // unconfirmed join keeps the roster at bay.
-                active.forwarding_open() && !joiner_listed && !active.confirmed
+                (
+                    active.forwarding_open() && !joiner_listed && !active.confirmed,
+                    active.confirmed && !joiner_listed,
+                )
             }
-            None => false,
+            None => (false, false),
+        };
+        // Issue #267: the forwarding window is for a joiner that is still
+        // there to receive the writes. Once discovery has evicted it,
+        // every forward would only dial a dead address — one a new
+        // container may already have been given — and burn
+        // KEY_TRANSFER_ATTEMPTS x FORWARD_TIMEOUT each, so close the
+        // window now instead of letting it lapse. The slot's marks were
+        // released to the sweep at confirmation, so taking it is exactly
+        // what the grace expiring would have done.
+        if joiner_evicted {
+            if let Some(taken) = slot.take() {
+                println!(
+                    "INFO joiner {} evicted by discovery at {discovery_addr}; closing its \
+                     forwarding window early",
+                    taken.joining_name
+                );
+            }
         }
+        pending
     };
     if join_still_pending {
         return;
@@ -10509,6 +10530,9 @@ mod tests {
             member_names(&known_ring),
             Some((vec!["test-node".to_string()], 2))
         );
+        // Issue #267: and the forwarding window closes with it — nothing
+        // is left to forward to an evicted joiner.
+        assert!(slot.lock().unwrap().is_none());
         *known_ring.lock().unwrap() = None;
 
         // Forwarding grace elapsed (a stale slot no request has lazily
