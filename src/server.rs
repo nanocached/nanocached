@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::io::BufReader;
@@ -351,6 +352,12 @@ struct CacheRequest {
 /// directly — see those fields' doc comments for why.
 type MigrationTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// Issue #266: a `spawn_or_supersede_rereplication` invocation, boxed so
+/// `register_with_discovery` can hand it to `send_heartbeats`'s own
+/// `JoinSet` over its `rereplication_tx` channel — same shape and
+/// reasoning as `MigrationTask`, just a different producer/consumer pair.
+type RereplicationTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// Per-connection settings that don't change once `run` starts, grouped so
 /// `dispatch_connection`/`handle_connection` take one value instead of two.
 #[derive(Clone)]
@@ -528,6 +535,32 @@ struct NodeContext {
     /// it, the `M` handler rejects new joins while it is set, and
     /// `/readyz` reports not-ready.
     leaving: Arc<Mutex<Option<LeaveState>>>,
+    /// Issue #266: a `run_rereplication` in flight, if any — set by
+    /// `spawn_or_supersede_rereplication` when `adopt_membership` reports
+    /// a ring change that dropped a member (an eviction, or a leave this
+    /// node did not itself hand off for), cleared once that run finishes.
+    /// `run_migration` waits (bounded) for this to clear before it starts
+    /// marking dead copies, so a join's sweep can't reclaim the sender's
+    /// only copy of a key the re-replication hasn't delivered to the
+    /// ring's newly promoted owner yet — see both functions' doc
+    /// comments.
+    active_rereplication: Arc<Mutex<Option<Arc<ActiveRereplication>>>>,
+    /// Issue #266: how a task that spawns a re-replication (either
+    /// `register_with_discovery`, on an eviction-driven ring change, or
+    /// `run_migration`, on the join-flip gap below) hands it to
+    /// `send_heartbeats`'s own `JoinSet` — see that field's doc comment
+    /// on `RereplicationTask` for why neither producer has a `JoinSet`
+    /// of its own suitable for a possibly-long-running task like this.
+    /// A clone of the same sender `run` creates once and threads to both
+    /// this struct and `send_heartbeats`'s receiving end.
+    rereplication_tx: mpsc::Sender<RereplicationTask>,
+    /// This node's shutdown signal (the same `watch::Receiver` every
+    /// other background task observes) — carried here so a task spawned
+    /// well after `NodeContext` was built (`run_migration`'s own
+    /// join-triggered re-replication, issue #266) can still stop
+    /// promptly at shutdown without a bespoke parameter thread of its
+    /// own.
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 /// Issue #124: a decommission in progress. The mirror of
@@ -692,6 +725,15 @@ pub(crate) async fn run(
     // #30), the same belief `wrong_node` rejects client requests against.
     let known_ring: KnownRing = Arc::new(Mutex::new(None));
 
+    // Issue #266: created once here (mirroring `migration_tx`/
+    // `forward_tx` below) rather than inside `send_heartbeats`, so both
+    // `NodeContext` (whose clones are how two different producers —
+    // `register_with_discovery` on an eviction-driven ring change, and
+    // `run_migration` on its own join-flip gap, see its doc comment —
+    // hand a re-replication task off) and `send_heartbeats` (which
+    // drains it into its own `JoinSet`) share the one channel.
+    let (rereplication_tx, rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+
     // Generated once and kept for this process's lifetime (node identity decoupled from address): a
     // restarted node has no data to reclaim its old identity for, so
     // there's nothing a stable name would preserve across a restart that
@@ -712,7 +754,16 @@ pub(crate) async fn run(
         tls_connector: config.tls_connector.clone(),
         request_tx: request_tx.clone(),
         leaving: Arc::new(Mutex::new(None)),
+        active_rereplication: Arc::new(Mutex::new(None)),
+        rereplication_tx: rereplication_tx.clone(),
+        shutdown_rx: shutdown_rx.clone(),
     });
+    // This function's own copy must go, or `send_heartbeats`'s drain of
+    // `rereplication_rx` would never see the channel close — every real
+    // producer holds its own clone via `NodeContext` (or a clone of it),
+    // and this binding otherwise outlives even `heartbeat_task.await`
+    // below, in `run`'s own shutdown sequence.
+    drop(rereplication_tx);
 
     // Issue #124: the operations sidecar — Prometheus-format /metrics
     // plus /healthz//readyz probes on their own listener, so scraping
@@ -749,10 +800,8 @@ pub(crate) async fn run(
     let heartbeat_task = match (heartbeat, &node_context) {
         (Some(config), Some(node_context)) => Some(tokio::spawn(send_heartbeats(
             config,
-            node_context.name.clone(),
-            node_context.token.clone(),
-            Arc::clone(&known_ring),
-            Arc::clone(&active_migration),
+            node_context.clone(),
+            rereplication_rx,
             heartbeat_stop_rx,
         ))),
         _ => None,
@@ -1838,6 +1887,13 @@ async fn handle_connection(
                 )
                 .await?;
 
+                // Issue #266: `joined` (with addresses) plus the
+                // joiner's own — `run_migration`'s own join-flip
+                // re-replication trigger reuses this instead of a fresh
+                // `L` fetch (see its own doc comment).
+                let mut addresses: HashMap<String, String> = joined.into_iter().collect();
+                addresses.insert(joining_name.clone(), joining_addr.clone());
+
                 // Handed to `run`'s own loop rather than spawned here
                 // directly, so it ends up tracked by `connection_tasks` —
                 // see `ConnectionConfig::migration_tx`. If the receiving
@@ -1857,6 +1913,7 @@ async fn handle_connection(
                         after_ring,
                         migration_guard,
                         keys_snapshot,
+                        addresses,
                     )))
                     .await;
 
@@ -2168,25 +2225,45 @@ async fn handle_connection(
 
                 continue;
             }
-            Ok((Command::HandoffSet { key, value, ttl }, tag)) => {
+            Ok((
+                Command::HandoffSet {
+                    key,
+                    value,
+                    ttl,
+                    if_absent,
+                },
+                tag,
+            )) => {
                 // Issue #124: a decommissioning peer handing this node an
                 // entry it is about to own — stored without the
                 // wrong-node check (ownership becomes true when the
                 // post-leave roster publishes, deliberately after this).
+                // Issue #266: also how a survivor re-replicates a key to
+                // the owner an eviction promoted, in which case
+                // `if_absent` is set and a key already present here wins.
                 let response = execute_command(
                     &request_tx,
                     Command::HandoffSet {
                         key: key.clone(),
                         value: value.clone(),
                         ttl,
+                        if_absent,
                     },
                 )
                 .await?;
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 // If this node is itself mid-join-handoff for the key,
-                // propagate like any other write.
-                if let Some(node_context) = &config.node_context
+                // propagate like any other write — but only for an
+                // ordinary (unconditional) handoff. A put-if-absent one
+                // that lost the race (the key was already present here)
+                // changed nothing to propagate; forwarding `value`
+                // regardless would ship a possibly-stale value onward as
+                // an unconditional overwrite. Re-replication already
+                // sends directly to every owner that needs the entry, so
+                // skipping this relay loses nothing.
+                if !if_absent
+                    && let Some(node_context) = &config.node_context
                     && let Some(target) = migration_target_for(node_context, &key)
                 {
                     spawn_forward(
@@ -2660,10 +2737,8 @@ enum DiscoveryRole {
 /// reports `C` under the same name these tasks register as.
 async fn send_heartbeats(
     config: HeartbeatConfig,
-    name: String,
-    token: String,
-    known_ring: KnownRing,
-    active_migration: Arc<Mutex<Option<ActiveMigration>>>,
+    node_context: NodeContext,
+    mut rereplication_rx: mpsc::Receiver<RereplicationTask>,
     shutdown_rx: watch::Receiver<bool>,
 ) {
     let (promoted_tx, promoted_rx) = watch::channel(false);
@@ -2683,16 +2758,49 @@ async fn send_heartbeats(
             config.interval,
             config.auth_secret.clone(),
             config.tls_connector.clone(),
-            name.clone(),
-            token.clone(),
-            Arc::clone(&known_ring),
-            Arc::clone(&active_migration),
+            node_context.clone(),
             role,
             shutdown_rx.clone(),
         ));
     }
+    // This function's own copy must go, or its later drain of
+    // `rereplication_rx` would deadlock waiting for a channel it is
+    // itself still holding a sender to (`NodeContext::rereplication_tx`)
+    // — every real producer (each `register_with_discovery` task above,
+    // and any spawned re-replication task) holds its own clone instead,
+    // and `node_context` isn't needed again in this function.
+    drop(node_context);
 
-    while tasks.join_next().await.is_some() {}
+    // Issue #266: drains any re-replication task a ring change
+    // triggered — either here, via `register_with_discovery`'s own
+    // `adopt_membership` detecting an eviction, or from `run_migration`
+    // (a completely different task, spawned off `run`'s own
+    // `migration_tx`) via its shared `NodeContext::rereplication_tx` —
+    // into the same `JoinSet` the registration connections themselves
+    // run in, so shutdown (via `heartbeat_task.await` in `run`) waits
+    // for it exactly as it already waits for those. `biased` so a task
+    // that arrived just as the last registration connection exited is
+    // still picked up before the `else` branch (both disabled) ends the
+    // loop; the channel closes once every clone of
+    // `NodeContext::rereplication_tx` this process holds has dropped —
+    // see `run`'s own `drop(rereplication_tx)`.
+    loop {
+        tokio::select! {
+            biased;
+
+            Some(task) = rereplication_rx.recv() => {
+                tasks.spawn(task);
+            }
+
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("WARN heartbeat task failed: {error}");
+                }
+            }
+
+            else => break,
+        }
+    }
 }
 
 /// Holds one long-lived connection to a single discovery replica:
@@ -2707,15 +2815,12 @@ async fn register_with_discovery(
     interval: Duration,
     auth_secret: Option<Bytes>,
     tls_connector: Option<TlsConnector>,
-    name: String,
-    token: String,
-    known_ring: KnownRing,
-    active_migration: Arc<Mutex<Option<ActiveMigration>>>,
+    node_context: NodeContext,
     mut role: DiscoveryRole,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let join = join_message(&name, port, &token);
-    let announce = announce_message(&name, port, &token);
+    let join = join_message(&node_context.name, port, &node_context.token);
+    let announce = announce_message(&node_context.name, port, &node_context.token);
 
     // A standby must not announce a node the primary hasn't promoted yet:
     // that would make it visible in the standby's `L` before its staged node join
@@ -2851,12 +2956,17 @@ async fn register_with_discovery(
                             // only once it has sent its own first client-side replication
                             // handoff `M` (issue #30) — a stale precomputed
                             // buffer would keep reporting "unknown" forever.
-                            let replication = known_ring
+                            let replication = node_context
+                                .known_ring
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .as_ref()
                                 .map(|membership| membership.replication);
-                            let heartbeat = heartbeat_message(&name, replication, &token);
+                            let heartbeat = heartbeat_message(
+                                &node_context.name,
+                                replication,
+                                &node_context.token,
+                            );
 
                             if !matches!(
                                 timeout(OUTBOUND_IO_TIMEOUT, stream.write_all(&heartbeat)).await,
@@ -2889,13 +2999,51 @@ async fn register_with_discovery(
                             if let Some((members, replication)) = roster
                                 && matches!(role, DiscoveryRole::Primary(_))
                             {
-                                adopt_membership(
-                                    &known_ring,
-                                    &active_migration,
+                                let change = adopt_membership(
+                                    &node_context.known_ring,
+                                    &node_context.active_migration,
                                     &discovery_addr,
                                     members,
                                     replication,
                                 );
+
+                                // Issue #266: a ring change that dropped a
+                                // member — an eviction, or a leave this
+                                // node did not itself hand off for —
+                                // leaves the cluster under-replicated
+                                // until someone re-replicates the keys
+                                // the change promoted a new owner into.
+                                // Handed to `send_heartbeats`'s own
+                                // `JoinSet` (this task has none of its
+                                // own) rather than run inline: it can
+                                // scan every key this node holds, which
+                                // must not stall this connection's own
+                                // heartbeat ticks.
+                                if let Some(change) = change
+                                    && change.dropped_a_member()
+                                {
+                                    let before_ring = change
+                                        .before
+                                        .expect("dropped_a_member() implies before is Some")
+                                        .ring
+                                        .clone();
+                                    let task: RereplicationTask =
+                                        Box::pin(spawn_or_supersede_rereplication(
+                                            node_context.clone(),
+                                            discovery_addr.clone(),
+                                            before_ring,
+                                            Arc::clone(&change.after),
+                                            shutdown_rx.clone(),
+                                        ));
+                                    if node_context.rereplication_tx.send(task).await.is_err() {
+                                        eprintln!(
+                                            "WARN re-replication: could not queue the task for a \
+                                             ring change (shutting down); a later ring change \
+                                             will retrigger it if the cluster is still \
+                                             under-replicated"
+                                        );
+                                    }
+                                }
                             }
 
                             if wait_or_shutdown(interval, &mut shutdown_rx).await {
@@ -3071,13 +3219,21 @@ async fn read_heartbeat_ack<S: AsyncBufReadExt + Unpin>(
 /// `forwarding_grace` (a minute or more), and an eviction landing inside
 /// it must not be ignored for that long. An abandoned join (`X`) clears
 /// the slot; and if that `X` was lost, the window is bounded regardless.
+///
+/// Returns the ring change this call actually applied, if any — `None`
+/// while a join is still pending or the roster matches what was already
+/// believed. Issue #266: the caller (`register_with_discovery`) uses this
+/// to detect a ring change that dropped a member — an eviction, or a
+/// leave this node did not itself hand off for — and spawn a
+/// re-replication task; `before` is `None` on the very first membership
+/// this node ever adopts, which by definition drops nothing.
 fn adopt_membership(
     known_ring: &KnownRing,
     active_migration: &Arc<Mutex<Option<ActiveMigration>>>,
     discovery_addr: &str,
     mut members: Vec<String>,
     replication: usize,
-) {
+) -> Option<RingChange> {
     let join_still_pending = {
         let mut slot = active_migration
             .lock()
@@ -3127,7 +3283,7 @@ fn adopt_membership(
         pending
     };
     if join_still_pending {
-        return;
+        return None;
     }
 
     members.sort_unstable();
@@ -3144,7 +3300,7 @@ fn adopt_membership(
         }
     });
     if unchanged {
-        return;
+        return None;
     }
 
     println!(
@@ -3152,10 +3308,51 @@ fn adopt_membership(
          replication factor {replication}",
         members.len()
     );
-    *guard = Some(Arc::new(Membership {
+    let before = guard.as_ref().cloned();
+    let after = Arc::new(Membership {
         ring: Arc::new(HashRing::new(members)),
         replication,
-    }));
+    });
+    *guard = Some(Arc::clone(&after));
+    Some(RingChange { before, after })
+}
+
+/// What `adopt_membership` actually applied — see its own doc comment.
+struct RingChange {
+    before: Option<Arc<Membership>>,
+    after: Arc<Membership>,
+}
+
+impl RingChange {
+    /// Issue #266: true if `after` is missing at least one member
+    /// `before` had — an eviction, or a leave this node did not itself
+    /// hand off for (an ordinary decommission already transferred every
+    /// affected key before it left, so re-triggering for it too is
+    /// harmless — the put-if-absent handoff (`U … A`) makes a redundant
+    /// send a no-op — just not free; simplicity over precision). `false`
+    /// when `before` is `None` (this node's very first membership) or
+    /// when the change only ever added members.
+    fn dropped_a_member(&self) -> bool {
+        self.before
+            .as_ref()
+            .is_some_and(|before| ring_dropped_a_member(&before.ring, &self.after.ring))
+    }
+}
+
+/// Issue #266: true if `before`'s member set contains a name `after`
+/// doesn't — the "was a member evicted (or otherwise dropped) between
+/// these two rings" test both re-replication trigger sites use:
+/// `RingChange::dropped_a_member` (an eviction-driven ring change,
+/// `before` = the primary's previous heartbeat-ack roster) and
+/// `run_migration`'s own join-flip trigger (`before` = this node's last
+/// `known_ring` belief, which the flip below is about to replace —
+/// see that function's own doc comment for why that belief can still
+/// list a member the `M` itself never saw).
+fn ring_dropped_a_member(before: &HashRing, after: &HashRing) -> bool {
+    before
+        .nodes()
+        .iter()
+        .any(|node| !after.nodes().contains(node))
 }
 
 /// Waits for `duration`, or returns `true` early if shutdown is signaled.
@@ -3357,6 +3554,27 @@ impl ActiveMigration {
     fn expired(&self) -> bool {
         self.confirmed && !self.forwarding_open()
     }
+}
+
+/// Issue #266: a `run_rereplication` in flight — the re-replication
+/// counterpart of `ActiveMigration`, held in `NodeContext::active_rereplication`.
+/// Wrapped in an `Arc` (rather than living directly in the slot, as
+/// `ActiveMigration` does) because `spawn_or_supersede_rereplication`
+/// needs to hand a superseded run's own handle to the code asking it to
+/// stop *after* it has already replaced the slot's contents with the new
+/// run — there is no single lock scope in which both "read the old
+/// value" and "write the new one" can happen while also holding a
+/// reference to the old value to poll afterward.
+struct ActiveRereplication {
+    /// Set by a later ring change's task to ask this run to stop early —
+    /// checked in `run_rereplication`'s per-key loop, same idiom as
+    /// `ActiveMigration::abort_requested`.
+    abort_requested: AtomicBool,
+    /// Set once `run_rereplication` returns (whether it finished,
+    /// aborted, or gave up on the roster fetch) — `Instant`-free, unlike
+    /// `ActiveMigration::completed_at`: nothing here needs to measure a
+    /// forwarding grace, only to know the run is over.
+    done: AtomicBool,
 }
 
 /// Occupies `slot` with an `ActiveMigration` for this guard's lifetime
@@ -3656,11 +3874,12 @@ fn migration_rings(
 }
 
 /// Size-derived migration timeout: counts how many of `keys` this node will actually
-/// send to the joining node, mirroring the sender/displaced predicate
-/// `run_migration` computes for real (the old primary for a key is the
-/// one designated sender — a key can be affected by the join without
-/// this node being the one that sends it). Purely to size discovery's
-/// migration timeout — not a transfer plan.
+/// send to the joining node, mirroring the predicate `run_migration`
+/// computes for real (issue #266: every old owner that holds an
+/// affected key sends it — not just a single designated "primary" — so
+/// this is "this node was one of the key's old owners", not "this node
+/// was the highest-ranked one"). Purely to size discovery's migration
+/// timeout — not a transfer plan.
 ///
 /// Takes `keys` (a `list_keys` snapshot) rather than fetching its own:
 /// this and `run_migration`'s own transfer loop used to each call
@@ -3689,7 +3908,7 @@ fn entries_to_send_count(
     keys.iter()
         .filter(|key| {
             after_ring.is_owner(key, joining_name, replication)
-                && before_ring.owners(key, replication).first() == Some(&self_name)
+                && before_ring.is_owner(key, self_name, replication)
         })
         .count()
 }
@@ -3700,16 +3919,36 @@ fn entries_to_send_count(
 /// of this node's own entries' top-R owner set changes when the joining
 /// node is added. Adding exactly one node can only insert it into a key's
 /// ranking, never reorder the existing nodes relative to each other, so
-/// per affected key exactly two roles exist among the pre-join owners:
-/// the old *primary* sends the joining node its copy (one designated
-/// sender — no duplicate transfers), and the node displaced from rank R
-/// to R+1 (if any — there is at most one) marks its now-dead copy for
-/// the post-handoff sweep. This node may hold either role, both (R=1:
-/// sender and displaced coincide, which is exactly the pre-replication
-/// behavior), or neither. There's no need to compare more than a pre-join
-/// ring. Transfers each such entry via an ordinary `SET` (reusing the
-/// client protocol, not a new one), marks it migrated, and once done
-/// reports `C` to discovery.
+/// per affected key exactly one role can apply to the node displaced from
+/// rank R to R+1 (if any — there is at most one): its now-dead copy is
+/// marked for the post-handoff sweep. This node may hold that role, or
+/// not, independently of whether it sends.
+///
+/// Issue #266: **every** pre-join owner of an affected key that actually
+/// holds it sends its copy to the joiner — not just a single designated
+/// "old primary". That used to be safe to optimize away (client writes
+/// fan out to every owner, so all owners were assumed equally
+/// up to date) until re-replication-after-eviction made it possible for
+/// an old owner to be a *ring-computed* owner without actually holding
+/// live data yet (a promotion whose re-replication hasn't caught up).
+/// Electing only the primary to send then risked a silent no-op — the
+/// primary's `peek_entry` comes back empty, nothing is transferred, and
+/// the *other* old owner (who does hold the real copy) gets marked
+/// displaced and swept anyway, destroying the only copy. Every owner
+/// sending instead means the joiner gets a copy as long as *any* old
+/// owner still has one. Sent as a put-if-absent `U … A`
+/// (`ForwardedWrite::HandoffSet`'s `if_absent`), not a plain `SET`, since
+/// more than one node may now send the same key: idempotent, so a
+/// redundant send from a second holder — or a concurrent client write
+/// racing the same joiner on the shared forwarding connection
+/// (`migration_target_for`, still an unconditional `SET` there since a
+/// live write is always the freshest) — never clobbers whichever arrives
+/// first; every one is still acked `S\n`. A displaced holder marks its
+/// copy dead only *after* its own send here actually succeeds — not
+/// merely because ring math says it's displaced — so a holder that
+/// failed to send (or never had the data to begin with) never has
+/// something reclaimed out from under a copy the joiner never received.
+/// There's no need to compare more than a pre-join ring.
 ///
 /// All transfers for one migration share a single connection to the
 /// joining node instead of opening (and tearing down) one per key —
@@ -3756,6 +3995,10 @@ async fn run_migration(
     after_ring: Arc<HashRing>,
     migration_guard: MigrationGuard,
     keys: Option<Vec<Key>>,
+    // Issue #266: the `M`'s own roster addresses (`joined`), plus the
+    // joiner's own — reused by this function's own join-flip
+    // re-replication trigger below instead of a fresh `L` fetch.
+    addresses: HashMap<String, String>,
 ) {
     println!("INFO migration started: handoff to {joining_name} at {joining_addr}");
 
@@ -3766,6 +4009,12 @@ async fn run_migration(
             return;
         }
     };
+
+    // Issue #266: a re-replication from an earlier ring change may still
+    // be delivering a copy this migration is about to mark dead (see
+    // `wait_for_rereplication_to_clear`'s own doc comment) — wait for it
+    // to clear before this handoff starts moving/marking anything.
+    wait_for_rereplication_to_clear(&node_context).await;
 
     let mut marked_this_run = Vec::new();
     let mut sent_count = 0usize;
@@ -3784,22 +4033,18 @@ async fn run_migration(
             continue;
         }
 
-        let old_owners = before_ring.owners(&key, replication);
-        // Client-side replication: the old primary is the one designated sender.
-        let sends = old_owners.first() == Some(&self_name);
-        // The (at most one) node the joiner displaced from rank R: its
-        // copy is dead once the join completes — mark it for the sweep,
-        // whether or not this node also happens to be the sender.
-        let displaced =
-            old_owners.contains(&self_name) && !after_ring.is_owner(&key, self_name, replication);
-
-        if !sends {
-            if displaced {
-                mark_migrated(&node_context.request_tx, &key).await;
-                marked_this_run.push(key);
-            }
+        // Issue #266: every old owner that holds this key sends it — see
+        // this function's own doc comment for why electing just one
+        // ("the old primary") is no longer safe. A key this node was
+        // never an old owner of is neither this node's to send nor to
+        // mark: skip it outright.
+        if !before_ring.is_owner(&key, self_name, replication) {
             continue;
         }
+        // The (at most one) node the joiner displaced from rank R: its
+        // copy is dead once the join completes — marked for the sweep
+        // below, but only once this node's own send actually succeeds.
+        let displaced = !after_ring.is_owner(&key, self_name, replication);
 
         // Re-checked live rather than trusting `entries()`'s snapshot: a
         // concurrent client write racing this key's turn (see
@@ -3831,10 +4076,11 @@ async fn run_migration(
             &node_context,
             &joining_addr,
             &mut stream,
-            ForwardedWrite::Set {
+            ForwardedWrite::HandoffSet {
                 key: &key,
                 value: &value,
                 ttl,
+                if_absent: true,
             },
         )
         .await;
@@ -3877,7 +4123,10 @@ async fn run_migration(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.replace(Arc::new(Membership {
-            ring: after_ring,
+            // Cloned, not moved: this function's own join-flip
+            // re-replication trigger (issue #266, below) needs
+            // `after_ring` again once the migration is done.
+            ring: Arc::clone(&after_ring),
             replication,
         }))
     };
@@ -3904,7 +4153,9 @@ async fn run_migration(
         return;
     }
 
-    migration_guard.completed(sent_count, marked_this_run, pre_completion_ring);
+    // Cloned, not moved: this function's own join-flip re-replication
+    // trigger (issue #266, below) needs `pre_completion_ring` again too.
+    migration_guard.completed(sent_count, marked_this_run, pre_completion_ring.clone());
 
     // ... and one more drain after the stamp catches a clear that slipped
     // in between: `route_clear` queues only while `completed_at` is
@@ -3924,6 +4175,46 @@ async fn run_migration(
             "WARN migration to {joining_addr} finished but reporting completion to {} failed: {error}",
             node_context.discovery_addr
         );
+    }
+
+    // Issue #266: the flip above may have silently absorbed an eviction
+    // this node's own `known_ring` hadn't caught up to yet — a
+    // restart+rejoin can outrace this node's next heartbeat ack, so
+    // `before_ring` (computed from the `M` itself, which only ever
+    // reflects discovery's *current*, already-post-eviction roster)
+    // never saw it either. Left alone, that eviction's promotion would
+    // never re-replicate: `known_ring` jumps straight from this node's
+    // stale pre-eviction belief to the post-join ring, so the next
+    // heartbeat ack matches it exactly and `adopt_membership` reports no
+    // change. Compare this node's own *last* belief (`pre_completion_ring`,
+    // which may still list the dead member) against the post-join ring
+    // instead, and trigger the same re-replication an eviction would
+    // have if it dropped one. Deliberately after `report_complete`
+    // above: this must never delay the `C` report, and by this point the
+    // migration is unambiguously done. `addresses` reuses what the `M`
+    // already carried (plus the joiner's own) rather than a fresh `L`
+    // fetch, and goes through the same channel/supersede/shutdown
+    // machinery as an eviction-triggered run — see
+    // `run_superseding_rereplication`'s doc comment.
+    if let Some(previous_membership) = pre_completion_ring {
+        let previous_ring = Arc::clone(&previous_membership.ring);
+        if ring_dropped_a_member(&previous_ring, &after_ring) {
+            let task: RereplicationTask = Box::pin(run_superseding_rereplication(
+                node_context.clone(),
+                previous_ring,
+                Arc::clone(&after_ring),
+                replication,
+                addresses,
+                node_context.shutdown_rx.clone(),
+            ));
+            if node_context.rereplication_tx.send(task).await.is_err() {
+                eprintln!(
+                    "WARN re-replication: could not queue the join-flip task (shutting down); \
+                     a later ring change will retrigger it if the cluster is still \
+                     under-replicated"
+                );
+            }
+        }
     }
 }
 
@@ -3994,16 +4285,24 @@ async fn transfer_with_retries(
                     "outbound clear timed out",
                 ))
             }),
-            // The join bulk path never carries these (they're the
-            // decommission's leave-forwards, which go through
-            // `forward_on_shared_connection`); handled for
-            // exhaustiveness with the same bounded send.
-            ForwardedWrite::HandoffSet { key, value, ttl } => timeout(
+            // Issue #266: `run_migration`'s own bulk transfer carries
+            // this too now (`if_absent: true`), alongside the
+            // decommission's leave-forwards (`if_absent: false`, which go
+            // through `forward_on_shared_connection` instead of this
+            // function — this arm exists for exhaustiveness on that
+            // side).
+            ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+            } => timeout(
                 OUTBOUND_IO_TIMEOUT,
                 ForwardedWrite::HandoffSet {
                     key,
                     value,
                     ttl: *ttl,
+                    if_absent: *if_absent,
                 }
                 .send(active_stream),
             )
@@ -4281,7 +4580,7 @@ async fn run_decommission(
             let Some(stream) = streams.get_mut(addr) else {
                 continue;
             };
-            match send_handoff_set(stream, &key, &value, ttl).await {
+            match send_handoff_set(stream, &key, &value, ttl, false).await {
                 Ok(()) => {
                     delivered = true;
                     break;
@@ -4358,8 +4657,12 @@ async fn send_leave(node_context: &NodeContext, discovery_addrs: &[String]) {
 }
 
 /// The `U` frame (issue #124) — `set_message`'s shape with the handoff
-/// letter and the namespace length always present.
-fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
+/// letter and the namespace length always present. `if_absent` (issue
+/// #266) appends the trailing `A` token that asks the receiver for
+/// put-if-absent semantics instead of an unconditional overwrite — set by
+/// re-replication after an eviction, never by an ordinary decommission
+/// handoff (`send_handoff_set`'s callers pass `false`).
+fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>, if_absent: bool) -> Vec<u8> {
     let mut header = format!(
         "U {} {} {}",
         key.namespace.len(),
@@ -4368,6 +4671,9 @@ fn handoff_message(key: &Key, value: &[u8], ttl: Option<Duration>) -> Vec<u8> {
     );
     if let Some(ttl) = ttl {
         header.push_str(&format!(" {}", ttl.as_secs()));
+    }
+    if if_absent {
+        header.push_str(" A");
     }
     header.push('\n');
     let mut message = header.into_bytes();
@@ -4391,9 +4697,12 @@ async fn send_handoff_set(
     key: &Key,
     value: &[u8],
     ttl: Option<Duration>,
+    if_absent: bool,
 ) -> io::Result<()> {
     timeout(OUTBOUND_IO_TIMEOUT, async {
-        stream.write_all(&handoff_message(key, value, ttl)).await?;
+        stream
+            .write_all(&handoff_message(key, value, ttl, if_absent))
+            .await?;
         let mut ack = [0u8; 2];
         stream.read_exact(&mut ack).await?;
         if &ack != b"S\n" {
@@ -4507,6 +4816,372 @@ async fn fetch_roster_once(
     }
 
     Ok((members, replication))
+}
+
+/// Issue #266: how long `run_migration` waits for an in-flight
+/// re-replication to clear before it starts marking dead copies, and how
+/// long a re-replication waits for an in-flight join migration to
+/// complete before it starts sending — see both functions' doc comments.
+/// Generous relative to a single handoff's own transfer time (this is a
+/// last-resort bound, not the expected wait) since giving up early
+/// defeats the point of waiting at all; either side proceeding anyway
+/// after this elapses just means one more, slightly-late ring-change
+/// cycle to reconcile, not lost data.
+const RING_CHANGE_HANDOFF_WAIT: Duration = Duration::from_secs(60);
+
+/// Issue #266: bounded wait for `node_context.active_rereplication` to
+/// clear, so `run_migration` doesn't mark a copy dead (releasing it to
+/// the sweep) that a re-replication in flight has not yet delivered to
+/// the ring's newly promoted owner — the two would otherwise race to
+/// leave that key on only the joiner, exactly the under-replication this
+/// issue exists to close. Not shutdown-aware, unlike `run_rereplication`
+/// itself: this runs inside an already-bounded handoff (`run_migration`),
+/// not a background task of its own, so it has nothing better to do
+/// while shutdown is pending than keep waiting out its own bound.
+async fn wait_for_rereplication_to_clear(node_context: &NodeContext) {
+    let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
+    loop {
+        let busy = node_context
+            .active_rereplication
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if !busy {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "WARN migration: a re-replication was still in flight after {}s; proceeding \
+                 anyway",
+                RING_CHANGE_HANDOFF_WAIT.as_secs()
+            );
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Issue #266: the mirror wait, on the re-replication side — a join
+/// migration in flight is about to change `known_ring` again (and,
+/// symmetrically, may itself want to mark this node's copy dead once it
+/// completes), so a re-replication computed against the ring as it stood
+/// a moment ago waits for the migration to finish rather than racing it
+/// with a stale before/after pair.
+///
+/// "In flight" means still transferring — `completed_at.is_none()`, the
+/// same check `run_decommission`'s own abort-wait loop uses — not merely
+/// "the slot is occupied": a completed handoff's slot stays `Some` for
+/// its whole `forwarding_grace` afterglow (up to ~100s for a large
+/// transfer, comfortably longer than this wait's own bound), and that
+/// window has nothing left to race — `known_ring` already flipped to
+/// `after_ring` the moment the transfer finished. Treating the slot's
+/// mere presence as "busy" made this wait time out on essentially every
+/// call shortly after any join, for no reason.
+async fn wait_for_migration_to_clear(node_context: &NodeContext) {
+    let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
+    loop {
+        let busy = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|active| active.completed_at.is_none());
+        if !busy {
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "WARN re-replication: a join migration was still in flight after {}s; \
+                 proceeding with the ring as adopted",
+                RING_CHANGE_HANDOFF_WAIT.as_secs()
+            );
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Issue #266: which addresses (empty if none) this node must
+/// re-replicate `key` to after a ring change dropped at least one
+/// member — pure so the sender-election + target computation has a fast
+/// unit test that needs no network harness, mirroring
+/// `classify_decommission_key` for the decommission's own transfer loop.
+///
+/// Sender election: of `key`'s owners under `before`, only the
+/// highest-ranked one that is still a member of `after` sends — the
+/// evicted node's own rank (if it held one) simply drops out of
+/// consideration, so the next-ranked survivor takes over the "first old
+/// owner sends" rule `run_migration` uses for a join. `self_name` must
+/// itself be an owner under `before`, or this returns empty without even
+/// looking for a sender (nothing to elect if this node wasn't an owner
+/// to begin with).
+///
+/// Targets: `after`'s owners minus `before`'s — the ranks this ring
+/// change newly promoted into `key`'s top-R. A survivor that was already
+/// an owner stays one (removing one node from an HRW ranking can only
+/// ever promote others, never demote a survivor — see the ranking's own
+/// properties), so this never needs to ask "did I just lose ownership":
+/// unlike a join, a re-replication never marks anything dead.
+fn rereplication_targets(
+    before: &HashRing,
+    after: &HashRing,
+    key: &Key,
+    replication: usize,
+    self_name: &str,
+) -> Vec<String> {
+    if !before.is_owner(key, self_name, replication) {
+        return Vec::new();
+    }
+
+    let old_owners = before.owners(key, replication);
+    let after_nodes = after.nodes();
+
+    let mut sender = None;
+    for owner in old_owners.iter().copied() {
+        if after_nodes.iter().any(|node| node.as_str() == owner) {
+            sender = Some(owner);
+            break;
+        }
+    }
+    if sender != Some(self_name) {
+        return Vec::new();
+    }
+
+    after
+        .owners(key, replication)
+        .into_iter()
+        .filter(|owner| !old_owners.contains(owner))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Issue #266: shared core for both re-replication trigger sites —
+/// supersedes (aborts, then waits briefly for) any re-replication
+/// already in flight for an earlier ring change (at most one runs at a
+/// time per node, so two runs can never interleave their sends),
+/// installs a fresh `ActiveRereplication` slot, runs `run_rereplication`
+/// against the given ring change and address map, then clears the slot
+/// (if a later ring change hasn't already claimed it). Takes everything
+/// by value so it can be boxed as a `RereplicationTask` and hand off
+/// through `NodeContext::rereplication_tx` — see that field's doc
+/// comment on why every producer goes through the same channel into
+/// `send_heartbeats`'s `JoinSet` rather than spawning directly.
+///
+/// Two callers: `spawn_or_supersede_rereplication` (an eviction-driven
+/// ring change — fetches the address map itself via `L`, and waits out
+/// any join migration in progress first) and `run_migration`'s own
+/// join-flip trigger (which already has the addresses from the `M` it
+/// just handled, plus the joiner's own, and runs only after its own
+/// transfer has completed — so neither of those two steps applies there).
+async fn run_superseding_rereplication(
+    node_context: NodeContext,
+    before_ring: Arc<HashRing>,
+    after_ring: Arc<HashRing>,
+    replication: usize,
+    addresses: HashMap<String, String>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let previous = node_context
+        .active_rereplication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(previous) = previous {
+        previous.abort_requested.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
+        while !previous.done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    let state = Arc::new(ActiveRereplication {
+        abort_requested: AtomicBool::new(false),
+        done: AtomicBool::new(false),
+    });
+    *node_context
+        .active_rereplication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
+
+    run_rereplication(
+        &node_context,
+        &before_ring,
+        &after_ring,
+        replication,
+        &addresses,
+        &state.abort_requested,
+        &mut shutdown_rx,
+    )
+    .await;
+
+    state.done.store(true, Ordering::SeqCst);
+    let mut slot = node_context
+        .active_rereplication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &state))
+    {
+        *slot = None;
+    }
+}
+
+/// Issue #266: the task `register_with_discovery` hands to
+/// `send_heartbeats`'s `JoinSet` when `adopt_membership` reports a ring
+/// change that dropped a member. Fetches the roster with addresses (the
+/// heartbeat ack carries names only) and waits out any join migration in
+/// progress (`wait_for_migration_to_clear`) before handing off to
+/// `run_superseding_rereplication` for the rest.
+async fn spawn_or_supersede_rereplication(
+    node_context: NodeContext,
+    discovery_addr: String,
+    before_ring: Arc<HashRing>,
+    after: Arc<Membership>,
+    shutdown_rx: watch::Receiver<bool>,
+) {
+    let addresses: HashMap<String, String> = match timeout(
+        OUTBOUND_IO_TIMEOUT,
+        fetch_roster_once(&node_context, &discovery_addr),
+    )
+    .await
+    {
+        Ok(Ok((members, _replication))) => members.into_iter().collect(),
+        Ok(Err(error)) => {
+            eprintln!(
+                "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
+                 failed: {error} — giving up; a later ring change will retrigger it if the \
+                 cluster is still under-replicated"
+            );
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
+                 timed out — giving up; a later ring change will retrigger it if the cluster is \
+                 still under-replicated"
+            );
+            return;
+        }
+    };
+
+    wait_for_migration_to_clear(&node_context).await;
+
+    let after_ring = Arc::clone(&after.ring);
+    run_superseding_rereplication(
+        node_context,
+        before_ring,
+        after_ring,
+        after.replication,
+        addresses,
+        shutdown_rx,
+    )
+    .await;
+}
+
+/// Issue #266: after a ring change dropped a member, streams every key
+/// this node is the elected sender for (`rereplication_targets`) to the
+/// owner(s) the change newly promoted — mirrors `run_decommission`'s
+/// handoff loop, with one shared, reused connection per target address,
+/// sent as a put-if-absent `U … A` (`send_handoff_set`'s `if_absent`) so
+/// this can never regress a newer client write that raced it. Returns
+/// once every key has been considered, `abort_requested` is set (a
+/// superseding ring change), or shutdown lands.
+async fn run_rereplication(
+    node_context: &NodeContext,
+    before_ring: &HashRing,
+    after_ring: &HashRing,
+    replication: usize,
+    addresses: &HashMap<String, String>,
+    abort_requested: &AtomicBool,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let Some(keys) = list_keys(&node_context.request_tx).await else {
+        eprintln!("WARN re-replication: cache task is unavailable");
+        return;
+    };
+
+    let self_name = node_context.name.as_str();
+    let mut streams: HashMap<String, ClientStream> = HashMap::new();
+    let mut sent = 0usize;
+    let mut skipped = 0usize;
+    let mut owners_reached: HashSet<String> = HashSet::new();
+
+    for key in keys {
+        if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+            break;
+        }
+
+        let targets = rereplication_targets(before_ring, after_ring, &key, replication, self_name);
+        if targets.is_empty() {
+            continue;
+        }
+
+        // Live re-peek, same reasoning as the join transfer and the
+        // decommission's own: a concurrent client write must win over
+        // whatever this snapshot held.
+        let Some((_, value, ttl)) = peek_entry(&node_context.request_tx, &key).await else {
+            continue;
+        };
+
+        for target in targets {
+            let Some(addr) = addresses.get(&target) else {
+                skipped += 1;
+                continue;
+            };
+
+            let mut delivered = false;
+            for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+                if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                    break;
+                }
+                if !streams.contains_key(addr) {
+                    match connect_and_authenticate(node_context, addr, AuthPeer::Node).await {
+                        Ok(stream) => {
+                            streams.insert(addr.clone(), stream);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "WARN re-replication: connecting to {addr} failed (attempt \
+                                 {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let Some(stream) = streams.get_mut(addr) else {
+                    continue;
+                };
+                match send_handoff_set(stream, &key, &value, ttl, true).await {
+                    Ok(()) => {
+                        delivered = true;
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "WARN re-replication: transfer to {addr} failed (attempt \
+                             {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                        );
+                        streams.remove(addr);
+                    }
+                }
+            }
+
+            if delivered {
+                sent += 1;
+                owners_reached.insert(target);
+            } else {
+                skipped += 1;
+            }
+        }
+    }
+
+    println!(
+        "INFO re-replication after membership change: sent {sent} entries to {} owner(s) ({} \
+         skipped)",
+        owners_reached.len(),
+        skipped
+    );
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
@@ -4853,11 +5528,18 @@ enum ForwardedWrite<'a> {
     /// Issue #124: the decommission's forwarded write — a `U` frame
     /// rather than a plain `S`, because until discovery publishes the
     /// post-leave roster the receiving entrant doesn't own the key yet
-    /// and would answer a plain `S` with `W`.
+    /// and would answer a plain `S` with `W`. Also (issue #266) how
+    /// `run_migration`'s own bulk transfer sends a key to the joiner:
+    /// `if_absent` is `true` there (every old owner that holds the key
+    /// sends it, so more than one send for the same key is now possible
+    /// and must not clobber whichever arrives first — see
+    /// `run_migration`'s doc comment) and always `false` for the
+    /// decommission's unconditional handoff.
     HandoffSet {
         key: &'a Key,
         value: &'a [u8],
         ttl: Option<Duration>,
+        if_absent: bool,
     },
     /// Issue #124: the decommission's forwarded delete (`u`), same
     /// wrong-node reasoning as `HandoffSet`.
@@ -4904,8 +5586,15 @@ impl ForwardedWrite<'_> {
     async fn send(self, stream: &mut ClientStream) -> io::Result<()> {
         match self {
             ForwardedWrite::Set { key, value, ttl } => send_set(stream, key, value, ttl).await,
-            ForwardedWrite::HandoffSet { key, value, ttl } => {
-                stream.write_all(&handoff_message(key, value, ttl)).await?;
+            ForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+            } => {
+                stream
+                    .write_all(&handoff_message(key, value, ttl, if_absent))
+                    .await?;
 
                 let mut ack = [0u8; 2];
                 stream.read_exact(&mut ack).await?;
@@ -5018,6 +5707,9 @@ impl OwnedForwardedWrite {
                         key,
                         value,
                         ttl: *ttl,
+                        // A concurrent client write must win unconditionally —
+                        // see `ForwardedWrite::HandoffSet`'s own doc comment.
+                        if_absent: false,
                     },
                 )
                 .await
@@ -5701,6 +6393,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let target = ForwardTarget {
@@ -5784,6 +6479,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         // Exactly what `migration_target_for` would hand every concurrent
@@ -5859,6 +6557,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         });
         let target = Arc::new(ForwardTarget {
             addr: joining_addr,
@@ -5930,6 +6631,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let target = ForwardTarget {
@@ -6029,6 +6733,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         // A dedicated forward channel, deliberately tiny (capacity 2) and
@@ -6163,6 +6870,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         // Capacity 1, occupied by an inert filler that's never polled —
@@ -7358,6 +8068,9 @@ mod tests {
             tls_connector: None,
             request_tx: mpsc::channel(1).0,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
         let scope = ClearScope::Namespace(Bytes::from_static(b"users"));
 
@@ -7432,14 +8145,21 @@ mod tests {
                     continue;
                 };
                 let header = String::from_utf8(buffer[..header_end].to_vec()).unwrap();
+                // Issue #266: `U`'s optional trailing `A` (put-if-absent)
+                // isn't a length field — skip it rather than fail to
+                // parse it as one.
                 let fields: Vec<usize> = header
                     .split(' ')
                     .skip(1)
+                    .filter(|field| *field != "A")
                     .map(|field| field.parse().unwrap())
                     .collect();
                 let (body_length, ack): (usize, &[u8]) = match header.as_bytes()[0] {
                     b'S' => (fields[0] + fields[1], b"S\n"),
                     b's' => (fields[0] + fields[1] + fields[2], b"S\n"),
+                    // Issue #266: `run_migration`'s own bulk transfer,
+                    // sent as a put-if-absent handoff.
+                    b'U' => (fields[0] + fields[1] + fields[2], b"S\n"),
                     b'c' => (fields[0], b"C\n"),
                     b'F' => (0, b"C\n"),
                     other => panic!("unexpected frame {other}"),
@@ -7509,6 +8229,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
@@ -7548,13 +8271,16 @@ mod tests {
             after_ring,
             migration_guard,
             keys,
+            HashMap::new(),
         )
         .await;
 
         let frames = frames.lock().unwrap().clone();
         assert_eq!(frames[0], b"c 5\nusers".to_vec(), "the clear goes first");
         assert_eq!(frames.len(), 1 + expected_keys);
-        assert!(frames[1..].iter().all(|frame| frame.starts_with(b"s 5 ")));
+        // Issue #266: `run_migration`'s own bulk transfer sends a `U`
+        // (put-if-absent), not a lowercase `s`.
+        assert!(frames[1..].iter().all(|frame| frame.starts_with(b"U 5 ")));
 
         // Once completed, a clear forwards like a concurrent write.
         assert!(matches!(
@@ -7603,6 +8329,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let connection_task = tokio::spawn(handle_connection(
@@ -7661,6 +8390,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let connection_task = tokio::spawn(handle_connection(
@@ -7759,6 +8491,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -7871,6 +8606,9 @@ mod tests {
                 addresses,
                 connections: Mutex::new(HashMap::new()),
             }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let (mut client, server) = tcp_pair().await;
@@ -7979,6 +8717,151 @@ mod tests {
     }
 
     #[test]
+    fn rereplication_targets_are_new_owners_only_for_the_elected_sender() {
+        // Issue #266: a 4-member ring loses "node-b" (an eviction, or a
+        // leave this node didn't hand off for). For every key, checked
+        // from "node-a"'s point of view against an independent reference
+        // computation of the same election rule.
+        let names = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+            "node-d".to_string(),
+        ];
+        let before = HashRing::new(names.clone());
+        let after = HashRing::new(
+            names
+                .iter()
+                .filter(|name| *name != "node-b")
+                .cloned()
+                .collect(),
+        );
+        let replication = 2;
+
+        let mut nonempty = 0;
+        for index in 0..500 {
+            let key = key(format!("key-{index}").as_bytes());
+            let old_owners = before.owners(&key, replication);
+            let owned_before = old_owners.contains(&"node-a");
+
+            // Reference: the highest-ranked old owner that survived.
+            let elected_sender = old_owners
+                .iter()
+                .find(|owner| after.nodes().iter().any(|node| node == *owner))
+                .copied();
+
+            let targets = rereplication_targets(&before, &after, &key, replication, "node-a");
+
+            if !owned_before || elected_sender != Some("node-a") {
+                assert!(
+                    targets.is_empty(),
+                    "key-{index}: expected no targets (owned={owned_before}, \
+                     sender={elected_sender:?}), got {targets:?}"
+                );
+                continue;
+            }
+
+            let new_owners = after.owners(&key, replication);
+            let expected: Vec<String> = new_owners
+                .iter()
+                .filter(|owner| !old_owners.contains(owner))
+                .map(|owner| owner.to_string())
+                .collect();
+            assert_eq!(targets, expected, "key-{index}");
+            for target in &targets {
+                assert!(after.is_owner(&key, target, replication));
+                assert!(!before.is_owner(&key, target, replication));
+                nonempty += 1;
+            }
+        }
+        assert!(nonempty > 0, "the sample must exercise at least one send");
+    }
+
+    #[test]
+    fn rereplication_targets_promotes_the_next_ranked_survivor_when_the_top_owner_is_evicted() {
+        // Issue #266 regression guard: sender election must skip the
+        // evicted node's own rank and elect the next-ranked *surviving*
+        // old owner — not just `old_owners.first()` (the rule a join
+        // handoff uses, where the joiner never displaces the sender).
+        // Finds a key whose pre-eviction top owner is exactly the node
+        // being evicted and "node-a" is next, then checks "node-a" is
+        // still elected sender despite not being rank 1 beforehand.
+        let names = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ];
+        let before = HashRing::new(names.clone());
+        let after = HashRing::new(
+            names
+                .iter()
+                .filter(|name| *name != "node-b")
+                .cloned()
+                .collect(),
+        );
+        let replication = 2;
+
+        let mut found = false;
+        for index in 0..500 {
+            let key = key(format!("key-{index}").as_bytes());
+            let old_owners = before.owners(&key, replication);
+            if old_owners.first() != Some(&"node-b") || !old_owners.contains(&"node-a") {
+                continue;
+            }
+            found = true;
+
+            let targets = rereplication_targets(&before, &after, &key, replication, "node-a");
+            assert!(
+                !targets.is_empty(),
+                "key-{index}: node-a should have been elected sender after node-b (rank 1) \
+                 was evicted"
+            );
+            break;
+        }
+        assert!(
+            found,
+            "the sample must contain a key with node-b ranked above node-a"
+        );
+    }
+
+    #[test]
+    fn ring_dropped_a_member_detects_a_dead_member_absent_from_after() {
+        // Issue #266: `run_migration`'s own join-flip trigger compares
+        // this node's *last* belief (which may still list a member
+        // discovery already evicted — a restart+rejoin outracing this
+        // node's next heartbeat ack) against the post-join ring, not the
+        // `M`'s own before_ring (which never had a chance to see that
+        // eviction at all — it's built from discovery's *current*,
+        // already-post-eviction roster).
+        let before = HashRing::new(vec![
+            "dead".to_string(),
+            "node-x".to_string(),
+            "node-y".to_string(),
+        ]);
+
+        // A pure join (no drop): the joiner is a strict superset.
+        let after_pure_join = HashRing::new(vec![
+            "dead".to_string(),
+            "node-x".to_string(),
+            "node-y".to_string(),
+            "joiner".to_string(),
+        ]);
+        assert!(!ring_dropped_a_member(&before, &after_pure_join));
+
+        // The eviction was folded into the same flip as the join: "dead"
+        // is gone, "joiner" is new.
+        let after_join_and_eviction = HashRing::new(vec![
+            "node-x".to_string(),
+            "node-y".to_string(),
+            "joiner".to_string(),
+        ]);
+        assert!(ring_dropped_a_member(&before, &after_join_and_eviction));
+
+        // Identical membership: no change either way.
+        assert!(!ring_dropped_a_member(&before, &before));
+    }
+
+    #[test]
     fn a_classify_decommission_key_filters_ownership_before_deadline() {
         // Issue #233: a key this node never owned must classify as
         // `NotOwned` even once the deadline has passed — not
@@ -8058,6 +8941,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         // R=1 over {leaver, peer}: every key the leaver owns must move
@@ -8236,6 +9122,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
@@ -8349,13 +9238,16 @@ mod tests {
         // Chosen (ready-node / other-node / joiner-0, R=2) so both
         // Client-side replication roles land on this node at once:
         //   "key-0": pre-join top-2 = [ready-node, other-node]; joiner-0
-        //            enters and displaces other-node — ready-node is the
-        //            designated sender and STAYS an owner, so it must
-        //            transfer the key and keep its own copy unmarked.
+        //            enters and displaces other-node — ready-node STAYS
+        //            an owner, so it sends the key and keeps its own
+        //            copy unmarked.
         //   "key-3": pre-join top-2 = [other-node, ready-node]; joiner-0
-        //            enters and displaces ready-node, which is NOT the
-        //            sender — no transfer, but its now-dead copy must be
-        //            marked so the post-handoff sweep reclaims it.
+        //            enters and displaces ready-node. Issue #266:
+        //            ready-node is still an old owner that holds the
+        //            key, so it sends it too (every holding old owner
+        //            sends now, not just the pre-join primary) — and,
+        //            since its own send succeeds, marks its now-dead
+        //            copy for the post-handoff sweep.
         send_command(
             &request_tx,
             Command::Set {
@@ -8375,7 +9267,8 @@ mod tests {
         )
         .await;
 
-        // Fake joining node: must receive exactly one SET (for "key-0").
+        // Fake joining node: must receive both keys, on the one shared
+        // connection (issue #266: ready-node is an old owner of both now).
         let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let joining_addr = joining_listener.local_addr().unwrap().to_string();
         let joining_received: Arc<std::sync::Mutex<Vec<u8>>> =
@@ -8383,13 +9276,15 @@ mod tests {
         let joining_received_task = Arc::clone(&joining_received);
         let joining_task = tokio::spawn(async move {
             let (mut connection, _) = joining_listener.accept().await.unwrap();
-            let mut buffer = [0u8; 256];
-            let bytes_read = connection.read(&mut buffer).await.unwrap();
-            joining_received_task
-                .lock()
-                .unwrap()
-                .extend_from_slice(&buffer[..bytes_read]);
-            connection.write_all(b"S\n").await.unwrap();
+            for _ in 0..2 {
+                let mut buffer = [0u8; 256];
+                let bytes_read = connection.read(&mut buffer).await.unwrap();
+                joining_received_task
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..bytes_read]);
+                connection.write_all(b"S\n").await.unwrap();
+            }
         });
 
         // Fake discovery: expects the C completion report.
@@ -8412,6 +9307,9 @@ mod tests {
             tls_connector: None,
             request_tx: request_tx.clone(),
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         let joined = vec![
@@ -8442,13 +9340,28 @@ mod tests {
             after_ring,
             migration_guard,
             keys,
+            HashMap::new(),
         )
         .await;
 
-        // The joiner got exactly the sender's key, nothing else.
-        assert_eq!(
-            *joining_received.lock().unwrap(),
-            set_message(&key(b"key-0"), b"primary-copy", None)
+        // The joiner got both keys, each as a put-if-absent handoff
+        // (issue #266) — in whatever order `list_keys` happened to
+        // return them, so checked as independent substrings rather than
+        // one fixed concatenation.
+        let expected_key0 = handoff_message(&key(b"key-0"), b"primary-copy", None, true);
+        let expected_key3 = handoff_message(&key(b"key-3"), b"replica-copy", None, true);
+        let received = joining_received.lock().unwrap().clone();
+        assert!(
+            received
+                .windows(expected_key0.len())
+                .any(|window| window == expected_key0.as_slice()),
+            "expected the joining node to receive \"key-0\", got {received:?}"
+        );
+        assert!(
+            received
+                .windows(expected_key3.len())
+                .any(|window| window == expected_key3.as_slice()),
+            "expected the joining node to receive \"key-3\", got {received:?}"
         );
 
         // The displaced copy — and only it — is reclaimed by the sweep.
@@ -8536,6 +9449,202 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_m_that_flips_a_known_ring_still_listing_an_evicted_member_triggers_rereplication() {
+        // Issue #266 end to end: this node ("node-x")'s own `known_ring`
+        // still lists "dead-node" (its next heartbeat ack hasn't caught
+        // up to the eviction yet — a restart+rejoin can outrace it), but
+        // the incoming `M`'s own roster (`joined`) is discovery's
+        // *current* view and already excludes it. For a key whose old
+        // owners (under the stale belief) were (dead-node, node-x) and
+        // whose new owners (under the post-join ring, excluding the
+        // joiner) are (node-x, node-y), node-x must re-replicate to
+        // node-y — the join's own before_ring/after_ring alone would
+        // never reveal that gap.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        const KEY_COUNT: u32 = 60;
+        for index in 0..KEY_COUNT {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let replication = 2;
+        let stale_belief = HashRing::new(vec![
+            "dead-node".to_string(),
+            "node-x".to_string(),
+            "node-y".to_string(),
+        ]);
+        let after_join = HashRing::new(vec![
+            "node-x".to_string(),
+            "node-y".to_string(),
+            "joiner-w".to_string(),
+        ]);
+        // Filtered to targets containing "node-y" specifically, not just
+        // "non-empty": for some keys the promoted owner is "joiner-w"
+        // itself rather than "node-y" (both are new members of
+        // `after_join`, and either can win a given key's promoted rank)
+        // — a real, valid outcome this test doesn't otherwise exercise
+        // (its fake joiner only expects run_migration's own bulk-transfer
+        // connection, see `spawn_recording_joiner`), so only the
+        // node-y-bound subset belongs in this assertion.
+        let expected_keys: Vec<Key> = (0..KEY_COUNT)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|key| {
+                rereplication_targets(&stale_belief, &after_join, key, replication, "node-x")
+                    .contains(&"node-y".to_string())
+            })
+            .collect();
+        assert!(
+            !expected_keys.is_empty(),
+            "the sample must contain at least one key node-x re-replicates to node-y"
+        );
+        assert!(
+            expected_keys.len() < KEY_COUNT as usize,
+            "the sample must also contain at least one key node-x does not re-replicate"
+        );
+
+        // node-y: records every `U … A` it receives.
+        let y_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let y_addr = y_listener.local_addr().unwrap().to_string();
+        let (y_frames, y_task) = spawn_rereplication_recording_peer(y_listener);
+
+        // joiner-w: the `M`'s own transfer target — content not checked
+        // here (that's `migrate_with_replication_marks_displaced_copies_
+        // and_keeps_the_senders`'s job), just drained so the transfer
+        // doesn't stall.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let (_joiner_frames, joining_task) = spawn_recording_joiner(joining_listener);
+
+        // Fake discovery: expects the `C` completion report.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let (rereplication_tx, mut rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+        let node_context = NodeContext {
+            name: "node-x".to_string(),
+            token: "tk-node-x".to_string(),
+            discovery_addr,
+            active_migration: Arc::new(Mutex::new(None)),
+            // This node's own (stale) belief — still lists "dead-node".
+            known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::new(stale_belief),
+                replication,
+            })))),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        // The `M`'s own roster: discovery's *current* view, which never
+        // included "dead-node" in the first place.
+        let joined = vec![
+            ("node-x".to_string(), "127.0.0.1:1".to_string()),
+            ("node-y".to_string(), y_addr.clone()),
+        ];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner-w", &joined);
+        let after_ring = Arc::new(after_ring);
+        assert_eq!(
+            after_ring.nodes().len(),
+            3,
+            "sanity: node-x, node-y, joiner-w"
+        );
+
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-w".to_string(),
+            joining_addr.clone(),
+            Arc::clone(&after_ring),
+            replication,
+            &joined,
+            &node_context.known_ring,
+        )
+        .unwrap_new();
+
+        let mut addresses: HashMap<String, String> = joined.into_iter().collect();
+        addresses.insert("joiner-w".to_string(), joining_addr.clone());
+
+        let keys = list_keys(&request_tx).await;
+
+        run_migration(
+            node_context.clone(),
+            "joiner-w".to_string(),
+            joining_addr,
+            replication,
+            before_ring,
+            after_ring,
+            migration_guard,
+            keys,
+            addresses,
+        )
+        .await;
+
+        // The join-flip trigger queued a re-replication task (issue
+        // #266) — run it inline rather than through a full
+        // `send_heartbeats`/`JoinSet`, exactly as `send_heartbeats`
+        // itself would.
+        let task = tokio::time::timeout(Duration::from_secs(5), rereplication_rx.recv())
+            .await
+            .expect("the join-flip trigger must queue a re-replication task")
+            .expect(
+                "the sender is still alive — node_context.clone() inside run_migration holds it",
+            );
+        task.await;
+
+        let frames = y_frames.lock().unwrap().clone();
+        let mut sent_keys: Vec<Key> = frames
+            .iter()
+            .map(|frame| {
+                let header_end = frame.iter().position(|byte| *byte == b'\n').unwrap();
+                let header = String::from_utf8(frame[..header_end].to_vec()).unwrap();
+                let mut fields = header.split(' ').skip(1);
+                let ns_len: usize = fields.next().unwrap().parse().unwrap();
+                let key_len: usize = fields.next().unwrap().parse().unwrap();
+                let body_start = header_end + 1;
+                Key::new(
+                    Bytes::copy_from_slice(&frame[body_start..body_start + ns_len]),
+                    Bytes::copy_from_slice(
+                        &frame[body_start + ns_len..body_start + ns_len + key_len],
+                    ),
+                )
+            })
+            .collect();
+        sent_keys.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut expected_sorted = expected_keys.clone();
+        expected_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(
+            sent_keys, expected_sorted,
+            "node-y should receive exactly the keys whose old owners were (dead-node, node-x) \
+             and whose post-join owners are (node-x, node-y)"
+        );
+
+        joining_task.abort();
+        y_task.abort();
+        discovery_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     // ── issue #93: abandon reverts known_ring ──────────────────────────
 
     /// A `NodeContext` (named "ready-node") whose `known_ring` currently
@@ -8595,6 +9704,9 @@ mod tests {
             tls_connector: None,
             request_tx,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
         (node_context, after_ring, pre_completion_ring)
     }
@@ -8818,6 +9930,9 @@ mod tests {
             tls_connector: None,
             request_tx,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
 
         *node_context.active_migration.lock().unwrap() = Some(ActiveMigration {
@@ -9027,6 +10142,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -9064,7 +10182,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let expected_set = set_message(&key(b"name"), b"Alice", None);
+        // Issue #266: run_migration's own bulk transfer now sends a
+        // put-if-absent `U … A`, not a plain `S` — see its doc comment.
+        let expected_set = handoff_message(&key(b"name"), b"Alice", None, true);
         assert_eq!(*joining_received.lock().unwrap(), expected_set);
         assert_eq!(
             *discovery_received.lock().unwrap(),
@@ -9146,6 +10266,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -9270,6 +10393,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -9314,7 +10440,9 @@ mod tests {
         );
 
         joining_task.await.unwrap();
-        let expected_set = set_message(&key(b"name"), b"Alice", None);
+        // Issue #266: run_migration's own bulk transfer now sends a
+        // put-if-absent `U … A`, not a plain `S` — see its doc comment.
+        let expected_set = handoff_message(&key(b"name"), b"Alice", None, true);
         assert_eq!(
             *joining_received.lock().unwrap(),
             expected_set,
@@ -9380,6 +10508,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -9544,6 +10675,9 @@ mod tests {
             tls_connector: None,
             request_tx,
             leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         };
         let mut stale = completed_forwarding_slot(&["dead"]);
         stale.completed_at = Some(Instant::now() - forwarding_grace(0) - Duration::from_secs(1));
@@ -9659,6 +10793,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -9809,6 +10946,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -9988,6 +11128,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -10023,8 +11166,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let expected_name = set_message(&key(b"name"), b"Alice", None);
-        let expected_age = set_message(&key(b"age"), b"30", None);
+        // Issue #266: run_migration's own bulk transfer now sends a
+        // put-if-absent `U … A`, not a plain `S` — see its doc comment.
+        let expected_name = handoff_message(&key(b"name"), b"Alice", None, true);
+        let expected_age = handoff_message(&key(b"age"), b"30", None, true);
         let received = joining_received.lock().unwrap().clone();
         assert!(
             received
@@ -10112,6 +11257,9 @@ mod tests {
                     tls_connector: None,
                     request_tx: request_tx.clone(),
                     leaving: Arc::new(Mutex::new(None)),
+                    active_rereplication: Arc::new(Mutex::new(None)),
+                    rereplication_tx: mpsc::channel(1).0,
+                    shutdown_rx: watch::channel(false).1,
                 }),
                 migration_tx,
                 forward_tx: mpsc::channel(1).0,
@@ -10205,6 +11353,17 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn send_heartbeats_stops_immediately_when_already_shut_down() {
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        // Explicit `let` + `drop`, not `mpsc::channel(4).1` inline: a
+        // discarded temporary in the argument list of a directly
+        // `.await`ed call lives until the `.await` completes (Rust's
+        // temporary-lifetime-extension rule for `f(..).await;`), so the
+        // sender half would stay alive for this whole call — keeping
+        // `rereplication_rx` open and `send_heartbeats` waiting on it
+        // forever, well past when `tasks` empties. Every other
+        // `send_heartbeats` test sidesteps this by wrapping the call in
+        // `tokio::spawn(..)`, which is never itself `.await`ed.
+        let (rereplication_tx, rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+        drop(rereplication_tx);
 
         send_heartbeats(
             HeartbeatConfig {
@@ -10214,10 +11373,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            rereplication_rx,
             shutdown_rx,
         )
         .await;
@@ -10268,10 +11430,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
@@ -10302,6 +11467,33 @@ mod tests {
             pre_completion_ring: None,
             pending_clears: Vec::new(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+
+    /// Issue #266: a minimal `NodeContext` for the `send_heartbeats`/
+    /// `register_with_discovery` tests below, none of which exercise a
+    /// ring change that drops a member (so `request_tx` — never actually
+    /// read by anything — is safe to leave dangling: no re-replication
+    /// task ever gets far enough to use it).
+    fn test_node_context(
+        name: &str,
+        token: &str,
+        known_ring: KnownRing,
+        active_migration: Arc<Mutex<Option<ActiveMigration>>>,
+    ) -> NodeContext {
+        NodeContext {
+            name: name.to_string(),
+            token: token.to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration,
+            known_ring,
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
         }
     }
 
@@ -10409,6 +11601,9 @@ mod tests {
                 tls_connector: None,
                 request_tx: mpsc::channel(1).0,
                 leaving: Arc::new(Mutex::new(None)),
+                active_rereplication: Arc::new(Mutex::new(None)),
+                rereplication_tx: mpsc::channel(1).0,
+                shutdown_rx: watch::channel(false).1,
             };
 
             let error = fetch_roster_once(&node_context, &discovery_addr)
@@ -10597,10 +11792,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::clone(&known_ring),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::clone(&known_ring),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
         sleep(Duration::from_millis(150)).await;
@@ -10618,6 +11816,385 @@ mod tests {
                 .any(|message| message.starts_with(b"H 9 3 12\n")),
             "expected a heartbeat reporting the adopted replication factor, got {received:?}"
         );
+    }
+
+    /// Issue #266: a fake discovery server serving both protocols
+    /// `spawn_or_supersede_rereplication` needs on the same listener — the
+    /// persistent `J`-then-`H` heartbeat connection (first ack names all
+    /// three members; every ack after that drops `evicted_name`,
+    /// simulating an eviction) and a one-shot `L` roster-with-addresses
+    /// fetch on a fresh connection.
+    fn spawn_heartbeat_and_roster_discovery(
+        listener: TcpListener,
+        self_name: &'static str,
+        survivor_name: &'static str,
+        survivor_addr: String,
+        evicted_name: &'static str,
+        replication: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut connection, _)) = listener.accept().await else {
+                    return;
+                };
+                let survivor_addr = survivor_addr.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+
+                    async fn read_line(
+                        connection: &mut TcpStream,
+                        buf: &mut Vec<u8>,
+                        chunk: &mut [u8],
+                    ) -> Option<String> {
+                        loop {
+                            if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
+                                let line = String::from_utf8(buf[..pos].to_vec()).ok()?;
+                                buf.drain(..=pos);
+                                return Some(line);
+                            }
+                            let bytes_read = connection.read(chunk).await.ok()?;
+                            if bytes_read == 0 {
+                                return None;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                    }
+
+                    async fn read_body(
+                        connection: &mut TcpStream,
+                        buf: &mut Vec<u8>,
+                        chunk: &mut [u8],
+                        len: usize,
+                    ) -> Option<()> {
+                        while buf.len() < len {
+                            let bytes_read = connection.read(chunk).await.ok()?;
+                            if bytes_read == 0 {
+                                return None;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        buf.drain(..len);
+                        Some(())
+                    }
+
+                    fn roster_response(members: &[(&str, &str)], replication: usize) -> Vec<u8> {
+                        let mut response =
+                            format!("N {} {replication}\n", members.len()).into_bytes();
+                        for (name, addr) in members {
+                            response.extend_from_slice(
+                                format!("{} {}\n", name.len(), addr.len()).as_bytes(),
+                            );
+                            response.extend_from_slice(name.as_bytes());
+                            response.extend_from_slice(addr.as_bytes());
+                            response.push(b'\n');
+                        }
+                        response
+                    }
+
+                    fn ack_response(members: &[(&str, &str)], replication: usize) -> Vec<u8> {
+                        let mut ack = format!("A {} {replication}\n", members.len()).into_bytes();
+                        for (name, addr) in members {
+                            ack.extend_from_slice(
+                                format!("{} {}\n", name.len(), addr.len()).as_bytes(),
+                            );
+                            ack.extend_from_slice(name.as_bytes());
+                            ack.extend_from_slice(addr.as_bytes());
+                            ack.push(b'\n');
+                        }
+                        ack
+                    }
+
+                    let Some(header) = read_line(&mut connection, &mut buf, &mut chunk).await
+                    else {
+                        return;
+                    };
+
+                    if header == "L" {
+                        let members = [
+                            (self_name, "127.0.0.1:1"),
+                            (survivor_name, survivor_addr.as_str()),
+                        ];
+                        let _ = connection
+                            .write_all(&roster_response(&members, replication))
+                            .await;
+                        return;
+                    }
+
+                    // "J <name-len> <port> <token-len>"
+                    let mut fields = header.split(' ');
+                    assert_eq!(fields.next(), Some("J"), "expected a J registration");
+                    let name_len: usize = fields.next().unwrap().parse().unwrap();
+                    let _port: usize = fields.next().unwrap().parse().unwrap();
+                    let token_len: usize = fields.next().unwrap().parse().unwrap();
+                    if read_body(&mut connection, &mut buf, &mut chunk, name_len + token_len)
+                        .await
+                        .is_none()
+                    {
+                        return;
+                    }
+                    if connection.write_all(b"R\n").await.is_err() {
+                        return;
+                    }
+
+                    let mut heartbeats = 0usize;
+                    loop {
+                        let Some(header) = read_line(&mut connection, &mut buf, &mut chunk).await
+                        else {
+                            return;
+                        };
+                        let mut fields = header.split(' ');
+                        assert_eq!(fields.next(), Some("H"), "expected an H heartbeat");
+                        let name_len: usize = fields.next().unwrap().parse().unwrap();
+                        let _replication_belief: usize = fields.next().unwrap().parse().unwrap();
+                        let token_len: usize = fields.next().unwrap().parse().unwrap();
+                        if read_body(&mut connection, &mut buf, &mut chunk, name_len + token_len)
+                            .await
+                            .is_none()
+                        {
+                            return;
+                        }
+
+                        heartbeats += 1;
+                        let ack = if heartbeats == 1 {
+                            // The full, pre-eviction roster.
+                            ack_response(
+                                &[
+                                    (self_name, "127.0.0.1:1"),
+                                    (survivor_name, "127.0.0.1:1"),
+                                    (evicted_name, "127.0.0.1:1"),
+                                ],
+                                replication,
+                            )
+                        } else {
+                            // Issue #266's trigger: `evicted_name` is gone.
+                            ack_response(
+                                &[(self_name, "127.0.0.1:1"), (survivor_name, "127.0.0.1:1")],
+                                replication,
+                            )
+                        };
+                        if connection.write_all(&ack).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    /// Issue #266: records every `U` frame a re-replication sends,
+    /// asserting each one carries the trailing `A` (put-if-absent) token
+    /// and acking `S\n` like a real receiver would for an absent key.
+    fn spawn_rereplication_recording_peer(
+        listener: TcpListener,
+    ) -> (RecordedFrames, tokio::task::JoinHandle<()>) {
+        let frames: RecordedFrames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&frames);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut connection, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut buf = BytesMut::new();
+                    loop {
+                        let Some(header_end) = buf.iter().position(|byte| *byte == b'\n') else {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                            continue;
+                        };
+                        let header = String::from_utf8(buf[..header_end].to_vec()).unwrap();
+                        assert!(header.starts_with("U "), "unexpected frame {header:?}");
+                        let mut fields = header.split(' ').skip(1);
+                        let ns_len: usize = fields.next().unwrap().parse().unwrap();
+                        let key_len: usize = fields.next().unwrap().parse().unwrap();
+                        let val_len: usize = fields.next().unwrap().parse().unwrap();
+                        let has_absent = header.ends_with(" A");
+                        let body_len = ns_len + key_len + val_len;
+                        let frame_end = header_end + 1 + body_len;
+                        while buf.len() < frame_end {
+                            let mut chunk = [0u8; 1024];
+                            let Ok(bytes_read) = connection.read(&mut chunk).await else {
+                                return;
+                            };
+                            if bytes_read == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&chunk[..bytes_read]);
+                        }
+                        let frame = buf.split_to(frame_end).to_vec();
+                        assert!(
+                            has_absent,
+                            "expected the put-if-absent marker on a re-replication send: \
+                             {frame:?}"
+                        );
+                        recorded.lock().unwrap().push(frame);
+                        let _ = connection.write_all(b"S\n").await;
+                    }
+                });
+            }
+        });
+        (frames, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_roster_member_triggers_rereplication_to_exactly_the_right_keys() {
+        // Issue #266 end to end: a 3-member ring (self "n1", survivor
+        // "n2", evicted "n3", R=2) whose heartbeat ack drops "n3" on its
+        // second tick. Every key for which "n1" is the elected sender
+        // (see `rereplication_targets`) must arrive at "n2" as `U … A`;
+        // every other seeded key must not.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        const KEY_COUNT: u32 = 60;
+        for index in 0..KEY_COUNT {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let replication = 2;
+        let before_ring = HashRing::new(vec!["n1".to_string(), "n2".to_string(), "n3".to_string()]);
+        let after_ring = HashRing::new(vec!["n1".to_string(), "n2".to_string()]);
+        let expected_keys: Vec<Key> = (0..KEY_COUNT)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|key| {
+                !rereplication_targets(&before_ring, &after_ring, key, replication, "n1").is_empty()
+            })
+            .collect();
+        assert!(
+            !expected_keys.is_empty(),
+            "the sample must contain at least one key n1 re-replicates"
+        );
+        assert!(
+            expected_keys.len() < KEY_COUNT as usize,
+            "the sample must also contain at least one key n1 does not re-replicate"
+        );
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_rereplication_recording_peer(peer_listener);
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = spawn_heartbeat_and_roster_discovery(
+            discovery_listener,
+            "n1",
+            "n2",
+            peer_addr,
+            "n3",
+            replication,
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // Issue #266: must be the receiving half of the exact sender
+        // `node_context.rereplication_tx` uses below — a mismatched pair
+        // (each with its own, disconnected channel) would make every
+        // `register_with_discovery` trigger fail silently with "channel
+        // closed", never reaching `send_heartbeats`'s `JoinSet` at all.
+        let (rereplication_tx, rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+
+        let node_context = NodeContext {
+            name: "n1".to_string(),
+            token: "tk-n1".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx,
+            shutdown_rx: shutdown_rx.clone(),
+        };
+
+        // Moved, not cloned: a lingering clone in this test's own scope
+        // would keep `rereplication_tx` alive past every task that
+        // actually uses it, so `send_heartbeats`'s own drain of
+        // `rereplication_rx` would never see the channel close and
+        // `heartbeat_task.await` below would hang forever (`run`'s own
+        // shutdown avoids this the same way — see its `drop(node_context)`
+        // ahead of `heartbeat_task.await`).
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            node_context,
+            rereplication_rx,
+            shutdown_rx,
+        ));
+
+        // Poll for the expected frame count instead of a fixed sleep —
+        // the eviction lands on the second heartbeat tick (~20-40ms in),
+        // and the re-replication itself still has to list, peek, and
+        // send every matching key.
+        let mut observed = 0;
+        for _ in 0..500 {
+            observed = frames.lock().unwrap().len();
+            if observed >= expected_keys.len() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        discovery_task.abort();
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            expected_keys.len(),
+            "expected exactly the keys n1 elects itself sender for, got {observed} of {} \
+             polled, frames: {frames:?}",
+            expected_keys.len()
+        );
+
+        let mut sent_keys: Vec<Key> = frames
+            .iter()
+            .map(|frame| {
+                // `U <ns-len> <key-len> <val-len> [ttl] A\n<ns><key><value>`
+                let header_end = frame.iter().position(|byte| *byte == b'\n').unwrap();
+                let header = String::from_utf8(frame[..header_end].to_vec()).unwrap();
+                let mut fields = header.split(' ').skip(1);
+                let ns_len: usize = fields.next().unwrap().parse().unwrap();
+                let key_len: usize = fields.next().unwrap().parse().unwrap();
+                let body_start = header_end + 1;
+                Key::new(
+                    Bytes::copy_from_slice(&frame[body_start..body_start + ns_len]),
+                    Bytes::copy_from_slice(
+                        &frame[body_start + ns_len..body_start + ns_len + key_len],
+                    ),
+                )
+            })
+            .collect();
+        sent_keys.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut expected_sorted = expected_keys.clone();
+        expected_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(sent_keys, expected_sorted);
+
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10642,10 +12219,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::clone(&known_ring),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::clone(&known_ring),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
         sleep(Duration::from_millis(150)).await;
@@ -10707,10 +12287,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::clone(&known_ring),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::clone(&known_ring),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
@@ -10802,10 +12385,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
@@ -10897,10 +12483,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
@@ -10944,10 +12533,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
@@ -11005,10 +12597,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: None,
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
@@ -11169,10 +12764,13 @@ mod tests {
                 auth_secret: None,
                 tls_connector: Some(connector),
             },
-            "test-node".to_string(),
-            "tk-test-node".to_string(),
-            Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(None)),
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
             shutdown_rx,
         ));
 
