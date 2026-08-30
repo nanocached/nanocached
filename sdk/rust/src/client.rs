@@ -320,6 +320,21 @@ fn validate_namespace_for_clear(namespace: &[u8]) -> Result<()> {
 #[doc(hidden)]
 pub static MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES: AtomicUsize = AtomicUsize::new(32);
 
+/// Hedged reads' losing legs (issue #64), analogous to
+/// `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES` above (issue #276): a losing
+/// leg is normally left running detached in `hedged_reads`, drained by
+/// `close()` — with no bound, a client issuing many concurrent hedged
+/// reads against a slow owner could accumulate an unbounded number of
+/// them. Tracked against `hedged_reads`' own length, not a separate
+/// permit pool shared with `background_replica_permits` — past this cap,
+/// a read's remaining legs are awaited synchronously right there instead
+/// of being left detached, the same "fall back to synchronous" shape
+/// `background_replica_permits` uses past its own cap. Read once per
+/// `connect`; public-but-hidden purely as a test hook, mirroring
+/// `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES`.
+#[doc(hidden)]
+pub static MAX_INFLIGHT_HEDGE_LOSER_LEGS: AtomicUsize = AtomicUsize::new(32);
+
 /// Monotonic counters for failures this SDK deliberately swallows
 /// (client-side replication / fire-and-forget replica writes / read repair) — observability for silently degrading
 /// replication or a stuck node-list refresh that would otherwise have no
@@ -742,6 +757,12 @@ struct Inner {
     /// write, so `close()` can drain it the same way before teardown
     /// instead of leaving it dangling past the client's own lifetime.
     hedged_reads: Mutex<tokio::task::JoinSet<()>>,
+    /// Cap for how many legs `hedged_reads` may hold before `read_hedged`
+    /// stops detaching its own still-outstanding losers and instead
+    /// awaits them synchronously (issue #276). Captured once from
+    /// `MAX_INFLIGHT_HEDGE_LOSER_LEGS` at `connect`, mirroring
+    /// `background_replica_cap`.
+    hedge_loser_cap: usize,
     stats: StatsCounters,
     /// SDK proxy mode (issue #122): see [`Options::via_proxy`]. When set,
     /// `target` is always `Target::Single` (a proxy is single-connection
@@ -1229,6 +1250,7 @@ impl NanocachedClient {
         };
 
         let background_replica_cap = MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES.load(Ordering::SeqCst);
+        let hedge_loser_cap = MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
         let inner = Arc::new(Inner {
             state: Mutex::new(State {
                 target,
@@ -1251,6 +1273,7 @@ impl NanocachedClient {
             read_repair: options.read_repair,
             read_hedge_after: options.read_hedge_after,
             hedged_reads: Mutex::new(tokio::task::JoinSet::new()),
+            hedge_loser_cap,
             stats: StatsCounters {
                 replica_write_failures: AtomicU64::new(0),
                 read_repair_failures: AtomicU64::new(0),
@@ -2794,7 +2817,11 @@ impl NanocachedClient {
     ///
     /// Every leg — including the ones still in flight once this method
     /// returns — is spawned via `spawn_hedge_leg` onto `hedged_reads`,
-    /// never cancelled, and drained by `close()`.
+    /// never cancelled, and drained by `close()`. Once `hedged_reads`
+    /// already holds `hedge_loser_cap` legs, though, this method's own
+    /// still-outstanding legs are awaited synchronously instead of left
+    /// detached (`resolve_hedge_losers`, issue #276) — the read still
+    /// completes correctly, it just stops accumulating background tasks.
     async fn read_hedged(
         &self,
         namespace: &[u8],
@@ -2856,10 +2883,19 @@ impl NanocachedClient {
             in_flight -= 1;
 
             match outcome.result {
-                Ok(Some(value)) => return Ok(Some(value)),
-                Ok(None) if outcome.index == 0 => return Ok(None),
+                Ok(Some(value)) => {
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    return Ok(Some(value));
+                }
+                Ok(None) if outcome.index == 0 => {
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    return Ok(None);
+                }
                 Ok(None) => replica_missed = true,
-                Err(Error::WrongNode) => return Err(Error::WrongNode),
+                Err(Error::WrongNode) => {
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
+                    return Err(Error::WrongNode);
+                }
                 Err(error) => last_error = Some(error),
             }
 
@@ -2891,6 +2927,37 @@ impl NanocachedClient {
         Err(last_error.unwrap_or_else(|| {
             Error::ConnectionLost("nanocached: no owner is reachable for this key".to_string())
         }))
+    }
+
+    /// Issue #276: `read_hedged` has already decided its answer, with
+    /// `in_flight` of its own legs still running (already spawned into
+    /// `hedged_reads` by `spawn_hedge_leg`, so counted in its length).
+    /// Normally they're simply left running — detached, in the
+    /// background, for `close()` to eventually drain, same as always.
+    /// But past `hedge_loser_cap` concurrently tracked legs (checked
+    /// against `hedged_reads`' own length, which still counts these
+    /// `in_flight` legs at this point), leaving more of them detached
+    /// would let one persistently slow owner accumulate one abandoned
+    /// task per hedged call forever. Instead, this read's own remaining
+    /// legs are drained right here — via `rx`, the same channel every
+    /// leg already reports its outcome to — before returning, so the
+    /// call still completes correctly, it just stops detaching. Outcomes
+    /// are discarded either way: a loser's result was never going to be
+    /// used.
+    async fn resolve_hedge_losers(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<HedgeOutcome>,
+        in_flight: usize,
+    ) {
+        if in_flight == 0 {
+            return;
+        }
+        if self.inner.hedged_reads.lock().await.len() < self.inner.hedge_loser_cap {
+            return;
+        }
+        for _ in 0..in_flight {
+            let _ = rx.recv().await;
+        }
     }
 
     /// Starts one hedge leg against `owners[index]`. Spawned onto
