@@ -3011,6 +3011,82 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_both_legs_done_in_the_same_wait_leaves_no_leak(self):
+        # Issue #229: asyncio.wait(FIRST_COMPLETED) can hand back more than
+        # one finished task in `done` in a single call — e.g. the primary
+        # and the hedge leg both failing around the same event-loop tick,
+        # as a dying node can. The old loop discarded each task from
+        # self._hedged_reads at the top of its own iteration, but a
+        # decisive outcome (a raise, or a return) exited the for loop
+        # immediately — skipping the discard for any other already-done
+        # task the for loop hadn't reached yet. Both legs here are made
+        # individually decisive (one returns, one raises WrongNodeError) so
+        # the leak reproduces regardless of the set's (unspecified)
+        # iteration order: whichever is visited first ends the loop before
+        # the other is ever discarded, in the pre-fix code.
+        #
+        # asyncio.wait's FIRST_COMPLETED still only reports tasks that were
+        # *already done* at the moment it runs its final done-check, so
+        # asyncio.wait itself is patched to await both legs to completion
+        # before delegating to the real asyncio.wait — this makes "both
+        # legs finish in the same wait() call" deterministic instead of
+        # depending on a real-time race between two sleeps.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.01
+            )
+            try:
+                await client.set("k", "v")
+                names = client._owner_names(b"", b"k")
+                self.assertGreater(len(names), 1)
+
+                hedge_started = asyncio.Event()
+
+                async def op(connection):
+                    if not hedge_started.is_set():
+                        # The primary leg: block until the hedge leg has
+                        # started, then answer with a genuine hit — decisive
+                        # because it's the primary (index 0).
+                        await hedge_started.wait()
+                        return "v"
+                    # The hedge leg: answer immediately with a decisive
+                    # failure of its own.
+                    raise WrongNodeError()
+
+                real_wait = asyncio.wait
+
+                async def patched_wait(fs, **kwargs):
+                    fs = list(fs)
+                    if len(fs) == 2:
+                        hedge_started.set()
+                        await asyncio.gather(*fs, return_exceptions=True)
+                    return await real_wait(fs, **kwargs)
+
+                # Which of the two decisive outcomes actually wins (the
+                # primary's hit, or the hedge leg's WrongNodeError) depends
+                # on the set's iteration order, which this test doesn't
+                # control — both are decisive so the leak reproduces either
+                # way; only the post-call _hedged_reads state matters here.
+                with mock.patch("asyncio.wait", patched_wait):
+                    try:
+                        await client._read_hedged(b"k", op, names)
+                    except WrongNodeError:
+                        pass
+
+                self.assertEqual(
+                    client._hedged_reads,
+                    set(),
+                    "both legs finished in the same wait() call, but one "
+                    "was left behind uncounted",
+                )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
     """issue #192: _MAX_INFLIGHT_HEDGE_LOSER_LEGS bounds how many losing
