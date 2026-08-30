@@ -398,7 +398,17 @@ registers with discovery and how SDKs in proxy mode find one), and
 <code>U</code>/<code>u</code>/<code>V</code> (handoff store, handoff
 delete, and node leave — the graceful-decommission frames a draining
 node uses to move its entries and exit membership; see
-<a href="deployment.html">Deployment</a>). These are versioned with the
+<a href="deployment.html">Deployment</a>). <code>U</code> also carries
+an optional trailing <code>A</code> token
+(<code>U &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; [ttl] [A]</code>):
+a survivor re-replicating a key after a membership change dropped a
+member (an eviction, or a leave it did not itself hand off for — see
+<a href="architecture.html">Architecture</a>) sends it instead of a
+plain overwrite, so a re-replication racing a newer client write can
+never regress it — the receiver stores the entry only if it was absent,
+and acks <code>S\n</code> either way, since a key already present there
+is a success for the sender, not a conflict. An ordinary decommission
+handoff never sets it. These are versioned with the
 server and not part of
 the public caching API; the server
 source documents them in detail.</p>

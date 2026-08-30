@@ -87,6 +87,23 @@ unreachable.</p>
   the surviving nodes' own ring view follows that eviction within one
   heartbeat interval too — a key re-homed from the dead node is served
   by its new owner rather than answered <code>W</code>.</li>
+  <li>That same ring-view update triggers <strong>re-replication</strong>:
+  rendezvous hashing's removal property means an eviction (or any leave)
+  can only ever <em>promote</em> a node into a key's top-R, never leave a
+  slot vacant, but nothing had sent that promoted node a copy — so at
+  R&nbsp;&ge;&nbsp;2 the cluster silently ran one replica short after the
+  <em>first</em> failure, and a second failure on the sole remaining
+  copy lost the key. Once a survivor notices the drop, the highest-ranked
+  surviving old owner of each affected key streams it to the newly
+  promoted owner(s) as a put-if-absent handoff (<code>U</code>'s
+  trailing <code>A</code> token — see <a href="protocol.html">Protocol</a>),
+  so a re-replication racing a newer client write can never regress it.
+  This runs independently of, and is ordered against, a join in
+  progress: a join's sweep of its own dead-copy marks waits for any
+  in-flight re-replication to finish first (so it can't reclaim a
+  survivor's only copy of a key re-replication hasn't delivered yet),
+  and a re-replication that starts while a join is running waits for the
+  join to finish first, since the join changes the ring again.</li>
 </ul>
 <p>Liveness is binary, though: a node that is slow but still answering is
 never evicted, and every request that touches it waits out its round

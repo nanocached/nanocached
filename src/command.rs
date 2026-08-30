@@ -173,17 +173,28 @@ pub enum Command {
     UnmarkMigrated {
         key: Key,
     },
-    /// `U <ns-len> <key-len> <val-len> [ttl] [tag]\n<ns><key><value>`
+    /// `U <ns-len> <key-len> <val-len> [ttl] [A] [tag]\n<ns><key><value>`
     /// (issue #124, cluster-internal like `M`/`X`): a decommissioning
-    /// node handing one of its entries to the key's post-leave owner.
-    /// Executes exactly as `Set`; the difference is in the connection
-    /// handler, which skips the wrong-node check — the receiver becomes
-    /// this key's owner only once discovery publishes the post-leave
-    /// roster, which by design happens *after* the transfer.
+    /// node handing one of its entries to the key's post-leave owner, or
+    /// (issue #266) a survivor re-replicating a key to the owner an
+    /// eviction promoted. Executes as `Set`, unless the trailing `A`
+    /// token (put-if-absent, same "content, not position, disambiguates
+    /// it" idiom as `k`'s `<cond>`) is present, in which case it executes
+    /// as set-if-absent instead — re-replication runs after the fact and
+    /// must not clobber a newer client write that raced it, so it asks
+    /// for absent semantics; an ordinary decommission handoff never sets
+    /// `A`, since nothing else could have written to an entrant that
+    /// doesn't own the key yet. Either way the difference from `Set` is
+    /// in the connection handler, which skips the wrong-node check — the
+    /// receiver becomes this key's owner only once discovery publishes
+    /// the post-change roster, which by design happens *after* the
+    /// transfer — and the receiver acks `S\n` either way: a key already
+    /// present under `A` is a success for the sender, not a conflict.
     HandoffSet {
         key: Key,
         value: Bytes,
         ttl: Option<Duration>,
+        if_absent: bool,
     },
     /// `u <ns-len> <key-len> [tag]\n<ns><key>` (issue #124,
     /// cluster-internal like `U`): a decommissioning node forwarding a
@@ -301,10 +312,35 @@ impl Command {
                 Response::MultiAck(entries)
             }
 
-            Self::Set { key, value, ttl } | Self::HandoffSet { key, value, ttl } => {
+            Self::Set { key, value, ttl } => {
                 match ttl {
                     Some(ttl) => cache.set_with_ttl(key, value, ttl),
                     None => cache.set(key, value),
+                }
+                Response::Stored
+            }
+
+            Self::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+            } => {
+                if if_absent {
+                    // Issue #266: re-replication after an eviction — must
+                    // not regress a newer client write that raced it. An
+                    // already-present key is still a success for the
+                    // sender (`Response::Stored` either way): the value
+                    // that won is by definition at least as new as what
+                    // re-replication was carrying.
+                    match cache.cas_set(&key, CasCondition::Absent, value, ttl) {
+                        CasResult::Stored | CasResult::Mismatch => {}
+                    }
+                } else {
+                    match ttl {
+                        Some(ttl) => cache.set_with_ttl(key, value, ttl),
+                        None => cache.set(key, value),
+                    }
                 }
                 Response::Stored
             }
@@ -954,24 +990,42 @@ fn parse_with_mode(
             };
             let key_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let value_length = parts.next().ok_or(ParseError::InvalidLength)?;
-            // In tagged mode the tag is the *last* field, so with both
-            // optional fields the header is `S <k> <v> [ttl] <tag>`:
-            // one trailing field is the tag alone, two are TTL then tag.
-            // The connection's negotiated mode is what disambiguates a
-            // three-field header — never a guess frame by frame.
-            let (ttl, tag) = if tagged {
-                let first = parts.next().ok_or(ParseError::InvalidLength)?;
-                match parts.next() {
-                    Some(second) => (Some(first), Some(parse_tag(second)?)),
-                    None => (None, Some(parse_tag(first)?)),
+
+            // Every field after `<value-len>`, in wire order: `[<ttl>]
+            // [A] [<tag>]`. `A` (issue #266's put-if-absent handoff) only
+            // ever appears for `U`; `S`/`s` have at most `[<ttl>]
+            // [<tag>]`. Collected up front — capped, so a frame with
+            // extra fields errors here rather than silently reading
+            // `parts` past what a human wrote — then peeled back to
+            // front: the tag is always last in tagged mode, and `A` is a
+            // literal token distinguishable from a numeric ttl by its
+            // content (same "content, not position, disambiguates it"
+            // idiom as `k`'s `<cond>`), so it doesn't need a fixed slot
+            // the way `tagged` gives the tag one.
+            let max_trailing = if handoff { 3 } else { 2 };
+            let mut trailing: Vec<&[u8]> = Vec::with_capacity(max_trailing);
+            for part in parts.by_ref() {
+                trailing.push(part);
+                if trailing.len() > max_trailing {
+                    return Err(ParseError::InvalidLength);
                 }
+            }
+
+            let tag = if tagged {
+                Some(parse_tag(trailing.pop().ok_or(ParseError::InvalidLength)?)?)
             } else {
-                (parts.next(), None)
+                None
             };
 
-            if parts.next().is_some() {
+            let if_absent = handoff && trailing.last().copied() == Some(b"A".as_slice());
+            if if_absent {
+                trailing.pop();
+            }
+
+            if trailing.len() > 1 {
                 return Err(ParseError::InvalidLength);
             }
+            let ttl = trailing.pop();
 
             let key_length = parse_length(key_length)?;
             let value_length = parse_length(value_length)?;
@@ -1016,7 +1070,12 @@ fn parse_with_mode(
             let value = frame.slice(key_end..value_end);
 
             let request = if handoff {
-                Command::HandoffSet { key, value, ttl }
+                Command::HandoffSet {
+                    key,
+                    value,
+                    ttl,
+                    if_absent,
+                }
             } else {
                 Command::Set { key, value, ttl }
             };
@@ -2414,6 +2473,7 @@ mod tests {
                 key: namespaced(b"users", b"name"),
                 value: Bytes::from_static(b"Alice"),
                 ttl: Some(Duration::from_secs(30)),
+                if_absent: false,
             })
         );
         assert!(input.is_empty());
@@ -2426,6 +2486,74 @@ mod tests {
             })
         );
         assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_handoff_set_with_the_trailing_absent_token() {
+        // Issue #266: `U`'s optional put-if-absent marker, in every
+        // position it can legally appear — with and without a ttl, and
+        // (in tagged mode) with and without one.
+        let mut input = buf(b"U 5 4 5 A\nusersnameAlice");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::HandoffSet {
+                key: namespaced(b"users", b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+                if_absent: true,
+            })
+        );
+
+        let mut input = buf(b"U 5 4 5 30 A\nusersnameAlice");
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::HandoffSet {
+                key: namespaced(b"users", b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: Some(Duration::from_secs(30)),
+                if_absent: true,
+            })
+        );
+
+        // `S`/`s` never take the `A` token — it's read back as (and
+        // fails to parse as) a ttl instead.
+        let mut input = buf(b"S 4 5 A\nnameAlice");
+        assert_eq!(parse(&mut input), Err(ParseError::InvalidLength));
+    }
+
+    #[test]
+    fn handoff_set_with_absent_condition_stores_only_when_the_key_is_missing() {
+        // Issue #266: re-replication after an eviction must not clobber a
+        // newer client write that raced it — but the receiver still acks
+        // success either way (checked at the connection-handler level,
+        // not here; `execute` only needs to leave the winning value
+        // alone).
+        let mut cache = Cache::new(1024 * 1024);
+
+        assert_eq!(
+            Command::HandoffSet {
+                key: key(b"name"),
+                value: Bytes::from_static(b"first"),
+                ttl: None,
+                if_absent: true,
+            }
+            .execute(&mut cache),
+            Response::Stored
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"first")));
+
+        // A newer write already raced ahead of the re-replication.
+        assert_eq!(
+            Command::HandoffSet {
+                key: key(b"name"),
+                value: Bytes::from_static(b"stale"),
+                ttl: None,
+                if_absent: true,
+            }
+            .execute(&mut cache),
+            Response::Stored
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"first")));
     }
 
     #[test]
