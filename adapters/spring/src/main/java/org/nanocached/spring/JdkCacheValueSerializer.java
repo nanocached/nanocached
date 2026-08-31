@@ -21,23 +21,37 @@ import java.io.Serializable;
  * ObjectInputStream} does not always pick up the process-wide filter on its own — or, when a
  * more specific policy than the process default is wanted, the filter passed to {@link
  * #JdkCacheValueSerializer(ObjectInputFilter)}.
+ *
+ * <p>The no-arg constructor's JVM-wide filter is re-read from {@link
+ * ObjectInputFilter.Config#getSerialFilter()} on every {@link #deserialize} call, not captured
+ * once at construction — the same reasoning as {@code nanocached-jcache}'s {@code
+ * ValueCodec#deserialize}: this serializer can be built (e.g. as a Spring bean) before some
+ * other part of the application installs the process-wide filter via {@code setSerialFilter},
+ * and capturing {@code null} at that moment would silently and permanently disable filtering
+ * for this instance even after the real filter is installed. The explicit-filter constructor
+ * below is unaffected — a caller-supplied filter is deliberately fixed, not the live global one.
  */
 public final class JdkCacheValueSerializer implements CacheValueSerializer {
 
-    private final ObjectInputFilter filter;
+    private final ObjectInputFilter explicitFilter;
+    private final boolean useGlobalFilter;
 
-    /** Uses the JVM-wide serial filter ({@link ObjectInputFilter.Config#getSerialFilter()}), if any. */
+    /** Uses the JVM-wide serial filter ({@link ObjectInputFilter.Config#getSerialFilter()}),
+     * re-read on every {@link #deserialize} call — see the class javadoc. */
     public JdkCacheValueSerializer() {
-        this(ObjectInputFilter.Config.getSerialFilter());
+        this.explicitFilter = null;
+        this.useGlobalFilter = true;
     }
 
     /**
      * Uses {@code filter} instead of (or in addition to configuring) the JVM-wide filter.
      * Pass {@code null} to explicitly deserialize without a filter — not recommended; see the
-     * class javadoc and the README's trust boundary section.
+     * class javadoc and the README's trust boundary section. Unlike the no-arg constructor,
+     * {@code filter} is fixed for this instance's lifetime, not re-read.
      */
     public JdkCacheValueSerializer(ObjectInputFilter filter) {
-        this.filter = filter;
+        this.explicitFilter = filter;
+        this.useGlobalFilter = false;
     }
 
     @Override
@@ -61,6 +75,11 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
     @Override
     public Object deserialize(byte[] bytes) {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
+            // Re-read the JVM-wide filter here rather than at construction
+            // time (issue #365): setSerialFilter may run after this
+            // serializer was built but before it is ever used, and a value
+            // captured once would silently miss that.
+            ObjectInputFilter filter = useGlobalFilter ? ObjectInputFilter.Config.getSerialFilter() : explicitFilter;
             if (filter != null) {
                 in.setObjectInputFilter(filter);
             }
