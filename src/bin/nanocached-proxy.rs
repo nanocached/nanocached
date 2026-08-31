@@ -1771,7 +1771,7 @@ async fn run_backend(
         let tag = next_tag;
         next_tag = next_tag.wrapping_add(1);
 
-        let frame = substitute_tag(request.frame, tag);
+        let (header, body) = substitute_tag(request.frame, tag);
 
         // Reserve the reply slot before writing: if the reader is gone
         // (poisoned), this fails and the request errors without touching
@@ -1784,7 +1784,16 @@ async fn run_backend(
             break;
         }
 
-        if write_half.write_all(&frame).await.is_err() {
+        // Issue #335: two writes instead of one, so `body` — up to
+        // `MAX_VALUE_SIZE` and unmodified by tag substitution — can go
+        // straight from `substitute_tag`'s zero-copy slice to the socket
+        // instead of through a freshly copied combined buffer first (see
+        // `substitute_tag`'s doc comment). Both target the same
+        // exclusively-owned stream in the same order the single write
+        // used to, so this is not observable on the wire.
+        if write_half.write_all(&header).await.is_err()
+            || write_half.write_all(&body).await.is_err()
+        {
             // The reader will observe the broken stream (or time out)
             // and poison; nothing more to write here.
             break;
@@ -1823,7 +1832,20 @@ async fn run_backend(
 /// send order, and with it their tag, is known).
 const TAG_PLACEHOLDER: &str = "{tag}";
 
-fn substitute_tag(frame: Bytes, tag: u32) -> Bytes {
+/// Splits `frame` into its header — with `{tag}` substituted for `tag` —
+/// and its body, for the caller to write as two separate pieces instead
+/// of one concatenated buffer.
+///
+/// Issue #335: this used to `extend_from_slice` the body onto the
+/// rebuilt header and return the result as a single `Bytes`, which
+/// recopies the *entire* body (up to `MAX_VALUE_SIZE`, 1MiB) on every
+/// request just to attach a handful of substituted header bytes ahead
+/// of it — on top of the copy that already assembled `frame` itself.
+/// The body never changes here, so it is returned as a slice of `frame`
+/// instead: `Bytes::slice` is a cheap refcount bump over the same
+/// backing allocation, not a copy, so it costs the same whether the
+/// body is empty or at the size limit.
+fn substitute_tag(frame: Bytes, tag: u32) -> (Bytes, Bytes) {
     let header_end = frame
         .iter()
         .position(|byte| *byte == b'\n')
@@ -1831,10 +1853,10 @@ fn substitute_tag(frame: Bytes, tag: u32) -> Bytes {
     let header =
         String::from_utf8(frame[..header_end].to_vec()).expect("framers always emit ASCII headers");
     let header = header.replace(TAG_PLACEHOLDER, &tag.to_string());
-    let mut framed = header.into_bytes();
-    framed.push(b'\n');
-    framed.extend_from_slice(&frame[header_end + 1..]);
-    framed.into()
+    let mut header = header.into_bytes();
+    header.push(b'\n');
+    let body = frame.slice(header_end + 1..);
+    (header.into(), body)
 }
 
 async fn read_reply<S: AsyncRead + Unpin>(
@@ -4692,6 +4714,39 @@ mod tests {
         );
         assert_eq!(read_auth_secret_from(|_| Some(String::new())), None);
         assert_eq!(read_auth_secret_from(|_| None), None);
+    }
+
+    // ── request framing ──────────────────────────────────────────────
+
+    #[test]
+    fn substitute_tag_replaces_the_placeholder_and_leaves_the_body_untouched() {
+        let frame: Bytes = Bytes::from_static(b"G 4 {tag}\nname");
+        let (header, body) = substitute_tag(frame, 7);
+        assert_eq!(&header[..], b"G 4 7\n");
+        assert_eq!(&body[..], b"name");
+    }
+
+    #[test]
+    fn substitute_tag_returns_the_body_as_a_zero_copy_slice_of_the_frame() {
+        // Issue #335: `substitute_tag` used to `extend_from_slice` the
+        // body into a freshly allocated buffer alongside the rebuilt
+        // header — a full recopy of up to `MAX_VALUE_SIZE` on every
+        // request, on top of the copy that already assembled the frame.
+        // Proves the fix: the returned body is a `Bytes::slice` over the
+        // very same backing allocation as the input frame, not a copy —
+        // same underlying pointer, not merely equal bytes.
+        let frame: Bytes = Bytes::from(b"S 3 5 {tag}\nkeyvalue".to_vec());
+        let body_offset = frame.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let original_body_ptr = frame[body_offset..].as_ptr();
+
+        let (_, body) = substitute_tag(frame, 3);
+
+        assert_eq!(
+            body.as_ptr(),
+            original_body_ptr,
+            "the body must be sliced from the original frame, not recopied"
+        );
+        assert_eq!(&body[..], b"keyvalue");
     }
 
     // ── arg parsing ──────────────────────────────────────────────────
