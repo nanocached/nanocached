@@ -58,6 +58,26 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Issue #329: bounds every single connect/read/write this harness makes
+/// against discovery or a node over its own raw sockets (`connect_timed`,
+/// `write_all_timed`, `read_line`, `read_exact_into`) — as opposed to
+/// `CONNECT_TIMEOUT`/`JOIN_TIMEOUT`/`JOIN_LOG_POLL_TIMEOUT`, which each
+/// bound a *loop* of many such operations. Before this, only those
+/// waiting loops had any bound at all; a single operation could block
+/// forever against a peer that accepted a connection and then went silent
+/// (crashed mid-response, deadlocked, or a bug on the other end),
+/// hanging the loop built on top of it — and everything waiting on that
+/// loop — indefinitely instead of failing fast with a clear error.
+/// Matches the value of `nanocached-discovery.rs`'s `OUTBOUND_IO_TIMEOUT`,
+/// which bounds the same kind of single operation there.
+#[cfg(not(test))]
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Shrunk under test (mirrors `nanocached-proxy.rs`'s
+/// `UPSTREAM_IO_TIMEOUT`, issue #177) so the regression test proving this
+/// bound actually fires doesn't have to burn 10 real seconds waiting for
+/// it.
+#[cfg(test)]
+const IO_TIMEOUT: Duration = Duration::from_millis(200);
 /// Bounds how long `wait_for_join_log_lines` polls discovery's log file for
 /// lines it should already have written by the time it's called (see that
 /// function's doc comment). Deliberately much shorter than `JOIN_TIMEOUT`,
@@ -339,6 +359,27 @@ async fn wait_until_connectable(addr: &str) -> io::Result<()> {
     })
 }
 
+/// Connects to `addr`, bounded by `IO_TIMEOUT` (issue #329) — a plain
+/// `TcpStream::connect` has no timeout of its own, so a peer that accepts
+/// but never completes the handshake at the application level (or a
+/// route that just black-holes the attempt) would otherwise hang whatever
+/// this harness is doing indefinitely.
+async fn connect_timed(addr: &str) -> io::Result<TcpStream> {
+    timeout(IO_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("connect to {addr} timed out")))?
+}
+
+/// `write_all` bounded by `IO_TIMEOUT` (issue #329) — without this, a
+/// peer that accepts the connection but stops draining its receive
+/// buffer (crashed-but-open, deadlocked, or a bug on the other end) would
+/// make this write block forever.
+async fn write_all_timed(stream: &mut TcpStream, buf: &[u8]) -> io::Result<()> {
+    timeout(IO_TIMEOUT, stream.write_all(buf))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write timed out"))?
+}
+
 async fn read_line(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Result<String> {
     loop {
         if let Some(pos) = buf.iter().position(|byte| *byte == b'\n') {
@@ -347,7 +388,15 @@ async fn read_line(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Result<Str
         }
 
         let mut chunk = [0u8; 4096];
-        let bytes_read = stream.read(&mut chunk).await?;
+        // Issue #329: bounded so a peer that accepts the connection and
+        // then goes silent (rather than closing it) doesn't hang this
+        // read forever — only the higher-level waiting loops built on
+        // top of `read_line` used to have any bound at all.
+        let bytes_read = timeout(IO_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "read timed out while reading a line")
+            })??;
 
         if bytes_read == 0 {
             return Err(io::Error::new(
@@ -367,7 +416,12 @@ async fn read_exact_into(
 ) -> io::Result<()> {
     while buf.len() < need {
         let mut chunk = [0u8; 4096];
-        let bytes_read = stream.read(&mut chunk).await?;
+        // Issue #329: same bound, same rationale, as `read_line` above.
+        let bytes_read = timeout(IO_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "read timed out while reading a body")
+            })??;
 
         if bytes_read == 0 {
             return Err(io::Error::new(
@@ -478,8 +532,8 @@ impl<'a> Ring<'a> {
 /// discovery, in the node identity decoupled from address `<name-length> <addr-length>\n<name><addr>`
 /// shape.
 async fn fetch_joined(discovery_addr: &str) -> io::Result<(Roster, usize)> {
-    let mut stream = TcpStream::connect(discovery_addr).await?;
-    stream.write_all(b"L\n").await?;
+    let mut stream = connect_timed(discovery_addr).await?;
+    write_all_timed(&mut stream, b"L\n").await?;
 
     let mut buf = BytesMut::new();
     let header = read_line(&mut stream, &mut buf).await?;
@@ -579,7 +633,7 @@ async fn set(
     message.extend_from_slice(namespace);
     message.extend_from_slice(key);
     message.extend_from_slice(value);
-    stream.write_all(&message).await?;
+    write_all_timed(stream, &message).await?;
 
     let line = read_line(stream, buf).await?;
     Ok(line == "S")
@@ -648,7 +702,7 @@ async fn get(
     namespace: &[u8],
     key: &[u8],
 ) -> io::Result<GetReply> {
-    stream.write_all(&get_message(namespace, key)).await?;
+    write_all_timed(stream, &get_message(namespace, key)).await?;
 
     let line = read_line(stream, buf).await?;
 
@@ -675,7 +729,7 @@ async fn get_value(
     namespace: &[u8],
     key: &[u8],
 ) -> io::Result<bool> {
-    stream.write_all(&get_message(namespace, key)).await?;
+    write_all_timed(stream, &get_message(namespace, key)).await?;
 
     let line = read_line(stream, buf).await?;
 
@@ -697,7 +751,7 @@ async fn get_or_connect<'a>(
     addr: &str,
 ) -> io::Result<&'a mut (TcpStream, BytesMut)> {
     if !conns.contains_key(addr) {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = connect_timed(addr).await?;
         conns.insert(addr.to_string(), (stream, BytesMut::new()));
     }
 
@@ -1120,7 +1174,7 @@ async fn verify_handoff(
         })?;
 
     let ring = Ring::new(roster);
-    let mut stream = TcpStream::connect(&new_node_addr).await?;
+    let mut stream = connect_timed(&new_node_addr).await?;
     let mut buf = BytesMut::new();
     let mut expected = 0usize;
     let mut missing = Vec::new();
@@ -1707,6 +1761,54 @@ mod tests {
             vec![("node-a".to_string(), "127.0.0.1:8356".to_string())]
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_joined_times_out_against_a_peer_that_accepts_and_goes_silent() {
+        // Regression for issue #329: before this fix, none of this
+        // harness's raw socket reads/writes/connects had a timeout of
+        // their own — only the higher-level waiting loops built on top of
+        // them did. A discovery process that accepted the connection and
+        // then never answered (crashed mid-response, deadlocked, or a bug
+        // on the other end) used to hang `fetch_joined` — and every
+        // caller waiting on it — forever instead of failing fast.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Accept the connection and go silent — never even reads the
+            // `L\n` request, let alone answers it.
+            sleep(Duration::from_secs(30)).await;
+        });
+
+        let started = Instant::now();
+        let error = fetch_joined(&addr)
+            .await
+            .expect_err("expected the silent peer to time out, not hang");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_timed_does_not_hang_against_an_address_that_never_answers() {
+        // Regression for issue #329, the connect-side half of the fix
+        // above: a bare `TcpStream::connect` has no timeout of its own,
+        // so a route that silently drops the connection attempt (rather
+        // than actively refusing it) used to hang whatever called it
+        // forever. This address is outside any range this sandbox/CI
+        // runner routes anywhere, so the connect attempt never resolves
+        // on its own — whether the network stack eventually answers with
+        // an explicit refusal or never answers at all is environment-
+        // dependent, so this only asserts `connect_timed` returns an
+        // error promptly either way, not which one.
+        let started = Instant::now();
+        connect_timed("10.255.255.1:1")
+            .await
+            .expect_err("expected an unreachable address to error, not hang");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// `run_waiting_join`'s structural serialization check (see its doc
