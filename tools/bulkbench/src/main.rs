@@ -26,6 +26,11 @@ const MAX_VALUE_LEN: usize = 2 * 1024 * 1024;
 /// bounds an `M` reply's hit bodies summed across the whole reply.
 const MAX_MULTI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Mirrors src/server.rs's MAX_REQUEST_SIZE — a multi-set (`o`) frame
+/// this benchmark builds must fit under this or the server will reject
+/// it, which we'd rather report clearly than hit as a write/read panic.
+const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
 fn usage() -> ! {
     eprintln!(
         "usage:\n  \
@@ -263,6 +268,26 @@ async fn run(args: &[String]) {
         "set" => true,
         _ => usage(),
     };
+
+    if bulk && set {
+        // Worst-case key length this run can generate, since key_bytes
+        // is `format!("bk:{index}")` — longer indices produce longer keys.
+        let key_len = key_bytes(keyspace.saturating_sub(1)).len();
+        let header_estimate =
+            format!("o 0 {batch}").len() + batch * format!(" {key_len} {value_size}").len() + 1;
+        let body_estimate = batch * (key_len + value_size);
+        let estimated_frame_size = header_estimate + body_estimate;
+        if estimated_frame_size > MAX_REQUEST_SIZE {
+            eprintln!(
+                "bulkbench: batch={batch} x value-size={value_size} (plus keyspace={keyspace}'s \
+                 key-length overhead) would build an estimated {estimated_frame_size}-byte \
+                 multi-set frame, exceeding the server's {MAX_REQUEST_SIZE}-byte request limit; \
+                 reduce --batch or --value-size."
+            );
+            std::process::exit(1);
+        }
+    }
+
     let value = vec![b'x'; value_size];
 
     let deadline = Instant::now() + duration;

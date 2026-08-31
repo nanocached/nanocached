@@ -19,6 +19,8 @@ public final class Main {
         String label = args[1];
         int count = Integer.parseInt(args[2]);
 
+        int exitCode = 0;
+
         try (NanocachedClient client = NanocachedClient.connect(options)) {
             if (cmd.equals("write")) {
                 for (int i = 0; i < count; i++) {
@@ -36,13 +38,18 @@ public final class Main {
                 }
                 if (bad > 0) {
                     System.out.println("label " + label + ": " + bad + "/" + count + " BAD");
-                    System.exit(1);
+                    exitCode = 1;
+                } else {
+                    System.out.println("label " + label + ": " + count + "/" + count + " OK");
                 }
-                System.out.println("label " + label + ": " + count + "/" + count + " OK");
             } else {
                 System.out.println("unknown command " + cmd);
-                System.exit(2);
+                exitCode = 2;
             }
+        }
+
+        if (exitCode != 0) {
+            System.exit(exitCode);
         }
     }
 }

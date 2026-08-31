@@ -13,36 +13,47 @@ var cmd = args[0];
 var label = args[1];
 var count = int.Parse(args[2]);
 
-using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+var exitCode = 0;
 
-if (cmd == "write")
+using (NanocachedClient client = await NanocachedClient.ConnectAsync(options))
 {
-    for (var i = 0; i < count; i++)
+    if (cmd == "write")
     {
-        await client.SetAsync($"x:{label}:{i}", $"v-{label}-{i}");
-    }
-    Console.WriteLine($"wrote {count} keys for label {label}");
-}
-else if (cmd == "read")
-{
-    var bad = 0;
-    for (var i = 0; i < count; i++)
-    {
-        var value = await client.GetAsync($"x:{label}:{i}");
-        if (value is null || value != $"v-{label}-{i}")
+        for (var i = 0; i < count; i++)
         {
-            bad++;
+            await client.SetAsync($"x:{label}:{i}", $"v-{label}-{i}");
+        }
+        Console.WriteLine($"wrote {count} keys for label {label}");
+    }
+    else if (cmd == "read")
+    {
+        var bad = 0;
+        for (var i = 0; i < count; i++)
+        {
+            var value = await client.GetAsync($"x:{label}:{i}");
+            if (value is null || value != $"v-{label}-{i}")
+            {
+                bad++;
+            }
+        }
+        if (bad > 0)
+        {
+            Console.WriteLine($"label {label}: {bad}/{count} BAD");
+            exitCode = 1;
+        }
+        else
+        {
+            Console.WriteLine($"label {label}: {count}/{count} OK");
         }
     }
-    if (bad > 0)
+    else
     {
-        Console.WriteLine($"label {label}: {bad}/{count} BAD");
-        Environment.Exit(1);
+        Console.WriteLine($"unknown command {cmd}");
+        exitCode = 2;
     }
-    Console.WriteLine($"label {label}: {count}/{count} OK");
 }
-else
+
+if (exitCode != 0)
 {
-    Console.WriteLine($"unknown command {cmd}");
-    Environment.Exit(2);
+    Environment.Exit(exitCode);
 }
