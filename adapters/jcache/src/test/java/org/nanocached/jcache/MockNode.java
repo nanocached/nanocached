@@ -55,6 +55,13 @@ final class MockNode implements AutoCloseable {
      * the adapter's {@code getAnd*} CAS retry loops actually retry
      * instead of only ever exercising the happy path. */
     final AtomicBoolean forceCasMismatchOnce = new AtomicBoolean(false);
+    /** When positive, every {@code k}/{@code x} request forces a mismatch
+     * ({@code N}) and decrements this counter — sustained contention,
+     * unlike {@link #forceCasMismatchOnce}'s single fault. Set this to
+     * more than {@code MAX_CAS_RETRIES} to exhaust the adapter's CAS retry
+     * budget and exercise {@code getAndPut}/{@code getAndReplace}'s
+     * {@code fallbackOverwrite} (issue #331). */
+    final AtomicInteger forceCasMismatchCount = new AtomicInteger(0);
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, InetAddress.getLoopbackAddress());
@@ -268,6 +275,7 @@ final class MockNode implements AutoCloseable {
 
         Entry existing = entry(ns(namespace), key);
         boolean matches = !forceCasMismatchOnce.compareAndSet(true, false)
+                && !forceSustainedMismatch()
                 && switch (cond) {
                     case "A" -> existing == null;
                     case "P" -> existing != null;
@@ -293,6 +301,7 @@ final class MockNode implements AutoCloseable {
 
         Entry existing = entry(ns(namespace), key);
         boolean matches = !forceCasMismatchOnce.compareAndSet(true, false)
+                && !forceSustainedMismatch()
                 && existing != null
                 && digestOf(existing.value()).equals(cond);
         if (matches) {
@@ -301,6 +310,10 @@ final class MockNode implements AutoCloseable {
         } else {
             reply(out, "N" + tagSuffix + "\n");
         }
+    }
+
+    private boolean forceSustainedMismatch() {
+        return forceCasMismatchCount.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
     }
 
     /** Same algorithm as {@code NanocachedClient.contentDigest} —
