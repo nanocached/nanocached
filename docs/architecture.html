@@ -105,6 +105,21 @@ unreachable.</p>
   and a re-replication that starts while a join is running waits for the
   join to finish first, since the join changes the ring again.</li>
 </ul>
+<p>These healers share one consistency model: each acts on a snapshot of
+membership taken when it starts, and no two of them coordinate. A
+planned leave (the SIGTERM decommission — see
+<a href="deployment.html">Deployment</a>) computes its handoffs the same
+way, from one roster fetch as the drain begins. Two membership changes
+landing inside one drain window — two nodes scaled in at once, or an
+eviction while a third drains — can therefore leave keys transiently
+below R: each leaver picks entrants from a roster that still lists the
+other, so a key whose owners included both comes out of the double-leave
+one handoff short. Nothing regresses (handoffs are put-if-absent) and
+reads keep landing on the surviving copies; a key that does lose its
+last copy is a cache miss, not corruption. There is no anti-entropy
+sweep: the gap closes per key as a later ring change re-ranks it, a
+client rewrites it, or its TTL turns it over — and it never opens at all
+when scale-in retires one node at a time.</p>
 <p>Liveness is binary, though: a node that is slow but still answering is
 never evicted, and every request that touches it waits out its round
 trip — with <em>R</em> copies on <em>N</em> nodes, about <em>R/N</em> of

@@ -590,7 +590,10 @@ struct NodeContext {
 /// roster alone, which single node newly enters each of its keys' top-R
 /// once it is gone (removing a node from an HRW ranking can only
 /// promote the previous rank-R+1 node), and hands that node the entry —
-/// the surviving owners already hold their copies.
+/// the surviving owners already hold their copies. Both rings are a
+/// one-shot snapshot of membership at drain start, never recomputed —
+/// see `run_decommission`'s doc comment for the concurrent-membership-
+/// change window this accepts (issue #357).
 struct LeaveState {
     /// The roster including this node — what routing looked like when
     /// the drain began.
@@ -4589,6 +4592,26 @@ async fn drain_pending_clears(
 /// (the process is exiting either way; clean membership beats a
 /// liveness-timeout ghost), degrading to today's crash semantics for
 /// the untransferred remainder.
+///
+/// Issue #357 — a documented tradeoff, not a defect: the ring pair from
+/// step 2 is one roster snapshot, never recomputed, and nothing tells a
+/// survivor's `run_rereplication` that a draining node intends to
+/// leave. Two membership changes landing inside one drain window — most
+/// plausibly two nodes scaled in at once, or an eviction while a third
+/// drains — can therefore leave keys transiently below R: each leaver
+/// picks entrants from a roster that still lists the other, so a key
+/// whose top-R contained both comes out of the double-leave with one
+/// handoff nobody performed (and at R=1, a handoff chained through the
+/// other leaver can be dropped outright — the recipient's own snapshot
+/// predates this node's `V`, so it classifies the key `NotOwned`).
+/// Accepted because the failure mode is bounded by cache semantics:
+/// handoffs are put-if-absent so nothing regresses, reads keep landing
+/// on the surviving copies via `W`-refresh, and a key that does lose
+/// its last copy is a miss, not corruption. There is no full
+/// anti-entropy: the gap closes per key as a later ring change re-ranks
+/// it, a client rewrites it, or its TTL turns it over. Operators avoid
+/// the window entirely by scaling in one node at a time — see
+/// docs/deployment.html ("Node: decommission").
 /// Issue #233: how `run_decommission`'s transfer loop disposes of one key
 /// — extracted so the deadline-vs-ownership ordering has a unit test that
 /// doesn't need a full network harness. A key this node never owned is
@@ -5372,6 +5395,14 @@ async fn spawn_or_supersede_rereplication(
 /// this can never regress a newer client write that raced it. Returns
 /// once every key has been considered, `abort_requested` is set (a
 /// superseding ring change), or shutdown lands.
+///
+/// Issue #357: this heals exactly the keys the triggering ring change
+/// re-ranked (`rereplication_targets` diffs `before_ring` against
+/// `after_ring`) — it is not anti-entropy, and it has no idea a member
+/// still present in both rings is mid-decommission. A key left below R
+/// by an earlier, unrelated window (see `run_decommission`'s doc
+/// comment) is only picked up here if a later change happens to re-rank
+/// it.
 ///
 /// Issue #295: a target this node has no membership token for (missing
 /// from `tokens`) is skipped exactly like a target with no address —
