@@ -103,6 +103,18 @@ reclaim all get the graceful path with no extra hooks.</p>
 <p><code>--drain-timeout 0</code> skips the handoff (the old
 crash-equivalent shutdown) — acceptable for fast restarts at
 R&nbsp;≥&nbsp;2, where replicas cover the gap.</p>
+<p><strong>Scale in one node at a time.</strong> A draining node plans
+its entire handoff from one roster snapshot taken as the drain begins.
+Two nodes draining at once each plan against a roster that still lists
+the other, so a key whose owners included both can come out of the
+double-leave one replica short until a later membership change, a
+rewrite, or its TTL turns it over — and at R=1, a handoff that lands on
+the other leaver can be dropped outright (see
+<a href="architecture.html">Architecture</a> on the self-healing
+consistency model). Scale-in policies that step the desired count down
+one instance per action avoid the window entirely; a larger single step
+(or a spot reclaim of several instances at once) trades that safety for
+speed and should be reserved for R&nbsp;≥&nbsp;2.</p>
 
 <h3>Proxy: drain</h3>
 <p>On SIGTERM a proxy deregisters from discovery's proxy roster
