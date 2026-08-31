@@ -1,4 +1,5 @@
 use crate::key::Key;
+use crate::server::constant_time_eq;
 use bytes::Bytes;
 use lru::LruCache;
 use std::collections::hash_map::RandomState;
@@ -444,7 +445,15 @@ impl Cache {
             (CasCondition::Present, Some(_)) => true,
             (CasCondition::Present, None) => false,
             (CasCondition::Digest(expected), Some(entry)) => {
-                content_digest(&entry.value) == expected
+                // Issue #336: was a plain `==`. A CAS digest is derived
+                // from the value the caller must already be able to read
+                // (a `G` on the same key, or its own prior write) rather
+                // than a secret this comparison alone protects, but a
+                // byte-at-a-time `==` still leaks, via timing, how many
+                // leading bytes of a guessed digest matched — the same
+                // reasoning `constant_time_eq` already exists for on
+                // every secret/token comparison in `server.rs`.
+                constant_time_eq(&content_digest(&entry.value), &expected)
             }
             (CasCondition::Digest(_), None) => false,
         }
@@ -1330,6 +1339,31 @@ mod tests {
         let mut cache = Cache::new(UNBOUNDED);
 
         assert!(!cache.cas_delete(&key(b"name"), content_digest(b"Alice")));
+    }
+
+    #[test]
+    fn cas_set_digest_condition_is_sensitive_to_a_single_trailing_byte() {
+        // Regression (issue #336): guards the `constant_time_eq` swap in
+        // `condition_holds_at` against a broken refactor (e.g. comparing
+        // the wrong slice, or stopping at the first mismatch and missing
+        // a later differing byte) — a digest differing in only its last
+        // byte must still be rejected.
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(key(b"name"), Bytes::from_static(b"Alice"));
+
+        let mut almost_right = content_digest(b"Alice");
+        *almost_right.last_mut().unwrap() ^= 0xff;
+
+        assert_eq!(
+            cache.cas_set(
+                &key(b"name"),
+                CasCondition::Digest(almost_right),
+                Bytes::from_static(b"Bob"),
+                None
+            ),
+            CasResult::Mismatch
+        );
+        assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
     }
 
     #[test]
