@@ -691,6 +691,13 @@ struct RegistryState {
     /// invalidates on every relevant mutation, so no separate bump is
     /// needed here — see `cached_list_response`.
     list_cache: Mutex<Option<CachedList>>,
+    /// The `T` (NodeRoster) response, cached the same way (issue #356):
+    /// `T` renders every entry's name/address/token regardless of state,
+    /// a strictly broader view than `L`/`H`'s `Joined`-only roster, so
+    /// `generation` is bumped on *every* mutation of that view (see
+    /// `bump_roster`) — the Waiting/Joining-only mutations that never
+    /// mattered to the other two caches included.
+    roster_cache: Mutex<Option<CachedRoster>>,
 }
 
 impl Default for RegistryState {
@@ -703,6 +710,7 @@ impl Default for RegistryState {
             generation: AtomicU64::new(0),
             heartbeat_ack: Mutex::new(None),
             list_cache: Mutex::new(None),
+            roster_cache: Mutex::new(None),
         }
     }
 }
@@ -717,6 +725,16 @@ type Registry = Arc<RegistryState>;
 /// serve a stale roster, the #61 bug). `Relaxed` is enough: the value is
 /// only ever compared for equality against a previously-read snapshot,
 /// and each bump happens under the `nodes` lock the rebuild also takes.
+///
+/// Issue #356: `cached_node_roster` (`T`) also keys off this counter, and
+/// its view is broader — every entry's name/address/token regardless of
+/// state — so mutations invisible to `L`/`H` bump too: a `J` registering
+/// or re-addressing a `Waiting` node, a `Waiting` eviction in
+/// `sweep_expired`, an abandoned join's `Joining` removal, and
+/// `on_node_connection_ended`'s owned-entry removal. Those bumps
+/// invalidate the `L`/`H` caches for nothing, but that's the documented
+/// "generous" tradeoff above; membership churn stays far rarer than the
+/// requests the caches serve.
 fn bump_roster(registry: &Registry) {
     registry.generation.fetch_add(1, Ordering::Relaxed);
 }
@@ -744,6 +762,20 @@ struct CachedAck {
 /// grace is time-, not membership-gated, so it stays outside the cache and
 /// is handled by the caller.
 struct CachedList {
+    generation: u64,
+    replication: usize,
+    response: Arc<[u8]>,
+}
+
+/// The cached `T` (NodeRoster) response and the `generation` it was built
+/// at (issue #356) — `CachedList`'s sibling for
+/// `RegistryState::roster_cache`. Unlike `L`/`H` there is no folded-in
+/// refuse decision: `T` skips the replication vote entirely (see the
+/// handler's own comment), so the cached bytes are always a full `N`
+/// listing. The per-requester authentication and the `list_ready_at`
+/// startup grace both stay outside the cache, handled by the caller —
+/// the former is per-connection, the latter time- not membership-gated.
+struct CachedRoster {
     generation: u64,
     replication: usize,
     response: Arc<[u8]>,
@@ -2517,7 +2549,8 @@ async fn start_join(
             return Err(JoinRejection::MigrateMessageTooLarge { message_len });
         }
 
-        if !guard.contains_key(name) {
+        let newly_registered = !guard.contains_key(name);
+        if newly_registered {
             println!("INFO node registered: {name} at {address} (waiting to join)");
         }
         // Captured once, at registration, for `waiting_timeout_for` — see
@@ -2541,8 +2574,15 @@ async fn start_join(
         // which may differ from the first registration's — same as
         // `apply_announce_to_existing` does for `P`. Not once `Joining`:
         // the in-flight handoff was dispatched against the recorded one.
+        let address_changed = info.state == NodeState::Waiting && info.address != address;
         if info.state == NodeState::Waiting {
             info.address = address;
+        }
+        // Issue #356: a `Waiting` entry appearing (or moving address) is
+        // invisible to `L`/`H` but not to `T`'s every-state roster —
+        // bumped here, still under `guard`, per `bump_roster`'s invariant.
+        if newly_registered || address_changed {
+            bump_roster(registry);
         }
         // Issue #3/#9: unconditionally overwritten on every accepted `J`
         // for this name — including a duplicate reusing an existing
@@ -2707,6 +2747,12 @@ async fn on_node_connection_ended(
         });
 
         let removed = if owns_entry { guard.remove(name) } else { None };
+        // Issue #356: same as `abandon_current_join`'s removal — a
+        // Waiting/Joining entry leaving the registry only matters to `T`,
+        // whose cache keys off this generation.
+        if removed.is_some() {
+            bump_roster(registry);
+        }
         (removed, owns_entry)
     };
 
@@ -2784,7 +2830,17 @@ async fn abandon_current_join(
     // re-joining). Wake it; the re-check in `wait_for_promotion` sees the
     // entry is gone and errors the connection closed, so the node's
     // heartbeat loop redials and re-`J`s.
-    let stranded = lock(registry).remove(&pending.joining_name);
+    let stranded = {
+        let mut guard = lock(registry);
+        let stranded = guard.remove(&pending.joining_name);
+        // Issue #356: a `Joining` entry leaving the registry is invisible
+        // to `L`/`H` but not to `T`'s every-state roster — bumped under
+        // `guard`, per `bump_roster`'s invariant.
+        if stranded.is_some() {
+            bump_roster(registry);
+        }
+        stranded
+    };
     if let Some(info) = stranded {
         info.promoted.notify_waiters();
         info.promoted.notify_one();
@@ -3624,6 +3680,92 @@ fn cached_list_response(registry: &Registry, replication: usize) -> Arc<[u8]> {
     response
 }
 
+/// The `T` (NodeRoster) response: `N <count> <replication>\n` then one
+/// `<name-len> <addr-len> <token-len>\n<name><addr><token>\n` per
+/// registered node — `build_list_response`'s sibling for `T`'s
+/// token-carrying, every-state listing (see the `NodeRoster` handler for
+/// why `Waiting`/`Joining` entries belong in it).
+fn build_node_roster_response(entries: &[(String, String, String)], replication: usize) -> Vec<u8> {
+    let mut response = format!("N {} {}\n", entries.len(), replication).into_bytes();
+    for (name, addr, token) in entries {
+        response.extend_from_slice(
+            format!("{} {} {}\n", name.len(), addr.len(), token.len()).as_bytes(),
+        );
+        response.extend_from_slice(name.as_bytes());
+        response.extend_from_slice(addr.as_bytes());
+        response.extend_from_slice(token.as_bytes());
+        response.push(b'\n');
+    }
+    response
+}
+
+/// The `T` response, cached and rebuilt only when the registry's
+/// `generation` has moved since the last build (issue #356) —
+/// `cached_list_response`'s sibling for `T`. Before this, every `T`
+/// scanned and re-serialized the whole registry (up to
+/// `MAX_REGISTRY_SIZE` entries) under the registry lock per request; the
+/// call is internal, authenticated, and comparatively rare, but an
+/// already-authenticated node tight-looping `T` was still an
+/// O(registry)-per-request load source with none of that excuse. `T`'s
+/// view is broader than `L`/`H`'s (every state, tokens included), which
+/// is why `bump_roster` also fires on the Waiting/Joining-only mutations
+/// — see its doc comment for the list.
+///
+/// No refuse case to fold in (no replication vote, per the handler's own
+/// comment); requester authentication and the `list_ready_at` startup
+/// grace are the caller's, exactly as they are for `L`/`H`.
+fn cached_node_roster(registry: &Registry, replication: usize) -> Arc<[u8]> {
+    let generation = registry.generation.load(Ordering::Relaxed);
+    {
+        let cached = registry
+            .roster_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(current) = cached.as_ref()
+            && current.generation == generation
+            && current.replication == replication
+        {
+            return Arc::clone(&current.response);
+        }
+    }
+
+    // Rebuild: read the generation under the registry lock so it matches
+    // the entries this snapshot serializes (a concurrent bump lands
+    // either fully before or fully after this critical section) — mirrors
+    // `cached_list_response`.
+    let entries: Vec<(String, String, String)>;
+    let built_generation;
+    {
+        let guard = lock(registry);
+        built_generation = registry.generation.load(Ordering::Relaxed);
+        entries = guard
+            .iter()
+            .map(|(name, info)| (name.clone(), info.address.clone(), info.token.clone()))
+            .collect();
+    }
+
+    let response: Arc<[u8]> =
+        Arc::from(build_node_roster_response(&entries, replication).as_slice());
+
+    let mut cached = registry
+        .roster_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Only advance the cache — a concurrent rebuild that already stored a
+    // newer generation for this same replication must not be overwritten
+    // with this older one.
+    if cached.as_ref().is_none_or(|current| {
+        current.replication != replication || current.generation <= built_generation
+    }) {
+        *cached = Some(CachedRoster {
+            generation: built_generation,
+            replication,
+            response: Arc::clone(&response),
+        });
+    }
+    response
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sweep_expired(
     registry: Registry,
@@ -3696,10 +3838,11 @@ async fn sweep_expired(
                         keep
                     });
                     // Evicting a `Joined` node changes the heartbeat-ack
-                    // roster (issue #95); Waiting evictions don't (they're
-                    // never in it). Issue #279: bumped here, still under
-                    // `guard`, rather than after it drops.
-                    if !heartbeat_evicted.is_empty() {
+                    // roster (issue #95); a `Waiting` eviction changes only
+                    // `T`'s every-state roster, which keys off the same
+                    // generation (issue #356). Issue #279: bumped here,
+                    // still under `guard`, rather than after it drops.
+                    if !heartbeat_evicted.is_empty() || !waiting_evicted.is_empty() {
                         bump_roster(&registry);
                     }
                 }
@@ -4110,24 +4253,13 @@ async fn handle_connection(
                 // this is an internal, already-authenticated, comparatively
                 // rare call (decommission, eviction re-replication), not
                 // the hot client-routing path that protection guards.
-                let entries: Vec<(String, String, String)> = {
-                    let reg = lock(&registry);
-                    reg.iter()
-                        .map(|(name, info)| {
-                            (name.clone(), info.address.clone(), info.token.clone())
-                        })
-                        .collect()
-                };
-                let mut response = format!("N {} {}\n", entries.len(), config.replication);
-                for (entry_name, addr, entry_token) in &entries {
-                    response.push_str(&format!(
-                        "{} {} {}\n{entry_name}{addr}{entry_token}\n",
-                        entry_name.len(),
-                        addr.len(),
-                        entry_token.len()
-                    ));
-                }
-                write_response(&mut stream, response.as_bytes()).await?;
+                //
+                // Issue #356: this used to scan and re-serialize the whole
+                // registry per request; the roster now comes from
+                // `cached_node_roster`, rebuilt only when the registry
+                // actually changes — see its own doc comment.
+                let response = cached_node_roster(&registry, config.replication);
+                write_response(&mut stream, &response).await?;
                 continue;
             }
             Ok(DiscoveryCommand::NodeLeave { name, token }) => {
@@ -5560,6 +5692,162 @@ mod tests {
             );
         }
         assert_eq!(&*cached_list_response(&registry, 2), b"B\n");
+    }
+
+    #[test]
+    fn cached_node_roster_matches_a_fresh_render_and_reuses_the_buffer_until_the_generation_moves()
+    {
+        // Issue #356: `cached_node_roster` is `cached_list_response`'s
+        // sibling for `T` — mirrors that test. Seeded with one node per
+        // state to also lock in `T`'s every-state, token-carrying view
+        // (issue #295): all three must appear, unlike `L`/`H`.
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "node-a".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk-a", Some(2)),
+            );
+            guard.insert(
+                "node-b".to_string(),
+                NodeInfo::new(
+                    "127.0.0.1:9002".to_string(),
+                    NodeState::Joining,
+                    "tk-b".to_string(),
+                ),
+            );
+            guard.insert(
+                "node-c".to_string(),
+                NodeInfo::with_queue_position(
+                    "127.0.0.1:9003".to_string(),
+                    NodeState::Waiting,
+                    "tk-c".to_string(),
+                    1,
+                ),
+            );
+        }
+
+        let first = cached_node_roster(&registry, 2);
+        let second = cached_node_roster(&registry, 2);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "an unchanged registry must reuse the cached buffer, not rebuild it"
+        );
+        let fresh: Vec<(String, String, String)> = {
+            let guard = lock(&registry);
+            guard
+                .iter()
+                .map(|(name, info)| (name.clone(), info.address.clone(), info.token.clone()))
+                .collect()
+        };
+        assert_eq!(&*first, build_node_roster_response(&fresh, 2).as_slice());
+        assert!(
+            first.starts_with(b"N 3 2\n"),
+            "T must list every state, not just Joined"
+        );
+
+        // A registry change plus its generation bump forces a rebuild.
+        {
+            let mut guard = lock(&registry);
+            guard.remove("node-c");
+        }
+        bump_roster(&registry);
+        let third = cached_node_roster(&registry, 2);
+        assert!(
+            !Arc::ptr_eq(&second, &third),
+            "a registry change must invalidate the cache"
+        );
+        assert!(third.starts_with(b"N 2 2\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_cache_is_invalidated_by_a_waiting_registration() {
+        // Issue #356: a `J` registering a `Waiting` node is invisible to
+        // `L`/`H` but must invalidate the `T` cache — driven through the
+        // real `start_join` rather than a manual `bump_roster` call, so
+        // this fails if that handler ever stops bumping.
+        let registry: Registry = Arc::new(RegistryState::default());
+        // A join already in progress keeps the registration below in
+        // `Waiting` instead of auto-promoting it via the empty-registry
+        // bootstrap shortcut.
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        assert_eq!(&*cached_node_roster(&registry, 2), b"N 0 2\n");
+
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "waiter",
+            "127.0.0.1:9001".to_string(),
+            "tk-waiter".to_string(),
+            1,
+        )
+        .await
+        .expect("the registration must be admitted");
+
+        assert_eq!(
+            &*cached_node_roster(&registry, 2),
+            b"N 1 2\n6 14 9\nwaiter127.0.0.1:9001tk-waiter\n",
+            "the Waiting registration must invalidate the cache"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn t_cache_is_invalidated_by_a_waiting_eviction() {
+        // Issue #356's other half: `sweep_expired` reaping a `Waiting`
+        // node never bumped the generation (it's not in the `L`/`H`
+        // roster) — but it is in `T`'s, so the cache primed before the
+        // eviction must not survive it.
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "waiter".to_string(),
+            NodeInfo::with_queue_position(
+                "10.0.0.1:9000".to_string(),
+                NodeState::Waiting,
+                "tk-waiter".to_string(),
+                1,
+            ),
+        );
+        assert!(cached_node_roster(&registry, 2).starts_with(b"N 1 2\n"));
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(sweep_expired(
+            Arc::clone(&registry),
+            current_join,
+            None,
+            None,
+            2,
+            // Far in the future: keeps the post-grace kick (issue #63)
+            // from promoting this lone Waiting entry first.
+            Instant::now() + Duration::from_secs(365 * 86_400),
+            Duration::from_secs(60),
+            shutdown_rx,
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(waiting_timeout_for(1) + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(!lock(&registry).contains_key("waiter"));
+
+        assert_eq!(
+            &*cached_node_roster(&registry, 2),
+            b"N 0 2\n",
+            "the Waiting eviction must invalidate the cache"
+        );
+
+        shutdown_tx.send_replace(true);
+        sweep_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
