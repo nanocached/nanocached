@@ -22,7 +22,7 @@ pub(crate) const SWEEP_BUDGET: usize = 2_000;
 /// but real RSS a small-value workload pays for every entry. A rough,
 /// documented estimate rather than a measured constant (issue #19); if a
 /// closer figure is measured later, this is the only place to change it.
-const ENTRY_OVERHEAD_BYTES: usize = 100;
+pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 100;
 
 struct Entry {
     value: Bytes,
