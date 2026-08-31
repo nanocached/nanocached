@@ -2613,6 +2613,77 @@ public class NanocachedClientTests
         await Assert.ThrowsAsync<AlreadyClosedException>(() => client.ClearAllAsync());
     }
 
+    [Fact]
+    public async Task ARedialCompletedAfterCloseIsDiscardedRatherThanInstalled()
+    {
+        // Issue #330: once a slot's redial dial completes, the code that
+        // installs the freshly dialed connection into
+        // _single/member.Connection must recheck _closed first —
+        // otherwise a Close() that raced the (possibly slow) dial would
+        // leak that connection and its background read-loop task past
+        // Close() having already returned. Mirrors RefreshNodeListAsync's
+        // and OpenNodeConnectionAsync's own identical rechecks for the
+        // same shape of race.
+        //
+        // Unit-level fallback, not a true end-to-end race repro: the
+        // window this fix closes is the gap between
+        // OpenNodeConnectionAsync's OWN _closed check (which every dial
+        // path already passes through first, and which — being
+        // synchronous with the code below it, no further await in
+        // between — already throws AlreadyClosedException for any close
+        // that lands during the dial itself) and the install step a few
+        // statements later. Empirically, racing Close() against a
+        // MockNode-delayed dial (via DelayAuth), even by hundreds of
+        // milliseconds, is always intercepted by that earlier check
+        // first, well before reaching the install step — so no external
+        // timing can land in the actual (sub-microsecond) gap this fix
+        // guards. Given that, the install step was split out into
+        // InstallRedialedConnection (NanocachedClient.cs) specifically so
+        // it can be driven directly here: a real, legitimately-dialed
+        // connection is obtained first (while _closed is still false, so
+        // OpenNodeConnectionAsync's own check is not involved at all),
+        // then _closed is flipped, then InstallRedialedConnection is
+        // invoked with that connection — exercising exactly the branch
+        // this fix added, in isolation. Reverting the fix (removing the
+        // _closed check from InstallRedialedConnection) makes this test
+        // fail: the connection would be installed into _single and
+        // returned instead of being closed and rejected.
+        using var node = new MockNode();
+        NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        FieldInfo singleField = typeof(NanocachedClient)
+            .GetField("_single", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var originalConnection = (Connection)singleField.GetValue(client)!;
+
+        // A real, independent dial to the same node, made while _closed
+        // is still false — entirely outside SlotConnectionAsync/
+        // InstallRedialedConnection, so it stands in for "the redial
+        // already finished dialing" without tripping
+        // OpenNodeConnectionAsync's own check.
+        MethodInfo dialWithCooldownAsync = typeof(NanocachedClient)
+            .GetMethod("DialWithCooldownAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var dialTask = (Task<Connection>)dialWithCooldownAsync.Invoke(client, new object?[] { node.Address })!;
+        Connection fresh = await dialTask;
+
+        FieldInfo closedField = typeof(NanocachedClient)
+            .GetField("_closed", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        closedField.SetValue(client, true);
+
+        MethodInfo installRedialedConnection = typeof(NanocachedClient)
+            .GetMethod("InstallRedialedConnection", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
+        var thrown = Assert.Throws<TargetInvocationException>(
+            () => installRedialedConnection.Invoke(client, new object?[] { null, fresh }));
+        Assert.IsType<AlreadyClosedException>(thrown.InnerException);
+
+        // fresh must never have been installed: _single still refers to
+        // the original connection, unchanged, and fresh was torn down
+        // rather than leaked.
+        var afterInvoke = (Connection?)singleField.GetValue(client);
+        Assert.Same(originalConnection, afterInvoke);
+        Assert.True(fresh.IsClosed);
+    }
+
     // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     // A "did it wait for the mock's delay" assertion can't compare the
