@@ -367,7 +367,12 @@ async fn wait_until_connectable(addr: &str) -> io::Result<()> {
 async fn connect_timed(addr: &str) -> io::Result<TcpStream> {
     timeout(IO_TIMEOUT, TcpStream::connect(addr))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, format!("connect to {addr} timed out")))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("connect to {addr} timed out"),
+            )
+        })?
 }
 
 /// `write_all` bounded by `IO_TIMEOUT` (issue #329) — without this, a
@@ -395,7 +400,10 @@ async fn read_line(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Result<Str
         let bytes_read = timeout(IO_TIMEOUT, stream.read(&mut chunk))
             .await
             .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "read timed out while reading a line")
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "read timed out while reading a line",
+                )
             })??;
 
         if bytes_read == 0 {
@@ -420,7 +428,10 @@ async fn read_exact_into(
         let bytes_read = timeout(IO_TIMEOUT, stream.read(&mut chunk))
             .await
             .map_err(|_| {
-                io::Error::new(io::ErrorKind::TimedOut, "read timed out while reading a body")
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "read timed out while reading a body",
+                )
             })??;
 
         if bytes_read == 0 {
