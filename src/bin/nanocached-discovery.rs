@@ -4144,25 +4144,48 @@ async fn handle_connection(
                         // Left unabandoned, the join would stall until
                         // `migration_timeout_for` (up to 2h) reaps it
                         // instead of moving on immediately.
-                        if removed_state == Some(NodeState::Joined) {
-                            let ready_member_left_mid_join = lock_current_join(&current_join)
+                        //
+                        // Issue #323: the *joining* node itself (state
+                        // Joining or Waiting) can also send an explicit
+                        // `V` to abort its own pending join — this must
+                        // abandon `current_join` the same way its
+                        // connection dying does in
+                        // `on_node_connection_ended` (which checks
+                        // `pending.joining_name == name` regardless of
+                        // state). Before this fix only a `Joined` removal
+                        // was ever checked here, so a self-`V` from the
+                        // joining node left `current_join` pointing at an
+                        // entry that no longer exists — stalling every
+                        // later join behind it until
+                        // `migration_timeout_for` eventually reaps the
+                        // ghost.
+                        let abandon_reason = match removed_state {
+                            Some(NodeState::Joined) => lock_current_join(&current_join)
                                 .as_ref()
                                 .is_some_and(|pending| {
                                     pending.expected.contains_key(&name)
                                         && !pending.completed.contains(&name)
-                                });
-                            if ready_member_left_mid_join {
-                                abandon_current_join(
-                                    &registry,
-                                    &current_join,
-                                    &config.auth_secret,
-                                    &config.tls_connector,
-                                    config.replication,
-                                    config.list_ready_at,
-                                    "ready member left mid-join",
-                                )
-                                .await;
+                                })
+                                .then_some("ready member left mid-join"),
+                            Some(NodeState::Joining) | Some(NodeState::Waiting) => {
+                                lock_current_join(&current_join)
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.joining_name == name)
+                                    .then_some("joining node left mid-join")
                             }
+                            None => None,
+                        };
+                        if let Some(reason) = abandon_reason {
+                            abandon_current_join(
+                                &registry,
+                                &current_join,
+                                &config.auth_secret,
+                                &config.tls_connector,
+                                config.replication,
+                                config.list_ready_at,
+                                reason,
+                            )
+                            .await;
                         }
 
                         write_response(&mut stream, b"R\n").await?;
@@ -7872,6 +7895,163 @@ mod tests {
             !lock(&registry).contains_key("node-b"),
             "abandon_current_join must also strand the joining node's own entry"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_v_from_the_joining_node_itself_abandons_its_own_join() {
+        // Regression for issue #323: before this fix, `NodeLeave`
+        // (`V`) only abandoned `current_join` when the *removed* node
+        // was an already-`Joined` ready member (issue #297's fix,
+        // sibling test above). A Joining node sending `V` for itself —
+        // e.g. to abort its own pending join — removed its registry
+        // entry but left `current_join` pointing at that now-gone name,
+        // stalling every later join behind it until
+        // `migration_timeout_for` (up to 2h) eventually reaped the
+        // ghost. `on_node_connection_ended` already treats this the
+        // same regardless of state (`pending.joining_name == name`);
+        // this handler must match that.
+        //
+        // A second node, node-c, is left `Waiting` so this also proves
+        // `try_begin_next_join` picks it up once the abandoned join
+        // clears `current_join` — its state flips to `Joining`
+        // synchronously, before `abandon_current_join`'s awaited `M`
+        // fanout to node-a even resolves.
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-c".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:3".to_string(),
+                NodeState::Waiting,
+                "tk-node-c".to_string(),
+            ),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_b, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        node_b.write_all(b"V 6 9\nnode-btk-node-b").await.unwrap();
+        let mut ack = [0u8; 2];
+        node_b.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"R\n");
+
+        assert!(!lock(&registry).contains_key("node-b"));
+        assert_eq!(
+            lock_current_join(&current_join)
+                .as_ref()
+                .map(|pending| pending.joining_name.clone()),
+            Some("node-c".to_string()),
+            "abandoning node-b's own join must let try_begin_next_join start node-c's"
+        );
+        assert_eq!(
+            lock(&registry).get("node-c").map(|info| info.state),
+            Some(NodeState::Joining),
+            "node-c must have been picked up as the next join once node-b's was abandoned"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_v_from_a_waiting_node_matching_the_current_join_abandons_it() {
+        // Regression for issue #323, the `Waiting` half of the fix above:
+        // the matching logic must key off `current_join.joining_name`,
+        // not the removed node's own state — `on_node_connection_ended`
+        // already does this unconditionally. This registry doesn't
+        // naturally reach a `Waiting` node being `current_join`'s
+        // `joining_name` (that transition flips the state to `Joining`
+        // atomically under the same lock, see `try_begin_next_join`),
+        // but the handler must not silently rely on that invariant
+        // holding forever — it checks name, not state, exactly like
+        // `on_node_connection_ended` does.
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Waiting,
+                "tk-node-b".to_string(),
+            ),
+        );
+
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+        })));
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_b, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        node_b.write_all(b"V 6 9\nnode-btk-node-b").await.unwrap();
+        let mut ack = [0u8; 2];
+        node_b.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"R\n");
+
+        assert!(
+            lock_current_join(&current_join).is_none(),
+            "the join must be abandoned once its joining node (still Waiting) explicitly leaves"
+        );
+        assert!(!lock(&registry).contains_key("node-b"));
     }
 
     #[tokio::test(flavor = "current_thread")]
