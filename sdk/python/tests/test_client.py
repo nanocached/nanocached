@@ -3415,6 +3415,55 @@ class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_cancelling_the_synchronous_wait_past_the_cap_does_not_leak_the_leg(self):
+        # issue #364, follow-up to #324's fix (PR #352): resolve_losers's
+        # over-cap branch discards its tasks from self._hedged_reads
+        # *before* synchronously awaiting them. If that wait is itself
+        # what gets cancelled (the caller gave up while resolve_losers was
+        # joining an over-cap batch), the outer loop's own
+        # `except asyncio.CancelledError: detach(pending)` finds those
+        # tasks already missing from self._hedged_reads — add_done_callback
+        # there is a no-op on a set that no longer holds them — so the
+        # still-running leg never makes it into close()'s drain. The fix
+        # re-adds the tasks to self._hedged_reads before re-raising so
+        # detach() has something to act on, same as an ordinary loser.
+        self._client_module._MAX_INFLIGHT_HEDGE_LOSER_LEGS = 0
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.02
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.3)
+
+                # The replica answers right away once hedged to (a
+                # decisive outcome), leaving the still-slow primary as the
+                # loser resolve_losers's over-cap branch synchronously
+                # joins — that join is what asyncio.wait_for below
+                # interrupts, well before the primary's 0.3s delay elapses.
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.get("k"), timeout=0.08)
+
+                self.assertEqual(
+                    len(client._hedged_reads),
+                    1,
+                    "the orphaned over-cap leg must still be registered for close() to drain",
+                )
+
+                await wait_for(
+                    lambda: client._hedged_reads == set(),
+                    "the orphaned leg to finish on its own and be discarded",
+                )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
     """Issue #67: connect() must tolerate a node that discovery still lists

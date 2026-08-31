@@ -2121,7 +2121,21 @@ class NanocachedClient:
                 return
             for task in tasks:
                 self._hedged_reads.discard(task)
-            await asyncio.wait(tasks)
+            try:
+                await asyncio.wait(tasks)
+            except asyncio.CancelledError:
+                # issue #364, follow-up to #324's fix (PR #352): if this
+                # wait itself is what gets cancelled (the caller gave up
+                # while we were synchronously joining an over-cap batch),
+                # the discard above already ran, so the outer loop's own
+                # `except asyncio.CancelledError: detach(pending)` finds
+                # these tasks no longer in self._hedged_reads —
+                # add_done_callback there just arms a callback on a task
+                # that's already absent from the set, a no-op. Re-add them
+                # here first so that outer detach() has something to work
+                # on, same as an ordinary loser that never hit the cap.
+                self._hedged_reads.update(tasks)
+                raise
 
         pending: set[asyncio.Task[object]] = {start(0)}
         next_index = 1
