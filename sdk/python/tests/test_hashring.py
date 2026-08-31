@@ -68,6 +68,28 @@ class HashRingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ring.route(b"k")
 
+    def test_duplicate_node_names_are_deduplicated(self):
+        # Regression (issue #360, mirrors src/hash_ring.rs's HashRing::new
+        # dedupe from issue #328): before this fix, a name repeated in the
+        # constructor's node list scored independently for each of its
+        # slots, so owners() could return the same node name more than
+        # once in the top-`replicas` set — inflating its effective share
+        # of the ring.
+        ring = HashRing(["a", "b", "b", "b", "c", "d"])
+        self.assertEqual(ring.owners(b"some-key", 0), [])
+        for replicas in range(6):
+            owners = ring.owners(b"some-key", replicas)
+            self.assertEqual(
+                len(set(owners)), len(owners), f"replicas={replicas} owners={owners}"
+            )
+
+        # Construction order is otherwise unaffected: the first
+        # occurrence of a repeated name is kept in place.
+        deduped = HashRing(["a", "b", "c", "d"])
+        for i in range(50):
+            key = f"key-{i}".encode()
+            self.assertEqual(ring.owners(key, 3), deduped.owners(key, 3))
+
 
 class NamespaceCrossLanguageVectorTests(unittest.TestCase):
     # Namespaces (issue #105): pinned outputs of key_hash(namespace, key)
