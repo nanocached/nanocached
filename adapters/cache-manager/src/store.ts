@@ -69,6 +69,16 @@ export interface NanocachedStoreConfig extends Config {
 // bypassing the configured default entirely (mirroring how Django's
 // `get_backend_timeout` only consults `default_timeout` when the caller
 // passed nothing at all, not when it passed an explicit negative).
+//
+// Issue #333: the same leak existed one level up — a *negative*
+// `defaultTtlMs` (the constructor's configured default, `Config.ttl`)
+// used to fall straight through to `effectiveMs <= 0` and return `0`,
+// i.e. "no expiry", the exact silent-immortal-entry bug #300 fixed for
+// the per-call case, just missed for the configured-default case. There
+// is no principled reason a negative default should mean something
+// different from a negative per-call value — both are "already expired"
+// — so `effectiveMs` (whichever of the two won) is now checked for
+// negativity the same way, after the per-call short-circuit above.
 const DO_NOT_CACHE = Symbol("nanocached-cache-manager: do not write, delete instead");
 
 function resolveTtlSeconds(
@@ -77,7 +87,9 @@ function resolveTtlSeconds(
 ): number | typeof DO_NOT_CACHE {
   if (ttlMs !== undefined && ttlMs < 0) return DO_NOT_CACHE;
   const effectiveMs = ttlMs !== undefined && ttlMs > 0 ? ttlMs : defaultTtlMs;
-  if (effectiveMs === undefined || effectiveMs <= 0) return 0;
+  if (effectiveMs === undefined) return 0;
+  if (effectiveMs < 0) return DO_NOT_CACHE;
+  if (effectiveMs === 0) return 0;
   return Math.ceil(effectiveMs / 1000);
 }
 
@@ -139,7 +151,22 @@ export class NanocachedStore implements Store {
       await this.ns.delete(key);
       return;
     }
-    await this.ns.set(key, JSON.stringify(data), wireTtl);
+    // Issue #333: `JSON.stringify` doesn't throw for a function, a
+    // `Symbol`, or another top-level non-serializable value — it just
+    // returns the *value* `undefined` (not the string "undefined"). Left
+    // unchecked, that `undefined` would reach `ns.set` and produce a
+    // confusing raw error deep inside the SDK instead of a clear one at
+    // this store's own boundary, right where the actual mistake (the
+    // caller's value shape) is.
+    const serialized = JSON.stringify(data);
+    if (serialized === undefined) {
+      throw new TypeError(
+        `nanocached-cache-manager: set(${JSON.stringify(key)}) value could not be JSON-serialized — ` +
+          "JSON.stringify() returned undefined, which usually means the value is a function, a Symbol, " +
+          "or another type JSON has no representation for.",
+      );
+    }
+    await this.ns.set(key, serialized, wireTtl);
   }
 
   async del(key: string): Promise<void> {
@@ -185,7 +212,16 @@ export class NanocachedStore implements Store {
     const values: Record<string, string> = {};
     for (const [key, value] of entries) {
       if (value === undefined) continue;
-      values[key] = JSON.stringify(value);
+      // Issue #333: same JSON.stringify-can-return-undefined guard as set().
+      const serialized = JSON.stringify(value);
+      if (serialized === undefined) {
+        throw new TypeError(
+          `nanocached-cache-manager: mset() value for key ${JSON.stringify(key)} could not be JSON-serialized — ` +
+            "JSON.stringify() returned undefined, which usually means the value is a function, a Symbol, " +
+            "or another type JSON has no representation for.",
+        );
+      }
+      values[key] = serialized;
     }
     if (Object.keys(values).length === 0) return;
     await this.ns.setMany(values, wireTtl);
