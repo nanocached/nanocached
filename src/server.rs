@@ -3981,8 +3981,24 @@ fn migration_rings(
     if !before_members.iter().any(|name| name == &node_context.name) {
         before_members.push(node_context.name.clone());
     }
+    // Issue #328: `joined` is a snapshot of a live discovery roster, with
+    // no guarantee it's free of duplicate names — `adopt_membership`
+    // (`known_ring`'s own update path) applies this identical
+    // `sort_unstable` + `dedup` to its membership list before building a
+    // `HashRing` from it; this path built one straight from `joined`
+    // without it. A duplicate here silently breaks `HashRing::is_owner`
+    // and `owners` agreeing with each other (see their doc comments),
+    // which is exactly what this function's before/after rings decide
+    // handoff roles from. `HashRing::new` now also dedupes defensively,
+    // but doing it here too keeps `before_members`/`after_members`
+    // themselves accurate for anything that inspects them directly.
+    before_members.sort_unstable();
+    before_members.dedup();
+
     let mut after_members = before_members.clone();
     after_members.push(joining_name.to_string());
+    after_members.sort_unstable();
+    after_members.dedup();
 
     (HashRing::new(before_members), HashRing::new(after_members))
 }
@@ -9391,6 +9407,74 @@ mod tests {
             found,
             "the sample must contain a key with node-b ranked above node-a"
         );
+    }
+
+    #[test]
+    fn migration_rings_deduplicates_a_repeated_name_in_the_joined_roster() {
+        // Regression (issue #328): `joined` is a snapshot of a live
+        // discovery roster, with no guarantee it's free of duplicate
+        // names — unlike `adopt_membership`'s membership list, which is
+        // `sort_unstable` + `dedup`ed before becoming a `HashRing`. A
+        // duplicate silently broke `HashRing::is_owner`/`owners`
+        // agreement (see their doc comments), which is exactly what this
+        // function's before/after rings are used to decide handoff roles
+        // from.
+        let node_context = NodeContext {
+            name: "self".to_string(),
+            token: "tok-self".to_string(),
+            discovery_addr: "127.0.0.1:1".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let joined = vec![
+            ("node-b".to_string(), "127.0.0.1:2".to_string()),
+            ("node-b".to_string(), "127.0.0.1:2".to_string()),
+            ("self".to_string(), "127.0.0.1:1".to_string()),
+        ];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner", &joined);
+
+        let mut before_nodes = before_ring.nodes().to_vec();
+        before_nodes.sort_unstable();
+        assert_eq!(
+            before_nodes,
+            vec!["node-b".to_string(), "self".to_string()],
+            "the repeated \"node-b\" entry must collapse to one member"
+        );
+
+        let mut after_nodes = after_ring.nodes().to_vec();
+        after_nodes.sort_unstable();
+        assert_eq!(
+            after_nodes,
+            vec![
+                "joiner".to_string(),
+                "node-b".to_string(),
+                "self".to_string()
+            ]
+        );
+
+        // With the duplicate collapsed, `owners`/`is_owner` must agree
+        // for every member across every replication factor.
+        let k = key(b"some-key");
+        for ring in [&before_ring, &after_ring] {
+            for replicas in 0..=ring.nodes().len() {
+                let owners = ring.owners(&k, replicas);
+                for name in ring.nodes() {
+                    assert_eq!(
+                        owners.contains(&name.as_str()),
+                        ring.is_owner(&k, name, replicas),
+                        "name={name} replicas={replicas} owners={owners:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

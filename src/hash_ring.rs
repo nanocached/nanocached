@@ -39,6 +39,7 @@
 //!   `config`) onto the same nodes.
 
 use crate::key::Key;
+use std::collections::HashSet;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -94,7 +95,26 @@ pub struct HashRing {
 }
 
 impl HashRing {
+    /// Issue #328 (defense in depth): every caller is expected to already
+    /// hand this a deduplicated membership list (`adopt_membership`'s
+    /// `sort_unstable` + `dedup`, and `migration_rings`'s copy of the
+    /// same as of this issue) — a repeated name otherwise makes
+    /// `is_owner` and `owners` silently disagree. `owners` scores every
+    /// element of the backing list independently, so one name occupying
+    /// more than one slot inflates its share of the top-`replicas`,
+    /// while `is_owner` (via `self.nodes.iter().position(..)` and the
+    /// `node == name` skip below it) treats every occurrence of a name
+    /// as the same single member. Deduplicating here — keeping the
+    /// first occurrence, so construction order is otherwise unaffected —
+    /// guards against a duplicate slipping through some caller this
+    /// doesn't know about, at a cost (one hash-set pass) construction
+    /// wasn't on any per-request hot path to begin with.
     pub fn new(nodes: Vec<String>) -> Self {
+        let mut seen = HashSet::with_capacity(nodes.len());
+        let nodes: Vec<String> = nodes
+            .into_iter()
+            .filter(|node| seen.insert(node.clone()))
+            .collect();
         let node_hashes = nodes.iter().map(|node| fnv1a(node.as_bytes())).collect();
         Self { nodes, node_hashes }
     }
@@ -335,6 +355,59 @@ mod tests {
             .map(|i| ring.route(&namespaced(format!("cache-{i}").as_bytes(), b"config")))
             .collect();
         assert!(primaries.len() > 1);
+    }
+
+    #[test]
+    fn duplicate_names_are_deduplicated_at_construction() {
+        // Issue #328: a repeated name in the input list must not survive
+        // into `nodes` — that's what keeps `is_owner` and `owners`
+        // agreeing (see `HashRing::new`'s doc comment).
+        let ring = HashRing::new(
+            ["a", "b", "b", "c", "a"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        );
+        assert_eq!(
+            ring.nodes(),
+            &["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn owners_and_is_owner_agree_even_if_a_duplicate_name_slips_through() {
+        // Regression (issue #328): before `HashRing::new` deduplicated,
+        // `owners` scored every element of the backing `Vec`
+        // independently — so a name repeated N times could occupy N
+        // slots of the returned top-`replicas` — while `is_owner`
+        // treated every occurrence of a name as the same single member
+        // (it looks up one index, then skips every node whose name
+        // equals it while counting how many others outrank it). The two
+        // disagreed on whether a duplicated node was "an owner".
+        let ring = HashRing::new(
+            ["a", "b", "b", "b", "c", "d"]
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        );
+        let k = key(b"some-key");
+
+        for replicas in 0..=5 {
+            let owners = ring.owners(&k, replicas);
+            for name in ["a", "b", "c", "d"] {
+                assert_eq!(
+                    owners.contains(&name),
+                    ring.is_owner(&k, name, replicas),
+                    "name={name} replicas={replicas} owners={owners:?}"
+                );
+            }
+            // No name should ever occupy more than one slot in the
+            // returned owner set.
+            let mut sorted = owners.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), owners.len(), "owners={owners:?}");
+        }
     }
 
     // `key_hash` for (ns, key), computed independently in Python from the
