@@ -3817,7 +3817,16 @@ async fn finish_cas_set(
 /// `finish_cas_set`'s retry path for both a primary `W` and a
 /// request-not-sent transport failure: re-fetches the current ring and
 /// runs the whole compare-and-set (primary leg, then the replica
-/// fan-out) again via `call`.
+/// fan-out) again via `call_non_idempotent`.
+///
+/// Issue #322: this used to call the unconditionally-retrying `call` —
+/// safe for `Set`/`Delete`, but `k` is exactly as non-idempotent here as
+/// it is on `finish_cas_set`'s own first attempt (see that function's
+/// doc comment and #293). Once this refanned `k` may have reached the
+/// primary's socket, replaying it on a redial risks re-evaluating (and
+/// possibly re-satisfying, or falsely failing) the condition against a
+/// value the first attempt already changed — the same double-apply
+/// `call_non_idempotent` exists to rule out for `refan_incr` (#272).
 async fn refan_cas_set(
     context: &ProxyContext,
     address: (&[u8], &[u8]),
@@ -3836,7 +3845,7 @@ async fn refan_cas_set(
     };
     match context
         .backends
-        .call(
+        .call_non_idempotent(
             context,
             primary,
             frame_cas_set(namespace, key, condition, value, ttl),
@@ -3919,7 +3928,10 @@ async fn fan_out_delete_result(
 }
 
 /// `finish_cas_delete`'s retry path for both a primary `W` and a
-/// request-not-sent transport failure.
+/// request-not-sent transport failure: re-runs the whole compare-and-delete
+/// again via `call_non_idempotent`, same #322 reasoning as
+/// `refan_cas_set` — `x` is no more idempotent than `k` once it may have
+/// reached the primary's socket.
 async fn refan_cas_delete(
     context: &ProxyContext,
     address: (&[u8], &[u8]),
@@ -3937,7 +3949,7 @@ async fn refan_cas_delete(
     };
     match context
         .backends
-        .call(
+        .call_non_idempotent(
             context,
             primary,
             frame_cas_delete(namespace, key, expected_digest),
@@ -7300,6 +7312,114 @@ mod tests {
             node.cas_deletes(),
             1,
             "exactly one `x` frame must reach the node — the retry, not a replay"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refan_cas_set_never_replays_once_the_primary_may_have_applied_it() {
+        // Issue #322: `refan_cas_set` used to retry its own primary leg
+        // via the unconditionally-retrying `call` — safe for
+        // `Set`/`Delete`, but `k` is exactly as non-idempotent here as it
+        // is on `finish_cas_set`'s first attempt (#293). Arms
+        // `close_after_cas_set_apply_once` on the node `refan_cas_set`
+        // itself dispatches to, proving the fix (`call_non_idempotent`)
+        // stops retrying a `k` that may have reached the primary instead
+        // of resending it and re-evaluating (and possibly misreporting)
+        // the condition against a value the first attempt already wrote.
+        let node = MockNode::start().await;
+        let ring = Arc::new(RingView::new(
+            vec![("node-a".to_string(), node.addr.clone())],
+            1,
+        ));
+        let context = ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(Some(ring)).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        node.close_after_cas_set_apply_once
+            .store(true, Ordering::SeqCst);
+        let outcome = refan_cas_set(
+            &context,
+            (b"", b"name"),
+            (CasCondition::Absent, b"Alice", None),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a lost reply after the refanned `k` may have applied must surface Fatal, not the answer to a replayed frame"
+        );
+        assert_eq!(
+            node.cas_sets(),
+            1,
+            "the lost-reply refan attempt must not be replayed onto the primary"
+        );
+        assert_eq!(
+            node.entry(b"", b"name"),
+            Some(b"Alice".to_vec()),
+            "the CAS must be applied exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refan_cas_delete_never_replays_once_the_primary_may_have_applied_it() {
+        // Same proof as
+        // `refan_cas_set_never_replays_once_the_primary_may_have_applied_it`,
+        // for `refan_cas_delete`/`x` (issue #322).
+        let node = MockNode::start().await;
+        let ring = Arc::new(RingView::new(
+            vec![("node-a".to_string(), node.addr.clone())],
+            1,
+        ));
+        let context = ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(Some(ring)).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        };
+
+        node.store
+            .lock()
+            .unwrap()
+            .insert((b"".to_vec(), b"name".to_vec()), b"Alice".to_vec());
+        let expected_digest = {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(b"Alice");
+            let mut digest = [0u8; 16];
+            digest.copy_from_slice(&hash[..16]);
+            digest
+        };
+
+        node.close_after_cas_delete_apply_once
+            .store(true, Ordering::SeqCst);
+        let outcome =
+            refan_cas_delete(&context, (b"", b"name"), expected_digest, None, false).await;
+
+        assert!(
+            outcome.is_err(),
+            "a lost reply after the refanned `x` may have applied must surface Fatal, not the answer to a replayed frame"
+        );
+        assert_eq!(
+            node.cas_deletes(),
+            1,
+            "the lost-reply refan attempt must not be replayed onto the primary"
+        );
+        assert_eq!(
+            node.entry(b"", b"name"),
+            None,
+            "the delete must be applied exactly once"
         );
     }
 
