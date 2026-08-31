@@ -2105,46 +2105,67 @@ class NanocachedClient:
         last_error: Exception | None = None
         replica_missed = False
 
-        while pending:
-            timeout = hedge_after if next_index < len(names) else None
-            done, pending = await asyncio.wait(
-                pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
-            )
-            if not done:
-                # Hedge interval elapsed with no answer: one more owner.
-                pending.add(start(next_index))
-                next_index += 1
-                continue
-            # issue #229: asyncio.wait(FIRST_COMPLETED) can return more
-            # than one finished task in `done` (e.g. the primary and a
-            # hedge leg failing in the same event-loop tick). Discard all
-            # of them from self._hedged_reads up front, before deciding
-            # the outcome below — a decisive outcome returns/raises from
-            # inside the loop, which would otherwise skip the discard for
-            # any task after the one that decided it, leaking it in
-            # _hedged_reads until close() and counting it against
-            # _MAX_INFLIGHT_HEDGE_LOSER_LEGS.
-            for task in done:
-                self._hedged_reads.discard(task)
-            for task in done:
-                index = legs[task]
-                try:
-                    value = task.result()
-                except WrongNodeError:
-                    await resolve_losers(pending)
-                    raise
-                except (NanocachedError, ConnectionError, OSError) as error:
-                    last_error = error
+        try:
+            while pending:
+                timeout = hedge_after if next_index < len(names) else None
+                done, pending = await asyncio.wait(
+                    pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    # Hedge interval elapsed with no answer: one more owner.
+                    pending.add(start(next_index))
+                    next_index += 1
                     continue
-                if value is not None or index == 0:
-                    await resolve_losers(pending)
-                    return value
-                replica_missed = True
-            if not pending and next_index < len(names):
-                # Everything so far failed or missed provisionally: the
-                # next owner gets its turn right away.
-                pending.add(start(next_index))
-                next_index += 1
+                # issue #229: asyncio.wait(FIRST_COMPLETED) can return more
+                # than one finished task in `done` (e.g. the primary and a
+                # hedge leg failing in the same event-loop tick). Discard all
+                # of them from self._hedged_reads up front, before deciding
+                # the outcome below — a decisive outcome returns/raises from
+                # inside the loop, which would otherwise skip the discard for
+                # any task after the one that decided it, leaking it in
+                # _hedged_reads until close() and counting it against
+                # _MAX_INFLIGHT_HEDGE_LOSER_LEGS.
+                for task in done:
+                    self._hedged_reads.discard(task)
+                for task in done:
+                    index = legs[task]
+                    try:
+                        value = task.result()
+                    except WrongNodeError:
+                        await resolve_losers(pending)
+                        raise
+                    except (NanocachedError, ConnectionError, OSError) as error:
+                        last_error = error
+                        continue
+                    if value is not None or index == 0:
+                        await resolve_losers(pending)
+                        return value
+                    replica_missed = True
+                if not pending and next_index < len(names):
+                    # Everything so far failed or missed provisionally: the
+                    # next owner gets its turn right away.
+                    pending.add(start(next_index))
+                    next_index += 1
+        except asyncio.CancelledError:
+            # issue #324: mirrors _write()'s own CancelledError handling
+            # (issue #189) — the caller gave up on this call (typically
+            # asyncio.wait_for(client.get(...), timeout)) while one or more
+            # legs `start()` registered in self._hedged_reads above were
+            # still running. Every leg only ever leaves that set via
+            # detach() or resolve_losers() below, both reached by the loop
+            # body above; cancelling out of the loop — whether at the
+            # asyncio.wait() call or at one of the resolve_losers() awaits
+            # — used to skip both, so `pending`'s legs stayed registered
+            # forever even after they finished running on their own. Past
+            # _MAX_INFLIGHT_HEDGE_LOSER_LEGS such leaks, resolve_losers()
+            # always takes its over-cap branch and hedging is permanently
+            # defeated. detach() here hands each still-running leg in
+            # `pending` the same done_callback a normal loser gets under
+            # the cap, so it still gets discarded once it finishes, without
+            # awaiting it here — cancellation propagates immediately, same
+            # as _write()'s primary leg.
+            detach(pending)
+            raise
 
         if replica_missed:
             return None
