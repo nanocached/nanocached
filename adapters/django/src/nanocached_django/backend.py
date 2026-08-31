@@ -130,8 +130,24 @@ async def _delete_all(handle, cache_keys: list) -> None:
     coroutine ``_run`` awaits — a plain generator expression passed
     straight to ``asyncio.gather`` isn't itself a coroutine (``_run``'s
     ``make_coro`` must return one, for ``run_coroutine_threadsafe``), so
-    this exists to be that coroutine."""
-    await asyncio.gather(*(handle.delete(cache_key) for cache_key in cache_keys))
+    this exists to be that coroutine.
+
+    Issue #332: ``return_exceptions=True`` so one leg raising doesn't stop
+    ``gather`` from waiting on the rest — plain ``gather`` re-raises the
+    first exception as soon as it's seen, before the other already-running
+    deletes are ever awaited, so their outcomes (including further
+    exceptions) are never observed here. That leaves this coroutine
+    returning while sibling deletes may still be in flight against the
+    node — an ambiguous state for a fan-out that's supposed to mean "all of
+    these are gone". Waiting for every leg first, then re-raising, matches
+    ``set_many``'s convention on this same class (see its comment): a
+    partial failure isn't collected per-key (``BaseCache.delete_many`` has
+    no per-key return value to collect it into, unlike ``set_many``), it
+    raises — just only after every leg has actually finished."""
+    results = await asyncio.gather(*(handle.delete(cache_key) for cache_key in cache_keys), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
 
 
 def _split_host_port(address: str) -> tuple[str, int]:
@@ -442,7 +458,24 @@ class NanocachedCache(BaseCache):
         if not cache_keys:
             return {}
         raw = self._run(lambda handle: handle.get_many_bytes(list(cache_keys)))
-        return {cache_keys[cache_key]: _decode_value(value) for cache_key, value in raw.items()}
+        # Issue #332: decoded per key, not as one dict comprehension —
+        # _decode_value's pickle.loads can raise on a single corrupt or
+        # cross-version-incompatible entry (UnpicklingError, EOFError,
+        # AttributeError, ImportError, ...; the exact exception depends on
+        # *how* the bytes are malformed, so this deliberately isn't narrowed
+        # to just UnpicklingError), and letting that abort the whole
+        # comprehension would fail every other key in the batch along with
+        # it. Django's own backends degrade per-key on a decode failure
+        # instead, so a bad entry is simply left out of the result here —
+        # matching what get() already does for a *missing* key, just for a
+        # value that turned out to be unreadable instead of absent.
+        decoded = {}
+        for cache_key, value in raw.items():
+            try:
+                decoded[cache_keys[cache_key]] = _decode_value(value)
+            except Exception:
+                continue
+        return decoded
 
     def set_many(self, data, timeout=DEFAULT_TIMEOUT, version=None):
         # One wire round trip per involved node (issue #152), via the

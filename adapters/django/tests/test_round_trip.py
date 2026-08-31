@@ -138,6 +138,60 @@ class RoundTripTests(unittest.TestCase):
         )
         self.assertEqual(self.cache.get_many(keys), {})
 
+    def test_get_many_skips_a_corrupt_entry_instead_of_failing_the_batch(self) -> None:
+        # Regression for issue #332: _decode_value's pickle.loads raising on
+        # one corrupt/incompatible entry used to abort get_many's whole dict
+        # comprehension, losing every other key in the batch along with it.
+        # Write the "bad" key's bytes directly into the mock node's store
+        # (bypassing set()/_encode_value, which would never produce this) to
+        # simulate corruption/incompatibility on the wire, the same way
+        # test_wire_key_matches_pickled_value reaches into ns_store directly.
+        self.cache.set("good", "fine")
+        wire_key = self.cache.make_key("bad", version=self.cache.version)
+        ROUNDTRIP_NODE.ns_store[(b"django", wire_key.encode())] = b"\xffnot a valid pickle stream"
+
+        result = self.cache.get_many(["good", "bad", "missing"])
+
+        self.assertEqual(result, {"good": "fine"})
+
+        # Only get_many degrades per-key — a direct get() on the same
+        # corrupt key still raises/propagates exactly as it did before.
+        with self.assertRaises(Exception):
+            self.cache.get("bad")
+
+    def test_delete_many_waits_for_every_leg_then_raises_on_a_failure(self) -> None:
+        # Regression for issue #332: _delete_all used plain asyncio.gather,
+        # which re-raises the first exception as soon as it's seen instead
+        # of waiting for every concurrently-dispatched delete() to finish —
+        # leaving sibling legs' outcomes unobserved. Patch one key's
+        # delete() to fail and assert (a) it still raises, surfacing the
+        # failure to the caller, and (b) every other key was still deleted
+        # (proving the fan-out ran all legs to completion, not abandoned
+        # mid-flight).
+        keys = [f"dm-fail-{i}" for i in range(5)]
+        for key in keys:
+            self.cache.set(key, "v")
+
+        handle = self.cache._namespace_handle
+        original_delete = handle.delete
+        failing_key = self.cache.make_key(keys[2], version=self.cache.version)
+
+        async def flaky_delete(cache_key):
+            if cache_key == failing_key:
+                raise RuntimeError("simulated delete failure")
+            return await original_delete(cache_key)
+
+        handle.delete = flaky_delete
+        try:
+            with self.assertRaises(RuntimeError):
+                self.cache.delete_many(keys)
+        finally:
+            handle.delete = original_delete
+
+        # Every other leg still completed despite the one failure.
+        surviving = [key for key in keys if key != keys[2]]
+        self.assertEqual(self.cache.get_many(surviving), {})
+
     def test_incr_and_decr(self) -> None:
         self.cache.set("counter", 10)
         self.assertEqual(self.cache.incr("counter"), 11)
