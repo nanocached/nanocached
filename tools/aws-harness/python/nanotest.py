@@ -41,7 +41,7 @@ async def cmd_write(label: str, count: int) -> int:
     client = await NanocachedClient.connect(addresses())
     for i in range(count):
         await client.set(f"x:{label}:{i}", f"v-{label}-{i}")
-    client.close()
+    await client.close()
     print(f"wrote {count} keys for label {label}")
     return 0
 
@@ -53,7 +53,7 @@ async def cmd_read(label: str, count: int) -> int:
         value = await client.get(f"x:{label}:{i}")
         if value != f"v-{label}-{i}":
             bad.append(i)
-    client.close()
+    await client.close()
     if bad:
         print(f"label {label}: {len(bad)}/{count} BAD (sample {bad[:5]})")
         return 1
@@ -74,7 +74,7 @@ async def cmd_preload(count: int) -> int:
         await asyncio.gather(
             *(client.set(f"bulk:{i}", bulk_value(i)) for i in range(start, min(start + 100, count)))
         )
-    client.close()
+    await client.close()
     print(f"preloaded {count} keys (replication={client.replication})")
     return 0
 
@@ -92,7 +92,7 @@ async def cmd_verify(count: int) -> int:
 
     for start in range(0, count, 100):
         await asyncio.gather(*(check(i) for i in range(start, min(start + 100, count))))
-    client.close()
+    await client.close()
     print(json.dumps({
         "checked": count,
         "missing": len(missing),
@@ -124,7 +124,7 @@ async def cmd_churn(seconds: float, outfile: str) -> int:
                 fails += 1
                 events.append({"t": t, "op": op, "error": type(exc).__name__, "detail": str(exc)[:120]})
         await asyncio.sleep(0.05)
-    client.close()
+    await client.close()
     summary = {
         "duration": round(time.monotonic() - t0, 1),
         "ops": ops,
