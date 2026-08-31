@@ -1293,11 +1293,29 @@ impl NanocachedClient {
         // can shorten it.
         let interval =
             Duration::from_millis(KEEPALIVE_INTERVAL_MS.load(std::sync::atomic::Ordering::SeqCst));
+        // Safety net for a client dropped without `close()` (issue #325):
+        // this task holds only a `Weak<Inner>`, never a strong one. If
+        // every `NanocachedClient` handle (the original plus every clone)
+        // is dropped without ever calling `close()`, `inner.closed` never
+        // becomes true and nothing else would tell this loop to stop — a
+        // strong `Arc<Inner>` here would keep `Inner` (and every
+        // connection it owns) alive forever, so `Connection::drop`'s own
+        // safety net could never fire either. With a `Weak`, the last
+        // strong `Arc<Inner>` dropping (i.e. the last client handle) is
+        // enough on its own: `Inner` drops immediately, its connections
+        // drop with it, and this task simply fails its next `upgrade()`
+        // and exits.
         let keepalive = Some({
-            let inner = Arc::clone(&inner);
+            let weak_inner = Arc::downgrade(&inner);
             Arc::new(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(interval).await;
+                    let inner = match weak_inner.upgrade() {
+                        Some(inner) => inner,
+                        // Every client handle was dropped without close()
+                        // (issue #325) — nothing left to keep alive.
+                        None => return,
+                    };
                     if inner.closed.load(Ordering::SeqCst) {
                         return;
                     }
