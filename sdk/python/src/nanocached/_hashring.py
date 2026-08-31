@@ -87,7 +87,19 @@ class HashRing:
     discovery server's node list. Ranking never changes once built."""
 
     def __init__(self, nodes: list[str]) -> None:
-        self._nodes = list(nodes)
+        # Issue #360 (mirrors src/hash_ring.rs's HashRing::new, issue
+        # #328): deduplicate, keeping the first occurrence so construction
+        # order is otherwise unaffected. A repeated name would otherwise
+        # let it score independently for each of its slots, occupying
+        # more than one place in owners()'s top-`replicas` and inflating
+        # its effective share of the ring.
+        seen: set[str] = set()
+        deduped = []
+        for node in nodes:
+            if node not in seen:
+                seen.add(node)
+                deduped.append(node)
+        self._nodes = deduped
         self._node_hashes = [fnv1a(node.encode("utf-8")) for node in self._nodes]
 
     def owners(self, key: bytes, replicas: int, *, namespace: bytes = b"") -> list[str]:

@@ -92,10 +92,27 @@ func fmix64(value uint64) uint64 {
 
 // NewHashRing builds a ranking over the given node names, once, from a
 // discovery server's node list. Ranking never changes after construction.
+//
+// Issue #360 (mirrors src/hash_ring.rs's HashRing::new dedupe, issue
+// #328): deduplicates nodes, keeping the first occurrence so construction
+// order is otherwise unaffected. A repeated name would otherwise score
+// independently for each of its slots in OwnersNS's bounded insertion,
+// occupying more than one place in the returned top-`replicas` set and
+// inflating its effective share of the ring.
 func NewHashRing(nodes []string) *HashRing {
+	deduped := make([]string, 0, len(nodes))
+	seen := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		if _, ok := seen[node]; ok {
+			continue
+		}
+		seen[node] = struct{}{}
+		deduped = append(deduped, node)
+	}
+
 	ring := &HashRing{
-		nodes:      append([]string(nil), nodes...),
-		nodeHashes: make([]uint64, len(nodes)),
+		nodes:      deduped,
+		nodeHashes: make([]uint64, len(deduped)),
 	}
 	for i, node := range ring.nodes {
 		ring.nodeHashes[i] = fnv1a([]byte(node))

@@ -255,3 +255,35 @@ func TestSpreadsKeysEvenly(t *testing.T) {
 		}
 	}
 }
+
+// TestDuplicateNodeNamesAreDeduplicated is a regression test for issue
+// #360 (mirrors src/hash_ring.rs's HashRing::new dedupe from issue #328):
+// before this fix, a name repeated in NewHashRing's node list scored
+// independently for each of its slots in OwnersNS's bounded insertion, so
+// a duplicated node could occupy more than one place in the returned
+// top-`replicas` set — inflating its effective share of the ring.
+func TestDuplicateNodeNamesAreDeduplicated(t *testing.T) {
+	ring := NewHashRing([]string{"a", "b", "b", "b", "c", "d"})
+	key := []byte("some-key")
+
+	for replicas := 0; replicas <= 5; replicas++ {
+		owners := ring.Owners(key, replicas)
+		seen := map[string]bool{}
+		for _, node := range owners {
+			if seen[node] {
+				t.Fatalf("replicas=%d: %q appears more than once in owners=%v", replicas, node, owners)
+			}
+			seen[node] = true
+		}
+	}
+
+	// Construction order is otherwise unaffected: the first occurrence of
+	// a repeated name is kept in place.
+	deduped := NewHashRing([]string{"a", "b", "c", "d"})
+	for i := 0; i < 200; i++ {
+		k := []byte(fmt.Sprintf("key-%d", i))
+		if got, want := ring.Owners(k, 4), deduped.Owners(k, 4); !reflect.DeepEqual(got, want) {
+			t.Fatalf("key-%d: Owners = %v, want %v", i, got, want)
+		}
+	}
+}
