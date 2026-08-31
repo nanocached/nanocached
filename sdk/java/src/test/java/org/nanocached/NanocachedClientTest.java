@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -2334,6 +2335,67 @@ class NanocachedClientTest {
                 String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
                 waitFor(() -> cluster.nodes().get(replica).store.containsKey(stored),
                         "the background write to land on the replica");
+            }
+        }
+    }
+
+    @Test
+    void fireAndForgetReplicaLegDoesNotAliasTheCallersArray() throws Exception {
+        // Issue #326: with compress off, set()'s `outgoing` used to be the
+        // caller's own `value` array, not a copy — a fire-and-forget
+        // replica leg closing over it could still be waiting to run once
+        // set() has already returned, so a caller that reused/mutated
+        // `value` in place right after the call could silently change
+        // what the replica ends up storing. The fix defensively copies
+        // the array for a leg that actually goes into the background,
+        // synchronously before set() returns — so it must never be
+        // affected by a mutation the caller makes afterwards, no matter
+        // how late the leg itself actually runs.
+        //
+        // To make "how late the leg actually runs" deterministic instead
+        // of a real-time race, permits/pool size are shrunk to 1 replica
+        // writer slot and every replicaWriters thread is occupied with a
+        // blocking dummy task before set() is even called — so the real
+        // leg is guaranteed to still be sitting in the queue, not yet
+        // read `outgoing`, at the point this test mutates `value`.
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+
+        try (Cluster cluster = startCluster(2)) {
+            String replica = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+
+            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
+                replicaWritersField.setAccessible(true);
+                ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
+
+                // 1 (maxInFlightBackgroundReplicaWrites) + REPLICA_WRITER_POOL_HEADROOM (16) threads.
+                int poolSize = 17;
+                java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(poolSize);
+                for (int i = 0; i < poolSize; i++) {
+                    replicaWriters.submit(() -> {
+                        occupied.countDown();
+                        release.await();
+                        return null;
+                    });
+                }
+                assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                        "every replicaWriters thread should have started its blocking dummy task");
+
+                byte[] value = "original".getBytes(StandardCharsets.UTF_8);
+                client.set("k".getBytes(StandardCharsets.UTF_8), value);
+                // The real replica leg is now queued behind the poolSize
+                // blocking tasks above — it cannot have read `value` yet.
+                Arrays.fill(value, (byte) 'X'); // mutate the caller's array in place, as a buffer-reuse caller would
+
+                release.countDown(); // let every dummy task finish, then the real leg runs
+
+                String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
+                waitFor(() -> cluster.nodes().get(replica).store.containsKey(stored),
+                        "the background write to land on the replica");
+                assertArrayEquals("original".getBytes(StandardCharsets.UTF_8),
+                        cluster.nodes().get(replica).store.get(stored),
+                        "the replica must store the original bytes, not the caller's later in-place mutation");
             }
         }
     }

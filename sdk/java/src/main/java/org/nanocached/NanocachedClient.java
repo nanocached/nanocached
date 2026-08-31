@@ -146,7 +146,12 @@ public final class NanocachedClient implements AutoCloseable {
          * Off by default. <b>Every client that reads or writes a given set
          * of keys must agree on this setting</b> — it is a per-keyspace
          * format decision, not a per-client preference; take care before enabling this against an existing keyspace
-         * another client may still touch with {@code compress} off. */
+         * another client may still touch with {@code compress} off. Purely
+         * a wire-format choice otherwise — including for {@link
+         * #fireAndForgetReplicas}, whose background replica legs are
+         * always safe against the caller reusing its value {@code byte[]}
+         * after a call returns regardless of this setting (issue #326;
+         * see that option's own doc). */
         public Options compress(boolean enabled) {
             this.compress = enabled;
             return this;
@@ -171,7 +176,14 @@ public final class NanocachedClient implements AutoCloseable {
          * too (fire-and-forget replica writes). Off by default. Unlike {@link #compress},
          * this is a pure latency/durability trade for this client's own
          * writes — it carries no wire format and needs no agreement with
-         * other clients. */
+         * other clients. It also needs no care from the caller around
+         * reusing a value {@code byte[]} right after a set/cas call
+         * returns: with {@link #compress} off, that array isn't copied on
+         * the normal synchronous path, but a background replica leg
+         * scheduled by this option always writes from its own
+         * defensively-copied snapshot instead (issue #326), so a later
+         * mutation to the caller's array can never leak into what a
+         * replica ends up storing. */
         public Options fireAndForgetReplicas(boolean enabled) {
             this.fireAndForgetReplicas = enabled;
             return this;
@@ -1997,6 +2009,24 @@ public final class NanocachedClient implements AutoCloseable {
             write(namespace, key, connection -> {
                 connection.set(namespace, key, outgoing, wireTtlSeconds);
                 return null;
+            }, () -> {
+                // issue #326: when compress is off, `outgoing` above is the
+                // caller's own `value` array, not a copy — Compression#compressValue
+                // always allocates fresh (see its prefixed() helper), so this copy
+                // is only needed on that branch. A fireAndForgetReplicas leg can
+                // still be running after set() has already returned to the caller;
+                // without this, a caller that reuses/mutates `value` in place right
+                // after the call returns could silently change what a background
+                // replica leg ends up storing. write() only ever calls this
+                // supplier for a leg that is actually going into the background —
+                // every synchronous/joined leg (including the primary) keeps using
+                // the uncopied `outgoing` above, since it always finishes before
+                // this method returns and so can never observe a later mutation.
+                byte[] backgroundSafe = compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
+                return connection -> {
+                    connection.set(namespace, key, backgroundSafe, wireTtlSeconds);
+                    return null;
+                };
             });
             return null;
         });
@@ -2259,7 +2289,6 @@ public final class NanocachedClient implements AutoCloseable {
         for (Map.Entry<String, OwnerBatch> ownerEntry : owners.entrySet()) {
             String name = ownerEntry.getKey();
             OwnerBatch batch = ownerEntry.getValue();
-            Runnable leg = () -> runMultiSetLeg(namespace, name, batch, keyBytes, valueBytes, ttlSeconds, retry);
 
             boolean pureReplica = !batch.isPrimary.contains(Boolean.TRUE);
             // Fire-and-forget replica writes: with fireAndForgetReplicas, up to
@@ -2268,19 +2297,33 @@ public final class NanocachedClient implements AutoCloseable {
             // write()'s own fire-and-forget branch exactly, including its
             // close()-race fallbacks.
             if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
+                // issue #326: valueBytes[idx] may still be the caller's own
+                // array when compress is off (Compression#compressValue always
+                // allocates fresh — see set()'s matching comment — so this copy
+                // is skipped when compress is on). This leg's runMultiSetLeg
+                // call doesn't happen until the background executor actually
+                // runs it, which can be well after setManyBytes() has already
+                // returned to a caller that reuses/mutates one of its value
+                // arrays in place — so hand it a defensively-copied array
+                // instead of the shared, still-mutable one. Only the entries
+                // this leg actually touches are copied, not the whole batch.
+                byte[][] backgroundValues = compress ? valueBytes : copyValuesForBackground(valueBytes, batch.indices);
+                Runnable backgroundLeg =
+                        () -> runMultiSetLeg(namespace, name, batch, keyBytes, backgroundValues, ttlSeconds, retry);
                 try {
-                    CompletableFuture.runAsync(leg, replicaWriters)
+                    CompletableFuture.runAsync(backgroundLeg, replicaWriters)
                             .whenComplete((ignoredResult, error) -> {
                                 backgroundReplicaWritePermits.release();
                                 reportBackgroundWriteBug(error);
                             });
                 } catch (RejectedExecutionException rejected) {
                     backgroundReplicaWritePermits.release();
-                    leg.run();
+                    backgroundLeg.run();
                 }
                 continue;
             }
 
+            Runnable leg = () -> runMultiSetLeg(namespace, name, batch, keyBytes, valueBytes, ttlSeconds, retry);
             legs.add(submitReplicaWrite(leg));
         }
 
@@ -2337,6 +2380,26 @@ public final class NanocachedClient implements AutoCloseable {
      * keys and a transport failure doesn't distinguish between them.
      * {@code retry} must already be a thread-safe list — this runs
      * concurrently with every other owner's leg. */
+
+    /**
+     * Issue #326: builds a defensively-copied {@code valueBytes} for a
+     * fire-and-forget {@link #multiSetPass} leg that goes to the
+     * background — copies only the entries {@code indices} (this leg's
+     * own {@link OwnerBatch#indices}) actually reads, leaving every other
+     * slot {@code null} since {@link #runMultiSetLeg} never looks at
+     * them. Only called when {@code compress} is off for the whole batch
+     * (see the caller) — when it's on, every element is already a fresh
+     * array from {@link Compression#compressValue} and needs no copy.
+     */
+    private static byte[][] copyValuesForBackground(byte[][] valueBytes, List<Integer> indices) {
+        byte[][] copy = new byte[valueBytes.length][];
+        for (int idx : indices) {
+            byte[] value = valueBytes[idx];
+            copy[idx] = Arrays.copyOf(value, value.length);
+        }
+        return copy;
+    }
+
     private void runMultiSetLeg(
             byte[] namespace, String name, OwnerBatch batch, byte[][] keyBytes, byte[][] valueBytes,
             Long ttlSeconds, List<Integer> retry) {
@@ -3302,6 +3365,30 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private <T> T write(byte[] namespace, byte[] key, ConnectionOp<T> op) {
+        return write(namespace, key, op, null);
+    }
+
+    /**
+     * As {@link #write(byte[], byte[], ConnectionOp)}, but {@code
+     * backgroundSafeOp} — when non-null — lazily supplies a variant of
+     * {@code op} to use for any replica leg that ends up running via the
+     * {@code fireAndForgetReplicas} background path (issue #326). Such a
+     * leg can still be running well after this method has already
+     * returned to its caller; if {@code op} closes over a byte[] the
+     * caller still owns (e.g. {@code compress} off, where the array isn't
+     * copied — see {@link #set}), a caller that reuses/mutates that array
+     * in place right after the call returns could otherwise silently
+     * change what the background leg stores. A synchronous/joined leg
+     * (including the primary) never needs this: it always finishes before
+     * this method returns, so it can never observe a later mutation, and
+     * keeps using {@code op} directly. {@code backgroundSafeOp} is called
+     * at most once per {@code write()} call — its result is reused by
+     * every fire-and-forget leg below, not rebuilt per leg — since the
+     * defensive copy it makes is immutable once made and safe to share.
+     */
+    private <T> T write(
+            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp) {
         if (ring == null) {
             return applyReconnecting(this::singleConnection, op);
         }
@@ -3311,25 +3398,10 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
+        ConnectionOp<T> backgroundOp = null; // lazily built at most once; see javadoc above (issue #326)
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (int i = 1; i < names.size(); i++) {
             String replica = names.get(i);
-            Runnable replicaWrite = () -> {
-                try {
-                    applyReconnecting(() -> memberConnection(replica), op);
-                } catch (NanocachedException ignored) {
-                    // Swallowed by design (client-side replication): a dead or disagreeing
-                    // replica leaves the key under-replicated until the next
-                    // node-list refresh, never fails the write. Counted via
-                    // stats().replicaWriteFailures so operators can spot
-                    // silently degrading replication. Narrowed to the
-                    // connection layer's own failure types, covering both
-                    // the fire-and-forget and synchronous-fallback callers
-                    // of this lambda, so a programming bug doesn't get
-                    // treated the same way as a dead replica.
-                    replicaWriteFailures.incrementAndGet();
-                }
-            };
 
             // Fire-and-forget replica writes: with fireAndForgetReplicas, up to
             // maxInFlightBackgroundReplicaWrites legs run in the
@@ -3337,6 +3409,26 @@ public final class NanocachedClient implements AutoCloseable {
             // cap, further legs fall back to the synchronous path exactly
             // as with the option off.
             if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
+                if (backgroundOp == null) {
+                    backgroundOp = backgroundSafeOp != null ? backgroundSafeOp.get() : op;
+                }
+                ConnectionOp<T> legOp = backgroundOp;
+                Runnable replicaWrite = () -> {
+                    try {
+                        applyReconnecting(() -> memberConnection(replica), legOp);
+                    } catch (NanocachedException ignored) {
+                        // Swallowed by design (client-side replication): a dead or disagreeing
+                        // replica leaves the key under-replicated until the next
+                        // node-list refresh, never fails the write. Counted via
+                        // stats().replicaWriteFailures so operators can spot
+                        // silently degrading replication. Narrowed to the
+                        // connection layer's own failure types, covering both
+                        // the fire-and-forget and synchronous-fallback callers
+                        // of this lambda, so a programming bug doesn't get
+                        // treated the same way as a dead replica.
+                        replicaWriteFailures.incrementAndGet();
+                    }
+                };
                 try {
                     CompletableFuture.runAsync(replicaWrite, replicaWriters)
                             .whenComplete((ignoredResult, error) -> {
@@ -3361,6 +3453,17 @@ public final class NanocachedClient implements AutoCloseable {
                 continue;
             }
 
+            Runnable replicaWrite = () -> {
+                try {
+                    applyReconnecting(() -> memberConnection(replica), op);
+                } catch (NanocachedException ignored) {
+                    // Swallowed by design (client-side replication) — see the
+                    // matching catch in the fire-and-forget branch above for
+                    // the full rationale; both callers of this lambda shape
+                    // share it verbatim.
+                    replicaWriteFailures.incrementAndGet();
+                }
+            };
             replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
 
@@ -3504,22 +3607,48 @@ public final class NanocachedClient implements AutoCloseable {
      * #replicaWriteFailures}.
      */
     private void replicateResultToReplicas(List<String> names, ConnectionOp<Void> op) {
+        replicateResultToReplicas(names, op, null);
+    }
+
+    /**
+     * As {@link #replicateResultToReplicas(List, ConnectionOp)}, but
+     * {@code backgroundSafeOp} — when non-null — lazily supplies a
+     * variant of {@code op} for any leg that ends up running via the
+     * {@code fireAndForgetReplicas} background path, exactly mirroring
+     * {@link #write}'s own {@code backgroundSafeOp} parameter (issue
+     * #326) — see that overload's javadoc for the full rationale.
+     * {@link #replicateIncrResult} (issue #129) never needs this: its
+     * {@code valueBytes} is always a fresh {@code Long.toString(...)
+     * .getBytes(...)} array, never caller-owned, so it keeps calling the
+     * two-argument overload above unchanged. Only {@link
+     * #casPrimaryThenReplicate} (issue #141) — whose {@code value} can be
+     * the caller's own array when {@code compress} is off, see {@link
+     * #cas} — passes one.
+     */
+    private void replicateResultToReplicas(
+            List<String> names, ConnectionOp<Void> op,
+            java.util.function.Supplier<ConnectionOp<Void>> backgroundSafeOp) {
+        ConnectionOp<Void> backgroundOp = null; // lazily built at most once; see write()'s matching field
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (int i = 1; i < names.size(); i++) {
             String replica = names.get(i);
-            Runnable replicaWrite = () -> {
-                try {
-                    applyReconnecting(() -> memberConnection(replica), op);
-                } catch (NanocachedException ignored) {
-                    // Swallowed by design, exactly like write()'s own
-                    // replica leg — see that method's matching catch for
-                    // the full rationale (issue: audit finding covers
-                    // both identically).
-                    replicaWriteFailures.incrementAndGet();
-                }
-            };
 
             if (fireAndForgetReplicas && backgroundReplicaWritePermits.tryAcquire()) {
+                if (backgroundOp == null) {
+                    backgroundOp = backgroundSafeOp != null ? backgroundSafeOp.get() : op;
+                }
+                ConnectionOp<Void> legOp = backgroundOp;
+                Runnable replicaWrite = () -> {
+                    try {
+                        applyReconnecting(() -> memberConnection(replica), legOp);
+                    } catch (NanocachedException ignored) {
+                        // Swallowed by design, exactly like write()'s own
+                        // replica leg — see that method's matching catch for
+                        // the full rationale (issue: audit finding covers
+                        // both identically).
+                        replicaWriteFailures.incrementAndGet();
+                    }
+                };
                 try {
                     CompletableFuture.runAsync(replicaWrite, replicaWriters)
                             .whenComplete((ignoredResult, error) -> {
@@ -3535,6 +3664,17 @@ public final class NanocachedClient implements AutoCloseable {
                 continue;
             }
 
+            Runnable replicaWrite = () -> {
+                try {
+                    applyReconnecting(() -> memberConnection(replica), op);
+                } catch (NanocachedException ignored) {
+                    // Swallowed by design, exactly like write()'s own
+                    // replica leg — see that method's matching catch for
+                    // the full rationale (issue: audit finding covers
+                    // both identically).
+                    replicaWriteFailures.incrementAndGet();
+                }
+            };
             replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
 
@@ -3592,6 +3732,19 @@ public final class NanocachedClient implements AutoCloseable {
         replicateResultToReplicas(names, connection -> {
             connection.set(namespace, key, value, ttlSeconds);
             return null;
+        }, () -> {
+            // issue #326: `value` here is cas()'s own `outgoing` — the caller's
+            // array when compress is off (never a copy on that branch; see
+            // set()'s matching comment). Same fix as write()'s: only a
+            // fireAndForgetReplicas leg that is actually going into the
+            // background gets this defensively-copied variant, since only that
+            // leg can still be running after casPrimaryThenReplicate (and so
+            // cas()) has already returned to the caller.
+            byte[] backgroundSafe = compress ? value : Arrays.copyOf(value, value.length);
+            return connection -> {
+                connection.set(namespace, key, backgroundSafe, ttlSeconds);
+                return null;
+            };
         });
         return true;
     }
