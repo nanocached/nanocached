@@ -35,5 +35,5 @@ if (cmd === "write") {
   rc = 2;
 }
 
-client.close();
+await client.close();
 process.exit(rc);

@@ -32,12 +32,22 @@ func parseAddresses(raw string) []nanocached.Address {
 }
 
 func main() {
+	os.Exit(run())
+}
+
+// run performs the smoke test and returns the process exit code. It is
+// separated from main so that the deferred client.Close() (which drains
+// in-flight background replica writes before the sockets are torn down)
+// always completes before the process exits — os.Exit does not run
+// deferred functions, so exiting directly from inside this function
+// would skip the drain.
+func run() int {
 	client, err := nanocached.Connect(nanocached.Config{
 		Addresses: parseAddresses(os.Getenv("NANOTEST_ADDRESSES")),
 	})
 	if err != nil {
 		fmt.Println("connect failed:", err)
-		os.Exit(1)
+		return 1
 	}
 	defer client.Close()
 
@@ -49,7 +59,7 @@ func main() {
 		for i := 0; i < count; i++ {
 			if err := client.Set(fmt.Sprintf("x:%s:%d", label, i), fmt.Sprintf("v-%s-%d", label, i), 0); err != nil {
 				fmt.Println("set failed:", err)
-				os.Exit(1)
+				return 1
 			}
 		}
 		fmt.Printf("wrote %d keys for label %s\n", count, label)
@@ -63,11 +73,12 @@ func main() {
 		}
 		if len(bad) > 0 {
 			fmt.Printf("label %s: %d/%d BAD (sample %v)\n", label, len(bad), count, bad[:min(5, len(bad))])
-			os.Exit(1)
+			return 1
 		}
 		fmt.Printf("label %s: %d/%d OK\n", label, count, count)
 	default:
 		fmt.Println("unknown command", cmd)
-		os.Exit(2)
+		return 2
 	}
+	return 0
 }
