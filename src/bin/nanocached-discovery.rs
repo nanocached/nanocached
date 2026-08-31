@@ -229,6 +229,20 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 const READ_CHUNK_SIZE: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
 const MAX_CONNECTIONS: usize = 1024;
+/// Issue #358: metrics/health/ready connections accepted at once on
+/// `--metrics-port` — a small, fixed cap dedicated to that listener,
+/// independent of `MAX_CONNECTIONS` (that semaphore governs the
+/// registration port; `run_metrics_server` never touches it). Without
+/// this, the metrics accept loop spawned one unbounded task per
+/// connection — a scrape storm, or a peer that just opens connections
+/// and holds them, could grow its task/fd count without limit. Fixed
+/// rather than a CLI flag: this port only ever sees a handful of
+/// legitimate scrapers (Prometheus, a load balancer's health check),
+/// never registration traffic, so there's no per-deployment tuning need
+/// to expose. Mirrors the node's and `nanocached-proxy`'s
+/// `METRICS_MAX_CONNECTIONS` (issues #327/#233) — same problem, same
+/// fix, independent re-implementation per the no-shared-modules policy.
+const METRICS_MAX_CONNECTIONS: usize = 16;
 /// Coarse cap on how many live connections a single source IP may hold at
 /// once, layered under the global `MAX_CONNECTIONS` semaphore (mirrors
 /// `src/server.rs`'s own `MAX_CONNECTIONS_PER_IP`: no per-source-IP
@@ -1684,8 +1698,15 @@ fn parse_length(input: &[u8]) -> Result<usize, ParseError> {
 /// Issue #124: minimal, dependency-free HTTP responder for Prometheus
 /// text-format metrics and orchestrator probes — see the node's
 /// `run_metrics_server` for the shared design notes. Unauthenticated;
-/// keep the port internal.
-async fn run_metrics_server(listener: TcpListener, registry: Registry, list_ready_at: Instant) {
+/// keep the port internal. Issue #358: `metrics_permits` bounds this
+/// listener's own concurrent connections (`METRICS_MAX_CONNECTIONS`) —
+/// separate from `MAX_CONNECTIONS`, which this never touches.
+async fn run_metrics_server(
+    listener: TcpListener,
+    registry: Registry,
+    list_ready_at: Instant,
+    metrics_permits: Arc<Semaphore>,
+) {
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -1701,8 +1722,19 @@ async fn run_metrics_server(listener: TcpListener, registry: Registry, list_read
                 continue;
             }
         };
+
+        // Issue #358: this listener has no client-listener-style busy
+        // reply — cap it with its own small semaphore instead, dropping
+        // the connection outright once it's exhausted rather than
+        // spawning an unbounded number of handler tasks.
+        let Ok(metrics_permit) = Arc::clone(&metrics_permits).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+
         let registry = Arc::clone(&registry);
         tokio::spawn(async move {
+            let _metrics_permit = metrics_permit;
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 serve_metrics_connection(stream, registry, list_ready_at),
@@ -2994,6 +3026,7 @@ async fn run(
             metrics_listener,
             Arc::clone(&cluster_state.registry),
             list_ready_at,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
         ));
     }
 
@@ -6562,7 +6595,12 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(run_metrics_server(listener, Arc::clone(&registry), ready));
+        tokio::spawn(run_metrics_server(
+            listener,
+            Arc::clone(&registry),
+            ready,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
+        ));
 
         let (status, body) = http_get(&addr, "/metrics").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
@@ -6588,11 +6626,67 @@ mod tests {
             listener,
             Arc::clone(&registry),
             Instant::now() + Duration::from_secs(60),
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
         ));
 
         let (status, _) = http_get(&addr, "/readyz").await;
         assert_eq!(status, "HTTP/1.1 503 Service Unavailable");
         // Liveness is unconditional.
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_listener_caps_its_own_concurrent_connections() {
+        // Regression (issue #358): before this fix, `run_metrics_server`'s
+        // accept loop spawned one unbounded task per connection — nothing
+        // comparable to `MAX_CONNECTIONS` on the registration port capped
+        // how many it would hold open at once, so a scrape storm (or a
+        // peer that just opens connections and holds them) could grow the
+        // task/fd count without limit. Mirrors the node's and
+        // `nanocached-proxy`'s identical regression tests for issues
+        // #327/#233.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let metrics_permits = Arc::new(Semaphore::new(1));
+        // Hold the listener's only permit, as if one scrape were already
+        // in flight.
+        let held = Arc::clone(&metrics_permits).try_acquire_owned().unwrap();
+        tokio::spawn(run_metrics_server(
+            listener,
+            Arc::clone(&registry),
+            Instant::now(),
+            metrics_permits,
+        ));
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        // Some platforms (macOS observed) answer a close of a socket that
+        // still has this test's unread request bytes sitting in its
+        // kernel buffer with a TCP RST instead of a clean FIN — either
+        // way, nothing was ever answered.
+        match stream.read_to_end(&mut response).await {
+            Ok(read) => assert_eq!(read, 0, "got a response: {response:?}"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ),
+                "unexpected read error over the metrics cap: {error}"
+            ),
+        }
+        assert!(
+            response.is_empty(),
+            "over the metrics cap, the connection must be dropped with no response, got {response:?}"
+        );
+
+        drop(held);
+        // Once the permit is free again, a scrape gets answered normally.
         let (status, _) = http_get(&addr, "/healthz").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
     }
