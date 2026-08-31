@@ -96,6 +96,7 @@ type mockNode struct {
 	storedToGetLeft  atomic.Int32
 	wrongTagLeft     atomic.Int32 // echoed response tags: echo the wrong tag on the next G on a tagged connection
 	swallowLeft      atomic.Int32 // echoed response tags: swallow the next G entirely (no reply)
+	busyLeft         atomic.Int32 // issue #334: answer the next G with an untagged `B` instead of its real reply, with the request already pending
 	lastSetTTL       atomic.Value // string: the TTL field of the last S, or "none"
 	setDelay         atomic.Int64 // nanoseconds; sleep this long before every S reply
 	getDelay         atomic.Int64 // nanoseconds; sleep this long before every G reply
@@ -241,6 +242,13 @@ func (m *mockNode) authHeadersSeen() []string {
 // off-by-one stream desync where every later response answers the
 // previous request.
 func (m *mockNode) swallowGetOnce() { m.swallowLeft.Add(1) }
+
+// answerBusyOnce answers the next G with an untagged `B` (server hit its
+// connection limit) instead of the real reply — with that G's own
+// request already sitting in c.pending when the client processes it, so
+// it reproduces a `B` arriving mid-stream rather than right after accept
+// (issue #334).
+func (m *mockNode) answerBusyOnce() { m.busyLeft.Add(1) }
 
 // failClearTimes makes this node's next n c/F requests fail: the request
 // is still read off the wire (so the stream stays well-formed for
@@ -513,6 +521,12 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			if m.takeOne(&m.swallowLeft) {
 				continue // no reply at all — the off-by-one desync injection
+			}
+			if m.takeOne(&m.busyLeft) {
+				if _, err := conn.Write([]byte("B\n")); err != nil { // always untagged, even on a tagged connection
+					return
+				}
+				continue
 			}
 			if tagged && m.takeOne(&m.wrongTagLeft) {
 				// Echo the wrong tag (the request's tag + 1) — the desync
@@ -1912,6 +1926,40 @@ func TestASwallowedResponseDesyncsAndIsCaughtBeforeDispatchTagged(t *testing.T) 
 	}
 	if got := node.connectionCount.Load(); got != 2 {
 		t.Fatalf("connectionCount = %d, want 2", got)
+	}
+}
+
+// TestAMidStreamBusyIsNeverMisdeliveredToAPendingRequest (issue #334): an
+// untagged `B` used to be recognized as the server's own "connection
+// limit reached" signal only when wasEmpty — no request pending yet, the
+// scenario right after accept. A `B` arriving with a request already
+// pending (e.g. this one, still waiting on its real answer) instead fell
+// through to the ordinary dispatch path and was delivered to that
+// request as if it were its answer, surfacing as a generic
+// "does not match the request (connection desynced)" mismatch instead of
+// the dedicated busy error — and, being untagged, skipping the tag-echo
+// check that would otherwise have caught the desync. `B` must be treated
+// as a protocol-level busy signal regardless of pending state.
+func TestAMidStreamBusyIsNeverMisdeliveredToAPendingRequest(t *testing.T) {
+	node := startMockNode(t, nil)
+	node.answerBusyOnce()
+
+	result, err := connectAndIdentify(node.address(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newConnection(result.conn, func() {}, result.tagged, nil)
+	defer conn.close()
+
+	_, _, err = conn.get([]byte("k"))
+	if err == nil || !strings.Contains(err.Error(), "connection limit reached") {
+		t.Fatalf("get() error = %v, want the dedicated busy error", err)
+	}
+	if strings.Contains(err.Error(), "desynced") || strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("get() error = %v, the busy response must not surface as a generic mismatch", err)
+	}
+	if !conn.isClosed() {
+		t.Fatal("expected the busy response to have poisoned (closed) the connection")
 	}
 }
 

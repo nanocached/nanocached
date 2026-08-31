@@ -840,12 +840,25 @@ func (c *connection) readLoop() {
 		}
 		c.mu.Unlock()
 
-		// An unsolicited "busy" response means the server hit its
-		// connection limit right after accept and is about to close the
-		// connection; it isn't an answer to anything we sent (mirrors
-		// the TypeScript SDK's Connection.onData).
-		if marker == 'B' && wasEmpty {
-			c.poison(fmt.Errorf("nanocached: server rejected the connection (connection limit reached)"))
+		// A "busy" response means the server hit its connection limit
+		// right after accept and is about to close the connection; it
+		// isn't an answer to anything we sent (mirrors the TypeScript
+		// SDK's Connection.onData). This holds regardless of whether a
+		// request happens to be pending: `B` is always an untagged,
+		// protocol-level signal, never an echoed answer (issue #334) —
+		// treating it as one only when wasEmpty let a `B` arriving
+		// mid-stream, with a request already pending, be misdelivered to
+		// the oldest pending request below and poison the connection via
+		// the generic mismatch path instead of this dedicated one.
+		if marker == 'B' {
+			err := fmt.Errorf("nanocached: server rejected the connection (connection limit reached)")
+			c.poison(err)
+			if haveReq {
+				// req has already been shifted out of c.pending above, so
+				// poison()'s own rejection sweep won't reach it — reject it
+				// here, same as the tag-mismatch case below.
+				req.ch <- roundTripResult{err: err}
+			}
 			return
 		}
 		if !haveReq {
