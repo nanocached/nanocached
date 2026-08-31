@@ -197,8 +197,12 @@ fn request_is_too_large(size: usize) -> bool {
 /// Compares two byte strings without leaking, via timing, how many leading
 /// bytes matched. Length differs openly (no secret ever has a length worth
 /// hiding), but once lengths match, every byte is compared regardless of
-/// earlier mismatches.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// earlier mismatches. `pub(crate)` so `cache.rs`'s CAS digest comparison
+/// (issue #336) can reuse this rather than keeping its own copy — unlike
+/// `nanocached-discovery`'s independent copy of the same function, that
+/// would be sharing *within* one binary, not across the no-shared-modules
+/// boundary between binaries.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
