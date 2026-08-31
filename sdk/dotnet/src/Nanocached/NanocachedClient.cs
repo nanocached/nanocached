@@ -3079,29 +3079,51 @@ public sealed class NanocachedClient : IDisposable
             Connection fresh = slot is null && _viaProxy
                 ? await DialProxyWithFailoverAsync(address).ConfigureAwait(false)
                 : await DialWithCooldownAsync(address).ConfigureAwait(false);
-            lock (_stateLock)
-            {
-                if (slot is null)
-                {
-                    _single = fresh;
-                }
-                else if (_members.TryGetValue(slot, out Member? member))
-                {
-                    member.Connection = fresh;
-                }
-                else
-                {
-                    fresh.Close();
-                    throw new ConnectionLostException(
-                        $"nanocached: {slot} left the cluster while reconnecting");
-                }
-            }
-            return fresh;
+            return InstallRedialedConnection(slot, fresh);
         }
         finally
         {
             gate.Release();
         }
+    }
+
+    /// <summary>Installs <paramref name="fresh"/> — a connection this
+    /// slot's redial just finished dialing — into <c>_single</c> or the
+    /// named member, or discards it. Split out of
+    /// <see cref="SlotConnectionAsync(string?)"/> so its guarded logic is
+    /// independently testable (issue #330's regression test drives this
+    /// directly, since forcing the underlying race deterministically from
+    /// outside proved impractical — see that test's comment).</summary>
+    private Connection InstallRedialedConnection(string? slot, Connection fresh)
+    {
+        lock (_stateLock)
+        {
+            if (_closed)
+            {
+                // Close() ran while we were reconnecting (issue #330):
+                // mirrors RefreshNodeListAsync's/OpenNodeConnectionAsync's
+                // same check — installing this connection now would leak
+                // it and its read-loop task past Close() having already
+                // returned.
+                fresh.Close();
+                throw new AlreadyClosedException();
+            }
+            if (slot is null)
+            {
+                _single = fresh;
+            }
+            else if (_members.TryGetValue(slot, out Member? member))
+            {
+                member.Connection = fresh;
+            }
+            else
+            {
+                fresh.Close();
+                throw new ConnectionLostException(
+                    $"nanocached: {slot} left the cluster while reconnecting");
+            }
+        }
+        return fresh;
     }
 
     /// <summary>Redials <paramref name="address"/>, honoring the
