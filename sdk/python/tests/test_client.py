@@ -4683,6 +4683,68 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await proxy_a.close()
             await proxy_b.close()
 
+    async def test_reconnect_purges_cooldowns_for_addresses_other_than_the_new_proxy(self):
+        # #363: _maybe_refresh no-ops in via_proxy mode (self._ring stays
+        # None forever, since via_proxy never builds a ring), so the #96
+        # purge that _refresh_node_list runs for departed cluster members
+        # never fires here — without a purge somewhere in the proxy
+        # redial path, _redial_cooldowns would grow one stale entry per
+        # proxy this client is ever swapped away from, for the life of a
+        # churning proxy fleet. The fix prunes down to at most the
+        # currently pinned proxy's own address every time
+        # _dial_one_proxy_randomly lands on one, mirroring the
+        # TypeScript SDK's refreshProxyTarget (issue #296).
+        proxy_a = await MockNode().start()
+        proxy_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[],
+            proxies=[(NAMES[0], proxy_a.address), (NAMES[1], proxy_b.address)],
+        ).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                connected_address = client._single_address
+                dead, survivor = (
+                    (proxy_a, proxy_b) if connected_address == proxy_a.address else (proxy_b, proxy_a)
+                )
+
+                # Plant a stale cooldown entry for an address that is
+                # neither the dead proxy nor the survivor — standing in
+                # for a proxy this client was pinned to even earlier in
+                # a churny fleet, before the currently-dying one.
+                stale_address = "127.0.0.1:1"
+                loop = asyncio.get_running_loop()
+                client._redial_cooldowns[stale_address] = (
+                    loop.time() + 100,
+                    ConnectionError("boom"),
+                )
+
+                await dead.close()
+                discovery.set_proxies([(NAMES[0], survivor.address)])
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                await client.set("k", "v")
+                self.assertEqual(client._single_address, survivor.address)
+
+                # Reconnecting to the survivor must prune every cooldown
+                # entry that isn't the newly pinned proxy's own address —
+                # both the pre-existing stale entry and (once the dead
+                # proxy's own direct-dial failure armed one) the dead
+                # proxy's entry itself.
+                self.assertNotIn(stale_address, client._redial_cooldowns)
+                self.assertNotIn(dead.address, client._redial_cooldowns)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy_a.close()
+            await proxy_b.close()
+
     async def test_get_many_and_set_many_ride_the_single_proxy_connection(self):
         # No owner grouping in proxy mode — the proxy splits/reassembles
         # server-side (docs/protocol.html "m / o"); this client just
