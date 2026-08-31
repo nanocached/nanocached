@@ -64,6 +64,24 @@ impl Default for ConnectionLimits {
         }
     }
 }
+
+/// Issue #327: metrics/health/ready connections accepted at once on
+/// `--metrics-port` — a small, fixed cap dedicated to that listener,
+/// independent of `DEFAULT_MAX_CONNECTIONS`/`ConnectionLimits` (those
+/// govern the client port; `run_metrics_server` only ever *reads* that
+/// semaphore, for the `nanocached_node_connections` gauge). Without
+/// this, the metrics accept loop spawned one unbounded task per
+/// connection — a scrape storm, or a peer that just opens connections
+/// and holds them, could grow its task/fd count without limit and
+/// without the client-side gauges ever showing anything unusual. Fixed
+/// rather than a CLI flag like `--max-connections`: this port only ever
+/// sees a handful of legitimate scrapers (Prometheus, a load balancer's
+/// health check), never client traffic, so there's no per-deployment
+/// tuning need to expose. Mirrors `nanocached-proxy`'s
+/// `METRICS_MAX_CONNECTIONS` (issue #233) — same problem, same fix,
+/// independent re-implementation per the no-shared-modules policy.
+const METRICS_MAX_CONNECTIONS: usize = 16;
+
 /// Default for `--max-memory` (issue #19): the cap was previously a fixed
 /// constant with no way to tune it, even though the capacity planner
 /// (`tools/capacity-planner.html`) already modeled capacity as a function
@@ -777,6 +795,11 @@ pub(crate) async fn run(
         Some(metrics_address) => {
             let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
             println!("INFO metrics endpoint listening on {metrics_address}");
+            // Issue #327: a dedicated, small cap on the metrics port's own
+            // accepted connections — independent of, and much smaller
+            // than, `connection_limit`/`limits.max_connections` above,
+            // which this task only ever reads for the `/metrics` gauge.
+            let metrics_connection_limit = Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS));
             Some(tokio::spawn(run_metrics_server(
                 metrics_listener,
                 request_tx.clone(),
@@ -785,6 +808,7 @@ pub(crate) async fn run(
                 Arc::clone(&known_ring),
                 node_context.is_some(),
                 shutdown_rx.clone(),
+                metrics_connection_limit,
             )))
         }
         None => None,
@@ -1289,6 +1313,7 @@ async fn write_response(stream: &mut ServerStream, data: &[u8]) -> io::Result<()
 /// for, or count against, client connection permits, and the port can
 /// stay unexposed to clients. No auth — the exposition is operational
 /// telemetry, and the deployment guide says to keep the port internal.
+#[allow(clippy::too_many_arguments)]
 async fn run_metrics_server(
     listener: TcpListener,
     request_tx: mpsc::Sender<CacheRequest>,
@@ -1297,6 +1322,7 @@ async fn run_metrics_server(
     known_ring: KnownRing,
     is_cluster: bool,
     mut shutdown_rx: watch::Receiver<bool>,
+    metrics_connection_limit: Arc<Semaphore>,
 ) {
     loop {
         let accepted = tokio::select! {
@@ -1319,10 +1345,22 @@ async fn run_metrics_server(
             }
         };
 
+        // Issue #327: this listener has no client-listener-style busy
+        // reply (that's a cache-protocol response, meaningless to an
+        // HTTP scraper) — cap it with its own small semaphore instead,
+        // dropping the connection outright once it's exhausted rather
+        // than spawning an unbounded number of handler tasks. Mirrors
+        // `nanocached-proxy`'s `run_metrics_server` (issue #233).
+        let Ok(metrics_permit) = Arc::clone(&metrics_connection_limit).try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+
         let request_tx = request_tx.clone();
         let connection_limit = Arc::clone(&connection_limit);
         let known_ring = Arc::clone(&known_ring);
         tokio::spawn(async move {
+            let _metrics_permit = metrics_permit;
             let _ = timeout(
                 Duration::from_secs(5),
                 serve_metrics_connection(
@@ -7320,6 +7358,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             false,
             shutdown_rx,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
         ));
 
         let (status, body) = http_get(&addr, "/metrics").await;
@@ -7381,6 +7420,7 @@ mod tests {
             Arc::clone(&known_ring),
             true,
             shutdown_rx,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
         ));
 
         // Cluster node, no membership yet: not ready.
@@ -7396,6 +7436,68 @@ mod tests {
         assert_eq!(status, "HTTP/1.1 200 OK");
 
         metrics_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_listener_caps_its_own_concurrent_connections() {
+        // Regression (issue #327): before this fix, `run_metrics_server`'s
+        // accept loop spawned one unbounded task per connection — nothing
+        // comparable to `DEFAULT_MAX_CONNECTIONS` on the client port
+        // capped how many it would hold open at once, so a scrape storm
+        // (or a peer that just opens connections and holds them) could
+        // grow the task/fd count without limit. Mirrors
+        // `nanocached-proxy`'s identical regression test for issue #233.
+        let (request_tx, _request_rx) = mpsc::channel(16);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let metrics_connection_limit = Arc::new(Semaphore::new(1));
+        // Hold the listener's only permit, as if one scrape were already
+        // in flight.
+        let held = Arc::clone(&metrics_connection_limit)
+            .try_acquire_owned()
+            .unwrap();
+        tokio::spawn(run_metrics_server(
+            listener,
+            request_tx,
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            DEFAULT_MAX_CONNECTIONS,
+            Arc::new(Mutex::new(None)),
+            false,
+            shutdown_rx,
+            metrics_connection_limit,
+        ));
+
+        let mut stream = TcpStream::connect(&addr).await.unwrap();
+        stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        // Some platforms (macOS observed) answer a close of a socket that
+        // still has this test's unread request bytes sitting in its
+        // kernel buffer with a TCP RST instead of a clean FIN — either
+        // way, nothing was ever answered.
+        match stream.read_to_end(&mut response).await {
+            Ok(read) => assert_eq!(read, 0, "got a response: {response:?}"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ),
+                "unexpected read error over the metrics cap: {error}"
+            ),
+        }
+        assert!(
+            response.is_empty(),
+            "over the metrics cap, the connection must be dropped with no response, got {response:?}"
+        );
+
+        drop(held);
+        // Once the permit is free again, a scrape gets answered normally.
+        let (status, _) = http_get(&addr, "/healthz").await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
     }
 
     #[test]
