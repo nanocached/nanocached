@@ -24,6 +24,17 @@ const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// entries rather than merely avoiding the degenerate case.
 const MIN_MAX_MEMORY_BYTES: usize = 1024 * 1024;
 
+/// Floor on each `--namespace-budget` (issue #355). The same degenerate
+/// case as `MIN_MAX_MEMORY_BYTES` guards against exists per namespace:
+/// `Cache::enforce_namespace_budget` never evicts below one entry, so a
+/// budget at or under `cache::ENTRY_OVERHEAD_BYTES` can never be
+/// satisfied and the namespace thrashes its own LRU tail on every write.
+/// Unlike the global cap, per-namespace caps are legitimately small
+/// (a framework named cache may hold a handful of entries), so the floor
+/// is only ten minimal entries' bookkeeping — enough to rule out the
+/// can-never-fit range without banning small-but-real budgets.
+const MIN_NAMESPACE_BUDGET_BYTES: usize = 10 * cache::ENTRY_OVERHEAD_BYTES;
+
 /// Reads the shared auth secret from the environment rather than a CLI
 /// flag, since CLI arguments are visible to anyone who can list processes
 /// (e.g. `ps`) on the host. An unset or empty value means auth is not
@@ -197,9 +208,14 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 let budget: usize = bytes.parse().map_err(|_| {
                     format!("invalid byte count in --namespace-budget {raw}: {bytes}")
                 })?;
-                if budget == 0 {
+                if budget < MIN_NAMESPACE_BUDGET_BYTES {
                     return Err(format!(
-                        "--namespace-budget {name}=0 would evict the namespace to a single                          entry on every write; omit the flag to leave it uncapped"
+                        "--namespace-budget {name}={budget} is below the minimum of \
+                         {MIN_NAMESPACE_BUDGET_BYTES} bytes; a budget that small would \
+                         evict the namespace down to a single entry on every write \
+                         (each entry costs ~{} bytes of bookkeeping before its key and \
+                         value); raise it, or omit the flag to leave the namespace uncapped",
+                        cache::ENTRY_OVERHEAD_BYTES
                     )
                     .into());
                 }
@@ -295,7 +311,8 @@ Usage: nanocached-node [options]
                                effective fleet ceiling
   --namespace-budget <ns>=<b> cap namespace <ns> at <b> bytes
                                (repeatable, one namespace each; empty
-                               <ns> = the default namespace). A
+                               <ns> = the default namespace; minimum
+                               {} bytes). A
                                namespace over its cap evicts from
                                itself, oldest first, so one churny
                                namespace can't evict every other; the
@@ -307,6 +324,7 @@ Usage: nanocached-node [options]
         MIN_MAX_MEMORY_BYTES / (1024 * 1024),
         server::DEFAULT_MAX_CONNECTIONS,
         server::DEFAULT_MAX_CONNECTIONS_PER_IP,
+        MIN_NAMESPACE_BUDGET_BYTES,
     )
 }
 
@@ -554,13 +572,47 @@ mod tests {
 
         let Err(ArgsError::Invalid(message)) = parse_args_from(args(&[
             "--namespace-budget",
-            "sessions=100",
+            "sessions=2048",
             "--namespace-budget",
-            "sessions=200",
+            "sessions=4096",
         ])) else {
             panic!("a duplicate namespace must be rejected");
         };
         assert!(message.contains("twice"), "{message}");
+    }
+
+    #[test]
+    fn namespace_budget_at_the_minimum_is_accepted() {
+        // Issue #355: the floor itself is fine — only values below it can
+        // never satisfy the budget (see MIN_NAMESPACE_BUDGET_BYTES).
+        let parsed = parse_args_from(args(&[
+            "--namespace-budget",
+            &format!("sessions={MIN_NAMESPACE_BUDGET_BYTES}"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.namespace_budgets,
+            vec![(Bytes::from_static(b"sessions"), MIN_NAMESPACE_BUDGET_BYTES)]
+        );
+    }
+
+    #[test]
+    fn namespace_budget_one_byte_below_the_minimum_is_rejected() {
+        // Issue #355: mirrors the --max-memory floor. A budget under
+        // MIN_NAMESPACE_BUDGET_BYTES makes the namespace evict its own
+        // LRU tail down to one entry on every write, forever.
+        let result = parse_args_from(args(&[
+            "--namespace-budget",
+            &format!("sessions={}", MIN_NAMESPACE_BUDGET_BYTES - 1),
+        ]));
+
+        let Err(ArgsError::Invalid(message)) = result else {
+            panic!("expected an Invalid rejection");
+        };
+        assert!(
+            message.contains("--namespace-budget"),
+            "expected the error to name the offending flag, got: {message}"
+        );
     }
 
     #[test]
