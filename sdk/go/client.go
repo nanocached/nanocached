@@ -1747,6 +1747,10 @@ func (c *Client) runMultiSetLeg(
 // ErrConnectionLost from Incr/Decr cannot tell whether the increment was
 // applied; the caller must decide whether to retry (accepting a possible
 // double-apply) or treat the outcome as unknown.
+//
+// Incompatible with Config.Compress (issue #321): returns
+// ErrCompressIncompatible immediately, before any I/O, on a client
+// constructed with Compress enabled — see ErrCompressIncompatible.
 func (c *Client) Incr(key string, delta int64) (value int64, ok bool, err error) {
 	return c.incrNS(nil, key, delta)
 }
@@ -1754,7 +1758,8 @@ func (c *Client) Incr(key string, delta int64) (value int64, ok bool, err error)
 // Decr is Incr with delta negated — a thin convenience wrapper; it sends
 // exactly the same `i` wire opcode as Incr, never a separate one. Returns
 // ErrInvalidArgument (issue #182) for delta == math.MinInt64, which has
-// no valid int64 negation — see negateDecrDelta.
+// no valid int64 negation — see negateDecrDelta. Also incompatible with
+// Config.Compress (issue #321) — see Incr.
 func (c *Client) Decr(key string, delta int64) (value int64, ok bool, err error) {
 	negated, err := negateDecrDelta(delta)
 	if err != nil {
@@ -1781,6 +1786,9 @@ func negateDecrDelta(delta int64) (int64, error) {
 // entry point a *Namespace handle's Incr/Decr forward to, mirroring
 // getBytesNS/setBytesNS/deleteNS.
 func (c *Client) incrNS(namespace []byte, key string, delta int64) (value int64, ok bool, err error) {
+	if c.compress {
+		return 0, false, ErrCompressIncompatible
+	}
 	if err := validateKey(namespace, key); err != nil {
 		return 0, false, err
 	}
@@ -2080,7 +2088,8 @@ func (n *Namespace) SetManyBytes(values map[string][]byte, ttlSeconds int64) err
 
 // Incr atomically adds delta to key's stored counter value within this
 // namespace and returns the result; ok is false when the key is missing.
-// See Client.Incr.
+// See Client.Incr, including its Config.Compress incompatibility
+// (issue #321).
 func (n *Namespace) Incr(key string, delta int64) (value int64, ok bool, err error) {
 	return n.client.incrNS(n.namespace, key, delta)
 }

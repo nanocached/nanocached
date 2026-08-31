@@ -2245,6 +2245,11 @@ impl NanocachedClient {
     /// integer, or applying `delta` would overflow `i64` (issue #129's
     /// `T`).
     ///
+    /// **Incompatible with value compression** (issue #321):
+    /// [`Error::CompressionIncompatible`] immediately, before any I/O, if
+    /// this client was built with `compress(true)` — disable `compress` or
+    /// use a separate client for counters.
+    ///
     /// **As volatile as [`Self::set`], not a durable counter**: LRU
     /// eviction and TTL expiry reclaim an incremented value exactly like
     /// any other entry. Good for rate limiting or approximate counters;
@@ -2284,12 +2289,20 @@ impl NanocachedClient {
 
     /// The shared implementation behind [`Self::incr`] and
     /// [`Namespace::incr`] (Namespaces, issue #105).
+    ///
+    /// Rejects outright, before any validation or I/O, when this client
+    /// was built with `compress(true)` (issue #321): value compression has
+    /// no marker byte on an INCR result, so a compressed replica write or a
+    /// later `get` of the incremented key could never round-trip safely.
     async fn incr_in(
         &self,
         namespace: &[u8],
         key: impl AsRef<[u8]>,
         delta: i64,
     ) -> Result<Option<i64>> {
+        if self.inner.compress {
+            return Err(Error::CompressionIncompatible);
+        }
         let key = key.as_ref();
         validate_key(namespace, key)?;
         self.before_operation().await?;

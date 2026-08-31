@@ -117,6 +117,11 @@ plain signed-decimal integer (or the delta would overflow `i64`). Both
 are also available on a `Namespace` handle, scoped exactly like its
 `get`/`set`/`delete`.
 
+**Incompatible with value compression.** A client built with
+`compress(true)` gets `Err(Error::CompressionIncompatible)` from
+`incr`/`decr` immediately, before any I/O — see Value compression below
+for why the two can't mix.
+
 **`incr` is exactly as volatile as `set`**: LRU eviction and TTL expiry
 reclaim an incremented value like any other entry. It's a good fit for
 rate limiting or approximate counters, not a substitute for a durable
@@ -536,6 +541,11 @@ for a fresh keyspace, or only after every client touching an existing one
 has upgraded and enabled it together. Incompressible data
 (already-compressed media, random bytes) is passed through unchanged
 rather than bloated.
+
+**Incompatible with counters.** `compress(true)` also rules out
+`incr`/`decr` on this client (see Counters above): an INCR result carries
+no marker byte, so there is no way to tell a compressed value from a
+plain integer on the wire.
 
 ## Notes
 

@@ -115,9 +115,10 @@ public sealed class NanocachedNamespace
     /// scoped to this handle's namespace. As volatile as
     /// <see cref="SetAsync(byte[], byte[], long)"/> — not for durable
     /// counts — and, in a cluster, only the primary owner runs the
-    /// increment; replicas receive the resulting value via <c>Set</c>. See
-    /// the client method's own doc comment for the full replication
-    /// design.</summary>
+    /// increment; replicas receive the resulting value via <c>Set</c>. Throws
+    /// <see cref="CompressionIncompatibleException"/> immediately when this
+    /// client has <c>Compress</c> enabled (issue #321). See the client
+    /// method's own doc comment for the full replication design.</summary>
     public Task<long?> IncrAsync(string key, long delta) => _client.IncrAsync(_namespace, key, delta);
 
     public Task<long?> IncrAsync(byte[] key, long delta) => _client.IncrAsync(_namespace, key, delta);

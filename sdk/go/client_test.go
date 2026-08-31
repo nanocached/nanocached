@@ -5373,6 +5373,40 @@ func TestDecrRejectsMinInt64Delta(t *testing.T) {
 	}
 }
 
+// TestIncrDecrRejectCompressBeforeAnyIO covers issue #321: a client
+// constructed with Compress enabled must reject Incr/Decr (including
+// through a Namespace handle) with ErrCompressIncompatible before any
+// wire I/O, since a compress-enabled Get always attempts to decompress
+// on read and the primary would otherwise forward its literal ASCII
+// result to replicas without a compression marker byte.
+func TestIncrDecrRejectCompressBeforeAnyIO(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, Compress: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, ok, err := client.Incr("counter", 1); ok || !errors.Is(err, ErrCompressIncompatible) {
+		t.Fatalf("Incr with Compress enabled = ok=%v err=%v, want ok=false err=ErrCompressIncompatible", ok, err)
+	}
+	if _, ok, err := client.Decr("counter", 1); ok || !errors.Is(err, ErrCompressIncompatible) {
+		t.Fatalf("Decr with Compress enabled = ok=%v err=%v, want ok=false err=ErrCompressIncompatible", ok, err)
+	}
+
+	ns := client.Namespace("counters")
+	if _, ok, err := ns.Incr("hits", 1); ok || !errors.Is(err, ErrCompressIncompatible) {
+		t.Fatalf("Namespace.Incr with Compress enabled = ok=%v err=%v, want ok=false err=ErrCompressIncompatible", ok, err)
+	}
+	if _, ok, err := ns.Decr("hits", 1); ok || !errors.Is(err, ErrCompressIncompatible) {
+		t.Fatalf("Namespace.Decr with Compress enabled = ok=%v err=%v, want ok=false err=ErrCompressIncompatible", ok, err)
+	}
+
+	if node.iRequestsReceived() != 0 {
+		t.Fatalf("iRequestsReceived = %d, want 0 (Compress must be rejected before any wire I/O)", node.iRequestsReceived())
+	}
+}
+
 func TestNamespaceIncrAndDecrScopeToTheirNamespace(t *testing.T) {
 	node := startMockNode(t, nil)
 	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})

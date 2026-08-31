@@ -1305,7 +1305,11 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         /** As {@link NanocachedClient#incr(byte[], long)}, scoped to
-         * {@link #namespace()} (issue #129). */
+         * {@link #namespace()} (issue #129).
+         *
+         * @throws NanocachedException.CompressionIncompatible if this
+         *         client was built with {@code compress} enabled (issue
+         *         #321) */
         public OptionalLong incr(byte[] key, long delta) {
             return NanocachedClient.this.incr(namespace, key, delta);
         }
@@ -2400,6 +2404,11 @@ public final class NanocachedClient implements AutoCloseable {
         return incr(key, 1L);
     }
 
+    /**
+     * @throws NanocachedException.CompressionIncompatible if this client
+     *         was built with {@code compress} enabled (issue #321) — see
+     *         {@link #incr(byte[], byte[], long)}
+     */
     public OptionalLong incr(byte[] key, long delta) {
         return incr(EMPTY_NAMESPACE, key, delta);
     }
@@ -2445,8 +2454,21 @@ public final class NanocachedClient implements AutoCloseable {
      * form: INCR always carries an explicit namespace length on the wire
      * (0 meaning default), so — unlike {@code get}/{@code set}/{@code
      * delete} — there is no separate legacy frame to fall back to; this
-     * is simply the one and only frame shape. */
+     * is simply the one and only frame shape.
+     *
+     * <p>Incompatible with value compression (issue #321): a client
+     * constructed with {@code compress} enabled rejects every incr/decr
+     * call here, before any I/O, rather than write an unmarked counter
+     * result a compress-enabled {@code get} can't decompress. See {@link
+     * NanocachedException.CompressionIncompatible}.
+     *
+     * @throws NanocachedException.CompressionIncompatible if this client
+     *         was built with {@code compress} enabled
+     */
     OptionalLong incr(byte[] namespace, byte[] key, long delta) {
+        if (compress) {
+            throw new NanocachedException.CompressionIncompatible();
+        }
         validateKey(namespace, key);
         beforeOperation();
         Connection.IncrResult result =

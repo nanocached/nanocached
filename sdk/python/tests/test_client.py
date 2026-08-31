@@ -12,6 +12,7 @@ from nanocached import (
     AlreadyClosedError,
     AuthenticationError,
     ClientStats,
+    CompressionIncompatibleError,
     ConnectionLostError,
     DecompressionError,
     DiscoveryBusyError,
@@ -1331,6 +1332,27 @@ class IncrTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.incr("counter"), 11)  # delta defaults to 1
             self.assertEqual(await client.incr("counter", 5), 16)
             self.assertEqual(await client.incr("counter", -20), -4)
+        finally:
+            await client.close()
+
+    async def test_incr_on_a_compress_enabled_client_raises_before_any_io(self):
+        # Issue #321: compress has no marker byte on incr's wire result,
+        # so this must be rejected up front rather than corrupt the
+        # keyspace — no wire op should even be attempted.
+        client = await self.connect(compress=True)
+        try:
+            with self.assertRaises(CompressionIncompatibleError):
+                await client.incr("counter")
+            self.assertEqual(self.node.incr_count, 0)
+        finally:
+            await client.close()
+
+    async def test_decr_on_a_compress_enabled_client_raises_before_any_io(self):
+        client = await self.connect(compress=True)
+        try:
+            with self.assertRaises(CompressionIncompatibleError):
+                await client.decr("counter")
+            self.assertEqual(self.node.incr_count, 0)
         finally:
             await client.close()
 
@@ -3765,6 +3787,20 @@ class NamespaceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await users.decr("counter", 3), 8)
             # The default namespace's own "counter" is a separate entry.
             self.assertIsNone(await client.incr("counter"))
+        finally:
+            await client.close()
+
+    async def test_namespace_incr_on_a_compress_enabled_client_raises_before_any_io(self):
+        # Issue #321: Namespace.incr()/decr() forward to the same
+        # client._incr() the top-level incr()/decr() use, so the guard
+        # applies here too.
+        client = await self.connect(compress=True)
+        try:
+            users = client.namespace("users")
+            with self.assertRaises(CompressionIncompatibleError):
+                await users.incr("counter")
+            with self.assertRaises(CompressionIncompatibleError):
+                await users.decr("counter")
         finally:
             await client.close()
 

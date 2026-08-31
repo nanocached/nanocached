@@ -144,6 +144,25 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
+     * Raised by {@code incr}/{@code decr} (including the namespace handle's
+     * overloads) on a client constructed with {@code compress} enabled
+     * (issue #321) — before any I/O. The protocol has no marker byte
+     * distinguishing a compressed value from INCR's plain-decimal-ASCII
+     * result, so a compress-enabled client can neither read back a value it
+     * increments nor increment a value it (or another compress-enabled
+     * client) wrote: this honest-subset restriction turns that into an
+     * immediate, clear error instead of a confusing runtime failure on
+     * {@code get} ({@link DecompressionFailed}) or on the server
+     * ({@link NotNumeric}).
+     */
+    public static final class CompressionIncompatible extends NanocachedException {
+        public CompressionIncompatible() {
+            super("nanocached: incr/decr is incompatible with value compression "
+                    + "(disable compress or use a separate client without it)");
+        }
+    }
+
+    /**
      * Raised by {@link NanocachedClient#getManyBytes} (issue #151) when
      * some keys are still wrong-node after the one bounded
      * refresh-and-retry every batch gets (the per-key analogue of {@code

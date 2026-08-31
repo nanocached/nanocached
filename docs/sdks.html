@@ -210,7 +210,10 @@ existed, err := client.Delete("greeting")</code></pre>
   counts that must survive. In a cluster only the primary owner runs the
   increment; the SDK writes the <em>result</em> to the remaining owners
   as an ordinary <code>set</code>, never by replaying the increment
-  itself (replaying it could drift a replica from the primary). See
+  itself (replaying it could drift a replica from the primary). Incompatible
+  with value compression: the SDKs reject <code>incr</code>/<code>decr</code>
+  outright on a client with <code>compress</code> enabled, since the protocol
+  has no way to tell a compressed value from a plain integer. See
   <a href="protocol.html#incr">i</a>.</li>
   <li><b>Compare-and-set</b> — <code>putIfAbsent</code>,
   <code>replace</code> (present-only and exact-match forms), and a
@@ -245,7 +248,10 @@ existed, err := client.Delete("greeting")</code></pre>
   or above a configurable threshold are transparently DEFLATE-compressed
   on write and decompressed on read. Every client touching a given
   keyspace must agree on the setting (<a
-  href="https://github.com/nanocached/nanocached/blob/main/value compression">value compression</a>).</li>
+  href="https://github.com/nanocached/nanocached/blob/main/value compression">value compression</a>).
+  Also incompatible with counters: a client with <code>compress</code>
+  enabled raises immediately from <code>incr</code>/<code>decr</code> rather
+  than produce a value the protocol can't safely round-trip.</li>
   <li><b>Fire-and-forget replica writes</b> — off by default; when
   enabled, a write returns as soon as the primary owner acks instead of
   also waiting for replica legs, which finish in the background (bounded,

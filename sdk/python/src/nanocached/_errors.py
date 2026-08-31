@@ -73,6 +73,25 @@ class NotNumericError(NanocachedError):
         )
 
 
+class CompressionIncompatibleError(NanocachedError):
+    """Raised by incr/decr (issue #321) on a client constructed with
+    ``compress=True``, before any I/O. The protocol has no marker byte
+    on the wire result of an increment, so a compress-enabled client
+    forwarding that result to replicas as an ordinary set() would write
+    an unmarked value get() then unconditionally tries to decompress
+    (and incr on a value a compress-enabled client already wrote fails
+    server-side with NotNumericError, since it's DEFLATE bytes, not
+    decimal text) — there is no way for the SDK to make this work, so
+    it raises instead of quietly corrupting the keyspace. Disable
+    compress, or use a separate, compress-disabled client for counters."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "nanocached: incr/decr is incompatible with value compression "
+            "(disable compress, or use a separate client for counters)"
+        )
+
+
 class ConnectionLostError(NanocachedError, ConnectionError):
     """A request's connection failed *after* its frame was already fully
     written to the socket (issue #225) — write()/drain() returned

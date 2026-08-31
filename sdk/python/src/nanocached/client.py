@@ -43,6 +43,7 @@ from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection
 from ._digest import content_digest
 from ._errors import (
     AlreadyClosedError,
+    CompressionIncompatibleError,
     ConnectionLostError,
     NanocachedError,
     PartialWrongNodeError,
@@ -1482,19 +1483,29 @@ class NanocachedClient:
         *before* the request was ever sent (e.g. an idle FIN) still
         redials and retries transparently, exactly as get/set/delete do
         — only a write that may have already landed is left for the
-        caller to decide whether to retry."""
+        caller to decide whether to retry.
+
+        Raises ``CompressionIncompatibleError`` immediately, before any
+        I/O, if this client was constructed with ``compress=True``
+        (issue #321): the protocol has no marker byte on an increment's
+        wire result, so there is no way to make compress and incr/decr
+        coexist safely. Disable compress, or use a separate client for
+        counters."""
         return await self._incr(b"", key, delta)
 
     async def decr(self, key: str | bytes, delta: int = 1) -> int | None:
         """``incr(key, -delta)`` (issue #129) — decr never sends a
         separate wire op; see incr(), including its at-least-once caveat
-        on a lost connection (issue #225)."""
+        on a lost connection (issue #225) and its CompressionIncompatibleError
+        on a compress-enabled client (issue #321)."""
         return await self.incr(key, -delta)
 
     async def _incr(self, namespace: bytes, key: str | bytes, delta: int) -> int | None:
         """The namespace-carrying implementation behind incr()/decr() and
         Namespace.incr()/Namespace.decr() (issue #129) — see
         _get_bytes()."""
+        if self._compress:
+            raise CompressionIncompatibleError()
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         _check_delta(delta)
@@ -2622,12 +2633,14 @@ class Namespace:
 
     async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
         """Same as NanocachedClient.incr(), scoped to this namespace
-        (issue #129)."""
+        (issue #129) — including its CompressionIncompatibleError on a
+        compress-enabled client (issue #321)."""
         return await self._client._incr(self._namespace, key, delta)
 
     async def decr(self, key: str | bytes, delta: int = 1) -> int | None:
         """Same as NanocachedClient.decr(), scoped to this namespace
-        (issue #129)."""
+        (issue #129) — including its CompressionIncompatibleError on a
+        compress-enabled client (issue #321)."""
         return await self._client._incr(self._namespace, key, -delta)
 
     async def put_if_absent(

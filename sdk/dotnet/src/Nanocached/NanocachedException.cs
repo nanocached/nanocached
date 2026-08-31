@@ -158,3 +158,21 @@ public sealed class NotNumericException : NanocachedException
     public NotNumericException()
         : base("nanocached: the stored value is not an integer INCR can operate on") { }
 }
+
+/// <summary>
+/// issue #321 — INCR/DECR is structurally incompatible with <c>Compress</c>:
+/// a successful increment forwards the primary's literal ASCII result to
+/// replicas as an unmarked <c>Set</c>, while <c>Compress</c> unconditionally
+/// runs decompression on every subsequent <c>Get</c>, so reading that key
+/// back always fails (and incrementing a value <c>Compress</c> itself wrote
+/// fails <see cref="NotNumericException"/> instead). The server never
+/// interprets values, so this can't be fixed with a wire-level marker byte
+/// alone — raised immediately, before any I/O, rather than let either
+/// failure mode surface later. Disable <c>Compress</c> on the client used
+/// for counters, or use a separate client for keys that need compression.
+/// </summary>
+public sealed class CompressionIncompatibleException : NanocachedException
+{
+    public CompressionIncompatibleException()
+        : base("nanocached: incr/decr is incompatible with value compression (disable Compress or use a separate client for counters)") { }
+}

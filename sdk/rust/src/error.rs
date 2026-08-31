@@ -80,6 +80,12 @@ pub enum Error {
     /// transient failure.
     #[cfg(feature = "compression")]
     Decompression(String),
+    /// `incr`/`decr` (issue #321) on a client constructed with `compress`
+    /// enabled: the protocol has no marker byte on an INCR result, so a
+    /// compressed replica write or a `get` of an incremented key can never
+    /// round-trip safely. Raised before any I/O — disable `compress` or
+    /// use a separate client for counters.
+    CompressionIncompatible,
     /// issue #151 — `get_many`/`get_many_bytes` when some keys are still
     /// wrong-node after the one bounded refresh-and-retry every batch
     /// gets (the per-key analogue of `get`/`get_bytes`' own `W`
@@ -113,6 +119,10 @@ impl fmt::Display for Error {
             Error::NotNumeric => write!(
                 f,
                 "nanocached: the stored value is not an integer INCR can operate on"
+            ),
+            Error::CompressionIncompatible => write!(
+                f,
+                "nanocached: incr/decr is incompatible with value compression (disable compress or use a separate client)"
             ),
             Error::ConnectionLost(message)
             | Error::ConnectionLostAfterSend(message)

@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import {
   AlreadyClosedError,
   AuthenticationError,
+  CompressionIncompatibleError,
   ConnectionLostError,
   contentDigest,
   CounterOutOfRangeError,
@@ -1590,6 +1591,45 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
         // not `String(Number("...53"))`, which would round back down to
         // 2^53 (JS's ties-to-even rule on the first unsafe integer).
         assert.equal(node.store.get("counter")?.toString("ascii"), (twoToThe53 + 1n).toString());
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient incr/decr rejects on a compress-enabled client (issue #321)", () => {
+  it("throws CompressionIncompatibleError from incr/decr before any I/O", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        await assert.rejects(client.incr("counter"), CompressionIncompatibleError);
+        await assert.rejects(client.decr("counter"), CompressionIncompatibleError);
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("throws CompressionIncompatibleError from a namespace handle's incr/decr too", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        const ns = client.namespace("ns");
+        await assert.rejects(ns.incr("counter"), CompressionIncompatibleError);
+        await assert.rejects(ns.decr("counter"), CompressionIncompatibleError);
       } finally {
         client.close();
       }
