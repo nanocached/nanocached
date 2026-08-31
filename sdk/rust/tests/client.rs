@@ -2357,6 +2357,53 @@ async fn keep_alive_pings_an_idle_connection() {
 }
 
 #[tokio::test]
+async fn dropping_every_client_handle_without_close_stops_the_keep_alive_task() {
+    // Regression for issue #325: the keep-alive task used to hold a
+    // strong `Arc<Inner>`, so dropping every `NanocachedClient` handle
+    // without ever calling `close()` left `Inner` — and the connections
+    // it owns — alive forever purely because the task itself still
+    // pinned them. `inner.closed` never became true (nobody sets it
+    // without `close()`), and the task kept finding the still-open
+    // connection reachable through its own strong `Arc`, so it pinged it
+    // forever. `Inner` now holds only a `Weak` reference, so dropping the
+    // last client handle drops `Inner` (and its connections) immediately,
+    // and the task exits on its next failed `upgrade()`. There's no
+    // public handle on the task itself, so this is observed indirectly:
+    // keep-alive pings must plateau after the drop instead of continuing
+    // to climb across further keep-alive intervals.
+    let node = MockNode::start().await;
+    let default_interval = nanocached::KEEPALIVE_INTERVAL_MS.load(Ordering::SeqCst);
+    nanocached::KEEPALIVE_INTERVAL_MS.store(40, Ordering::SeqCst);
+    let connected = NanocachedClient::connect(options(node.port)).await;
+    nanocached::KEEPALIVE_INTERVAL_MS.store(default_interval, Ordering::SeqCst);
+    let client = connected.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while node.state.gets.load(Ordering::SeqCst) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no keep-alive pings before drop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(client); // no close() — that's the whole point of this test
+
+    // Let any ping already in flight land, then record the count and
+    // confirm it plateaus rather than continuing to climb across several
+    // more keep-alive intervals (before the fix, it never would).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let after_drop = node.state.gets.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(200)).await; // several more 40ms intervals
+    assert_eq!(
+        node.state.gets.load(Ordering::SeqCst),
+        after_drop,
+        "keep-alive pings kept climbing after every client handle was dropped without close()"
+    );
+    node.stop();
+}
+
+#[tokio::test]
 async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_returns() {
     // Regression: a server that completes the A handshake but then never
     // answers a G/S/D (accepts the TCP connection and goes silent — a
