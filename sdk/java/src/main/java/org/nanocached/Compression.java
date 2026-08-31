@@ -35,6 +35,15 @@ final class Compression {
      * shrink the value (incompressible data), the marker byte alone is
      * added and the value is stored unchanged. Always returns a value
      * with the marker byte prefixed.
+     *
+     * <p>Every return path here goes through {@link #prefixed}, which
+     * always allocates a brand-new array — so the result never aliases
+     * {@code value} (the caller's own array), even on the
+     * marker-byte-only paths above. {@link NanocachedClient}'s
+     * fire-and-forget replica legs rely on this: a leg only needs its own
+     * defensive copy when {@code compress} is off (issue #326), since a
+     * compressed value here is already safe to hand to a background task
+     * without copying it again.
      */
     static byte[] compressValue(byte[] value, int threshold) {
         if (value.length < threshold) {
