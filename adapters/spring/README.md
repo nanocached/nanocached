@@ -175,10 +175,12 @@ Mitigate with all of:
 
 ## Consistency notes
 
-The wire has single-key get/set/delete and no compare-and-set, so
-`putIfAbsent` is get-then-put (two racing writers can both see "absent";
-the later put wins), and cross-JVM `get(key, valueLoader)` stampedes are
-possible as described above.
+`putIfAbsent` uses the wire's compare-and-set `putIfAbsent` (issue #141)
+and is genuinely atomic: exactly one of two racing writers for the same
+key stores its value, the other gets back the winner's. Cross-JVM
+`get(key, valueLoader)` stampedes are still possible as described above —
+the per-JVM striped lock only protects one process from computing the
+same key twice.
 
 ## Requirements
 

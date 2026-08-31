@@ -3,6 +3,7 @@ package org.nanocached.spring;
 import java.time.Duration;
 import java.util.concurrent.Callable;
 import org.nanocached.NanocachedClient;
+import org.springframework.cache.Cache.ValueWrapper;
 import org.springframework.cache.support.AbstractValueAdaptingCache;
 
 /**
@@ -16,11 +17,12 @@ import org.springframework.cache.support.AbstractValueAdaptingCache;
  * as Spring's {@code NullValue} marker through the configured
  * {@link CacheValueSerializer}.
  *
- * <p>Consistency notes — the wire has single-key get/set/delete and no
- * compare-and-set, so:
+ * <p>Consistency notes:
  * <ul>
- *   <li>{@link #putIfAbsent} is get-then-put, not atomic: two racing
- *       writers can both see "absent" and the later put wins;
+ *   <li>{@link #putIfAbsent} is the wire's compare-and-set {@code
+ *       putIfAbsent} (issue #141, add-if-absent) — genuinely atomic:
+ *       exactly one of two racing writers for the same key stores its
+ *       value, the other gets back the winner's;
  *   <li>{@link #get(Object, Callable)} computes on a miss under a
  *       <em>per-JVM</em> striped lock — one computation per process, but
  *       processes sharing the cluster may compute the same key
@@ -128,6 +130,30 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
     public void put(Object key, Object value) {
         byte[] payload = serializer.serialize(toStoreValue(value));
         namespace.set(keyConverter.toKeyBytes(key), payload, ttlSeconds);
+    }
+
+    /**
+     * The wire's compare-and-set {@code putIfAbsent} (issue #141): one
+     * conditioned write, not Spring's default get-then-put — two racing
+     * callers for the same key can no longer both observe "absent" and
+     * both write.
+     *
+     * <p>On a lost race (the key was already present) this follows up
+     * with a plain read to report the existing value, purely for the
+     * return value the {@link org.springframework.cache.Cache} contract
+     * promises the caller; the write itself already atomically no-opped
+     * against the wire before that read happens, so a value that changes
+     * between the two only affects what this call <em>reports</em>, not
+     * what it stores.
+     */
+    @Override
+    public ValueWrapper putIfAbsent(Object key, Object value) {
+        byte[] keyBytes = keyConverter.toKeyBytes(key);
+        byte[] payload = serializer.serialize(toStoreValue(value));
+        if (namespace.putIfAbsent(keyBytes, payload, ttlSeconds)) {
+            return null;
+        }
+        return toValueWrapper(lookup(key));
     }
 
     @Override

@@ -16,10 +16,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  * wire protocol the Spring adapter's client traffic produces: the
  * {@code A ... T} handshake, the namespaced {@code g}/{@code s}/{@code
  * d}/{@code c} commands, their legacy default-namespace forms (the
- * SDK's keep-alive probe), and {@code F}. A trimmed re-implementation of
- * the SDK's own test double (that one is package-private to the SDK), not
- * a real store: no TTL expiry, no LRU — the adapter tests only assert
- * what reaches the wire and what comes back.
+ * SDK's keep-alive probe), the compare-and-set {@code k} (issue #141)
+ * {@link NanocachedCache#putIfAbsent} relies on, and {@code F}. A
+ * trimmed re-implementation of the SDK's own test double (that one is
+ * package-private to the SDK), not a real store: no TTL expiry, no LRU —
+ * the adapter tests only assert what reaches the wire and what comes
+ * back.
  */
 final class MockNode implements AutoCloseable {
 
@@ -31,6 +33,7 @@ final class MockNode implements AutoCloseable {
     final Map<ByteBuffer, Map<ByteBuffer, Entry>> stores = new ConcurrentHashMap<>();
     final AtomicInteger clearCount = new AtomicInteger();
     final AtomicInteger flushCount = new AtomicInteger();
+    final AtomicInteger casSetCount = new AtomicInteger();
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress());
@@ -116,6 +119,7 @@ final class MockNode implements AutoCloseable {
                         flushCount.incrementAndGet();
                         reply(out, "C" + tagSuffix + "\n");
                     }
+                    case "k" -> casSet(in, out, parts, tagged, tagSuffix);
                     default -> throw new IOException("unexpected command " + parts[0]);
                 }
             }
@@ -157,6 +161,40 @@ final class MockNode implements AutoCloseable {
         byte[] key = in.readNBytes(keyLength);
         boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
         reply(out, (existed ? "D" : "N") + tagSuffix + "\n");
+    }
+
+    /** {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]},
+     * docs/protocol.html "k / x" — only {@code <cond> == "A"} (add if
+     * absent) is implemented, the only condition {@link
+     * NanocachedCache#putIfAbsent} ever sends. The store's per-namespace
+     * map is the lock: check-then-put is synchronized on it so two
+     * connections racing on the same key really do serialize the way the
+     * real server's CAS does, not just "usually" thanks to test timing. */
+    private void casSet(InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
+            throws IOException {
+        byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
+        int keyLength = Integer.parseInt(parts[2]);
+        int valueLength = Integer.parseInt(parts[3]);
+        String cond = parts[4];
+        byte[] key = in.readNBytes(keyLength);
+        byte[] value = in.readNBytes(valueLength);
+        casSetCount.incrementAndGet();
+
+        if (!"A".equals(cond)) {
+            throw new IOException("MockNode: only cond \"A\" is implemented, got " + cond);
+        }
+        Map<ByteBuffer, Entry> map = store(ns(namespace));
+        ByteBuffer keyBuffer = ByteBuffer.wrap(key);
+        boolean stored;
+        synchronized (map) {
+            stored = !map.containsKey(keyBuffer);
+            if (stored) {
+                int ttlFieldCount = parts.length - 5 - (tagged ? 1 : 0);
+                long ttlSeconds = ttlFieldCount > 0 ? Long.parseLong(parts[5]) : 0;
+                map.put(keyBuffer, new Entry(value, ttlSeconds));
+            }
+        }
+        reply(out, (stored ? "S" : "N") + tagSuffix + "\n");
     }
 
     private static String ns(byte[] namespace) {

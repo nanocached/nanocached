@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
@@ -248,6 +249,79 @@ class NanocachedCacheManagerTest {
         assertNotNull(existing);
         assertEquals(new User("Alice", 30), existing.get());
         assertEquals(new User("Alice", 30), cache.get("k", User.class));
+    }
+
+    @Test
+    void putIfAbsentUsesTheWireCompareAndSetNotGetThenPut() {
+        Cache cache = manager().build().getCache("users");
+
+        assertNull(cache.putIfAbsent("k", new User("Alice", 30)));
+        assertEquals(1, node.casSetCount.get(), "a winning putIfAbsent must be one CAS write");
+
+        Cache.ValueWrapper existing = cache.putIfAbsent("k", new User("Bob", 40));
+        assertNotNull(existing);
+        assertEquals(
+                2,
+                node.casSetCount.get(),
+                "a losing putIfAbsent must still be one CAS write, not a get followed by a put");
+    }
+
+    @Test
+    void putIfAbsentIsAtomicUnderConcurrentWriters() throws Exception {
+        Cache cache = manager().build().getCache("users");
+        int callers = 8;
+        CountDownLatch ready = new CountDownLatch(callers);
+        CountDownLatch go = new CountDownLatch(1);
+        Thread[] threads = new Thread[callers];
+        Cache.ValueWrapper[] results = new Cache.ValueWrapper[callers];
+
+        for (int i = 0; i < callers; i++) {
+            int slot = i;
+            threads[i] = new Thread(() -> {
+                ready.countDown();
+                try {
+                    go.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                results[slot] = cache.putIfAbsent("k", new User("writer-" + slot, slot));
+            });
+            threads[i].start();
+        }
+        ready.await();
+        go.countDown();
+        for (Thread thread : threads) {
+            thread.join();
+        }
+
+        long winners = Arrays.stream(results).filter(Objects::isNull).count();
+        assertEquals(1, winners, "exactly one racing putIfAbsent must win");
+        User stored = cache.get("k", User.class);
+        for (Cache.ValueWrapper result : results) {
+            if (result != null) {
+                assertEquals(stored, result.get(), "every loser must observe the winner's value");
+            }
+        }
+    }
+
+    @Test
+    void putIfAbsentTreatsACachedNullAsPresent() {
+        Cache cache = manager().build().getCache("users");
+        cache.put("nobody", null);
+
+        Cache.ValueWrapper existing = cache.putIfAbsent("nobody", new User("Alice", 30));
+
+        assertNotNull(existing, "a cached null is a present entry, not absent");
+        assertNull(existing.get());
+        assertNull(cache.get("nobody", User.class), "the cached null must not have been overwritten");
+    }
+
+    @Test
+    void putIfAbsentRejectsNullWhenNullValuesAreDisallowed() {
+        Cache cache = manager().allowNullValues(false).build().getCache("users");
+
+        assertThrows(IllegalArgumentException.class, () -> cache.putIfAbsent("k", null));
     }
 
     @Test
