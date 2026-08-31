@@ -492,6 +492,29 @@ class NanocachedClientTest {
         }
     }
 
+    // issue #321: compress has no marker byte distinguishing a compressed
+    // value from INCR's plain-decimal-ASCII result, so a compress-enabled
+    // client must refuse incr/decr outright, before any I/O.
+    @Test
+    void incrAndDecrRejectCompressEnabledClientsBeforeAnyIO() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true))) {
+                int connectionsAfterConnect = node.connectionCount.get();
+                assertThrows(NanocachedException.CompressionIncompatible.class,
+                        () -> client.incr("counter", 1));
+                assertThrows(NanocachedException.CompressionIncompatible.class,
+                        () -> client.decr("counter", 1));
+                assertThrows(NanocachedException.CompressionIncompatible.class,
+                        () -> client.namespace("tenant-a").incr("counter"));
+                assertThrows(NanocachedException.CompressionIncompatible.class,
+                        () -> client.namespace("tenant-a").decr("counter"));
+                // No new connection was opened for any of the rejected calls.
+                assertEquals(connectionsAfterConnect, node.connectionCount.get());
+            }
+        }
+    }
+
     // issue #225: INCR is not idempotent, so unlike get/set/delete the
     // built-in redial-and-retry must never resend it once its bytes may
     // already have reached the server. These two tests cover the two

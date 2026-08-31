@@ -129,6 +129,11 @@ plain decimal integer, or whose result would overflow a 64-bit counter,
 throws `NanocachedException.NotNumeric`. Both exist on
 `client.namespace(ns)` handles too, scoped exactly like `get`/`set`.
 
+**Incompatible with value compression.** A client built with
+`compress(true)` throws `NanocachedException.CompressionIncompatible` from
+`incr`/`decr` immediately, before any I/O — see
+[Value compression](#value-compression) for why.
+
 ```java
 client.set("hits", "0");
 client.incr("hits");         // 1
@@ -474,6 +479,10 @@ this on for a fresh keyspace, or only after every client touching an
 existing one has upgraded and enabled it together. Incompressible data
 (already-compressed media, random bytes) is passed through unchanged
 rather than bloated.
+
+**Incompatible with `incr`/`decr`.** There is no marker byte for INCR's
+plain-decimal-ASCII result, so a client with `compress(true)` refuses to
+call `incr`/`decr` at all — see [Counters](#counters-incrdecr).
 
 ## close()
 

@@ -1796,6 +1796,28 @@ public class NanocachedClientTests
         Assert.Equal(Bytes("2"), replica.Store[MockNode.KeyOf(namespaceBytes, Bytes("counter"))]);
     }
 
+    [Fact]
+    public async Task IncrDecrRejectCompressionBeforeAnyIo()
+    {
+        // issue #321: incr/decr forwards the primary's literal ASCII
+        // result to replicas without a marker byte, while a
+        // Compress-enabled client always tries to decompress on Get — so
+        // reading an incremented key back is guaranteed to fail. Reject
+        // up front instead, before the request ever reaches the wire.
+        using var node = new MockNode();
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+
+        await Assert.ThrowsAsync<CompressionIncompatibleException>(() => client.IncrAsync("counter", 1));
+        await Assert.ThrowsAsync<CompressionIncompatibleException>(() => client.DecrAsync("counter", 1));
+
+        NanocachedNamespace ns = client.Namespace("users");
+        await Assert.ThrowsAsync<CompressionIncompatibleException>(() => ns.IncrAsync("counter", 1));
+        await Assert.ThrowsAsync<CompressionIncompatibleException>(() => ns.DecrAsync("counter", 1));
+
+        Assert.Equal(0, node.IncrRequestCount);
+    }
+
     // ── compare-and-set (issue #141) ─────────────────────────────
 
     [Fact]

@@ -182,6 +182,13 @@ earlier dropped replica write). `NanocachedNamespace` exposes the same
 **Not idempotent** — see [Reconnect and keep-alive](#reconnect-and-keep-alive)
 for what that means for a request that loses its connection mid-flight.
 
+**Incompatible with `Compress`** — a client constructed with `Compress =
+true` throws `CompressionIncompatibleException` immediately, before any
+I/O, from every `IncrAsync`/`DecrAsync` call (including
+`NanocachedNamespace`'s). An incremented value can't safely round-trip
+through compression, so disable `Compress` or use a separate client for
+counters (see [Value compression](#value-compression)).
+
 ## Batched get and set
 
 `GetManyAsync`/`GetManyBytesAsync` and `SetManyAsync`/`SetManyBytesAsync`
@@ -502,6 +509,10 @@ client touching an existing one has upgraded and enabled it together.
 Incompressible data (already-compressed media, random bytes) is passed
 through unchanged rather than bloated.
 
+**Incompatible with `IncrAsync`/`DecrAsync`** — see [Incr / Decr](#incr--decr).
+A client with `Compress = true` raises immediately rather than produce a
+counter value the protocol can't safely round-trip.
+
 ## close()
 
 `client.Close()` (or `Dispose()`/`using`) is idempotent; calling it a
@@ -516,10 +527,11 @@ that a false positive.
 ## Errors
 
 Every exception this SDK throws extends `NanocachedException` —
-including `AuthenticationFailedException` for a rejected secret and
+including `AuthenticationFailedException` for a rejected secret,
 `NotNumericException` for an `IncrAsync`/`DecrAsync` whose stored value
-isn't an integer — so one catch clause covers "an expected nanocached
-failure". Caller mistakes
+isn't an integer, and `CompressionIncompatibleException` for
+`IncrAsync`/`DecrAsync` called on a `Compress`-enabled client — so one
+catch clause covers "an expected nanocached failure". Caller mistakes
 (an invalid TTL, an empty address list) throw `ArgumentException`
 instead: they indicate a bug in the calling code, not a nanocached
 failure, a convention shared across the SDKs (issue #47).

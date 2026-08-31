@@ -69,6 +69,17 @@ var (
 	// numeric value (or delete it).
 	ErrNotNumeric = errors.New("nanocached: the stored value is not an integer INCR can operate on")
 
+	// ErrCompressIncompatible is returned by Incr/Decr (issue #321) when
+	// Config.Compress is enabled: the primary would forward its literal
+	// ASCII result to replicas without the compression marker byte, and a
+	// compress-enabled Get always attempts to decompress on read — so
+	// incrementing a compressed keyspace can never round-trip correctly.
+	// The protocol has no way to tell a compressed value from a plain
+	// counter, so this is rejected client-side, before any I/O, rather
+	// than attempted. Disable Compress, or use a separate client without
+	// it for counter keys.
+	ErrCompressIncompatible = errors.New("nanocached: incr/decr is incompatible with value compression (disable compress or use a separate client)")
+
 	// ErrRetryable is returned when a single request was answered `R`
 	// (issue #125) on every attempt of the bounded retry budget — the
 	// server (today, only nanocached-proxy) reported the request itself

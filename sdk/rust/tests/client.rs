@@ -1085,6 +1085,42 @@ async fn incr_on_a_non_numeric_stored_value_errors_not_numeric() {
 }
 
 #[tokio::test]
+async fn incr_on_a_compressing_client_errors_before_any_io() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port).compress(true))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        client.incr("hits", 1).await,
+        Err(Error::CompressionIncompatible)
+    ));
+    assert!(matches!(
+        client.decr("hits", 1).await,
+        Err(Error::CompressionIncompatible)
+    ));
+    assert_eq!(
+        node.state.incrs.load(Ordering::SeqCst),
+        0,
+        "the compress guard must fire before the request ever reaches the wire"
+    );
+
+    let ns = client.namespace("ns");
+    assert!(matches!(
+        ns.incr("hits", 1).await,
+        Err(Error::CompressionIncompatible)
+    ));
+    assert!(matches!(
+        ns.decr("hits", 1).await,
+        Err(Error::CompressionIncompatible)
+    ));
+    assert_eq!(node.state.incrs.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
 async fn a_successful_incr_returns_the_new_value() {
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();

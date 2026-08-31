@@ -166,6 +166,13 @@ returns `None`, matching `get()`; a key whose stored value isn't an
 integer INCR can operate on (or where applying the delta would overflow a
 signed 64-bit integer) raises `NotNumericError`.
 
+**Incompatible with `compress`.** A client constructed with
+`compress=True` raises `CompressionIncompatibleError` from `incr`/`decr`
+immediately, before any I/O: the wire result of an increment carries no
+compression marker byte, so there is no way to forward it to replicas or
+read it back safely (see "Value compression" below) — disable `compress`,
+or use a separate client for counters.
+
 A counter is exactly as volatile as any other entry: LRU eviction and TTL
 expiry reclaim it like a plain `set`, so this is a fit for rate limiting
 and approximate counters, not durable counts (billing, inventory).
@@ -410,6 +417,9 @@ subclass — catch that one class when you don't care which:
 - `NotNumericError` — `incr`/`decr` found a stored value that isn't an
   integer INCR can operate on, or applying the delta would overflow a
   signed 64-bit integer (see Counters (incr/decr)).
+- `CompressionIncompatibleError` — `incr`/`decr` was called on a client
+  constructed with `compress=True`; raised immediately, before any I/O
+  (see Counters (incr/decr)).
 - `RetryableError` — a request was answered the retryable-error status
   `R` three times running. `R` means the request itself failed
   transiently — today, `nanocached-proxy` sends it when its upstream
@@ -487,6 +497,11 @@ read). There is no dual-mode migration path: only turn this on for a
 fresh keyspace, or only after every client touching an existing one has
 upgraded and enabled it together. Incompressible data (already-compressed
 media, random bytes) is passed through unchanged rather than bloated.
+
+**Incompatible with `incr`/`decr` (issue #321).** A `compress=True` client
+raises `CompressionIncompatibleError` from both immediately rather than
+produce a value the protocol can't safely round-trip — see "Counters
+(incr/decr)" above.
 
 ## Notes
 

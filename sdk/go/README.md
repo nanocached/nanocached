@@ -270,6 +270,11 @@ it) — so a caller that sees `ErrConnectionLost` from `Incr`/`Decr` cannot
 tell whether the increment took effect, and must decide for itself
 whether to retry (risking a double-apply) or treat the result as unknown.
 
+**Incompatible with `Compress`** (issue #321): a client constructed with
+`Compress: true` returns `ErrCompressIncompatible` from `Incr`/`Decr`
+immediately, before any I/O, rather than produce a value the protocol
+can't safely round-trip — see "Value compression" below.
+
 ## Batched get and set
 
 `GetMany`/`GetManyBytes` and `SetMany`/`SetManyBytes` (the `m`/`o`
@@ -503,6 +508,11 @@ an existing one has upgraded and enabled it together. Incompressible
 data (already-compressed media, random bytes) is passed through
 unchanged rather than bloated.
 
+**Incompatible with `Incr`/`Decr`** (issue #321): the protocol has no way
+to tell a compressed value from a plain counter, so `Compress: true`
+makes `Incr`/`Decr` return `ErrCompressIncompatible` rather than corrupt
+a counter or a compressed value — see "Incr and Decr" above.
+
 ## Notes
 
 - This SDK speaks the current wire protocol (rendezvous hashing,
@@ -511,8 +521,9 @@ unchanged rather than bloated.
   the TypeScript/Python/Java/Rust/.NET SDKs also assert.
 - Errors: `ErrClosed`, `ErrWrongNode`, `ErrDiscoveryBusy`,
   `ErrConnectionLost`, `ErrAuthenticationFailed`, `ErrDecompression`,
-  `ErrNotNumeric` (see "Incr and Decr" above), and `ErrRetryable` (see
-  "Transient retries" above) are sentinels for `errors.Is`. Caller
+  `ErrNotNumeric` (see "Incr and Decr" above), `ErrCompressIncompatible`
+  (see "Incr and Decr" above), and `ErrRetryable` (see "Transient
+  retries" above) are sentinels for `errors.Is`. Caller
   mistakes (an invalid TTL, an empty address list)
   surface as ordinary errors outside the sentinel set — they indicate a
   bug in the calling code, not a nanocached failure; this convention is

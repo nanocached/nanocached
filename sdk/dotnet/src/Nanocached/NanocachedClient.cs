@@ -1710,7 +1710,14 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="ConnectionLostException"/> in that case instead of
     /// silently double-applying it. A caller that needs to know for certain
     /// whether an Incr landed after seeing this exception should read the
-    /// counter back rather than assume either outcome.</para></summary>
+    /// counter back rather than assume either outcome.</para>
+    ///
+    /// <para><b>Incompatible with <c>Compress</c> (issue #321)</b>: throws
+    /// <see cref="CompressionIncompatibleException"/> immediately, before
+    /// any I/O, when this client was constructed with <c>Compress</c>
+    /// enabled — an incremented value can't safely round-trip through
+    /// compression. Disable <c>Compress</c> or use a separate client for
+    /// counters.</para></summary>
     public Task<long?> IncrAsync(byte[] key, long delta) => IncrAsync(EmptyNamespace, key, delta);
 
     /// <summary>issue #129: as <see cref="IncrAsync(string, long)"/>,
@@ -1725,6 +1732,10 @@ public sealed class NanocachedClient : IDisposable
     /// duplicating this client's networking.</summary>
     internal async Task<long?> IncrAsync(byte[] namespaceBytes, byte[] key, long delta)
     {
+        if (_compress)
+        {
+            throw new CompressionIncompatibleException();
+        }
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
         try
@@ -1746,7 +1757,10 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="IncrAsync(byte[], long)"/> (issue #225): not idempotent,
     /// so a connection lost after the request frame was already fully
     /// written throws <see cref="ConnectionLostException"/> rather than
-    /// risk decrementing twice.</summary>
+    /// risk decrementing twice. Also throws
+    /// <see cref="CompressionIncompatibleException"/> when <c>Compress</c>
+    /// is enabled, for the same reason <see cref="IncrAsync(byte[], long)"/>
+    /// does (issue #321).</summary>
     public Task<long?> DecrAsync(string key, long delta) => IncrAsync(key, NegateDecrDelta(delta));
 
     /// <summary>issue #129: <see cref="IncrAsync(byte[], long)"/> with

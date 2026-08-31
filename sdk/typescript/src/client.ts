@@ -40,6 +40,20 @@ export class AlreadyClosedError extends NanocachedError {
   }
 }
 
+/** Thrown by incr/decr (issue #321), before any I/O, on a client
+ * constructed with `compress` enabled. The protocol has no marker byte on
+ * the wire form incr/decr's ASCII result takes, so a compress-enabled
+ * client can neither incr a key a compress-enabled `set` wrote (server-
+ * side NotNumericError) nor have a later `get` decompress an incremented
+ * key's unmarked result — there is no way to make this combination work,
+ * only to fail it clearly instead of corrupting reads. */
+export class CompressionIncompatibleError extends NanocachedError {
+  constructor() {
+    super("nanocached: incr/decr is incompatible with value compression (disable compress or use a separate client)");
+    this.name = "CompressionIncompatibleError";
+  }
+}
+
 /** Thrown by getMany/getManyBytes (issues #128/#150/#151) when some
  * keys are still wrong-node after the one bounded refresh-and-retry
  * every batch gets (the per-key analogue of get/set's own `W`
@@ -1199,6 +1213,9 @@ export class NanocachedClient {
   /** Atomically adds `delta` (signed, default 1) to `key`'s stored
    * counter and returns the new value — `null` if the key is missing or
    * expired, matching `get`'s own miss convention. Throws
+   * `CompressionIncompatibleError` (issue #321), before any I/O, if this
+   * client has `compress` enabled — incr/decr and value compression are
+   * incompatible, see "Value compression" in README.md. Throws
    * `NotNumericError` if the stored value isn't an integer INCR can
    * operate on, or if applying `delta` would overflow; throws
    * `CounterOutOfRangeError` (issue #224) if the new counter falls
@@ -1231,7 +1248,9 @@ export class NanocachedClient {
 
   /** `incr` with a negated delta — there is no separate wire operation for
    * decrement, the server (and the wire protocol) only ever sees `i`. Same
-   * at-least-once caveat as `incr` on a connection loss (issue #225). */
+   * at-least-once caveat as `incr` on a connection loss (issue #225), and
+   * the same `CompressionIncompatibleError` on a compress-enabled client
+   * (issue #321). */
   async decr(key: string | Uint8Array, delta = 1): Promise<number | null> {
     return this.incrInNamespace(EMPTY_NAMESPACE, key, -delta);
   }
@@ -1757,6 +1776,7 @@ export class NanocachedClient {
    * replica byte-identical to the primary; only the value handed back to
    * *this* caller is refused. */
   private async incrInNamespace(namespace: Uint8Array, key: string | Uint8Array, delta: number): Promise<number | null> {
+    if (this.compress) throw new CompressionIncompatibleError();
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     const result = await this.withWrongNodeRetry(

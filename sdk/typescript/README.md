@@ -158,6 +158,10 @@ after every client touching an existing one has upgraded and enabled it
 together. Incompressible data (already-compressed media, random bytes) is
 passed through unchanged rather than bloated.
 
+**Incompatible with `incr`/`decr`** (issue #321): a `compress`-enabled
+client rejects `incr`/`decr` outright with `CompressionIncompatibleError`
+— see [`incr`/`decr`](#incr--decr) above.
+
 ## Cluster behavior
 
 When `connect()` reaches a discovery server, the SDK fetches the node list,
@@ -386,6 +390,15 @@ wire operation for decrement, the server only ever sees `i`. Both default
 isn't an integer `incr` can operate on (or where applying `delta` would
 overflow) rejects with `NotNumericError`.
 
+**Incompatible with value compression** (issue #321): a client constructed
+with `compress: true` rejects `incr`/`decr` immediately, before any I/O,
+with `CompressionIncompatibleError`. The wire protocol has no marker byte
+on incr/decr's ASCII result, so a compress-enabled client can neither incr
+a key a compress-enabled `set` wrote (server-side `NotNumericError`) nor
+have a later `get` decompress an incremented key's unmarked result — see
+"Value compression" below. Disable `compress` or use a separate client for
+counters.
+
 **As volatile as `set`**: LRU eviction and TTL expiry reclaim an
 incremented value exactly like any other entry. Good for rate limiting and
 approximate counters; not for a durable count (billing, inventory) — use a
@@ -601,8 +614,8 @@ Every error the SDK itself raises — `AlreadyClosedError`,
 `getMany`/`getManyBytes` when a batch is still partially wrong-node
 after one refresh — see [Batched get and set](#batched-get-and-set)),
 `ConnectionLostError`, `RetryableError`,
-`NotNumericError`, `CounterOutOfRangeError`, `DecompressionError`,
-`DiscoveryBusyError`, and protocol/auth failures —
+`NotNumericError`, `CounterOutOfRangeError`, `CompressionIncompatibleError`,
+`DecompressionError`, `DiscoveryBusyError`, and protocol/auth failures —
 extends the exported `NanocachedError` base class, so `error instanceof
 NanocachedError` distinguishes an expected nanocached failure from
 everything else. Node system errors from the socket itself
