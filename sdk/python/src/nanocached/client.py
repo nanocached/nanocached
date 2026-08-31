@@ -787,6 +787,18 @@ class NanocachedClient:
                 target.writer.close()
                 raise AlreadyClosedError()
             self._single_address = proxy.address
+            # In via_proxy mode this is the only address this client ever
+            # dials, so _redial_cooldowns should hold at most one entry
+            # at a time — without this, every proxy this client is ever
+            # swapped away from (issue #363) leaks its cooldown entry
+            # forever in a churning proxy fleet, the same leak
+            # _refresh_node_list already prunes for departed cluster
+            # members (#96); via_proxy mode never runs that refresh
+            # (_maybe_refresh no-ops while self._ring is None), so this
+            # is the one place a newly pinned proxy address is known.
+            for cooled_address in list(self._redial_cooldowns):
+                if cooled_address != proxy.address:
+                    del self._redial_cooldowns[cooled_address]
             return self._new_connection(target.reader, target.writer, target.tagged)
         raise last_error if last_error is not None else NanocachedError(
             "nanocached: no proxies registered with discovery"
