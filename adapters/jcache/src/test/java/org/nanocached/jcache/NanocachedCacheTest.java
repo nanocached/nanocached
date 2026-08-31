@@ -562,6 +562,73 @@ class NanocachedCacheTest {
     }
 
     @Test
+    void twoArgReplaceOnDurationZeroOnUpdateDeletesAndFiresRemoved() throws Exception {
+        // Issue #331: replace(K,V)'s Duration.ZERO-on-update branch deleted
+        // the entry but never fired Removed nor recorded the removal —
+        // unlike put()/getAndPut()/replace(K,V,V)/getAndReplace's equivalent
+        // zero-TTL branches (see the #278 comment on put()).
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ZERO));
+        Cache<String, String> zeroCache = manager.createCache("zero-replace", config);
+        manager.enableStatistics("zero-replace", true);
+
+        // Seed "a" as already-present, bypassing the cache — see the putAll
+        // test above for why.
+        node.store("zero-replace")
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
+                        new MockNode.Entry(ValueCodec.serialize("old"), 60L));
+
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        zeroCache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
+
+        assertTrue(zeroCache.replace("a", "1")); // update resolves to Duration.ZERO -> deletes
+
+        assertNull(zeroCache.get("a"));
+        assertEquals(List.of("REMOVED:a:old=old"), events);
+        assertEquals(1, statisticsMBean("zero-replace").getCacheRemovals());
+    }
+
+    @Test
+    void getAndPutFallbackOverwriteOnDurationZeroDeletesAndFiresRemoved() throws Exception {
+        // Issue #331: fallbackOverwrite's delete branch (reached once the CAS
+        // retry budget is exhausted and the TTL resolves to Duration.ZERO)
+        // deleted the entry but never recorded the removal in statistics nor
+        // fired Removed — unlike getAndReplace's equivalent inline fallback
+        // branch, which it mirrors.
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(Duration.ZERO));
+        Cache<String, String> zeroCache = manager.createCache("zero-fallback", config);
+        manager.enableStatistics("zero-fallback", true);
+
+        // Seed "a" as already-present, bypassing the cache — see the putAll
+        // test above for why.
+        node.store("zero-fallback")
+                .put(
+                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
+                        new MockNode.Entry(ValueCodec.serialize("old"), 60L));
+
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        zeroCache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
+
+        // Sustained CAS mismatch on every k/x request exhausts getAndPut's
+        // retry budget, forcing it to fall through to fallbackOverwrite.
+        node.forceCasMismatchCount.set(50);
+
+        assertEquals("old", zeroCache.getAndPut("a", "1"));
+
+        assertNull(zeroCache.get("a"));
+        assertEquals(List.of("REMOVED:a:old=old"), events);
+        assertEquals(1, statisticsMBean("zero-fallback").getCacheRemovals());
+    }
+
+    @Test
     void accessedExpiryPolicyRefreshesTheTtlOnEveryGet() {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);

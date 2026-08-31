@@ -81,6 +81,15 @@ public final class NanocachedCacheManager implements CacheManager {
             throw new CacheException(
                     "nanocached-jcache: a cache named \"" + cacheName + "\" already exists");
         }
+        // Issue #331: only register the statistics MBean once this cache
+        // instance has actually won the putIfAbsent race above — doing it
+        // in NanocachedCache's constructor meant a losing createCache call
+        // for a duplicate name would register (or attempt to register) a
+        // JMX MBean before failing with the CacheException above, an
+        // unrelated side effect on the losing race.
+        if (complete.isStatisticsEnabled()) {
+            cache.setStatisticsEnabled(true);
+        }
         return cache;
     }
 

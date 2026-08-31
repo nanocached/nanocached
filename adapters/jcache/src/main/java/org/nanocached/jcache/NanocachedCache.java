@@ -129,9 +129,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 configuration.getCacheEntryListenerConfigurations()) {
             addListener(listenerConfig);
         }
-        if (configuration.isStatisticsEnabled()) {
-            setStatisticsEnabled(true);
-        }
+        // Issue #331: statistics-MBean registration is deferred to
+        // NanocachedCacheManager.createCache, after it wins the
+        // putIfAbsent race for this cache's name — registering it here
+        // means a losing createCache call for a duplicate name registers
+        // (or attempts to register) a JMX MBean before failing with
+        // CacheException, an unrelated side effect on the losing race.
     }
 
     // ── reads ───────────────────────────────────────────────────────
@@ -333,6 +336,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         if (ttl.isEmpty()) {
             if (fallback.isPresent()) {
                 namespace.delete(keyBytes);
+                // Issue #331: mirrors getAndReplace's inline fallback branch
+                // below — deleting an existing entry here must also record
+                // the removal and fire Removed, not just put().
+                statistics.recordRemove();
+                fireRemoved(key, ValueCodec.deserialize(fallback.get().value()));
             }
             return fallback.map(entry -> (V) ValueCodec.deserialize(entry.value())).orElse(null);
         }
@@ -426,9 +434,17 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         byte[] keyBytes = KeyCodec.toKeyBytes(key);
         OptionalLong ttl = wireTtlSeconds(expiryPolicy.getExpiryForUpdate());
         if (ttl.isEmpty()) {
+            // Issue #331: an update resolving to Duration.ZERO deletes the
+            // entry just like put()/getAndPut()/replace(K,V,V) do (see the
+            // #278 comment on put()) — so it must fire Removed the same
+            // way they do, not silently. Unlike those methods, replace(K,V)
+            // doesn't already hold a deserialized old value, so read it
+            // here first.
+            Optional<byte[]> existing = namespace.getBytes(keyBytes);
             boolean removed = namespace.delete(keyBytes);
             if (removed) {
                 statistics.recordRemove();
+                existing.ifPresent(bytes -> fireRemoved(key, ValueCodec.deserialize(bytes)));
             }
             return removed;
         }

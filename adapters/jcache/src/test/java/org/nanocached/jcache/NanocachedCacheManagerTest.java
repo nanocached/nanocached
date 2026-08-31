@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.Serializable;
+import java.lang.management.ManagementFactory;
 import java.net.URI;
 import java.util.Properties;
 import java.util.Set;
@@ -17,6 +18,8 @@ import javax.cache.configuration.MutableConfiguration;
 import javax.cache.integration.CacheLoader;
 import javax.cache.integration.CacheLoaderException;
 import javax.cache.spi.CachingProvider;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -69,6 +72,38 @@ class NanocachedCacheManagerTest {
                 CacheException.class,
                 () -> manager.createCache(
                         "users", new MutableConfiguration<String, User>().setTypes(String.class, User.class)));
+    }
+
+    @Test
+    void creatingADuplicateCacheNameWithStatisticsEnabledStillReportsTheDuplicateNameError() throws Exception {
+        // Issue #331: the losing createCache used to construct its
+        // NanocachedCache — which registered a statistics MBean under the
+        // same ObjectName the winner already claimed — before the
+        // duplicate-name putIfAbsent check ran. That meant a duplicate name
+        // with statistics enabled failed with an MBean-registration
+        // CacheException instead of the intended "already exists" one, and
+        // left the platform MBean server in a confusing state.
+        MutableConfiguration<String, User> first = new MutableConfiguration<>();
+        first.setTypes(String.class, User.class);
+        first.setStatisticsEnabled(true);
+        javax.cache.Cache<String, User> winner = manager.createCache("dup-stats", first);
+
+        MutableConfiguration<String, User> second = new MutableConfiguration<>();
+        second.setTypes(String.class, User.class);
+        second.setStatisticsEnabled(true);
+
+        CacheException ex = assertThrows(CacheException.class, () -> manager.createCache("dup-stats", second));
+        assertTrue(ex.getMessage().contains("already exists"), "unexpected message: " + ex.getMessage());
+
+        // The winner's own MBean must still be registered exactly once, and
+        // the winner's cache must remain fully usable.
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
+                + ObjectName.quote(manager.getURI().toString()) + ",Cache=" + ObjectName.quote("dup-stats"));
+        assertTrue(mbs.isRegistered(objectName), "the winner's statistics MBean must be registered");
+
+        winner.put("a", new User("a", 1));
+        assertEquals(new User("a", 1), winner.get("a"));
     }
 
     @Test
