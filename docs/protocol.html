@@ -394,13 +394,22 @@ and migration frames — <code>L</code> (node list),
 announce), <code>M</code>/<code>X</code>/<code>C</code> (migrate,
 cancel, complete), <code>Y</code>/<code>Z</code>/<code>Q</code> (proxy
 announce, deregister, and list — how <code>nanocached-proxy</code>
-registers with discovery and how SDKs in proxy mode find one), and
+registers with discovery and how SDKs in proxy mode find one),
 <code>U</code>/<code>u</code>/<code>V</code> (handoff store, handoff
 delete, and node leave — the graceful-decommission frames a draining
 node uses to move its entries and exit membership; see
-<a href="deployment.html">Deployment</a>). <code>U</code> also carries
-an optional trailing <code>A</code> token
-(<code>U &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt; [ttl] [A]</code>):
+<a href="deployment.html">Deployment</a>), and <code>T</code> (node
+roster: a registered node fetching the member list <em>with</em> every
+member's membership token, self-identifying the way a heartbeat does —
+the frames below need those tokens, and discovery hands them only to
+proven members, never to a client that merely holds the shared secret;
+see <a href="architecture.html">Architecture</a> for what that trust
+model implies). <code>M</code>, <code>U</code>, and <code>u</code> each
+carry the <em>receiving</em> node's membership token
+(<code>U &lt;ns-len&gt; &lt;key-len&gt; &lt;val-len&gt;
+&lt;token-len&gt; [ttl] [A]</code>), verified before the frame acts,
+since these are exactly the frames that skip the wrong-node check.
+<code>U</code> also carries an optional trailing <code>A</code> token:
 a survivor re-replicating a key after a membership change dropped a
 member (an eviction, or a leave it did not itself hand off for — see
 <a href="architecture.html">Architecture</a>) sends it instead of a
