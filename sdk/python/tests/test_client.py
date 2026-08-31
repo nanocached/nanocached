@@ -3275,6 +3275,77 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_cancelling_a_hedged_read_does_not_leak_the_running_legs(self):
+        # Issue #324: asyncio.wait_for(client.get(...), timeout) (or any
+        # other cancellation of the caller's await) used to be caught by
+        # nothing in _read_hedged's main loop — CancelledError propagated
+        # straight out, skipping the detach()/resolve_losers() call that is
+        # the only thing that ever arranges for a still-running leg to be
+        # discarded from self._hedged_reads once it finishes. Both legs
+        # here are still running when the cancellation lands; once each
+        # eventually finishes on its own, it must still be gone from
+        # self._hedged_reads instead of sitting there forever.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.02
+            )
+            try:
+                await client.set("k", "v")
+                primary, replica = self.owners_of("k")
+                nodes[primary].delay_gets(0.3)
+                nodes[replica].delay_gets(0.3)
+
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(client.get("k"), timeout=0.05)
+
+                # Both legs are still in flight at this point (0.3s hasn't
+                # elapsed) but already registered by start() above.
+                self.assertEqual(len(client._hedged_reads), 2)
+
+                await wait_for(
+                    lambda: client._hedged_reads == set(),
+                    "both orphaned legs to finish and be discarded",
+                )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_close_still_drains_a_leg_orphaned_by_a_cancelled_hedged_read(self):
+        # Companion to the previous test, mirroring
+        # test_close_still_drains_a_replica_leg_orphaned_by_a_cancelled_write
+        # (issue #189) for hedged reads: close() must still wait for the
+        # orphaned legs via _hedged_reads' drain instead of racing
+        # _teardown() against a task nothing else references.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.02
+            )
+            primary, replica = self.owners_of("k")
+            await client.set("k", "v")
+            nodes[primary].delay_gets(0.3)
+            nodes[replica].delay_gets(0.08)
+
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(client.get("k"), timeout=0.05)
+
+            # The replica leg is still in flight at this point (0.08s
+            # hasn't elapsed) with nothing awaiting it yet.
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                await client.close()
+                await asyncio.sleep(0)
+
+            self.assertNotIn("destroyed", captured.getvalue())
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
 
 class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
     """issue #192: _MAX_INFLIGHT_HEDGE_LOSER_LEGS bounds how many losing
