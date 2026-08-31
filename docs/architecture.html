@@ -165,6 +165,23 @@ shared storage:</p>
 <p>Pair this with a supervisor that restarts a dead replica (systemd,
 Kubernetes) and two replicas make discovery effectively always
 available.</p>
+<p>Membership carries a second, per-node secret alongside the shared
+one: each node registers with a random <em>membership token</em>, and
+the frames that skip a node's wrong-node check — a join's
+<code>M</code>, a decommission's or re-replication's
+<code>U</code>/<code>u</code> — must present the <em>receiver's</em>
+token, so holding the cluster-wide shared secret alone doesn't let a
+client forge them. The flip side is deliberate: any registered node can
+fetch every member's token from discovery (the <code>T</code> frame),
+because a draining node must authorize handoffs to every peer, and a
+survivor re-replicating after an eviction must authorize them to owners
+it never met at registration time. Compromising one node therefore
+yields enough to impersonate any node in the cluster — the tokens
+narrow who can speak the internal frames from "anything holding the
+shared secret" down to "cluster members", not further. Size the blast
+radius accordingly: keep the data and operations ports internal (see
+<a href="deployment.html">Deployment</a>'s security groups), and treat
+a node-level compromise as a cluster-level event.</p>
 
 <h2>The proxy tier (optional)</h2>
 <p>Proxyless client-side sharding holds one connection per node per
