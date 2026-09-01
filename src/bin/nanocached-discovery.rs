@@ -4217,10 +4217,22 @@ async fn handle_connection(
                 // (idempotent no-ops for a stale/unknown name), a
                 // mismatch here specifically means "not a genuinely
                 // registered node", so there is nothing safe to answer.
+                //
+                // The `state == Joined` guard matches `Heartbeat`'s check
+                // (see its handler): `start_join` stores the joiner's own
+                // self-chosen token unverified, so a `Waiting`/`Joining`
+                // entry proves nothing about identity. Without this guard,
+                // anyone who can reach discovery could send `J <name>
+                // <port> <token>` to park a `Waiting` entry under a token
+                // they picked, then replay it here to read back EVERY
+                // member's address and token — the exact "hands them only
+                // to proven members" invariant this handler documents. A
+                // genuinely joined node is the only proof of membership.
                 let authenticated = {
                     let reg = lock(&registry);
                     reg.get(&name).is_some_and(|info| {
-                        constant_time_eq(info.token.as_bytes(), token.as_bytes())
+                        info.state == NodeState::Joined
+                            && constant_time_eq(info.token.as_bytes(), token.as_bytes())
                     })
                 };
                 if !authenticated {
@@ -5335,6 +5347,107 @@ mod tests {
         }
 
         assert_eq!(received, expected);
+    }
+
+    /// Drives one `handle_connection` over a real socket, writes `frame`,
+    /// and returns everything the server sent back before it closed. Shared
+    /// by the `T`-authorization regression tests below so each seeds only
+    /// its registry and asserts on the bytes.
+    async fn roundtrip_one_frame(registry: Registry, frame: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_registry = Arc::clone(&registry);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_connection(
+                MaybeTls::Plain(stream),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                server_registry,
+                current_join,
+                ConnectionConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    list_ready_at: Instant::now(),
+                    replication: 2,
+                    auth_secret: None,
+                    tls_acceptor: None,
+                    tls_connector: None,
+                    announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+                },
+                shutdown_rx,
+                Arc::new(std::sync::Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(frame).await.unwrap();
+        let mut received = Vec::new();
+        client.read_to_end(&mut received).await.unwrap();
+        received
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_from_a_joined_node_returns_the_roster() {
+        // The happy path this authorization guard must keep working: a
+        // genuinely `Joined` node presenting its own token gets the
+        // token-carrying every-state roster back (issue #295).
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            guard.insert(
+                "node-j".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk-j", Some(2)),
+            );
+        }
+
+        // `T <name_len> <token_len>\n<name><token>` — "node-j"/"tk-j".
+        let received = roundtrip_one_frame(registry, b"T 6 4\nnode-jtk-j").await;
+
+        assert!(
+            received.starts_with(b"N "),
+            "a Joined node's T must be answered with the roster, got {received:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_from_a_waiting_node_is_rejected_without_leaking_the_roster() {
+        // Regression (pass-7 audit): `start_join` stores the joiner's own
+        // self-chosen token unverified, so a `Waiting` entry proves nothing
+        // about identity. `T` must apply the same `state == Joined` guard as
+        // `Heartbeat` — otherwise anyone reachable by discovery could park a
+        // `Waiting` entry under a token they picked and replay it here to
+        // read back every member's address and token. The requester matches
+        // a real registry entry by name AND token, and is still rejected: it
+        // is the `Waiting` state, not a bad token, that closes the door.
+        let registry: Registry = Arc::new(RegistryState::default());
+        {
+            let mut guard = lock(&registry);
+            // A real Joined member whose token must NOT leak.
+            guard.insert(
+                "node-j".to_string(),
+                joined_node_reporting("127.0.0.1:9001", "tk-j", Some(2)),
+            );
+            // The attacker's self-registered Waiting entry.
+            guard.insert(
+                "node-w".to_string(),
+                NodeInfo::new(
+                    "127.0.0.1:9002".to_string(),
+                    NodeState::Waiting,
+                    "tk-w".to_string(),
+                ),
+            );
+        }
+
+        // `T` presenting the Waiting entry's own (matching) name/token.
+        let received = roundtrip_one_frame(registry, b"T 6 4\nnode-wtk-w").await;
+
+        assert!(
+            received.is_empty(),
+            "a Waiting node's T must be rejected with no response written, got {received:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

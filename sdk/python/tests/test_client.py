@@ -743,6 +743,53 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             silent.close()
             await silent.wait_closed()
 
+    async def test_open_cluster_rejects_a_nested_discovery_address_without_leaking(self):
+        # Regression (pass-7 audit): if a roster entry points at another
+        # discovery server, dialing it returns a ClusterTarget, not a
+        # NodeTarget. _open_cluster's non-node-address cleanup must (1)
+        # raise NanocachedError, not the AttributeError that closing a
+        # writer-less ClusterTarget used to throw, and (2) still close the
+        # sockets it already opened to the genuine nodes this round.
+        from nanocached import _identify
+        from nanocached.client import ClusterTarget, DiscoveredNode, NodeTarget
+
+        class SpyWriter:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        node_writer = SpyWriter()
+        node_target = NodeTarget(reader=object(), writer=node_writer, tagged=True)
+        nested = ClusterTarget(nodes=[], replication=1)
+
+        async def fake_identify(host, port, secret, ssl_context):
+            # First address is a genuine node, second is a nested discovery.
+            return node_target if port == 9001 else nested
+
+        client = NanocachedClient.__new__(NanocachedClient)
+        client._auth_secret = None
+        client._ssl_context = None
+        identified = ClusterTarget(
+            nodes=[
+                DiscoveredNode(name="real", address="127.0.0.1:9001"),
+                DiscoveredNode(name="nested", address="127.0.0.1:9002"),
+            ],
+            replication=1,
+        )
+
+        with mock.patch.object(_identify, "connect_and_identify", fake_identify), mock.patch(
+            "nanocached.client.connect_and_identify", fake_identify
+        ):
+            with self.assertRaises(NanocachedError):
+                await client._open_cluster(identified)
+
+        self.assertTrue(
+            node_writer.closed,
+            "the genuine node's socket must be closed during non-node-address cleanup",
+        )
+
     async def test_a_refresh_finishing_after_close_installs_no_connections(self):
         # Regression for issue #10.
         node = await MockNode().start()

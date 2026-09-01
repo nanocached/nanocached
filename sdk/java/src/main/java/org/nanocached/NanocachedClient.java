@@ -22,6 +22,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -3937,6 +3938,22 @@ public final class NanocachedClient implements AutoCloseable {
             if (proxies == null || proxies.isEmpty()) {
                 throw sameProxyFailed;
             }
+
+            // Issue #296 removes the single previousAddress entry, but the
+            // failover loop below also arms a cooldown for every candidate
+            // proxy it tries and fails before one accepts — and in proxy
+            // mode maybeRefresh's cluster-side prune (refreshNodeList) never
+            // runs (ring stays null forever), so those entries, plus any for
+            // a proxy the tier has since autoscaled away, would accumulate
+            // in reconnectCooldowns for the client's whole lifetime. A fresh
+            // roster is exactly the set of addresses that can still be
+            // dialed, so drop every cooldown entry for an address no longer
+            // in it; the loop then rearms only the ones it actually retries.
+            Set<String> rosterAddresses = new HashSet<>();
+            for (DiscoveredNode proxy : proxies) {
+                rosterAddresses.add(proxy.address());
+            }
+            reconnectCooldowns.keySet().retainAll(rosterAddresses);
 
             List<DiscoveredNode> shuffled = new ArrayList<>(proxies);
             java.util.Collections.shuffle(shuffled);

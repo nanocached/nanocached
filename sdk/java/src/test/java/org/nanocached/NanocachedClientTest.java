@@ -4602,6 +4602,64 @@ class NanocachedClientTest {
     }
 
     @Test
+    void viaProxyFailoverPrunesCooldownsForProxiesNoLongerInTheRoster() throws Exception {
+        // Regression (pass-7 audit): #296 purges only the single
+        // previousAddress on a swap. A cooldown armed for any other
+        // address the proxy tier has since autoscaled away -- e.g. a
+        // candidate the failover loop tried and failed before landing on a
+        // survivor -- is never dialed again and, with refreshNodeList inert
+        // in proxy mode, would linger in reconnectCooldowns for the
+        // client's whole life. A failover must prune every cooldown entry
+        // whose address is no longer in the freshly fetched roster.
+        try (MockNode proxyA = new MockNode();
+                MockNode proxyB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()),
+                    new DiscoveredNode("proxy-b", proxyB.address()));
+
+            try (NanocachedClient client =
+                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                client.set("k", "v");
+
+                Field reconnectCooldownsField =
+                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                reconnectCooldownsField.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                Map<String, Object> reconnectCooldowns =
+                        (Map<String, Object>) reconnectCooldownsField.get(client);
+
+                // Stand in for a retired proxy's leftover cooldown: an
+                // address that is NOT in the roster and is NOT the
+                // previousAddress the #296 purge would catch.
+                String retiredAddress = "10.255.255.1:9999";
+                Class<?> cooldownEntryClass = Class.forName(
+                        "org.nanocached.NanocachedClient$CooldownEntry");
+                var ctor = cooldownEntryClass.getDeclaredConstructor(long.class, RuntimeException.class);
+                ctor.setAccessible(true);
+                reconnectCooldowns.put(
+                        retiredAddress,
+                        ctor.newInstance(System.nanoTime() + Duration.ofHours(1).toNanos(),
+                                new RuntimeException("stale")));
+                assertTrue(reconnectCooldowns.containsKey(retiredAddress));
+
+                MockNode connected = proxyA.connectionCount.get() > 0 ? proxyA : proxyB;
+                MockNode survivor = connected == proxyA ? proxyB : proxyA;
+                connected.close();
+                Thread.sleep(50);
+
+                assertEquals(Optional.empty(), client.get("k2"));
+                assertTrue(survivor.connectionCount.get() >= 1,
+                        "the survivor must have been dialed after reconnect");
+
+                assertFalse(reconnectCooldowns.containsKey(retiredAddress),
+                        "a failover must prune cooldown entries for addresses no longer "
+                                + "in the proxy roster, not just the previousAddress");
+            }
+        }
+    }
+
+    @Test
     void viaProxyIgnoresReadHedgeAfterAndSendsASingleGet() throws Exception {
         try (MockNode proxy = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
