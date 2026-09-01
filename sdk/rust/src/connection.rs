@@ -1074,7 +1074,14 @@ async fn read_loop(
                 drain_pending(&shared, None).await;
                 return;
             }
-            result = read_one_response(&mut read_half, shared.tagged) => result,
+            result = read_one_response(
+                &mut read_half,
+                shared.tagged,
+                // Production reads the process-wide default here; the bound
+                // is a parameter only so tests can pass an explicit value
+                // (see read_one_response).
+                MAX_MULTI_GET_RESPONSE_BYTES.load(Ordering::SeqCst),
+            ) => result,
         };
 
         let (marker, value, ttl_seconds, tag, entries) = match response {
@@ -1223,6 +1230,14 @@ type WireResponse = (
 async fn read_one_response(
     read_half: &mut BufReader<ReadHalf<Stream>>,
     tagged: bool,
+    // The multi-get cumulative-reply cap, passed in rather than read from
+    // the `MAX_MULTI_GET_RESPONSE_BYTES` static here, so a unit test can
+    // exercise the bound with an explicit value instead of mutating the
+    // process-wide static — which, read on each connection's background
+    // read task while `cargo test` runs the suite concurrently, would let
+    // one test's lowered bound reject another's ordinary reply (a rare
+    // flake, reproduced in CI on 2026-09-01).
+    max_multi_get_response_bytes: usize,
 ) -> Result<WireResponse> {
     let marker = read_half.read_u8().await?;
     match marker {
@@ -1238,7 +1253,7 @@ async fn read_one_response(
                     _ => {
                         return Err(Error::Protocol(
                             "nanocached: invalid value header in response".to_string(),
-                        ))
+                        ));
                     }
                 }
             } else {
@@ -1284,7 +1299,7 @@ async fn read_one_response(
                     _ => {
                         return Err(Error::Protocol(
                             "nanocached: invalid incr response header".to_string(),
-                        ))
+                        ));
                     }
                 }
             } else {
@@ -1294,7 +1309,7 @@ async fn read_one_response(
                     _ => {
                         return Err(Error::Protocol(
                             "nanocached: invalid incr response header".to_string(),
-                        ))
+                        ));
                     }
                 }
             };
@@ -1393,7 +1408,7 @@ async fn read_one_response(
                 // MAX_MULTI_GET_RESPONSE_BYTES (see that static's own doc
                 // comment).
                 let mut total_bytes: usize = 0;
-                let max_response_bytes = MAX_MULTI_GET_RESPONSE_BYTES.load(Ordering::SeqCst);
+                let max_response_bytes = max_multi_get_response_bytes;
                 for token in result_tokens {
                     match *token {
                         "-" => entries.push(MultiEntry::Miss),
@@ -1435,7 +1450,7 @@ async fn read_one_response(
                             return Err(Error::Protocol(
                                 "nanocached: invalid multi-set result token in response"
                                     .to_string(),
-                            ))
+                            ));
                         }
                     }
                 }
@@ -1523,7 +1538,11 @@ mod tests {
     /// function is generic only over `tagged`, not the stream, so a
     /// concrete `Stream::Plain` is the only way to drive it) and returns
     /// its result.
-    async fn read_one_from_bytes(wire: &[u8], tagged: bool) -> Result<WireResponse> {
+    async fn read_one_from_bytes(
+        wire: &[u8],
+        tagged: bool,
+        max_multi_get_response_bytes: usize,
+    ) -> Result<WireResponse> {
         use tokio::net::{TcpListener, TcpStream};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1538,10 +1557,13 @@ mod tests {
         let (server, _) = listener.accept().await.unwrap();
         let (read_half, _write_half) = split(Stream::Plain(server));
         let mut read_half = BufReader::new(read_half);
-        let result = read_one_response(&mut read_half, tagged).await;
+        let result = read_one_response(&mut read_half, tagged, max_multi_get_response_bytes).await;
         writer.await.unwrap();
         result
     }
+
+    /// A bound large enough not to interfere, for tests unconcerned with it.
+    const UNBOUNDED_MULTI_GET: usize = usize::MAX;
 
     #[tokio::test]
     async fn multi_get_header_with_an_overflowing_count_is_a_protocol_error_not_a_panic() {
@@ -1550,11 +1572,37 @@ mod tests {
         // the field-count check straight into an out-of-bounds
         // `rest[..count]` panic inside the spawned read loop. It must be a
         // clean protocol error instead.
-        let result = read_one_from_bytes(b"M 18446744073709551615\n", true).await;
+        let result =
+            read_one_from_bytes(b"M 18446744073709551615\n", true, UNBOUNDED_MULTI_GET).await;
         assert!(
             matches!(result, Err(Error::Protocol(_))),
             "an overflowing multi-get count must be a protocol error, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_get_reply_over_the_cumulative_bound_is_rejected_before_the_last_body() {
+        // Issue #207, moved off the process-wide MAX_MULTI_GET_RESPONSE_BYTES
+        // static (2026-09-01): a reply whose hit bodies sum past the cap is
+        // a protocol error, rejected before the offending body is read. Two
+        // 2-byte hits (running total 4) trip a bound of 3. Passing the bound
+        // explicitly here — instead of shrinking the shared static — keeps
+        // this from racing any concurrently-running multi-get test.
+        let result = read_one_from_bytes(b"M 2 2 2\nxyzz", false, 3).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(ref message)) if message.contains("exceeds 3 bytes")),
+            "a reply over the cumulative bound must be a protocol error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_get_reply_within_the_cumulative_bound_is_accepted() {
+        // The bound-not-tripped counterpart: two hits summing to exactly the
+        // 3-byte bound (2 + 1) are accepted, proving the check doesn't reject
+        // a reply merely for being close to the bound.
+        let result = read_one_from_bytes(b"M 2 2 1\nxyz", false, 3).await;
+        let marker = result.expect("a reply within the bound must be accepted").0;
+        assert_eq!(marker, b'M');
     }
 
     #[test]
