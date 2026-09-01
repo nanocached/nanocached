@@ -109,6 +109,11 @@ const MAX_NAME_OR_ADDR_LENGTH: usize = 4096;
 /// single entry has even been read. Far above any cluster size this
 /// harness's own scenarios ever create.
 const MAX_ROSTER_ENTRIES: usize = 1 << 16;
+/// Aggregate cap on a single `read_line` accumulation, so a peer dripping
+/// newline-free bytes just under `IO_TIMEOUT` can't grow the buffer
+/// without end. Matches the node's 1 MiB request cap (`MAX_REQUEST_SIZE`,
+/// `src/server.rs`): no legitimate line comes close.
+const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// A node's name paired with its dialable address.
 type Roster = Vec<(String, String)>;
@@ -414,6 +419,18 @@ async fn read_line(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Result<Str
         }
 
         buf.extend_from_slice(&chunk[..bytes_read]);
+
+        // Aggregate bound (issue #329's companion): each read renews
+        // `IO_TIMEOUT`, so a peer that keeps dripping a few newline-free
+        // bytes just under the timeout would grow `buf` without end and
+        // never let this loop return. A line larger than the node's own
+        // 1 MiB request cap is not a real response, so stop instead.
+        if buf.len() > MAX_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "line exceeded the maximum length without a newline",
+            ));
+        }
     }
 }
 
