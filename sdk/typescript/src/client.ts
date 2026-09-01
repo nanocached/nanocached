@@ -2734,20 +2734,37 @@ export class NanocachedClient {
       const result = dialResults[i];
 
       if (result.status === "rejected") {
-        // Connecting to this new node failed — skip it silently and retry
-        // on the next refresh (see the doc comment above), counted in
+        // Connecting to this new node failed. Keep it in the ring with a
+        // null connection and arm its cooldown, rather than dropping it
+        // (issue #67, matching openCluster and the Go/Rust/.NET SDKs): the
+        // HashRing ranks by the full candidate set, so dropping a
+        // just-discovered node on a transient dial failure would make this
+        // client route keys near it differently from every peer that did
+        // reach it until the next refresh. Kept, its keys fail over per
+        // request; the next refresh still retries the dial. The failure
+        // stays silent to the caller and is counted in
         // stats().refreshFailures.
         this.refreshFailures++;
+        members.set(node.name, { address: node.address, connection: null });
+        this.reconnectCooldowns.set(node.address, {
+          until: Date.now() + this.reconnectCooldownMs,
+          error: result.reason as Error,
+        });
         continue;
       }
 
       const nodeIdentified = result.value;
       if (nodeIdentified.kind !== "node") {
-        // Discovery returned an address that no longer identifies as a
-        // cache node — skip it silently, same as any other failure to
-        // connect here (see the doc comment above), and count it in
-        // stats().refreshFailures.
+        // Discovery returned an address that identifies as a discovery/
+        // proxy, not a cache node. Treated the same as a failed dial above
+        // so the ring still agrees with peers (the socket was already
+        // closed by connectAndIdentify); counted in stats().refreshFailures.
         this.refreshFailures++;
+        members.set(node.name, { address: node.address, connection: null });
+        this.reconnectCooldowns.set(node.address, {
+          until: Date.now() + this.reconnectCooldownMs,
+          error: new NanocachedError(`nanocached: discovery returned a non-node address: ${node.address}`),
+        });
         continue;
       }
 

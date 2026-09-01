@@ -4316,12 +4316,19 @@ public class TolerantBootstrapTests
     }
 
     [Fact]
-    public async Task RefreshInstallsReachableNewNodesDespiteOneFailingDial()
+    public async Task RefreshKeepsANewNodeInTheRingEvenWhenItsDialFails()
     {
         // A failing dial for one newly discovered node must not prevent
         // the other newly discovered nodes from being installed: every
         // dial outcome is gathered first, and only then applied under
         // the lock — mirroring OpenClusterAsync.
+        //
+        // Regression (pass-7 audit): the unreachable new node must ALSO be
+        // installed, with a null connection, so it stays in the ring —
+        // matching OpenClusterAsync and the Go/Rust SDKs. Dropping it would
+        // make this client's HashRing rank keys near it differently from
+        // every peer that did reach it until the next refresh; kept, its
+        // keys fail over per request and its cooldown is armed.
         using var seed = new MockNode();
         using var discovery = new MockDiscovery(new[] { ("seed", seed.Address) }, replication: 1);
 
@@ -4346,7 +4353,9 @@ public class TolerantBootstrapTests
         await ForceRefreshAsync(client);
 
         Assert.NotNull(GetMemberConnection(client, "good"));
-        Assert.False(HasMember(client, "bad"), "a failing dial must not install a member");
+        Assert.True(HasMember(client, "bad"), "an unreachable new node must stay in the ring");
+        Assert.Null(GetMemberConnection(client, "bad"));
+        Assert.True(GetCooldowns(client).Contains(badAddress), "its reconnect cooldown must be armed");
         Assert.Equal(before + 1, client.Stats().RefreshFailures);
     }
 }

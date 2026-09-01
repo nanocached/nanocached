@@ -5368,16 +5368,22 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
 
         await (client as any).refreshNodeList();
 
-        // The unreachable new node is counted and skipped — it never even
-        // gets a placeholder member (unlike connect()'s tolerant bootstrap,
-        // issue #67, a refresh just leaves it out and retries later) — but
-        // the two reachable new nodes dialed alongside it are still
-        // installed.
+        // The two reachable new nodes dialed alongside the dead one are
+        // installed. Regression (pass-7 audit): the unreachable new node is
+        // ALSO installed, with a null connection, so it stays in the ring —
+        // matching connect()'s tolerant bootstrap (issue #67) and the
+        // Go/Rust/.NET SDKs. Dropping it would make this client's HashRing
+        // rank keys near it differently from every peer that reached it
+        // until the next refresh; kept, its keys fail over per request and
+        // its cooldown is armed.
         assert.equal(client.stats().refreshFailures, 1);
-        const members = (client as any).target.members as Map<string, { connection: unknown }>;
+        const members = (client as any).target.members as Map<string, { connection: unknown; address: string }>;
         assert.ok(members.get("node-a")?.connection !== null, "node-a was not installed");
         assert.ok(members.get("node-b")?.connection !== null, "node-b was not installed");
-        assert.ok(!members.has("dead"), "the unreachable node should not appear in members at all");
+        assert.ok(members.has("dead"), "the unreachable node must stay in the ring");
+        assert.equal(members.get("dead")?.connection, null, "with no connection");
+        const cooldowns = (client as any).reconnectCooldowns as Map<string, unknown>;
+        assert.ok(cooldowns.has(`127.0.0.1:${deadPort}`), "its reconnect cooldown must be armed");
       } finally {
         client.close();
       }
