@@ -1,6 +1,7 @@
 package org.nanocached.jcache;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
@@ -111,6 +112,24 @@ public final class NanocachedCachingProvider implements CachingProvider {
         String compressionThreshold = properties.getProperty("nanocached.compression-threshold");
         if (compressionThreshold != null) {
             options.compressionThreshold(Integer.parseInt(compressionThreshold));
+        }
+        String fireAndForgetReplicas = properties.getProperty("nanocached.fire-and-forget-replicas");
+        if (fireAndForgetReplicas != null) {
+            options.fireAndForgetReplicas(Boolean.parseBoolean(fireAndForgetReplicas));
+        }
+        String readRepair = properties.getProperty("nanocached.read-repair");
+        if (readRepair != null) {
+            options.readRepair(Boolean.parseBoolean(readRepair));
+        }
+        // Durations are given in whole milliseconds here — a plain
+        // Properties value has no ISO-8601 binder like Boot's does.
+        String reconnectCooldownMillis = properties.getProperty("nanocached.reconnect-cooldown-millis");
+        if (reconnectCooldownMillis != null) {
+            options.reconnectCooldown(Duration.ofMillis(Long.parseLong(reconnectCooldownMillis)));
+        }
+        String readHedgeAfterMillis = properties.getProperty("nanocached.read-hedge-after-millis");
+        if (readHedgeAfterMillis != null) {
+            options.readHedgeAfter(Duration.ofMillis(Long.parseLong(readHedgeAfterMillis)));
         }
 
         try {

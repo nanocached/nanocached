@@ -217,4 +217,30 @@ class NanocachedCacheAutoConfigurationTest {
         service.findNullable("alice");
         assertEquals(1, service.calls(), "a null result must be cached by default");
     }
+
+    @Test
+    void clientReliabilityOptionsBindAndReachTheClient() {
+        // Regression (pass-7 audit): the starter used to forward only
+        // tls/ca/compress/compressionThreshold, so a properties-only app had
+        // no way to set fireAndForgetReplicas/readRepair/reconnectCooldown/
+        // readHedgeAfter without hand-writing the client bean the starter
+        // exists to avoid. Booting with them set proves they bind (asserted
+        // on NanocachedProperties) and that the client bean is still built
+        // from them without error (the forwarding path runs).
+        boot(
+                YamlOnlyConfig.class,
+                "nanocached.fire-and-forget-replicas=true",
+                "nanocached.read-repair=true",
+                "nanocached.reconnect-cooldown=2s",
+                "nanocached.read-hedge-after=50ms");
+
+        NanocachedProperties props = context.getBean(NanocachedProperties.class);
+        assertEquals(Boolean.TRUE, props.getFireAndForgetReplicas());
+        assertEquals(Boolean.TRUE, props.getReadRepair());
+        assertEquals(java.time.Duration.ofSeconds(2), props.getReconnectCooldown());
+        assertEquals(java.time.Duration.ofMillis(50), props.getReadHedgeAfter());
+        // The client bean built from these properties exists (no exception
+        // thrown while forwarding them).
+        assertInstanceOf(NanocachedClient.class, context.getBean(NanocachedClient.class));
+    }
 }

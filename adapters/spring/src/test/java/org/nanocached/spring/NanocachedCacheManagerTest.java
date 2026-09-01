@@ -132,17 +132,24 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
-    void zeroTtlMeansNoExpiryAndSubSecondTtlRoundsUp() {
+    void zeroTtlMeansNoExpiryAndPositiveTtlRoundsUp() {
         NanocachedCacheManager manager = manager()
                 .ttl("forever", Duration.ZERO)
                 .ttl("blink", Duration.ofMillis(200))
+                // Regression (pass-7 audit): a fractional TTL above 1s must
+                // round UP, not floor. 2.5s used to reach the wire as 2s
+                // (Duration.toSeconds floors), expiring the entry up to half
+                // a second early.
+                .ttl("fractional", Duration.ofMillis(2500))
                 .build();
         manager.getCache("forever").put("k", new User("Alice", 30));
         manager.getCache("blink").put("k", new User("Bob", 40));
+        manager.getCache("fractional").put("k", new User("Carol", 50));
 
         byte[] key = "String:k".getBytes(StandardCharsets.UTF_8);
         assertEquals(0, node.entry("forever", key).ttlSeconds());
         assertEquals(1, node.entry("blink", key).ttlSeconds());
+        assertEquals(3, node.entry("fractional", key).ttlSeconds());
     }
 
     @Test

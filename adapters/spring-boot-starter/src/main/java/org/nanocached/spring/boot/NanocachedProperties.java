@@ -43,6 +43,26 @@ public class NanocachedProperties {
      * true}. */
     private Integer compressionThreshold;
 
+    /** Whether replica writes are dispatched fire-and-forget. Unset defers
+     * to the SDK default ({@code false}). Mirrors {@code
+     * Options.fireAndForgetReplicas}. */
+    private Boolean fireAndForgetReplicas;
+
+    /** Whether a clean miss probes the remaining owners and repairs the
+     * primary in the background (read repair). Unset defers to the SDK
+     * default ({@code false}). Mirrors {@code Options.readRepair}. */
+    private Boolean readRepair;
+
+    /** How long an address stays "down" after a failed reconnect dial.
+     * Unset defers to the SDK default (1s). Mirrors {@code
+     * Options.reconnectCooldown}. */
+    private Duration reconnectCooldown;
+
+    /** Send a read to the next owner once the primary has been silent this
+     * long (hedged reads). Unset (the default) is off. Mirrors {@code
+     * Options.readHedgeAfter}. */
+    private Duration readHedgeAfter;
+
     @NestedConfigurationProperty
     private final Cache cache = new Cache();
 
@@ -92,6 +112,38 @@ public class NanocachedProperties {
 
     public void setCompressionThreshold(Integer compressionThreshold) {
         this.compressionThreshold = compressionThreshold;
+    }
+
+    public Boolean getFireAndForgetReplicas() {
+        return fireAndForgetReplicas;
+    }
+
+    public void setFireAndForgetReplicas(Boolean fireAndForgetReplicas) {
+        this.fireAndForgetReplicas = fireAndForgetReplicas;
+    }
+
+    public Boolean getReadRepair() {
+        return readRepair;
+    }
+
+    public void setReadRepair(Boolean readRepair) {
+        this.readRepair = readRepair;
+    }
+
+    public Duration getReconnectCooldown() {
+        return reconnectCooldown;
+    }
+
+    public void setReconnectCooldown(Duration reconnectCooldown) {
+        this.reconnectCooldown = reconnectCooldown;
+    }
+
+    public Duration getReadHedgeAfter() {
+        return readHedgeAfter;
+    }
+
+    public void setReadHedgeAfter(Duration readHedgeAfter) {
+        this.readHedgeAfter = readHedgeAfter;
     }
 
     public Cache getCache() {

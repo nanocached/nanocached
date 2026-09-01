@@ -301,6 +301,26 @@ class NanocachedCacheTest {
     // ── batched getAll / putAll (issue #160) ─────────────────────────
 
     @Test
+    void aByteArrayKeyDoesNotCollideWithATypePrefixedStringKey() {
+        // Regression (pass-7 audit): byte[] keys used to pass through raw
+        // while String keys became "String:<value>". A byte[] whose bytes
+        // spell "String:x" would then share a wire key with the string "x"
+        // and one would read back the other's value. The 0x00 marker on
+        // byte[] keys keeps the two families apart.
+        MutableConfiguration<Object, String> config = new MutableConfiguration<>();
+        config.setTypes(Object.class, String.class);
+        config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+        Cache<Object, String> mixed = manager.createCache("collision", config);
+
+        byte[] spellsStringX = "String:x".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        mixed.put(spellsStringX, "from-bytes");
+        mixed.put("x", "from-string");
+
+        assertEquals("from-bytes", mixed.get(spellsStringX));
+        assertEquals("from-string", mixed.get("x"));
+    }
+
+    @Test
     void getAllBatchesEveryKeyTypeIntoOneBulkRead() {
         MutableConfiguration<Object, String> config = new MutableConfiguration<>();
         config.setTypes(Object.class, String.class);
