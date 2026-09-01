@@ -11,12 +11,12 @@
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf, split};
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::io::{split, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+use tokio::sync::{oneshot, watch, Mutex};
 
 use crate::error::{Error, Result};
 use crate::identify::Stream;
