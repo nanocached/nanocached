@@ -165,6 +165,13 @@ impl Shared {
 pub(crate) struct Connection {
     shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
+    /// Per-request round-trip deadline (see `request`). Resolved once per
+    /// client from `Options::request_timeout` (falling back to the
+    /// `REQUEST_TIMEOUT_MS` static) and carried per connection, so tests can
+    /// shorten it on their own client without mutating the shared static —
+    /// which, read on every request while the suite runs concurrently, could
+    /// time out an unrelated test's request.
+    request_timeout: Duration,
     /// Retryable-error status `R` (issue #125): every `R` this connection
     /// ever receives increments this — shared with every other connection
     /// this client opens (see `NanocachedClient::connect`'s
@@ -295,6 +302,7 @@ impl Connection {
         tracking_key: String,
         tagged: bool,
         transient_retries: Arc<AtomicU64>,
+        request_timeout: Duration,
     ) -> Self {
         crate::open_targets::increment(&tracking_key);
         let (read_half, write_half) = split(stream);
@@ -337,6 +345,7 @@ impl Connection {
             shared,
             shutdown: shutdown_tx,
             transient_retries,
+            request_timeout,
         }
     }
 
@@ -362,6 +371,9 @@ impl Connection {
             }),
             shutdown: shutdown_tx,
             transient_retries: Arc::new(AtomicU64::new(0)),
+            // Never runs a request (fails closed first), so the value is
+            // immaterial; the static default keeps it self-consistent.
+            request_timeout: Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::SeqCst)),
         }
     }
 
@@ -609,7 +621,7 @@ impl Connection {
     where
         F: Fn(Option<u32>) -> Vec<u8>,
     {
-        let timeout = Duration::from_millis(REQUEST_TIMEOUT_MS.load(Ordering::SeqCst));
+        let timeout = self.request_timeout;
         match tokio::time::timeout(timeout, self.request_uncapped(build)).await {
             Ok(result) => result,
             Err(_) => {
