@@ -3334,16 +3334,16 @@ public sealed class NanocachedClient : IDisposable
         // block refreshes/retries for N × connect-timeout on a scale-out
         // of N nodes. Every dial outcome is gathered first, then results
         // are installed under one lock — mirroring OpenClusterAsync.
-        async Task<(DiscoveredNode Node, Connection? Connection, bool Failed)> DialNodeAsync(
+        async Task<(DiscoveredNode Node, Connection? Connection, Exception? Error)> DialNodeAsync(
             DiscoveredNode node)
         {
             try
             {
-                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), false);
+                return (node, await OpenNodeConnectionAsync(node.Address).ConfigureAwait(false), null);
             }
-            catch (NanocachedException)
+            catch (NanocachedException error)
             {
-                return (node, null, true);
+                return (node, null, error);
             }
         }
 
@@ -3362,7 +3362,7 @@ public sealed class NanocachedClient : IDisposable
                 return;
             }
 
-            foreach (var (node, connection, failed) in outcomes)
+            foreach (var (node, connection, error) in outcomes)
             {
                 if (connection is not null)
                 {
@@ -3370,16 +3370,19 @@ public sealed class NanocachedClient : IDisposable
                     continue;
                 }
 
-                if (failed)
-                {
-                    Interlocked.Increment(ref _refreshFailures);
-                    // Left out of the ring for now; the next refresh
-                    // retries it. Silent by design — refresh is
-                    // opportunistic/best-effort and must never fail the
-                    // caller's operation, consistent with client-side
-                    // replication's eventual-consistency model. Counted
-                    // via Stats().RefreshFailures.
-                }
+                Interlocked.Increment(ref _refreshFailures);
+                // Install the just-discovered node with a null connection and
+                // arm its cooldown, rather than leaving it out of the ring
+                // (issue #67, matching OpenClusterAsync and the Go/Rust SDKs).
+                // The HashRing ranks by the full candidate set, so dropping a
+                // new node on a transient dial failure would make this
+                // client's primary/replica choice for keys near it disagree
+                // with every peer that DID reach it until the next refresh;
+                // keeping it means its keys fail over per request instead. The
+                // failure is still silent to the caller (refresh is best-effort)
+                // and counted via Stats().RefreshFailures.
+                _members[node.Name] = new Member(node.Address, null);
+                ArmReconnectCooldown(node.Address, error!);
             }
 
             _ring = new HashRing(_members.Keys.ToList());
