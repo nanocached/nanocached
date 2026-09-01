@@ -2185,7 +2185,12 @@ async fn handle_connection(
                                     &config,
                                     node_context.clone(),
                                     target,
-                                    OwnedForwardedWrite::HandoffSet { key, value, ttl },
+                                    OwnedForwardedWrite::HandoffSet {
+                                        key,
+                                        value,
+                                        ttl,
+                                        if_absent: false,
+                                    },
                                 );
                             }
                         }
@@ -2265,6 +2270,7 @@ async fn handle_connection(
                             key: key.clone(),
                             value: value.clone(),
                             ttl,
+                            if_absent: false,
                         },
                     );
                 }
@@ -2333,24 +2339,39 @@ async fn handle_connection(
                 write_response(&mut stream, &encode_response(&response, tag)).await?;
 
                 // If this node is itself mid-join-handoff for the key,
-                // propagate like any other write — but only for an
-                // ordinary (unconditional) handoff. A put-if-absent one
-                // that lost the race (the key was already present here)
-                // changed nothing to propagate; forwarding `value`
-                // regardless would ship a possibly-stale value onward as
-                // an unconditional overwrite. Re-replication already
-                // sends directly to every owner that needs the entry, so
-                // skipping this relay loses nothing.
-                if !if_absent
-                    && let Some(node_context) = &config.node_context
+                // relay it to the joining owner too.
+                //
+                // An ordinary (unconditional) handoff relays as an
+                // unconditional `S`, exactly like a client `Set`.
+                //
+                // A put-if-absent handoff (re-replication after an
+                // eviction, issue #266) relays as another put-if-absent
+                // `U`, never as an unconditional overwrite — the pass-7
+                // audit found that skipping it entirely could strand a key
+                // on the joining owner. Re-replication computes its targets
+                // once, at task start, so a node that joins while it runs is
+                // never sent the key directly; and if the `U` reaches here
+                // after this node's own handoff snapshot for that joiner was
+                // taken (the wait for re-replication to clear can time out
+                // and proceed anyway), the snapshot missed it too. Relaying
+                // as `U` closes both gaps without the staleness risk of an
+                // unconditional overwrite: if the joiner already holds a
+                // value it keeps it, and if it holds nothing it finally
+                // gets this key instead of missing it permanently.
+                if let Some(node_context) = &config.node_context
                     && let Some(target) = migration_target_for(node_context, &key)
                 {
-                    spawn_forward(
-                        &config,
-                        node_context.clone(),
-                        target,
-                        OwnedForwardedWrite::Set { key, value, ttl },
-                    );
+                    let forward = if if_absent {
+                        OwnedForwardedWrite::HandoffSet {
+                            key,
+                            value,
+                            ttl,
+                            if_absent: true,
+                        }
+                    } else {
+                        OwnedForwardedWrite::Set { key, value, ttl }
+                    };
+                    spawn_forward(&config, node_context.clone(), target, forward);
                 }
 
                 continue;
@@ -2504,6 +2525,7 @@ async fn handle_connection(
                                 key: key.clone(),
                                 value: value.clone(),
                                 ttl,
+                                if_absent: false,
                             },
                         );
                     }
@@ -2572,7 +2594,12 @@ async fn handle_connection(
                             &config,
                             node_context.clone(),
                             target,
-                            OwnedForwardedWrite::HandoffSet { key, value, ttl },
+                            OwnedForwardedWrite::HandoffSet {
+                                key,
+                                value,
+                                ttl,
+                                if_absent: false,
+                            },
                         );
                     }
                 }
@@ -6020,11 +6047,15 @@ enum OwnedForwardedWrite {
     },
     /// Issue #124: a decommission's leave-forward — sent as `U`/`u`
     /// frames (see `ForwardedWrite::HandoffSet`/`HandoffDelete` for why
-    /// plain `S`/`D` won't do).
+    /// plain `S`/`D` won't do). `if_absent` is `false` for those (a
+    /// concurrent client write must win unconditionally) and `true` only
+    /// for the join relay of a re-replication put-if-absent (pass-7 audit),
+    /// which must not overwrite a value the joining owner already holds.
     HandoffSet {
         key: Key,
         value: Bytes,
         ttl: Option<Duration>,
+        if_absent: bool,
     },
     HandoffDelete {
         key: Key,
@@ -6045,7 +6076,12 @@ impl OwnedForwardedWrite {
             OwnedForwardedWrite::Delete { key } => {
                 delete_on_joining_node(node_context, target, key).await
             }
-            OwnedForwardedWrite::HandoffSet { key, value, ttl } => {
+            OwnedForwardedWrite::HandoffSet {
+                key,
+                value,
+                ttl,
+                if_absent,
+            } => {
                 forward_on_shared_connection(
                     node_context,
                     target,
@@ -6053,9 +6089,13 @@ impl OwnedForwardedWrite {
                         key,
                         value,
                         ttl: *ttl,
-                        // A concurrent client write must win unconditionally —
-                        // see `ForwardedWrite::HandoffSet`'s own doc comment.
-                        if_absent: false,
+                        // `false` for a decommission leave-forward (a
+                        // concurrent client write must win unconditionally —
+                        // see `ForwardedWrite::HandoffSet`'s own doc
+                        // comment); `true` for the join relay of a
+                        // re-replication put-if-absent, so the joining owner
+                        // keeps any value it already holds.
+                        if_absent: *if_absent,
                         // Issue #295: `target`'s own token, not this
                         // node's — see `Command::HandoffSet::token`.
                         token: &target.token,
@@ -9162,6 +9202,124 @@ mod tests {
             received,
             b"S 5 2\nkey-av1S 5 2\nkey-bv2".to_vec(),
             "both owned keys from the MultiSet must be forwarded to the joining node"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_set_if_absent_is_relayed_to_the_joining_node_as_if_absent() {
+        // Regression (pass-7 audit): a put-if-absent handoff (`U ... A`, the
+        // re-replication-after-eviction form, issue #266) applied here while
+        // this node is mid-join-handoff used to NOT be relayed to the
+        // joining owner at all. Re-replication computes its targets once, so
+        // a node that joins while it runs never gets the key directly, and
+        // this node's own handoff snapshot can miss it too — the key could
+        // be stranded on the joiner permanently. It must be relayed, but as
+        // another `U ... A` (if_absent), never an unconditional overwrite,
+        // so the joiner keeps any value it already holds.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 256];
+            let bytes_read = connection.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0);
+            received.extend_from_slice(&buffer[..bytes_read]);
+            connection.write_all(b"S\n").await.unwrap();
+            received
+        });
+
+        // Two members, R=2: the joiner is in every key's top-R, so the
+        // applied handoff must relay.
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+        ]));
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: joining_addr.clone(),
+                joining_token: "tok-joiner-0".to_string(),
+                after_ring,
+                replication: 2,
+                completed_at: None,
+                forwarding_grace: Duration::from_secs(60),
+                acked_entries: None,
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: Vec::new(),
+                confirmed: false,
+                pre_completion_ring: None,
+                pending_clears: Vec::new(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+            }))),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+
+        // `U 0 5 2 13 A\n<token>key-av1`: ns=0, key="key-a" (5), value="v1"
+        // (2), token="tk-ready-node" (13), `A` = if_absent.
+        client
+            .write_all(b"U 0 5 2 13 A\ntk-ready-nodekey-av1")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+
+        let received = joining_task.await.unwrap();
+        // Relayed to the joiner as another if_absent `U` (the `A` marker),
+        // with the joiner's own token ("tok-joiner-0", 12 bytes) — not an
+        // unconditional `S` that would clobber a value the joiner may hold.
+        assert_eq!(
+            received,
+            b"U 0 5 2 12 A\ntok-joiner-0key-av1".to_vec(),
+            "an applied if_absent handoff must relay to the joiner as an if_absent U"
         );
     }
 
