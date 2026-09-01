@@ -701,11 +701,16 @@ class NanocachedClient:
 
         # A non-node answer is a configuration error, not a liveness one:
         # checked across every outcome first so the sockets this same
-        # round already opened are closed rather than leaked.
+        # round already opened are closed rather than leaked. Only a
+        # NodeTarget owns a writer to close — a ClusterTarget (the
+        # non-node answer itself) has none, so it must be matched by type
+        # rather than "not an Exception", or closing it raises
+        # AttributeError, which both masks the intended NanocachedError and
+        # aborts the cleanup loop, leaking every socket after it.
         for node, outcome in outcomes:
             if not isinstance(outcome, (Exception, NodeTarget)):
                 for _, other in outcomes:
-                    if not isinstance(other, Exception):
+                    if isinstance(other, NodeTarget):
                         other.writer.close()
                 raise NanocachedError(
                     f"nanocached: discovery server returned a non-node address: {node.address}"

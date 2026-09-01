@@ -1358,8 +1358,15 @@ async fn read_one_response(
                     ))
                 })?;
             let rest: Vec<&str> = fields.collect();
+            // `count` is untrusted (a buggy or hostile node picks it): every
+            // other length field in this crate is bounded, so bound this one
+            // too. Compare against `rest.len()` rather than computing
+            // `count + 1`, which overflows to 0 for `count == usize::MAX` and
+            // in release builds would slip past the check straight into an
+            // out-of-bounds `rest[..count]` panic. `checked_sub` on the
+            // known-good `rest.len()` cannot overflow.
             let (result_tokens, tag): (&[&str], Option<u32>) = if tagged {
-                if rest.len() != count + 1 {
+                if rest.len().checked_sub(1) != Some(count) {
                     return Err(Error::Protocol(format!(
                         "nanocached: invalid multi-{} header in response",
                         if marker == b'M' { "get" } else { "set" }
@@ -1511,6 +1518,44 @@ pub(crate) async fn read_line<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds `wire` to `read_one_response` over a real socket pair (the
+    /// function is generic only over `tagged`, not the stream, so a
+    /// concrete `Stream::Plain` is the only way to drive it) and returns
+    /// its result.
+    async fn read_one_from_bytes(wire: &[u8], tagged: bool) -> Result<WireResponse> {
+        use tokio::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wire = wire.to_vec();
+        let writer = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&wire).await.unwrap();
+            // Hold the connection open so a well-formed frame isn't
+            // truncated by an early close mid-read.
+            client.shutdown().await.unwrap();
+        });
+        let (server, _) = listener.accept().await.unwrap();
+        let (read_half, _write_half) = split(Stream::Plain(server));
+        let mut read_half = BufReader::new(read_half);
+        let result = read_one_response(&mut read_half, tagged).await;
+        writer.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn multi_get_header_with_an_overflowing_count_is_a_protocol_error_not_a_panic() {
+        // Regression (pass-7 audit): `count` is untrusted. `usize::MAX`
+        // once made `count + 1` wrap to 0 in release builds, slipping past
+        // the field-count check straight into an out-of-bounds
+        // `rest[..count]` panic inside the spawned read loop. It must be a
+        // clean protocol error instead.
+        let result = read_one_from_bytes(b"M 18446744073709551615\n", true).await;
+        assert!(
+            matches!(result, Err(Error::Protocol(_))),
+            "an overflowing multi-get count must be a protocol error, got {result:?}"
+        );
+    }
 
     #[test]
     fn encode_get_emits_the_legacy_frame_for_the_default_namespace() {

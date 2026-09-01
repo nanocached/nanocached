@@ -1626,11 +1626,22 @@ struct BackendRequest {
     reply: oneshot::Sender<io::Result<NodeReply>>,
 }
 
+/// Hands out a unique id per dialed backend connection so `run_backend`'s
+/// teardown, and `enqueue`'s poisoned-handle recheck, can tell "the
+/// connection I am holding" from "a replacement another task redialed into
+/// this slot" — without keeping a `Sender` clone alive for the comparison
+/// (that would pin the queue open and defeat the drop-ends-the-task
+/// invariant `BackendHandle` documents; see `run_backend`).
+static NEXT_BACKEND_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A live, authenticated, tagged connection to one node, owned by a
 /// task: requests are written in arrival order and replies matched
-/// FIFO by tag. Dropping the sender ends the task and the connection.
+/// FIFO by tag. Dropping every sender ends the task and the connection —
+/// so nothing outside the slot map (and any in-flight `enqueue`) may hold
+/// one, or a pruned backend's task and socket would leak.
 #[derive(Clone)]
 struct BackendHandle {
+    id: u64,
     sender: mpsc::Sender<BackendRequest>,
 }
 
@@ -1670,16 +1681,23 @@ impl BackendHandle {
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "backend handshake timed out"))??;
 
         let (sender, receiver) = mpsc::channel(BACKEND_QUEUE_DEPTH);
+        let id = NEXT_BACKEND_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // `run_backend` gets a *weak* handle to the slot: it must be able to
+        // clear the slot at teardown, but holding a strong `Arc` would keep
+        // the `Option<BackendHandle>` — and so this connection's own
+        // `Sender` — alive even after `prune` drops the map's entry, which
+        // would stop `receiver.recv()` from ever returning `None` and leak
+        // the task and socket for a retired address (pass-7 audit).
         tokio::spawn(run_backend(
             stream,
             buf,
             receiver,
             addr.to_string(),
-            slot,
+            Arc::downgrade(&slot),
             dialed,
-            sender.clone(),
+            id,
         ));
-        Ok(Self { sender })
+        Ok(Self { id, sender })
     }
 }
 
@@ -1705,9 +1723,9 @@ async fn run_backend(
     buf: BytesMut,
     mut receiver: mpsc::Receiver<BackendRequest>,
     addr: String,
-    slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
+    slot: std::sync::Weak<tokio::sync::Mutex<Option<BackendHandle>>>,
     dialed: Arc<std::sync::atomic::AtomicUsize>,
-    own_sender: mpsc::Sender<BackendRequest>,
+    own_id: u64,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     let (pending_tx, mut pending_rx) =
@@ -1758,6 +1776,14 @@ async fn run_backend(
     });
 
     let mut next_tag: u32 = 0;
+    // Distinguishes the two exit reasons for the log below: a broken/
+    // timed-out stream (poison) versus every sender being dropped —
+    // which now includes `SharedBackends::prune` retiring this address,
+    // the case that previously leaked because `run_backend` used to hold
+    // its own `Sender` clone and so `receiver.recv()` never returned
+    // `None`. Holding no sender here is what lets a pruned, idle backend
+    // wind down promptly instead.
+    let mut poisoned_exit = false;
 
     loop {
         let request = tokio::select! {
@@ -1765,7 +1791,10 @@ async fn run_backend(
                 Some(request) => request,
                 None => break,
             },
-            () = poisoned.notified() => break,
+            () = poisoned.notified() => {
+                poisoned_exit = true;
+                break;
+            }
         };
 
         let tag = next_tag;
@@ -1781,6 +1810,7 @@ async fn run_backend(
             .await
             .is_err()
         {
+            poisoned_exit = true;
             break;
         }
 
@@ -1796,6 +1826,7 @@ async fn run_backend(
         {
             // The reader will observe the broken stream (or time out)
             // and poison; nothing more to write here.
+            poisoned_exit = true;
             break;
         }
     }
@@ -1805,24 +1836,44 @@ async fn run_backend(
     drop(pending_tx);
     let _ = reader.await;
 
-    // issue #192: name which backend poisoned — previously this task
+    // issue #192: name which backend went away — previously this task
     // exited silently and the operator only learned from a downstream
-    // "backend connection is gone" error with no address attached.
-    eprintln!("WARN backend connection to {addr} poisoned; will redial on next request");
+    // "backend connection is gone" error with no address attached. A
+    // clean drain (every sender dropped, e.g. prune retired the address)
+    // is expected teardown, not a fault, so it is logged differently.
+    if poisoned_exit {
+        eprintln!("WARN backend connection to {addr} poisoned; will redial on next request");
+    } else {
+        eprintln!("INFO backend connection to {addr} closed; no callers remain");
+    }
 
     // issue #192: eagerly clear this connection's slot and decrement the
     // `dialed` gauge right when the task actually exits, rather than
     // leaving it counted as live until some later caller's send against
-    // it fails and `SharedBackends::enqueue` lazily notices. Only clear
-    // it if the slot still holds *this* connection — another task may
-    // already have redialed and replaced it.
-    let mut guard = slot.lock().await;
-    if guard
-        .as_ref()
-        .is_some_and(|current| current.sender.same_channel(&own_sender))
-    {
-        *guard = None;
-        dialed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    // it fails and `SharedBackends::enqueue` lazily notices.
+    //
+    // Exactly one `-1` must pair with this connection's dial `+1`, split
+    // across three teardown shapes (the slot lock serializes them against
+    // `enqueue`'s own recheck, so each sees a consistent slot):
+    //   * slot still ours (`id == own_id`): we clear it and decrement.
+    //   * slot holds a different id, or is already `None`: `enqueue`'s
+    //     failed-send recheck already found this connection dead, cleared
+    //     it and decremented (possibly redialing a replacement) — we must
+    //     not decrement again.
+    //   * slot gone entirely (`prune` dropped the map's only strong ref,
+    //     which is what closed our queue): nobody else will account for
+    //     this dial, so we decrement here.
+    match slot.upgrade() {
+        Some(slot) => {
+            let mut guard = slot.lock().await;
+            if guard.as_ref().is_some_and(|current| current.id == own_id) {
+                *guard = None;
+                dialed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        None => {
+            dialed.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -2469,7 +2520,7 @@ impl SharedBackends {
             let mut guard = slot.lock().await;
             if guard
                 .as_ref()
-                .is_some_and(|current| current.sender.same_channel(&handle.sender))
+                .is_some_and(|current| current.id == handle.id)
             {
                 *guard = None;
                 self.dialed
@@ -6590,6 +6641,57 @@ mod tests {
         })
         .await
         .expect("dialed gauge must reach 0 even for a connection pruned from the map");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pruning_an_unreferenced_backend_tears_down_its_task_and_socket() {
+        // Regression (pass-7 audit): when autoscaling retires a node,
+        // `prune` drops its slot entry, but the backend's task and TCP
+        // socket must actually go away. They previously leaked: the task
+        // held its own `Sender` clone, so `receiver.recv()` never
+        // returned `None` after the slot's handle was dropped, and — with
+        // no further traffic to trip the reader into poisoning — the two
+        // tokio tasks and the fd lived for the whole proxy's lifetime.
+        // The node here stays fully alive, so a dropped-sender teardown is
+        // the ONLY thing that can wind the task down.
+        let node = MockNode::start().await;
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(None).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        // Dial via a normal request and let it complete, so no caller
+        // holds a handle clone afterward — the slot map is the sole owner.
+        let reply = context
+            .backends
+            .enqueue(
+                &context,
+                &node.addr,
+                frame_set(b"", b"k", b"v", None),
+                Expect::Stored,
+            )
+            .await;
+        assert!(matches!(reply.await, Ok(NodeReply::Stored)));
+        assert_eq!(context.backends.dialed.load(Ordering::Relaxed), 1);
+
+        // Retire the address. `prune` drops the slot's handle — the last
+        // sender — with the node still alive and no traffic in flight.
+        let ring = RingView::new(vec![("other".to_string(), "127.0.0.1:1".to_string())], 1);
+        context.backends.prune(&ring);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while context.backends.dialed.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a pruned backend's task must wind down on its own, not leak");
     }
 
     #[tokio::test(flavor = "current_thread")]
