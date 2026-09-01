@@ -1987,6 +1987,11 @@ async fn handle_connection(
                         "WARN rejected X from {address}: membership token mismatch \
                          (sender is not this node's discovery server)"
                     );
+                    // Send an explicit rejection frame before closing, the
+                    // same shape `M`/`U` use on a token mismatch, so the
+                    // caller reads a rejection rather than only observing a
+                    // bare connection reset.
+                    write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "X carried the wrong membership token",

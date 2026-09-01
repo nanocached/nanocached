@@ -675,7 +675,16 @@ impl Cache {
     /// no-op, memory accounting included, if `key` wasn't marked.
     fn clear_migrated_mark(&mut self, key: &Key) {
         if self.migrated.remove(key) {
-            self.used_bytes -= key.namespace.len() + key.name.len();
+            let mark_bytes = key.namespace.len() + key.name.len();
+            self.used_bytes -= mark_bytes;
+            // Mirror `mark_migrated`'s per-namespace credit. The sub-map is
+            // absent only when this same removal just emptied it — the
+            // eviction/removal callers drop the namespace (which still held
+            // this mark's bytes) before calling here, so there is nothing
+            // left to subtract in that case.
+            if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
+                namespace.used_bytes -= mark_bytes;
+            }
         }
     }
 
@@ -761,7 +770,16 @@ impl Cache {
     /// otherwise invisible to the memory limit.
     pub fn mark_migrated(&mut self, key: &Key) {
         if self.contains(key) && self.migrated.insert(key.clone()) {
-            self.used_bytes += key.namespace.len() + key.name.len();
+            let mark_bytes = key.namespace.len() + key.name.len();
+            self.used_bytes += mark_bytes;
+            // Credit the owning namespace too, so per-namespace accounting
+            // (`stats`'s `/metrics` rows and `--namespace-budget`) stays
+            // consistent with the global total mid-migration instead of the
+            // namespace rows summing to less than `used_bytes`. `contains`
+            // above guarantees the sub-map exists here.
+            if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
+                namespace.used_bytes += mark_bytes;
+            }
         }
     }
 
@@ -832,8 +850,15 @@ impl Cache {
 
         let removed = dropped.entries.len();
         self.entry_count -= removed;
+        // `dropped.used_bytes` already includes this namespace's `migrated`
+        // mark bytes (`mark_migrated` credits them to the sub-map), so this
+        // one subtraction covers entries and marks alike. The marks are then
+        // dropped from the set directly — crediting `used_bytes` per mark
+        // here would double-subtract bytes this line already reclaimed. That
+        // retain is O(marks), and marks only exist while a handoff is in
+        // flight.
         self.used_bytes -= dropped.used_bytes;
-        self.retain_marks(|key| &key.namespace[..] != namespace);
+        self.migrated.retain(|key| &key.namespace[..] != namespace);
 
         removed
     }
@@ -849,20 +874,6 @@ impl Cache {
         // `used_bytes` is already 0; the marks' duplicate bytes went with
         // everything else.
         removed
-    }
-
-    /// Drops every `migrated` mark `keep` rejects, crediting `used_bytes`
-    /// for each — `clear_migrated_mark` over a predicate.
-    fn retain_marks(&mut self, keep: impl Fn(&Key) -> bool) {
-        let mut credited = 0usize;
-        self.migrated.retain(|key| {
-            let kept = keep(key);
-            if !kept {
-                credited += key.namespace.len() + key.name.len();
-            }
-            kept
-        });
-        self.used_bytes -= credited;
     }
 
     /// Staged node join's active-deletion facility: reclaims entries marked by
@@ -2143,6 +2154,63 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"a")), Some(Bytes::from_static(b"1")));
         assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"2")));
+    }
+
+    #[test]
+    fn per_namespace_used_bytes_stay_consistent_with_the_global_total_across_marks() {
+        // Regression (pass-7 audit): `mark_migrated` used to credit the
+        // duplicate mark bytes to the global `used_bytes` only, so mid-
+        // migration the per-namespace rows summed to LESS than the global
+        // total (an observable /metrics mismatch, and a slightly loose
+        // `--namespace-budget`). The two must agree through every mark
+        // lifecycle: mark, unmark, overwrite, eviction, and CLEAR.
+        let consistent = |cache: &Cache| {
+            let stats = cache.stats();
+            let per_ns: usize = stats.namespaces.iter().map(|n| n.used_bytes).sum();
+            assert_eq!(
+                per_ns, stats.used_bytes,
+                "namespace rows must sum to the global used_bytes"
+            );
+        };
+
+        let mut cache = Cache::new(UNBOUNDED);
+        cache.set(namespaced(b"users", b"a"), Bytes::from_static(b"1"));
+        cache.set(namespaced(b"users", b"b"), Bytes::from_static(b"2"));
+        cache.set(namespaced(b"orders", b"c"), Bytes::from_static(b"3"));
+        consistent(&cache);
+
+        cache.mark_migrated(&namespaced(b"users", b"a"));
+        cache.mark_migrated(&namespaced(b"orders", b"c"));
+        consistent(&cache);
+
+        // Unmark one, overwrite another (overwrite clears its mark).
+        cache.unmark_migrated(&namespaced(b"users", b"a"));
+        cache.set(namespaced(b"orders", b"c"), Bytes::from_static(b"33"));
+        consistent(&cache);
+
+        // Re-mark, then CLEAR the whole namespace out from under the mark.
+        cache.mark_migrated(&namespaced(b"orders", b"c"));
+        consistent(&cache);
+        cache.clear(b"orders");
+        consistent(&cache);
+    }
+
+    #[test]
+    fn evicting_a_marked_entry_keeps_namespace_and_global_bytes_consistent() {
+        // The eviction path drops the sub-map (when it empties) before
+        // clearing the mark, so the per-namespace credit must not be
+        // double-subtracted. A budget tight enough to force an eviction of
+        // a marked, still-present entry exercises exactly that ordering.
+        let mut cache = Cache::new(2 * (2 + ENTRY_OVERHEAD_BYTES));
+        cache.set(namespaced(b"ns", b"a"), Bytes::from_static(b"1"));
+        cache.mark_migrated(&namespaced(b"ns", b"a"));
+        // Inserting past the budget evicts the marked "a".
+        cache.set(namespaced(b"ns", b"b"), Bytes::from_static(b"2"));
+
+        let stats = cache.stats();
+        let per_ns: usize = stats.namespaces.iter().map(|n| n.used_bytes).sum();
+        assert_eq!(per_ns, stats.used_bytes);
+        assert_eq!(cache.get(&namespaced(b"ns", b"a")), None);
     }
 
     #[test]

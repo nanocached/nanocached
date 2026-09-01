@@ -864,19 +864,31 @@ async fn run_refresher(
         // gossip), and re-announcing is what keeps the entry alive past
         // the liveness timeout. Failures only warn: an unreachable
         // replica can't take the proxy down, it just won't list it.
-        // Re-checked against the drain flag right before sending, so a
-        // drain that began mid-cycle can't re-register this proxy.
-        if let Some((identity, port)) = &announce {
-            for addr in &discovery {
-                if *drain.borrow() {
-                    break;
-                }
-                if let Err(error) =
-                    announce_to(addr, &secret, &tls_connector, identity, *port).await
-                {
-                    eprintln!("WARN proxy announce to {addr} failed: {error}");
-                }
-            }
+        // Checked against the drain flag before sending, so a drain
+        // already in progress at the start of a cycle can't re-register
+        // this proxy. Fanned out concurrently (like every other
+        // multi-replica path here) rather than serially, so one slow or
+        // unreachable replica can't stretch a cycle to the sum of all
+        // replicas' round-trips.
+        if let Some((identity, port)) = &announce
+            && !*drain.borrow()
+        {
+            // Bind shared references once so each `async move` future
+            // captures a Copy of the reference, not the owned value.
+            let (secret_ref, tls_ref, port_val) = (&secret, &tls_connector, *port);
+            let futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = discovery
+                .iter()
+                .map(|addr| {
+                    Box::pin(async move {
+                        if let Err(error) =
+                            announce_to(addr, secret_ref, tls_ref, identity, port_val).await
+                        {
+                            eprintln!("WARN proxy announce to {addr} failed: {error}");
+                        }
+                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                })
+                .collect();
+            join_all(futs).await;
         }
 
         tokio::select! {
@@ -894,13 +906,24 @@ async fn run_refresher(
 
     // Issue #124: leave `Q` immediately — a stopped proxy must not
     // linger there until the liveness timeout, where new clients would
-    // keep dialing it.
+    // keep dialing it. Fanned out concurrently so the shutdown's single
+    // `UPSTREAM_IO_TIMEOUT` budget (see `run`) covers all replicas'
+    // deregistrations in parallel rather than needing their sum, which
+    // would let a slow replica eat the budget before the others' `Z`
+    // frames go out.
     if let Some((identity, _)) = &announce {
-        for addr in &discovery {
-            if let Err(error) = deregister_from(addr, &secret, &tls_connector, identity).await {
-                eprintln!("WARN proxy deregister to {addr} failed: {error}");
-            }
-        }
+        let (secret_ref, tls_ref) = (&secret, &tls_connector);
+        let futs: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = discovery
+            .iter()
+            .map(|addr| {
+                Box::pin(async move {
+                    if let Err(error) = deregister_from(addr, secret_ref, tls_ref, identity).await {
+                        eprintln!("WARN proxy deregister to {addr} failed: {error}");
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            })
+            .collect();
+        join_all(futs).await;
     }
 }
 
@@ -4163,6 +4186,12 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
 
     let mut buf = BytesMut::new();
     let mut authenticated = context.secret.is_none();
+    // Whether an `A` handshake has already been processed on this
+    // connection. Distinct from `authenticated` (true from the start in
+    // no-secret mode), so the first `A` still negotiates tagging while a
+    // second one is rejected rather than allowed to flip `tagged`
+    // mid-stream and desync every following frame.
+    let mut auth_negotiated = false;
     let mut tagged = false;
     // Issue #125: set when the client's `A` carried the `R` token.
     // Stable before any request is dispatched (auth precedes requests),
@@ -4180,6 +4209,16 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     tagging,
                     retry_capable: retryable,
                 }) => {
+                    if auth_negotiated {
+                        // A repeat `A` after the handshake is a protocol
+                        // violation — answer `E` and close (the node's
+                        // stance on any protocol error) rather than let it
+                        // re-negotiate tagging on a live connection.
+                        let (response_tx, response_rx) = oneshot::channel();
+                        let _ = response_tx.send(Err(Fatal));
+                        let _ = fifo_tx.send(response_rx).await;
+                        break 'connection Ok(());
+                    }
                     let accepted = match &context.secret {
                         Some(required) => secrets_match(&secret, required),
                         // No secret configured: any non-empty secret is
@@ -4189,6 +4228,7 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
                     let (response_tx, response_rx) = oneshot::channel();
                     let reply: &[u8] = if accepted {
                         authenticated = true;
+                        auth_negotiated = true;
                         tagged = tagging;
                         retry_capable = retryable;
                         if tagging { b"OnT\n" } else { b"On\n" }
@@ -5819,6 +5859,24 @@ mod tests {
             },
             "no further replies after the fatal E"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_auth_after_the_handshake_is_rejected_and_closes() {
+        // Regression (pass-7 audit): a repeat `A` on an already-negotiated
+        // connection used to silently overwrite `tagged`/`retry_capable`,
+        // desyncing every following frame. It must now be a protocol error
+        // (`E`, then close), like any other.
+        let (_nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+
+        // A second, differently-shaped `A` (tagged this time).
+        stream.write_all(b"A 1 T\nx").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+
+        // The connection is closed: the next read sees EOF.
+        let n = stream.read_buf(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "the proxy must close the connection after the E");
     }
 
     #[tokio::test(flavor = "current_thread")]
