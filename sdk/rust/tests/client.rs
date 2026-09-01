@@ -2368,16 +2368,15 @@ async fn transparently_reconnects_after_a_server_fin() {
 
 #[tokio::test]
 async fn keep_alive_pings_an_idle_connection() {
-    // Keep-alive is always on with an internal interval (issue #27); the
-    // hidden static exists only so tests can shorten it. The interval is
-    // read once at connect, so restore it immediately after connecting to
-    // keep the lowered value from leaking into concurrently running tests.
+    // Keep-alive is always on with an internal interval (issue #27). Set a
+    // short interval on THIS client via Options (not the shared static), so
+    // a concurrently running test's connections keep the default cadence.
     let node = MockNode::start().await;
-    let default_interval = nanocached::KEEPALIVE_INTERVAL_MS.load(Ordering::SeqCst);
-    nanocached::KEEPALIVE_INTERVAL_MS.store(40, Ordering::SeqCst);
-    let connected = NanocachedClient::connect(options(node.port)).await;
-    nanocached::KEEPALIVE_INTERVAL_MS.store(default_interval, Ordering::SeqCst);
-    let client = connected.unwrap();
+    let client = NanocachedClient::connect(
+        options(node.port).keep_alive_interval(Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while node.state.gets.load(Ordering::SeqCst) < 2 {
@@ -2408,11 +2407,12 @@ async fn dropping_every_client_handle_without_close_stops_the_keep_alive_task() 
     // keep-alive pings must plateau after the drop instead of continuing
     // to climb across further keep-alive intervals.
     let node = MockNode::start().await;
-    let default_interval = nanocached::KEEPALIVE_INTERVAL_MS.load(Ordering::SeqCst);
-    nanocached::KEEPALIVE_INTERVAL_MS.store(40, Ordering::SeqCst);
-    let connected = NanocachedClient::connect(options(node.port)).await;
-    nanocached::KEEPALIVE_INTERVAL_MS.store(default_interval, Ordering::SeqCst);
-    let client = connected.unwrap();
+    // Short keep-alive on THIS client only (Options, not the shared static).
+    let client = NanocachedClient::connect(
+        options(node.port).keep_alive_interval(Duration::from_millis(40)),
+    )
+    .await
+    .unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while node.state.gets.load(Ordering::SeqCst) < 2 {
@@ -2447,21 +2447,18 @@ async fn a_request_to_a_half_open_server_fails_within_the_timeout_and_close_retu
     // forever, and close() must still return promptly rather than being
     // left waiting on a connection that will never hear back.
     let node = MockNode::start().await;
-    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    // A short per-request timeout on THIS client only (Options, not the
+    // shared static), so a concurrently running test's slower requests keep
+    // the default deadline. 800ms is comfortably above the largest simulated
+    // server delay used elsewhere in this suite (200ms).
+    let client =
+        NanocachedClient::connect(options(node.port).request_timeout(Duration::from_millis(800)))
+            .await
+            .unwrap();
     node.state.silent.store(true, Ordering::SeqCst);
 
-    // REQUEST_TIMEOUT_MS is read fresh on every request (unlike
-    // KEEPALIVE_INTERVAL_MS, which is only read at connect), so lowering
-    // and restoring it tightly around the one call below keeps this from
-    // affecting concurrently running tests' requests — 800ms is chosen
-    // comfortably above the largest simulated server delay used anywhere
-    // else in this suite (200ms), so even a request from another test
-    // that lands inside this window still comfortably beats it.
-    let default_timeout = nanocached::REQUEST_TIMEOUT_MS.load(Ordering::SeqCst);
-    nanocached::REQUEST_TIMEOUT_MS.store(800, Ordering::SeqCst);
     let started = tokio::time::Instant::now();
     let result = client.get("k").await;
-    nanocached::REQUEST_TIMEOUT_MS.store(default_timeout, Ordering::SeqCst);
 
     assert!(
         matches!(result, Err(Error::ConnectionLost(_))),

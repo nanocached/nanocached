@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::cas::{content_digest, CasToken};
 use crate::compression::resolve_compression;
-use crate::connection::{CasCondition, Connection, MultiEntry};
+use crate::connection::{CasCondition, Connection, MultiEntry, REQUEST_TIMEOUT_MS};
 use crate::error::{Error, Result};
 use crate::hash_ring::HashRing;
 use crate::identify::{
@@ -382,6 +382,8 @@ pub struct Options {
     reconnect_cooldown: ReconnectCooldown,
     read_hedge_after: Option<Duration>,
     via_proxy: bool,
+    keep_alive_interval: Option<Duration>,
+    request_timeout: Option<Duration>,
 }
 
 /// `Options::reconnect_cooldown`'s intent, kept distinct from the
@@ -427,6 +429,8 @@ impl Default for Options {
             reconnect_cooldown: ReconnectCooldown::Default,
             read_hedge_after: None,
             via_proxy: false,
+            keep_alive_interval: None,
+            request_timeout: None,
         }
     }
 }
@@ -635,6 +639,23 @@ impl Options {
         self.via_proxy = enabled;
         self
     }
+
+    /// How often each connection sends an internal keep-alive when
+    /// otherwise idle (issue #27). Unset defers to the SDK default (half
+    /// the server's 60s idle timeout). Read once per connection at connect.
+    pub fn keep_alive_interval(mut self, interval: Duration) -> Self {
+        self.keep_alive_interval = Some(interval);
+        self
+    }
+
+    /// Per-request round-trip deadline: a request that hasn't completed by
+    /// then poisons its connection (a half-open server that accepts but
+    /// never answers is indistinguishable from a slow one). Unset defers to
+    /// the SDK default (30s). Read fresh on every request.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
 }
 
 struct Member {
@@ -770,6 +791,11 @@ struct Inner {
     /// `ConnectionLost` from it differently than a genuine standalone
     /// node's — see `reconnect_proxy`.
     via_proxy: bool,
+    /// Resolved once from [`Options::request_timeout`] (falling back to the
+    /// `REQUEST_TIMEOUT_MS` static), then handed to every `Connection` this
+    /// client opens — including the ones a later refresh/reconnect dials —
+    /// so the per-request deadline is per-client, not a shared global.
+    request_timeout: Duration,
 }
 
 impl Inner {
@@ -824,6 +850,7 @@ async fn connect_via_proxy(
     auth_secret: Option<&[u8]>,
     tls: Option<&TlsConfig>,
     transient_retries: &Arc<AtomicU64>,
+    request_timeout: Duration,
 ) -> Result<(Target, String)> {
     let mut last_error: Option<Error> = None;
 
@@ -887,6 +914,7 @@ async fn connect_via_proxy(
                     key.clone(),
                     tagged,
                     Arc::clone(transient_retries),
+                    request_timeout,
                 ));
                 return Ok((
                     Target::Single {
@@ -1007,6 +1035,13 @@ impl NanocachedClient {
         let compress = resolve_compression(options.compress)?;
         let auth_secret = options.auth_secret.as_deref().map(str::as_bytes);
         let reconnect_cooldown = options.reconnect_cooldown.resolve();
+        // Resolved once and handed to every connection this client opens
+        // (bootstrap, proxy, and later refresh/reconnect dials), so the
+        // per-request deadline is per-client rather than a shared global a
+        // concurrent test could shorten — see `Inner::request_timeout`.
+        let request_timeout = options.request_timeout.unwrap_or_else(|| {
+            Duration::from_millis(REQUEST_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
+        });
 
         let mut last_error: Option<Error> = None;
         let mut target: Option<Target> = None;
@@ -1038,6 +1073,7 @@ impl NanocachedClient {
                 auth_secret,
                 tls.as_ref(),
                 &transient_retries,
+                request_timeout,
             )
             .await?;
             target = Some(proxy_target);
@@ -1089,6 +1125,7 @@ impl NanocachedClient {
                                 key.clone(),
                                 tagged,
                                 Arc::clone(&transient_retries),
+                                request_timeout,
                             )),
                         });
                         tracking_key = key;
@@ -1139,6 +1176,7 @@ impl NanocachedClient {
                                                 key.clone(),
                                                 tagged,
                                                 Arc::clone(&transient_retries),
+                                                request_timeout,
                                             )),
                                         },
                                     );
@@ -1285,14 +1323,19 @@ impl NanocachedClient {
                 transient_retries,
             },
             via_proxy: options.via_proxy,
+            request_timeout,
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
         // half the server's 60s idle timeout, so it never severs a healthy
-        // client. Read once per connect; the static exists only so tests
-        // can shorten it.
-        let interval =
-            Duration::from_millis(KEEPALIVE_INTERVAL_MS.load(std::sync::atomic::Ordering::SeqCst));
+        // client. A per-client `Options::keep_alive_interval` wins; otherwise
+        // the `KEEPALIVE_INTERVAL_MS` static supplies the default. Read once
+        // per connect. (The per-client override is why tests no longer need
+        // to mutate the shared static — which, read on connect while the
+        // suite runs concurrently, could perturb an unrelated test.)
+        let interval = options.keep_alive_interval.unwrap_or_else(|| {
+            Duration::from_millis(KEEPALIVE_INTERVAL_MS.load(std::sync::atomic::Ordering::SeqCst))
+        });
         // Safety net for a client dropped without `close()` (issue #325):
         // this task holds only a `Weak<Inner>`, never a strong one. If
         // every `NanocachedClient` handle (the original plus every clone)
@@ -3445,6 +3488,7 @@ impl NanocachedClient {
             self.inner.tracking_key.clone(),
             tagged,
             Arc::clone(&self.inner.stats.transient_retries),
+            self.inner.request_timeout,
         ));
 
         let mut state = self.inner.state.lock().await;
@@ -3680,6 +3724,7 @@ impl NanocachedClient {
             self.inner.tracking_key.clone(),
             tagged,
             Arc::clone(&self.inner.stats.transient_retries),
+            self.inner.request_timeout,
         ));
 
         let mut state = self.inner.state.lock().await;
