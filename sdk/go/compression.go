@@ -26,6 +26,17 @@ const (
 // decompression bomb). Far above any realistic cache value.
 const maxDecompressedLength = 64 * 1024 * 1024
 
+// maxMultiGetDecompressedBytes bounds the CUMULATIVE decompressed size of a
+// single GetMany/GetManyBytes response. maxDecompressedLength caps one
+// value, but a batch (up to maxBatchKeys entries) could pair that per-value
+// cap with the key count to force ~maxBatchKeys * 64 MiB of client
+// allocation from one small, highly-compressible wire response — the
+// per-value bomb defense amplified across the batch. 256 MiB leaves ample
+// room for a legitimate large batch (a 640 KiB average across 400 keys)
+// while bounding the worst case. A var, not a const, only so a test can
+// lower it without allocating the real bound.
+var maxMultiGetDecompressedBytes int64 = 256 * 1024 * 1024
+
 // compressValue: below threshold, or when compressing doesn't actually
 // shrink the value (incompressible data), the marker byte alone is added
 // and the value is stored unchanged. Always returns a value with the

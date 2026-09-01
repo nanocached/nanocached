@@ -25,6 +25,17 @@ _WBITS_RAW_DEFLATE = -15
 # decompression bomb). Far above any realistic cache value.
 _MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024
 
+# Bounds the CUMULATIVE decompressed size of one get_many/get_many_bytes
+# response. _MAX_DECOMPRESSED_LENGTH caps a single value, but a batch (up to
+# _MAX_BATCH_KEYS entries) could pair that per-value cap with the key count
+# to force ~_MAX_BATCH_KEYS * 64 MiB of client allocation from one small,
+# highly-compressible wire response — the per-value bomb defense amplified
+# across the batch. 256 MiB leaves ample room for a legitimate large batch
+# (a 640 KiB average across 400 keys) while bounding the worst case. Module
+# global (not a Final) only so a test can lower it without allocating the
+# real bound.
+_MAX_MULTIGET_DECOMPRESSED_BYTES = 256 * 1024 * 1024
+
 
 class DecompressionError(NanocachedError):
     """Raised by get/get_bytes when a value with ``compress`` enabled

@@ -16,6 +16,23 @@ const MARKER_DEFLATE = 0x01;
 // bomb). Far above any realistic cache value.
 const MAX_DECOMPRESSED_LENGTH = 64 * 1024 * 1024;
 
+// Bounds the CUMULATIVE decompressed size of one getMany/getManyBytes
+// response. MAX_DECOMPRESSED_LENGTH caps a single value, but a batch (up to
+// MAX_BATCH_KEYS entries) could pair that per-value cap with the key count
+// to force ~MAX_BATCH_KEYS * 64 MiB of client allocation from one small,
+// highly-compressible wire response — the per-value bomb defense amplified
+// across the batch. 256 MiB leaves ample room for a legitimate large batch
+// (a 640 KiB average across 400 keys) while bounding the worst case. A
+// mutable binding (with the test-only setter below) only so a test can
+// lower it without allocating the real bound.
+export let maxMultiGetDecompressedBytes = 256 * 1024 * 1024;
+
+/** Test-only: lower {@link maxMultiGetDecompressedBytes} so the cumulative
+ * multi-get budget can be exercised without allocating 256 MiB. */
+export function setMaxMultiGetDecompressedBytesForTest(bytes: number): void {
+  maxMultiGetDecompressedBytes = bytes;
+}
+
 /** Thrown by get/getBytes when a value with `compress` enabled can't be
  * interpreted — almost always a `compress` mismatch between clients
  * sharing this key (see value compression's compatibility caveat: every

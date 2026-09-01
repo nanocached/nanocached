@@ -38,7 +38,12 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from ._compression import compress_value, decompress_value
+from ._compression import (
+    _MAX_MULTIGET_DECOMPRESSED_BYTES,
+    DecompressionError,
+    compress_value,
+    decompress_value,
+)
 from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection
 from ._digest import content_digest
 from ._errors import (
@@ -1120,6 +1125,24 @@ class NanocachedClient:
     def _maybe_decompress(self, value: bytes) -> bytes:
         return decompress_value(value) if self._compress else value
 
+    def _decompress_for_batch(self, value: bytes, budget: list[int]) -> bytes:
+        """Decompresses one hit value for a get_many batch and charges its
+        size against the response's cumulative budget (pass-7 audit).
+        decompress_value already caps a single value; this bounds the whole
+        response so a batch of highly-compressible values can't amplify that
+        per-value cap into gigabytes of allocation. ``budget`` is a
+        one-element list used as a shared mutable counter across the two
+        cluster passes and every concurrent owner group (decompression here
+        is synchronous, so the asyncio event loop never interleaves it)."""
+        if budget[0] > _MAX_MULTIGET_DECOMPRESSED_BYTES:
+            raise DecompressionError(
+                "cumulative decompressed size of this get_many response exceeds the "
+                "maximum — possible decompression bomb across the batch"
+            )
+        out = self._maybe_decompress(value)
+        budget[0] += len(out)
+        return out
+
     async def get_many_bytes(self, keys: Sequence[str | bytes]) -> dict[str | bytes, bytes]:
         """The raw companion to get_many(): no UTF-8 decoding. See
         get_many()'s docstring for the batch contract."""
@@ -1162,6 +1185,11 @@ class NanocachedClient:
         originals, key_bytes_list = self._dedupe_batch_keys(keys, namespace)
         await self._before_operation()
 
+        # Cumulative decompressed bytes across this whole response — see
+        # _decompress_for_batch. A shared one-element list so the bound
+        # spans both cluster passes, not one pass.
+        budget = [0]
+
         if self._ring is None:
             entries, error = await self._multi_get_chunked(
                 self._single_connection, namespace, key_bytes_list
@@ -1169,7 +1197,7 @@ class NanocachedClient:
             values: dict[str | bytes, bytes] = {}
             for original, entry in zip(originals, entries):
                 if isinstance(entry, (bytes, bytearray)):
-                    values[original] = self._maybe_decompress(entry)
+                    values[original] = self._decompress_for_batch(entry, budget)
             if error is not None:
                 raise error
             if any(entry is WRONG_NODE for entry in entries):
@@ -1177,11 +1205,11 @@ class NanocachedClient:
             return values
 
         values = {}
-        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, None)
+        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, None, budget)
         if not retry:
             return values
         await self._maybe_refresh(force=True)
-        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, retry)
+        retry = await self._multi_get_pass(namespace, originals, key_bytes_list, values, retry, budget)
         if retry:
             raise PartialWrongNodeError(values)
         return values
@@ -1233,6 +1261,7 @@ class NanocachedClient:
         key_bytes_list: list[bytes],
         values: dict[str | bytes, bytes],
         retry_indices: list[int] | None,
+        budget: list[int],
     ) -> list[int]:
         """Runs one pass of get_many_bytes' cluster routing: group the
         given indices (every key, when retry_indices is None — the
@@ -1270,7 +1299,7 @@ class NanocachedClient:
                 if entry is WRONG_NODE:
                     local_retry.append(idx)
                 elif entry is not None:
-                    local_values[originals[idx]] = self._maybe_decompress(entry)
+                    local_values[originals[idx]] = self._decompress_for_batch(entry, budget)
             return local_retry, local_values
 
         results = await asyncio.gather(*(run_group(owner, idxs) for owner, idxs in groups.items()))

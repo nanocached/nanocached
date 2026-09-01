@@ -4915,6 +4915,20 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_get_many_bytes_enforces_a_cumulative_decompressed_budget(self):
+        # Regression (pass-7 audit): the per-value decompression cap can be
+        # amplified across a batch. Patched low so the guard fires without
+        # allocating the real 256 MiB bound.
+        client = await self.connect()
+        try:
+            await client.set("a", "12")
+            await client.set("c", "34")
+            with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
+                with self.assertRaises(DecompressionError):
+                    await client.get_many_bytes(["a", "c"])
+        finally:
+            await client.close()
+
     async def test_str_and_bytes_keys_may_be_mixed_and_are_keyed_by_the_original_object(self):
         client = await self.connect()
         try:
