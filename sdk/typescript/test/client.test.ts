@@ -21,6 +21,7 @@ import { HashRing } from "../src/hashRing.js";
 import { FIRE_AND_FORGET_TUNING, HEDGE_READ_TUNING, KEEPALIVE_TUNING, MAX_BATCH_KEYS } from "../src/client.js";
 import { REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
+import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
 import { startMockDiscovery, startMockNode, unusedPort, type MockNode } from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
@@ -2232,6 +2233,28 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         client.close();
       }
     } finally {
+      await node.close();
+    }
+  });
+
+  it("enforces a cumulative decompressed budget across the batch", async () => {
+    // Regression (pass-7 audit): the per-value decompression cap can be
+    // amplified across a batch. The cumulative budget is lowered here so
+    // the guard fires without allocating the real 256 MiB bound.
+    const saved = maxMultiGetDecompressedBytes;
+    setMaxMultiGetDecompressedBytesForTest(1);
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "12");
+        await client.set("c", "34");
+        await assert.rejects(client.getManyBytes(["a", "c"]), DecompressionError);
+      } finally {
+        client.close();
+      }
+    } finally {
+      setMaxMultiGetDecompressedBytesForTest(saved);
       await node.close();
     }
   });

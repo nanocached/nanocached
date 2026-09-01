@@ -1206,6 +1206,10 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 	c.mu.Unlock()
 
 	values := make(map[string][]byte, len(keys))
+	// Cumulative decompressed bytes across this whole response — see
+	// maxMultiGetDecompressedBytes. Threaded through both cluster passes so
+	// the bound spans the entire batch, not one pass.
+	var decompressed int64
 
 	if single {
 		entries, chunkErr := c.multiGetChunked("", namespace, keyBytes)
@@ -1213,10 +1217,16 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 			if !entry.ok {
 				continue
 			}
+			if decompressed > maxMultiGetDecompressedBytes {
+				return values, decompressionFailed(
+					"cumulative decompressed size of this GetMany response exceeds the " +
+						"maximum — possible decompression bomb across the batch")
+			}
 			value, decErr := c.maybeDecompress(entry.value)
 			if decErr != nil {
 				return values, decErr
 			}
+			decompressed += int64(len(value))
 			values[keys[i]] = value
 		}
 		if chunkErr != nil {
@@ -1228,7 +1238,7 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 		return values, nil
 	}
 
-	retry, err := c.multiGetPass(namespace, keys, keyBytes, values, nil)
+	retry, err := c.multiGetPass(namespace, keys, keyBytes, values, nil, &decompressed)
 	if err != nil {
 		return values, err
 	}
@@ -1236,7 +1246,7 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 		return values, nil
 	}
 	c.maybeRefresh(true)
-	retry, err = c.multiGetPass(namespace, keys, keyBytes, values, retry)
+	retry, err = c.multiGetPass(namespace, keys, keyBytes, values, retry, &decompressed)
 	if err != nil {
 		return values, err
 	}
@@ -1346,7 +1356,7 @@ func (c *Client) multiGetChunked(slot string, namespace []byte, keys [][]byte) (
 // feeding into the retry pass.
 func (c *Client) multiGetPass(
 	namespace []byte, keys []string, keyBytes [][]byte,
-	values map[string][]byte, retryIndices []int,
+	values map[string][]byte, retryIndices []int, decompressed *int64,
 ) ([]int, error) {
 	indices := retryIndices
 	if indices == nil {
@@ -1392,6 +1402,21 @@ func (c *Client) multiGetPass(
 				case entry.wrongNode:
 					retry = append(retry, idx)
 				case entry.ok:
+					// Decompression here runs under `mu`, so it is
+					// serialized across every owner goroutine: once the
+					// cumulative budget is crossed, the remaining entries
+					// (in this and other groups) skip decompressing rather
+					// than each allocating another value first. Peak
+					// allocation is therefore the budget plus one value.
+					if *decompressed > maxMultiGetDecompressedBytes {
+						if spliceErr == nil {
+							spliceErr = decompressionFailed(
+								"cumulative decompressed size of this GetMany response " +
+									"exceeds the maximum — possible decompression bomb " +
+									"across the batch")
+						}
+						continue
+					}
 					value, decErr := c.maybeDecompress(entry.value)
 					if decErr != nil {
 						if spliceErr == nil {
@@ -1399,6 +1424,7 @@ func (c *Client) multiGetPass(
 						}
 						continue
 					}
+					*decompressed += int64(len(value))
 					values[keys[idx]] = value
 				}
 			}

@@ -3377,6 +3377,36 @@ func TestGetManyReturnsHitsAndMissesInOneCall(t *testing.T) {
 	}
 }
 
+func TestGetManyBytesEnforcesACumulativeDecompressedBudget(t *testing.T) {
+	// Regression (pass-7 audit): maxDecompressedLength caps a single value,
+	// but a batch could pair that per-value cap with the key count to force
+	// ~maxBatchKeys * 64 MiB of allocation from one small wire response. The
+	// cumulative budget spans the whole response. Lowered here so the guard
+	// can be exercised without allocating the real 256 MiB bound.
+	saved := maxMultiGetDecompressedBytes
+	maxMultiGetDecompressedBytes = 1
+	defer func() { maxMultiGetDecompressedBytes = saved }()
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("a", "12", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set("c", "34", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.GetManyBytes([]string{"a", "c"})
+	if !errors.Is(err, ErrDecompression) {
+		t.Fatalf("GetManyBytes err = %v, want ErrDecompression for the cumulative budget", err)
+	}
+}
+
 func TestSetManyThenGetManyRoundTripWithTTL(t *testing.T) {
 	node := startMockNode(t, nil)
 	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})

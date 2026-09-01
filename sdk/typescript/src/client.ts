@@ -4,7 +4,7 @@ import type { TLSSocket } from "node:tls";
 import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, WrongNodeError } from "./connection.js";
 import { connectAndIdentify, connectAndListProxies, type DiscoveredNode } from "./identify.js";
 import { HashRing } from "./hashRing.js";
-import { compressValue, decompressValue } from "./compression.js";
+import { compressValue, decompressValue, DecompressionError, maxMultiGetDecompressedBytes } from "./compression.js";
 import { NanocachedError } from "./errors.js";
 import {
   checkKey,
@@ -1422,6 +1422,10 @@ export class NanocachedClient {
     await this.maybeRefreshNodeList();
 
     const values = new Map<string, Buffer>();
+    // Cumulative decompressed bytes across this whole response — see
+    // maxMultiGetDecompressedBytes. Shared (by reference) across both
+    // cluster passes so the bound spans the entire batch, not one pass.
+    const budget = { decompressed: 0 };
 
     if (this.target.kind !== "cluster") {
       // Single/proxy mode: no retry layer at all, matching
@@ -1436,20 +1440,37 @@ export class NanocachedClient {
         // get (issue #294) — without it, a compress-enabled client's
         // batch reads would hand back marker-prefixed DEFLATE bytes
         // instead of the original value.
-        if (entry.kind === "hit") values.set(keys[i], this.compress ? decompressValue(entry.value) : entry.value);
+        if (entry.kind === "hit") values.set(keys[i], this.decompressForBatch(entry.value, budget));
         else if (entry.kind === "wrongNode") wrongNode = true;
       }
       if (wrongNode) throw new PartialWrongNodeError(values);
       return values;
     }
 
-    let retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, undefined);
+    let retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, undefined, budget);
     if (retryIndices.length === 0) return values;
 
     await this.maybeRefreshNodeList({ force: true });
-    retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, retryIndices);
+    retryIndices = await this.multiGetPass(namespace, keys, keyBytes, values, retryIndices, budget);
     if (retryIndices.length > 0) throw new PartialWrongNodeError(values);
     return values;
+  }
+
+  /** Decompresses one hit value for a getMany batch and charges its
+   * decompressed size against the response's cumulative budget (issue:
+   * pass-7 audit). decompressValue already caps a single value; this
+   * bounds the whole response so a batch of highly-compressible values
+   * can't amplify that per-value cap into gigabytes of allocation. */
+  private decompressForBatch(raw: Buffer, budget: { decompressed: number }): Buffer {
+    if (budget.decompressed > maxMultiGetDecompressedBytes) {
+      throw new DecompressionError(
+        "cumulative decompressed size of this getMany response exceeds the maximum — " +
+          "possible decompression bomb across the batch",
+      );
+    }
+    const value = this.compress ? decompressValue(raw) : raw;
+    budget.decompressed += value.length;
+    return value;
   }
 
   /** One pass of getManyBytes' cluster routing: group the given indices
@@ -1474,6 +1495,7 @@ export class NanocachedClient {
     keyBytes: readonly Buffer[],
     values: Map<string, Buffer>,
     retryIndices: readonly number[] | undefined,
+    budget: { decompressed: number },
   ): Promise<number[]> {
     const indices = retryIndices ?? keyBytes.map((_, index) => index);
 
@@ -1508,7 +1530,7 @@ export class NanocachedClient {
           // Same decompression getBytesInNamespace applies to a single get
           // (issue #294) — a cluster-mode batch read must not hand back
           // marker-prefixed DEFLATE bytes when compress is enabled.
-          else if (entry.kind === "hit") values.set(keys[index], this.compress ? decompressValue(entry.value) : entry.value);
+          else if (entry.kind === "hit") values.set(keys[index], this.decompressForBatch(entry.value, budget));
         }
       }),
     );
