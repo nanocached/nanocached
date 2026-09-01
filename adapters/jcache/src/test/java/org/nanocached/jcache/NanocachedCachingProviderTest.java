@@ -70,6 +70,26 @@ class NanocachedCachingProviderTest {
     }
 
     @Test
+    void clientReliabilityOptionsAreParsedAndForwarded() {
+        // Regression (pass-7 audit): the provider used to forward only
+        // tls/ca/compress/compression-threshold. Setting the reliability
+        // options proves they are parsed (Boolean/Long/Duration) and
+        // forwarded to Options without error — a bad property name or a
+        // parse slip would throw out of connect() and fail getCacheManager.
+        try (CachingProvider provider = new NanocachedCachingProvider()) {
+            Properties properties = propertiesFor(node);
+            properties.setProperty("nanocached.fire-and-forget-replicas", "true");
+            properties.setProperty("nanocached.read-repair", "true");
+            properties.setProperty("nanocached.reconnect-cooldown-millis", "2000");
+            properties.setProperty("nanocached.read-hedge-after-millis", "50");
+
+            CacheManager manager =
+                    provider.getCacheManager(URI.create("test:reliability-options"), null, properties);
+            assertTrue(!manager.isClosed());
+        }
+    }
+
+    @Test
     void theSameUriAndClassLoaderReturnTheSameManager() {
         try (CachingProvider provider = new NanocachedCachingProvider()) {
             URI uri = URI.create("test:identity");

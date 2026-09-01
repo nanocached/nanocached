@@ -910,7 +910,16 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         if (duration.isZero()) {
             return OptionalLong.empty();
         }
-        long seconds = duration.getTimeUnit().toSeconds(duration.getDurationAmount());
+        // Round UP to whole seconds so an entry never expires earlier than
+        // asked: TimeUnit.toSeconds floors (integer division), turning e.g.
+        // 1900ms into 1s instead of 2s. Go through nanos so any unit rounds
+        // correctly (toNanos saturates for an absurdly large amount, which
+        // only ever yields a larger — still valid — TTL).
+        long nanos = duration.getTimeUnit().toNanos(duration.getDurationAmount());
+        long seconds = nanos / 1_000_000_000L;
+        if (nanos % 1_000_000_000L != 0) {
+            seconds++;
+        }
         return OptionalLong.of(Math.max(1L, seconds));
     }
 

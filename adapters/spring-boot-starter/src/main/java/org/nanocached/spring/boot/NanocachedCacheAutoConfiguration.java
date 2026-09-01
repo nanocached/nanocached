@@ -58,6 +58,18 @@ public class NanocachedCacheAutoConfiguration {
         if (properties.getCompressionThreshold() != null) {
             options.compressionThreshold(properties.getCompressionThreshold());
         }
+        if (properties.getFireAndForgetReplicas() != null) {
+            options.fireAndForgetReplicas(properties.getFireAndForgetReplicas());
+        }
+        if (properties.getReadRepair() != null) {
+            options.readRepair(properties.getReadRepair());
+        }
+        if (properties.getReconnectCooldown() != null) {
+            options.reconnectCooldown(properties.getReconnectCooldown());
+        }
+        if (properties.getReadHedgeAfter() != null) {
+            options.readHedgeAfter(properties.getReadHedgeAfter());
+        }
         return NanocachedClient.connect(options);
     }
 

@@ -65,13 +65,21 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
     }
 
     /** {@code Duration.ZERO} means "no expiry" (the SDK's own 0-TTL
-     * convention); a positive sub-second TTL rounds up to 1s rather than
-     * silently becoming eternal. */
+     * convention); any positive TTL rounds UP to whole seconds so an entry
+     * never expires earlier than asked — a sub-second TTL becomes 1s, and
+     * 2.5s becomes 3s, not 2s. Matches the ceiling every other adapter uses
+     * (cache-manager/keyv {@code Math.ceil}, Django {@code math.ceil}, .NET
+     * {@code Math.Ceiling}); {@code Duration.toSeconds()} floors, which
+     * would expire a 2.5s entry up to half a second early. */
     private static long toTtlSeconds(Duration ttl) {
         if (ttl.isZero()) {
             return 0;
         }
-        return Math.max(1, ttl.toSeconds());
+        long seconds = ttl.getSeconds();
+        if (ttl.getNano() > 0) {
+            seconds++;
+        }
+        return Math.max(1, seconds);
     }
 
     @Override
