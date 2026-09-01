@@ -2518,7 +2518,10 @@ impl SharedBackends {
             }
 
             let mut guard = slot.lock().await;
-            if guard.as_ref().is_some_and(|current| current.id == handle.id) {
+            if guard
+                .as_ref()
+                .is_some_and(|current| current.id == handle.id)
+            {
                 *guard = None;
                 self.dialed
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
