@@ -893,6 +893,64 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("reassembles a large node-list response trickled in many small chunks (issue #423)", async () => {
+    // Regression: readFrame used to re-concatenate the whole accumulated
+    // buffer on every single onData chunk (O(n^2) total bytes copied as
+    // the buffer grows) instead of accumulating chunks in an array like
+    // connection.ts already does for value bodies. This doesn't assert on
+    // timing (too flaky), just that a response split across many small
+    // writes is still reassembled correctly by the array-accumulation
+    // path.
+    const { createServer } = await import("node:net");
+    const entryCount = 200;
+    let body = "";
+    for (let i = 0; i < entryCount; i++) {
+      const name = `node-${i}`;
+      const address = `10.0.0.${i % 256}:700${i}`;
+      body += `${name.length} ${address.length}\n${name}${address}\n`;
+    }
+    const full = Buffer.from(`N ${entryCount} 3\n${body}`, "ascii");
+    const server = createServer((socket) => {
+      socket.on("error", () => {});
+      socket.on("data", (chunk: Buffer) => {
+        const text = chunk.toString("ascii");
+        if (text.startsWith("A ")) {
+          socket.write("Od\n");
+          return;
+        }
+        if (text.startsWith("L")) {
+          let offset = 0;
+          const sendNext = () => {
+            if (socket.destroyed || offset >= full.length) return;
+            const end = Math.min(offset + 37, full.length);
+            socket.write(full.subarray(offset, end));
+            offset = end;
+            setImmediate(sendNext);
+          };
+          sendNext();
+        }
+      });
+    });
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port));
+    });
+    try {
+      const { connectAndIdentify } = await import("../src/identify.js");
+      const result = await connectAndIdentify({ host: "127.0.0.1", port });
+      assert.equal(result.kind, "cluster");
+      if (result.kind === "cluster") {
+        assert.equal(result.replication, 3);
+        assert.equal(result.nodes.length, entryCount);
+        assert.equal(result.nodes[0].name, "node-0");
+        assert.equal(result.nodes[0].address, "10.0.0.0:7000");
+        assert.equal(result.nodes[entryCount - 1].name, `node-${entryCount - 1}`);
+        assert.equal(result.nodes[entryCount - 1].address, `10.0.0.${(entryCount - 1) % 256}:700${entryCount - 1}`);
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("a malformed value length poisons the connection and the next request redials", async () => {
     // Regression for issue #8: a garbage `V <len>` header desyncs the
     // stream; the connection must be poisoned (never reused mid-frame)
@@ -1595,6 +1653,28 @@ describe("NanocachedClient incr/decr against a single node (issue #129)", () => 
       } finally {
         client.close();
       }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe("NanocachedClient incr/decr checks closed before compression (issue #413)", () => {
+  it("throws AlreadyClosedError, not CompressionIncompatibleError, from incr/decr after close() on a compress-enabled client", async () => {
+    // Regression: incrInNamespace used to check `this.compress` before
+    // `this.closed`, unlike every other public method on this client
+    // (get/set/delete/cas/clear all check closed first) — so
+    // close()+incr() on a compress-enabled client surfaced the wrong
+    // error type.
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      client.close();
+      await assert.rejects(client.incr("counter"), AlreadyClosedError);
+      await assert.rejects(client.decr("counter"), AlreadyClosedError);
     } finally {
       await node.close();
     }

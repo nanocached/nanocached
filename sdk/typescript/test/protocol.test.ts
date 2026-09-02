@@ -607,6 +607,36 @@ describe("tryParseResponse — batched get/set M/O (issues #128/#150/#151)", () 
     assert.throws(() => tryParseResponse(Buffer.from("M 1 x\n")), /invalid multi-get result length/);
   });
 
+  it("throws on an oversized header even when it arrives complete in a single chunk (issue #423)", () => {
+    // Regression: MAX_MULTI_HEADER_LENGTH (4096 bytes) used to be checked
+    // only on the incomplete-header branch (headerEnd === -1). A peer
+    // that delivers a complete header + LF within one chunk — realistic,
+    // since Node can hand `onData` far more than 4KB at once — skipped
+    // the cap entirely, leaving `count` (and the `new Array(header.count)`
+    // it drives) unbounded. Build a roster whose header is legitimately
+    // self-consistent (count matches the fields actually present) but
+    // whose header line alone is already past the 4 KiB cap.
+    const tokenCount = 3000; // "M " + count + 3000 * "- " comfortably exceeds 4096 bytes
+    const tokens = new Array(tokenCount).fill("-");
+    const wire = `M ${tokenCount} ${tokens.join(" ")}\n`;
+    assert.ok(wire.length > 4096, "test setup: header must exceed the 4096-byte cap to exercise the regression");
+    assert.throws(() => tryParseResponse(Buffer.from(wire)), /header too long/);
+  });
+
+  it("throws on a count field with no magnitude bound / non-decimal grammar (issue #423)", () => {
+    // Mirrors the ttl regression test above (issue #233): bare `Number()`
+    // + `Number.isInteger` accepts scientific notation and precision-
+    // losing long digit strings; the strict TAG_PATTERN + isSafeInteger
+    // parsing used elsewhere in this file must reject them here too.
+    assert.throws(() => tryParseResponse(Buffer.from("M 1e2 -\n")), /invalid multi-get\/multi-set count/);
+    assert.throws(() => tryParseResponse(Buffer.from(`M ${"9".repeat(30)} -\n`)), /invalid multi-get\/multi-set count/);
+  });
+
+  it("throws on a hit length field with no magnitude bound / non-decimal grammar (issue #423)", () => {
+    assert.throws(() => tryParseResponse(Buffer.from("M 1 1e2\n")), /invalid multi-get result length/);
+    assert.throws(() => tryParseResponse(Buffer.from(`M 1 ${"9".repeat(30)}\n`)), /invalid multi-get result length/);
+  });
+
   describe("cumulative response size bound (issue #207)", () => {
     const originalBound = MULTI_GET_TUNING.maxResponseBytes;
     afterEach(() => {
@@ -691,6 +721,14 @@ describe("peekMultiFrameLength (issues #128/#150/#151)", () => {
   it("accounts for the tag field in tagged mode", () => {
     const buf = Buffer.from("M 1 3 9\nabc");
     assert.equal(peekMultiFrameLength(buf, true), "M 1 3 9\n".length + 3);
+  });
+
+  it("returns undefined for a hit-length token that isn't strict-decimal (issue #423)", () => {
+    // Scientific notation used to parse via bare Number()/Number.isInteger
+    // as if it were a legitimate length; strict parsing must reject it
+    // (never-throws contract preserved: the malformed header is left for
+    // tryParseResponse to reject on its own next call).
+    assert.equal(peekMultiFrameLength(Buffer.from("M 1 1e2\nabc"), false), undefined);
   });
 });
 

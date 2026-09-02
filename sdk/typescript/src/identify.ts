@@ -94,7 +94,13 @@ function readFrame<T>(
   maxBufferLength?: number,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
-    let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    // Chunks are accumulated in an array and only concatenated when a
+    // parse is attempted, instead of concatenating on every onData call —
+    // avoids an O(n^2) cost re-copying the whole buffer for each fragment
+    // of a large discovery response. Mirrors connection.ts's identical fix
+    // for value bodies.
+    let chunks: Buffer[] = [];
+    let chunksLength = 0;
 
     // A server that accepts the connection but never answers (a
     // blackholed address behaves the same way) must not hang the caller.
@@ -110,7 +116,9 @@ function readFrame<T>(
       socket.off("close", onClose);
     };
     const onData = (chunk: Buffer) => {
-      buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
+      chunks.push(chunk);
+      chunksLength += chunk.length;
+      const buffer = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, chunksLength);
 
       let parsed: T | null;
       try {
@@ -130,7 +138,13 @@ function readFrame<T>(
       if (maxBufferLength !== undefined && buffer.length > maxBufferLength) {
         cleanup();
         reject(new NanocachedError("nanocached: discovery response exceeds maximum size (connection desynced)"));
+        return;
       }
+
+      // Collapse back to a single stored chunk so later onData calls
+      // don't re-concat bytes already merged here.
+      chunks = [buffer];
+      chunksLength = buffer.length;
     };
     const onError = (error: Error) => {
       cleanup();
