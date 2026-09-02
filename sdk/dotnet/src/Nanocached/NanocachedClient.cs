@@ -1129,6 +1129,10 @@ public sealed class NanocachedClient : IDisposable
         await BeforeOperationAsync().ConfigureAwait(false);
 
         var values = new Dictionary<string, byte[]>(keys.Count);
+        // Cumulative decompressed bytes across this whole response — see
+        // DecompressForBatch. A shared one-element holder so the bound
+        // spans both cluster passes, not one pass.
+        long[] budget = { 0 };
 
         if (_ring is null)
         {
@@ -1140,7 +1144,7 @@ public sealed class NanocachedClient : IDisposable
                 Connection.MultiEntry entry = entries[i];
                 if (entry.Ok)
                 {
-                    values[keys[i]] = MaybeDecompress(entry.Value!);
+                    values[keys[i]] = DecompressForBatch(entry.Value!, budget);
                 }
                 else if (entry.WrongNode)
                 {
@@ -1151,10 +1155,10 @@ public sealed class NanocachedClient : IDisposable
             return values;
         }
 
-        List<int>? retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, null).ConfigureAwait(false);
+        List<int>? retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, null, budget).ConfigureAwait(false);
         if (retry.Count == 0) return values;
         await MaybeRefreshAsync(force: true).ConfigureAwait(false);
-        retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, retry).ConfigureAwait(false);
+        retry = await MultiGetPassAsync(namespaceBytes, keys, keyBytes, values, retry, budget).ConfigureAwait(false);
         if (retry.Count > 0) throw new PartialWrongNodeException<Dictionary<string, byte[]>>(values);
         return values;
     }
@@ -1165,6 +1169,33 @@ public sealed class NanocachedClient : IDisposable
     /// per-entry splicing can share it: a no-op when <c>Compress</c> is
     /// off.</summary>
     private byte[] MaybeDecompress(byte[] value) => _compress ? Compression.DecompressValue(value) : value;
+
+    /// <summary>Decompresses one hit value for a <c>GetMany</c> batch and
+    /// charges its decompressed size against the response's cumulative
+    /// budget (issue #386). <see cref="Compression.DecompressValue"/>
+    /// already caps a single value; this bounds the whole response so a
+    /// batch of highly compressible values can't amplify that per-value
+    /// cap into gigabytes of allocation. Locked on the budget holder
+    /// because <see cref="RunMultiGetLegAsync"/> runs one leg per owner
+    /// concurrently: once the budget is crossed, remaining entries (in
+    /// this and other legs) fail before decompressing rather than each
+    /// allocating another value first — peak allocation is therefore the
+    /// budget plus one value per concurrent leg.</summary>
+    private byte[] DecompressForBatch(byte[] raw, long[] budget)
+    {
+        lock (budget)
+        {
+            if (budget[0] > Compression.MaxMultiGetDecompressedBytes)
+            {
+                throw new DecompressionException(
+                    "nanocached: cumulative decompressed size of this GetMany response " +
+                    "exceeds the maximum — possible decompression bomb across the batch");
+            }
+            byte[] value = MaybeDecompress(raw);
+            budget[0] += value.Length;
+            return value;
+        }
+    }
 
     /// <summary>Issues one or more <c>m</c> sub-frames against
     /// <paramref name="slot"/>'s connection (<c>null</c> for the
@@ -1216,7 +1247,7 @@ public sealed class NanocachedClient : IDisposable
     /// refresh.</summary>
     private async Task<List<int>> MultiGetPassAsync(
         byte[] namespaceBytes, IReadOnlyList<string> keys, byte[][] keyBytes,
-        Dictionary<string, byte[]> values, List<int>? retryIndices)
+        Dictionary<string, byte[]> values, List<int>? retryIndices, long[] budget)
     {
         List<int> indices = retryIndices ?? Enumerable.Range(0, keys.Count).ToList();
 
@@ -1241,7 +1272,7 @@ public sealed class NanocachedClient : IDisposable
         var legs = new List<Task<List<int>>>(groups.Count);
         foreach ((string owner, List<int> groupIndices) in groups)
         {
-            legs.Add(RunMultiGetLegAsync(namespaceBytes, owner, groupIndices, keys, keyBytes, values));
+            legs.Add(RunMultiGetLegAsync(namespaceBytes, owner, groupIndices, keys, keyBytes, values, budget));
         }
         foreach (Task<List<int>> leg in legs)
         {
@@ -1260,7 +1291,8 @@ public sealed class NanocachedClient : IDisposable
     /// into the retry pass, since it isn't a routing outcome).</summary>
     private async Task<List<int>> RunMultiGetLegAsync(
         byte[] namespaceBytes, string owner, List<int> groupIndices,
-        IReadOnlyList<string> keys, byte[][] keyBytes, Dictionary<string, byte[]> values)
+        IReadOnlyList<string> keys, byte[][] keyBytes, Dictionary<string, byte[]> values,
+        long[] budget)
     {
         var groupKeys = new byte[groupIndices.Count][];
         for (int i = 0; i < groupIndices.Count; i++)
@@ -1293,7 +1325,7 @@ public sealed class NanocachedClient : IDisposable
                 // Dictionary isn't thread-safe for concurrent writers.
                 lock (values)
                 {
-                    values[keys[idx]] = MaybeDecompress(entry.Value!);
+                    values[keys[idx]] = DecompressForBatch(entry.Value!, budget);
                 }
             }
         }

@@ -1777,6 +1777,10 @@ public final class NanocachedClient implements AutoCloseable {
         beforeOperation();
 
         byte[][] values = new byte[keys.length][];
+        // Cumulative decompressed bytes across this whole response — see
+        // decompressForBatch. A shared one-element holder so the bound
+        // spans both cluster passes, not one pass.
+        long[] budget = {0};
 
         boolean single;
         synchronized (stateLock) {
@@ -1789,7 +1793,7 @@ public final class NanocachedClient implements AutoCloseable {
             for (int i = 0; i < entries.size(); i++) {
                 Connection.MultiEntry entry = entries.get(i);
                 if (entry.ok()) {
-                    values[i] = maybeDecompress(entry.value());
+                    values[i] = decompressForBatch(entry.value(), budget);
                 } else if (entry.wrongNode()) {
                     unresolved.add(i);
                 }
@@ -1798,10 +1802,10 @@ public final class NanocachedClient implements AutoCloseable {
             return values;
         }
 
-        List<Integer> retry = multiGetPass(namespace, keys, values, null);
+        List<Integer> retry = multiGetPass(namespace, keys, values, null, budget);
         if (retry.isEmpty()) return values;
         maybeRefresh(true);
-        retry = multiGetPass(namespace, keys, values, retry);
+        retry = multiGetPass(namespace, keys, values, retry, budget);
         if (!retry.isEmpty()) throw new NanocachedException.PartialWrongNodeRaw(values, retry);
         return values;
     }
@@ -1812,6 +1816,30 @@ public final class NanocachedClient implements AutoCloseable {
      * no-op when {@code compress} is off. */
     private byte[] maybeDecompress(byte[] value) {
         return compress ? Compression.decompressValue(value) : value;
+    }
+
+    /** Decompresses one hit value for a {@code getMany} batch and charges
+     * its decompressed size against the response's cumulative budget
+     * (issue #386). {@link Compression#decompressValue} already caps a
+     * single value; this bounds the whole response so a batch of highly
+     * compressible values can't amplify that per-value cap into gigabytes
+     * of allocation. Synchronized on the budget holder because {@link
+     * #runMultiGetLeg} runs one leg per owner concurrently on {@link
+     * #replicaWriters}: once the budget is crossed, remaining entries (in
+     * this and other legs) fail before decompressing rather than each
+     * allocating another value first — peak allocation is therefore the
+     * budget plus one value per concurrent leg. */
+    private byte[] decompressForBatch(byte[] raw, long[] budget) {
+        synchronized (budget) {
+            if (budget[0] > Compression.maxMultiGetDecompressedBytes) {
+                throw new NanocachedException.DecompressionFailed(
+                        "nanocached: cumulative decompressed size of this getMany response "
+                                + "exceeds the maximum — possible decompression bomb across the batch");
+            }
+            byte[] value = maybeDecompress(raw);
+            budget[0] += value.length;
+            return value;
+        }
     }
 
     /** Issues one or more {@code m} sub-frames against whatever {@code
@@ -1891,7 +1919,8 @@ public final class NanocachedClient implements AutoCloseable {
      * outright. Called once for the initial pass and once more, if
      * needed, after a single forced refresh. */
     private List<Integer> multiGetPass(
-            byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices) {
+            byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices,
+            long[] budget) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
             indices = new ArrayList<>(keyBytes.length);
@@ -1916,7 +1945,7 @@ public final class NanocachedClient implements AutoCloseable {
         for (Map.Entry<String, List<Integer>> group : groups.entrySet()) {
             String owner = group.getKey();
             List<Integer> groupIndices = group.getValue();
-            Runnable leg = () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values, retry);
+            Runnable leg = () -> runMultiGetLeg(namespace, owner, groupIndices, keyBytes, values, retry, budget);
             // issue #277: routed through submitReplicaWrite (rather than a
             // raw CompletableFuture.supplyAsync onto replicaWriters, as
             // this used to be) so a leg racing close() past
@@ -1951,7 +1980,7 @@ public final class NanocachedClient implements AutoCloseable {
      * {@link #runMultiSetLeg}. */
     private void runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
-            byte[][] keyBytes, byte[][] values, List<Integer> retry) {
+            byte[][] keyBytes, byte[][] values, List<Integer> retry, long[] budget) {
         byte[][] groupKeys = new byte[groupIndices.size()][];
         for (int i = 0; i < groupIndices.size(); i++) {
             groupKeys[i] = keyBytes[groupIndices.get(i)];
@@ -1971,7 +2000,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (entry.wrongNode()) {
                 retry.add(idx);
             } else if (entry.ok()) {
-                values[idx] = maybeDecompress(entry.value());
+                values[idx] = decompressForBatch(entry.value(), budget);
             }
         }
     }

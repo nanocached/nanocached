@@ -939,6 +939,35 @@ public class NanocachedClientTests
         Assert.Equal(1, node.MultiGetRequestCount);
     }
 
+    // issue #386: the per-value decompression cap alone lets a batch
+    // amplify it by the key count (batch x 64 MiB from one small wire
+    // reply); the cumulative budget must abort the batch instead. The cap
+    // is lowered so the test doesn't allocate the real 256 MiB bound, and
+    // charged decompressed bytes apply whether or not Compress is on.
+    [Fact]
+    public async Task GetManyCapsCumulativeDecompressedBytesAcrossTheBatch()
+    {
+        long saved = Compression.MaxMultiGetDecompressedBytes;
+        Compression.MaxMultiGetDecompressedBytes = 4;
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+            await client.SetAsync("a", "12345678");
+            await client.SetAsync("b", "12345678");
+            DecompressionException error = await Assert.ThrowsAsync<DecompressionException>(
+                () => client.GetManyAsync(new[] { "a", "b" }));
+            Assert.Contains("across the batch", error.Message);
+            // A single-key read is untouched by the batch bound.
+            Assert.Equal("12345678", await client.GetAsync("a"));
+        }
+        finally
+        {
+            Compression.MaxMultiGetDecompressedBytes = saved;
+        }
+    }
+
     [Fact]
     public async Task GetManyBytesRoundTripsRawByteValues()
     {

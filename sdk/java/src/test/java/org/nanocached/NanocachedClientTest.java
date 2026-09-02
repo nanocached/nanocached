@@ -181,6 +181,31 @@ class NanocachedClientTest {
         }
     }
 
+    // issue #386: the per-value decompression cap alone lets a batch
+    // amplify it by the key count (batch × 64 MiB from one small wire
+    // reply); the cumulative budget must abort the batch instead. The cap
+    // is lowered so the test doesn't allocate the real 256 MiB bound, and
+    // charged decompressed bytes apply whether or not compress is on.
+    @Test
+    void getManyCapsCumulativeDecompressedBytesAcrossTheBatch() throws Exception {
+        long saved = Compression.maxMultiGetDecompressedBytes;
+        Compression.maxMultiGetDecompressedBytes = 4;
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "12345678");
+                client.set("b", "12345678");
+                NanocachedException.DecompressionFailed error =
+                        assertThrows(NanocachedException.DecompressionFailed.class,
+                                () -> client.getMany(List.of("a", "b")));
+                assertTrue(error.getMessage().contains("across the batch"));
+                // A single-key read is untouched by the batch bound.
+                assertEquals("12345678", client.get("a").orElseThrow());
+            }
+        } finally {
+            Compression.maxMultiGetDecompressedBytes = saved;
+        }
+    }
+
     @Test
     void getManyBytesRoundTripsArbitraryBytes() throws Exception {
         try (MockNode node = new MockNode()) {

@@ -24,6 +24,19 @@ internal static class Compression
     // value. Same 64 MiB cap as the other five SDKs (issue #41).
     private const int MaxDecompressedLength = 64 * 1024 * 1024;
 
+    // Bounds the CUMULATIVE decompressed size of a single
+    // GetManyAsync/GetManyBytesAsync response (issue #386).
+    // MaxDecompressedLength caps one value, but a batch (up to
+    // MaxBatchKeys entries) could pair that per-value cap with the key
+    // count to force ~MaxBatchKeys * 64 MiB of client allocation from one
+    // small, highly-compressible wire response — the per-value bomb
+    // defense amplified across the batch. 256 MiB leaves ample room for a
+    // legitimate large batch (a 640 KiB average across 400 keys) while
+    // bounding the worst case. A mutable field, not a const, only so a
+    // test can lower it without allocating the real bound. Same 256 MiB
+    // cap as the other five SDKs.
+    internal static long MaxMultiGetDecompressedBytes = 256L * 1024 * 1024;
+
     /// <summary>Below <paramref name="threshold"/>, or when compressing
     /// doesn't actually shrink the value (incompressible data), the
     /// marker byte alone is added and the value is stored unchanged.

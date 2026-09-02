@@ -320,6 +320,21 @@ fn validate_namespace_for_clear(namespace: &[u8]) -> Result<()> {
 #[doc(hidden)]
 pub static MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES: AtomicUsize = AtomicUsize::new(32);
 
+/// Bounds the CUMULATIVE decompressed size of a single
+/// `get_many`/`get_many_bytes` response (issue #386). The per-value cap
+/// (`compression::MAX_DECOMPRESSED_LENGTH`, 64 MiB) bounds one value, but
+/// a batch (up to `MAX_BATCH_KEYS` entries) could pair that per-value cap
+/// with the key count to force ~`MAX_BATCH_KEYS` * 64 MiB of client
+/// allocation from one small, highly-compressible wire response — the
+/// per-value bomb defense amplified across the batch. 256 MiB leaves
+/// ample room for a legitimate large batch (a 640 KiB average across 400
+/// keys) while bounding the worst case. A plain const, not a mutable
+/// static: `decompress_for_batch` takes the cap as a parameter, so tests
+/// pass an explicit value instead of mutating process-wide state (the
+/// race `read_one_response`'s wire bound already had to design out). Same
+/// 256 MiB cap as the other five SDKs.
+const MAX_MULTIGET_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Hedged reads' losing legs (issue #64), analogous to
 /// `MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES` above (issue #276): a losing
 /// leg is normally left running detached in `hedged_reads`, drained by
@@ -1818,6 +1833,10 @@ impl NanocachedClient {
         self.before_operation().await?;
 
         let mut values: HashMap<String, Vec<u8>> = HashMap::with_capacity(key_strings.len());
+        // Cumulative decompressed bytes across this whole response — see
+        // decompress_for_batch. Shared across both cluster passes so the
+        // bound spans the entire batch, not one pass.
+        let budget = AtomicU64::new(0);
 
         let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
         if single {
@@ -1826,7 +1845,15 @@ impl NanocachedClient {
             for (i, entry) in entries.into_iter().enumerate() {
                 match entry {
                     MultiEntry::Hit(value) => {
-                        values.insert(key_strings[i].to_string(), self.maybe_decompress(value)?);
+                        values.insert(
+                            key_strings[i].to_string(),
+                            Self::decompress_for_batch(
+                                self.inner.compress,
+                                value,
+                                &budget,
+                                MAX_MULTIGET_DECOMPRESSED_BYTES,
+                            )?,
+                        );
                     }
                     MultiEntry::WrongNode => wrong_node = true,
                     MultiEntry::Miss | MultiEntry::Stored => {}
@@ -1840,14 +1867,28 @@ impl NanocachedClient {
 
         let indices: Vec<usize> = (0..key_strings.len()).collect();
         let retry = self
-            .multi_get_pass(namespace, &key_strings, &key_bytes, &mut values, indices)
+            .multi_get_pass(
+                namespace,
+                &key_strings,
+                &key_bytes,
+                &mut values,
+                indices,
+                &budget,
+            )
             .await?;
         if retry.is_empty() {
             return Ok(values);
         }
         self.maybe_refresh(true).await;
         let retry = self
-            .multi_get_pass(namespace, &key_strings, &key_bytes, &mut values, retry)
+            .multi_get_pass(
+                namespace,
+                &key_strings,
+                &key_bytes,
+                &mut values,
+                retry,
+                &budget,
+            )
             .await?;
         if !retry.is_empty() {
             return Err(Error::PartialWrongNode(values));
@@ -1855,15 +1896,38 @@ impl NanocachedClient {
         Ok(values)
     }
 
-    /// `compress`'s decompression step (see [`Self::get_bytes_in`]),
-    /// generalized so [`Self::get_many_bytes_in`]'s per-entry splicing
-    /// can share it: a no-op when `compress` is off.
-    fn maybe_decompress(&self, value: Vec<u8>) -> Result<Vec<u8>> {
-        if self.inner.compress {
-            crate::compression::decompress_value(&value)
-        } else {
-            Ok(value)
+    /// Decompresses one hit value for a `get_many` batch and charges its
+    /// decompressed size against the response's cumulative budget (issue
+    /// #386). `decompress_value` already caps a single value; this bounds
+    /// the whole response so a batch of highly compressible values can't
+    /// amplify that per-value cap into gigabytes of allocation. The cap is
+    /// a parameter (production passes [`MAX_MULTIGET_DECOMPRESSED_BYTES`])
+    /// rather than a mutable static, so a unit test can exercise the bound
+    /// without racing concurrently running tests through a process-wide
+    /// global — the same stance `read_one_response`'s wire bound takes.
+    /// An associated function, not a method, for the same reason: the unit
+    /// test needs no connected client. `join_all` polls the owner legs on
+    /// one task, so the relaxed atomics are never contended mid-check.
+    fn decompress_for_batch(
+        compress: bool,
+        value: Vec<u8>,
+        budget: &AtomicU64,
+        cap: u64,
+    ) -> Result<Vec<u8>> {
+        if budget.load(Ordering::Relaxed) > cap {
+            return Err(Error::Decompression(
+                "nanocached: cumulative decompressed size of this get_many response exceeds \
+                 the maximum — possible decompression bomb across the batch"
+                    .to_string(),
+            ));
         }
+        let value = if compress {
+            crate::compression::decompress_value(&value)?
+        } else {
+            value
+        };
+        budget.fetch_add(value.len() as u64, Ordering::Relaxed);
+        Ok(value)
     }
 
     /// Issues one or more `m` sub-frames against `slot`'s connection
@@ -1911,6 +1975,7 @@ impl NanocachedClient {
         key_bytes: &[Vec<u8>],
         values: &mut HashMap<String, Vec<u8>>,
         indices: Vec<usize>,
+        budget: &AtomicU64,
     ) -> Result<Vec<usize>> {
         let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
         let mut retry = Vec::new();
@@ -1927,7 +1992,14 @@ impl NanocachedClient {
 
         let outcomes =
             futures_util::future::join_all(groups.iter().map(|(owner, group_indices)| {
-                self.run_multi_get_leg(namespace, owner, group_indices, key_strings, key_bytes)
+                self.run_multi_get_leg(
+                    namespace,
+                    owner,
+                    group_indices,
+                    key_strings,
+                    key_bytes,
+                    budget,
+                )
             }))
             .await;
 
@@ -1960,6 +2032,7 @@ impl NanocachedClient {
         group_indices: &[usize],
         key_strings: &[&str],
         key_bytes: &[Vec<u8>],
+        budget: &AtomicU64,
     ) -> Result<(Vec<usize>, Vec<(String, Vec<u8>)>)> {
         let group_keys: Vec<Vec<u8>> = group_indices
             .iter()
@@ -1979,7 +2052,15 @@ impl NanocachedClient {
             match entry {
                 MultiEntry::WrongNode => retry.push(idx),
                 MultiEntry::Hit(value) => {
-                    hits.push((key_strings[idx].to_string(), self.maybe_decompress(value)?));
+                    hits.push((
+                        key_strings[idx].to_string(),
+                        Self::decompress_for_batch(
+                            self.inner.compress,
+                            value,
+                            budget,
+                            MAX_MULTIGET_DECOMPRESSED_BYTES,
+                        )?,
+                    ));
                 }
                 MultiEntry::Miss | MultiEntry::Stored => {}
             }
@@ -4001,6 +4082,45 @@ impl Namespace {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    // issue #386: the per-value decompression cap alone lets a batch
+    // amplify it by the key count (batch × 64 MiB from one small wire
+    // reply); the cumulative budget must abort the batch instead. Driven
+    // through decompress_for_batch with an explicit cap — never by
+    // mutating a process-wide bound — so concurrently running tests can't
+    // observe it (the read_one_response precedent).
+    #[test]
+    fn a_batch_over_the_cumulative_decompression_budget_is_rejected() {
+        let budget = AtomicU64::new(0);
+        // First value fits and charges the budget…
+        let first =
+            NanocachedClient::decompress_for_batch(false, vec![b'x'; 8], &budget, 4).unwrap();
+        assert_eq!(first.len(), 8);
+        // …after which the budget is over the cap, so the next entry is
+        // rejected before allocating its decompressed form.
+        let error = NanocachedClient::decompress_for_batch(false, vec![b'y'; 8], &budget, 4)
+            .expect_err("second value must trip the cumulative budget");
+        match error {
+            Error::Decompression(message) => {
+                assert!(message.contains("across the batch"), "{message}");
+            }
+            other => panic!("expected a decompression error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_batch_exactly_at_the_cumulative_decompression_budget_passes() {
+        let budget = AtomicU64::new(0);
+        for _ in 0..2 {
+            NanocachedClient::decompress_for_batch(false, vec![b'x'; 4], &budget, 8).unwrap();
+        }
+        // budget == cap is not over it: the next check still admits one
+        // more value (the bound is a budget, not a hard ceiling — the
+        // same one-value overshoot Go/TS/Python accept).
+        NanocachedClient::decompress_for_batch(false, vec![b'x'; 1], &budget, 8).unwrap();
+    }
+
     use super::*;
 
     #[test]
