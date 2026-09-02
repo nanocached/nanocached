@@ -9,12 +9,17 @@ this dependency and setting `nanocached.addresses` is the whole setup.
 
 ```yaml
 nanocached:
-  addresses: "10.0.0.1:8357,10.0.0.2:8357"
+  addresses:
+    - 10.0.0.1:8357
+    - 10.0.0.2:8357
   cache:
     default-ttl: 10m
     ttl:
       sessions: 30s
 ```
+
+The comma-separated string form (`addresses: "10.0.0.1:8357,10.0.0.2:8357"`)
+binds identically — use whichever your configuration style prefers.
 
 ```java
 @SpringBootApplication
@@ -28,7 +33,8 @@ No `@Bean` methods. The autoconfiguration registers a `NanocachedClient`
 off just that one, leaving the other autoconfigured.
 
 **Inert without `nanocached.addresses`.** The autoconfiguration is gated on
-that property (`@ConditionalOnProperty`), so adding the dependency alone
+that property (a `Binder`-based condition that accepts both the YAML-list
+and comma-string forms, issue #388), so adding the dependency alone
 changes nothing — same principle as Boot's own autoconfigurations backing
 off until configured. It also runs `@AutoConfigureBefore` Boot's own
 `CacheAutoConfiguration`, so it wins over Boot's default manager (e.g. the
