@@ -113,6 +113,19 @@ connection survive the request cycle.
   closed); the next operation lazily reconnects. Use it at process exit
   or in tests.
 
+### Preforking servers (Gunicorn `preload_app`, uWSGI)
+
+The bridge is fork-aware (issue #393): the backend records which process
+started its loop thread and rebuilds the loop, thread and client on the
+first cache operation in a `fork()` child. Without that, a warm-up cache
+touch in a preloading master (e.g. from `AppConfig.ready()`) would leave
+every worker holding a loop whose driving thread died in the fork —
+and each operation would block forever on
+`run_coroutine_threadsafe(...).result()`. The parent's inherited sockets
+are deliberately left untouched in the child; the parent remains their
+owner. No configuration is needed — `preload_app = True` and uWSGI
+without `lazy-apps` both just work.
+
 ## Timeouts
 
 Django's `timeout` conventions are translated to nanocached's wire TTL
