@@ -114,12 +114,15 @@ export function encodeGet(key: Uint8Array, tag?: number, namespace: Uint8Array =
 // this field existed; the server has no separate "explicit no-op TTL"
 // concept, so any other encoding would be a distinct thing.
 export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
-  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
-    // A non-integer/negative TTL (3.5, -1, NaN, Infinity) would serialize to a
-    // frame the server rejects with no reply, closing the shared, pipelined
-    // connection — taking every other in-flight request on it down too. Reject
-    // it here, synchronously, before anything is written.
-    throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
+    // A non-integer/negative/too-large TTL (3.5, -1, NaN, Infinity, 1e21)
+    // would serialize to a frame the server rejects with no reply, closing
+    // the shared, pipelined connection — taking every other in-flight
+    // request on it down too. `Number.isInteger(1e21)` is true but
+    // `${1e21}` serializes as "1e+21", a non-decimal TTL field the
+    // server's parser can't read — reject it here, synchronously, before
+    // anything is written, same bound as encodeIncr's delta.
+    throw new RangeError(`nanocached: ttlSeconds must be a non-negative safe integer, got ${ttlSeconds}`);
   }
   checkKeyAndValue(key, value, namespace);
 
@@ -243,12 +246,12 @@ function condToken(cond: CasCondition): string {
 // new value is supplied whole by the caller, so there's no old TTL to
 // preserve.
 export function encodeCas(key: Uint8Array, value: Uint8Array, cond: CasCondition, ttlSeconds = 0, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
-  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
-    // Same rationale as encodeSet's own check: a bad TTL would serialize
-    // into a frame the server rejects with no reply, closing the shared,
-    // pipelined connection and taking every other in-flight request on it
-    // down too.
-    throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
+    // Same rationale as encodeSet's own check: a bad/too-large TTL would
+    // serialize into a frame the server rejects with no reply, closing the
+    // shared, pipelined connection and taking every other in-flight
+    // request on it down too.
+    throw new RangeError(`nanocached: ttlSeconds must be a non-negative safe integer, got ${ttlSeconds}`);
   }
   checkKeyAndValue(key, value, namespace);
   const token = condToken(cond);
@@ -401,8 +404,8 @@ export function encodeMultiSet(
   if (keys.length !== values.length) {
     throw new RangeError(`nanocached: encodeMultiSet keys/values length mismatch (${keys.length} vs ${values.length})`);
   }
-  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 0) {
-    throw new RangeError(`nanocached: ttlSeconds must be a non-negative integer, got ${ttlSeconds}`);
+  if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
+    throw new RangeError(`nanocached: ttlSeconds must be a non-negative safe integer, got ${ttlSeconds}`);
   }
 
   // Uses multiSetEntryCost (issue #222), not raw key+value bytes, so

@@ -63,6 +63,20 @@ describe("encodeSet", () => {
     }
   });
 
+  it("rejects TTLs beyond Number.MAX_SAFE_INTEGER synchronously", () => {
+    // Number.isInteger(1e21) is true, but `${1e21}` serializes as "1e+21" —
+    // a non-decimal TTL field the server's parser can't read, closing the
+    // connection with no reply (issue #438-followup). 2**53 is one past
+    // the last safe integer.
+    for (const ttl of [1e21, 2 ** 53]) {
+      assert.throws(() => encodeSet(Buffer.from("k"), Buffer.from("v"), ttl), RangeError);
+    }
+  });
+
+  it("accepts a TTL of exactly Number.MAX_SAFE_INTEGER (2**53 - 1)", () => {
+    assert.doesNotThrow(() => encodeSet(Buffer.from("k"), Buffer.from("v"), Number.MAX_SAFE_INTEGER));
+  });
+
   it("rejects an empty key synchronously", () => {
     assert.throws(() => encodeSet(Buffer.alloc(0), Buffer.from("v")), RangeError);
   });
@@ -234,6 +248,16 @@ describe("encodeMultiSet (issues #150/#151)", () => {
     }
   });
 
+  it("rejects TTLs beyond Number.MAX_SAFE_INTEGER synchronously", () => {
+    for (const ttl of [1e21, 2 ** 53]) {
+      assert.throws(() => encodeMultiSet(keys, values, ttl), RangeError);
+    }
+  });
+
+  it("accepts a TTL of exactly Number.MAX_SAFE_INTEGER (2**53 - 1)", () => {
+    assert.doesNotThrow(() => encodeMultiSet(keys, values, Number.MAX_SAFE_INTEGER));
+  });
+
   it("rejects many pairs whose combined size exceeds MAX_REQUEST_BYTES even though no single pair does", () => {
     const bigKeys = Array.from({ length: 10 }, () => Buffer.alloc(1));
     const bigValues = Array.from({ length: 10 }, () => Buffer.alloc(Math.ceil(MAX_REQUEST_BYTES / 9)));
@@ -318,6 +342,16 @@ describe("encodeCas (issue #141)", () => {
     for (const ttl of [3.5, -1, NaN, Infinity]) {
       assert.throws(() => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "absent" }, ttl), RangeError);
     }
+  });
+
+  it("rejects TTLs beyond Number.MAX_SAFE_INTEGER synchronously", () => {
+    for (const ttl of [1e21, 2 ** 53]) {
+      assert.throws(() => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "absent" }, ttl), RangeError);
+    }
+  });
+
+  it("accepts a TTL of exactly Number.MAX_SAFE_INTEGER (2**53 - 1)", () => {
+    assert.doesNotThrow(() => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "absent" }, Number.MAX_SAFE_INTEGER));
   });
 
   it("rejects a digest condition that isn't a 32-character lowercase hex string", () => {
