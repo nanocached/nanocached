@@ -34,6 +34,13 @@ import org.springframework.context.annotation.Conditional;
  * would race the other way and Boot's default manager would win instead
  * (the same ordering {@code nanocached-spring}'s manual two-bean setup gets
  * for free from being declared directly in the app's own configuration).
+ *
+ * <p>{@code nanocached.reconnect-cooldown: 0s} (or any zero duration)
+ * disables the reconnect cooldown outright ({@code
+ * Options.disableReconnectCooldown()}) rather than mapping to the SDK's
+ * own default cooldown, which is what a bare {@code
+ * Options.reconnectCooldown(Duration.ZERO)} call means — see {@link
+ * NanocachedProperties#getReconnectCooldown()}.
  */
 @AutoConfiguration
 @AutoConfigureBefore(CacheAutoConfiguration.class)
@@ -67,7 +74,16 @@ public class NanocachedCacheAutoConfiguration {
             options.readRepair(properties.getReadRepair());
         }
         if (properties.getReconnectCooldown() != null) {
-            options.reconnectCooldown(properties.getReconnectCooldown());
+            // A zero duration means "disable the cooldown", not "use the
+            // SDK default" — Options.reconnectCooldown(Duration.ZERO)
+            // itself means the latter (issue #417), so a zero property
+            // value (e.g. reconnect-cooldown: 0s) has to route through
+            // disableReconnectCooldown() to actually take effect.
+            if (properties.getReconnectCooldown().isZero()) {
+                options.disableReconnectCooldown();
+            } else {
+                options.reconnectCooldown(properties.getReconnectCooldown());
+            }
         }
         if (properties.getReadHedgeAfter() != null) {
             options.readHedgeAfter(properties.getReadHedgeAfter());

@@ -122,10 +122,10 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
             T loaded;
             try {
                 loaded = valueLoader.call();
+                put(key, loaded);
             } catch (Exception e) {
                 throw new ValueRetrievalException(key, valueLoader, e);
             }
-            put(key, loaded);
             return loaded;
         }
     }
@@ -153,6 +153,21 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
      * against the wire before that read happens, so a value that changes
      * between the two only affects what this call <em>reports</em>, not
      * what it stores.
+     *
+     * <p><b>Read-back race:</b> the follow-up read is a second, separate
+     * round trip — it is not part of the same atomic operation as the
+     * conditioned write. Between the write losing and the read
+     * completing, another writer can {@link #evict}, {@link #clear}, or
+     * overwrite the key (e.g. via its own {@code putIfAbsent} win racing
+     * with a concurrent {@link #evict}, or a TTL expiry landing in that
+     * window). Callers may therefore observe a returned {@link
+     * ValueWrapper} that is stale (holds a value already superseded by
+     * the time it's returned) or {@code null} for a key that was in fact
+     * present at the moment the write lost — the wire truth at write time
+     * is captured correctly, but what this method <em>reports</em> back
+     * can lag it. This mirrors the read half of every other
+     * read-after-write path in this adapter (e.g. {@link #lookup}); only
+     * the conditioned write itself is atomic.
      */
     @Override
     public ValueWrapper putIfAbsent(Object key, Object value) {
