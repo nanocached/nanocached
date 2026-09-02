@@ -3322,6 +3322,61 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_replica_hit_beats_the_primarys_miss_in_the_same_wait(self):
+        # Issue #387: when the primary's miss and a replica's hit land in
+        # the same asyncio.wait(FIRST_COMPLETED) batch, the old loop
+        # decided on whichever task the set happened to iterate first —
+        # visiting the primary first returned None for a key a replica had
+        # just answered, violating the "hedging never turns a hit into a
+        # miss" contract (a primary that lost the key to eviction/restart
+        # while a replica still holds it). The whole batch must be
+        # evaluated first, with a hit from any owner winning. Same
+        # patched-wait construction as
+        # test_both_legs_done_in_the_same_wait_leaves_no_leak, so both
+        # legs deterministically finish in one wait() call.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_hedge_after=0.01
+            )
+            try:
+                await client.set("k", "v")
+                names = client._owner_names(b"", b"k")
+                self.assertGreater(len(names), 1)
+
+                hedge_started = asyncio.Event()
+
+                async def op(connection):
+                    if not hedge_started.is_set():
+                        # The primary leg: block until the hedge leg has
+                        # started, then answer with a miss — decisive on
+                        # its own (index 0), but it must not outrank the
+                        # replica's hit below.
+                        await hedge_started.wait()
+                        return None
+                    # The hedge leg: a genuine hit.
+                    return "v"
+
+                real_wait = asyncio.wait
+
+                async def patched_wait(fs, **kwargs):
+                    fs = list(fs)
+                    if len(fs) == 2:
+                        hedge_started.set()
+                        await asyncio.gather(*fs, return_exceptions=True)
+                    return await real_wait(fs, **kwargs)
+
+                with mock.patch("asyncio.wait", patched_wait):
+                    self.assertEqual(
+                        await client._read_hedged(b"k", op, names), "v"
+                    )
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_cancelling_a_hedged_read_does_not_leak_the_running_legs(self):
         # Issue #324: asyncio.wait_for(client.get(...), timeout) (or any
         # other cancellation of the caller's await) used to be caught by
