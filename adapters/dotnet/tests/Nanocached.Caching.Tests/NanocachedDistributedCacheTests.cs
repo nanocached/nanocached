@@ -81,6 +81,51 @@ public sealed class NanocachedDistributedCacheTests
 
     // ── Sliding expiration ──────────────────────────────────────────
 
+    // issue #391: the sliding renewal used to be read-then-SetAsync — a
+    // non-atomic read-modify-write. A concurrent Set landing between the
+    // read and the renewal write was silently clobbered by the stale
+    // renewal (a lost update: e.g. a session read racing a session
+    // update). The renewal must be token-conditional and LOSE that race.
+    // MockNode.AfterGet interleaves the concurrent writer
+    // deterministically, right after the adapter's read is served.
+    [Fact]
+    public async Task A_sliding_renewal_never_clobbers_a_concurrent_Set()
+    {
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "session"u8.ToArray();
+
+        await cache.SetAsync(
+            "session", new byte[] { 1 },
+            new DistributedCacheEntryOptions { SlidingExpiration = TimeSpan.FromSeconds(30) });
+
+        // The concurrent writer: its own client (and connection — the
+        // hook runs on the read connection's serve loop, which a write
+        // over the same connection would deadlock), firing between the
+        // adapter's read and its renewal write — exactly the window the
+        // old SetAsync renewal lost.
+        await using ServiceProvider writerProvider = BuildProvider(node);
+        IDistributedCache writer = writerProvider.GetRequiredService<IDistributedCache>();
+        node.AfterGet = (_, _) =>
+        {
+            node.AfterGet = null; // the writer's own ops must not recurse
+            writer.Set(
+                "session", new byte[] { 2 },
+                new DistributedCacheEntryOptions { SlidingExpiration = TimeSpan.FromSeconds(60) });
+        };
+
+        byte[]? read = await cache.GetAsync("session");
+        Assert.Equal(new byte[] { 1 }, read); // the read itself saw the old value
+
+        // The concurrent writer's entry must have survived the renewal.
+        byte[]? after = await cache.GetAsync("session");
+        Assert.Equal(new byte[] { 2 }, after);
+        MockNode.Entry? entry = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
+        Assert.NotNull(entry);
+        Assert.Equal(60, entry!.TtlSeconds);
+    }
+
     [Fact]
     public async Task Sliding_expiration_writes_the_configured_TTL_and_is_renewed_on_Get()
     {
@@ -96,15 +141,15 @@ public sealed class NanocachedDistributedCacheTests
         MockNode.Entry? afterSet = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
         Assert.NotNull(afterSet);
         Assert.Equal(30, afterSet!.TtlSeconds);
-        int setCountAfterSet = node.SetCount;
+        int casCountAfterSet = node.CasCount;
 
         byte[]? value = await cache.GetAsync("session");
         Assert.Equal(new byte[] { 9, 9 }, value);
 
-        // A Get on a sliding entry re-sets it — a second `s` request must
-        // actually have reached the wire, not just a re-read of the
-        // existing entry.
-        Assert.Equal(setCountAfterSet + 1, node.SetCount);
+        // A Get on a sliding entry re-writes it — a `k` (token-conditional
+        // replace, issue #391) must actually have reached the wire, not
+        // just a re-read of the existing entry.
+        Assert.Equal(casCountAfterSet + 1, node.CasCount);
         MockNode.Entry? afterGet = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
         Assert.NotNull(afterGet);
         Assert.Equal(30, afterGet!.TtlSeconds);
@@ -121,11 +166,11 @@ public sealed class NanocachedDistributedCacheTests
         await cache.SetAsync(
             "session2", new byte[] { 1 },
             new DistributedCacheEntryOptions { SlidingExpiration = TimeSpan.FromSeconds(15) });
-        int setCountAfterSet = node.SetCount;
+        int casCountAfterSet = node.CasCount;
 
         await cache.RefreshAsync("session2");
 
-        Assert.Equal(setCountAfterSet + 1, node.SetCount); // a second `s` reached the wire
+        Assert.Equal(casCountAfterSet + 1, node.CasCount); // a `k` renewal reached the wire (issue #391)
         MockNode.Entry? afterRefresh = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
         Assert.NotNull(afterRefresh);
         Assert.Equal(15, afterRefresh!.TtlSeconds);
@@ -193,6 +238,7 @@ public sealed class NanocachedDistributedCacheTests
         await cache.GetAsync("fixed");
 
         Assert.Equal(setCountAfterSet, node.SetCount); // no second `s` was sent
+        Assert.Equal(0, node.CasCount); // and no `k` renewal either (issue #391)
         MockNode.Entry? afterGet = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
         Assert.Same(beforeGet, afterGet);
     }

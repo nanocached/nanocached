@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Nanocached.Caching.Tests;
@@ -29,6 +30,7 @@ internal sealed class MockNode : IDisposable
     private int _clearCount;
     private int _flushCount;
     private int _setCount;
+    private int _casCount;
 
     internal MockNode()
     {
@@ -52,6 +54,17 @@ internal sealed class MockNode : IDisposable
     /// stored value still looks the same.</summary>
     internal int SetCount => Volatile.Read(ref _setCount);
 
+    /// <summary>How many <c>k</c> (compare-and-set) requests this node has
+    /// received — the sliding-renewal counterpart to <see cref="SetCount"/>
+    /// now that Get/Refresh renew conditionally (issue #391).</summary>
+    internal int CasCount => Volatile.Read(ref _casCount);
+
+    /// <summary>Test hook (issue #391): invoked synchronously right after a
+    /// <c>G</c>/<c>g</c> reply is written, with the namespace and key just
+    /// served — lets a test deterministically interleave a concurrent
+    /// writer between the adapter's read and its sliding-renewal write.</summary>
+    internal Action<string, byte[]>? AfterGet;
+
     /// <summary>The entry currently stored for <paramref name="key"/> in
     /// namespace <paramref name="ns"/> (<c>""</c> for the default/legacy
     /// namespace) — what tests assert against to see exactly what reached
@@ -62,6 +75,11 @@ internal sealed class MockNode : IDisposable
             : null;
 
     private static string EncodeKey(byte[] bytes) => Convert.ToBase64String(bytes);
+
+    /// <summary>The SDK's CAS token shape (issue #141): the first 16 bytes
+    /// of SHA-256 over the stored wire bytes, lowercase hex.</summary>
+    private static string Digest(byte[] value) =>
+        Convert.ToHexString(SHA256.HashData(value), 0, 16).ToLowerInvariant();
 
     private ConcurrentDictionary<string, Entry> Store(string ns) =>
         _stores.GetOrAdd(ns, static _ => new ConcurrentDictionary<string, Entry>());
@@ -151,6 +169,50 @@ internal sealed class MockNode : IDisposable
                         await ReplyAsync(stream, "C" + tagSuffix + "\n").ConfigureAwait(false);
                         break;
                     }
+                    case "k":
+                    {
+                        // k <ns-len> <key-len> <val-len> <cond> [<ttl>][ <tag>]
+                        byte[] ns = await ReadExactlyAsync(stream, int.Parse(parts[1])).ConfigureAwait(false);
+                        byte[] key = await ReadExactlyAsync(stream, int.Parse(parts[2])).ConfigureAwait(false);
+                        byte[] value = await ReadExactlyAsync(stream, int.Parse(parts[3])).ConfigureAwait(false);
+                        string cond = parts[4];
+                        int fixedFields = 5 + (tagged ? 1 : 0);
+                        long ttl = parts.Length > fixedFields ? long.Parse(parts[5]) : 0;
+                        Interlocked.Increment(ref _casCount);
+                        var store = Store(Ns(ns));
+                        bool stored;
+                        lock (store)
+                        {
+                            Entry? current = store.TryGetValue(EncodeKey(key), out Entry? e) ? e : null;
+                            bool matches = cond switch
+                            {
+                                "A" => current is null,
+                                "P" => current is not null,
+                                _ => current is not null && Digest(current.Value) == cond,
+                            };
+                            if (matches) store[EncodeKey(key)] = new Entry(value, ttl);
+                            stored = matches;
+                        }
+                        await ReplyAsync(stream, (stored ? "S" : "N") + tagSuffix + "\n").ConfigureAwait(false);
+                        break;
+                    }
+                    case "x":
+                    {
+                        // x <ns-len> <key-len> <digest> [<tag>]
+                        byte[] ns = await ReadExactlyAsync(stream, int.Parse(parts[1])).ConfigureAwait(false);
+                        byte[] key = await ReadExactlyAsync(stream, int.Parse(parts[2])).ConfigureAwait(false);
+                        string digest = parts[3];
+                        var store = Store(Ns(ns));
+                        bool removed;
+                        lock (store)
+                        {
+                            removed = store.TryGetValue(EncodeKey(key), out Entry? current)
+                                && Digest(current.Value) == digest
+                                && store.TryRemove(EncodeKey(key), out _);
+                        }
+                        await ReplyAsync(stream, (removed ? "D" : "N") + tagSuffix + "\n").ConfigureAwait(false);
+                        break;
+                    }
                     case "F":
                         _stores.Clear();
                         Interlocked.Increment(ref _flushCount);
@@ -180,6 +242,7 @@ internal sealed class MockNode : IDisposable
         await stream.WriteAsync(header).ConfigureAwait(false);
         await stream.WriteAsync(entry.Value).ConfigureAwait(false);
         await stream.FlushAsync().ConfigureAwait(false);
+        AfterGet?.Invoke(ns, key);
     }
 
     private async Task SetAsync(
