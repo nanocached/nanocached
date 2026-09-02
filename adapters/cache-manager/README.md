@@ -14,10 +14,10 @@ nanocached cluster.
   namespace's `CLEAR` (issue #106): an O(1) sub-map drop on every node,
   never the whole-cluster flush.
 - **`get`/`set`/`del`/`mget`/`mset`/`mdel`** map to the SDK's namespaced
-  get/set/delete, with all of its routing, replication, hedged reads and
-  retries. `mget`/`mset`/`mdel` are a client-side `Promise.all` loop over
-  the single-key ops — bulk wire operations are a separate, later
-  decision, not part of this adapter.
+  operations, with all of its routing, replication, hedged reads and
+  retries. `mget`/`mset` use the SDK's batched `getMany`/`setMany`
+  (issue #152): one wire round trip per involved node. `mdel` remains a
+  `Promise.all` loop — the wire has no multi-key delete.
 - **Values are JSON-serialized** (`JSON.stringify`/`JSON.parse`), the
   convention `cache-manager`'s own stores use (its Redis store does the
   same).
@@ -125,11 +125,12 @@ client directly, for anything this store doesn't itself surface —
   `wrap()` without `refreshThreshold` at all. If your application relies
   on refresh-ahead actually firing before expiry, this store cannot
   provide that; use `wrap()` for its cache-aside behavior only.
-- **`mget`/`mset`/`mdel`** are `Promise.all` loops over `get`/`set`/`del`
-  — concurrent, not a single wire round trip. `mget` preserves key order
-  in its result (including `undefined` holes for misses); `mset` applies
-  one `ttl` to every entry, same as `cache-manager`'s own multi-store
-  fallback for a store lacking a native `mset`.
+- **`mget`/`mset`** ride the wire's batched multi-get/multi-set (issue
+  #152) — one round trip per involved node; **`mdel`** is a concurrent
+  `Promise.all` loop over `del`. `mget` preserves key order in its result
+  (including `undefined` holes for misses); `mset` applies one `ttl` to
+  every entry, same as `cache-manager`'s own multi-store fallback for a
+  store lacking a native `mset`.
 
 ## Requirements
 

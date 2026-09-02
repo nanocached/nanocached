@@ -51,6 +51,10 @@ All under the `nanocached` prefix, passed straight to
 | `ca` | `Options.ca` |
 | `compress` | `Options.compress` |
 | `compression-threshold` | `Options.compressionThreshold` |
+| `fire-and-forget-replicas` | `Options.fireAndForgetReplicas` |
+| `read-repair` | `Options.readRepair` |
+| `reconnect-cooldown` | `Options.reconnectCooldown` |
+| `read-hedge-after` | `Options.readHedgeAfter` |
 | `cache.default-ttl` | `NanocachedCacheManager.Builder.defaultTtl` |
 | `cache.ttl.<name>` | `NanocachedCacheManager.Builder.ttl(name, ...)` |
 | `cache.allow-null-values` | `NanocachedCacheManager.Builder.allowNullValues` |
