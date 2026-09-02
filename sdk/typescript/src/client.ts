@@ -1810,8 +1810,8 @@ export class NanocachedClient {
    * replica byte-identical to the primary; only the value handed back to
    * *this* caller is refused. */
   private async incrInNamespace(namespace: Uint8Array, key: string | Uint8Array, delta: number): Promise<number | null> {
-    if (this.compress) throw new CompressionIncompatibleError();
     if (this.closed) throw new AlreadyClosedError();
+    if (this.compress) throw new CompressionIncompatibleError();
     await this.maybeRefreshNodeList();
     const result = await this.withWrongNodeRetry(
       () =>
