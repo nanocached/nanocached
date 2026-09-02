@@ -2198,20 +2198,44 @@ class NanocachedClient:
                 # _MAX_INFLIGHT_HEDGE_LOSER_LEGS.
                 for task in done:
                     self._hedged_reads.discard(task)
+                # issue #387: a `done` batch can carry more than one
+                # DECISIVE outcome at once (e.g. the primary's miss and a
+                # replica's hit landing in the same event-loop tick), and
+                # set iteration order is arbitrary — deciding on the first
+                # task visited used to return None for a key a replica had
+                # just answered whenever the primary happened to be
+                # visited first, violating the "hedging never turns a hit
+                # into a miss" contract above. Evaluate the whole batch
+                # first, then decide by the documented priority: a hit
+                # from any owner is final; then WrongNodeError propagates;
+                # only then is the primary's miss accepted as the answer.
+                hit_value: object = None
+                wrong_node: WrongNodeError | None = None
+                primary_missed = False
                 for task in done:
                     index = legs[task]
                     try:
                         value = task.result()
-                    except WrongNodeError:
-                        await resolve_losers(pending)
-                        raise
+                    except WrongNodeError as error:
+                        wrong_node = error
                     except (NanocachedError, ConnectionError, OSError) as error:
                         last_error = error
-                        continue
-                    if value is not None or index == 0:
-                        await resolve_losers(pending)
-                        return value
-                    replica_missed = True
+                    else:
+                        if value is not None:
+                            hit_value = value
+                        elif index == 0:
+                            primary_missed = True
+                        else:
+                            replica_missed = True
+                if hit_value is not None:
+                    await resolve_losers(pending)
+                    return hit_value
+                if wrong_node is not None:
+                    await resolve_losers(pending)
+                    raise wrong_node
+                if primary_missed:
+                    await resolve_losers(pending)
+                    return None
                 if not pending and next_index < len(names):
                     # Everything so far failed or missed provisionally: the
                     # next owner gets its turn right away.
