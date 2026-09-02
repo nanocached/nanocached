@@ -714,8 +714,33 @@ type clusterDialOutcome struct {
 // non-tolerated error, checked before anything is installed so it can't
 // leak a socket successfully opened for a different node in the same
 // dial round.
+// dedupeDiscoveredNodes drops repeated node names from discovery's raw
+// list, first occurrence winning — the same stance NewHashRing takes
+// (issues #328/#360), carried into the connection layer (issue #389).
+// Without it, refreshNodeList's move-then-install dance clobbers a live
+// member with a deadConnection() placeholder on a name's second
+// occurrence: the first occurrence moves the live member into `fresh` and
+// deletes it from c.members, the second finds c.members empty for that
+// name and overwrites the fresh slot — and the no-longer-listed close
+// sweep only walks what's left in c.members, so the orphaned socket and
+// its readLoop goroutine are never closed, invisible to Close() and
+// Stats(). openCluster's per-name map writes leak a tracked connection
+// the same way.
+func dedupeDiscoveredNodes(nodes []discoveredNode) []discoveredNode {
+	seen := make(map[string]bool, len(nodes))
+	deduped := make([]discoveredNode, 0, len(nodes))
+	for _, node := range nodes {
+		if seen[node.Name] {
+			continue
+		}
+		seen[node.Name] = true
+		deduped = append(deduped, node)
+	}
+	return deduped
+}
+
 func (c *Client) openCluster(result *identified) error {
-	nodes := result.nodes
+	nodes := dedupeDiscoveredNodes(result.nodes)
 	outcomes := make([]clusterDialOutcome, len(nodes))
 	var wg sync.WaitGroup
 	wg.Add(len(nodes))
@@ -2850,6 +2875,7 @@ func (c *Client) maybeRefresh(force bool) {
 
 func (c *Client) refreshNodeList() {
 	nodes, replication, ok := c.fetchNodeList()
+	nodes = dedupeDiscoveredNodes(nodes)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
