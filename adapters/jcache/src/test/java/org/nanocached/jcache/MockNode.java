@@ -11,7 +11,10 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -62,6 +65,31 @@ final class MockNode implements AutoCloseable {
      * budget and exercise {@code getAndPut}/{@code getAndReplace}'s
      * {@code fallbackOverwrite} (issue #331). */
     final AtomicInteger forceCasMismatchCount = new AtomicInteger(0);
+    /** Wire keys (the {@link KeyCodec#toKeyBytes} output, not the JCache
+     * key itself) mapped to how many more times {@code m}'s {@link
+     * #multiGet} must answer {@code W} for that key before answering
+     * normally again — each hit decrements the counter, mirroring {@link
+     * #forceCasMismatchCount}'s "sustained contention" shape. Set to 1 for
+     * a one-shot mid-batch ring change ({@code getAll}'s issue #415
+     * partial-wrong-node regression tests); set higher than the adapter's
+     * retry budget to exhaust it. Separate from {@link
+     * #forceWrongNodeCountsForSet} so a {@code putAll}'s own preceding
+     * existence-check {@code getManyBytes} call can't consume a fault
+     * meant for its {@code setManyBytes} call (they're different wire
+     * requests, sharing only the key). A plain single-node mock never
+     * emits {@code W} on its own, so this is the only way these tests can
+     * produce one. */
+    final Map<ByteBuffer, AtomicInteger> forceWrongNodeCountsForGet = new ConcurrentHashMap<>();
+    /** As {@link #forceWrongNodeCountsForGet}, but for {@code o}'s {@link
+     * #multiSet} ({@code putAll}'s issue #415 regression tests). */
+    final Map<ByteBuffer, AtomicInteger> forceWrongNodeCountsForSet = new ConcurrentHashMap<>();
+    /** Milliseconds every single-key {@code d} (delete) sleeps before
+     * answering — 0 (the default) is no delay. Used to prove {@code
+     * removeAll(Set)} fans its deletes out concurrently rather than one
+     * after another (issue #415), the same shape as
+     * nanocached-django's {@code test_delete_many_fans_out_concurrently}
+     * (issue #233). */
+    volatile long deleteDelayMillis = 0;
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, InetAddress.getLoopbackAddress());
@@ -107,9 +135,19 @@ final class MockNode implements AutoCloseable {
     private void serve(Socket socket) {
         connectionCount.incrementAndGet();
         liveConnectionCount.incrementAndGet();
+        // Issue #415: a delayed delete reply (see delete()'s doc) is
+        // computed off this loop's thread, but the SDK's Connection
+        // requires replies in strict request order even on a tagged
+        // connection (readLoop verifies the echoed tag against the
+        // oldest still-pending request, not a lookup by tag) — so every
+        // delayed reply is queued here, in request order, and a single
+        // writer thread blocks on each in turn before writing it.
+        BlockingQueue<CompletableFuture<byte[]>> deleteReplies = new LinkedBlockingQueue<>();
+        Thread deleteReplyWriter = null;
         try (socket) {
             InputStream in = socket.getInputStream();
             OutputStream out = socket.getOutputStream();
+            deleteReplyWriter = startDeleteReplyWriter(out, deleteReplies);
             boolean tagged = false;
             while (true) {
                 String[] parts = readLine(in).split(" ");
@@ -134,7 +172,7 @@ final class MockNode implements AutoCloseable {
                     }
                     case "d" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
-                        delete(in, out, ns(namespace), Integer.parseInt(parts[2]), tagSuffix);
+                        delete(in, ns(namespace), Integer.parseInt(parts[2]), tagSuffix, deleteReplies);
                     }
                     case "c" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
@@ -159,7 +197,42 @@ final class MockNode implements AutoCloseable {
             // connection closed by the client (or test teardown)
         } finally {
             liveConnectionCount.decrementAndGet();
+            if (deleteReplyWriter != null) {
+                deleteReplyWriter.interrupt();
+            }
         }
+    }
+
+    /** See {@link #serve}'s doc: drains {@code replies} strictly in the
+     * order {@link #delete} enqueued them, blocking on each future before
+     * writing it and moving to the next — so replies stay in request
+     * order on the wire even though every delayed delete's own wait runs
+     * concurrently with every other one's. */
+    private Thread startDeleteReplyWriter(OutputStream out, BlockingQueue<CompletableFuture<byte[]>> replies) {
+        Thread writer = new Thread(() -> {
+            try {
+                while (true) {
+                    byte[] line;
+                    try {
+                        line = replies.take().join();
+                    } catch (InterruptedException stop) {
+                        return;
+                    } catch (java.util.concurrent.CancellationException
+                            | java.util.concurrent.CompletionException stopped) {
+                        return;
+                    }
+                    synchronized (out) {
+                        out.write(line);
+                        out.flush();
+                    }
+                }
+            } catch (IOException closed) {
+                // The connection died under us — nothing left to answer.
+            }
+        });
+        writer.setDaemon(true);
+        writer.start();
+        return writer;
     }
 
     private void get(InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
@@ -170,9 +243,11 @@ final class MockNode implements AutoCloseable {
             reply(out, "N" + tagSuffix + "\n");
             return;
         }
-        out.write(("V " + entry.value().length + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
-        out.write(entry.value());
-        out.flush();
+        synchronized (out) {
+            out.write(("V " + entry.value().length + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+            out.write(entry.value());
+            out.flush();
+        }
     }
 
     private void set(
@@ -188,17 +263,56 @@ final class MockNode implements AutoCloseable {
         reply(out, "S" + tagSuffix + "\n");
     }
 
-    private void delete(InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
+    /** Issue #415: when {@link #deleteDelayMillis} is set, the mutation
+     * and reply are computed on a throwaway daemon thread instead of
+     * blocking this connection's one read loop with {@code Thread.sleep}
+     * — blocking the read loop would serialize every delete's delay one
+     * after another regardless of how many requests the client had
+     * already pipelined onto the wire, masking the exact difference a
+     * concurrent {@code removeAll(Set)} is supposed to make over the old
+     * one-RPC-at-a-time loop. The reply itself is hop through {@code
+     * replies} rather than written directly — see {@link #serve}'s doc —
+     * so N deletes submitted together still answer in request order, in
+     * roughly one {@link #deleteDelayMillis} altogether rather than N of
+     * them back to back. */
+    private void delete(
+            InputStream in,
+            String namespace,
+            int keyLength,
+            String tagSuffix,
+            BlockingQueue<CompletableFuture<byte[]>> replies)
             throws IOException {
         byte[] key = in.readNBytes(keyLength);
-        boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
-        reply(out, (existed ? "D" : "N") + tagSuffix + "\n");
+        long delay = deleteDelayMillis;
+        if (delay <= 0) {
+            boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
+            replies.add(CompletableFuture.completedFuture(
+                    ((existed ? "D" : "N") + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII)));
+            return;
+        }
+        CompletableFuture<byte[]> future = new CompletableFuture<>();
+        replies.add(future);
+        Thread worker = new Thread(() -> {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                future.cancel(false);
+                return;
+            }
+            boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
+            future.complete(((existed ? "D" : "N") + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+        });
+        worker.setDaemon(true);
+        worker.start();
     }
 
     /** {@code m <ns-len> <n> <key-len-1> ... <key-len-n> [tag]}, docs/protocol.html
      * "m / o". Reply: {@code M <n> <result-1> ... <result-n> [tag]\n<hit values>},
-     * each result a decimal byte length (hit) or {@code -} (miss) — no {@code W}
-     * from a single-node mock. */
+     * each result a decimal byte length (hit), {@code -} (miss), or {@code W}
+     * (wrong node) — this single-node mock only ever answers {@code W} for a key
+     * in {@link #forceWrongNodeCountsForGet} (issue #415's regression tests),
+     * never on its own. */
     private void multiGet(InputStream in, OutputStream out, String namespace, String[] parts, String tagSuffix)
             throws IOException {
         int n = Integer.parseInt(parts[2]);
@@ -208,30 +322,42 @@ final class MockNode implements AutoCloseable {
         }
         multiGetCount.incrementAndGet();
         byte[][] values = new byte[n][];
+        boolean[] wrongNode = new boolean[n];
         for (int i = 0; i < n; i++) {
             byte[] key = in.readNBytes(keyLengths[i]);
+            if (forceWrongNode(forceWrongNodeCountsForGet, key)) {
+                wrongNode[i] = true;
+                continue;
+            }
             Entry entry = entry(namespace, key);
             values[i] = entry == null ? null : entry.value();
         }
         StringBuilder header = new StringBuilder("M ").append(n);
-        for (byte[] value : values) {
-            header.append(' ').append(value == null ? "-" : String.valueOf(value.length));
-        }
-        header.append(tagSuffix).append('\n');
-        out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
-        for (byte[] value : values) {
-            if (value != null) {
-                out.write(value);
+        for (int i = 0; i < n; i++) {
+            if (wrongNode[i]) {
+                header.append(" W");
+            } else {
+                header.append(' ').append(values[i] == null ? "-" : String.valueOf(values[i].length));
             }
         }
-        out.flush();
+        header.append(tagSuffix).append('\n');
+        synchronized (out) {
+            out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+            for (int i = 0; i < n; i++) {
+                if (!wrongNode[i] && values[i] != null) {
+                    out.write(values[i]);
+                }
+            }
+            out.flush();
+        }
     }
 
     /** {@code o <ns-len> <n> <key-len-1> <val-len-1> ... <key-len-n> <val-len-n>
      * [ttl] [tag]}, docs/protocol.html "m / o" — one shared TTL for the whole
      * batch, omitted from the wire when 0. Reply: {@code O <n> <result-1> ...
-     * <result-n> [tag]\n}, every result {@code S} — no {@code W} from a
-     * single-node mock. */
+     * <result-n> [tag]\n}, every result {@code S} unless the key is in {@link
+     * #forceWrongNodeCountsForSet} (issue #415's regression tests, {@code W} then)
+     * — this single-node mock never answers {@code W} on its own. */
     private void multiSet(
             InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
@@ -245,18 +371,25 @@ final class MockNode implements AutoCloseable {
         int trailing = parts.length - (3 + 2 * n) - (tagged ? 1 : 0);
         long ttlSeconds = trailing > 0 ? Long.parseLong(parts[3 + 2 * n]) : 0;
         multiSetCount.incrementAndGet();
+        boolean[] wrongNode = new boolean[n];
         for (int i = 0; i < n; i++) {
             byte[] key = in.readNBytes(keyLengths[i]);
             byte[] value = in.readNBytes(valueLengths[i]);
+            if (forceWrongNode(forceWrongNodeCountsForSet, key)) {
+                wrongNode[i] = true;
+                continue;
+            }
             store(namespace).put(ByteBuffer.wrap(key), new Entry(value, ttlSeconds));
         }
         StringBuilder header = new StringBuilder("O ").append(n);
         for (int i = 0; i < n; i++) {
-            header.append(" S");
+            header.append(wrongNode[i] ? " W" : " S");
         }
         header.append(tagSuffix).append('\n');
-        out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
-        out.flush();
+        synchronized (out) {
+            out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+        }
     }
 
     /** {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]}. {@code
@@ -316,6 +449,12 @@ final class MockNode implements AutoCloseable {
         return forceCasMismatchCount.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
     }
 
+    /** See {@link #forceWrongNodeCountsForGet}/{@link #forceWrongNodeCountsForSet}. */
+    private static boolean forceWrongNode(Map<ByteBuffer, AtomicInteger> counts, byte[] key) {
+        AtomicInteger remaining = counts.get(ByteBuffer.wrap(key));
+        return remaining != null && remaining.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
+    }
+
     /** Same algorithm as {@code NanocachedClient.contentDigest} —
      * SHA-256 truncated to 16 bytes, lowercase hex — reimplemented
      * independently so a bug in one isn't masked by the other. */
@@ -337,9 +476,16 @@ final class MockNode implements AutoCloseable {
         return new String(namespace, StandardCharsets.UTF_8);
     }
 
+    /** Synchronized on {@code out} (issue #415): {@link #delete}'s delayed
+     * responder thread can answer while the main read loop is mid-write
+     * for an unrelated request on the same connection, so every write
+     * site in this class serializes on the same monitor to keep replies
+     * from interleaving on the wire. */
     private void reply(OutputStream out, String line) throws IOException {
-        out.write(line.getBytes(StandardCharsets.US_ASCII));
-        out.flush();
+        synchronized (out) {
+            out.write(line.getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+        }
     }
 
     private static String readLine(InputStream in) throws IOException {
