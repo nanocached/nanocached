@@ -258,6 +258,29 @@ public sealed class MockNode : IDisposable
     /// doc comment) needs to see a node fail.</summary>
     public void FailClearOnce() => Interlocked.Increment(ref _failClearReplies);
 
+    /// <summary>issue #411: from the <paramref name="n"/>-th <c>m</c>
+    /// (multi-get) request onward (1-based, counted across every
+    /// connection this node has ever accepted — same node-level counter as
+    /// <see cref="MultiGetRequestCount"/>), fail at the connection level
+    /// instead of replying: the frame is read (so the TCP stream stays
+    /// well-formed) and the connection is then closed, mirroring
+    /// <see cref="FailClearOnce"/>'s failure shape but STICKY — every
+    /// request numbered <paramref name="n"/> or higher fails this way, not
+    /// just one, so a test can prove a chunked batch's first
+    /// <paramref name="n"/> - 1 sub-frames succeed and then BOTH the
+    /// sub-frame that dies AND the SDK's own built-in
+    /// reconnect-and-retry's resend of it (a fresh connection, but still
+    /// counted by this same node-level counter) fail — the scenario where
+    /// the connection failure actually escapes to the caller instead of
+    /// being transparently absorbed by the retry.</summary>
+    public void FailMultiGetFromRequestOnward(int n) => _failMultiGetFromRequest = n;
+    private int _failMultiGetFromRequest = int.MaxValue;
+
+    /// <summary>issue #411: the <c>o</c> (multi-set) counterpart of
+    /// <see cref="FailMultiGetFromRequestOnward"/>.</summary>
+    public void FailMultiSetFromRequestOnward(int n) => _failMultiSetFromRequest = n;
+    private int _failMultiSetFromRequest = int.MaxValue;
+
     /// <summary>issue #225: makes the next <c>i</c> request that would
     /// otherwise succeed apply its increment to the store (mutating state
     /// exactly as a real node would) and then close the connection
@@ -854,7 +877,7 @@ public sealed class MockNode : IDisposable
                         {
                             keys[i] = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3 + i], CultureInfo.InvariantCulture));
                         }
-                        Interlocked.Increment(ref _multiGetRequestCount);
+                        int multiGetRequestNumber = Interlocked.Increment(ref _multiGetRequestCount);
                         // issue #222: namespace + every key's bytes — the
                         // same total MultiGetChunkedAsync's cumulative
                         // bound tracks, minus its header allowance.
@@ -862,6 +885,14 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #411: frame consumed (stream stays
+                        // well-formed), connection then dropped instead of
+                        // answered — see FailMultiGetFromRequestOnward's
+                        // doc comment.
+                        if (multiGetRequestNumber >= _failMultiGetFromRequest)
+                        {
+                            return;
                         }
                         if (TakeOne(ref _retryableReplies))
                         {
@@ -917,7 +948,7 @@ public sealed class MockNode : IDisposable
                             keys[i] = await Wire.ReadExactlyAsync(stream, keyLens[i]);
                             values[i] = await Wire.ReadExactlyAsync(stream, valueLens[i]);
                         }
-                        Interlocked.Increment(ref _multiSetRequestCount);
+                        int multiSetRequestNumber = Interlocked.Increment(ref _multiSetRequestCount);
                         // issue #222: namespace + every key's and value's
                         // bytes — the same total MultiSetChunkedAsync's
                         // cumulative bound tracks, minus its header
@@ -927,6 +958,14 @@ public sealed class MockNode : IDisposable
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
+                        }
+                        // issue #411: frame consumed (stream stays
+                        // well-formed), connection then dropped instead of
+                        // answered — see FailMultiSetFromRequestOnward's
+                        // doc comment.
+                        if (multiSetRequestNumber >= _failMultiSetFromRequest)
+                        {
+                            return;
                         }
                         if (TakeOne(ref _retryableReplies))
                         {

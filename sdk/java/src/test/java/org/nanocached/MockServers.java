@@ -138,6 +138,16 @@ final class MockServers {
          * outlast a single fan-out pass's own applyReconnecting redial)
          * and then let a later attempt succeed. */
         private final AtomicInteger clearFailures = new AtomicInteger();
+        /** issue #411: one-off counters that answer the next `m`/`o` frame
+         * normally, then tear the whole node down (listener + every open
+         * connection, exactly like {@link #close()}) immediately after —
+         * for regression coverage of a chunked multi-get/multi-set batch
+         * whose first sub-frame succeeds but whose next one hits a
+         * connection failure that the client's own built-in
+         * reconnect-and-retry can't recover from either, since the
+         * listener itself is gone by the time it redials. */
+        private final AtomicInteger closeAfterMultiGet = new AtomicInteger();
+        private final AtomicInteger closeAfterMultiSet = new AtomicInteger();
         private volatile boolean silent = false;
         /** The TTL (whole seconds; 0 if omitted on the wire) from the
          * most recent S request this server received. */
@@ -338,6 +348,33 @@ final class MockServers {
                 int pending = clearFailures.get();
                 if (pending == 0) return false;
                 if (clearFailures.compareAndSet(pending, pending - 1)) return true;
+            }
+        }
+
+        /** issue #411: answer the next `m` frame normally, then tear this
+         * whole node down — see {@link #closeAfterMultiGet}. */
+        void closeAfterNextMultiGet() {
+            closeAfterMultiGet.incrementAndGet();
+        }
+
+        private boolean takeCloseAfterMultiGet() {
+            while (true) {
+                int pending = closeAfterMultiGet.get();
+                if (pending == 0) return false;
+                if (closeAfterMultiGet.compareAndSet(pending, pending - 1)) return true;
+            }
+        }
+
+        /** As {@link #closeAfterNextMultiGet}, for `o` (multi-set). */
+        void closeAfterNextMultiSet() {
+            closeAfterMultiSet.incrementAndGet();
+        }
+
+        private boolean takeCloseAfterMultiSet() {
+            while (true) {
+                int pending = closeAfterMultiSet.get();
+                if (pending == 0) return false;
+                if (closeAfterMultiSet.compareAndSet(pending, pending - 1)) return true;
             }
         }
 
@@ -879,6 +916,14 @@ final class MockServers {
                             out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
                             out.write(body.toByteArray());
                             out.flush();
+                            if (takeCloseAfterMultiGet()) {
+                                try {
+                                    close();
+                                } catch (IOException ignored) {
+                                    // Best-effort.
+                                }
+                                return;
+                            }
                         }
                         case "o" -> {
                             int nsLen = Integer.parseInt(parts[1]);
@@ -925,6 +970,14 @@ final class MockServers {
                             header.append(tagSuffix).append('\n');
                             out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
                             out.flush();
+                            if (takeCloseAfterMultiSet()) {
+                                try {
+                                    close();
+                                } catch (IOException ignored) {
+                                    // Best-effort.
+                                }
+                                return;
+                            }
                         }
                         case "d" -> {
                             String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));

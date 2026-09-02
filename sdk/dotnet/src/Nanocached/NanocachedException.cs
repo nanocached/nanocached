@@ -78,8 +78,16 @@ public sealed class DiscoveryBusyException : NanocachedException
         : base("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's") { }
 }
 
-/// <summary>A connection-level failure; the client redials lazily on the next use.</summary>
-public sealed class ConnectionLostException : NanocachedException
+/// <summary>A connection-level failure; the client redials lazily on the next use.
+///
+/// <para>Not <c>sealed</c> (unlike this SDK's other leaf exceptions) so
+/// <see cref="PartialConnectionLostException{T}"/> — issue #411's
+/// chunked-batch partial-failure carrier — can subclass it while still
+/// satisfying every existing <c>catch (ConnectionLostException)</c>, the
+/// same reason <see cref="WrongNodeException"/> is deliberately left
+/// unsealed for <see cref="PartialWrongNodeException{T}"/>.</para>
+/// </summary>
+public class ConnectionLostException : NanocachedException
 {
     /// <summary>
     /// issue #225 — internal only: true when this specific failure happened
@@ -110,6 +118,47 @@ public sealed class ConnectionLostException : NanocachedException
     internal ConnectionLostException(string message, Exception inner, bool requestNotSent) : base(message, inner)
     {
         RequestNotSent = requestNotSent;
+    }
+}
+
+/// <summary>
+/// issue #411 — raised by <c>NanocachedClient.GetManyBytesAsync</c>/
+/// <c>NanocachedClient.SetManyBytesAsync</c> (and their decoded-string
+/// siblings) when a connection failure interrupts a chunked multi-get/
+/// multi-set batch (batch chunking, issue #222: <c>MultiGetChunkedAsync</c>/
+/// <c>MultiSetChunkedAsync</c> split an over-<c>MaxBatchKeys</c> or
+/// over-<c>MaxRequestBytes</c> batch into more than one <c>m</c>/<c>o</c>
+/// wire sub-frame) after at least one earlier sub-frame already completed —
+/// and this SDK's own built-in reconnect-and-retry
+/// (<c>ApplyReconnectingAsync</c>) already tried and failed on the
+/// sub-frame that lost the connection. A <see cref="ConnectionLostException"/>
+/// subclass — chaining the original failure as <see cref="Exception.InnerException"/> —
+/// so existing <c>catch (ConnectionLostException)</c> handling keeps working
+/// unchanged, mirroring how <see cref="PartialWrongNodeException{T}"/>
+/// subclasses <see cref="WrongNodeException"/> for the analogous wrong-node
+/// case. <see cref="PartialValues"/> holds whatever the batch DID confirm
+/// before the failing sub-frame: for get, every key that resolved
+/// (<c>T</c> = <c>Dictionary&lt;string, byte[]&gt;</c>, exactly like
+/// <see cref="PartialWrongNodeException{T}"/>'s own <c>T</c>); for set,
+/// since there's nothing to "return" on success, every key confirmed
+/// stored instead (<c>T</c> = <c>HashSet&lt;string&gt;</c>).
+///
+/// <para>If the very FIRST sub-frame is the one that fails, there is no
+/// partial data yet, so a plain (bare) <see cref="ConnectionLostException"/>
+/// propagates instead — this type is only thrown once a second or later
+/// sub-frame fails.</para>
+/// </summary>
+public sealed class PartialConnectionLostException<T> : ConnectionLostException
+{
+    public T PartialValues { get; }
+
+    public PartialConnectionLostException(T partialValues, Exception inner)
+        : base(
+            "nanocached: connection lost partway through a chunked batch; " +
+            "PartialValues holds what the batch confirmed before the failing chunk",
+            inner)
+    {
+        PartialValues = partialValues;
     }
 }
 

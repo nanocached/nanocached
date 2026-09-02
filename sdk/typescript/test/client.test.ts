@@ -13,6 +13,7 @@ import {
   NanocachedClient,
   NanocachedError,
   NotNumericError,
+  PartialConnectionLostError,
   PartialWrongNodeError,
   RetryableError,
   WrongNodeError,
@@ -2582,6 +2583,184 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
   });
 });
 
+describe("NanocachedClient chunked batch partial success on connection loss (issue #411)", () => {
+  // A batch that spans more than one m/o sub-frame (see the two describe
+  // blocks above) used to silently discard every earlier, already-
+  // successful chunk's results whenever a later chunk's connection died —
+  // the bare ConnectionLostError (or raw Node socket error) that killed
+  // the later chunk propagated alone, wrongly implying nothing had been
+  // read or written at all. These intercept the single/proxy-mode
+  // connection's own multiGet/multiSet after letting the first call
+  // through for real (so chunk 1 genuinely lands on the mock node), and
+  // reject the second call the way a dead connection would — proving
+  // multiGetChunked/multiSetChunked themselves now preserve the earlier
+  // chunk(s) instead of the caller (getManyBytesInNamespace/
+  // setManyInNamespace) ever seeing a bare, information-losing error.
+
+  it("setManyBytes: a connection failure on chunk 2 surfaces PartialConnectionLostError naming chunk 1's already-stored keys", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        // Establishes the single connection this test then hooks.
+        await client.set("warmup", "1");
+
+        const count = 50;
+        const valueSize = 50_000; // count * valueSize far exceeds MAX_REQUEST_BYTES (~1 MiB)
+        assert.ok(count * valueSize > MAX_REQUEST_BYTES, "cumulative bytes must force more than one o sub-frame");
+        const values: Record<string, Uint8Array> = {};
+        const keys: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const key = `key-${i}`;
+          keys.push(key);
+          values[key] = Buffer.alloc(valueSize, i % 256);
+        }
+
+        const connection: any = (client as any).target.connection;
+        const originalMultiSet = connection.multiSet.bind(connection);
+        let calls = 0;
+        mock.method(connection, "multiSet", (...args: unknown[]) => {
+          calls++;
+          if (calls === 1) return originalMultiSet(...args);
+          return Promise.reject(new ConnectionLostError("nanocached: chunk 2 connection lost"));
+        });
+
+        try {
+          await client.setManyBytes(values);
+          assert.fail("expected setManyBytes to reject");
+        } catch (error) {
+          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${error}`);
+          assert.ok(error instanceof ConnectionLostError);
+          const stored = (error as PartialConnectionLostError<string[]>).partialValues;
+          assert.ok(stored.length > 0, "expected chunk 1's keys to be preserved");
+          assert.ok(stored.length < count, "expected fewer than every key — chunk 2's keys must not appear");
+          for (const key of stored) {
+            assert.ok(node.store.has(key), `expected ${key} (reported stored) to actually be on the node`);
+          }
+        }
+        assert.equal(calls, 2, "test setup: expected exactly chunk 1 (through) and chunk 2 (rejected) to run");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getManyBytes: a connection failure on chunk 2 surfaces PartialConnectionLostError carrying chunk 1's already-fetched values", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const count = 50;
+        const keySize = 25_000; // count * keySize far exceeds MAX_REQUEST_BYTES (~1 MiB)
+        assert.ok(count * keySize > MAX_REQUEST_BYTES, "cumulative bytes must force more than one m sub-frame");
+        const values: Record<string, string> = {};
+        const keys: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const key = `${"k".repeat(keySize)}-${i}`;
+          keys.push(key);
+          values[key] = `value-${i}`;
+        }
+        await client.setMany(values); // establishes the single connection this test then hooks
+
+        const connection: any = (client as any).target.connection;
+        const originalMultiGet = connection.multiGet.bind(connection);
+        let calls = 0;
+        mock.method(connection, "multiGet", (...args: unknown[]) => {
+          calls++;
+          if (calls === 1) return originalMultiGet(...args);
+          return Promise.reject(new ConnectionLostError("nanocached: chunk 2 connection lost"));
+        });
+
+        try {
+          await client.getManyBytes(keys);
+          assert.fail("expected getManyBytes to reject");
+        } catch (error) {
+          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${error}`);
+          assert.ok(error instanceof ConnectionLostError);
+          const partial = (error as PartialConnectionLostError<Map<string, Buffer>>).partialValues;
+          assert.ok(partial.size > 0, "expected chunk 1's values to be preserved");
+          assert.ok(partial.size < count, "expected fewer than every key — chunk 2's keys must not appear");
+          for (const [key, value] of partial) {
+            assert.deepEqual(value, Buffer.from(values[key], "utf8"));
+          }
+        }
+        assert.equal(calls, 2, "test setup: expected exactly chunk 1 (through) and chunk 2 (rejected) to run");
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("getMany: the same connection failure decodes PartialConnectionLostError's partialValues, mirroring PartialWrongNodeError", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const count = 50;
+        const keySize = 25_000;
+        const values: Record<string, string> = {};
+        const keys: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const key = `${"k".repeat(keySize)}-${i}`;
+          keys.push(key);
+          values[key] = `value-${i}`;
+        }
+        await client.setMany(values);
+
+        const connection: any = (client as any).target.connection;
+        const originalMultiGet = connection.multiGet.bind(connection);
+        let calls = 0;
+        mock.method(connection, "multiGet", (...args: unknown[]) => {
+          calls++;
+          if (calls === 1) return originalMultiGet(...args);
+          return Promise.reject(new ConnectionLostError("nanocached: chunk 2 connection lost"));
+        });
+
+        try {
+          await client.getMany(keys);
+          assert.fail("expected getMany to reject");
+        } catch (error) {
+          assert.ok(error instanceof PartialConnectionLostError);
+          const partial = (error as PartialConnectionLostError<Map<string, string>>).partialValues;
+          assert.ok(partial.size > 0 && partial.size < count);
+          for (const [key, value] of partial) assert.equal(value, values[key]);
+        }
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("a connection failure on chunk 1 (nothing succeeded yet) still propagates as a plain ConnectionLostError, not Partial", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("warmup", "1"); // establishes the single connection this test then hooks
+
+        const connection: any = (client as any).target.connection;
+        mock.method(connection, "multiSet", () => Promise.reject(new ConnectionLostError("nanocached: chunk 1 connection lost")));
+
+        await assert.rejects(client.setManyBytes({ a: Buffer.from("1"), b: Buffer.from("2") }), (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.ok(!(error instanceof PartialConnectionLostError), "chunk 1 has no partial data worth wrapping");
+          return true;
+        });
+      } finally {
+        client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
 describe("NanocachedClient getManyBytes cumulative response size bound (issue #207)", () => {
   // MULTI_GET_TUNING exists only so these tests can shrink it, mirroring
   // REQUEST_TIMEOUT_TUNING above.
@@ -3437,6 +3616,90 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
         "a replica write landed after close() had already resolved — it was abandoned mid-drain",
       );
     } finally {
+      await cluster.close();
+    }
+  });
+});
+
+describe("NanocachedClient cluster-leg chunked partial success on connection loss (issue #411)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function startReplicatedCluster() {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const nodes = [
+      { name: names[0], mock: nodeA },
+      { name: names[1], mock: nodeB },
+    ];
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 2 },
+    );
+    return {
+      nodes,
+      discovery,
+      close: async () => {
+        await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+      },
+    };
+  }
+
+  it("setMany: a connection failure on one owner's chunk 2 doesn't overcount replicaWriteFailures for keys chunk 1 already stored", async () => {
+    // Regression for the runLeg overcount described in issue #411: with
+    // exactly 2 nodes and replication 2, every key's owners are both
+    // nodes — one primary, one replica — so one owner's single `o` leg
+    // for a batch necessarily mixes primary- and replica-role keys. The
+    // bug marked the WHOLE leg (both bookkeeping for retry AND
+    // stats().replicaWriteFailures) as failed on any connection error,
+    // even for replica-role keys an earlier chunk had already stored for
+    // real.
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      await client.set("warmup", "1"); // establishes both owners' connections
+
+      const count = 50;
+      const valueSize = 50_000; // forces more than one `o` sub-frame per leg
+      const values: Record<string, Uint8Array> = {};
+      const keys: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const key = `key-${i}`;
+        keys.push(key);
+        values[key] = Buffer.alloc(valueSize, i % 256);
+      }
+
+      const ring = new HashRing(names);
+      const nodeA = cluster.nodes[0];
+      const aReplicaRoleKeys = keys.filter((key) => ring.owners(Buffer.from(key), 2)[1] === nodeA.name);
+      assert.ok(aReplicaRoleKeys.length > 0, "test setup: expected at least one replica-role key on node A");
+
+      const connectionA: any = (client as any).target.members.get(nodeA.name).connection;
+      const originalMultiSet = connectionA.multiSet.bind(connectionA);
+      let calls = 0;
+      let chunk1Keys: string[] = [];
+      mock.method(connectionA, "multiSet", (keyBytes: Buffer[], ...rest: unknown[]) => {
+        calls++;
+        if (calls === 1) {
+          chunk1Keys = keyBytes.map((b) => b.toString("utf8"));
+          return originalMultiSet(keyBytes, ...rest);
+        }
+        return Promise.reject(new ConnectionLostError("nanocached: chunk 2 connection lost"));
+      });
+
+      await assert.rejects(client.setManyBytes(values)); // node A's leg stays "down" on the forced-refresh retry too
+
+      const chunk1ReplicaKeys = chunk1Keys.filter((key) => aReplicaRoleKeys.includes(key));
+      assert.ok(chunk1ReplicaKeys.length > 0, "test setup: expected at least one replica-role key in node A's first chunk");
+
+      assert.ok(
+        client.stats().replicaWriteFailures < aReplicaRoleKeys.length,
+        `expected replicaWriteFailures (${client.stats().replicaWriteFailures}) to stay below every A-replica-role key ` +
+          `(${aReplicaRoleKeys.length}) — chunk 1's ${chunk1ReplicaKeys.length} already-stored keys must not be counted as failed`,
+      );
+      for (const key of chunk1ReplicaKeys) {
+        assert.ok(nodeA.mock.store.has(key), `expected ${key} (chunk 1, replica-role) to actually be stored on node A`);
+      }
+    } finally {
+      client.close();
       await cluster.close();
     }
   });

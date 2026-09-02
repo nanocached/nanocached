@@ -51,6 +51,8 @@ from ._errors import (
     CompressionIncompatibleError,
     ConnectionLostError,
     NanocachedError,
+    PartialConnectionLostError,
+    PartialSetConnectionLostError,
     PartialWrongNodeError,
     WrongNodeError,
 )
@@ -1169,10 +1171,20 @@ class NanocachedClient:
         Larger batches are transparently split into more than one ``m``
         sub-frame per owner, bounded by both _MAX_BATCH_KEYS and
         _MAX_REQUEST_BYTES (issue #222) — callers never need to think
-        about this. Hedged reads and read repair do not apply to
-        batches: hedging's miss sentinel and read repair both assume a
-        single value, not a partial-hit roster (Go's and TypeScript's
-        ports made the same call)."""
+        about this, except for one failure mode: in single-node/proxy
+        mode (no ring to retry against), a connection failure on one of
+        those sub-frames after an earlier one already succeeded raises
+        PartialConnectionLostError instead of a bare connection error,
+        so a mostly-successful batch's hits aren't silently discarded
+        behind one late chunk's connection loss (issue #411) — its
+        ``partial_values`` holds every key the earlier chunk(s) DID
+        resolve, and its ``__cause__`` is the original connection
+        error. A failure on the very first sub-frame has nothing yet to
+        attach, so it still raises that original exception unwrapped.
+        Hedged reads and read repair do not apply to batches: hedging's
+        miss sentinel and read repair both assume a single value, not a
+        partial-hit roster (Go's and TypeScript's ports made the same
+        call)."""
         return await self._get_many(b"", keys)
 
     async def _get_many_bytes(
@@ -1191,7 +1203,7 @@ class NanocachedClient:
         budget = [0]
 
         if self._ring is None:
-            entries, error = await self._multi_get_chunked(
+            entries, error, failed_at = await self._multi_get_chunked(
                 self._single_connection, namespace, key_bytes_list
             )
             values: dict[str | bytes, bytes] = {}
@@ -1199,6 +1211,22 @@ class NanocachedClient:
                 if isinstance(entry, (bytes, bytearray)):
                     values[original] = self._decompress_for_batch(entry, budget)
             if error is not None:
+                # issue #411: single-node/proxy mode never retries a
+                # chunk failure (no ring to refresh against — see
+                # _with_wrong_node_retry's own docstring), so a
+                # connection failure on chunk N>1 would otherwise
+                # silently discard every hit an earlier, already-
+                # succeeded chunk found. failed_at > 0 means at least
+                # one prior chunk completed; failed_at == 0 means the
+                # very first chunk failed outright, with nothing yet to
+                # attach, so the original exception still propagates
+                # unwrapped exactly as before this fix.
+                if failed_at > 0:
+                    raise PartialConnectionLostError(
+                        values,
+                        f"nanocached: get_many/get_many_bytes lost its connection after "
+                        f"{failed_at} of {len(key_bytes_list)} keys had already resolved: {error}",
+                    ) from error
                 raise error
             if any(entry is WRONG_NODE for entry in entries):
                 raise WrongNodeError()
@@ -1219,14 +1247,14 @@ class NanocachedClient:
         Namespace.get_many() — see _get()."""
         try:
             raw = await self._get_many_bytes(namespace, keys)
-        except PartialWrongNodeError as error:
+        except (PartialWrongNodeError, PartialConnectionLostError) as error:
             error.partial_values = {key: value.decode() for key, value in error.partial_values.items()}
             raise
         return {key: value.decode() for key, value in raw.items()}
 
     async def _multi_get_chunked(
         self, connection_getter, namespace: bytes, keys: list[bytes]
-    ) -> tuple[list[bytes | None | object], BaseException | None]:
+    ) -> tuple[list[bytes | None | object], BaseException | None, int]:
         """Issues one or more ``m`` sub-frames for ``keys`` — already
         grouped to one owner (or the single/proxy target) by the caller
         — splitting into chunks bounded by both _MAX_BATCH_KEYS and
@@ -1241,7 +1269,16 @@ class NanocachedClient:
         remaining keys' entries at the zero value (None — a clean miss)
         and that chunk's error is returned alongside — the caller treats
         that gap as "still needs a retry", exactly like a per-key
-        WrongNode."""
+        WrongNode.
+
+        The third element, ``failed_at`` (issue #411), is the index at
+        which the failing chunk *began* — 0 when the very first chunk
+        failed outright (nothing earlier to have succeeded), or
+        len(keys) when every chunk succeeded (error is None then). A
+        caller that wants to tell "some earlier chunk already succeeded,
+        so entries[:failed_at] is real partial data worth keeping" apart
+        from "the first chunk itself failed, so there's nothing to
+        attach" checks ``failed_at > 0``."""
         entries: list[bytes | None | object] = [None] * len(keys)
         bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
         for start, end in bounds:
@@ -1250,9 +1287,9 @@ class NanocachedClient:
                 connection = await connection_getter()
                 chunk_entries = await connection.multi_get(chunk, namespace)
             except _SWALLOWABLE_ERRORS as error:
-                return entries, error
+                return entries, error, start
             entries[start:end] = chunk_entries
-        return entries, None
+        return entries, None, len(keys)
 
     async def _multi_get_pass(
         self,
@@ -1288,7 +1325,7 @@ class NanocachedClient:
 
         async def run_group(owner: str, group_indices: list[int]) -> tuple[list[int], dict[str | bytes, bytes]]:
             group_keys = [key_bytes_list[idx] for idx in group_indices]
-            entries, error = await self._multi_get_chunked(
+            entries, error, _failed_at = await self._multi_get_chunked(
                 lambda: self._member_connection(owner), namespace, group_keys
             )
             if error is not None:
@@ -1336,7 +1373,17 @@ class NanocachedClient:
 
         Larger batches are transparently split into more than one ``o``
         sub-frame per node, bounded by both _MAX_BATCH_KEYS and
-        _MAX_REQUEST_BYTES (issue #222)."""
+        _MAX_REQUEST_BYTES (issue #222) — with one exception to the
+        "nothing partial worth attaching" rule above: in single-node/
+        proxy mode, a connection failure on one of those sub-frames
+        after an earlier one already stored its keys raises
+        PartialSetConnectionLostError instead of a bare connection
+        error (issue #411) — unlike a wrong-node retry exhausting, there
+        genuinely is something to report here, which keys were already
+        confirmed stored. Its ``partial_keys`` holds those keys, and its
+        ``__cause__`` is the original connection error. A failure on the
+        very first sub-frame has nothing yet to attach, so it still
+        raises that original exception unwrapped."""
         await self._set_many(b"", values, ttl_seconds=ttl_seconds)
 
     async def _set_many(
@@ -1349,6 +1396,7 @@ class NanocachedClient:
         if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
             raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
 
+        originals: list[str | bytes] = []
         key_bytes_list: list[bytes] = []
         value_bytes_list: list[bytes] = []
         seen: dict[bytes, str | bytes] = {}
@@ -1366,15 +1414,36 @@ class NanocachedClient:
                     f"{seen[key_bytes]!r} both encode to {key_bytes!r}"
                 )
             seen[key_bytes] = original
+            originals.append(original)
             key_bytes_list.append(key_bytes)
             value_bytes_list.append(value_bytes)
         await self._before_operation()
 
         if self._ring is None:
-            entries, error = await self._multi_set_chunked(
+            entries, error, failed_at = await self._multi_set_chunked(
                 self._single_connection, namespace, key_bytes_list, value_bytes_list, ttl_seconds
             )
             if error is not None:
+                # issue #411: single-node/proxy mode never retries a
+                # chunk failure (see the matching comment in
+                # _get_many_bytes above) — without this, a connection
+                # failure on chunk N>1 would silently discard which keys
+                # an earlier, already-succeeded chunk actually stored.
+                # failed_at == 0 means the very first chunk failed
+                # outright, with nothing stored yet to attach, so the
+                # original exception still propagates unwrapped exactly
+                # as before this fix.
+                if failed_at > 0:
+                    stored = {
+                        original
+                        for original, entry in zip(originals, entries)
+                        if entry is True
+                    }
+                    raise PartialSetConnectionLostError(
+                        stored,
+                        f"nanocached: set_many lost its connection after {failed_at} of "
+                        f"{len(key_bytes_list)} keys had already been stored: {error}",
+                    ) from error
                 raise error
             if any(entry is WRONG_NODE for entry in entries):
                 raise WrongNodeError()
@@ -1399,7 +1468,7 @@ class NanocachedClient:
         keys: list[bytes],
         values: list[bytes],
         ttl_seconds: int,
-    ) -> tuple[list[bool | object], BaseException | None]:
+    ) -> tuple[list[bool | object], BaseException | None, int]:
         """_multi_get_chunked's write-side twin: one or more ``o``
         sub-frames against ``connection_getter`` for keys/values (already
         grouped to one owner, or the single/proxy target), split into
@@ -1409,7 +1478,13 @@ class NanocachedClient:
         server's 1 MiB frame cap. Always returns len(keys) entries; a
         chunk that fails outright leaves the remaining keys' entries at
         the zero value (False) and that chunk's error is returned
-        alongside."""
+        alongside. ``failed_at`` (issue #411) is the same "where did the
+        failing chunk begin" index _multi_get_chunked's own docstring
+        describes — entries[idx] is True/WRONG_NODE for every idx <
+        failed_at (a chunk that actually completed), and the untouched
+        default False for every idx >= failed_at, so a caller can tell
+        an entry a completed chunk genuinely reported apart from one
+        never attempted, without needing failed_at at all."""
         entries: list[bool | object] = [False] * len(keys)
         bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], [len(value) for value in values])
         for start, end in bounds:
@@ -1419,9 +1494,9 @@ class NanocachedClient:
                     keys[start:end], values[start:end], ttl_seconds, namespace
                 )
             except _SWALLOWABLE_ERRORS as error:
-                return entries, error
+                return entries, error, start
             entries[start:end] = chunk_entries
-        return entries, None
+        return entries, None, len(keys)
 
     async def _multi_set_pass(
         self,
@@ -1463,23 +1538,33 @@ class NanocachedClient:
         async def run_leg(name: str, leg_indices: list[int], is_primary: list[bool]) -> list[int]:
             group_keys = [key_bytes_list[idx] for idx in leg_indices]
             group_values = [value_bytes_list[idx] for idx in leg_indices]
-            entries, error = await self._multi_set_chunked(
+            # issue #411: a leg's own o-frame can itself be chunked
+            # (issue #222) — on a connection failure, _multi_set_chunked
+            # already leaves entries[idx] as True/WRONG_NODE for every
+            # idx < failed_at (a sub-chunk that genuinely completed) and
+            # only the untouched False default beyond it, so a single
+            # failing sub-chunk no longer re-blames keys THIS SAME leg
+            # already got a real answer for — retrying an
+            # already-primary-stored key, or double-counting an
+            # already-resolved replica leg into replica_write_failures
+            # (the same class of overcounting bug fixed in the other
+            # SDKs' leg-runners). `error` itself carries no further
+            # per-key information beyond what `entries` already exposes,
+            # so it's intentionally not consulted below.
+            entries, _error, _failed_at = await self._multi_set_chunked(
                 lambda: self._member_connection(name), namespace, group_keys, group_values, ttl_seconds
             )
             leg_retry: list[int] = []
-            if error is not None:
-                for idx, primary in zip(leg_indices, is_primary):
-                    if primary:
-                        leg_retry.append(idx)
-                    else:
-                        self._replica_write_failures += 1
-                return leg_retry
             for idx, primary, entry in zip(leg_indices, is_primary, entries):
-                if not primary:
-                    if entry is WRONG_NODE:
-                        self._replica_write_failures += 1
+                if entry is True:
                     continue
-                if entry is WRONG_NODE:
+                # WRONG_NODE (a real per-key answer) or the untouched
+                # False default (this key's sub-chunk was never reached
+                # because an earlier one in this same leg failed) — both
+                # need the same "not actually stored" handling.
+                if not primary:
+                    self._replica_write_failures += 1
+                else:
                     leg_retry.append(idx)
             return leg_retry
 

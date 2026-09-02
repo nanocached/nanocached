@@ -246,7 +246,7 @@ func TestViaProxyGetManyAndSetManyRideTheSingleConnection(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 0); err != nil {
+	if _, err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 0); err != nil {
 		t.Fatalf("SetMany via proxy = %v", err)
 	}
 	if got := proxy.oCount.Load(); got != 1 {

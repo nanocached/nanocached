@@ -20,6 +20,8 @@ from nanocached import (
     NanocachedClient,
     NanocachedError,
     NotNumericError,
+    PartialConnectionLostError,
+    PartialSetConnectionLostError,
     PartialWrongNodeError,
     RetryableError,
     WrongNodeError,
@@ -5157,6 +5159,125 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_get_many_raises_partial_connection_lost_error_when_a_later_chunk_fails(self):
+        # Issue #411: get_many/get_many_bytes previously discarded an
+        # earlier, already-succeeded chunk's hits when a later chunk's
+        # own connection failure propagated — single-node/proxy mode
+        # never retries a chunk failure (no ring to refresh against), so
+        # this failure mode reaches the caller directly, and used to
+        # arrive as a bare connection error with no trace of the earlier
+        # chunk's hits.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            await client.set_many(values)
+            self.assertEqual(self.node.multi_set_count, 2)
+
+            self.node.fail_multi_get_after(1)
+            with self.assertRaises(PartialConnectionLostError) as ctx:
+                await client.get_many(list(values.keys()))
+
+            error = ctx.exception
+            self.assertEqual(self.node.multi_get_count, 2)
+            first_chunk_keys = list(values.keys())[:_MAX_BATCH_KEYS]
+            self.assertEqual(set(error.partial_values), set(first_chunk_keys))
+            for key in first_chunk_keys:
+                self.assertEqual(error.partial_values[key], values[key])
+            self.assertIsInstance(error.__cause__, ConnectionError)
+
+            # The connection was poisoned, not left desynced — a fresh
+            # call recovers cleanly.
+            self.assertEqual(await client.get_many(list(values.keys())), values)
+        finally:
+            await client.close()
+
+    async def test_get_many_bytes_partial_connection_lost_error_carries_raw_bytes(self):
+        # get_many_bytes' own companion to the test above: partial_values
+        # must carry raw bytes, not decoded str, exactly like a plain
+        # successful get_many_bytes() result would.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            await client.set_many(values)
+
+            self.node.fail_multi_get_after(1)
+            with self.assertRaises(PartialConnectionLostError) as ctx:
+                await client.get_many_bytes(list(values.keys()))
+
+            error = ctx.exception
+            first_chunk_keys = list(values.keys())[:_MAX_BATCH_KEYS]
+            self.assertEqual(set(error.partial_values), set(first_chunk_keys))
+            for key in first_chunk_keys:
+                self.assertEqual(error.partial_values[key], values[key].encode())
+        finally:
+            await client.close()
+
+    async def test_get_many_propagates_the_bare_error_when_the_first_chunk_fails(self):
+        # The other half of the #411 fix: a failure on the very first
+        # chunk has no partial data yet to attach, so it must still
+        # raise the original connection error unwrapped, exactly as
+        # before this fix — not PartialConnectionLostError.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            await client.set_many(values)
+
+            self.node.fail_multi_get_after(0)
+            with self.assertRaises(ConnectionError) as ctx:
+                await client.get_many(list(values.keys()))
+            self.assertNotIsInstance(ctx.exception, PartialConnectionLostError)
+        finally:
+            await client.close()
+
+    async def test_set_many_raises_partial_set_connection_lost_error_when_a_later_chunk_fails(self):
+        # set_many's own version of the fix above (issue #411): unlike
+        # a wrong-node retry exhausting (which has no value to report),
+        # a connection failure mid-batch DOES have something meaningful
+        # to attach — which keys an earlier, already-succeeded chunk
+        # actually stored.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            self.node.fail_multi_set_after(1)
+            with self.assertRaises(PartialSetConnectionLostError) as ctx:
+                await client.set_many(values)
+
+            error = ctx.exception
+            self.assertEqual(self.node.multi_set_count, 2)
+            first_chunk_keys = set(list(values.keys())[:_MAX_BATCH_KEYS])
+            self.assertEqual(error.partial_keys, first_chunk_keys)
+            self.assertIsInstance(error.__cause__, ConnectionError)
+
+            # The keys the failed chunk never reached are genuinely
+            # absent — only the first chunk's keys actually landed.
+            stored = await client.get_many(list(first_chunk_keys))
+            self.assertEqual(stored, {k: values[k] for k in first_chunk_keys})
+            last_key = list(values.keys())[_MAX_BATCH_KEYS]
+            self.assertNotIn(last_key, await client.get_many_bytes([last_key]))
+        finally:
+            await client.close()
+
+    async def test_set_many_propagates_the_bare_error_when_the_first_chunk_fails(self):
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        client = await self.connect()
+        try:
+            values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS + 1)}
+            self.node.fail_multi_set_after(0)
+            with self.assertRaises(ConnectionError) as ctx:
+                await client.set_many(values)
+            self.assertNotIsInstance(ctx.exception, PartialSetConnectionLostError)
+        finally:
+            await client.close()
+
     async def test_a_multi_get_reply_over_the_cumulative_bytes_bound_is_rejected_as_a_desync(self):
         # Issue #207 (follow-up to #179's Java fix, PR #201): each
         # individual entry's declared length is already capped at
@@ -5373,6 +5494,47 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 # The other key was still stored — a batch never fails as
                 # a whole.
                 self.assertEqual(await client.get_many([other]), {other: "v2"})
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_leg_chunk_failure_does_not_overcount_already_succeeded_keys(self):
+        # Issue #411 (cluster-mode sibling of the single-node partial-
+        # write fix above): a leg's own o-frame can itself be chunked
+        # (issue #222) when it holds more than _MAX_BATCH_KEYS keys —
+        # replication=2 on this 2-node cluster means every key's owner
+        # list is both nodes, so each node's leg holds every key. A
+        # connection failure on that leg's second sub-frame must not
+        # re-blame the keys the first sub-frame already resolved: not by
+        # retrying an already-primary-stored key, and not by
+        # double-counting an already-resolved replica key into
+        # replica_write_failures — the same class of overcounting bug
+        # already fixed in the other SDKs' leg-runners.
+        from nanocached.client import _MAX_BATCH_KEYS
+
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                keys = [f"key-{i}" for i in range(_MAX_BATCH_KEYS + 1)]
+                values = {key: f"v{i}" for i, key in enumerate(keys)}
+
+                nodes[NAMES[1]].fail_multi_set_after(1)
+                await client.set_many(values)  # must not raise
+
+                self.assertGreaterEqual(nodes[NAMES[1]].multi_set_count, 2)
+                # Before the fix, every key this leg holds in a replica
+                # role (roughly half of _MAX_BATCH_KEYS + 1) would have
+                # been double-counted as a replica failure even though
+                # the first sub-frame already stored them — only the
+                # single key the failing sub-frame actually held can
+                # legitimately count here, and only if this leg wasn't
+                # that key's primary.
+                self.assertLessEqual(client.stats().replica_write_failures, 1)
+                self.assertEqual(await client.get_many(keys), values)
             finally:
                 await client.close()
         finally:

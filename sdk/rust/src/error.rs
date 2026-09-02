@@ -103,6 +103,34 @@ pub enum Error {
     /// [`Self::PartialWrongNode`]'s own map has been decoded the same
     /// way a successful `get_many` decodes `get_many_bytes`' own result.
     PartialWrongNodeText(HashMap<String, String>),
+    /// issue #411 — `get_many`/`get_many_bytes`, single-node/proxy mode
+    /// only: a chunked batch (issue #222) split into more than one `m`
+    /// sub-frame, and a connection failure on chunk N>1 — after the
+    /// SDK's own transparent reconnect-and-retry for that chunk
+    /// (`apply_reconnecting`) also failed — aborted the batch. Carries
+    /// every key that DID resolve from the chunk(s) that landed before
+    /// the failure, plus the underlying connection error, rather than
+    /// discarding those results and surfacing a bare connection error
+    /// that would wrongly imply nothing was read at all. Mirrors
+    /// [`Self::PartialWrongNode`]'s shape. Never raised when the very
+    /// first chunk fails — there is no partial data yet, so the plain
+    /// underlying error propagates instead, exactly as before this
+    /// issue.
+    PartialConnectionLost(HashMap<String, Vec<u8>>, Box<Error>),
+    /// As [`Self::PartialConnectionLost`], but returned by `get_many` —
+    /// the UTF-8-decoded counterpart (see [`Self::PartialWrongNodeText`]).
+    PartialConnectionLostText(HashMap<String, String>, Box<Error>),
+    /// issue #411 — `set_many`/`set_many_bytes`' write-side analogue of
+    /// [`Self::PartialConnectionLost`] (single-node/proxy mode only): a
+    /// chunked batch's connection was lost on chunk N>1 after the SDK's
+    /// own reconnect-and-retry for that chunk also failed. Unlike
+    /// [`Self::WrongNode`] (which `set_many`/`set_many_bytes` return
+    /// plain, with nothing to attach, since a successful set has no
+    /// value to return), this condition DOES have something meaningful
+    /// to report: carries every key confirmed stored by the chunk(s)
+    /// that landed before the failure, plus the underlying connection
+    /// error.
+    PartialConnectionLostKeys(std::collections::HashSet<String>, Box<Error>),
 }
 
 impl fmt::Display for Error {
@@ -139,6 +167,17 @@ impl fmt::Display for Error {
                 f,
                 "nanocached: some keys in this batch are still wrong-node after a refresh-and-retry"
             ),
+            Error::PartialConnectionLost(_, cause)
+            | Error::PartialConnectionLostText(_, cause) => write!(
+                f,
+                "nanocached: connection lost partway through a chunked batch, after some \
+                 chunks already succeeded: {cause}"
+            ),
+            Error::PartialConnectionLostKeys(_, cause) => write!(
+                f,
+                "nanocached: connection lost partway through a chunked batch, after some \
+                 keys were already stored: {cause}"
+            ),
         }
     }
 }
@@ -147,6 +186,9 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::InvalidUtf8(error) => Some(error),
+            Error::PartialConnectionLost(_, cause)
+            | Error::PartialConnectionLostText(_, cause)
+            | Error::PartialConnectionLostKeys(_, cause) => Some(cause.as_ref()),
             _ => None,
         }
     }

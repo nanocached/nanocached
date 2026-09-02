@@ -197,7 +197,16 @@ is logged-and-swallowed into `stats().replica_write_failures`, exactly
 like a plain `set`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
-sub-frame per owner — callers never need to think about this.
+sub-frame per owner — callers never need to think about this. In
+single-node/proxy mode, if the connection is lost partway through a
+multi-sub-frame batch — after at least one sub-frame already
+succeeded, and the SDK's own built-in reconnect-and-retry for the
+failing one also fails — the results already resolved aren't
+discarded: `get_many`/`get_many_bytes` return
+`Err(Error::PartialConnectionLostText(partial, cause))`/`Err(Error::PartialConnectionLost(partial, cause))`,
+and `set_many`/`set_many_bytes` return
+`Err(Error::PartialConnectionLostKeys(succeeded_keys, cause))` — each
+carrying the underlying connection error as `cause`.
 
 ## Compare-and-set
 

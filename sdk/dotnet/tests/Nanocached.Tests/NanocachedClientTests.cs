@@ -1251,6 +1251,141 @@ public class NanocachedClientTests
         Assert.Equal(expected, result);
     }
 
+    [Fact]
+    public async Task GetManyBytesAsyncThrowsPartialConnectionLostExceptionWhenALaterChunkFailsAfterAnEarlierOneSucceeded()
+    {
+        // Regression for issue #411: MultiGetChunkedAsync used to let a
+        // later chunk's connection failure (surviving the SDK's own
+        // built-in reconnect-and-retry, ApplyReconnectingAsync) fault the
+        // whole call, silently discarding whatever earlier chunks had
+        // already resolved. Two ~600 KB keys force exactly two `m`
+        // sub-frames (same sizing as GetManyAsyncSplitsByCumulativeBytesForLargeKeys
+        // above); the first sub-frame (key0) succeeds, and the second
+        // (key1) fails at the connection level on BOTH its original
+        // attempt and the built-in redial's retry, so the failure actually
+        // escapes instead of being transparently absorbed.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        var rng = new Random(411);
+        string MakeKey(int i)
+        {
+            var keyBytes = new byte[600_000];
+            rng.NextBytes(keyBytes);
+            for (int b = 0; b < keyBytes.Length; b++) keyBytes[b] = (byte)(keyBytes[b] & 0x7F);
+            return $"k{i}-" + Encoding.ASCII.GetString(keyBytes);
+        }
+        string key0 = MakeKey(0);
+        string key1 = MakeKey(1);
+        await client.SetAsync(key0, "v0");
+        await client.SetAsync(key1, "v1");
+
+        node.FailMultiGetFromRequestOnward(2);
+
+        PartialConnectionLostException<Dictionary<string, byte[]>> error =
+            await Assert.ThrowsAsync<PartialConnectionLostException<Dictionary<string, byte[]>>>(
+                () => client.GetManyBytesAsync(new[] { key0, key1 }));
+
+        Assert.True(
+            node.MultiGetRequestCount >= 3,
+            $"expected chunk 2's original attempt plus its redial retry (>= 3 total `m` requests), got {node.MultiGetRequestCount}");
+        // The exact opposite of a bare exception implying total failure:
+        // key0's chunk really did succeed, and that must survive.
+        Assert.Single(error.PartialValues);
+        Assert.Equal(Encoding.UTF8.GetBytes("v0"), error.PartialValues[key0]);
+        Assert.False(error.PartialValues.ContainsKey(key1));
+        Assert.IsType<ConnectionLostException>(error.InnerException);
+    }
+
+    [Fact]
+    public async Task SetManyBytesAsyncThrowsPartialConnectionLostExceptionWhenALaterChunkFailsAfterAnEarlierOneSucceeded()
+    {
+        // SetMany counterpart to the GetMany regression above. Two ~600 KB
+        // values force exactly two `o` sub-frames (same sizing as
+        // SetManyBytesAsyncSplitsByCumulativeBytesWhenIndividuallyValidPairsSumPastTheCap
+        // above, with 2 items instead of 3 so the split is deterministic);
+        // the first sub-frame (k0) is actually stored before the second
+        // (k1) fails at the connection level on both its original attempt
+        // and the built-in redial's retry.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        var rng = new Random(411);
+        var value0 = new byte[600_000];
+        var value1 = new byte[600_000];
+        rng.NextBytes(value0);
+        rng.NextBytes(value1);
+        var values = new Dictionary<string, byte[]> { ["k0"] = value0, ["k1"] = value1 };
+
+        node.FailMultiSetFromRequestOnward(2);
+
+        PartialConnectionLostException<HashSet<string>> error =
+            await Assert.ThrowsAsync<PartialConnectionLostException<HashSet<string>>>(
+                () => client.SetManyBytesAsync(values));
+
+        Assert.True(
+            node.MultiSetRequestCount >= 3,
+            $"expected chunk 2's original attempt plus its redial retry (>= 3 total `o` requests), got {node.MultiSetRequestCount}");
+        // The exact opposite of a bare exception implying total failure:
+        // k0's chunk really did land on the server, and that must survive.
+        Assert.Single(error.PartialValues);
+        Assert.Contains("k0", error.PartialValues);
+        Assert.DoesNotContain("k1", error.PartialValues);
+        Assert.IsType<ConnectionLostException>(error.InnerException);
+        Assert.True(node.Store.ContainsKey(MockNode.KeyOf(Bytes("k0"))));
+        Assert.False(node.Store.ContainsKey(MockNode.KeyOf(Bytes("k1"))));
+    }
+
+    [Fact]
+    public async Task SetManyBytesAsyncClusterLegDoesNotOvercountReplicaWriteFailuresWhenALaterChunkFailsAfterAnEarlierOneSucceeded()
+    {
+        // Regression for issue #411's cluster-mode counterpart:
+        // RunMultiSetLegAsync used to treat a whole leg's connection
+        // failure as EVERY key in that leg failing — for both the retry
+        // list (primary-held keys) and ReplicaWriteFailures
+        // (replica-held keys) — even when an earlier chunk of that SAME
+        // leg had already completed. Two ~600 KB values that both
+        // replicate onto the same node force that node's leg into two `o`
+        // sub-frames; the first (key0) actually lands, and only the
+        // second (key1) fails at the connection level (on both its
+        // original attempt and the built-in redial's retry). Before this
+        // fix, ReplicaWriteFailures would count 2 (both keys); the fix
+        // must count only 1 (just key1, the one that genuinely failed).
+        using Cluster cluster = StartCluster(replication: 2);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+
+        string replicaName = Names[1];
+        var keys = new List<string>();
+        for (int i = 0; keys.Count < 2; i++)
+        {
+            Assert.True(i < 10_000, $"could not find 2 keys replicating onto {replicaName}");
+            string candidate = $"leg-key-{i}";
+            if (OwnersOf(candidate)[1] == replicaName) keys.Add(candidate);
+        }
+        string key0 = keys[0], key1 = keys[1];
+
+        var rng = new Random(411);
+        var value0 = new byte[600_000];
+        var value1 = new byte[600_000];
+        rng.NextBytes(value0);
+        rng.NextBytes(value1);
+        var values = new Dictionary<string, byte[]> { [key0] = value0, [key1] = value1 };
+
+        MockNode replicaNode = cluster.Nodes[replicaName];
+        replicaNode.FailMultiSetFromRequestOnward(2);
+
+        // Both keys' primaries are healthy, so — mirroring
+        // ADeadReplicaDoesNotFailWrites' own stance that a dead/failing
+        // replica never fails a write — the batch as a whole succeeds
+        // despite the replica leg's mid-batch connection failure.
+        await client.SetManyBytesAsync(values);
+
+        Assert.Equal(1, client.Stats().ReplicaWriteFailures);
+        Assert.True(replicaNode.Store.ContainsKey(MockNode.KeyOf(Bytes(key0))));
+        Assert.False(replicaNode.Store.ContainsKey(MockNode.KeyOf(Bytes(key1))));
+    }
+
     // ── クラスタと複製 ────────────────────────────────────────────
 
     private sealed record Cluster(

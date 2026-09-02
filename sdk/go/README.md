@@ -282,7 +282,8 @@ frames) fetch or store several keys in one round trip per owner instead
 of one round trip per key:
 
 ```go
-err = client.SetMany(map[string]string{"a": "1", "b": "2"}, 0) // shared ttlSeconds for the whole batch
+stored, err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 0) // shared ttlSeconds for the whole batch
+// stored == map[string]bool{"a": true, "b": true} on full success
 values, err := client.GetMany([]string{"a", "b", "missing"})
 // values == map[string]string{"a": "1", "b": "2"} — "missing" is simply absent
 ```
@@ -297,10 +298,14 @@ if some keys are still routed to the wrong node after one bounded
 refresh-and-retry (the same policy `Get`/`Set` apply per key, not
 per call), `GetManyBytes` returns the partial map together with
 `ErrWrongNode` rather than discarding a mostly-successful batch, and
-`SetManyBytes` returns `ErrWrongNode` while every other key in the
-batch was still stored. In single-node/proxy mode a `W` propagates
-immediately, exactly like `Get`/`Set`'s own single-mode behavior — there
-is no ring to refresh against.
+`SetManyBytes` returns the map of every key actually confirmed stored
+together with `ErrWrongNode` — every other key in the batch was still
+stored. This also covers a connection failure partway through a
+chunked batch (see below): the returned map always reflects exactly
+what was actually persisted in that call, so a non-nil error never
+means "assume nothing was written". In single-node/proxy mode a `W`
+propagates immediately, exactly like `Get`/`Set`'s own single-mode
+behavior — there is no ring to refresh against.
 
 Within one `SetMany`/`SetManyBytes` batch, the same node can be one
 key's primary and another key's replica at once; it receives exactly

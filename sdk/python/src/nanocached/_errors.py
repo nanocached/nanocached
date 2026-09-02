@@ -120,6 +120,62 @@ class ConnectionLostError(NanocachedError, ConnectionError):
         super().__init__(message)
 
 
+class PartialConnectionLostError(NanocachedError, ConnectionError):
+    """Raised by get_many/get_many_bytes (issue #411) when a batch spans
+    more than one ``m`` sub-frame (batch chunking, issue #222) and a
+    later chunk's connection failure escapes without being retried — in
+    single-node/proxy mode there is no ring to refresh against and retry
+    from (mirroring WrongNodeError's own single-mode stance), so this is
+    only ever raised there — after at least one earlier chunk already
+    succeeded over the same connection. Mirrors PartialWrongNodeError's
+    shape for this related but distinct failure mode: ``partial_values``
+    holds every key that DID resolve from the chunk(s) that succeeded
+    before the failure, keyed by the original object the caller passed,
+    so a mostly-successful batch's data isn't discarded behind one late
+    chunk's connection error.
+
+    Same multiple-inheritance shape as ConnectionLostError above
+    (NanocachedError, ConnectionError) rather than subclassing it: the
+    exception that actually escapes a failing chunk is not always a
+    ConnectionLostError specifically (issue #225's narrower "the request
+    may have already reached the server" case) — it may just as well be
+    a plain builtin ConnectionError/OSError (e.g. the chunk's connection
+    was already dead, or the redial for a later chunk itself failed) —
+    raised with ``from`` the original error either way, so it's always
+    reachable via ``__cause__``.
+
+    Only raised when a chunk *after* the first has already succeeded; a
+    failure on the very first chunk has no partial data to attach and
+    still raises that original exception unwrapped, exactly as before
+    this fix. get_many()'s own PartialConnectionLostError carries str
+    values (UTF-8 decoded); get_many_bytes() carries the raw bytes."""
+
+    def __init__(self, partial_values: dict, message: str) -> None:
+        super().__init__(message)
+        self.partial_values = partial_values
+
+
+class PartialSetConnectionLostError(NanocachedError, ConnectionError):
+    """set_many's analog of PartialConnectionLostError above (issue
+    #411): unlike PartialWrongNodeError's write-side sibling — a plain
+    WrongNodeError, since a successful set() has no value to report —
+    THIS condition does have something meaningful to attach: which keys
+    were already confirmed stored (by a chunk whose ``o`` sub-frame
+    completed) before a later chunk's connection failure escaped,
+    single-node/proxy mode only, exactly like PartialConnectionLostError
+    (there is no ring to refresh against and retry from). ``partial_keys``
+    holds every key the batch DID store, as the original object the
+    caller passed — not a dict, since a successful set carries no value
+    worth returning, only the fact that it landed. Same rule as its read
+    sibling: a failure on the very first chunk has nothing to attach and
+    still raises the original exception unwrapped; the original error is
+    always reachable via ``__cause__``."""
+
+    def __init__(self, partial_keys: set, message: str) -> None:
+        super().__init__(message)
+        self.partial_keys = partial_keys
+
+
 class RetryableError(NanocachedError):
     """A single request was answered ``R`` (issue #125) three times
     running — the connection's bounded transient-retry budget (2 retries,

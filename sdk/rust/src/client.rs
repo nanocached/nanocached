@@ -1782,6 +1782,9 @@ impl NanocachedClient {
             Err(Error::PartialWrongNode(partial)) => {
                 Err(Error::PartialWrongNodeText(decode_many(partial)?))
             }
+            Err(Error::PartialConnectionLost(partial, cause)) => Err(
+                Error::PartialConnectionLostText(decode_many(partial)?, cause),
+            ),
             Err(other) => Err(other),
         }
     }
@@ -1840,29 +1843,35 @@ impl NanocachedClient {
 
         let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
         if single {
-            let entries = self.multi_get_chunked(None, namespace, &key_bytes).await?;
-            let mut wrong_node = false;
-            for (i, entry) in entries.into_iter().enumerate() {
-                match entry {
-                    MultiEntry::Hit(value) => {
-                        values.insert(
-                            key_strings[i].to_string(),
-                            Self::decompress_for_batch(
-                                self.inner.compress,
-                                value,
-                                &budget,
-                                MAX_MULTIGET_DECOMPRESSED_BYTES,
-                            )?,
-                        );
+            match self.multi_get_chunked(None, namespace, &key_bytes).await {
+                Ok(entries) => {
+                    let wrong_node =
+                        self.splice_multi_get_entries(entries, &key_strings, &mut values, &budget)?;
+                    if wrong_node {
+                        return Err(Error::PartialWrongNode(values));
                     }
-                    MultiEntry::WrongNode => wrong_node = true,
-                    MultiEntry::Miss | MultiEntry::Stored => {}
+                    return Ok(values);
+                }
+                // Issue #411: a connection failure mid-chunk, after the
+                // built-in reconnect-and-retry (apply_reconnecting)
+                // already failed once. `partial_entries` is empty when
+                // the very first chunk failed — nothing resolved yet, so
+                // the plain underlying error propagates exactly as
+                // before. Once at least one chunk landed, surface what
+                // it resolved instead of discarding it.
+                Err((partial_entries, error)) => {
+                    if partial_entries.is_empty() {
+                        return Err(error);
+                    }
+                    self.splice_multi_get_entries(
+                        partial_entries,
+                        &key_strings,
+                        &mut values,
+                        &budget,
+                    )?;
+                    return Err(Error::PartialConnectionLost(values, Box::new(error)));
                 }
             }
-            if wrong_node {
-                return Err(Error::PartialWrongNode(values));
-            }
-            return Ok(values);
         }
 
         let indices: Vec<usize> = (0..key_strings.len()).collect();
@@ -1930,6 +1939,44 @@ impl NanocachedClient {
         Ok(value)
     }
 
+    /// Splices a (possibly partial) run of `multi_get_chunked`'s entries
+    /// into `values`, decompressing hits through
+    /// [`Self::decompress_for_batch`] — shared by both the full-success
+    /// and issue #411 partial-connection-failure paths of
+    /// [`Self::get_many_bytes_in`]'s single-node/proxy-mode branch, so a
+    /// mid-batch connection failure decodes exactly the same way a
+    /// fully successful batch does. `key_strings` must have at least
+    /// `entries.len()` elements, in the same order `entries` was
+    /// produced (`multi_get_chunked` never reorders keys). Returns
+    /// whether any entry was wrong-node.
+    fn splice_multi_get_entries(
+        &self,
+        entries: Vec<MultiEntry>,
+        key_strings: &[&str],
+        values: &mut HashMap<String, Vec<u8>>,
+        budget: &AtomicU64,
+    ) -> Result<bool> {
+        let mut wrong_node = false;
+        for (i, entry) in entries.into_iter().enumerate() {
+            match entry {
+                MultiEntry::Hit(value) => {
+                    values.insert(
+                        key_strings[i].to_string(),
+                        Self::decompress_for_batch(
+                            self.inner.compress,
+                            value,
+                            budget,
+                            MAX_MULTIGET_DECOMPRESSED_BYTES,
+                        )?,
+                    );
+                }
+                MultiEntry::WrongNode => wrong_node = true,
+                MultiEntry::Miss | MultiEntry::Stored => {}
+            }
+        }
+        Ok(wrong_node)
+    }
+
     /// Issues one or more `m` sub-frames against `slot`'s connection
     /// (`None` for the single/proxy target) — already grouped to one
     /// owner by the caller — splitting into chunks bounded by both
@@ -1938,12 +1985,21 @@ impl NanocachedClient {
     /// wire's header bound or the server's `MAX_REQUEST_SIZE` (a batch of
     /// individually valid keys that would sum past it is split into more
     /// sub-frames instead).
+    ///
+    /// Issue #411: on `Ok`, every key resolved. On `Err`, the tuple's
+    /// first element is every entry from the chunk(s) that landed
+    /// *before* the one that failed — always a prefix of `keys`, since
+    /// chunks are issued strictly in order — so a caller with a
+    /// partial-result carrier to fill (single-node/proxy-mode
+    /// `get_many_bytes_in`/`set_many_bytes_in`, and the cluster-mode leg
+    /// runners) can still report what those chunks already resolved
+    /// instead of discarding it.
     async fn multi_get_chunked(
         &self,
         slot: Option<&str>,
         namespace: &[u8],
         keys: &[Vec<u8>],
-    ) -> Result<Vec<MultiEntry>> {
+    ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
         let mut entries = Vec::with_capacity(keys.len());
         let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
         let mut start = 0;
@@ -1953,8 +2009,10 @@ impl NanocachedClient {
             let op = |connection: Arc<Connection>| async move {
                 connection.multi_get(namespace, chunk).await
             };
-            let chunk_entries = self.apply_reconnecting(slot, &op).await?;
-            entries.extend(chunk_entries);
+            match self.apply_reconnecting(slot, &op).await {
+                Ok(chunk_entries) => entries.extend(chunk_entries),
+                Err(error) => return Err((entries, error)),
+            }
         }
         Ok(entries)
     }
@@ -2015,16 +2073,17 @@ impl NanocachedClient {
 
     /// One owner group's `m` exchange, run concurrently with every other
     /// group by [`Self::multi_get_pass`]: a connection-level failure
-    /// retries the whole group (indistinguishable from a
-    /// possibly-idle-closed connection, same stance
-    /// [`Self::apply_reconnecting`]'s own callers take elsewhere); a
-    /// per-key `W` retries just that key; a hit is returned for the
-    /// caller to splice into `values` once every group has finished (a
-    /// client-side `compress` mismatch propagates, aborting the batch
-    /// immediately — never fed into the retry pass, since it isn't a
-    /// routing outcome). Returns `(retry indices, decoded hits)` rather
-    /// than mutating shared state directly, since every group runs
-    /// concurrently with the others.
+    /// retries whatever chunk(s) of the group didn't get a response —
+    /// same stance [`Self::apply_reconnecting`]'s own callers take
+    /// elsewhere, just scoped to the unresolved tail rather than the
+    /// whole group since issue #411's `multi_get_chunked` now reports
+    /// which chunk(s) landed before the failure; a per-key `W` retries
+    /// just that key; a hit is returned for the caller to splice into
+    /// `values` once every group has finished (a client-side `compress`
+    /// mismatch propagates, aborting the batch immediately — never fed
+    /// into the retry pass, since it isn't a routing outcome). Returns
+    /// `(retry indices, decoded hits)` rather than mutating shared state
+    /// directly, since every group runs concurrently with the others.
     async fn run_multi_get_leg(
         &self,
         namespace: &[u8],
@@ -2038,13 +2097,14 @@ impl NanocachedClient {
             .iter()
             .map(|&i| key_bytes[i].clone())
             .collect();
-        let entries = match self
+        let (entries, tail_failed) = match self
             .multi_get_chunked(Some(owner), namespace, &group_keys)
             .await
         {
-            Ok(entries) => entries,
-            Err(_connection_failure) => return Ok((group_indices.to_vec(), Vec::new())),
+            Ok(entries) => (entries, false),
+            Err((partial_entries, _connection_failure)) => (partial_entries, true),
         };
+        let resolved = entries.len();
 
         let mut retry = Vec::new();
         let mut hits = Vec::new();
@@ -2064,6 +2124,9 @@ impl NanocachedClient {
                 }
                 MultiEntry::Miss | MultiEntry::Stored => {}
             }
+        }
+        if tail_failed {
+            retry.extend_from_slice(&group_indices[resolved..]);
         }
         Ok((retry, hits))
     }
@@ -2151,16 +2214,42 @@ impl NanocachedClient {
 
         let single = matches!(self.inner.state.lock().await.target, Target::Single { .. });
         if single {
-            let entries = self
+            match self
                 .multi_set_chunked(None, namespace, &key_bytes, &value_bytes, ttl_seconds)
-                .await?;
-            if entries
-                .iter()
-                .any(|entry| matches!(entry, MultiEntry::WrongNode))
+                .await
             {
-                return Err(Error::WrongNode);
+                Ok(entries) => {
+                    if entries
+                        .iter()
+                        .any(|entry| matches!(entry, MultiEntry::WrongNode))
+                    {
+                        return Err(Error::WrongNode);
+                    }
+                    return Ok(());
+                }
+                // Issue #411: a connection failure mid-chunk, after the
+                // built-in reconnect-and-retry already failed once.
+                // `partial_entries` is empty when the very first chunk
+                // failed — nothing stored yet, so the plain underlying
+                // error propagates exactly as before. Once at least one
+                // chunk landed, surface which keys it actually stored
+                // instead of discarding that.
+                Err((partial_entries, error)) => {
+                    if partial_entries.is_empty() {
+                        return Err(error);
+                    }
+                    let succeeded: std::collections::HashSet<String> = partial_entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| matches!(entry, MultiEntry::Stored))
+                        .map(|(i, _)| {
+                            String::from_utf8(key_bytes[i].clone())
+                                .expect("key bytes were validated as UTF-8 in this method")
+                        })
+                        .collect();
+                    return Err(Error::PartialConnectionLostKeys(succeeded, Box::new(error)));
+                }
             }
-            return Ok(());
         }
 
         let indices: Vec<usize> = (0..key_bytes.len()).collect();
@@ -2192,6 +2281,10 @@ impl NanocachedClient {
     /// outright, while the cluster fan-out (`multi_set_pass`) passes
     /// `Arc<[u8]>`s shared across every owner a key was replicated to —
     /// this doesn't care which, it only ever needs `&[u8]`.
+    ///
+    /// Issue #411: same partial-on-error contract as
+    /// [`Self::multi_get_chunked`] — `Err`'s first element is every
+    /// entry from the chunk(s) that landed before the one that failed.
     async fn multi_set_chunked<B: AsRef<[u8]>>(
         &self,
         slot: Option<&str>,
@@ -2199,7 +2292,7 @@ impl NanocachedClient {
         keys: &[B],
         values: &[B],
         ttl_seconds: u64,
-    ) -> Result<Vec<MultiEntry>> {
+    ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
         let mut entries = Vec::with_capacity(keys.len());
         let lengths = chunk_lengths(namespace.len(), keys.len(), |i| {
             set_entry_cost(keys[i].as_ref(), values[i].as_ref())
@@ -2214,8 +2307,10 @@ impl NanocachedClient {
                     .multi_set(namespace, key_chunk, value_chunk, ttl_seconds)
                     .await
             };
-            let chunk_entries = self.apply_reconnecting(slot, &op).await?;
-            entries.extend(chunk_entries);
+            match self.apply_reconnecting(slot, &op).await {
+                Ok(chunk_entries) => entries.extend(chunk_entries),
+                Err(error) => return Err((entries, error)),
+            }
         }
         Ok(entries)
     }
@@ -2315,16 +2410,59 @@ impl NanocachedClient {
         retry
     }
 
+    /// Applies one `multi_set_chunked` entry's outcome for one key in a
+    /// leg: only a primary-held wrong-node key is pushed onto `retry`;
+    /// a replica-held key's wrong-node (or, from
+    /// [`Self::run_multi_set_leg`]'s unresolved-tail path, outright
+    /// connection failure) is instead counted into
+    /// `stats().replica_write_failures`, mirroring [`Self::write`]'s own
+    /// stance for single-key set. Factored out so both the
+    /// fully-resolved and (issue #411) partially-resolved paths of
+    /// `run_multi_set_leg` apply the exact same rule to a chunk that DID
+    /// get a response — the fix for #411's stats-overcount report is
+    /// precisely that a chunk which already succeeded must go through
+    /// this, not through the unresolved-tail's blanket "count everything
+    /// as failed" branch.
+    fn apply_multi_set_leg_entry(
+        &self,
+        idx: usize,
+        is_primary: bool,
+        entry: &MultiEntry,
+        retry: &mut Vec<usize>,
+    ) {
+        let wrong_node = matches!(entry, MultiEntry::WrongNode);
+        if !is_primary {
+            if wrong_node {
+                self.inner
+                    .stats
+                    .replica_write_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        if wrong_node {
+            retry.push(idx);
+        }
+    }
+
     /// Dispatches one owner's `o` sub-batch (via
     /// [`Self::multi_set_chunked`]) and returns the indices that need
     /// retrying: only primary-held keys can end up in the returned list;
     /// every replica-held key's failure or `W` is counted in
     /// `stats().replica_write_failures` instead, mirroring
-    /// [`Self::write`]'s own stance for single-key set. A
-    /// connection-level failure for the whole leg is treated the same
-    /// way, key by key, since the SAME sub-frame can carry both primary-
-    /// and replica-held keys and a transport failure doesn't distinguish
-    /// between them.
+    /// [`Self::write`]'s own stance for single-key set.
+    ///
+    /// Issue #411: a connection-level failure only affects the chunk(s)
+    /// that never got a response — `multi_set_chunked`'s `Err` carries
+    /// every entry from the chunk(s) that landed first, and those go
+    /// through the exact same [`Self::apply_multi_set_leg_entry`] rule
+    /// the fully-resolved path uses. Only the unresolved tail is treated
+    /// key-by-key as an outright failure (a connection-level failure
+    /// doesn't distinguish primary- from replica-held keys within the
+    /// SAME sub-frame). Before this fix, ANY chunk failing counted the
+    /// whole leg — including keys an earlier chunk had already stored —
+    /// as failed, double-counting `stats().replica_write_failures` and
+    /// needlessly retrying already-stored primary keys.
     async fn run_multi_set_leg(
         &self,
         namespace: &[u8],
@@ -2345,25 +2483,22 @@ impl NanocachedClient {
         {
             Ok(entries) => {
                 for ((&idx, &is_primary), entry) in
-                    batch.indices.iter().zip(&batch.is_primary).zip(entries)
+                    batch.indices.iter().zip(&batch.is_primary).zip(&entries)
                 {
-                    let wrong_node = matches!(entry, MultiEntry::WrongNode);
-                    if !is_primary {
-                        if wrong_node {
-                            self.inner
-                                .stats
-                                .replica_write_failures
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        continue;
-                    }
-                    if wrong_node {
-                        retry.push(idx);
-                    }
+                    self.apply_multi_set_leg_entry(idx, is_primary, entry, &mut retry);
                 }
             }
-            Err(_connection_failure) => {
-                for i in 0..batch.indices.len() {
+            Err((partial_entries, _connection_failure)) => {
+                let resolved = partial_entries.len();
+                for ((&idx, &is_primary), entry) in batch
+                    .indices
+                    .iter()
+                    .zip(&batch.is_primary)
+                    .zip(&partial_entries)
+                {
+                    self.apply_multi_set_leg_entry(idx, is_primary, entry, &mut retry);
+                }
+                for i in resolved..batch.indices.len() {
                     if batch.is_primary[i] {
                         retry.push(batch.indices[i]);
                     } else {
@@ -3230,6 +3365,15 @@ impl NanocachedClient {
     /// task instead of being awaited below — past that cap, further legs
     /// fall back to the synchronous path exactly as with the option off.
     ///
+    /// Issue #424: the synchronous path (`fire_and_forget_replicas` off,
+    /// or the background-replica permit pool exhausted) fans every leg
+    /// out concurrently with `join_all`, matching
+    /// [`Self::clear_fanout_once`]'s own N-node fan-out — a write at
+    /// replication factor R pays `max()` of one round trip beyond the
+    /// primary, not R-1 sequential ones. Per-leg error/stat handling is
+    /// unchanged: each leg's own `apply_reconnecting` outcome still
+    /// counts into `stats().replica_write_failures` independently.
+    ///
     /// Shared between `write` (called concurrently with the primary leg,
     /// since `set`/`delete` are idempotent and safe to replay regardless
     /// of the primary's own outcome) and `incr_once` (issue #129, called
@@ -3244,6 +3388,11 @@ impl NanocachedClient {
         replicas: &[String],
         body: WriteBody<'_>,
     ) {
+        // Names that end up needing the synchronous path this call
+        // (fire-and-forget off, or its permit pool was exhausted this
+        // time) — collected instead of awaited inline in the loop below
+        // so they can be fanned out concurrently afterward (issue #424).
+        let mut sync_names: Vec<&str> = Vec::new();
         for name in replicas {
             if self.inner.fire_and_forget_replicas {
                 if let Ok(permit) =
@@ -3306,18 +3455,31 @@ impl NanocachedClient {
                     }
                 }
             }
-            let op = |connection: Arc<Connection>| {
-                let body = &body;
-                async move {
-                    match body {
-                        WriteBody::Set { value, ttl_seconds } => {
-                            connection.set(namespace, key, value, *ttl_seconds).await
-                        }
-                        WriteBody::Delete => connection.delete(namespace, key).await.map(|_| ()),
+            sync_names.push(name.as_str());
+        }
+
+        if sync_names.is_empty() {
+            return;
+        }
+        let op = |connection: Arc<Connection>| {
+            let body = &body;
+            async move {
+                match body {
+                    WriteBody::Set { value, ttl_seconds } => {
+                        connection.set(namespace, key, value, *ttl_seconds).await
                     }
+                    WriteBody::Delete => connection.delete(namespace, key).await.map(|_| ()),
                 }
-            };
-            if self.apply_reconnecting(Some(name), &op).await.is_err() {
+            }
+        };
+        let outcomes = futures_util::future::join_all(
+            sync_names
+                .iter()
+                .map(|&name| self.apply_reconnecting(Some(name), &op)),
+        )
+        .await;
+        for outcome in outcomes {
+            if outcome.is_err() {
                 self.inner
                     .stats
                     .replica_write_failures

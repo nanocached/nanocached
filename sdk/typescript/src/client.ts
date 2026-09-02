@@ -73,6 +73,38 @@ export class PartialWrongNodeError<T = unknown> extends WrongNodeError {
   }
 }
 
+/** Thrown by getMany/getManyBytes/setMany/setManyBytes (issue #411) when a
+ * batch spans more than one `m`/`o` sub-frame (batch chunking, see
+ * MAX_BATCH_KEYS/MAX_REQUEST_BYTES/`nextChunkEnd`) and the connection dies
+ * partway through — on chunk 2 or later, after at least one earlier chunk
+ * already succeeded. Without this, that earlier success was silently
+ * discarded: the bare `ConnectionLostError` (or raw Node socket error)
+ * that killed the later chunk propagated alone, wrongly implying nothing
+ * had been read or written. A subclass of `ConnectionLostError` (mirroring
+ * `PartialWrongNodeError`'s own relationship to `WrongNodeError`), so
+ * existing `catch (ConnectionLostError)` handling keeps working unchanged,
+ * and `requestWasSent` is forwarded from whichever chunk actually failed.
+ * `partialValues` holds whatever the earlier, already-successful chunks
+ * produced: a `Map<string, Buffer>` (getManyBytes) or `Map<string,
+ * string>` (getMany), mirroring `PartialWrongNodeError`'s get-side usage;
+ * for setMany/setManyBytes it's the `string[]` of keys already confirmed
+ * stored — unlike the wrong-node case (whose doc comment explains why a
+ * plain `WrongNodeError` has nothing worth attaching), a connection loss
+ * mid-batch DOES leave something meaningful to report. If the very first
+ * chunk fails, there's no partial data yet, so the plain, unwrapped
+ * connection error still propagates instead — only chunk 2+ failing after
+ * chunk 1 succeeded goes through this class. */
+export class PartialConnectionLostError<T = unknown> extends ConnectionLostError {
+  constructor(
+    public readonly partialValues: T,
+    message: string,
+    options?: { requestWasSent?: boolean },
+  ) {
+    super(message, options);
+    this.name = "PartialConnectionLostError";
+  }
+}
+
 // Constructors that only ever show up at a by-design swallow site because
 // of an actual bug in this SDK's own code (or in a caller's arguments,
 // e.g. an invalid ttlSeconds surfacing from encodeSet deep inside a
@@ -1375,6 +1407,11 @@ export class NanocachedClient {
       if (error instanceof PartialWrongNodeError) {
         throw new PartialWrongNodeError(this.decodeMany(error.partialValues as Map<string, Buffer>));
       }
+      if (error instanceof PartialConnectionLostError) {
+        throw new PartialConnectionLostError(this.decodeMany(error.partialValues as Map<string, Buffer>), error.message, {
+          requestWasSent: error.requestWasSent,
+        });
+      }
       throw error;
     }
   }
@@ -1404,7 +1441,12 @@ export class NanocachedClient {
    * Larger batches are transparently split into more than one `m`
    * sub-frame per owner (batch chunking, see MAX_BATCH_KEYS and, for
    * the cumulative-bytes bound alongside it, MAX_REQUEST_BYTES /
-   * `nextChunkEnd`) — callers never need to think about this. */
+   * `nextChunkEnd`) — callers never need to think about this. If the
+   * connection dies partway through a chunked batch, after at least one
+   * earlier sub-frame already succeeded, this throws
+   * `PartialConnectionLostError` instead (issue #411) — same idea as
+   * `PartialWrongNodeError` above, just for a connection loss instead of
+   * stale routing. */
   async getManyBytes(keys: readonly string[]): Promise<Map<string, Buffer>> {
     return this.getManyBytesInNamespace(EMPTY_NAMESPACE, keys);
   }
@@ -1436,7 +1478,24 @@ export class NanocachedClient {
       // getRawInNamespace's own non-cluster branch (withWrongNodeRetry
       // excludes "single", and a proxy connection has no ring to
       // refresh against either way).
-      const entries = await this.multiGetChunked(() => this.connectionForSingleTarget(), namespace, keyBytes);
+      let entries: MultiEntry[];
+      try {
+        entries = await this.multiGetChunked(() => this.connectionForSingleTarget(), namespace, keyBytes);
+      } catch (error) {
+        // issue #411: a chunked batch's earlier sub-frames already
+        // resolved before the connection died on a later one — apply them
+        // to `values` and hand them back instead of discarding a
+        // mostly-successful batch.
+        if (error instanceof PartialConnectionLostError) {
+          const partial = error.partialValues as MultiEntry[];
+          for (let i = 0; i < partial.length; i++) {
+            const entry = partial[i];
+            if (entry.kind === "hit") values.set(keys[i], this.decompressForBatch(entry.value, budget));
+          }
+          throw new PartialConnectionLostError(values, error.message, { requestWasSent: error.requestWasSent });
+        }
+        throw error;
+      }
       let wrongNode = false;
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
@@ -1524,6 +1583,22 @@ export class NanocachedClient {
         try {
           entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
         } catch (error) {
+          // issue #411: this owner's group already got chunked into more
+          // than one `m` sub-frame, and an earlier one succeeded before
+          // the connection died on a later one — apply what it already
+          // fetched instead of retrying keys that are already resolved;
+          // only the indices the failing chunk never reached go back into
+          // `retry`.
+          if (error instanceof PartialConnectionLostError) {
+            const partial = error.partialValues as MultiEntry[];
+            for (let i = 0; i < partial.length; i++) {
+              const entry = partial[i];
+              if (entry.kind === "hit") values.set(keys[groupIndices[i]], this.decompressForBatch(entry.value, budget));
+              else if (entry.kind === "wrongNode") retry.push(groupIndices[i]);
+            }
+            retry.push(...groupIndices.slice(partial.length));
+            return;
+          }
           // issue #390: this was the file's one undiscriminating swallow
           // site — a genuine programming error thrown here was folded
           // into the per-key retry list and finally misreported as
@@ -1567,9 +1642,24 @@ export class NanocachedClient {
     const entries: MultiEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length; ) {
       const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
-      const connection = await connectionFor();
-      const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
-      for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+      try {
+        const connection = await connectionFor();
+        const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
+        for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+      } catch (error) {
+        // issue #411: chunk `start`/`end` covers keyBytes[start..end); a
+        // connection-shaped failure here (this connectionFor() redial, or
+        // this chunk's own request/reply) after at least one earlier chunk
+        // already landed (start > 0) must not silently drop entries
+        // [0..start) — only a chunk-1 failure has nothing worth
+        // preserving, so it falls through to the plain rethrow below.
+        if (start > 0 && isConnectionError(error)) {
+          throw new PartialConnectionLostError<MultiEntry[]>(entries.slice(0, start), (error as Error).message, {
+            requestWasSent: error instanceof ConnectionLostError ? error.requestWasSent : true,
+          });
+        }
+        throw error;
+      }
       start = end;
     }
     return entries;
@@ -1615,7 +1705,11 @@ export class NanocachedClient {
    * Larger batches are transparently split into more than one `o`
    * sub-frame per node (batch chunking, see MAX_BATCH_KEYS and, for
    * the cumulative-bytes bound alongside it, MAX_REQUEST_BYTES /
-   * `nextChunkEnd`). */
+   * `nextChunkEnd`). If the connection dies partway through a chunked
+   * sub-frame sequence, after at least one earlier one already stored its
+   * keys, this throws `PartialConnectionLostError` (issue #411) whose
+   * `.partialValues` lists the keys already confirmed stored, rather than
+   * an information-losing bare `ConnectionLostError`. */
   async setManyBytes(values: Record<string, Uint8Array>, ttlSeconds = 0): Promise<void> {
     return this.setManyInNamespace(EMPTY_NAMESPACE, values, ttlSeconds);
   }
@@ -1643,7 +1737,23 @@ export class NanocachedClient {
     await this.maybeRefreshNodeList();
 
     if (this.target.kind !== "cluster") {
-      const entries = await this.multiSetChunked(() => this.connectionForSingleTarget(), namespace, keyBytes, valueBytes, ttlSeconds);
+      let entries: MultiAckEntry[];
+      try {
+        entries = await this.multiSetChunked(() => this.connectionForSingleTarget(), namespace, keyBytes, valueBytes, ttlSeconds);
+      } catch (error) {
+        // issue #411: an earlier sub-frame already stored its keys before
+        // the connection died on a later one — report which keys are
+        // confirmed stored instead of an information-losing bare throw.
+        if (error instanceof PartialConnectionLostError) {
+          const partial = error.partialValues as MultiAckEntry[];
+          const stored: string[] = [];
+          for (let i = 0; i < partial.length; i++) {
+            if (partial[i].kind === "stored") stored.push(keys[i]);
+          }
+          throw new PartialConnectionLostError(stored, error.message, { requestWasSent: error.requestWasSent });
+        }
+        throw error;
+      }
       if (entries.some((entry) => entry.kind === "wrongNode")) throw new WrongNodeError();
       return;
     }
@@ -1672,9 +1782,20 @@ export class NanocachedClient {
     const entries: MultiAckEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length; ) {
       const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]));
-      const connection = await connectionFor();
-      const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
-      for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+      try {
+        const connection = await connectionFor();
+        const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
+        for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
+      } catch (error) {
+        // multiGetChunked's write-side twin of the issue #411 fix — see
+        // its own comment for why start > 0 is the deciding factor.
+        if (start > 0 && isConnectionError(error)) {
+          throw new PartialConnectionLostError<MultiAckEntry[]>(entries.slice(0, start), (error as Error).message, {
+            requestWasSent: error instanceof ConnectionLostError ? error.requestWasSent : true,
+          });
+        }
+        throw error;
+      }
       start = end;
     }
     return entries;
@@ -1735,6 +1856,33 @@ export class NanocachedClient {
           const groupValueBytes = group.indices.map((index) => valueBytes[index]);
           entries = await this.multiSetChunked(() => this.memberConnection(name), namespace, groupKeyBytes, groupValueBytes, ttlSeconds);
         } catch (error) {
+          // issue #411: this leg already got chunked into more than one
+          // `o` sub-frame, and an earlier one succeeded before the
+          // connection died on a later one — without this, the whole leg
+          // (including chunks that already succeeded) got marked failed
+          // for both retry-index bookkeeping and
+          // stats().replicaWriteFailures, overcounting failures for keys
+          // that had already been stored. Indices covered by the partial
+          // ack get the same real-ack treatment as the success path below;
+          // only what the failing chunk never reached falls through to
+          // the whole-leg-failure bookkeeping.
+          if (error instanceof PartialConnectionLostError) {
+            const partial = error.partialValues as MultiAckEntry[];
+            for (let i = 0; i < group.indices.length; i++) {
+              if (i < partial.length) {
+                if (!group.isPrimary[i]) {
+                  if (partial[i].kind === "wrongNode") this.replicaWriteFailures++;
+                  continue;
+                }
+                if (partial[i].kind === "wrongNode") retry.push(group.indices[i]);
+              } else if (group.isPrimary[i]) {
+                retry.push(group.indices[i]);
+              } else {
+                this.replicaWriteFailures++;
+              }
+            }
+            return;
+          }
           // Swallowed by design, mirroring writeToOwners' replicaWrite
           // closure — an actual programming bug (isSwallowable) still
           // propagates instead of vanishing into a retry/stat.
