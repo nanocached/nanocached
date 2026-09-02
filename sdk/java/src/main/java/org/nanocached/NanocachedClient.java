@@ -1828,16 +1828,27 @@ public final class NanocachedClient implements AutoCloseable {
      * #replicaWriters}: once the budget is crossed, remaining entries (in
      * this and other legs) fail before decompressing rather than each
      * allocating another value first — peak allocation is therefore the
-     * budget plus one value per concurrent leg. */
+     * budget plus one value per concurrent leg.
+     *
+     * <p>The budget only applies when {@code compress} is actually enabled
+     * (issue #410b) — with it off, {@link #maybeDecompress} is a no-op and
+     * the per-response read size already bounds this path on its own, so
+     * charging it here would just be an undocumented total-batch cap on
+     * uncompressed batches. And the current entry is charged before the
+     * cap is checked (issue #410a) so the entry that actually crosses it
+     * is caught — and excluded — rather than slipping through, which
+     * matters most when it is the last hit in the response. */
     private byte[] decompressForBatch(byte[] raw, long[] budget) {
         synchronized (budget) {
-            if (budget[0] > Compression.maxMultiGetDecompressedBytes) {
-                throw new NanocachedException.DecompressionFailed(
-                        "nanocached: cumulative decompressed size of this getMany response "
-                                + "exceeds the maximum — possible decompression bomb across the batch");
-            }
             byte[] value = maybeDecompress(raw);
-            budget[0] += value.length;
+            if (compress) {
+                budget[0] += value.length;
+                if (budget[0] > Compression.maxMultiGetDecompressedBytes) {
+                    throw new NanocachedException.DecompressionFailed(
+                            "nanocached: cumulative decompressed size of this getMany response "
+                                    + "exceeds the maximum — possible decompression bomb across the batch");
+                }
+            }
             return value;
         }
     }

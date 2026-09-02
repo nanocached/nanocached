@@ -1908,25 +1908,37 @@ impl NanocachedClient {
     /// An associated function, not a method, for the same reason: the unit
     /// test needs no connected client. `join_all` polls the owner legs on
     /// one task, so the relaxed atomics are never contended mid-check.
+    ///
+    /// The budget only applies when `compress` is actually enabled (issue
+    /// #410b) — with it off, `value` below is returned unchanged and the
+    /// per-response read size already bounds this path on its own, so
+    /// charging it here would just be an undocumented total-batch cap on
+    /// uncompressed batches. And the current entry is charged before the
+    /// cap is checked (issue #410a) so the entry that actually crosses it
+    /// is caught — and excluded — rather than slipping through, which
+    /// matters most when it is the last hit in the response.
     fn decompress_for_batch(
         compress: bool,
         value: Vec<u8>,
         budget: &AtomicU64,
         cap: u64,
     ) -> Result<Vec<u8>> {
-        if budget.load(Ordering::Relaxed) > cap {
-            return Err(Error::Decompression(
-                "nanocached: cumulative decompressed size of this get_many response exceeds \
-                 the maximum — possible decompression bomb across the batch"
-                    .to_string(),
-            ));
-        }
         let value = if compress {
             crate::compression::decompress_value(&value)?
         } else {
             value
         };
-        budget.fetch_add(value.len() as u64, Ordering::Relaxed);
+        if compress {
+            let charged =
+                budget.fetch_add(value.len() as u64, Ordering::Relaxed) + value.len() as u64;
+            if charged > cap {
+                return Err(Error::Decompression(
+                    "nanocached: cumulative decompressed size of this get_many response exceeds \
+                     the maximum — possible decompression bomb across the batch"
+                        .to_string(),
+                ));
+            }
+        }
         Ok(value)
     }
 
@@ -4089,17 +4101,28 @@ mod tests {
     // reply); the cumulative budget must abort the batch instead. Driven
     // through decompress_for_batch with an explicit cap — never by
     // mutating a process-wide bound — so concurrently running tests can't
-    // observe it (the read_one_response precedent).
+    // observe it (the read_one_response precedent). The budget only
+    // applies when compress is enabled (issue #410b), so these tests pass
+    // compress=true and marker-prefix their values (MARKER_RAW = 0x00) so
+    // decompress_value accepts them as valid, uncompressed wire values.
+    fn raw_marked(len: usize) -> Vec<u8> {
+        let mut value = vec![0u8];
+        value.extend(std::iter::repeat_n(b'x', len));
+        value
+    }
+
     #[test]
     fn a_batch_over_the_cumulative_decompression_budget_is_rejected() {
         let budget = AtomicU64::new(0);
         // First value fits and charges the budget…
         let first =
-            NanocachedClient::decompress_for_batch(false, vec![b'x'; 8], &budget, 4).unwrap();
+            NanocachedClient::decompress_for_batch(true, raw_marked(8), &budget, 12).unwrap();
         assert_eq!(first.len(), 8);
-        // …after which the budget is over the cap, so the next entry is
-        // rejected before allocating its decompressed form.
-        let error = NanocachedClient::decompress_for_batch(false, vec![b'y'; 8], &budget, 4)
+        // …after which a second value that pushes the cumulative total
+        // past the cap is rejected — charged (issue #410a) before the
+        // check, so it is the crossing entry itself that is caught, not
+        // some later one.
+        let error = NanocachedClient::decompress_for_batch(true, raw_marked(8), &budget, 12)
             .expect_err("second value must trip the cumulative budget");
         match error {
             Error::Decompression(message) => {
@@ -4113,12 +4136,69 @@ mod tests {
     fn a_batch_exactly_at_the_cumulative_decompression_budget_passes() {
         let budget = AtomicU64::new(0);
         for _ in 0..2 {
-            NanocachedClient::decompress_for_batch(false, vec![b'x'; 4], &budget, 8).unwrap();
+            NanocachedClient::decompress_for_batch(true, raw_marked(4), &budget, 8).unwrap();
         }
-        // budget == cap is not over it: the next check still admits one
-        // more value (the bound is a budget, not a hard ceiling — the
-        // same one-value overshoot Go/TS/Python accept).
-        NanocachedClient::decompress_for_batch(false, vec![b'x'; 1], &budget, 8).unwrap();
+        // budget == cap is not over it: charge-then-check still admits a
+        // cumulative total sitting exactly at the cap (the bound is a
+        // budget, not a hard ceiling below it).
+        assert_eq!(budget.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn a_value_that_pushes_an_exactly_at_cap_budget_over_it_is_rejected() {
+        // Regression (pass-9 audit, issue #410a): under the old
+        // check-before-charge order, a budget sitting exactly at the cap
+        // passed the pre-charge check, so the next value's charge could
+        // push it over without ever being caught. Charge-then-check must
+        // reject this crossing entry.
+        let budget = AtomicU64::new(0);
+        for _ in 0..2 {
+            NanocachedClient::decompress_for_batch(true, raw_marked(4), &budget, 8).unwrap();
+        }
+        let error = NanocachedClient::decompress_for_batch(true, raw_marked(1), &budget, 8)
+            .expect_err("a value pushing an at-cap budget over it must be rejected");
+        match error {
+            Error::Decompression(message) => {
+                assert!(message.contains("across the batch"), "{message}");
+            }
+            other => panic!("expected a decompression error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_crossing_entry_is_caught_even_when_it_is_the_only_and_last_one() {
+        // Regression (pass-9 audit, issue #410a): the cumulative budget
+        // used to be checked BEFORE charging the current entry, so the
+        // entry that actually crosses the cap always slipped through
+        // uncaught — and if it was the last (or only) hit in the
+        // response, the guard never fired at all. Charge-then-check must
+        // still catch a lone crossing entry.
+        let budget = AtomicU64::new(0);
+        let error = NanocachedClient::decompress_for_batch(true, raw_marked(8), &budget, 4)
+            .expect_err("the sole, crossing entry must be caught");
+        match error {
+            Error::Decompression(message) => {
+                assert!(message.contains("across the batch"), "{message}");
+            }
+            other => panic!("expected a decompression error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_budget_is_not_charged_or_enforced_when_compress_is_disabled() {
+        // Regression (pass-9 audit, issue #410b): the budget used to be
+        // charged and enforced even when compression is disabled, so a
+        // large uncompressed batch could fail with a misleading
+        // "decompression bomb" error. With compress=false, decompression
+        // is a no-op and plain (unmarked) bytes pass straight through,
+        // unbounded by a cap far smaller than either value.
+        let budget = AtomicU64::new(0);
+        let value = NanocachedClient::decompress_for_batch(false, vec![b'x'; 8], &budget, 4)
+            .expect("compress=false must never charge or enforce the cumulative budget");
+        assert_eq!(value.len(), 8);
+        let value = NanocachedClient::decompress_for_batch(false, vec![b'y'; 8], &budget, 4)
+            .expect("a second large value must still pass with compress disabled");
+        assert_eq!(value.len(), 8);
     }
 
     use super::*;

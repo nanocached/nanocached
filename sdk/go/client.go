@@ -1242,16 +1242,21 @@ func (c *Client) getManyNS(namespace []byte, keys []string) (map[string][]byte, 
 			if !entry.ok {
 				continue
 			}
-			if decompressed > maxMultiGetDecompressedBytes {
-				return values, decompressionFailed(
-					"cumulative decompressed size of this GetMany response exceeds the " +
-						"maximum — possible decompression bomb across the batch")
-			}
 			value, decErr := c.maybeDecompress(entry.value)
 			if decErr != nil {
 				return values, decErr
 			}
-			decompressed += int64(len(value))
+			// The cumulative budget only applies when compression is
+			// actually enabled — with it off, maybeDecompress is a no-op
+			// and the per-response read size already bounds this path.
+			if c.compress {
+				decompressed += int64(len(value))
+				if decompressed > maxMultiGetDecompressedBytes {
+					return values, decompressionFailed(
+						"cumulative decompressed size of this GetMany response exceeds the " +
+							"maximum — possible decompression bomb across the batch")
+				}
+			}
 			values[keys[i]] = value
 		}
 		if chunkErr != nil {
@@ -1431,15 +1436,11 @@ func (c *Client) multiGetPass(
 					// serialized across every owner goroutine: once the
 					// cumulative budget is crossed, the remaining entries
 					// (in this and other groups) skip decompressing rather
-					// than each allocating another value first. Peak
-					// allocation is therefore the budget plus one value.
+					// than each allocating another value first. The budget
+					// only applies when compression is enabled — with it
+					// off, maybeDecompress is a no-op and *decompressed
+					// never advances, so this check never trips.
 					if *decompressed > maxMultiGetDecompressedBytes {
-						if spliceErr == nil {
-							spliceErr = decompressionFailed(
-								"cumulative decompressed size of this GetMany response " +
-									"exceeds the maximum — possible decompression bomb " +
-									"across the batch")
-						}
 						continue
 					}
 					value, decErr := c.maybeDecompress(entry.value)
@@ -1449,7 +1450,21 @@ func (c *Client) multiGetPass(
 						}
 						continue
 					}
-					*decompressed += int64(len(value))
+					if c.compress {
+						// Charge the current entry before checking so the
+						// entry that actually crosses the cap is caught
+						// (and excluded) rather than slipping through.
+						*decompressed += int64(len(value))
+						if *decompressed > maxMultiGetDecompressedBytes {
+							if spliceErr == nil {
+								spliceErr = decompressionFailed(
+									"cumulative decompressed size of this GetMany response " +
+										"exceeds the maximum — possible decompression bomb " +
+										"across the batch")
+							}
+							continue
+						}
+					}
 					values[keys[idx]] = value
 				}
 			}

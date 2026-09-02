@@ -1133,14 +1133,24 @@ class NanocachedClient:
         per-value cap into gigabytes of allocation. ``budget`` is a
         one-element list used as a shared mutable counter across the two
         cluster passes and every concurrent owner group (decompression here
-        is synchronous, so the asyncio event loop never interleaves it)."""
-        if budget[0] > _MAX_MULTIGET_DECOMPRESSED_BYTES:
-            raise DecompressionError(
-                "cumulative decompressed size of this get_many response exceeds the "
-                "maximum — possible decompression bomb across the batch"
-            )
+        is synchronous, so the asyncio event loop never interleaves it).
+        The budget only applies when compression is actually enabled — with
+        it off, _maybe_decompress() is a no-op and the per-response read
+        size already bounds this path on its own, so charging it here would
+        just be an undocumented total-batch cap on uncompressed batches."""
         out = self._maybe_decompress(value)
-        budget[0] += len(out)
+        if self._compress:
+            # Charge the current entry before checking so the entry that
+            # actually crosses the cap is caught (and excluded) rather than
+            # slipping through — this matters most when it is the last hit
+            # in the response, where a check-before-charge order would
+            # never trip at all.
+            budget[0] += len(out)
+            if budget[0] > _MAX_MULTIGET_DECOMPRESSED_BYTES:
+                raise DecompressionError(
+                    "cumulative decompressed size of this get_many response exceeds the "
+                    "maximum — possible decompression bomb across the batch"
+                )
         return out
 
     async def get_many_bytes(self, keys: Sequence[str | bytes]) -> dict[str | bytes, bytes]:
