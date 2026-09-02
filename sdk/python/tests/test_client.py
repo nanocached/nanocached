@@ -538,6 +538,31 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_close_awaits_each_connections_read_task_leaving_nothing_pending(self):
+        # Issue #412(b): close() reaped every other background task
+        # (redials, refresh, keepalive, background replica writes,
+        # hedged reads — see test_close_awaits_the_keepalive_task_
+        # leaving_nothing_pending's own issue #189 fix above) but never
+        # awaited a Connection's own `_read_task` — _teardown() only
+        # called Connection.close(), which closes the writer and
+        # returns immediately without waiting for the read loop to
+        # actually notice and finish. A short-lived program torn down
+        # right after close() could log "Task was destroyed but it is
+        # pending!" for it. Assert the read task itself is both
+        # finished and gone from asyncio.all_tasks() by the time
+        # close() returns.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            await client.set("k", "v")
+            read_task = client._single._read_task
+            self.assertIsNotNone(read_task)
+            await client.close()
+            self.assertTrue(read_task.done())
+            self.assertNotIn(read_task, asyncio.all_tasks())
+        finally:
+            await node.close()
+
 
 class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_malformed_value_length_poisons_the_connection(self):
@@ -2020,6 +2045,67 @@ class NonIdempotentReplayTests(unittest.IsolatedAsyncioTestCase):
                 await client.incr("counter", 5)
             # Applied exactly once: a blind retry would have sent a
             # second `i` and landed on 20, not 15.
+            self.assertEqual(await client.get("counter"), "15")
+            self.assertEqual(self.node.incr_count, 1)
+        finally:
+            await client.close()
+
+    async def test_a_lost_reply_arriving_while_drain_is_still_suspended_is_not_replayed(self):
+        # Issue #412(a): write() can hand a frame's bytes to the OS
+        # socket buffer before the following `await writer.drain()`
+        # returns. If the connection is poisoned while _send() is still
+        # suspended inside that drain() — not after it returns —
+        # slot.sent must already read True at that moment, or
+        # _error_for classifies the failure as "never left the client"
+        # and _with_wrong_node_retry blindly resends it, double-applying
+        # the increment. Normally there's no way to observe this window:
+        # drain() for a small frame over loopback returns essentially
+        # immediately, long before any server-side reaction could poison
+        # the connection. So this patches StreamWriter.drain to hold the
+        # coroutine open on an Event — an artificial slow-drain
+        # transport, mirroring this module's own flaky_write pattern
+        # (see test_a_reset_while_writing_the_extended_auth_frame_also_
+        # falls_back_to_untagged) for simulating transport-level faults
+        # — while the real (unpatched) write() has already handed the
+        # frame to the kernel for real, so the node genuinely receives
+        # and applies it.
+        client = await self.connect()
+        try:
+            await client.set("counter", "10")
+            # The node fully applies the increment, then closes the
+            # connection instead of ever sending the `I` reply — so
+            # nothing but the read loop noticing that close can resolve
+            # the pending future while drain() is held open below.
+            self.node.apply_and_drop_next_incr()
+
+            real_drain = asyncio.StreamWriter.drain
+            drain_entered = asyncio.Event()
+            release_drain = asyncio.Event()
+
+            async def slow_drain(writer):
+                drain_entered.set()
+                await release_drain.wait()
+                await real_drain(writer)
+
+            with mock.patch.object(asyncio.StreamWriter, "drain", slow_drain):
+                incr_task = asyncio.ensure_future(client.incr("counter", 5))
+                await wait_for(lambda: drain_entered.is_set(), "drain() to be entered")
+                # The node's drop must poison the connection while this
+                # coroutine is still parked in drain() above — proving
+                # the write already reached the server even though
+                # drain() itself hasn't returned to _send() yet.
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the dropped connection to be noticed while drain() is still suspended",
+                )
+                release_drain.set()
+                with self.assertRaises(ConnectionLostError):
+                    await incr_task
+
+            # Applied exactly once: a blind retry (the pre-fix behavior,
+            # since the old code only marked the slot sent after drain()
+            # returned — too late here) would have sent a second `i` and
+            # landed on 20, not 15.
             self.assertEqual(await client.get("counter"), "15")
             self.assertEqual(self.node.incr_count, 1)
         finally:
@@ -5351,6 +5437,38 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 # A subclass of WrongNodeError — existing handling keeps
                 # working unchanged.
                 self.assertIsInstance(ctx.exception, WrongNodeError)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_partial_wrong_node_survives_a_non_utf8_partial_value(self):
+        # Issue #412(c): the PartialWrongNodeError handler in _get_many()
+        # used to build partial_values with a plain .decode(), which
+        # raises UnicodeDecodeError on a non-UTF-8 stored value — masking
+        # the PartialWrongNodeError (the wrong-node/partial-failure
+        # information) it was meant to construct and propagate. Stores
+        # raw non-UTF-8 bytes for the key that stays healthy so the
+        # decode inside that handler is actually exercised, and asserts
+        # PartialWrongNodeError still comes through (with a lossy
+        # errors="replace" decode) instead of UnicodeDecodeError.
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                key, other = "some-key", "other-key"
+                non_utf8 = b"\xff\xfe\x00\x01"
+                await client.set_many({key: "v", other: non_utf8})
+                owner = nodes[self.owners_of(key)[0]]
+
+                owner.answer_wrong_node_for_keys({key.encode()}, times=10)
+                with self.assertRaises(PartialWrongNodeError) as ctx:
+                    await client.get_many([key, other])
+                self.assertEqual(
+                    ctx.exception.partial_values, {other: non_utf8.decode(errors="replace")}
+                )
             finally:
                 await client.close()
         finally:
