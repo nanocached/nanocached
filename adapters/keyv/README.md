@@ -69,6 +69,11 @@ const cache = createCache({ stores: [new Keyv({ store, useKeyPrefix: false })] }
 
 await cache.set("user:42", { name: "Ada" });
 const user = await cache.get("user:42");
+
+// createCache() never disconnects its stores on its own (verified against
+// cache-manager 7.2.9) — call this yourself on shutdown, e.g. in a signal
+// handler. See "Lifecycle" below.
+process.on("SIGTERM", () => cache.disconnect());
 ```
 
 ### With NestJS 11's `CacheModule`
@@ -102,10 +107,21 @@ unmodified.
 Keyv never closes a store itself. `store.disconnect()` (this adapter's own
 addition, matching the sibling `cache-manager` store's convention) closes
 the underlying `NanocachedClient`; call it on shutdown. It's idempotent,
-like `NanocachedClient.close`. Under `cache-manager`'s `createCache()` or
-NestJS's `CacheModule`, their own teardown (`cacheManager.onModuleDestroy`
-under Nest) already calls each store's `disconnect()` for you — don't call
-it a second time yourself in that case.
+like `NanocachedClient.close`.
+
+Plain `cache-manager` v6+ `createCache()` does **not** auto-disconnect its
+stores — verified against installed `cache-manager@7.2.9`: `createCache()`
+only exposes its own `cache.disconnect()` (which fans out to each store's
+`disconnect()`), it never calls it for you. Skipping this in your own
+shutdown path leaks the socket and its keep-alive timer, as in the
+`cache-manager` v6+ example above.
+
+NestJS's `CacheModule` is the one case that *does* wire this up for you:
+`@nestjs/cache-manager` (verified against 3.1.3) sets
+`cacheManager.onModuleDestroy` to call each store's `disconnect()`, which
+Nest invokes when the module is destroyed — on `app.close()`, or on a
+shutdown signal if `app.enableShutdownHooks()` was called. Don't call
+`disconnect()` a second time yourself in that case.
 
 `store.client` reaches the underlying SDK client directly, for anything
 this store doesn't itself surface (`client.stats()`, `client.replication`,
