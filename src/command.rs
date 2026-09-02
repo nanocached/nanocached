@@ -368,15 +368,15 @@ impl Command {
                     // already-present key is still a success for the
                     // sender (`Response::Stored` either way): the value
                     // that won is by definition at least as new as what
-                    // re-replication was carrying.
-                    match cache.cas_set(&key, CasCondition::Absent, value, ttl) {
+                    // re-replication was carrying. Issue #394: the
+                    // handoff variants leave the client-visible
+                    // `sets`/`cas_sets` counters alone — no client asked
+                    // for this write.
+                    match cache.handoff_set_if_absent(&key, value, ttl) {
                         CasResult::Stored | CasResult::Mismatch => {}
                     }
                 } else {
-                    match ttl {
-                        Some(ttl) => cache.set_with_ttl(key, value, ttl),
-                        None => cache.set(key, value),
-                    }
+                    cache.handoff_set(key, value, ttl);
                 }
                 Response::Stored
             }
@@ -2786,6 +2786,47 @@ mod tests {
             Response::Stored
         );
         assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"first")));
+    }
+
+    #[test]
+    fn handoff_set_does_not_count_as_a_client_write() {
+        // Issue #394: U handoffs are cluster management — re-replication,
+        // decommission drain, join relay. They used to funnel through
+        // set/cas_set and inflate the client-visible sets_total /
+        // cas_sets_total counters by the size of the internal transfer,
+        // contradicting the metrics HELP text and tripping rate-based
+        // alerting during routine scaling events.
+        let mut cache = Cache::new(1024 * 1024);
+
+        Command::HandoffSet {
+            key: key(b"plain"),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+            if_absent: false,
+            token: "tok-h".to_string(),
+        }
+        .execute(&mut cache);
+        Command::HandoffSet {
+            key: key(b"absent"),
+            value: Bytes::from_static(b"v"),
+            ttl: Some(Duration::from_secs(60)),
+            if_absent: true,
+            token: "tok-h".to_string(),
+        }
+        .execute(&mut cache);
+
+        let stats = cache.stats();
+        assert_eq!(
+            stats.sets, 0,
+            "handoff writes must not count as client sets"
+        );
+        assert_eq!(
+            stats.cas_sets, 0,
+            "put-if-absent handoffs must not count as client k writes"
+        );
+        // Both writes really landed, TTL included.
+        assert_eq!(cache.get(&key(b"plain")), Some(Bytes::from_static(b"v")));
+        assert_eq!(cache.get(&key(b"absent")), Some(Bytes::from_static(b"v")));
     }
 
     #[test]

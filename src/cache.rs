@@ -124,9 +124,13 @@ pub struct Cache {
     /// for the small one. Keyed independently of `namespaces` — a budget
     /// outlives its (empty-and-dropped) sub-map.
     budgets: HashMap<Bytes, usize, RandomState>,
-    /// Issue #124: client-visible operation counters, snapshotted by
-    /// `stats()` for the metrics endpoint. Plain fields, not atomics —
-    /// the cache actor is single-threaded.
+    /// Issue #124: operation counters, snapshotted by `stats()` for the
+    /// metrics endpoint. Plain fields, not atomics — the cache actor is
+    /// single-threaded. Issue #394: `U` handoff writes bypass these (see
+    /// `handoff_set`); `sets` still includes staged-join migration and
+    /// any other internal write delivered as an ordinary `S` frame,
+    /// which this node cannot tell apart from a client's — the exported
+    /// HELP text says so.
     hits: u64,
     misses: u64,
     sets: u64,
@@ -387,6 +391,43 @@ impl Cache {
         ttl: Option<Duration>,
     ) -> CasResult {
         self.cas_set_at(key, condition, value, ttl, Instant::now())
+    }
+
+    /// Issue #394: `U` handoff writes (re-replication after an eviction,
+    /// decommission drain, join relay) are cluster management, not client
+    /// traffic — they used to funnel through `set`/`cas_set` and inflate
+    /// the client-visible `sets`/`cas_sets` counters by the size of
+    /// whatever internal transfer was in flight, contradicting the
+    /// metrics HELP text and tripping rate-based alerting during routine
+    /// scaling. These variants insert without touching any operation
+    /// counter. (Staged-join migration transfer arrives as ordinary `S`
+    /// frames from the source node and stays indistinguishable from a
+    /// client write here — the `sets_total` HELP text documents that
+    /// remainder instead.)
+    pub fn handoff_set(&mut self, key: Key, value: Bytes, ttl: Option<Duration>) {
+        // Same TTL-overflow stance as `set_with_ttl`: too far out to
+        // represent is "never expires", not a panic.
+        let expires_at = ttl.and_then(|ttl| Instant::now().checked_add(ttl));
+        self.insert(key, value, expires_at);
+    }
+
+    /// The `if_absent` companion to [`Self::handoff_set`] (issue #266's
+    /// put-if-absent re-replication), mirroring `cas_set_at` with
+    /// `CasCondition::Absent` minus the `cas_sets` bump — no client sent
+    /// a `k` frame for this write.
+    pub fn handoff_set_if_absent(
+        &mut self,
+        key: &Key,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> CasResult {
+        let now = Instant::now();
+        if !self.condition_holds_at(key, CasCondition::Absent, now) {
+            return CasResult::Mismatch;
+        }
+        let expires_at = ttl.and_then(|ttl| now.checked_add(ttl));
+        self.insert(key.clone(), value, expires_at);
+        CasResult::Stored
     }
 
     fn cas_set_at(

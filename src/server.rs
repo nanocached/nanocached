@@ -1541,7 +1541,12 @@ fn render_node_metrics(
     metric(
         "nanocached_node_sets_total",
         "counter",
-        "Stored writes.",
+        "Stored writes. Includes cluster-management writes delivered as \
+         ordinary S frames — a staged join's migration transfer and a \
+         decommissioning node's drain-out — which this node cannot tell \
+         apart from client writes (issue #394): expect a one-time burst \
+         proportional to the moved dataset during scaling events. \
+         Re-replication handoffs (U) are not counted here.",
         format!("nanocached_node_sets_total {}\n", stats.sets),
     );
     metric(
@@ -1574,7 +1579,9 @@ fn render_node_metrics(
         "nanocached_node_cas_sets_total",
         "counter",
         "Successful k (compare-and-set) writes (issue #141) — a mismatched \
-         condition isn't counted here.",
+         condition isn't counted here, and neither are internal \
+         re-replication handoffs (issue #394): this counts client k \
+         frames only.",
         format!("nanocached_node_cas_sets_total {}\n", stats.cas_sets),
     );
     metric(
