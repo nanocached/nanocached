@@ -7961,9 +7961,7 @@ mod tests {
         let node = MockNode::start().await;
         // As large as a value reply is allowed to be (`read_reply` in
         // this same module rejects a `V` length over `MAX_REQUEST_SIZE`
-        // as a protocol violation) — large enough, paired with the
-        // receiver's shrunk buffer below, to overrun even a generous
-        // default OS send buffer.
+        // as a protocol violation).
         let big_value = vec![b'x'; MAX_REQUEST_SIZE - 1024];
         node.store
             .lock()
@@ -7973,24 +7971,38 @@ mod tests {
         let discovery = start_mock_discovery(roster, 1).await;
         let proxy = start_proxy(&discovery, None, 1).await;
 
-        // Occupies the sole connection permit, then asks for the huge
-        // value and never reads the response. Shrinking this socket's
-        // own receive buffer bounds how much the proxy's writer can hand
-        // off to the kernel before blocking, regardless of how generous
-        // this platform's default buffers are. Half-closing the write
-        // side afterward (a TCP FIN, not a full close) lets
-        // `handle_client`'s *reader* observe EOF and reach its
-        // `drop(fifo_tx); writer.await` teardown quickly instead of
-        // idling for the full, real (not shrunk-under-test)
-        // `IDLE_TIMEOUT` — the read direction, and so the still-unread
-        // receive buffer the writer is stalled on, is untouched by this.
+        // Occupies the sole connection permit, then pipelines
+        // `REQUEST_COUNT` requests for the huge value and never reads
+        // any response. A *single* ~1MiB reply is not reliably enough to
+        // block the writer on every platform: Linux loopback sockets
+        // autotune their buffers to several MiB regardless of this
+        // client's shrunk receive buffer below, so one reply can be
+        // handed entirely to the kernel and "complete" without the
+        // writer ever truly blocking (this is exactly what happened in
+        // CI — see the "verify on Linux before pushing" lesson).
+        // Pipelining enough of these (well under `CLIENT_IN_FLIGHT`)
+        // queues tens of MiB of unread reply data, comfortably beyond
+        // any realistic combination of sender/receiver buffer sizes on
+        // any platform, so some write in the sequence must eventually
+        // block for real. The shrunk receive buffer is kept too, since
+        // it only helps make the block happen sooner.
+        const REQUEST_COUNT: usize = 64;
         let socket = tokio::net::TcpSocket::new_v4().unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
         let mut stalled = socket.connect(proxy.parse().unwrap()).await.unwrap();
         let mut buf = BytesMut::new();
         stalled.write_all(b"A 1\nx").await.unwrap();
         assert_eq!(read_line(&mut stalled, &mut buf).await.unwrap(), "On");
-        stalled.write_all(b"G 3\nkey").await.unwrap();
+        for _ in 0..REQUEST_COUNT {
+            stalled.write_all(b"G 3\nkey").await.unwrap();
+        }
+        // Half-closing the write side afterward (a TCP FIN, not a full
+        // close) lets `handle_client`'s *reader* observe EOF, once it
+        // has read every pipelined request above, and reach its
+        // `drop(fifo_tx); writer.await` teardown quickly instead of
+        // idling for the full, real (not shrunk-under-test)
+        // `IDLE_TIMEOUT` — the read direction, and so the still-unread
+        // receive buffer the writer is stalled on, is untouched by this.
         stalled.shutdown().await.unwrap();
 
         // While the writer is stalled, the proxy is over its connection
