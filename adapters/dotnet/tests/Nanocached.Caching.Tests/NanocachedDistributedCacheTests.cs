@@ -359,6 +359,29 @@ public sealed class NanocachedDistributedCacheTests
     }
 
     [Fact]
+    public async Task Sub_second_remainder_past_a_whole_second_rounds_up_not_down()
+    {
+        // Regression for issue #418: AbsoluteExpirationRelativeToNow's
+        // instant used to be floored via DateTimeOffset.ToUnixTimeSeconds()
+        // before WireTtlSeconds' own ceiling ran, so a 5.9s-from-now
+        // expiration could floor to "+5s" and then ceil right back to 5 —
+        // one second short of the caller's intent, expiring up to ~1s
+        // early. It must round up to 6, never down to 5.
+        using var node = new MockNode();
+        await using ServiceProvider provider = BuildProvider(node);
+        IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+        byte[] key = "ttl5point9"u8.ToArray();
+
+        await cache.SetAsync(
+            "ttl5point9", new byte[] { 1 },
+            new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(5.9) });
+
+        MockNode.Entry? entry = node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key);
+        Assert.NotNull(entry);
+        Assert.Equal(6, entry!.TtlSeconds);
+    }
+
+    [Fact]
     public async Task Past_absolute_expiration_throws()
     {
         using var node = new MockNode();
