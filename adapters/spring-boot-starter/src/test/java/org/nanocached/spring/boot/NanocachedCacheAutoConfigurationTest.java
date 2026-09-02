@@ -152,6 +152,27 @@ class NanocachedCacheAutoConfigurationTest {
                 "no nanocached.addresses means the starter must not attempt a connection");
     }
 
+    // issue #388: the idiomatic YAML list form binds as indexed keys
+    // (nanocached.addresses[0], ...) and never produces the literal
+    // nanocached.addresses key — @ConditionalOnProperty on the literal
+    // key silently skipped the whole autoconfiguration for such configs,
+    // handing @Cacheable to Boot's in-memory default with no error. The
+    // Binder-based condition must treat both forms as configured.
+    @Test
+    void indexedYamlListAddressesActivateTheStarter() {
+        SpringApplicationBuilder builder = new SpringApplicationBuilder(YamlOnlyConfig.class)
+                .web(WebApplicationType.NONE)
+                .properties("nanocached.addresses[0]=127.0.0.1:" + node.port());
+        context = builder.build().run();
+
+        assertInstanceOf(NanocachedCacheManager.class, context.getBean(CacheManager.class));
+
+        UserService service = context.getBean(UserService.class);
+        service.findUser("alice");
+        service.findUser("alice");
+        assertEquals(1, service.calls(), "the second lookup must come from the cluster cache");
+    }
+
     @Test
     void aStraySpringCacheTypeRedisDoesNotOverrideTheStarter() {
         boot(YamlOnlyConfig.class, "spring.cache.type=redis");

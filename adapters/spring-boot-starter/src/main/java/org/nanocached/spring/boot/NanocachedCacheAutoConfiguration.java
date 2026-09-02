@@ -8,10 +8,10 @@ import org.springframework.boot.autoconfigure.AutoConfigureBefore;
 import org.springframework.boot.autoconfigure.cache.CacheAutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 
 /**
  * Registers a {@link NanocachedClient} and a {@link NanocachedCacheManager}
@@ -20,11 +20,13 @@ import org.springframework.context.annotation.Bean;
  * nanocached.addresses} — no manual {@code @Bean} methods, unlike
  * {@code nanocached-spring} on its own (see that module's README).
  *
- * <p>Inert until {@code nanocached.addresses} is set ({@link
- * ConditionalOnProperty}): adding this starter's dependency alone changes
- * nothing, matching Boot's own opt-in-by-configuration convention. Each
- * bean also backs off individually ({@link ConditionalOnMissingBean}) so
- * an app can supply its own client or manager and keep the other.
+ * <p>Inert until {@code nanocached.addresses} is set — in either the
+ * comma-string or the YAML-list form, see {@link
+ * OnNanocachedAddressesCondition} (issue #388): adding this starter's
+ * dependency alone changes nothing, matching Boot's own
+ * opt-in-by-configuration convention. Each bean also backs off
+ * individually ({@link ConditionalOnMissingBean}) so an app can supply
+ * its own client or manager and keep the other.
  *
  * <p>{@link AutoConfigureBefore} Boot's own {@link CacheAutoConfiguration}
  * so this configuration's {@code CacheManager} exists by the time Boot's
@@ -37,7 +39,7 @@ import org.springframework.context.annotation.Bean;
 @AutoConfigureBefore(CacheAutoConfiguration.class)
 @EnableConfigurationProperties(NanocachedProperties.class)
 @ConditionalOnClass({NanocachedClient.class, CacheManager.class})
-@ConditionalOnProperty("nanocached.addresses")
+@Conditional(OnNanocachedAddressesCondition.class)
 public class NanocachedCacheAutoConfiguration {
 
     @Bean(destroyMethod = "close")
