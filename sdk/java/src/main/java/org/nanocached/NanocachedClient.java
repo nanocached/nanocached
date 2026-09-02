@@ -1975,9 +1975,19 @@ public final class NanocachedClient implements AutoCloseable {
      * spliced into {@code values} (decompression failures propagate,
      * aborting the batch immediately — never fed into the retry pass,
      * since they're a client-side {@code compress} mismatch, not a
-     * routing outcome). {@code retry} must already be a thread-safe list
-     * — this runs concurrently with every other owner's leg, mirroring
-     * {@link #runMultiSetLeg}. */
+     * routing outcome). Unlike the {@code multiGetChunked} call above,
+     * {@link #decompressForBatch}'s {@link
+     * NanocachedException.DecompressionFailed} is deliberately left
+     * uncaught here rather than folded into the same retry-and-return
+     * guard — it needs to escape this leg, not be swallowed — but that
+     * means it can reach {@link #drainLegsKeepingFirstBug} on a leg other
+     * than the first to fail, since every owner's leg runs concurrently
+     * and any of them can trip the shared {@code budget} check at the
+     * same time (issue #413); {@code drainLegsKeepingFirstBug} knows to
+     * classify that one specially rather than as a background write bug.
+     * {@code retry} must already be a thread-safe list — this runs
+     * concurrently with every other owner's leg, mirroring {@link
+     * #runMultiSetLeg}. */
     private void runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
             byte[][] keyBytes, byte[][] values, List<Integer> retry, long[] budget) {
@@ -2381,6 +2391,19 @@ public final class NanocachedClient implements AutoCloseable {
      * protocol-level failure this SDK produces is already wrapped as a
      * {@link NanocachedException} and caught well before here — a
      * genuine, uncaught bug is by definition not reproducible that way).
+     *
+     * <p>One deliberate exception to that: {@link #runMultiGetLeg} lets a
+     * {@link NanocachedException.DecompressionFailed} from {@link
+     * #decompressForBatch} escape uncaught by design, and since every
+     * owner's leg runs concurrently, more than one leg can trip it at
+     * once (the same shared decompression-budget check, tripped by
+     * multiple legs racing past it together). Only the first such bug
+     * reaching here is a real signal — it's already the one this method
+     * rethrows to the caller, aborting the whole batch — so any further
+     * one is a redundant echo of the same client-side condition, not an
+     * independent programming bug, and reporting it via {@link
+     * #reportBackgroundWriteBug} would violate that counter's own
+     * documented invariant (issue #413). It's dropped instead.
      * Returns the first bug, or {@code null} if every leg succeeded. */
     RuntimeException drainLegsKeepingFirstBug(List<CompletableFuture<Void>> legs) {
         RuntimeException legBug = null;
@@ -2391,7 +2414,7 @@ public final class NanocachedClient implements AutoCloseable {
                 RuntimeException bug = unwrapReplicaBug(wrapped);
                 if (legBug == null) {
                     legBug = bug;
-                } else {
+                } else if (!(bug instanceof NanocachedException.DecompressionFailed)) {
                     reportBackgroundWriteBug(bug);
                 }
             }

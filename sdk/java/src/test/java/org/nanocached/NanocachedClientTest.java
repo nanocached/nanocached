@@ -2013,7 +2013,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void multiGetDrainsEveryLegAndReportsASecondLegsBugAfterTheFirstFails() throws Exception {
+    void multiGetDrainsEveryLegAndDoesNotCountASecondLegsDecompressionFailureAsABackgroundBug() throws Exception {
         // Regression for issue #230: multiGetPass used to rethrow on the
         // first failing leg's join() without draining the remaining
         // legs, so a second, independent leg's bug would vanish silently
@@ -2021,10 +2021,18 @@ class NanocachedClientTest {
         // always drain every leg first. Two owners each hold a corrupted
         // "compressed" value (an unrecognized marker byte, which escapes
         // runMultiGetLeg as a DecompressionFailed rather than being fed
-        // into the retry pass, per that method's own doc comment); the
-        // first leg's failure must still propagate, and the second leg's
-        // failure must still be counted via reportBackgroundWriteBug
-        // rather than being lost.
+        // into the retry pass, per that method's own doc comment).
+        //
+        // Issue #413: this used to also assert the second leg's
+        // DecompressionFailed was counted via backgroundWriteBugs — but
+        // that counter is documented to "never increment for a legitimate
+        // reason", and a client-side compress mismatch/decompression bomb
+        // is exactly that: a legitimate, expected failure, not a
+        // programming bug in this SDK's background-write handling. Both
+        // legs racing the same corrupt-data condition concurrently must
+        // still leave exactly one DecompressionFailed propagating to the
+        // caller (whichever leg drains first) and must NOT bump
+        // backgroundWriteBugs for the other.
         try (Cluster cluster = startCluster(1)) {
             String keyOnNodeA = null;
             String keyOnNodeB = null;
@@ -2050,8 +2058,9 @@ class NanocachedClientTest {
                 long before = client.stats().backgroundWriteBugs();
                 assertThrows(NanocachedException.DecompressionFailed.class,
                         () -> client.getManyBytes(List.of(finalKeyOnNodeA, finalKeyOnNodeB)));
-                assertEquals(before + 1, client.stats().backgroundWriteBugs(),
-                        "the second owner leg's decompression bug must still be observed, not silently dropped");
+                assertEquals(before, client.stats().backgroundWriteBugs(),
+                        "a concurrent leg's DecompressionFailed is a legitimate, expected failure — "
+                                + "it must never be counted as a background write bug");
             }
         }
     }
@@ -2089,6 +2098,44 @@ class NanocachedClientTest {
                 assertSame(first, returned, "the first leg's bug must be the one returned to the caller");
                 assertEquals(before + 2, client.stats().backgroundWriteBugs(),
                         "the second and third legs' bugs must still be counted, not discarded");
+            }
+        }
+    }
+
+    @Test
+    void drainLegsKeepingFirstBugDoesNotCountAFurtherDecompressionFailedAsABackgroundBug() throws Exception {
+        // Regression for issue #413(b): runMultiGetLeg deliberately lets a
+        // DecompressionFailed from decompressForBatch escape uncaught
+        // (per that method's own doc comment — a decompression failure
+        // must abort the whole batch, never be fed into the retry pass),
+        // so unlike every other leg failure this SDK produces, it is NOT
+        // already caught before reaching drainLegsKeepingFirstBug. Since
+        // every owner's leg runs concurrently, more than one leg can hit
+        // it at once (e.g. every leg racing the same shared
+        // decompression-budget check). Only the first such bug reaching
+        // here needs to propagate to the caller; any further one is a
+        // redundant echo of the same client-side condition, not an
+        // independent programming bug, and must be dropped rather than
+        // counted via backgroundWriteBugs — that counter is documented to
+        // "never increment for a legitimate reason".
+        try (Cluster cluster = startCluster(1)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                RuntimeException first = new NanocachedException.DecompressionFailed("first leg's decompression bug");
+                RuntimeException second = new NanocachedException.DecompressionFailed("second leg's decompression bug");
+                RuntimeException third = new IllegalStateException("third leg's genuine bug");
+                List<CompletableFuture<Void>> legs = List.of(
+                        CompletableFuture.completedFuture(null),
+                        CompletableFuture.failedFuture(first),
+                        CompletableFuture.failedFuture(second),
+                        CompletableFuture.failedFuture(third));
+
+                long before = client.stats().backgroundWriteBugs();
+                RuntimeException returned = client.drainLegsKeepingFirstBug(legs);
+
+                assertSame(first, returned, "the first leg's bug must be the one returned to the caller");
+                assertEquals(before + 1, client.stats().backgroundWriteBugs(),
+                        "the second leg's DecompressionFailed must be dropped, not counted as a background "
+                                + "bug — only the third leg's genuine bug may bump the counter");
             }
         }
     }
