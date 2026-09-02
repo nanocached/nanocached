@@ -12,6 +12,7 @@ import unittest
 
 from support import ROUNDTRIP_NODE
 from django.core.cache import caches
+from nanocached_django import NanocachedCache
 
 
 class _Status(enum.IntEnum):
@@ -78,11 +79,17 @@ class RoundTripTests(unittest.TestCase):
         self.assertTrue(self.cache.has_key("nullable"))
 
     def test_add_semantics(self) -> None:
+        cas_set_count_before = ROUNDTRIP_NODE.cas_set_count
         self.assertTrue(self.cache.add("fresh", "first"))
         self.assertEqual(self.cache.get("fresh"), "first")
         # Already present: add() is a no-op and reports False.
         self.assertFalse(self.cache.add("fresh", "second"))
         self.assertEqual(self.cache.get("fresh"), "first")
+        # issue #414: both calls went out as the wire's atomic `k`/A
+        # compare-and-set (put_if_absent), not a get-then-set — the
+        # False above is the CAS's own condition-mismatch reply, not a
+        # separate GET this backend had to interpret itself.
+        self.assertEqual(ROUNDTRIP_NODE.cas_set_count, cas_set_count_before + 2)
 
     def test_delete_and_has_key(self) -> None:
         self.cache.set("temp", "value")
@@ -234,6 +241,27 @@ class RoundTripTests(unittest.TestCase):
         self.cache.set("greeting", "hello")
         with self.assertRaises(NotNumericError):
             self.cache.incr("greeting")
+
+    def test_compress_incompatible_with_incr_is_translated_to_value_error(self) -> None:
+        # issue #414(c): CompressionIncompatibleError (issue #321) is an
+        # SDK-internal type, outside BaseCache's contract — this backend
+        # must translate it to ValueError at the adapter boundary rather
+        # than letting it leak out. This backend instance is built
+        # directly (not through the module-level `caches` registry,
+        # which has no COMPRESS-enabled alias) so the underlying SDK
+        # client actually raises the real error incr()/decr() would hit
+        # with OPTIONS.COMPRESS enabled.
+        backend = NanocachedCache(
+            ROUNDTRIP_NODE.address,
+            {"OPTIONS": {"NAMESPACE": "compress-incr-test", "COMPRESS": True}},
+        )
+        self.addCleanup(backend.shutdown)
+        backend.set("counter", 1)
+
+        with self.assertRaises(ValueError):
+            backend.incr("counter")
+        with self.assertRaises(ValueError):
+            backend.decr("counter")
 
     def test_int_values_round_trip_without_pickling(self) -> None:
         # Issue #129: a plain int is stored as INCR's own decimal-ASCII

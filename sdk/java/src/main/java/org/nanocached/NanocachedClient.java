@@ -1864,16 +1864,27 @@ public final class NanocachedClient implements AutoCloseable {
      * #replicaWriters}: once the budget is crossed, remaining entries (in
      * this and other legs) fail before decompressing rather than each
      * allocating another value first — peak allocation is therefore the
-     * budget plus one value per concurrent leg. */
+     * budget plus one value per concurrent leg.
+     *
+     * <p>The budget only applies when {@code compress} is actually enabled
+     * (issue #410b) — with it off, {@link #maybeDecompress} is a no-op and
+     * the per-response read size already bounds this path on its own, so
+     * charging it here would just be an undocumented total-batch cap on
+     * uncompressed batches. And the current entry is charged before the
+     * cap is checked (issue #410a) so the entry that actually crosses it
+     * is caught — and excluded — rather than slipping through, which
+     * matters most when it is the last hit in the response. */
     private byte[] decompressForBatch(byte[] raw, long[] budget) {
         synchronized (budget) {
-            if (budget[0] > Compression.maxMultiGetDecompressedBytes) {
-                throw new NanocachedException.DecompressionFailed(
-                        "nanocached: cumulative decompressed size of this getMany response "
-                                + "exceeds the maximum — possible decompression bomb across the batch");
-            }
             byte[] value = maybeDecompress(raw);
-            budget[0] += value.length;
+            if (compress) {
+                budget[0] += value.length;
+                if (budget[0] > Compression.maxMultiGetDecompressedBytes) {
+                    throw new NanocachedException.DecompressionFailed(
+                            "nanocached: cumulative decompressed size of this getMany response "
+                                    + "exceeds the maximum — possible decompression bomb across the batch");
+                }
+            }
             return value;
         }
     }
@@ -2067,7 +2078,18 @@ public final class NanocachedClient implements AutoCloseable {
      * simply re-fetches the group, so nothing already resolved is lost,
      * just retried once more; unlike the single-mode path there is no
      * further pass to fall back to after that, so there's no partial
-     * exception to build here. */
+     * exception to build here.
+     *
+     * <p>Unlike the {@code multiGetChunked} call above, {@link
+     * #decompressForBatch}'s {@link NanocachedException.DecompressionFailed}
+     * is deliberately left uncaught here rather than folded into the same
+     * retry-and-return guard — it needs to escape this leg, not be
+     * swallowed — but that means it can reach {@link
+     * #drainLegsKeepingFirstBug} on a leg other than the first to fail,
+     * since every owner's leg runs concurrently and any of them can trip
+     * the shared {@code budget} check at the same time (issue #413);
+     * {@code drainLegsKeepingFirstBug} knows to classify that one
+     * specially rather than as a background write bug. */
     private void runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
             byte[][] keyBytes, byte[][] values, List<Integer> retry, long[] budget) {
@@ -2525,6 +2547,19 @@ public final class NanocachedClient implements AutoCloseable {
      * protocol-level failure this SDK produces is already wrapped as a
      * {@link NanocachedException} and caught well before here — a
      * genuine, uncaught bug is by definition not reproducible that way).
+     *
+     * <p>One deliberate exception to that: {@link #runMultiGetLeg} lets a
+     * {@link NanocachedException.DecompressionFailed} from {@link
+     * #decompressForBatch} escape uncaught by design, and since every
+     * owner's leg runs concurrently, more than one leg can trip it at
+     * once (the same shared decompression-budget check, tripped by
+     * multiple legs racing past it together). Only the first such bug
+     * reaching here is a real signal — it's already the one this method
+     * rethrows to the caller, aborting the whole batch — so any further
+     * one is a redundant echo of the same client-side condition, not an
+     * independent programming bug, and reporting it via {@link
+     * #reportBackgroundWriteBug} would violate that counter's own
+     * documented invariant (issue #413). It's dropped instead.
      * Returns the first bug, or {@code null} if every leg succeeded. */
     RuntimeException drainLegsKeepingFirstBug(List<CompletableFuture<Void>> legs) {
         RuntimeException legBug = null;
@@ -2535,7 +2570,7 @@ public final class NanocachedClient implements AutoCloseable {
                 RuntimeException bug = unwrapReplicaBug(wrapped);
                 if (legBug == null) {
                     legBug = bug;
-                } else {
+                } else if (!(bug instanceof NanocachedException.DecompressionFailed)) {
                     reportBackgroundWriteBug(bug);
                 }
             }

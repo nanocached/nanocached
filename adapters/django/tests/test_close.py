@@ -75,6 +75,50 @@ class CloseLifecycleTests(unittest.TestCase):
         parent_thread.join()
         parent_loop.close()
 
+    def test_fork_hook_resets_a_lifecycle_lock_still_held_at_fork_time(self) -> None:
+        # issue #414: if another thread holds _lifecycle_lock at the
+        # moment of fork() (e.g. a threaded warm-up cache touch racing
+        # gunicorn preload_app), the forked child inherits it already
+        # locked with no thread that could ever release it — CPython
+        # does not reinitialize a plain threading.Lock after fork the
+        # way it does its own import lock, so every subsequent
+        # `with self._lifecycle_lock` in the child (starting with the
+        # very next _ensure_started() call) would block forever. The fix
+        # registers an os.register_at_fork(after_in_child=...) hook that
+        # swaps in a fresh, unlocked Lock() for every live instance.
+        #
+        # This calls that registered hook directly rather than
+        # performing a real os.fork() — fork() alongside live threads
+        # and an asyncio loop, from inside a unittest process, is
+        # exactly the combination Python's own documentation warns is
+        # unsafe — but it still exercises the real mechanism: the exact
+        # callable object handed to os.register_at_fork().
+        from nanocached_django.backend import _reset_lifecycle_locks_in_child
+
+        backend = self._new_backend()
+        backend.set("k", "v")  # forces the lazy connect, registers the hook
+        backend._lifecycle_lock.acquire()  # simulate another thread holding it at fork time
+        old_lock = backend._lifecycle_lock
+
+        _reset_lifecycle_locks_in_child()
+
+        self.assertIsNot(backend._lifecycle_lock, old_lock)
+        # The new lock is a fresh, unlocked Lock() — acquiring it must
+        # not block.
+        self.assertTrue(backend._lifecycle_lock.acquire(timeout=1))
+        backend._lifecycle_lock.release()
+        backend.shutdown()
+
+    def test_fork_hook_is_registered_on_posix(self) -> None:
+        import os
+
+        from nanocached_django import backend as backend_module
+
+        backend = self._new_backend()
+        self.addCleanup(backend.shutdown)
+        if hasattr(os, "register_at_fork"):
+            self.assertTrue(backend_module._fork_hook_registered)
+
     def test_close_on_request_option_makes_close_tear_down(self) -> None:
         backend = self._new_backend(CLOSE_ON_REQUEST=True)
         backend.set("k", "v")

@@ -601,6 +601,21 @@ function parseTtlSeconds(field: string): number {
   return ttlSeconds;
 }
 
+// Same strict-decimal-digits-only, magnitude-checked parsing as
+// parseTtlSeconds above (issue #233's TAG_PATTERN/Number.isSafeInteger
+// discipline), shared by the multi-header `count` field and each
+// per-key `length` token in an `M` reply — those used bare `Number()` +
+// `Number.isInteger`, which (unlike this) accepts scientific notation,
+// leading `+`/whitespace, and precision-losing long digit strings.
+// Returns `undefined` rather than throwing so each call site can attach
+// its own error message (and, for peekMultiFrameLength, keep its
+// never-throws contract).
+function parseStrictInteger(field: string): number | undefined {
+  if (!TAG_PATTERN.test(field)) return undefined;
+  const value = Number(field);
+  return Number.isSafeInteger(value) ? value : undefined;
+}
+
 interface MultiHeader {
   count: number;
   tokens: string[];
@@ -625,10 +640,18 @@ function parseMultiHeader(buf: Buffer, tagged: boolean): MultiHeader | null {
     }
     return null;
   }
+  // Applied unconditionally, not just on the incomplete-header branch
+  // above: a peer that delivers a complete header + LF within a single
+  // chunk (realistic — Node can hand `onData` far more than 4KB at once)
+  // must not skip this cap, since `count` below is otherwise unbounded
+  // and drives `new Array(header.count)` further down.
+  if (headerEnd > MAX_MULTI_HEADER_LENGTH) {
+    throw new NanocachedError("nanocached: invalid multi-get/multi-set response (header too long)");
+  }
 
   const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
-  const count = Number(fields[0]);
-  if (!Number.isInteger(count) || count < 0) {
+  const count = parseStrictInteger(fields[0]);
+  if (count === undefined) {
     throw new NanocachedError("nanocached: invalid multi-get/multi-set count in response");
   }
   const expectedFields = 1 + count + (tagged ? 1 : 0);
@@ -667,8 +690,8 @@ export function peekMultiFrameLength(buf: Buffer, tagged: boolean): number | und
   let total = header.headerEnd + 1;
   for (const token of header.tokens) {
     if (token === "-" || token === "W") continue;
-    const length = Number(token);
-    if (!Number.isInteger(length) || length < 0) return undefined;
+    const length = parseStrictInteger(token);
+    if (length === undefined) return undefined;
     total += length;
   }
   return total;
@@ -842,8 +865,8 @@ export function tryParseResponse(buf: Buffer, tagged = false): { response: Parse
           hitLengths[i] = -1;
           continue;
         }
-        const length = Number(token);
-        if (!Number.isInteger(length) || length < 0 || length > MAX_VALUE_LENGTH) {
+        const length = parseStrictInteger(token);
+        if (length === undefined || length > MAX_VALUE_LENGTH) {
           throw new NanocachedError("nanocached: invalid multi-get result length in response");
         }
         hitLengths[i] = length;

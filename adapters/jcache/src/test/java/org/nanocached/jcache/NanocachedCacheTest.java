@@ -14,6 +14,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.cache.Cache;
 import javax.cache.CacheManager;
 import javax.cache.configuration.CacheEntryListenerConfiguration;
@@ -41,6 +42,7 @@ import javax.management.ObjectName;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.nanocached.NanocachedException;
 
 class NanocachedCacheTest {
 
@@ -459,6 +461,72 @@ class NanocachedCacheTest {
         assertEquals(0, node.multiSetCount.get());
     }
 
+    // ── getAll/putAll partial-wrong-node recovery (issue #415) ───────
+
+    @Test
+    void getAllRetriesAndMergesTheRemainderAfterAMidBatchWrongNode() {
+        // A ring change mid-batch used to discard the whole getAll: the
+        // SDK's getManyBytes throws NanocachedException.PartialWrongNodeRaw,
+        // which carries every key that DID resolve, but getAll used to let
+        // that exception propagate uncaught, losing the resolved data too.
+        // It must now retry just the still-unresolved remainder and merge
+        // the result back in.
+        cache.putAll(Map.of("a", "1", "b", "2", "c", "3"));
+        node.forceWrongNodeCountsForGet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+        node.multiGetCount.set(0);
+
+        Map<String, String> all = cache.getAll(Set.of("a", "b", "c", "missing"));
+
+        assertEquals(Map.of("a", "1", "b", "2", "c", "3"), all);
+        assertEquals(2, node.multiGetCount.get(), "the forced W costs exactly one extra retry round");
+    }
+
+    @Test
+    void getAllPropagatesWrongNodeOnceItsRetryBudgetIsExhausted() {
+        // A key that never actually resolves (the ring never settles)
+        // must not retry forever — it eventually propagates, the same as
+        // it would if the SDK's own single-key withWrongNodeRetry gave up.
+        cache.put("a", "1");
+        node.forceWrongNodeCountsForGet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
+
+        assertThrows(NanocachedException.WrongNode.class, () -> cache.getAll(Set.of("a")));
+    }
+
+    @Test
+    void putAllRetriesTheGroupAndFiresEventsAfterAMidBatchWrongNode() {
+        // Same regression as getAll's above, but for putAll: setManyBytes
+        // has no per-key partial payload to retry a remainder from (see
+        // NanocachedException.PartialWrongNode's own doc), so putAll
+        // retries the whole TTL group instead — a mid-batch ring change
+        // must not abort the write and drop its listener events.
+        List<String> events = new CopyOnWriteArrayList<>();
+        RecordingListener<String, String> listener = new RecordingListener<>(events);
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
+        node.forceWrongNodeCountsForSet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+        node.multiSetCount.set(0);
+
+        cache.putAll(Map.of("a", "1", "b", "2"));
+
+        assertEquals("1", cache.get("a"));
+        assertEquals("2", cache.get("b"));
+        assertEquals(2, node.multiSetCount.get(), "the forced W costs exactly one extra retry round");
+        assertEquals(2, events.size());
+        assertTrue(events.contains("CREATED:a:1"));
+        assertTrue(events.contains("CREATED:b:2"));
+    }
+
+    @Test
+    void putAllPropagatesWrongNodeOnceItsRetryBudgetIsExhausted() {
+        node.forceWrongNodeCountsForSet.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
+
+        assertThrows(NanocachedException.WrongNode.class, () -> cache.putAll(Map.of("a", "1")));
+    }
+
     /** creation → 60 s, update → 30 s: two distinct TTLs within one putAll. */
     private static final class SplitExpiryPolicy implements ExpiryPolicy, java.io.Serializable {
         @Override
@@ -488,6 +556,47 @@ class NanocachedCacheTest {
         assertFalse(cache.containsKey("a"));
         assertFalse(cache.containsKey("b"));
         assertEquals("3", cache.get("c"));
+    }
+
+    @Test
+    void removeAllOfAnEmptySetIsANoOp() {
+        cache.removeAll(Set.of());
+    }
+
+    @Test
+    void removeAllFansItsDeletesOutConcurrentlyRatherThanOneAtATime() {
+        // Issue #415: removeAll(Set) used to be `for (K key : keys)
+        // remove(key)` — one blocking RPC after another. With N keys and
+        // each delete taking node.deleteDelayMillis to answer (answered
+        // off the mock's read loop — see MockNode.delete's doc — so the
+        // delay only measures how many round trips are actually in
+        // flight together, not the mock's own processing order), the old
+        // loop takes roughly N * delayMillis; a concurrent fan-out takes
+        // roughly one delayMillis, however many keys there are.
+        int keyCount = 20;
+        long delayMillis = 150;
+        Map<String, String> entries = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            entries.put("k" + i, "v" + i);
+        }
+        cache.putAll(entries);
+        node.deleteDelayMillis = delayMillis;
+        long elapsedMillis;
+        try {
+            long start = System.nanoTime();
+            cache.removeAll(entries.keySet());
+            elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        } finally {
+            node.deleteDelayMillis = 0;
+        }
+
+        assertTrue(
+                elapsedMillis < keyCount * delayMillis / 2,
+                "removeAll should fan its deletes out concurrently, not run them one at a time (took "
+                        + elapsedMillis + "ms for " + keyCount + " keys at " + delayMillis + "ms each)");
+        for (String key : entries.keySet()) {
+            assertFalse(cache.containsKey(key));
+        }
     }
 
     @Test

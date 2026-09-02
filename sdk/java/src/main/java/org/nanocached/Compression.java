@@ -39,7 +39,7 @@ final class Compression {
     // bounding the worst case. Mutable, not final, only so a test can
     // lower it without allocating the real bound. Same 256 MiB cap as the
     // other five SDKs.
-    static long maxMultiGetDecompressedBytes = 256L * 1024 * 1024;
+    static volatile long maxMultiGetDecompressedBytes = 256L * 1024 * 1024;
 
     private Compression() {}
 

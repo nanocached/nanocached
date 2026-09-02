@@ -3413,7 +3413,7 @@ func TestGetManyBytesEnforcesACumulativeDecompressedBudget(t *testing.T) {
 	defer func() { maxMultiGetDecompressedBytes = saved }()
 
 	node := startMockNode(t, nil)
-	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, Compress: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3429,6 +3429,70 @@ func TestGetManyBytesEnforcesACumulativeDecompressedBudget(t *testing.T) {
 	_, err = client.GetManyBytes([]string{"a", "c"})
 	if !errors.Is(err, ErrDecompression) {
 		t.Fatalf("GetManyBytes err = %v, want ErrDecompression for the cumulative budget", err)
+	}
+}
+
+func TestGetManyBytesBudgetCatchesTheCrossingEntryEvenWhenLast(t *testing.T) {
+	// Regression (pass-9 audit, issue #410a): the cumulative budget used to
+	// be checked BEFORE charging the current entry, so the entry that
+	// actually crosses the cap always slipped through uncaught — and if it
+	// was the last hit in the response, the guard never fired at all. Only
+	// one key here, so the crossing entry is necessarily the last (and
+	// only) one; charge-then-check must still catch it.
+	saved := maxMultiGetDecompressedBytes
+	maxMultiGetDecompressedBytes = 1
+	defer func() { maxMultiGetDecompressedBytes = saved }()
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, Compress: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("a", "12", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.GetManyBytes([]string{"a"})
+	if !errors.Is(err, ErrDecompression) {
+		t.Fatalf("GetManyBytes err = %v, want ErrDecompression for the cumulative budget "+
+			"even when the crossing entry is the last (only) one", err)
+	}
+}
+
+func TestGetManyBytesDoesNotChargeTheBudgetWhenCompressIsDisabled(t *testing.T) {
+	// Regression (pass-9 audit, issue #410b): the cumulative budget used to
+	// be charged and enforced even when the client has compression
+	// disabled, so a large uncompressed batch could fail with a misleading
+	// "decompression bomb" error. Lower the budget far below what this
+	// batch would need if it were (wrongly) charged, and confirm it still
+	// succeeds with compression off.
+	saved := maxMultiGetDecompressedBytes
+	maxMultiGetDecompressedBytes = 1
+	defer func() { maxMultiGetDecompressedBytes = saved }()
+
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("a", "12", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set("c", "34", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	values, err := client.GetManyBytes([]string{"a", "c"})
+	if err != nil {
+		t.Fatalf("GetManyBytes err = %v, want nil — the cumulative budget must not apply "+
+			"when compression is disabled", err)
+	}
+	if string(values["a"]) != "12" || string(values["c"]) != "34" {
+		t.Fatalf("GetManyBytes = %v, want {a:12 c:34}", values)
 	}
 }
 

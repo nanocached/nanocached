@@ -1,9 +1,11 @@
 """A trimmed, synchronous stand-in for nanocached-node, speaking just
 enough of the wire protocol — ``A``, namespaced ``g``/``s``/``d`` (issue
 #105) with their legacy ``G``/``S``/``D`` counterparts, ``c``/``F``
-(issue #106), ``i`` (issue #129), and ``m``/``o`` (issue #152) — for
-these adapter tests to exercise NanocachedCache over a real TCP socket
-without the Rust binary.
+(issue #106), ``i`` (issue #129), ``m``/``o`` (issue #152), and the
+``A``/``P``-conditioned forms of ``k`` (issue #141/#414 — the
+digest-conditioned form isn't exercised by these adapter tests and isn't
+implemented here) — for these adapter tests to exercise NanocachedCache
+over a real TCP socket without the Rust binary.
 A trimmed re-implementation of
 ``sdk/python/tests/mock_servers.py``'s ``MockNode`` (that module is
 private to the SDK's own test suite, see the shared adapters spec) built
@@ -47,6 +49,7 @@ class MockNode:
         self.incr_count = 0
         self.multi_get_count = 0
         self.multi_set_count = 0
+        self.cas_set_count = 0
 
         self._lock = threading.Lock()
         self._server: socketserver.ThreadingTCPServer | None = None
@@ -242,6 +245,40 @@ class MockNode:
                                     new_bytes,
                                 )
                     wfile.write(reply)
+                    wfile.flush()
+
+                elif cmd == b"k":
+                    # Compare-and-set (issue #141, docs/protocol.html
+                    # "k / x"): <namespace-length> <key-length>
+                    # <value-length> <cond> [<ttl-seconds>] — <cond> is a
+                    # bare token, not length-prefixed: "A" (absent), "P"
+                    # (present), or a 32-character hex digest (not
+                    # implemented by this mock — see the module
+                    # docstring). Always namespaced, no legacy uppercase
+                    # form, same as `i`/`c`.
+                    namespace = rfile.read(int(parts[1]))
+                    key_length = int(parts[2])
+                    value_length = int(parts[3])
+                    cond = parts[4]
+                    ttl = int(parts[5]) if len(parts) > 5 else 0
+                    key = rfile.read(key_length)
+                    value = rfile.read(value_length)
+                    self.cas_set_count += 1
+                    with self._lock:
+                        current = self.ns_store.get((namespace, key)) if namespace else self.store.get(key)
+                        if cond == b"A":
+                            matches = current is None
+                        elif cond == b"P":
+                            matches = current is not None
+                        else:
+                            matches = False  # digest form: unsupported by this mock
+                        if matches:
+                            self.ttls[(namespace, key)] = ttl
+                            if namespace:
+                                self.ns_store[(namespace, key)] = value
+                            else:
+                                self.store[key] = value
+                    wfile.write((b"S" if matches else b"N") + b"\n")
                     wfile.flush()
 
                 elif cmd == b"m":

@@ -1202,19 +1202,32 @@ public sealed class NanocachedClient : IDisposable
     /// concurrently: once the budget is crossed, remaining entries (in
     /// this and other legs) fail before decompressing rather than each
     /// allocating another value first — peak allocation is therefore the
-    /// budget plus one value per concurrent leg.</summary>
+    /// budget plus one value per concurrent leg.
+    ///
+    /// <para>The budget only applies when <c>Compress</c> is actually
+    /// enabled (issue #410b) — with it off, <see cref="MaybeDecompress"/>
+    /// is a no-op and the per-response read size already bounds this path
+    /// on its own, so charging it here would just be an undocumented
+    /// total-batch cap on uncompressed batches. And the current entry is
+    /// charged before the cap is checked (issue #410a) so the entry that
+    /// actually crosses it is caught — and excluded — rather than
+    /// slipping through, which matters most when it is the last hit in
+    /// the response.</para></summary>
     private byte[] DecompressForBatch(byte[] raw, long[] budget)
     {
         lock (budget)
         {
-            if (budget[0] > Compression.MaxMultiGetDecompressedBytes)
-            {
-                throw new DecompressionException(
-                    "nanocached: cumulative decompressed size of this GetMany response " +
-                    "exceeds the maximum — possible decompression bomb across the batch");
-            }
             byte[] value = MaybeDecompress(raw);
-            budget[0] += value.Length;
+            if (_compress)
+            {
+                budget[0] += value.Length;
+                if (budget[0] > Compression.MaxMultiGetDecompressedBytes)
+                {
+                    throw new DecompressionException(
+                        "nanocached: cumulative decompressed size of this GetMany response " +
+                        "exceeds the maximum — possible decompression bomb across the batch");
+                }
+            }
             return value;
         }
     }

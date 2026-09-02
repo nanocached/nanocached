@@ -1523,16 +1523,27 @@ export class NanocachedClient {
    * decompressed size against the response's cumulative budget (issue:
    * pass-7 audit). decompressValue already caps a single value; this
    * bounds the whole response so a batch of highly-compressible values
-   * can't amplify that per-value cap into gigabytes of allocation. */
+   * can't amplify that per-value cap into gigabytes of allocation.
+   *
+   * The budget only applies when compression is actually enabled (issue
+   * #410b) — with it off, `value` below is just `raw` and the
+   * per-response read size already bounds this path on its own, so
+   * charging it here would just be an undocumented total-batch cap on
+   * uncompressed batches. And the charge happens before the check (issue
+   * #410a) so the entry that actually crosses the cap is caught — and
+   * excluded — rather than slipping through, which matters most when it
+   * is the last hit in the response. */
   private decompressForBatch(raw: Buffer, budget: { decompressed: number }): Buffer {
-    if (budget.decompressed > maxMultiGetDecompressedBytes) {
-      throw new DecompressionError(
-        "cumulative decompressed size of this getMany response exceeds the maximum — " +
-          "possible decompression bomb across the batch",
-      );
-    }
     const value = this.compress ? decompressValue(raw) : raw;
-    budget.decompressed += value.length;
+    if (this.compress) {
+      budget.decompressed += value.length;
+      if (budget.decompressed > maxMultiGetDecompressedBytes) {
+        throw new DecompressionError(
+          "cumulative decompressed size of this getMany response exceeds the maximum — " +
+            "possible decompression bomb across the batch",
+        );
+      }
+    }
     return value;
   }
 
@@ -1958,8 +1969,8 @@ export class NanocachedClient {
    * replica byte-identical to the primary; only the value handed back to
    * *this* caller is refused. */
   private async incrInNamespace(namespace: Uint8Array, key: string | Uint8Array, delta: number): Promise<number | null> {
-    if (this.compress) throw new CompressionIncompatibleError();
     if (this.closed) throw new AlreadyClosedError();
+    if (this.compress) throw new CompressionIncompatibleError();
     await this.maybeRefreshNodeList();
     const result = await this.withWrongNodeRetry(
       () =>

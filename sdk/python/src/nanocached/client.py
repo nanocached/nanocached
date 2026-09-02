@@ -590,7 +590,7 @@ class NanocachedClient:
             try:
                 await client._open_cluster(identified)
             except BaseException:
-                client._teardown()
+                await client._teardown()
                 raise
             client._start_keepalive()
             return client
@@ -653,7 +653,7 @@ class NanocachedClient:
             try:
                 await client._connect_to_proxy(identified)
             except BaseException:
-                client._teardown()
+                await client._teardown()
                 raise
             client._start_keepalive()
             return client
@@ -1135,14 +1135,24 @@ class NanocachedClient:
         per-value cap into gigabytes of allocation. ``budget`` is a
         one-element list used as a shared mutable counter across the two
         cluster passes and every concurrent owner group (decompression here
-        is synchronous, so the asyncio event loop never interleaves it)."""
-        if budget[0] > _MAX_MULTIGET_DECOMPRESSED_BYTES:
-            raise DecompressionError(
-                "cumulative decompressed size of this get_many response exceeds the "
-                "maximum — possible decompression bomb across the batch"
-            )
+        is synchronous, so the asyncio event loop never interleaves it).
+        The budget only applies when compression is actually enabled — with
+        it off, _maybe_decompress() is a no-op and the per-response read
+        size already bounds this path on its own, so charging it here would
+        just be an undocumented total-batch cap on uncompressed batches."""
         out = self._maybe_decompress(value)
-        budget[0] += len(out)
+        if self._compress:
+            # Charge the current entry before checking so the entry that
+            # actually crosses the cap is caught (and excluded) rather than
+            # slipping through — this matters most when it is the last hit
+            # in the response, where a check-before-charge order would
+            # never trip at all.
+            budget[0] += len(out)
+            if budget[0] > _MAX_MULTIGET_DECOMPRESSED_BYTES:
+                raise DecompressionError(
+                    "cumulative decompressed size of this get_many response exceeds the "
+                    "maximum — possible decompression bomb across the batch"
+                )
         return out
 
     async def get_many_bytes(self, keys: Sequence[str | bytes]) -> dict[str | bytes, bytes]:
@@ -1248,7 +1258,21 @@ class NanocachedClient:
         try:
             raw = await self._get_many_bytes(namespace, keys)
         except (PartialWrongNodeError, PartialConnectionLostError) as error:
-            error.partial_values = {key: value.decode() for key, value in error.partial_values.items()}
+            # Defensive decode (issue #412): a stored value need not be
+            # valid UTF-8 even when this is get_many() rather than
+            # get_many_bytes() (nothing on the write side enforces
+            # that) — a plain .decode() raising UnicodeDecodeError here
+            # would replace the exception this except block exists to
+            # enrich and re-raise with an unrelated decode error,
+            # masking the wrong-node/partial-failure information callers
+            # need. errors="replace" keeps this best-effort convenience
+            # view lossy rather than exception-prone; the exact bytes
+            # are still available via partial_values before this
+            # reassignment, and via get_many_bytes() to any caller who
+            # needs them exact.
+            error.partial_values = {
+                key: value.decode(errors="replace") for key, value in error.partial_values.items()
+            }
             raise
         return {key: value.decode() for key, value in raw.items()}
 
@@ -2072,7 +2096,7 @@ class NanocachedClient:
         await _drain_tasks(self._background_replica_writes)
         await _drain_tasks(self._hedged_reads)
 
-        self._teardown()
+        await self._teardown()
 
     async def __aenter__(self) -> "NanocachedClient":
         return self
@@ -2080,12 +2104,23 @@ class NanocachedClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    def _teardown(self) -> None:
+    async def _teardown(self) -> None:
+        connections = []
         if self._single is not None:
             self._single.close()
+            connections.append(self._single)
         for member in self._members.values():
             if member.connection is not None:
                 member.connection.close()
+                connections.append(member.connection)
+        # Reap each connection's read-loop task (issue #412), the same
+        # way close() already reaps _keepalive_task/_refresh_task/
+        # _redials/_background_replica_writes/_hedged_reads just above —
+        # close() alone only closes the writer, which doesn't guarantee
+        # the read loop notices and finishes before this coroutine
+        # returns.
+        if connections:
+            await asyncio.gather(*(c.wait_closed() for c in connections), return_exceptions=True)
 
     # ── ルーティングと複製 ─────────────────────────────────────────
 
@@ -2678,7 +2713,7 @@ class NanocachedClient:
             )
 
         if self._closed:
-            self._teardown()
+            await self._teardown()
             return
 
         # Drop reconnect-cooldown entries for addresses whose owning node

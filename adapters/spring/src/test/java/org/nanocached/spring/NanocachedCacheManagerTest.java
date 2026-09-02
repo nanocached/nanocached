@@ -248,6 +248,35 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
+    void getWithLoaderWrapsStoreFailuresFromTheSuccessfulLoad() {
+        // Regression (issue #417): put(key, loaded) used to sit outside
+        // the try/catch that wraps the loader call, so a store-side
+        // failure for an otherwise-successful load (a non-Serializable
+        // value with the default serializer, here) escaped unwrapped
+        // instead of being reported as Spring's own ConcurrentMapCache
+        // reports it: a ValueRetrievalException.
+        Cache cache = manager().build().getCache("users");
+        Object notSerializable = new Object();
+
+        Cache.ValueRetrievalException thrown = assertThrows(
+                Cache.ValueRetrievalException.class,
+                () -> cache.get("k", () -> notSerializable));
+        assertInstanceOf(IllegalArgumentException.class, thrown.getCause());
+    }
+
+    @Test
+    void getWithLoaderWrapsStoreFailuresFromANullValueWhenDisallowed() {
+        Cache cache = manager().allowNullValues(false).build().getCache("users");
+
+        Cache.ValueRetrievalException thrown = assertThrows(
+                Cache.ValueRetrievalException.class,
+                () -> cache.get("k", () -> null));
+        assertInstanceOf(IllegalArgumentException.class, thrown.getCause());
+        // The failed store must not have left a half-written entry behind.
+        assertNull(cache.get("k"));
+    }
+
+    @Test
     void putIfAbsentKeepsTheFirstValue() {
         Cache cache = manager().build().getCache("users");
 

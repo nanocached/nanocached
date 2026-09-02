@@ -865,13 +865,19 @@ pub(crate) async fn run(
         forward_tx,
     };
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    // Issue #407: boxed and reassignable (rather than `tokio::pin!`'d
+    // once) so a second signal while draining can be listened for again —
+    // `shutdown_signal()`'s underlying future is consumed the moment it
+    // resolves, and re-polling a completed future is not something the
+    // `Future` contract allows, so "listening again" means installing a
+    // fresh one, not reusing this one.
+    let mut shutdown: Pin<Box<dyn Future<Output = io::Result<()>> + Send>> =
+        Box::pin(shutdown_signal());
 
     // Issue #124: set once the decommission has been spawned; its
     // completion signal re-enters the loop below to run the ordinary
     // shutdown. A second signal while draining falls through to the
-    // immediate path (operator override).
+    // immediate path (operator override, issue #407).
     let mut decommission_started = false;
     let (decommission_done_tx, mut decommission_done_rx) = watch::channel(false);
 
@@ -879,8 +885,30 @@ pub(crate) async fn run(
         tokio::select! {
             biased;
 
-            result = &mut shutdown, if !decommission_started => {
+            result = &mut shutdown => {
                 result?;
+
+                // Issue #407: a second Ctrl-C/SIGTERM while decommission
+                // draining is already under way is the operator override
+                // this branch's own comment above promises — stop waiting
+                // on the drain budget (or a `decommission_done` that may
+                // never come) and fall straight into the same immediate
+                // shutdown path a non-clustered node's first signal takes.
+                if decommission_started {
+                    println!(
+                        "INFO second shutdown signal received — overriding decommission drain"
+                    );
+                    shutdown_tx.send_replace(true);
+                    if let Some(migration) = active_migration
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                    {
+                        migration.abort_requested.store(true, Ordering::SeqCst);
+                    }
+
+                    break;
+                }
 
                 // Issue #124: a clustered node with a drain budget
                 // decommissions first — hand entries to their post-leave
@@ -889,11 +917,9 @@ pub(crate) async fn run(
                 // write-forwarding during the drain is the point), so
                 // the decommission is spawned and its completion loops
                 // back in via `decommission_done`.
-                if let (Some(node_context), Some(discovery_addrs), false) = (
-                    &node_context,
-                    &discovery_addrs_for_leave,
-                    decommission_started,
-                ) && !drain_timeout.is_zero()
+                if let (Some(node_context), Some(discovery_addrs)) =
+                    (&node_context, &discovery_addrs_for_leave)
+                    && !drain_timeout.is_zero()
                 {
                     println!(
                         "INFO shutdown signal received — decommissioning (budget {}s)",
@@ -911,6 +937,10 @@ pub(crate) async fn run(
                         run_decommission(node_context, discovery_addrs, drain_timeout).await;
                         let _ = done.send(true);
                     });
+                    // Issue #407: re-arm so a second signal during the
+                    // drain is still noticed (see the boxed `shutdown`'s
+                    // own doc comment above).
+                    shutdown = Box::pin(shutdown_signal());
                     continue;
                 }
 
@@ -2135,11 +2165,30 @@ async fn handle_connection(
                     // call, and `Bytes::clone` is a cheap refcount bump.
                     // Issue #233: skip the clone entirely when there's no
                     // `node_context` to forward through — the loop below
-                    // never runs in that case.
-                    let forward = config
-                        .node_context
-                        .is_some()
-                        .then(|| (owned_keys.clone(), owned_values.clone()));
+                    // never runs in that case. Issue #408: also skip it in
+                    // the steady state, when a `node_context` exists but
+                    // neither a migration nor a decommission is actually in
+                    // flight — `migration_target_for`/`leave_target_for`
+                    // would return `None` for every key below regardless,
+                    // so cloning the whole batch up front paid for a copy
+                    // every ordinary `MultiSet` never used. Both locks are
+                    // cheap presence checks, unlike the per-key `Bytes`
+                    // clones this decides whether to pay for.
+                    let forwarding_possible =
+                        config.node_context.as_ref().is_some_and(|node_context| {
+                            node_context
+                                .active_migration
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .is_some()
+                                || node_context
+                                    .leaving
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .is_some()
+                        });
+                    let forward =
+                        forwarding_possible.then(|| (owned_keys.clone(), owned_values.clone()));
 
                     let response = execute_command(
                         &request_tx,
@@ -2164,9 +2213,9 @@ async fn handle_connection(
                     // owned key, once the local write is confirmed stored
                     // (`execute` only ever answers `Stored` for an owned
                     // key, but check anyway rather than assume it).
-                    if let Some(node_context) = &config.node_context {
-                        let (forward_names, forward_values) =
-                            forward.expect("node_context.is_some() implies forward is Some");
+                    if let (Some(node_context), Some((forward_names, forward_values))) =
+                        (&config.node_context, forward)
+                    {
                         for ((name, value), result) in forward_names
                             .into_iter()
                             .zip(forward_values)
@@ -3305,10 +3354,13 @@ async fn read_heartbeat_ack<S: AsyncBufReadExt + Unpin>(
         .and_then(|raw| raw.parse().ok())
         .filter(|count| *count <= MAX_ROSTER_ENTRIES)
         .ok_or_else(malformed)?;
+    // Issue #408: upper-bounded like `count` just above — a replication
+    // factor can never sensibly exceed the roster size, and leaving it
+    // unbounded is asymmetric with how `count` is validated right here.
     let replication: usize = fields
         .next()
         .and_then(|raw| raw.parse().ok())
-        .filter(|replication| *replication >= 1)
+        .filter(|replication| (1..=MAX_ROSTER_ENTRIES).contains(replication))
         .ok_or_else(malformed)?;
     if fields.next().is_some() {
         return Err(malformed());
@@ -3382,6 +3434,14 @@ fn adopt_membership(
     mut members: Vec<String>,
     replication: usize,
 ) -> Option<RingChange> {
+    // Issue #408: every message below is printed only after its lock is
+    // dropped — `active_migration`/`known_ring` are both also locked from
+    // the GET/SET hot path (`migration_target_for` and friends), so a
+    // backpressured stdout/stderr must not stall it, matching
+    // `MigrationGuard::new`'s own already-fixed sibling branch.
+    let mut confirmed_msg: Option<(String, usize)> = None;
+    let mut evicted_msg: Option<String> = None;
+
     let join_still_pending = {
         let mut slot = active_migration
             .lock()
@@ -3394,12 +3454,7 @@ fn adopt_membership(
                 // copies may now be swept (`run_sweep`).
                 if joiner_listed && active.completed_at.is_some() && !active.confirmed {
                     active.confirmed = true;
-                    println!(
-                        "INFO join of {} confirmed by discovery at {discovery_addr}; {} dead \
-                         copies released to the sweep",
-                        active.joining_name,
-                        active.marked_keys.len()
-                    );
+                    confirmed_msg = Some((active.joining_name.clone(), active.marked_keys.len()));
                 }
                 // A joiner discovery already confirmed and later dropped
                 // from its roster was *evicted*, not "not yet joined": the
@@ -3422,14 +3477,24 @@ fn adopt_membership(
         // released to the sweep at confirmation, so taking it is exactly
         // what the grace expiring would have done.
         if joiner_evicted && let Some(taken) = slot.take() {
-            println!(
-                "INFO joiner {} evicted by discovery at {discovery_addr}; closing its \
-                 forwarding window early",
-                taken.joining_name
-            );
+            evicted_msg = Some(taken.joining_name);
         }
         pending
     };
+
+    if let Some((joining_name, marked_len)) = confirmed_msg {
+        println!(
+            "INFO join of {joining_name} confirmed by discovery at {discovery_addr}; \
+             {marked_len} dead copies released to the sweep"
+        );
+    }
+    if let Some(joining_name) = evicted_msg {
+        println!(
+            "INFO joiner {joining_name} evicted by discovery at {discovery_addr}; closing its \
+             forwarding window early"
+        );
+    }
+
     if join_still_pending {
         return None;
     }
@@ -3451,17 +3516,20 @@ fn adopt_membership(
         return None;
     }
 
-    println!(
-        "INFO membership updated from discovery at {discovery_addr}: {} member(s), \
-         replication factor {replication}",
-        members.len()
-    );
+    let member_count = members.len();
     let before = guard.as_ref().cloned();
     let after = Arc::new(Membership {
         ring: Arc::new(HashRing::new(members)),
         replication,
     });
     *guard = Some(Arc::clone(&after));
+    drop(guard);
+
+    println!(
+        "INFO membership updated from discovery at {discovery_addr}: {member_count} member(s), \
+         replication factor {replication}"
+    );
+
     Some(RingChange { before, after })
 }
 
@@ -3856,6 +3924,14 @@ impl MigrationGuard {
 
         let mut restore = Vec::new();
         let mut abandoned_known_ring: Option<(Arc<HashRing>, Option<Arc<Membership>>)> = None;
+        // Issue #408: message for the abandoned-handoff branch below,
+        // printed only after `guard` is dropped (same reasoning as the
+        // `completed_at.is_none()` branch just above it: `slot` is also
+        // locked by `migration_target_for` on every GET/SET, so a
+        // backpressured stderr must not stall that hot path). Captures its
+        // own copy of `joining_name` since the parameter is moved into the
+        // new `ActiveMigration` below, before this can be printed.
+        let mut abandoned_msg: Option<(String, usize, String)> = None;
         if let Some(existing) = guard.as_ref() {
             if existing.joining_name == joining_name {
                 // Same-name retry: re-ack idempotently once the original
@@ -3900,12 +3976,11 @@ impl MigrationGuard {
                     Arc::clone(&existing.after_ring),
                     existing.pre_completion_ring.clone(),
                 ));
-                eprintln!(
-                    "WARN previous handoff to {} was abandoned (not in the roster M for \
-                     {joining_name} carries); restoring {} dead copies",
-                    existing.joining_name,
-                    restore.len()
-                );
+                abandoned_msg = Some((
+                    existing.joining_name.clone(),
+                    restore.len(),
+                    joining_name.clone(),
+                ));
             }
         }
 
@@ -3928,6 +4003,13 @@ impl MigrationGuard {
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
+
+        if let Some((abandoned_joining_name, restored_count, joining_name)) = abandoned_msg {
+            eprintln!(
+                "WARN previous handoff to {abandoned_joining_name} was abandoned (not in the \
+                 roster M for {joining_name} carries); restoring {restored_count} dead copies"
+            );
+        }
 
         // Locked only after the slot lock above is dropped — never both at
         // once (matches `abandon_migration`'s ordering).
@@ -4191,7 +4273,7 @@ async fn run_migration(
     // be delivering a copy this migration is about to mark dead (see
     // `wait_for_rereplication_to_clear`'s own doc comment) — wait for it
     // to clear before this handoff starts moving/marking anything.
-    wait_for_rereplication_to_clear(&node_context).await;
+    wait_for_rereplication_to_clear(&node_context, &migration_guard.abort_requested).await;
 
     let mut marked_this_run = Vec::new();
     let mut sent_count = 0usize;
@@ -4698,14 +4780,30 @@ async fn run_decommission(
     {
         active.abort_requested.store(true, Ordering::SeqCst);
     }
-    for _ in 0..50 {
+    // Issue #407: tied to `deadline` (this whole decommission's own
+    // `drain_budget`), not a fixed iteration count unrelated to it — a
+    // bare `0..50` (a fixed 5s) could cut this wait short well before a
+    // generous drain budget elapses, capping it far below what the
+    // operator actually asked for. Named/logged like the sibling waits,
+    // `wait_for_rereplication_to_clear`/`wait_for_migration_to_clear`,
+    // whose own comments point at this exact `completed_at.is_none()`
+    // check.
+    loop {
         let busy = node_context
             .active_migration
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .is_some_and(|active| active.completed_at.is_none());
-        if !busy || Instant::now() >= deadline {
+        if !busy {
+            break;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "WARN decommission: an in-flight join migration was still active after the \
+                 drain budget ({}s) elapsed; proceeding with the handoff anyway",
+                drain_budget.as_secs()
+            );
             break;
         }
         sleep(Duration::from_millis(100)).await;
@@ -5148,9 +5246,23 @@ const RING_CHANGE_HANDOFF_WAIT: Duration = Duration::from_secs(60);
 /// itself: this runs inside an already-bounded handoff (`run_migration`),
 /// not a background task of its own, so it has nothing better to do
 /// while shutdown is pending than keep waiting out its own bound.
-async fn wait_for_rereplication_to_clear(node_context: &NodeContext) {
+///
+/// Issue #422: also polls `abort_requested` — this handoff's *own*
+/// abort flag (`MigrationGuard::abort_requested`), not the
+/// re-replication's — and returns early once it's set. Without this, a
+/// handoff `abandon_migration` cancels while it's blocked in here isn't
+/// noticed until this wait returns on its own (up to
+/// `RING_CHANGE_HANDOFF_WAIT`, 60s): `run_migration`'s own abort check
+/// lives inside its `for key in keys` loop, which this wait runs ahead
+/// of, and `run_sweep` pauses entirely for as long as
+/// `active_migration.completed_at.is_none()` — true the whole time this
+/// abandoned handoff sits here, for no reason.
+async fn wait_for_rereplication_to_clear(node_context: &NodeContext, abort_requested: &AtomicBool) {
     let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
     loop {
+        if abort_requested.load(Ordering::SeqCst) {
+            return;
+        }
         let busy = node_context
             .active_rereplication
             .lock()
@@ -5187,6 +5299,12 @@ async fn wait_for_rereplication_to_clear(node_context: &NodeContext) {
 /// `after_ring` the moment the transfer finished. Treating the slot's
 /// mere presence as "busy" made this wait time out on essentially every
 /// call shortly after any join, for no reason.
+///
+/// Issue #422: also treats the occupying migration's own
+/// `abort_requested` as "not really busy" — once `abandon_migration` has
+/// flagged it, `run_migration` is already on its way to unwinding and
+/// clearing the slot (see `MigrationGuard::drop`); there is nothing left
+/// here worth waiting the full `RING_CHANGE_HANDOFF_WAIT` for.
 async fn wait_for_migration_to_clear(node_context: &NodeContext) {
     let deadline = Instant::now() + RING_CHANGE_HANDOFF_WAIT;
     loop {
@@ -5195,7 +5313,9 @@ async fn wait_for_migration_to_clear(node_context: &NodeContext) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .is_some_and(|active| active.completed_at.is_none());
+            .is_some_and(|active| {
+                active.completed_at.is_none() && !active.abort_requested.load(Ordering::SeqCst)
+            });
         if !busy {
             return;
         }
@@ -5217,14 +5337,29 @@ async fn wait_for_migration_to_clear(node_context: &NodeContext) {
 /// unit test that needs no network harness, mirroring
 /// `classify_decommission_key` for the decommission's own transfer loop.
 ///
-/// Sender election: of `key`'s owners under `before`, only the
-/// highest-ranked one that is still a member of `after` sends — the
-/// evicted node's own rank (if it held one) simply drops out of
-/// consideration, so the next-ranked survivor takes over the "first old
-/// owner sends" rule `run_migration` uses for a join. `self_name` must
-/// itself be an owner under `before`, or this returns empty without even
-/// looking for a sender (nothing to elect if this node wasn't an owner
+/// Sender: every one of `key`'s owners under `before` that is still a
+/// member of `after` is eligible to send — not just the highest-ranked
+/// survivor. `self_name` must itself be an owner under `before` and
+/// still be a member under `after`, or this returns empty (nothing to
+/// send if this node wasn't an old owner, or didn't survive the change,
 /// to begin with).
+///
+/// Issue #405: this used to elect only the single highest-ranked
+/// surviving old owner as "the" sender, mirroring how `run_migration`
+/// used to elect only "the old primary" before issue #266 fixed that.
+/// The same failure mode applies here: after consecutive ring changes,
+/// the highest-ranked survivor can itself have been promoted by an
+/// *earlier* change and not hold the data yet (its own re-replication
+/// hasn't caught up). Electing only it risked the exact same silent
+/// no-op #266 fixed for migration — `run_rereplication`'s live
+/// `peek_entry` re-check comes back empty, nothing is sent, and the key
+/// stays under-replicated with nothing left to retrigger it. Every
+/// surviving old owner being eligible instead means the promoted node
+/// gets a copy as long as *any* surviving old owner still has one — each
+/// node decides this independently for itself (this function is called
+/// once per node, with that node's own name as `self_name`), and sends
+/// are idempotent put-if-absent (`send_handoff_set`'s `if_absent`), so
+/// more than one real sender is safe.
 ///
 /// Targets: `after`'s owners minus `before`'s — the ranks this ring
 /// change newly promoted into `key`'s top-R. A survivor that was already
@@ -5242,21 +5377,11 @@ fn rereplication_targets(
     if !before.is_owner(key, self_name, replication) {
         return Vec::new();
     }
-
-    let old_owners = before.owners(key, replication);
-    let after_nodes = after.nodes();
-
-    let mut sender = None;
-    for owner in old_owners.iter().copied() {
-        if after_nodes.iter().any(|node| node.as_str() == owner) {
-            sender = Some(owner);
-            break;
-        }
-    }
-    if sender != Some(self_name) {
+    if !after.nodes().iter().any(|node| node.as_str() == self_name) {
         return Vec::new();
     }
 
+    let old_owners = before.owners(key, replication);
     after
         .owners(key, replication)
         .into_iter()
@@ -5427,7 +5552,8 @@ async fn spawn_or_supersede_rereplication(
 }
 
 /// Issue #266: after a ring change dropped a member, streams every key
-/// this node is the elected sender for (`rereplication_targets`) to the
+/// this node is an eligible sender for (`rereplication_targets` — issue
+/// #405: every surviving old owner, not just the highest-ranked one) to the
 /// owner(s) the change newly promoted — mirrors `run_decommission`'s
 /// handoff loop, with one shared, reused connection per target address,
 /// sent as a put-if-absent `U … A` (`send_handoff_set`'s `if_absent`) so
@@ -9615,6 +9741,71 @@ mod tests {
     }
 
     #[test]
+    fn rereplication_targets_makes_every_surviving_old_owner_eligible_not_just_the_top_ranked() {
+        // Regression (issue #405): with replication >= 3, a single
+        // eviction can leave *two* surviving old owners for the same
+        // key (unlike replication == 2, where evicting one node out of
+        // a pair leaves at most one survivor). The old "elect only the
+        // highest-ranked survivor" rule left the lower-ranked survivor's
+        // own `rereplication_targets` call returning empty — silently
+        // skipping it as a candidate sender even though it might be the
+        // only one that actually still holds the data (e.g. after
+        // consecutive evictions, when the higher-ranked survivor was
+        // itself only just promoted by an earlier ring change and its
+        // own re-replication hasn't caught up yet). Both survivors must
+        // now be eligible.
+        let names = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+            "node-d".to_string(),
+        ];
+        let before = HashRing::new(names.clone());
+        let after = HashRing::new(
+            names
+                .iter()
+                .filter(|name| *name != "node-d")
+                .cloned()
+                .collect(),
+        );
+        let replication = 3;
+
+        let mut found = false;
+        for index in 0..500 {
+            let key = key(format!("key-{index}").as_bytes());
+            let old_owners = before.owners(&key, replication);
+            // A key whose pre-eviction top-3 includes the evicted node
+            // ("node-d") alongside two other, surviving, owners — so
+            // both survivors are old owners of the same key.
+            if !old_owners.contains(&"node-d") {
+                continue;
+            }
+            let survivors: Vec<&&str> = old_owners
+                .iter()
+                .filter(|owner| **owner != "node-d")
+                .collect();
+            if survivors.len() != 2 {
+                continue;
+            }
+            found = true;
+
+            for survivor in &survivors {
+                let targets = rereplication_targets(&before, &after, &key, replication, survivor);
+                assert!(
+                    !targets.is_empty(),
+                    "key-{index}: surviving old owner {survivor} should be an eligible \
+                     sender, not just the highest-ranked survivor"
+                );
+            }
+            break;
+        }
+        assert!(
+            found,
+            "the sample must contain a key with two surviving old owners"
+        );
+    }
+
+    #[test]
     fn migration_rings_deduplicates_a_repeated_name_in_the_joined_roster() {
         // Regression (issue #328): `joined` is a snapshot of a live
         // discovery roster, with no guarantee it's free of duplicate
@@ -12467,6 +12658,64 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_rereplication_to_clear_returns_immediately_once_this_handoffs_own_abort_is_requested()
+     {
+        // Regression (issue #422): this wait used to poll only
+        // `active_rereplication`'s busy flag and the 60s
+        // `RING_CHANGE_HANDOFF_WAIT` deadline, never the caller's own
+        // `abort_requested` — so a handoff `abandon_migration` cancelled
+        // while it sat blocked in here wasn't noticed until the wait
+        // returned on its own, stalling `run_sweep` (which pauses
+        // entirely while `active_migration.completed_at.is_none()`) for
+        // up to that whole deadline for no reason.
+        let node_context = test_node_context(
+            "self",
+            "tok-self",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        // Busy: a re-replication is (apparently) still in flight.
+        *node_context.active_rereplication.lock().unwrap() = Some(Arc::new(ActiveRereplication {
+            abort_requested: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        }));
+        let abort_requested = AtomicBool::new(true);
+
+        let started = Instant::now();
+        wait_for_rereplication_to_clear(&node_context, &abort_requested).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "should return immediately once abort_requested is set, not wait out the deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_for_migration_to_clear_returns_immediately_once_the_occupying_migration_is_abandoned()
+     {
+        // Regression (issue #422): symmetric fix on the migration side —
+        // a migration `abandon_migration` has flagged (its own slot's
+        // `abort_requested`) is already on its way to being cleared by
+        // `MigrationGuard::drop`; waiting out the full deadline for it
+        // serves no purpose and only delays the re-replication blocked
+        // here.
+        let active = test_active_migration(None);
+        active.abort_requested.store(true, Ordering::SeqCst);
+        let node_context = test_node_context(
+            "self",
+            "tok-self",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(active))),
+        );
+
+        let started = Instant::now();
+        wait_for_migration_to_clear(&node_context).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "should return immediately once the occupying migration's own abort_requested is set"
+        );
+    }
+
     fn member_names(known_ring: &KnownRing) -> Option<(Vec<String>, usize)> {
         known_ring.lock().unwrap().as_ref().map(|membership| {
             let mut names = membership.ring.nodes().to_vec();
@@ -12503,6 +12752,9 @@ mod tests {
             b"A 1 2\n6 14 7\nnode-a127.0.0.1:9001\n",
             b"A 99999999 2\n",
             b"A 1 2\n99999 14\n",
+            // Issue #408: `replication` is now upper-bounded, symmetric
+            // with `count` just above it.
+            b"A 1 99999999\n",
         ] {
             let mut stream = tokio::io::BufReader::new(malformed);
             assert!(

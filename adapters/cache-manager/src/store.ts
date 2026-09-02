@@ -1,4 +1,10 @@
-import { NanocachedClient, type NanocachedAddress, type NanocachedNamespace } from "nanocached";
+import {
+  NanocachedClient,
+  PartialWrongNodeError,
+  MAX_BATCH_KEYS,
+  type NanocachedAddress,
+  type NanocachedNamespace,
+} from "nanocached";
 import type { Config, Milliseconds, Store } from "cache-manager";
 
 // cache-manager convention (matching its own Redis store): a store binds
@@ -187,11 +193,51 @@ export class NanocachedStore implements Store {
    * iteration order. */
   async mget(...keys: string[]): Promise<unknown[]> {
     if (keys.length === 0) return [];
-    const raw = await this.ns.getMany(keys);
+    const raw = await this.mgetResolved(keys);
     return keys.map((key) => {
       const value = raw.get(key);
       return value === undefined ? undefined : (JSON.parse(value) as unknown);
     });
+  }
+
+  /** `getMany`, but resolving a ring reconfiguration mid-batch itself
+   * (issue #416) instead of discarding an otherwise-successful batch.
+   *
+   * `ns.getMany` already does one bounded refresh-and-retry internally
+   * per key before giving up on it (the SDK's own `multiGetPass`); a
+   * batch that's STILL got some keys routed to the wrong node after that
+   * throws `PartialWrongNodeError` instead of returning, with
+   * `.partialValues` holding every key that resolved (hit) before the
+   * unresolved ones were hit. Without this, that error would propagate
+   * straight out of `mget` and throw away every value the batch DID
+   * manage to fetch.
+   *
+   * `.partialValues` doesn't distinguish "genuine miss" from "still
+   * wrong node" — both are simply absent from the map — so the keys
+   * retried here are a superset of the ones that actually need
+   * re-routing; retrying a genuine miss again is harmless, just an extra
+   * round trip for it. If the retry itself still can't place every key
+   * (another concurrent reconfiguration), this gives up after that one
+   * retry and merges whatever it got rather than looping or throwing —
+   * any keys still unresolved come back as ordinary misses (`undefined`
+   * from the caller's perspective), same as if they'd never been in the
+   * cache. */
+  private async mgetResolved(keys: string[]): Promise<Map<string, string>> {
+    try {
+      return await this.ns.getMany(keys);
+    } catch (error) {
+      if (!(error instanceof PartialWrongNodeError)) throw error;
+      const succeeded = error.partialValues as Map<string, string>;
+      const stillNeeded = keys.filter((key) => !succeeded.has(key));
+      if (stillNeeded.length === 0) return succeeded;
+      try {
+        const retried = await this.ns.getMany(stillNeeded);
+        return new Map([...succeeded, ...retried]);
+      } catch (retryError) {
+        if (!(retryError instanceof PartialWrongNodeError)) throw retryError;
+        return new Map([...succeeded, ...(retryError.partialValues as Map<string, string>)]);
+      }
+    }
   }
 
   /** One wire round trip per involved node (issue #152), via the SDK's
@@ -227,9 +273,19 @@ export class NanocachedStore implements Store {
     await this.ns.setMany(values, wireTtl);
   }
 
-  /** Client-side loop over `del`, concurrently. */
+  /** Client-side loop over `del`, concurrently — chunked at
+   * `MAX_BATCH_KEYS` (issue #416), the same bound `mget`/`mset` get for
+   * free from the SDK's own `getMany`/`setMany` chunking. There's no
+   * bulk-delete wire op (unlike `getMany`/`setMany`'s `m`/`o`), so a
+   * single `Promise.all` here would fan out one concurrent `d` request
+   * per key with no bound at all for an arbitrarily large batch; this
+   * instead runs at most `MAX_BATCH_KEYS` deletes concurrently at a
+   * time, chunk by chunk. */
   async mdel(...keys: string[]): Promise<void> {
-    await Promise.all(keys.map((key) => this.del(key)));
+    for (let start = 0; start < keys.length; start += MAX_BATCH_KEYS) {
+      const chunk = keys.slice(start, start + MAX_BATCH_KEYS);
+      await Promise.all(chunk.map((key) => this.del(key)));
+    }
   }
 
   /** The wire has no way to enumerate a namespace's keys — a node only
