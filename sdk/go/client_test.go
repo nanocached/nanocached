@@ -4030,6 +4030,43 @@ func TestConnectFailsOnlyWhenEveryNodeIsUnreachable(t *testing.T) {
 	}
 }
 
+func TestRefreshKeepsTheLiveConnectionWhenDiscoveryRepeatsANodeName(t *testing.T) {
+	// #389: NewHashRing dedupes repeated node names (#328/#360), but the
+	// connection layer didn't — on refresh, a name's first occurrence
+	// moved the live member into the fresh map and deleted it from
+	// c.members, and the second occurrence (finding c.members empty for
+	// that name) overwrote the fresh slot with a deadConnection()
+	// placeholder. The clobbered live connection was invisible to the
+	// no-longer-listed close sweep, leaking its socket and readLoop
+	// goroutine, and the next request had to redial for no reason.
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	name := testNames[0]
+	client.mu.Lock()
+	before := client.members[name].connection
+	client.mu.Unlock()
+
+	// Discovery hands back the same node twice (a transient duplicate).
+	discovery.setNodes([]discoveredNode{
+		{Name: name, Address: nodes[name].address()},
+		{Name: name, Address: nodes[name].address()},
+		{Name: testNames[1], Address: nodes[testNames[1]].address()},
+	})
+	client.maybeRefresh(true)
+
+	client.mu.Lock()
+	after := client.members[name].connection
+	client.mu.Unlock()
+	if before != after {
+		t.Fatalf("a repeated node name replaced the live connection (leaking it) instead of being deduped")
+	}
+}
+
 func TestRefreshPurgesCooldownsForDepartedAddresses(t *testing.T) {
 	// #96: a node that leaves the cluster must not leave its per-address
 	// reconnect-cooldown entry behind — in a churny deployment (a fresh
