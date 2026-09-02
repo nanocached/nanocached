@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import pickle
 import re
 import threading
@@ -109,7 +110,15 @@ _DECIMAL_INT_RE = re.compile(rb"^-?(0|[1-9]\d*)$")
 
 
 def _is_counter_value(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    # Exactly ``int`` — not a subclass (issue #392): ``IntEnum``/
+    # ``IntFlag`` (including Django's own ``models.IntegerChoices``)
+    # would round-trip through the decimal fast path as a plain ``int``,
+    # silently losing enum identity (``.label``, ``isinstance`` checks).
+    # Such values take the pickle path instead, which preserves their
+    # type; ``incr()``/``decr()`` keep requiring plain-int counters,
+    # matching django.core.cache's own semantics. ``bool`` is excluded
+    # for free — it's an ``int`` subclass too.
+    return type(value) is int
 
 
 def _encode_value(value: object) -> bytes:
@@ -219,6 +228,9 @@ class NanocachedCache(BaseCache):
         self._loop_thread: threading.Thread | None = None
         self._client: NanocachedClient | None = None
         self._namespace_handle = None
+        # The PID that started (and whose thread drives) self._loop —
+        # see _ensure_started's fork check (issue #393).
+        self._loop_pid: int | None = None
         # Guards start/close against concurrent callers on different
         # Django worker threads racing to lazily start (or to close) the
         # same backend instance — the loop and client themselves are
@@ -229,11 +241,28 @@ class NanocachedCache(BaseCache):
     # ── the sync/async bridge ───────────────────────────────────────
 
     def _ensure_started(self) -> None:
-        if self._loop is not None:
+        if self._loop is not None and self._loop_pid == os.getpid():
             return
         with self._lifecycle_lock:
             if self._loop is not None:
-                return
+                if self._loop_pid == os.getpid():
+                    return
+                # issue #393: this process is a fork() child (preforking
+                # WSGI servers with preload — Gunicorn preload_app,
+                # uWSGI without lazy-apps — where a warm-up cache touch
+                # in the master started the loop before workers forked).
+                # Only the forking thread survives fork(), so the thread
+                # driving this loop does not exist here: every
+                # run_coroutine_threadsafe(...).result() against it would
+                # block forever. Drop the inherited bridge state and
+                # start a fresh loop/thread/client for this process; the
+                # parent's objects (and its now-shared sockets) are the
+                # parent's to close — touching them from the child could
+                # corrupt the parent's live connections mid-frame.
+                self._loop = None
+                self._loop_thread = None
+                self._client = None
+                self._namespace_handle = None
             loop = asyncio.new_event_loop()
             started = threading.Event()
 
@@ -255,6 +284,7 @@ class NanocachedCache(BaseCache):
             # None until _connect() finishes).
             self._loop = loop
             self._loop_thread = thread
+            self._loop_pid = os.getpid()
             try:
                 asyncio.run_coroutine_threadsafe(self._connect(), loop).result()
             except BaseException:

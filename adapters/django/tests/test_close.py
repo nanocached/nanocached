@@ -7,8 +7,10 @@ thread behind, with the next operation lazily reconnecting."""
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import unittest
+from unittest import mock
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
 from mock_node import MockNode
@@ -39,6 +41,39 @@ class CloseLifecycleTests(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.assertEqual(backend.get("k"), "v")
         backend.shutdown()
+
+    def test_a_forked_child_gets_a_fresh_loop_instead_of_a_dead_bridge(self) -> None:
+        # issue #393: under a preforking WSGI server with preload
+        # (Gunicorn preload_app, uWSGI without lazy-apps), a warm-up
+        # cache touch in the master starts the loop thread before
+        # fork(); only the forking thread survives in each worker, so
+        # the inherited loop has no driving thread there and every
+        # run_coroutine_threadsafe(...).result() blocks forever. The
+        # backend records the loop-starting PID and must rebuild the
+        # bridge when it changes. Simulated via a patched os.getpid —
+        # a real fork() with live threads is not something a unittest
+        # should attempt.
+        backend = self._new_backend()
+        backend.set("k", "v")
+        parent_loop = backend._loop
+        parent_thread = backend._loop_thread
+        parent_client = backend._client
+
+        with mock.patch("os.getpid", return_value=backend._loop_pid + 1):
+            self.assertEqual(backend.get("k"), "v")
+            self.assertIsNot(backend._loop, parent_loop)
+            self.assertIsNot(backend._loop_thread, parent_thread)
+            self.assertTrue(backend._loop_thread.is_alive())
+            backend.shutdown()
+
+        # The backend intentionally left the simulated parent's bridge
+        # alone (a real child must not touch the parent's sockets); this
+        # test is the "parent" too, though, so drain it here to leak
+        # neither the thread nor the client's background tasks.
+        asyncio.run_coroutine_threadsafe(parent_client.close(), parent_loop).result()
+        parent_loop.call_soon_threadsafe(parent_loop.stop)
+        parent_thread.join()
+        parent_loop.close()
 
     def test_close_on_request_option_makes_close_tear_down(self) -> None:
         backend = self._new_backend(CLOSE_ON_REQUEST=True)

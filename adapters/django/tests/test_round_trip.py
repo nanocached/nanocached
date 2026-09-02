@@ -6,11 +6,20 @@ directly. Every test here goes through the standard Django cache API."""
 from __future__ import annotations
 
 import asyncio
+import enum
 import time
 import unittest
 
 from support import ROUNDTRIP_NODE
 from django.core.cache import caches
+
+
+class _Status(enum.IntEnum):
+    """Module-level for pickle, like _Point below — stands in for
+    Django's own models.IntegerChoices pattern (issue #392)."""
+
+    ACTIVE = 1
+    DISABLED = 2
 
 
 class _Point:
@@ -43,6 +52,19 @@ class RoundTripTests(unittest.TestCase):
 
         self.cache.set("point", _Point(1, 2))
         self.assertEqual(self.cache.get("point"), _Point(1, 2))
+
+    def test_int_subclasses_keep_their_type(self) -> None:
+        # issue #392: IntEnum/IntegerChoices used to match the counter
+        # fast path (isinstance(value, int)), round-tripping as a bare
+        # int and silently losing enum identity. Subclasses must take
+        # the pickle path; exact ints keep the counter encoding.
+        self.cache.set("status", _Status.ACTIVE)
+        got = self.cache.get("status")
+        self.assertIsInstance(got, _Status)
+        self.assertIs(got, _Status.ACTIVE)
+
+        self.cache.set("plain", 1)
+        self.assertIs(type(self.cache.get("plain")), int)
 
     def test_missing_key_returns_default(self) -> None:
         self.assertIsNone(self.cache.get("does-not-exist"))
