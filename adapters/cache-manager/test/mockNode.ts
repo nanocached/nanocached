@@ -38,6 +38,24 @@ export interface MockNode {
    * (`"g"`/`"s"`/`"d"`/`"c"`/`"G"`/`"F"`) — mostly useful for asserting
    * the keep-alive probe's shape if a test ever needs to. */
   lastCommand(): string;
+  /** Arms one or more keys so the *next* `m` (batched get) request that
+   * includes them gets a "W" (wrong node) token for that key instead of
+   * its usual hit/miss lookup — simulating a ring reconfiguration mid-
+   * batch (issue #416). Each call arms one more "W" per key: a key
+   * armed once fails on the next `m` request that includes it and then
+   * resolves normally after that (a retry succeeds), while a key armed
+   * twice fails on the next *two* such requests (a retry fails too) —
+   * lets a test choose whether a retry should succeed or also give up. */
+  failNextMultiGetFor(keys: Iterable<string>): void;
+  /** Delays every `d` (delete) response by `ms` before writing it, so
+   * `maxConcurrentDeletes()` can observe how many `d` requests the
+   * client had outstanding at once (issue #416's mdel chunking test). */
+  delayDeletes(ms: number): void;
+  /** The largest number of `d` requests this server had received but
+   * not yet responded to at the same time, since startup (or since the
+   * last read — this is a running high-water mark, not reset by
+   * reading it). */
+  maxConcurrentDeletes(): number;
   close(): Promise<void>;
 }
 
@@ -71,6 +89,14 @@ export async function startMockNode(): Promise<MockNode> {
   let lastSetTtl = 0;
   let lastCommand = "";
   const sockets = new Set<Socket>();
+  // Counts, not a plain Set: each call to failNextMultiGetFor(keys) arms
+  // one more "W" for that key, so a test can make a key fail on more
+  // than one successive m request (e.g. the initial attempt AND a
+  // retry) rather than only ever once.
+  const wrongNodeCounts = new Map<string, number>();
+  let deleteDelayMs = 0;
+  let activeDeletes = 0;
+  let peakConcurrentDeletes = 0;
 
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -160,7 +186,20 @@ export async function startMockNode(): Promise<MockNode> {
             const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
 
-            socket.write(storeFor(namespace).delete(key) ? "D\n" : "N\n");
+            // Concurrency instrumentation for mdel's chunking regression
+            // test (issue #416): every `d` request bumps the outstanding
+            // count for as long as its response is deferred (see
+            // `delayDeletes`/`maxConcurrentDeletes`), so a test can assert
+            // an unbounded client-side `Promise.all` never shows up here
+            // as more than `MAX_BATCH_KEYS` requests in flight at once.
+            activeDeletes++;
+            if (activeDeletes > peakConcurrentDeletes) peakConcurrentDeletes = activeDeletes;
+            const respond = () => {
+              activeDeletes--;
+              socket.write(storeFor(namespace).delete(key) ? "D\n" : "N\n");
+            };
+            if (deleteDelayMs > 0) setTimeout(respond, deleteDelayMs);
+            else respond();
             break;
           }
 
@@ -207,9 +246,24 @@ export async function startMockNode(): Promise<MockNode> {
             buffer = buffer.subarray(offset);
 
             const store = storeFor(namespace);
-            const values = keys.map((key) => store.get(key));
-            const results = values.map((value) => (value === undefined ? "-" : String(value.length)));
-            const hits = values.filter((value): value is Buffer => value !== undefined);
+            const results: string[] = [];
+            const hits: Buffer[] = [];
+            for (const key of keys) {
+              const remaining = wrongNodeCounts.get(key) ?? 0;
+              if (remaining > 0) {
+                if (remaining === 1) wrongNodeCounts.delete(key);
+                else wrongNodeCounts.set(key, remaining - 1);
+                results.push("W");
+                continue;
+              }
+              const value = store.get(key);
+              if (value === undefined) {
+                results.push("-");
+              } else {
+                results.push(String(value.length));
+                hits.push(value);
+              }
+            }
             socket.write(Buffer.concat([Buffer.from(`M ${n} ${results.join(" ")}\n`), ...hits]));
             break;
           }
@@ -266,6 +320,13 @@ export async function startMockNode(): Promise<MockNode> {
     clearCount: () => clears,
     lastSetTtl: () => lastSetTtl,
     lastCommand: () => lastCommand,
+    failNextMultiGetFor: (keys) => {
+      for (const key of keys) wrongNodeCounts.set(key, (wrongNodeCounts.get(key) ?? 0) + 1);
+    },
+    delayDeletes: (ms) => {
+      deleteDelayMs = ms;
+    },
+    maxConcurrentDeletes: () => peakConcurrentDeletes,
     close: () =>
       new Promise<void>((resolve, reject) => {
         for (const socket of sockets) socket.destroy();
