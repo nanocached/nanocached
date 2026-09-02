@@ -642,6 +642,20 @@ fn next_connection_id() -> u64 {
     NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Issue #421(c): identifies one `PendingJoin` incarnation, so a stale
+/// result from an abandoned join can't be credited to a fresh
+/// `PendingJoin` that happens to share the same `joining_name` (a node
+/// whose join was abandoned and which immediately re-registers reuses its
+/// own name). Mirrors `NEXT_CONNECTION_ID`: one global monotonic counter
+/// rather than anything threaded through `CurrentJoin`, since every new
+/// `PendingJoin` needs exactly one value, unique for the life of the
+/// process.
+static NEXT_JOIN_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_join_generation() -> u64 {
+    NEXT_JOIN_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The node registry (`nodes`, keyed by name — node identity decoupled
 /// from address's random per-process node identity, not address; see
 /// `NodeInfo::address`) plus a `generation` counter (issue #95) bumped
@@ -805,12 +819,19 @@ struct CachedRoster {
 /// acknowledging its `M` so far (size-derived migration timeout), updated as each of
 /// `try_begin_next_join`'s parallel sends resolves. Starts at 0 (the
 /// bound is just `MIGRATION_TIMEOUT_BASE` until the first ack arrives).
+/// `generation` (issue #421(c), `next_join_generation`) identifies this
+/// specific incarnation: `joining_name` alone isn't enough, since an
+/// abandoned join's node can immediately re-register and start a fresh
+/// `PendingJoin` under the very same name, and a late-arriving M-send
+/// result from the abandoned incarnation must not be credited to the new
+/// one (see the check in `try_begin_next_join`'s completion loop).
 struct PendingJoin {
     joining_name: String,
     expected: HashMap<String, String>,
     completed: HashSet<String>,
     started_at: Instant,
     max_entries: usize,
+    generation: u64,
 }
 
 type CurrentJoin = Arc<Mutex<Option<PendingJoin>>>;
@@ -1938,7 +1959,7 @@ async fn try_begin_next_join(
     // again after each bootstrap promotion; the next candidate then
     // finds a `Joined` member and starts a real staged join, after which
     // `C`/abandon chain the rest as usual.
-    let (name, joining_addr, joined, ready_tokens) = loop {
+    let (name, joining_addr, joined, ready_tokens, generation) = loop {
         let mut join_guard = lock_current_join(current_join);
 
         if join_guard.is_some() {
@@ -2010,6 +2031,7 @@ async fn try_begin_next_join(
         // lock scope, keyed by the same names as `joined`, so this is
         // just reusing it rather than a second registry pass.
         let expected = ready_tokens.clone();
+        let generation = next_join_generation();
 
         *join_guard = Some(PendingJoin {
             joining_name: name.clone(),
@@ -2017,9 +2039,10 @@ async fn try_begin_next_join(
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation,
         });
 
-        break (name, joining_addr, joined, ready_tokens);
+        break (name, joining_addr, joined, ready_tokens, generation);
     };
 
     println!(
@@ -2033,13 +2056,21 @@ async fn try_begin_next_join(
     // node is still spawned and still contacted; a permit just gates when
     // each spawned task's own dial actually starts.
     let fanout_limit = Arc::new(Semaphore::new(MAX_FANOUT_CONCURRENCY));
+    // Issue #409(a): share the invariant roster via one `Arc` instead of
+    // deep-cloning the whole `Vec` on every iteration below. The roster is
+    // identical for every ready node in this fanout, so a per-iteration
+    // `joined.clone()` was an O(N^2) allocation running synchronously on
+    // the current_thread runtime — for a large `joined` roster that stalls
+    // heartbeats/accepts long enough to risk spurious liveness evictions.
+    // Cloning the `Arc` instead is O(1) per iteration.
+    let joined_roster = Arc::new(joined);
 
-    for (ready_name, ready_addr) in joined.iter().cloned() {
+    for (ready_name, ready_addr) in joined_roster.iter().cloned() {
         let auth_secret = auth_secret.clone();
         let tls_connector = tls_connector.clone();
         let joining_name = name.clone();
         let joining_addr = joining_addr.clone();
-        let joined_roster = joined.clone();
+        let joined_roster = Arc::clone(&joined_roster);
         // Every `Joined` node in `joined` was captured with its token in the
         // same lock scope, so this lookup is always present.
         let ready_token = ready_tokens.get(&ready_name).cloned().unwrap_or_default();
@@ -2083,21 +2114,40 @@ async fn try_begin_next_join(
                 );
             }
             Ok((_, Ok(entries))) => {
-                // Size-derived migration timeout: sizes the migration timeout by the
-                // largest handoff any ready node reported — a report for
-                // a since-abandoned/replaced join (this one's slot
-                // already moved on to a different `joining_name`) must
-                // not be credited here, mirroring `handle_complete`'s own
-                // guard.
                 let mut join_guard = lock_current_join(current_join);
-                if let Some(pending) = join_guard.as_mut()
-                    && pending.joining_name == name
-                {
-                    pending.max_entries = pending.max_entries.max(entries);
-                }
+                credit_migrate_send_result(&mut join_guard, &name, generation, entries);
             }
             Err(error) => eprintln!("WARN a task sending M panicked: {error}"),
         }
+    }
+}
+
+/// Applies one ready node's successful `M`-send result (its reported entry
+/// count) to `pending.max_entries`, sizing the size-derived migration
+/// timeout — but only if `pending` is still the exact `PendingJoin`
+/// incarnation this result was sent for. `joining_name` alone isn't
+/// enough: a report for a since-abandoned/replaced join (this slot has
+/// already moved on to a different `joining_name`) must not be credited
+/// here, mirroring `handle_complete`'s own guard against a stale-name
+/// report. Issue #421(c) closes the narrower gap that check alone leaves:
+/// if the node named `joining_name` was abandoned and immediately
+/// re-registered under that very same name, a late-arriving result from
+/// the abandoned (stale) incarnation must not be credited to the fresh
+/// `PendingJoin` that now occupies the slot — so `generation` (captured by
+/// the caller when its own incarnation started, from
+/// `PendingJoin::generation`/`next_join_generation`) is checked too, not
+/// just the name.
+fn credit_migrate_send_result(
+    join_guard: &mut Option<PendingJoin>,
+    joining_name: &str,
+    generation: u64,
+    entries: usize,
+) {
+    if let Some(pending) = join_guard.as_mut()
+        && pending.joining_name == joining_name
+        && pending.generation == generation
+    {
+        pending.max_entries = pending.max_entries.max(entries);
     }
 }
 
@@ -2535,18 +2585,34 @@ async fn start_join(
         // actually goes out (only ever making the real message bigger,
         // never smaller, so this can under- but never over-admit). See
         // `NODE_MAX_REQUEST_SIZE` and `build_migrate_message`.
-        let joined_now: Vec<(String, String)> = guard
-            .iter()
-            .filter(|(_, info)| info.state == NodeState::Joined)
-            .map(|(joined_name, info)| (joined_name.clone(), info.address.clone()))
-            .collect();
-        // The `M` recipients' tokens are all per-process UUIDs of the same
-        // length as this joining node's own `token`, so it stands in here
-        // for an accurate size estimate without looking each recipient up.
-        let message_len =
-            build_migrate_message(&token, name, &address, &joined_now, replication).len();
-        if message_len > NODE_MAX_REQUEST_SIZE {
-            return Err(JoinRejection::MigrateMessageTooLarge { message_len });
+        //
+        // Issue #421(b): like the two waiting-queue caps above, only a
+        // genuinely new name counts here. A duplicate `J` for a name
+        // already registered (the token check above already confirmed
+        // it's the same node) is a supported reconnect (issue #7/#9)
+        // that just reuses the existing `Waiting` entry rather than
+        // registering afresh — running this check against it risks
+        // wrongly rejecting a legitimate reconnect with
+        // `JoinRejection::MigrateMessageTooLarge` if the joined roster
+        // has grown since the node's original registration, leaving the
+        // stale entry (pointing at a dead `owner_connection_id`) parked
+        // until `sweep_expired`'s `waiting_timeout_for` eventually reaps
+        // it.
+        if !guard.contains_key(name) {
+            let joined_now: Vec<(String, String)> = guard
+                .iter()
+                .filter(|(_, info)| info.state == NodeState::Joined)
+                .map(|(joined_name, info)| (joined_name.clone(), info.address.clone()))
+                .collect();
+            // The `M` recipients' tokens are all per-process UUIDs of the
+            // same length as this joining node's own `token`, so it
+            // stands in here for an accurate size estimate without
+            // looking each recipient up.
+            let message_len =
+                build_migrate_message(&token, name, &address, &joined_now, replication).len();
+            if message_len > NODE_MAX_REQUEST_SIZE {
+                return Err(JoinRejection::MigrateMessageTooLarge { message_len });
+            }
         }
 
         let newly_registered = !guard.contains_key(name);
@@ -3086,7 +3152,12 @@ async fn run(
         ));
     }
 
-    let sweep_task = tokio::spawn(sweep_expired(
+    // Issue #421(a): kept alongside the originals (moved into the spawn
+    // below) so the watchdog arm in the main select! loop can respawn
+    // sweep_task after a panic without needing to reconstruct these.
+    let sweep_auth_secret = auth_secret.clone();
+    let sweep_tls_connector = tls_connector.clone();
+    let mut sweep_task = tokio::spawn(sweep_expired(
         Arc::clone(&cluster_state.registry),
         Arc::clone(&cluster_state.current_join),
         auth_secret,
@@ -3115,6 +3186,42 @@ async fn run(
                 if let Some(Err(error)) = result {
                     eprintln!("WARN connection task failed: {error}");
                 }
+            }
+
+            // Issue #421(a): sweep_task's JoinHandle used to be joined only
+            // at shutdown (see the `timeout(SHUTDOWN_TIMEOUT, sweep_task)`
+            // below) — unlike connection_tasks above, nothing in this loop
+            // ever polled it, so a panic anywhere in sweep_expired's call
+            // graph (dead-node eviction, stalled-join reaping, post-grace
+            // join kickoff) silently killed just that task while the
+            // process kept serving normally, with no signal that
+            // membership maintenance had gone dark. Watch it here and
+            // respawn on exit so it comes back with a loud WARN instead.
+            // sweep_expired only ever returns (`Ok(())`) via its own
+            // `shutdown_rx.changed()` branch, which fires only after
+            // `shutdown_tx.send_replace(true)` just above — by which point
+            // this loop has already broken, so this arm observing `Ok(())`
+            // would itself be unexpected; treat it the same as a panic
+            // rather than assume it's safe to ignore.
+            result = &mut sweep_task => {
+                match result {
+                    Ok(()) => {
+                        eprintln!("WARN sweep task exited unexpectedly; respawning");
+                    }
+                    Err(error) => {
+                        eprintln!("WARN sweep task panicked: {error}; respawning");
+                    }
+                }
+                sweep_task = tokio::spawn(sweep_expired(
+                    Arc::clone(&cluster_state.registry),
+                    Arc::clone(&cluster_state.current_join),
+                    sweep_auth_secret.clone(),
+                    sweep_tls_connector.clone(),
+                    replication,
+                    list_ready_at,
+                    liveness_timeout,
+                    shutdown_rx.clone(),
+                ));
             }
 
             result = listener.accept() => {
@@ -5889,6 +5996,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         assert_eq!(&*cached_node_roster(&registry, 2), b"N 0 2\n");
@@ -6605,6 +6713,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn start_join_does_not_size_reject_a_duplicate_j_for_an_already_waiting_node() {
+        // Regression for issue #421(b): the `NODE_MAX_REQUEST_SIZE` check
+        // must only apply to a genuinely new registration, like the
+        // waiting-queue caps just above it in `start_join` already do (via
+        // `!guard.contains_key(name)`). A duplicate `J` for a name already
+        // registered here is a supported reconnect (issue #7/#9) that just
+        // reuses the existing `Waiting` entry — it must not be rejected
+        // just because the joined roster has grown past the cap since the
+        // node's original registration.
+        let registry: Registry = Arc::new(RegistryState::default());
+        // A join already in progress (for some unrelated node) keeps every
+        // registration below in `Waiting` instead of auto-promoting it via
+        // the empty-registry bootstrap shortcut — same trick the waiting-cap
+        // tests below use.
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 1,
+        })));
+
+        // First registration: the joined roster is empty, so this is well
+        // under NODE_MAX_REQUEST_SIZE and registers as `Waiting`.
+        let first = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "joining-node",
+            "127.0.0.1:9999".to_string(),
+            "tk-joining-node".to_string(),
+            1,
+        )
+        .await;
+        assert!(first.is_ok());
+        assert_eq!(
+            lock(&registry).get("joining-node").map(|info| info.state),
+            Some(NodeState::Waiting)
+        );
+
+        // The joined roster grows enough, after that registration, that a
+        // fresh registration's `M` would now exceed NODE_MAX_REQUEST_SIZE
+        // (same construction as the rejection test above).
+        let long_name_prefix = "x".repeat(10_000);
+        let long_addr = format!("127.0.0.1:1{}", "y".repeat(10_000));
+        {
+            let mut guard = lock(&registry);
+            for i in 0..60 {
+                guard.insert(
+                    format!("{long_name_prefix}-{i}"),
+                    NodeInfo::new(long_addr.clone(), NodeState::Joined, "tk".to_string()),
+                );
+            }
+        }
+
+        // A duplicate `J` for the same already-registered name, presenting
+        // the same token, must still succeed — not be rejected with
+        // `MigrateMessageTooLarge` — and must not disturb its existing
+        // `Waiting` entry.
+        let second = start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "joining-node",
+            "127.0.0.1:9999".to_string(),
+            "tk-joining-node".to_string(),
+            2,
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "duplicate J for an already-registered name was wrongly size-rejected: {second:?}"
+        );
+        assert_eq!(
+            lock(&registry).get("joining-node").map(|info| info.state),
+            Some(NodeState::Waiting)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn start_join_rejects_a_new_registration_once_the_source_hits_the_waiting_cap() {
         // Regression: with auth unset, an unauthenticated attacker can
         // `J` under distinct fake names from one source without limit —
@@ -6623,6 +6818,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         for i in 0..MAX_WAITING_PER_SOURCE_IP {
@@ -6723,6 +6919,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let mut connection_id = 0u64;
@@ -7974,6 +8171,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let config = || ConnectionConfig {
@@ -8163,6 +8361,44 @@ mod tests {
         assert_eq!(&promoted, b"R\n");
     }
 
+    #[test]
+    fn credit_migrate_send_result_ignores_a_stale_generation_under_the_same_name() {
+        // Regression for issue #421(c): a stale M-send result from an
+        // abandoned PendingJoin must not inflate max_entries for a fresh
+        // PendingJoin that re-registered under the very same
+        // `joining_name` — `joining_name` alone isn't a safe enough guard,
+        // since a node's own name is exactly what's reused across
+        // incarnations.
+        let mut join_guard = Some(PendingJoin {
+            joining_name: "node-x".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 5,
+            generation: 2,
+        });
+
+        // A result from generation 1 (the abandoned incarnation) must not
+        // touch generation 2's max_entries, even though the name matches.
+        credit_migrate_send_result(&mut join_guard, "node-x", 1, 999);
+        assert_eq!(join_guard.as_ref().unwrap().max_entries, 5);
+
+        // A result naming a different join entirely is still ignored too
+        // (issue #5's existing guard, unaffected by this fix).
+        credit_migrate_send_result(&mut join_guard, "node-y", 2, 999);
+        assert_eq!(join_guard.as_ref().unwrap().max_entries, 5);
+
+        // A result for the current incarnation (matching name AND
+        // generation) is credited, same as before this fix.
+        credit_migrate_send_result(&mut join_guard, "node-x", 2, 42);
+        assert_eq!(join_guard.as_ref().unwrap().max_entries, 42);
+
+        // Crediting again only ever raises the max (size-derived migration
+        // timeout is sized by the largest report seen).
+        credit_migrate_send_result(&mut join_guard, "node-x", 2, 10);
+        assert_eq!(join_guard.as_ref().unwrap().max_entries, 42);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_forged_complete_after_a_ready_members_eviction_and_reregistration_is_rejected() {
         // Issue #34 forged-completion fix (see `PendingJoin::expected`'s
@@ -8283,6 +8519,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -8354,6 +8591,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -8445,6 +8683,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -8515,6 +8754,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -8663,6 +8903,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         tokio::time::timeout(
@@ -10210,6 +10451,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         // Node A's *heartbeat* connection to discovery dies (a transient
@@ -10290,6 +10532,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         // Node B (the joining node itself) disconnects before being
@@ -10371,6 +10614,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         // The OLD connection (id 1, no longer the recorded owner) reports
@@ -10454,6 +10698,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 0,
+            generation: 1,
         })));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -10511,6 +10756,7 @@ mod tests {
             completed: HashSet::new(),
             started_at: Instant::now(),
             max_entries: 100_000,
+            generation: 1,
         })));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
