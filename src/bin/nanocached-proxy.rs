@@ -147,6 +147,23 @@ const METRICS_MAX_CONNECTIONS: usize = 16;
 /// expectations (SDK keep-alives flow through and reset it).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Issue #420: bounds each write to a client socket, the same way
+/// `IDLE_TIMEOUT` bounds a client's reads. Without this, a client that
+/// stops reading its socket leaves `handle_client`'s writer task parked
+/// forever inside `write_all` — and since `IDLE_TIMEOUT` firing on the
+/// reader side only leads to `drop(fifo_tx); writer.await`, that wait
+/// itself would then block forever on the stuck writer, so
+/// `handle_client` never returns and its `max_connections` permit is
+/// never released. Kept equal to `IDLE_TIMEOUT` in production — both are
+/// "how unresponsive can this client be" bounds on the same connection.
+#[cfg(not(test))]
+const CLIENT_WRITE_TIMEOUT: Duration = IDLE_TIMEOUT;
+/// Issue #420: shrunk under test like `UPSTREAM_IO_TIMEOUT`, so a test
+/// that stalls a client's reads to exercise this timeout doesn't have to
+/// pay out `IDLE_TIMEOUT`'s full 60 real seconds.
+#[cfg(test)]
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(600);
+
 /// Every backend/discovery I/O interaction is bounded by this, so one
 /// hung upstream can't pin a driver task forever.
 #[cfg(not(test))]
@@ -637,34 +654,48 @@ async fn read_exact_into<S: AsyncRead + Unpin>(
 
 // ─── discovery client ────────────────────────────────────────────────
 
-/// Fetches `L` from the first answering discovery replica. A `B` (the
-/// replica's startup grace) or connect failure tries the next replica.
+/// Fetches `L` from the fastest answering discovery replica. A `B` (the
+/// replica's startup grace) or connect failure falls back to another
+/// replica; `Err` only once every replica has failed.
+///
+/// Issue #409: every replica is raced concurrently (`race_ok`) rather
+/// than tried one at a time — this was the one multi-address fan-out
+/// left sequential by the #177 pass. A `for` loop here meant a
+/// black-holed first replica cost a full `UPSTREAM_IO_TIMEOUT` on every
+/// refresh cycle (`run_refresher`'s `REFRESH_INTERVAL` tick and every
+/// `force_refresh`) before the next replica was even dialed, directly
+/// delaying `/readyz` and `force_refresh` convergence behind it.
 async fn fetch_roster(
     context_discovery: &[String],
     secret: &Option<Bytes>,
     tls_connector: &Option<TlsConnector>,
 ) -> io::Result<Arc<RingView>> {
-    let mut last_error = io::Error::other("no discovery replicas configured");
-
-    for addr in context_discovery {
-        match timeout(
-            UPSTREAM_IO_TIMEOUT,
-            fetch_roster_from(addr, secret, tls_connector),
-        )
-        .await
-        {
-            Ok(Ok(ring)) => return Ok(ring),
-            Ok(Err(error)) => last_error = error,
-            Err(_) => {
-                last_error = io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!("L fetch from {addr} timed out"),
-                )
-            }
-        }
+    if context_discovery.is_empty() {
+        return Err(io::Error::other("no discovery replicas configured"));
     }
 
-    Err(last_error)
+    let futs: Vec<RaceFuture<'_, Arc<RingView>>> = context_discovery
+        .iter()
+        .map(|addr| {
+            let fut = async move {
+                match timeout(
+                    UPSTREAM_IO_TIMEOUT,
+                    fetch_roster_from(addr, secret, tls_connector),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("L fetch from {addr} timed out"),
+                    )),
+                }
+            };
+            Box::pin(fut) as RaceFuture<'_, Arc<RingView>>
+        })
+        .collect();
+
+    race_ok(futs).await
 }
 
 async fn fetch_roster_from(
@@ -1844,9 +1875,22 @@ async fn run_backend(
         // `substitute_tag`'s doc comment). Both target the same
         // exclusively-owned stream in the same order the single write
         // used to, so this is not observable on the wire.
-        if write_half.write_all(&header).await.is_err()
-            || write_half.write_all(&body).await.is_err()
-        {
+        //
+        // Issue #420: bounded by `UPSTREAM_IO_TIMEOUT`, like every other
+        // I/O site against this connection. A node that stops draining
+        // its receive buffer while keeping the connection open would
+        // otherwise park this write forever — the reader's own per-reply
+        // timeout can't help here: `poisoned.notified()` above is only
+        // checked between requests, not while a write is in flight, so
+        // nothing would ever bring this task back around to notice it.
+        // A write timeout is treated exactly like a write error: poison
+        // and stop, so the slot clears and the next `enqueue` redials.
+        let write_result = timeout(UPSTREAM_IO_TIMEOUT, async {
+            write_half.write_all(&header).await?;
+            write_half.write_all(&body).await
+        })
+        .await;
+        if !matches!(write_result, Ok(Ok(()))) {
             // The reader will observe the broken stream (or time out)
             // and poison; nothing more to write here.
             poisoned_exit = true;
@@ -2670,6 +2714,44 @@ async fn join_all<'a, T>(futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>
                     .map(|value| value.take().unwrap())
                     .collect(),
             )
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// One future in a `race_ok` fan-out.
+type RaceFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
+
+/// Issue #409: like `join_all`, but returns the moment any future
+/// resolves `Ok`, leaving the rest unpolled from then on — a race rather
+/// than a join. Used for a fan-out where only the fastest success
+/// matters (`fetch_roster`'s discovery replicas), as opposed to
+/// `join_all`'s fan-outs where every reply is needed. If every future
+/// resolves `Err` (or `futs` is empty), returns the last error seen in
+/// polling order.
+async fn race_ok<'a, T>(futs: Vec<RaceFuture<'a, T>>) -> io::Result<T> {
+    let mut slots: Vec<Option<RaceFuture<'a, T>>> = futs.into_iter().map(Some).collect();
+    let mut last_error: Option<io::Error> = None;
+    let mut remaining = slots.len();
+    std::future::poll_fn(move |cx| {
+        for slot in slots.iter_mut() {
+            if let Some(fut) = slot.as_mut()
+                && let Poll::Ready(value) = fut.as_mut().poll(cx)
+            {
+                *slot = None;
+                remaining -= 1;
+                match value {
+                    Ok(value) => return Poll::Ready(Ok(value)),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+        }
+        if remaining == 0 {
+            Poll::Ready(Err(last_error
+                .take()
+                .unwrap_or_else(|| io::Error::other("no futures to race"))))
         } else {
             Poll::Pending
         }
@@ -4168,15 +4250,25 @@ async fn handle_client(stream: ServerStream, context: Arc<ProxyContext>) -> io::
         while let Some(pending) = fifo_rx.recv().await {
             match pending.await {
                 Ok(Ok(response)) => {
-                    if write_half.write_all(&response).await.is_err() {
-                        return write_half;
+                    // Issue #420: bounded like every other write in this
+                    // module. A client that stops reading its socket
+                    // would otherwise park this `write_all` forever —
+                    // and `handle_client`'s teardown (`drop(fifo_tx);
+                    // writer.await`) would then hang right along with
+                    // it, leaking this connection's `max_connections`
+                    // permit for good. A timeout is treated exactly like
+                    // a write error: stop delivering and let the caller
+                    // tear the connection down.
+                    match timeout(CLIENT_WRITE_TIMEOUT, write_half.write_all(&response)).await {
+                        Ok(Ok(())) => {}
+                        _ => return write_half,
                     }
                 }
                 Ok(Err(Fatal)) | Err(_) => {
                     writer_context
                         .upstream_failures_total
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let _ = write_half.write_all(b"E\n").await;
+                    let _ = timeout(CLIENT_WRITE_TIMEOUT, write_half.write_all(b"E\n")).await;
                     return write_half;
                 }
             }
@@ -5738,6 +5830,55 @@ mod tests {
                     return;
                 };
                 tokio::spawn(serve_black_hole(stream));
+            }
+        });
+        addr
+    }
+
+    /// Issue #420: a node that completes the tagged auth handshake
+    /// normally — so `BackendHandle::connect` succeeds and `run_backend`
+    /// reaches its established write loop — then reads nothing else ever
+    /// again. Unlike `serve_black_hole` (which never answers anything,
+    /// including the handshake, so the *dial* itself is what times out),
+    /// this exercises a write that stalls on an already-live connection:
+    /// once a big enough request is queued, `write_half.write_all` in
+    /// `run_backend`'s writer blocks on the unread socket exactly as a
+    /// node that stops draining its receive buffer would.
+    async fn serve_silent_after_handshake(mut stream: TcpStream) {
+        let mut buf = BytesMut::new();
+        let Ok(line) = read_line(&mut stream, &mut buf).await else {
+            return;
+        };
+        let mut parts = line.split(' ');
+        if parts.next() != Some("A") {
+            return;
+        }
+        let Some(length) = parts.next().and_then(|field| field.parse::<usize>().ok()) else {
+            return;
+        };
+        if read_exact_into(&mut stream, &mut buf, length)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if stream.write_all(b"OnT\n").await.is_err() {
+            return;
+        }
+        // Never read (or write) again.
+        let _stream = stream;
+        std::future::pending::<()>().await;
+    }
+
+    async fn start_silent_after_handshake_node() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(serve_silent_after_handshake(stream));
             }
         });
         addr
@@ -7751,5 +7892,190 @@ mod tests {
             elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
             "elapsed {elapsed:?} suggests the dead primary was retried before the replica"
         );
+    }
+
+    // ── issue #420: bounded writes to backends and clients ──────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_backend_write_is_bounded_and_frees_the_dialed_gauge() {
+        // Before the fix, `write_half.write_all` in `run_backend`'s
+        // writer had no timeout, unlike every other I/O site against this
+        // connection. A node that completes the handshake and then just
+        // never reads again would park this write forever:
+        // `poisoned.notified()` is only checked between requests, not
+        // while a write is in flight, so nothing would ever bring the
+        // writer back around to notice the reader poisoning on its own
+        // per-reply timeout. The task, its socket, and the `dialed` gauge
+        // would leak permanently, and the slot would keep pointing at the
+        // dead handle.
+        let silent = start_silent_after_handshake_node().await;
+        let context = bare_context();
+        // Comfortably larger than any plausible default OS socket buffer
+        // pair on an unread loopback connection, so the write reliably
+        // blocks instead of racing a platform-specific buffer size.
+        let big_value = vec![b'x'; 5_000_000];
+
+        // Deliberately not awaited: `run_backend`'s writer stalls trying
+        // to deliver this to `silent`, and the point of this test is what
+        // happens to the connection's own bookkeeping while that reply
+        // never arrives — not the reply itself.
+        let _pending = context
+            .backends
+            .enqueue(
+                &context,
+                &silent,
+                frame_set(b"", b"key", &big_value, None),
+                Expect::Stored,
+            )
+            .await;
+
+        assert_eq!(
+            context.backends.dialed.load(Ordering::SeqCst),
+            1,
+            "the dial should have succeeded before the write ever stalls"
+        );
+
+        // Without the fix this spins until the outer timeout below fires
+        // and fails the test: the writer task never reaches its
+        // teardown, so `dialed` never drops back to 0.
+        timeout(UPSTREAM_IO_TIMEOUT * 10, async {
+            while context.backends.dialed.load(Ordering::SeqCst) != 0 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled writer must time out and release its dialed-gauge slot");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_that_stops_reading_does_not_block_the_writer_forever() {
+        // Before the fix, `write_half.write_all` in `handle_client`'s
+        // writer had no timeout either. A client that stops reading its
+        // socket would park that write forever — and `handle_client`'s
+        // own teardown (`drop(fifo_tx); writer.await`) would then hang
+        // right along with it, so `handle_client` never returns and its
+        // `max_connections` permit (acquired in `serve`) is never
+        // released. With `max_connections` set to 1, one such client
+        // should permanently starve every later connection without the
+        // fix.
+        let node = MockNode::start().await;
+        // As large as a value reply is allowed to be (`read_reply` in
+        // this same module rejects a `V` length over `MAX_REQUEST_SIZE`
+        // as a protocol violation) — large enough, paired with the
+        // receiver's shrunk buffer below, to overrun even a generous
+        // default OS send buffer.
+        let big_value = vec![b'x'; MAX_REQUEST_SIZE - 1024];
+        node.store
+            .lock()
+            .unwrap()
+            .insert((Vec::new(), b"key".to_vec()), big_value);
+        let roster = vec![("node".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, None, 1).await;
+
+        // Occupies the sole connection permit, then asks for the huge
+        // value and never reads the response. Shrinking this socket's
+        // own receive buffer bounds how much the proxy's writer can hand
+        // off to the kernel before blocking, regardless of how generous
+        // this platform's default buffers are. Half-closing the write
+        // side afterward (a TCP FIN, not a full close) lets
+        // `handle_client`'s *reader* observe EOF and reach its
+        // `drop(fifo_tx); writer.await` teardown quickly instead of
+        // idling for the full, real (not shrunk-under-test)
+        // `IDLE_TIMEOUT` — the read direction, and so the still-unread
+        // receive buffer the writer is stalled on, is untouched by this.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut stalled = socket.connect(proxy.parse().unwrap()).await.unwrap();
+        let mut buf = BytesMut::new();
+        stalled.write_all(b"A 1\nx").await.unwrap();
+        assert_eq!(read_line(&mut stalled, &mut buf).await.unwrap(), "On");
+        stalled.write_all(b"G 3\nkey").await.unwrap();
+        stalled.shutdown().await.unwrap();
+
+        // While the writer is stalled, the proxy is over its connection
+        // budget: a fresh connection is answered `B` and closed
+        // immediately — the existing, unrelated `max_connections`
+        // behavior, not itself proof of the fix.
+        let mut busy = TcpStream::connect(&proxy).await.unwrap();
+        let mut busy_buf = BytesMut::new();
+        assert_eq!(read_line(&mut busy, &mut busy_buf).await.unwrap(), "B");
+
+        // The actual proof: once the stalled writer's bounded timeout
+        // fires, `handle_client` tears the connection down and releases
+        // its permit, letting a fresh connection through. Without the
+        // fix this loop never succeeds and the outer timeout fails the
+        // test instead of hanging the suite forever.
+        let start = std::time::Instant::now();
+        timeout(UPSTREAM_IO_TIMEOUT * 10, async {
+            loop {
+                let mut probe = TcpStream::connect(&proxy).await.unwrap();
+                let mut probe_buf = BytesMut::new();
+                probe.write_all(b"A 1\nx").await.unwrap();
+                match read_line(&mut probe, &mut probe_buf).await.as_deref() {
+                    Ok("On") => return,
+                    _ => sleep(Duration::from_millis(10)).await,
+                }
+            }
+        })
+        .await
+        .expect("the stalled client's permit must be released once its writer times out");
+        // Confirms the permit was released *because* the write timeout
+        // actually fired, not because the write happened to finish
+        // instantly (which would make this test pass for the wrong
+        // reason even without the fix).
+        assert!(
+            start.elapsed() >= CLIENT_WRITE_TIMEOUT,
+            "elapsed {:?} is suspiciously fast for a write that was supposed to stall",
+            start.elapsed()
+        );
+    }
+
+    // ── issue #409(b): `fetch_roster` races its replicas ────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_races_replicas_instead_of_trying_them_in_order() {
+        // Before the fix, `fetch_roster` tried discovery replicas one at
+        // a time in a `for` loop — the one multi-address fan-out left
+        // sequential by the earlier #177 pass (every other fan-out in
+        // this module already runs concurrently). A black-holed first
+        // replica cost a full `UPSTREAM_IO_TIMEOUT` on every refresh
+        // cycle, and delayed `/readyz`/`force_refresh` convergence,
+        // before the next (live) replica was even dialed.
+        let black_hole = start_black_hole_node().await;
+        let live =
+            start_mock_discovery(vec![("node".to_string(), "127.0.0.1:1".to_string())], 1).await;
+
+        let start = std::time::Instant::now();
+        let result = fetch_roster(&[black_hole, live], &None, &None).await;
+        let elapsed = start.elapsed();
+
+        let ring = result.expect("the live replica's roster should still answer");
+        assert_eq!(ring.all_addresses(), vec!["127.0.0.1:1".to_string()]);
+        // Raced concurrently, the live replica answers almost
+        // immediately regardless of where the black hole sits in the
+        // list; sequential trial would have cost a full
+        // `UPSTREAM_IO_TIMEOUT` first since the black hole is listed
+        // *before* the live replica.
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT / 2,
+            "elapsed {elapsed:?} suggests the black-holed replica was tried before the live one, not raced"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_falls_back_when_every_replica_but_one_fails() {
+        // The race still needs a correct fallback story: if the fastest
+        // replicas all fail (refuse, or answer `B` for their startup
+        // grace), the one that eventually succeeds must still be
+        // returned rather than the race giving up early.
+        let refused = "127.0.0.1:1".to_string(); // connection refused: fails fast
+        let live =
+            start_mock_discovery(vec![("node".to_string(), "127.0.0.1:2".to_string())], 1).await;
+
+        let ring = fetch_roster(&[refused, live], &None, &None)
+            .await
+            .expect("the live replica's roster should still answer");
+        assert_eq!(ring.all_addresses(), vec!["127.0.0.1:2".to_string()]);
     }
 }
