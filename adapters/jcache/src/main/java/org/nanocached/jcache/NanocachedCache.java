@@ -11,7 +11,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.cache.Cache;
 import javax.cache.CacheException;
@@ -36,6 +40,7 @@ import javax.cache.processor.EntryProcessorResult;
 import javax.management.JMException;
 import javax.management.ObjectName;
 import org.nanocached.NanocachedClient;
+import org.nanocached.NanocachedException;
 
 /**
  * One JCache {@link Cache}, backed by one nanocached namespace (issue
@@ -102,6 +107,42 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      * itself, so exhausting the retry budget there just reports
      * failure. */
     private static final int MAX_CAS_RETRIES = 10;
+
+    /** Bound on {@link #getAll}/{@link #putAll} retrying the remainder of
+     * a batch that is still wrong-node after the SDK's own {@code
+     * getManyBytes}/{@code setManyBytes} built-in one bounded
+     * refresh-and-retry (issue #415) — the same role {@link
+     * #MAX_CAS_RETRIES} plays for the CAS loops above: a ring that keeps
+     * moving under one batch for this long is pathological, so this stays
+     * small and a batch still unresolved after it propagates instead of
+     * retrying forever. */
+    private static final int MAX_BULK_WRONG_NODE_RETRIES = 3;
+
+    /** Bound on {@link #removeAll(Set)}'s client-side concurrent fan-out
+     * (issue #415): the wire protocol has no bulk-delete primitive — only
+     * single-key {@code delete}/{@code deleteIfMatches} on {@link
+     * NanocachedClient.Namespace} — so this dispatches one {@link
+     * #remove(Object)} per key concurrently rather than sequentially, the
+     * same pattern {@code nanocached-django}'s {@code delete_many} (issue
+     * #233) and {@code nanocached-cache-manager}'s {@code mdel} use.
+     * Sized to the same order of magnitude as the SDK's own per-frame
+     * batch bound ({@code NanocachedClient.MAX_BATCH_KEYS}, 400 — private
+     * to that package, so not reusable directly) rather than launching one
+     * thread per key for an arbitrarily large key set: a fixed pool this
+     * size caps in-flight delete RPCs at once, queuing the rest, however
+     * large the key set. */
+    private static final int MAX_CONCURRENT_REMOVES = 256;
+
+    /** Shared, JVM-wide fan-out pool for {@link #removeAll(Set)} — daemon
+     * threads so it never blocks JVM shutdown, and lazily grown (a fixed
+     * pool only starts a thread when a task needs one) so it costs nothing
+     * until first used. */
+    private static final ExecutorService REMOVE_ALL_EXECUTOR = Executors.newFixedThreadPool(
+            MAX_CONCURRENT_REMOVES, runnable -> {
+                Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     private static final long NO_EXPIRY = 0L;
 
@@ -179,7 +220,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         for (int i = 0; i < ordered.size(); i++) {
             wireKeys[i] = KeyCodec.toKeyBytes(Objects.requireNonNull(ordered.get(i), "key"));
         }
-        byte[][] raw = namespace.getManyBytes(wireKeys);
+        byte[][] raw = getManyBytesResolvingWrongNode(wireKeys);
 
         Duration accessExpiry = expiryPolicy.getExpiryForAccess();
         OptionalLong accessTtl = accessExpiry == null ? OptionalLong.empty() : wireTtlSeconds(accessExpiry);
@@ -217,6 +258,60 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                     accessTtl.getAsLong());
         }
         return result;
+    }
+
+    /**
+     * {@link NanocachedClient.Namespace#getManyBytes(byte[][])}, but a
+     * ring change mid-batch (issue #415) no longer discards the keys that
+     * DID resolve: {@link NanocachedException.PartialWrongNodeRaw}
+     * carries every value that resolved plus the positions that didn't,
+     * so this retries only that remainder — bounded by {@link
+     * #MAX_BULK_WRONG_NODE_RETRIES} — splicing each round's newly
+     * resolved values back into their original positions. Single-key
+     * {@link #get} gets "one ring change doesn't lose data" for free from
+     * the SDK's own transparent {@code withWrongNodeRetry}; the bulk
+     * primitive has already spent its one built-in refresh-and-retry by
+     * the time it throws, so this does the equivalent at the adapter
+     * layer instead of just letting the exception propagate and throwing
+     * away an otherwise-successful batch.
+     */
+    private byte[][] getManyBytesResolvingWrongNode(byte[][] wireKeys) {
+        byte[][] result = new byte[wireKeys.length][];
+        int[] positions = identityPositions(wireKeys.length);
+        byte[][] pending = wireKeys;
+        for (int attempt = 0; ; attempt++) {
+            try {
+                byte[][] values = namespace.getManyBytes(pending);
+                for (int i = 0; i < positions.length; i++) {
+                    result[positions[i]] = values[i];
+                }
+                return result;
+            } catch (NanocachedException.PartialWrongNodeRaw partial) {
+                for (int i = 0; i < positions.length; i++) {
+                    result[positions[i]] = partial.partialValues[i];
+                }
+                if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
+                    throw partial;
+                }
+                int[] unresolved = partial.unresolvedIndices;
+                int[] nextPositions = new int[unresolved.length];
+                byte[][] nextPending = new byte[unresolved.length][];
+                for (int i = 0; i < unresolved.length; i++) {
+                    nextPositions[i] = positions[unresolved[i]];
+                    nextPending[i] = pending[unresolved[i]];
+                }
+                positions = nextPositions;
+                pending = nextPending;
+            }
+        }
+    }
+
+    private static int[] identityPositions(int n) {
+        int[] positions = new int[n];
+        for (int i = 0; i < n; i++) {
+            positions[i] = i;
+        }
+        return positions;
     }
 
     @Override
@@ -536,7 +631,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             n++;
         }
 
-        byte[][] existing = namespace.getManyBytes(wireKeys);
+        byte[][] existing = getManyBytesResolvingWrongNode(wireKeys);
 
         // Resolved TTL → the positions that share it. Insertion order is
         // kept so the groups' writes (and their listener events) follow
@@ -568,13 +663,41 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 groupKeys[g] = wireKeys[positions.get(g)];
                 groupValues[g] = wireValues[positions.get(g)];
             }
-            namespace.setManyBytes(groupKeys, groupValues, group.getKey());
+            setManyBytesResolvingWrongNode(groupKeys, groupValues, group.getKey());
             for (int i : positions) {
                 statistics.recordPut();
                 if (existing[i] != null) {
                     fireUpdated(keys.get(i), values.get(i), ValueCodec.deserialize(existing[i]));
                 } else {
                     fireCreated(keys.get(i), values.get(i));
+                }
+            }
+        }
+    }
+
+    /**
+     * {@link NanocachedClient.Namespace#setManyBytes(byte[][], byte[][],
+     * long)}, but a ring change mid-batch (issue #415) no longer aborts
+     * the whole group and discards its listener events with it:
+     * {@code setManyBytes} has nothing per-key to retry a remainder from
+     * on a partial failure — see {@link
+     * NanocachedException.PartialWrongNode}'s own doc, "there's no
+     * partial payload worth attaching" — so, bounded by {@link
+     * #MAX_BULK_WRONG_NODE_RETRIES}, this retries the *whole* group
+     * instead. That's safe: {@code setManyBytes}' per-key writes are
+     * idempotent, so re-sending a key that already landed on a previous
+     * attempt (the ring simply hadn't caught up yet) is a harmless
+     * duplicate write of the exact same value/TTL this call was already
+     * going to make.
+     */
+    private void setManyBytesResolvingWrongNode(byte[][] keys, byte[][] values, long ttlSeconds) {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                namespace.setManyBytes(keys, values, ttlSeconds);
+                return;
+            } catch (NanocachedException.WrongNode error) {
+                if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
+                    throw error;
                 }
             }
         }
@@ -666,12 +789,43 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         return oldValue;
     }
 
+    /**
+     * Fans every key's {@link #remove(Object)} out concurrently on {@link
+     * #REMOVE_ALL_EXECUTOR} (issue #415) rather than issuing one delete
+     * RPC after another: there is no bulk-delete primitive on the wire
+     * ({@link NanocachedClient.Namespace} only has single-key {@code
+     * delete}/{@code deleteIfMatches}), so this is the client-side
+     * analogue of {@link #getAll}/{@link #putAll}'s own wire-level
+     * batching — see {@link #MAX_CONCURRENT_REMOVES} for the concurrency
+     * bound. {@link CompletableFuture#allOf} waits for every leg to
+     * finish, success or failure, before this reports anything — the same
+     * "wait for all, then raise" convention {@code nanocached-django}'s
+     * {@code delete_many} (issue #233/#332) and {@code
+     * nanocached-cache-manager}'s {@code mdel} follow — so a failing key
+     * never leaves sibling deletes still in flight when this returns.
+     */
     @Override
     public void removeAll(Set<? extends K> keys) {
         requireNotClosed();
         Objects.requireNonNull(keys, "keys");
+        if (keys.isEmpty()) {
+            return;
+        }
+        List<CompletableFuture<Void>> futures = new ArrayList<>(keys.size());
         for (K key : keys) {
-            remove(key);
+            futures.add(CompletableFuture.runAsync(() -> remove(key), REMOVE_ALL_EXECUTOR));
+        }
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();
+        } catch (CompletionException wrapped) {
+            Throwable cause = wrapped.getCause();
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw wrapped;
         }
     }
 
