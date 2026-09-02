@@ -539,10 +539,21 @@ impl Cache {
         // this one to the next sweep (it would silently delete it).
         self.clear_migrated_mark(&key);
 
-        let namespace = self
-            .namespaces
-            .entry(key.namespace.clone())
-            .or_insert_with(Namespace::new);
+        // Issue #406: `key.namespace` is sliced zero-copy out of the
+        // request frame by the parser (like `key.name` and `value` above),
+        // so using it as-is for a *fresh* namespace's map key would pin
+        // the whole pipelined receive-buffer chunk alive for as long as
+        // the namespace exists — uncharged to `used_bytes`, same class of
+        // bug `value`/`key.name` are re-copied above to avoid. An
+        // already-known namespace is looked up first so the common case
+        // (an existing namespace) doesn't pay for a copy it doesn't need.
+        let namespace = if let Some(namespace) = self.namespaces.get_mut(&key.namespace) {
+            namespace
+        } else {
+            self.namespaces
+                .entry(Bytes::copy_from_slice(&key.namespace))
+                .or_insert_with(Namespace::new)
+        };
 
         // An overwrite keeps the stored key (`LruCache::put` would too, and
         // discard the copy), so only copy the key for a genuinely new
@@ -1698,6 +1709,44 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"k1")), None);
         assert_eq!(cache.get(&key(b"k2")), Some(Bytes::from_static(b"vvvv")));
+    }
+
+    #[test]
+    fn a_fresh_namespaces_map_key_is_a_copy_not_a_slice_of_the_callers_buffer() {
+        // Regression (issue #406): the parser slices `key.namespace`
+        // zero-copy out of the request frame (like `key.name`/`value`,
+        // which `insert` already re-copies for exactly this reason — see
+        // its own comment). Using it as-is for a brand-new namespace's
+        // `HashMap` key would pin whatever buffer it was sliced from —
+        // potentially an entire pipelined read chunk — alive for as long
+        // as the namespace exists, uncharged to `used_bytes`.
+        let mut cache = Cache::new(UNBOUNDED);
+
+        // A namespace name sliced out of a much larger shared buffer, the
+        // same shape a zero-copy parse would produce.
+        let mut backing = vec![0u8; 4096];
+        backing[100..106].copy_from_slice(b"tenant");
+        let backing = Bytes::from(backing);
+        let namespace = backing.slice(100..106);
+        assert_eq!(&namespace[..], b"tenant");
+
+        cache.set(
+            Key::new(namespace.clone(), Bytes::copy_from_slice(b"k")),
+            Bytes::from_static(b"v"),
+        );
+
+        let stored_namespace = cache
+            .namespaces
+            .keys()
+            .find(|stored| stored.as_ref() == b"tenant")
+            .expect("the namespace was just inserted");
+
+        assert_ne!(
+            stored_namespace.as_ptr(),
+            namespace.as_ptr(),
+            "the namespace map key must be its own allocation, not a zero-copy slice of the \
+             caller's buffer"
+        );
     }
 
     #[test]
