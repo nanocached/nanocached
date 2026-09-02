@@ -28,9 +28,16 @@ namespace Nanocached.Caching;
 /// (see the private <c>Envelope</c> type) recording the configured sliding
 /// window and/or absolute expiry alongside the payload, so a later
 /// <see cref="Get"/>/<see cref="Refresh"/> can recompute the remaining TTL
-/// and re-set the entry with it. An entry with no sliding window is never
-/// rewritten on <see cref="Get"/> — its TTL (if any) is fixed regardless of
-/// access, so the extra round trip would buy nothing.</para>
+/// and re-write the entry with it. The renewal is a conditional
+/// compare-and-set against the exact bytes the read returned (issue #391):
+/// a plain re-set would be a read-modify-write that silently clobbers a
+/// concurrent <see cref="Set"/> landing between the read and the renewal —
+/// a lost update with nothing signalling it. A renewal whose condition no
+/// longer matches is simply skipped: whoever won wrote a fresher entry
+/// (with its own TTL) than the one this renewal was about to restore. An
+/// entry with no sliding window is never rewritten on <see cref="Get"/> —
+/// its TTL (if any) is fixed regardless of access, so the extra round trip
+/// would buy nothing.</para>
 /// </summary>
 public class NanocachedDistributedCache : IDistributedCache
 {
@@ -80,10 +87,10 @@ public class NanocachedDistributedCache : IDistributedCache
         token.ThrowIfCancellationRequested();
 
         byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-        byte[]? raw = await _namespace.GetBytesAsync(keyBytes).ConfigureAwait(false);
-        if (raw is null) return null;
+        (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes).ConfigureAwait(false);
+        if (read is not { } hit) return null;
 
-        Envelope envelope = Envelope.Parse(raw);
+        Envelope envelope = Envelope.Parse(hit.Value);
         if (envelope.SlidingSeconds == 0) return envelope.Payload; // fixed TTL (or none) — nothing to renew
 
         DateTimeOffset now = DateTimeOffset.UtcNow;
@@ -94,17 +101,24 @@ public class NanocachedDistributedCache : IDistributedCache
             // be floored to a 1-second TTL and resurrected by the
             // sliding renewal below — treat it as expired instead, the
             // same miss this call would answer once eviction actually
-            // catches up.
-            await _namespace.DeleteAsync(keyBytes).ConfigureAwait(false);
+            // catches up. Conditional on the token (issue #391) so a
+            // concurrent Set that just replaced the entry isn't deleted
+            // along with the expired bytes this call actually read.
+            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token).ConfigureAwait(false);
             return null;
         }
 
-        // Sliding expiration: re-set with the recomputed TTL before
+        // Sliding expiration: re-write with the recomputed TTL before
         // returning — awaited, never fire-and-forget (shared spec), so a
         // caller that awaits this call can rely on the renewal having
-        // actually reached the wire.
+        // actually reached the wire. Conditional on the read's token
+        // (issue #391): an unconditional SetAsync here was a
+        // read-modify-write that could clobber a concurrent Set landing
+        // between the read above and this write. A false return means
+        // exactly that — someone else just wrote a fresher entry — so the
+        // renewal is skipped, not retried.
         long wireTtl = envelope.WireTtlSeconds(now);
-        await _namespace.SetAsync(keyBytes, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
         return envelope.Payload;
     }
 
@@ -133,12 +147,12 @@ public class NanocachedDistributedCache : IDistributedCache
         token.ThrowIfCancellationRequested();
 
         byte[] keyBytes = Encoding.UTF8.GetBytes(key);
-        byte[]? raw = await _namespace.GetBytesAsync(keyBytes).ConfigureAwait(false);
+        (byte[] Value, string Token)? read = await _namespace.GetBytesWithTokenAsync(keyBytes).ConfigureAwait(false);
         // A missing key is a no-op, per IDistributedCache's contract —
         // not a miss error.
-        if (raw is null) return;
+        if (read is not { } hit) return;
 
-        Envelope envelope = Envelope.Parse(raw);
+        Envelope envelope = Envelope.Parse(hit.Value);
         // No sliding window: nothing a refresh would change (an absolute
         // expiry doesn't move; no expiry needs no TTL rewrite either) — so
         // skip the round trip rather than re-set identical content.
@@ -149,13 +163,17 @@ public class NanocachedDistributedCache : IDistributedCache
         {
             // Issue #233: see GetAsync's identical check — an already-past
             // absolute expiry must not be floored to a 1-second TTL and
-            // resurrected by this refresh.
-            await _namespace.DeleteAsync(keyBytes).ConfigureAwait(false);
+            // resurrected by this refresh. Token-conditional for the same
+            // reason as there (issue #391).
+            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token).ConfigureAwait(false);
             return;
         }
 
+        // Token-conditional renewal — see GetAsync (issue #391): a lost
+        // condition means a concurrent writer just refreshed the entry,
+        // so there is nothing left for this renewal to do.
         long wireTtl = envelope.WireTtlSeconds(now);
-        await _namespace.SetAsync(keyBytes, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
+        await _namespace.ReplaceAsync(keyBytes, hit.Token, envelope.ToBytes(), wireTtl).ConfigureAwait(false);
     }
 
     public void Remove(string key) => RemoveAsync(key).GetAwaiter().GetResult();
