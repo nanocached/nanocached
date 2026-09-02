@@ -39,11 +39,12 @@ import os
 import pickle
 import re
 import threading
+import weakref
 
 from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
 from django.core.exceptions import ImproperlyConfigured
 
-from nanocached import NanocachedClient
+from nanocached import CompressionIncompatibleError, NanocachedClient
 
 # OPTIONS.NAMESPACE default — every key this backend touches lives under
 # this namespace unless the CACHES entry overrides it (issue #105).
@@ -192,6 +193,50 @@ def _parse_addresses(location) -> list[tuple[str, int]]:
     return [_split_host_port(entry.strip()) for entry in entries]
 
 
+# issue #414: os.register_at_fork's after_in_child hook resets every
+# live instance's _lifecycle_lock in the forked child. A plain
+# threading.Lock is *not* automatically reinitialized by CPython after
+# fork the way the interpreter's own import lock is — if some other
+# thread happened to hold this lock at fork time (a threaded warm-up
+# cache touch racing gunicorn ``preload_app``'s fork, or uWSGI without
+# ``lazy-apps``), the child inherits it already locked with no thread
+# that could ever release it, so every subsequent ``with
+# self._lifecycle_lock`` in _ensure_started()/_run()/shutdown() blocks
+# forever in that child — before it even reaches the issue #393
+# fork-PID check above that would otherwise rebuild the loop/thread/
+# client. Swapping in a fresh, unlocked Lock() per instance clears
+# that regardless of whether the inherited lock happened to be held.
+#
+# Registered once per process (not once per instance — register_at_fork
+# has no matching unregister, so a repeated call would pile up one more
+# no-op hook per instance ever constructed) the first time any
+# NanocachedCache is built. A WeakSet, not a strong list, so tracking an
+# instance here never keeps it alive past its own last real reference.
+_live_instances: "weakref.WeakSet[NanocachedCache]" = weakref.WeakSet()
+_fork_hook_registration_lock = threading.Lock()
+_fork_hook_registered = False
+
+
+def _reset_lifecycle_locks_in_child() -> None:
+    for instance in list(_live_instances):
+        instance._lifecycle_lock = threading.Lock()
+
+
+def _ensure_fork_hook_registered() -> None:
+    global _fork_hook_registered
+    if _fork_hook_registered:
+        return
+    with _fork_hook_registration_lock:
+        if _fork_hook_registered:
+            return
+        # os.register_at_fork only exists on POSIX (no fork() on
+        # Windows) — guarded rather than imported unconditionally so
+        # this module still loads there.
+        if hasattr(os, "register_at_fork"):
+            os.register_at_fork(after_in_child=_reset_lifecycle_locks_in_child)
+        _fork_hook_registered = True
+
+
 class NanocachedCache(BaseCache):
     """Usage: ``"BACKEND": "nanocached_django.NanocachedCache"`` with
     ``LOCATION`` and ``OPTIONS`` as described in the module README's Setup
@@ -237,6 +282,11 @@ class NanocachedCache(BaseCache):
         # otherwise only ever touched from _run()'s single background
         # thread.
         self._lifecycle_lock = threading.Lock()
+        # issue #414: track this instance so a fork() elsewhere in the
+        # process can reset its lock in the child — see
+        # _reset_lifecycle_locks_in_child() above.
+        _live_instances.add(self)
+        _ensure_fork_hook_registered()
 
     # ── the sync/async bridge ───────────────────────────────────────
 
@@ -417,23 +467,29 @@ class NanocachedCache(BaseCache):
     # ── BaseCache SPI ────────────────────────────────────────────────
 
     def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
-        """Get-then-set, not atomic — the wire has no compare-and-set
-        (same trade-off the Spring adapter documents for its
-        ``putIfAbsent``): two racing callers can both observe "absent" and
-        both write, and the later write wins."""
+        """Atomic add via the SDK's ``put_if_absent`` (issue #141's k/A
+        compare-and-set, wired up here in #414): the key's primary owner
+        alone evaluates "is this absent" and performs the write, so two
+        racing ``add()`` calls can never both observe absent and both
+        write — the loser's ``put_if_absent`` simply comes back ``False``,
+        matching ``BaseCache.add()``'s "return False, don't overwrite"
+        contract exactly. (This docstring used to claim "the wire has no
+        compare-and-set" — true before #141/PR #146 added ``k``/``x``,
+        stale by the time of #414.)"""
         cache_key = self.make_and_validate_key(key, version=version)
         wire_ttl = self.get_backend_timeout(timeout)
-        existing = self._run(lambda handle: handle.get_bytes(cache_key))
-        if existing is not None:
-            return False
         if wire_ttl is _DO_NOT_CACHE:
-            # Nothing to store, but the key really was absent — same
+            # Nothing to store either way (see get_backend_timeout), so
+            # there's no write for put_if_absent to condition — just
+            # report whether the key really was absent, the same
             # "logically added, immediately expired" contract other
             # backends give a zero/negative timeout (e.g. LocMemCache).
-            return True
+            existing = self._run(lambda handle: handle.get_bytes(cache_key))
+            return existing is None
         encoded = _encode_value(value)
-        self._run(lambda handle: handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
-        return True
+        return self._run(
+            lambda handle: handle.put_if_absent(cache_key, encoded, ttl_seconds=wire_ttl)
+        )
 
     def get(self, key, default=None, version=None):
         cache_key = self.make_and_validate_key(key, version=version)
@@ -558,9 +614,27 @@ class NanocachedCache(BaseCache):
         As volatile as ``set()``: LRU eviction or this alias's TIMEOUT
         reclaim a counter the same as any other entry, so this is a fit
         for rate limiting or approximate counts, not for a count that
-        must survive (billing, inventory)."""
+        must survive (billing, inventory).
+
+        issue #414: ``OPTIONS.COMPRESS`` and ``incr``/``decr`` cannot
+        coexist on the SDK client this backend holds (issue #321's
+        ``CompressionIncompatibleError`` — the wire has no marker byte on
+        an increment's result, so a compress-enabled client can't tell a
+        counter reply from anything else on a later ``get()``). That
+        exception is an SDK-internal type, outside what
+        ``BaseCache.incr()`` callers are expected to catch, so it's
+        translated to ``ValueError`` at this boundary instead — the same
+        exception type this method already raises for a missing key,
+        which is as close as Django's cache contract comes to "this
+        combination of settings doesn't support incr()"."""
         cache_key = self.make_and_validate_key(key, version=version)
-        new_value = self._run(lambda handle: handle.incr(cache_key, delta))
+        try:
+            new_value = self._run(lambda handle: handle.incr(cache_key, delta))
+        except CompressionIncompatibleError as exc:
+            raise ValueError(
+                "nanocached_django: incr()/decr() cannot be used on a cache "
+                "alias configured with OPTIONS.COMPRESS"
+            ) from exc
         if new_value is None:
             raise ValueError(f"Key '{key}' not found")
         return new_value
