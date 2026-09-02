@@ -169,6 +169,17 @@ type mockNode struct {
 	frameSizesMu sync.Mutex
 	mFrameSizes  []int
 	oFrameSizes  []int
+	// closeAfterMFrames/closeAfterOFrames (issue #411): when non-zero,
+	// this node closes itself entirely — every open connection plus its
+	// own listener, so a subsequent redial also fails, mirroring close()
+	// — right after successfully replying to its Nth `m`/`o` frame.
+	// Regression coverage for a connection failure on chunk N>1 of a
+	// chunked GetMany/SetMany batch, where chunks 1..N-1 already
+	// succeeded: the built-in reconnect retry (applyReconnecting) is
+	// given nothing left to redial to, so the failure actually
+	// propagates instead of being transparently retried away.
+	closeAfterMFrames atomic.Int32
+	closeAfterOFrames atomic.Int32
 }
 
 // mockNodeOpts configures a startMockNode server's echoed response tags
@@ -294,6 +305,12 @@ func (m *mockNode) oFrameSizesSeen() []int {
 	defer m.frameSizesMu.Unlock()
 	return append([]int(nil), m.oFrameSizes...)
 }
+
+// closeAfterMFrame/closeAfterOFrame (issue #411) arm this node to close
+// itself entirely right after successfully replying to its nth `m`/`o`
+// frame — see closeAfterMFrames/closeAfterOFrames on mockNode.
+func (m *mockNode) closeAfterMFrame(n int32) { m.closeAfterMFrames.Store(n) }
+func (m *mockNode) closeAfterOFrame(n int32) { m.closeAfterOFrames.Store(n) }
 
 // mockDigestHex computes the same content digest hex a real
 // nanocached-node evaluates a `k`/`x` <cond> digest against
@@ -770,6 +787,10 @@ func (m *mockNode) serve(conn net.Conn) {
 			if _, err := conn.Write(append([]byte(header+tagSuffix+"\n"), body...)); err != nil {
 				return
 			}
+			if n := m.closeAfterMFrames.Load(); n != 0 && m.mCount.Load() == n {
+				m.close()
+				return
+			}
 		// Batched set (issues #150/#151): `o <ns-len> <n> <key-len-1>
 		// <value-len-1> ... <key-len-n> <value-len-n> [<ttl>][ <tag>]
 		// \n<ns><key-1><value-1>...<key-n><value-n>` — one shared TTL
@@ -835,6 +856,10 @@ func (m *mockNode) serve(conn net.Conn) {
 				header += " S"
 			}
 			if _, err := conn.Write([]byte(header + tagSuffix + "\n")); err != nil {
+				return
+			}
+			if n := m.closeAfterOFrames.Load(); n != 0 && m.oCount.Load() == n {
+				m.close()
 				return
 			}
 		// Incr/Decr (issue #129): `i <ns-len> <key-len> <delta>[ <tag>]
@@ -1547,7 +1572,7 @@ func TestRejectsANamespacePlusKeyPlusValueThatExceedsMaxRequestBytes(t *testing.
 	if err := ns.SetBytes("k", value, 0); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("oversized namespace+key+value accepted by SetBytes, err = %v, want ErrInvalidArgument", err)
 	}
-	if err := ns.SetManyBytes(map[string][]byte{"k": value}, 0); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := ns.SetManyBytes(map[string][]byte{"k": value}, 0); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("oversized namespace+key+value accepted by SetManyBytes, err = %v, want ErrInvalidArgument", err)
 	}
 	if _, err := ns.PutIfAbsent("k", value, 0); !errors.Is(err, ErrInvalidArgument) {
@@ -3479,7 +3504,7 @@ func TestSetManyThenGetManyRoundTripWithTTL(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 60); err != nil {
+	if _, err := client.SetMany(map[string]string{"a": "1", "b": "2"}, 60); err != nil {
 		t.Fatalf("SetMany err = %v", err)
 	}
 	if ttl, ok := node.storedTTL("a"); !ok || ttl != 60 {
@@ -3520,7 +3545,7 @@ func TestSetManyBytesRequiresAtLeastOneKey(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.SetMany(map[string]string{}, 0); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := client.SetMany(map[string]string{}, 0); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("SetMany({}) err = %v, want ErrInvalidArgument", err)
 	}
 }
@@ -3547,7 +3572,7 @@ func TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames(t *testing.T) {
 		values[key] = fmt.Sprintf("value-%d", i)
 	}
 
-	if err := client.SetMany(values, 0); err != nil {
+	if _, err := client.SetMany(values, 0); err != nil {
 		t.Fatalf("SetMany err = %v", err)
 	}
 	if got := node.oCount.Load(); got != 2 {
@@ -3568,6 +3593,124 @@ func TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames(t *testing.T) {
 		if got[key] != want {
 			t.Fatalf("GetMany[%q] = %q, want %q", key, got[key], want)
 		}
+	}
+}
+
+// TestGetManyBytesReturnsPartialResultsOnChunkConnectionFailure is
+// issue #411's read-side confirmation: GetManyBytes' single-mode path
+// (getManyNS) already builds its returned values map from whatever
+// `m` sub-frames actually completed, regardless of whether the overall
+// call also returns an error — multiGetChunked's own contract leaves a
+// failed chunk's entries at the zero value instead of discarding the
+// earlier chunks it already collected. maxBatchKeys+5 keys forces
+// exactly two `m` sub-frames (see
+// TestBatchLargerThanMaxBatchKeysSplitsIntoMultipleSubFrames above,
+// GetMany's own half); the node is armed to close itself entirely —
+// every open connection plus its own listener, so the built-in
+// reconnect retry (applyReconnecting) also fails to redial — right
+// after replying to the first one, so the second sub-frame's
+// connection failure actually propagates instead of being
+// transparently retried away.
+func TestGetManyBytesReturnsPartialResultsOnChunkConnectionFailure(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const total = maxBatchKeys + 5
+	keys := make([]string, total)
+	want := make(map[string]string, total)
+	for i := 0; i < total; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
+		keys[i] = key
+		want[key] = value
+		if err := client.SetBytes(key, []byte(value), 0); err != nil {
+			t.Fatalf("SetBytes(%d) err = %v", i, err)
+		}
+	}
+
+	node.closeAfterMFrame(1) // close right after the first `m` sub-frame succeeds
+
+	values, err := client.GetManyBytes(keys)
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("err = %v, want ErrConnectionLost", err)
+	}
+	if got := node.mCount.Load(); got != 1 {
+		t.Fatalf("mCount = %d, want 1 (only the first chunk should have gotten through)", got)
+	}
+	if len(values) != maxBatchKeys {
+		t.Fatalf("GetManyBytes returned %d keys on a chunk-2 connection failure, want %d "+
+			"(the first chunk's hits) — not zero", len(values), maxBatchKeys)
+	}
+	// keys/values are processed in request order, so the first chunk is
+	// deterministically keys[0:maxBatchKeys].
+	for _, key := range keys[:maxBatchKeys] {
+		if got := string(values[key]); got != want[key] {
+			t.Errorf("values[%q] = %q, want %q", key, got, want[key])
+		}
+	}
+	for _, key := range keys[maxBatchKeys:] {
+		if _, ok := values[key]; ok {
+			t.Errorf("values[%q] present, want absent — its chunk never got a response", key)
+		}
+	}
+}
+
+// TestSetManyBytesReturnsPartialResultsOnChunkConnectionFailure is
+// issue #411's fix under test: a connection failure on chunk N>1 of a
+// chunked SetMany/SetManyBytes batch must not discard chunks 1..N-1's
+// already-confirmed writes — SetManyBytes now returns (map[string]bool,
+// error), and the map must reflect exactly what was actually persisted
+// even when err != nil, mirroring GetManyBytes' own values map (see
+// TestGetManyBytesReturnsPartialResultsOnChunkConnectionFailure just
+// above, whose setup this parallels). Before this fix, setManyNS's
+// single-mode path discarded multiSetChunked's partial entries the
+// moment chunkErr was non-nil.
+func TestSetManyBytesReturnsPartialResultsOnChunkConnectionFailure(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const total = maxBatchKeys + 5
+	values := make(map[string][]byte, total)
+	for i := 0; i < total; i++ {
+		values[fmt.Sprintf("key-%d", i)] = []byte(fmt.Sprintf("value-%d", i))
+	}
+
+	node.closeAfterOFrame(1) // close right after the first `o` sub-frame succeeds
+
+	stored, err := client.SetManyBytes(values, 0)
+	if !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("err = %v, want ErrConnectionLost", err)
+	}
+	if got := node.oCount.Load(); got != 1 {
+		t.Fatalf("oCount = %d, want 1 (only the first chunk should have gotten through)", got)
+	}
+	if len(stored) != maxBatchKeys {
+		t.Fatalf("SetManyBytes reported %d stored keys on a chunk-2 connection failure, want %d "+
+			"(the first chunk's writes) — not zero", len(stored), maxBatchKeys)
+	}
+	for key, ok := range stored {
+		if !ok {
+			t.Errorf("stored[%q] = false, want every entry present to mean true", key)
+		}
+		if !node.hasKey(key) {
+			t.Errorf("stored[%q] = true but the node never actually persisted it", key)
+		}
+		if got, ok := node.storedValue(key); !ok || got != string(values[key]) {
+			t.Errorf("node's stored value for %q = %q, %v, want %q, true", key, got, ok, values[key])
+		}
+	}
+	// Every key the node actually has must be reflected in the returned
+	// map too — no silently-successful write should go unreported.
+	if node.storeLen() != len(stored) {
+		t.Fatalf("node has %d stored keys but SetManyBytes only reported %d", node.storeLen(), len(stored))
 	}
 }
 
@@ -3601,7 +3744,7 @@ func TestSetManyBytesSplitsByCumulativeBytesEvenUnderMaxBatchKeys(t *testing.T) 
 		values[key] = value
 	}
 
-	if err := client.SetManyBytes(values, 0); err != nil {
+	if _, err := client.SetManyBytes(values, 0); err != nil {
 		t.Fatalf("SetManyBytes err = %v", err)
 	}
 
@@ -3812,7 +3955,7 @@ func TestClusterGetManySplitsAcrossOwnersAndReassembles(t *testing.T) {
 		keys[i] = key
 		values[key] = fmt.Sprintf("value-%d", i)
 	}
-	if err := client.SetMany(values, 0); err != nil {
+	if _, err := client.SetMany(values, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3851,7 +3994,7 @@ func TestClusterSetManyStoresOnEveryOwnerWithReplication2(t *testing.T) {
 		keys[i] = key
 		values[key] = fmt.Sprintf("value-%d", i)
 	}
-	if err := client.SetMany(values, 0); err != nil {
+	if _, err := client.SetMany(values, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3882,7 +4025,7 @@ func TestClusterSetManySendsExactlyOneSubFrameToANodeThatIsPrimaryForOneKeyAndRe
 	keyA := keyWithPrimary(t, testNames[0])
 	keyB := keyWithPrimary(t, testNames[1])
 
-	if err := client.SetMany(map[string]string{keyA: "va", keyB: "vb"}, 0); err != nil {
+	if _, err := client.SetMany(map[string]string{keyA: "va", keyB: "vb"}, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3982,7 +4125,7 @@ func TestClusterSetManyRecoversAPerKeyWrongNodeAfterARefresh(t *testing.T) {
 	owner.multiWrongNodeKey.Store(wrongKey)
 	owner.multiWrongNodeLeft.Add(1)
 
-	if err := client.SetMany(map[string]string{wrongKey: "w", okKey: "ok"}, 0); err != nil {
+	if _, err := client.SetMany(map[string]string{wrongKey: "w", okKey: "ok"}, 0); err != nil {
 		t.Fatalf("SetMany after one per-key W = %v, want success", err)
 	}
 	if !owner.hasKey(wrongKey) || !owner.hasKey(okKey) {

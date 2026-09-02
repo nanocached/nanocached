@@ -1074,6 +1074,11 @@ public sealed class NanocachedClient : IDisposable
         {
             throw new PartialWrongNodeException<Dictionary<string, string>>(DecodeMany(partial.PartialValues));
         }
+        catch (PartialConnectionLostException<Dictionary<string, byte[]>> partial)
+        {
+            throw new PartialConnectionLostException<Dictionary<string, string>>(
+                DecodeMany(partial.PartialValues), partial.InnerException!);
+        }
     }
 
     private static Dictionary<string, string> DecodeMany(Dictionary<string, byte[]> raw)
@@ -1136,8 +1141,25 @@ public sealed class NanocachedClient : IDisposable
 
         if (_ring is null)
         {
-            List<Connection.MultiEntry> entries =
-                await MultiGetChunkedAsync(null, namespaceBytes, keyBytes).ConfigureAwait(false);
+            List<Connection.MultiEntry> entries;
+            try
+            {
+                entries = await MultiGetChunkedAsync(null, namespaceBytes, keyBytes).ConfigureAwait(false);
+            }
+            catch (ChunkedBatchInterruptedException partial)
+            {
+                // issue #411: a later chunk's connection failure survived
+                // the built-in reconnect — don't discard the earlier
+                // chunks' already-decoded hits, carry them instead.
+                var partialValues = new Dictionary<string, byte[]>(partial.CompletedEntries.Count);
+                for (int i = 0; i < partial.CompletedEntries.Count; i++)
+                {
+                    Connection.MultiEntry entry = partial.CompletedEntries[i];
+                    if (entry.Ok) partialValues[keys[i]] = DecompressForBatch(entry.Value!, budget);
+                }
+                throw new PartialConnectionLostException<Dictionary<string, byte[]>>(
+                    partialValues, partial.InnerException!);
+            }
             bool wrongNode = false;
             for (int i = 0; i < entries.Count; i++)
             {
@@ -1210,6 +1232,38 @@ public sealed class NanocachedClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// issue #411 — internal signal only, never seen outside this file.
+    /// Thrown by <see cref="MultiGetChunkedAsync"/>/
+    /// <see cref="MultiSetChunkedAsync"/> when a chunk's connection failure
+    /// (surviving <see cref="ApplyReconnectingAsync{T}"/>'s own built-in
+    /// redial-and-retry) interrupts a chunked call after at least one
+    /// earlier chunk of THAT call already completed. <see cref="CompletedEntries"/>
+    /// holds those chunks' entries, in request order, corresponding 1:1 to
+    /// the prefix of whatever key/value arrays the failing
+    /// <see cref="MultiGetChunkedAsync"/>/<see cref="MultiSetChunkedAsync"/>
+    /// call was given — <see cref="GetManyBytesAsync(byte[], IReadOnlyList{string})"/>/
+    /// <see cref="SetManyBytesAsync(byte[], IReadOnlyDictionary{string, byte[]}, long)"/>'s
+    /// single-mode branch and <see cref="RunMultiSetLegAsync"/> (cluster
+    /// mode) each translate this into whatever "partial success" means for
+    /// their own public contract (a <see cref="PartialConnectionLostException{T}"/>
+    /// for the single-mode callers; per-key retry/replica-failure
+    /// bookkeeping for the cluster leg runner) instead of losing it. Never
+    /// thrown when the very first chunk is the one that fails — there is
+    /// nothing to attach yet, so a bare connection-layer exception
+    /// propagates unchanged in that case, exactly as before this fix.
+    /// </summary>
+    private sealed class ChunkedBatchInterruptedException : Exception
+    {
+        public IReadOnlyList<Connection.MultiEntry> CompletedEntries { get; }
+
+        public ChunkedBatchInterruptedException(IReadOnlyList<Connection.MultiEntry> completedEntries, Exception inner)
+            : base(inner.Message, inner)
+        {
+            CompletedEntries = completedEntries;
+        }
+    }
+
     /// <summary>Issues one or more <c>m</c> sub-frames against
     /// <paramref name="slot"/>'s connection (<c>null</c> for the
     /// single/proxy target) — already grouped to one owner by the caller
@@ -1218,7 +1272,15 @@ public sealed class NanocachedClient : IDisposable
     /// namespace+key wire bytes (batch chunking), whichever comes first.
     /// A single key always fits on its own — <see cref="ValidateKey"/>
     /// already guarantees that — so the byte bound only ever closes a
-    /// chunk early, never drops an entry.</summary>
+    /// chunk early, never drops an entry.
+    ///
+    /// <para>issue #411: when a chunk after the first one fails at the
+    /// connection level (surviving <see cref="ApplyReconnectingAsync{T}"/>'s
+    /// own redial-and-retry), throws <see cref="ChunkedBatchInterruptedException"/>
+    /// carrying every earlier chunk's already-completed entries instead of
+    /// discarding them — see that type's doc comment. A first-chunk
+    /// failure has nothing to attach yet, so it propagates as the bare
+    /// underlying exception, unchanged.</para></summary>
     private async Task<List<Connection.MultiEntry>> MultiGetChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys)
     {
@@ -1236,8 +1298,17 @@ public sealed class NanocachedClient : IDisposable
                 end++;
             }
             ArraySegment<byte[]> chunk = new(keys, start, end - start);
-            List<Connection.MultiEntry> chunkEntries = await ApplyReconnectingAsync(
-                slot, connection => connection.MultiGetAsync(namespaceBytes, chunk)).ConfigureAwait(false);
+            List<Connection.MultiEntry> chunkEntries;
+            try
+            {
+                chunkEntries = await ApplyReconnectingAsync(
+                    slot, connection => connection.MultiGetAsync(namespaceBytes, chunk)).ConfigureAwait(false);
+            }
+            catch (Exception error) when (start > 0 && (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException))
+            {
+                throw new ChunkedBatchInterruptedException(entries.GetRange(0, start), error);
+            }
             for (int i = start; i < end; i++)
             {
                 entries[i] = chunkEntries[i - start];
@@ -1318,8 +1389,19 @@ public sealed class NanocachedClient : IDisposable
         {
             entries = await MultiGetChunkedAsync(owner, namespaceBytes, groupKeys).ConfigureAwait(false);
         }
-        catch (Exception error) when (error is NanocachedException)
+        catch (Exception error) when (error is NanocachedException or ChunkedBatchInterruptedException)
         {
+            // issue #411: MultiGetChunkedAsync now throws
+            // ChunkedBatchInterruptedException (not a NanocachedException)
+            // instead of a bare connection exception when a chunk after
+            // the first one fails mid-leg — caught here alongside it so it
+            // can't escape uncaught. Reusing its partial entries for a
+            // per-key retry/success split (like the multi-set leg runner
+            // now does) isn't done here — out of this issue's confirmed
+            // scope for the get side — so this whole leg is retried in
+            // full, exactly as any other leg-level connection failure
+            // already was before this fix; a retried key that already
+            // resolved just resolves again.
             return new List<int>(groupIndices);
         }
 
@@ -1490,8 +1572,24 @@ public sealed class NanocachedClient : IDisposable
 
         if (_ring is null)
         {
-            List<Connection.MultiEntry> entries = await MultiSetChunkedAsync(
-                null, namespaceBytes, keyBytes, valueBytes, ttlSeconds).ConfigureAwait(false);
+            List<Connection.MultiEntry> entries;
+            try
+            {
+                entries = await MultiSetChunkedAsync(
+                    null, namespaceBytes, keyBytes, valueBytes, ttlSeconds).ConfigureAwait(false);
+            }
+            catch (ChunkedBatchInterruptedException partial)
+            {
+                // issue #411: a later chunk's connection failure survived
+                // the built-in reconnect — don't discard the keys the
+                // earlier chunks already confirmed stored.
+                var confirmed = new HashSet<string>();
+                for (int idx = 0; idx < partial.CompletedEntries.Count; idx++)
+                {
+                    if (partial.CompletedEntries[idx].Ok) confirmed.Add(keys[idx]);
+                }
+                throw new PartialConnectionLostException<HashSet<string>>(confirmed, partial.InnerException!);
+            }
             foreach (Connection.MultiEntry entry in entries)
             {
                 if (entry.WrongNode) throw new WrongNodeException();
@@ -1515,7 +1613,13 @@ public sealed class NanocachedClient : IDisposable
     /// <see cref="MaxRequestBytes"/> of cumulative namespace+key+value
     /// wire bytes, the same way — a single pair always fits on its own,
     /// since <see cref="ValidateKeyAndValue"/> already guarantees
-    /// that.</summary>
+    /// that.
+    ///
+    /// <para>issue #411: as <see cref="MultiGetChunkedAsync"/>, throws
+    /// <see cref="ChunkedBatchInterruptedException"/> instead of the bare
+    /// connection failure when a chunk after the first one fails at the
+    /// connection level, carrying every earlier chunk's already-completed
+    /// entries.</para></summary>
     private async Task<List<Connection.MultiEntry>> MultiSetChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys, byte[][] values, long ttlSeconds)
     {
@@ -1534,9 +1638,18 @@ public sealed class NanocachedClient : IDisposable
             }
             ArraySegment<byte[]> keyChunk = new(keys, start, end - start);
             ArraySegment<byte[]> valueChunk = new(values, start, end - start);
-            List<Connection.MultiEntry> chunkEntries = await ApplyReconnectingAsync(
-                slot, connection => connection.MultiSetAsync(namespaceBytes, keyChunk, valueChunk, ttlSeconds))
-                .ConfigureAwait(false);
+            List<Connection.MultiEntry> chunkEntries;
+            try
+            {
+                chunkEntries = await ApplyReconnectingAsync(
+                    slot, connection => connection.MultiSetAsync(namespaceBytes, keyChunk, valueChunk, ttlSeconds))
+                    .ConfigureAwait(false);
+            }
+            catch (Exception error) when (start > 0 && (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException))
+            {
+                throw new ChunkedBatchInterruptedException(entries.GetRange(0, start), error);
+            }
             for (int idx = start; idx < end; idx++)
             {
                 entries[idx] = chunkEntries[idx - start];
@@ -1678,6 +1791,37 @@ public sealed class NanocachedClient : IDisposable
         {
             entries = await MultiSetChunkedAsync(name, namespaceBytes, groupKeys, groupValues, ttlSeconds)
                 .ConfigureAwait(false);
+        }
+        catch (ChunkedBatchInterruptedException partial)
+        {
+            // issue #411: a later chunk's connection failure used to mark
+            // this WHOLE leg — including keys an earlier chunk of the SAME
+            // leg already confirmed stored — as failed for both the retry
+            // list and ReplicaWriteFailures, overcounting failures for keys
+            // that actually succeeded. Apply each already-completed key's
+            // real result instead, and fall back to the old whole-failure
+            // treatment only for the keys that were never attempted (the
+            // chunk that failed, or a later one still queued behind it).
+            int completed = partial.CompletedEntries.Count;
+            lock (retry)
+            {
+                for (int i = 0; i < batch.Indices.Count; i++)
+                {
+                    if (i < completed)
+                    {
+                        if (!batch.IsPrimary[i])
+                        {
+                            if (partial.CompletedEntries[i].WrongNode) Interlocked.Increment(ref _replicaWriteFailures);
+                            continue;
+                        }
+                        if (partial.CompletedEntries[i].WrongNode) retry.Add(batch.Indices[i]);
+                        continue;
+                    }
+                    if (batch.IsPrimary[i]) retry.Add(batch.Indices[i]);
+                    else Interlocked.Increment(ref _replicaWriteFailures);
+                }
+            }
+            return;
         }
         catch (Exception error) when (error is NanocachedException or IOException
             or System.Net.Sockets.SocketException or ObjectDisposedException)

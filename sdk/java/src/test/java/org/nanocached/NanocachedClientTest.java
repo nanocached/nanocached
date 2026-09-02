@@ -486,6 +486,214 @@ class NanocachedClientTest {
         }
     }
 
+    // ── chunked multi-get/multi-set partial success on connection
+    //    failure (issue #411) ───────────────────────────────────────
+
+    @Test
+    void getManyBytesChunkedConnectionFailureCarriesFirstChunksValues() throws Exception {
+        // Regression for issue #411: multiGetChunked used to let a
+        // connection failure on the SECOND `m` sub-frame — after the
+        // first already succeeded, and after the client's own built-in
+        // reconnect-and-retry also failed (the node is fully torn down
+        // by then) — propagate as a bare ConnectionFailed, discarding
+        // everything the first sub-frame had already resolved.
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int keyCount = 401; // MAX_BATCH_KEYS(400) + 1 forces exactly two `m` sub-frames
+                byte[][] keys = new byte[keyCount][];
+                for (int i = 0; i < keyCount; i++) {
+                    keys[i] = ("k" + i).getBytes(StandardCharsets.UTF_8);
+                }
+                byte[] firstValue = "first-chunk-value".getBytes(StandardCharsets.UTF_8);
+                client.set(keys[0], firstValue);
+
+                node.closeAfterNextMultiGet();
+                NanocachedException.PartialConnectionFailedRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedRaw.class, () -> client.getManyBytes(keys));
+
+                assertEquals(1, node.multiGetCount.get(),
+                        "the node must have answered exactly the first sub-frame before it went down");
+                assertEquals(keyCount, failure.partialValues.length);
+                assertArrayEquals(firstValue, failure.partialValues[0]);
+                assertEquals(1, failure.unresolvedIndices.length);
+                assertEquals(400, failure.unresolvedIndices[0],
+                        "only the second sub-frame's own key (index 400) should be unresolved");
+            }
+        }
+    }
+
+    @Test
+    void getManyBytesStringKeyedChunkedConnectionFailureCarriesFirstChunksValues() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int keyCount = 401;
+                List<String> keys = new ArrayList<>();
+                for (int i = 0; i < keyCount; i++) keys.add("k" + i);
+                client.set("k0", "first-chunk-value");
+
+                node.closeAfterNextMultiGet();
+                NanocachedException.PartialConnectionFailed failure = assertThrows(
+                        NanocachedException.PartialConnectionFailed.class, () -> client.getManyBytes(keys));
+
+                assertEquals("first-chunk-value",
+                        new String(failure.partialValues.get("k0"), StandardCharsets.UTF_8));
+                assertEquals(1, failure.partialValues.size(),
+                        "k0 is the only key ever actually set — every other key in the first chunk is "
+                                + "a genuine miss, and the second chunk's own key never even ran");
+            }
+        }
+    }
+
+    @Test
+    void getManyChunkedConnectionFailureCarriesFirstChunksValues() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int keyCount = 401;
+                List<String> keys = new ArrayList<>();
+                for (int i = 0; i < keyCount; i++) keys.add("k" + i);
+                client.set("k0", "first-chunk-value");
+
+                node.closeAfterNextMultiGet();
+                NanocachedException.PartialConnectionFailedStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedStrings.class, () -> client.getMany(keys));
+
+                assertEquals(Map.of("k0", "first-chunk-value"), failure.partialValues);
+            }
+        }
+    }
+
+    @Test
+    void setManyBytesChunkedConnectionFailureCarriesFirstChunksSucceededIndices() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int pairCount = 401; // MAX_BATCH_KEYS(400) + 1 forces exactly two `o` sub-frames
+                byte[][] keys = new byte[pairCount][];
+                byte[][] values = new byte[pairCount][];
+                for (int i = 0; i < pairCount; i++) {
+                    keys[i] = ("k" + i).getBytes(StandardCharsets.UTF_8);
+                    values[i] = new byte[] {(byte) i};
+                }
+
+                node.closeAfterNextMultiSet();
+                NanocachedException.PartialConnectionFailedSetRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedSetRaw.class,
+                        () -> client.setManyBytes(keys, values));
+
+                assertEquals(1, node.multiSetCount.get(),
+                        "the node must have answered exactly the first sub-frame before it went down");
+                assertEquals(400, failure.succeededIndices.length);
+                for (int i = 0; i < 400; i++) {
+                    assertEquals(i, failure.succeededIndices[i]);
+                }
+                // The first chunk's own writes must really have landed,
+                // not just been reported as succeeded.
+                assertArrayEquals(values[0], node.store.get(MockNode.keyOf(keys[0])));
+                assertArrayEquals(values[399], node.store.get(MockNode.keyOf(keys[399])));
+            }
+        }
+    }
+
+    @Test
+    void setManyBytesMapKeyedChunkedConnectionFailureCarriesFirstChunksSucceededKeys() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                int pairCount = 401;
+                Map<String, byte[]> values = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < pairCount; i++) {
+                    values.put("k" + i, new byte[] {(byte) i});
+                }
+
+                node.closeAfterNextMultiSet();
+                NanocachedException.PartialConnectionFailedSet failure = assertThrows(
+                        NanocachedException.PartialConnectionFailedSet.class, () -> client.setManyBytes(values));
+
+                assertEquals(400, failure.succeededKeys.size());
+                assertTrue(failure.succeededKeys.contains("k0"));
+                assertTrue(failure.succeededKeys.contains("k399"));
+                assertFalse(failure.succeededKeys.contains("k400"),
+                        "the second sub-frame's own key must not be reported as succeeded");
+            }
+        }
+    }
+
+    @Test
+    void chunkedConnectionFailureOnTheFirstSubFrameStaysAPlainConnectionFailed() throws Exception {
+        // issue #411's fix only wraps a chunk's connection failure into a
+        // Partial* exception once an earlier chunk has already succeeded
+        // — the very first (and, here, only) chunk failing must keep
+        // throwing the exact same plain ConnectionFailed it always has,
+        // not some Partial* subclass.
+        try (MockNode node = new MockNode()) {
+            int port = node.port();
+            try (NanocachedClient client = connect("127.0.0.1", port)) {
+                node.close();
+                firstConnectionFailure(client, port); // establishes the node is reliably down
+
+                NanocachedException.ConnectionFailed getFailure = assertThrows(
+                        NanocachedException.ConnectionFailed.class,
+                        () -> client.getManyBytes(new byte[][] {{1}, {2}}));
+                assertSame(NanocachedException.ConnectionFailed.class, getFailure.getClass());
+
+                NanocachedException.ConnectionFailed setFailure = assertThrows(
+                        NanocachedException.ConnectionFailed.class,
+                        () -> client.setManyBytes(new byte[][] {{1}, {2}}, new byte[][] {{9}, {9}}));
+                assertSame(NanocachedException.ConnectionFailed.class, setFailure.getClass());
+            }
+        }
+    }
+
+    @Test
+    void clusterMultiSetLegOnlyCountsTheFailedChunksReplicaKeysAsFailures() throws Exception {
+        // Regression for issue #411's cluster-leg overcount (mirroring
+        // the same bug already found and fixed in Rust's
+        // run_multi_set_leg): runMultiSetLeg used to mark EVERY key in
+        // its whole OwnerBatch as failed on any connection failure, even
+        // keys an earlier, already-succeeded `o` sub-frame had already
+        // confirmed stored — overcounting replicaWriteFailures for keys
+        // that in fact landed just fine.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                HashRing ring = new HashRing(NAMES);
+                // 5 keys that all route primary to NAMES.get(0), so
+                // NAMES.get(1) is a pure-replica leg for the whole batch:
+                // a pure-replica leg never contributes to the
+                // client-visible retry list, so replicaWriteFailures is
+                // the only observable signal of its connection failure.
+                List<String> keys = new ArrayList<>();
+                int candidate = 0;
+                while (keys.size() < 5) {
+                    String key = "k" + candidate++;
+                    if (ring.route(key.getBytes(StandardCharsets.UTF_8)).equals(NAMES.get(0))) {
+                        keys.add(key);
+                    }
+                }
+                Map<String, byte[]> values = new java.util.LinkedHashMap<>();
+                for (String key : keys) {
+                    byte[] value = new byte[300_000];
+                    java.util.Arrays.fill(value, (byte) 7);
+                    values.put(key, value);
+                }
+
+                MockNode replicaLeg = cluster.nodes().get(NAMES.get(1));
+                replicaLeg.closeAfterNextMultiSet();
+
+                long before = client.stats().replicaWriteFailures();
+                // Must NOT throw: a pure-replica leg's failure is
+                // logged-and-swallowed into stats, never surfaced to the
+                // caller.
+                client.setManyBytes(values);
+                long delta = client.stats().replicaWriteFailures() - before;
+
+                assertTrue(delta > 0,
+                        "the failed chunk's own replica-held keys must still be counted, got " + delta);
+                assertTrue(delta < keys.size(),
+                        "only the failed chunk's own keys should count as new failures — got " + delta
+                                + " for a " + keys.size() + "-key batch whose first `o` sub-frame already "
+                                + "succeeded");
+            }
+        }
+    }
+
     // ── INCR/DECR (issue #129) ────────────────────────────────────
 
     @Test

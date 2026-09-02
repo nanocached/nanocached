@@ -125,6 +125,14 @@ class MockNode:
         # more than one frame went out.
         self.multi_get_frame_sizes: list[int] = []
         self.multi_set_frame_sizes: list[int] = []
+        # issue #411: closes the connection instead of replying to the
+        # `m`/`o` request that arrives after this many have already been
+        # answered normally — simulates a connection drop on a chunked
+        # get_many/set_many's chunk N>1, with earlier chunks having
+        # already succeeded over the same connection. None means "don't
+        # fail any" — see fail_multi_get_after()/fail_multi_set_after().
+        self._multi_get_fail_after: int | None = None
+        self._multi_set_fail_after: int | None = None
         self._fail_clear_replies = 0
         self._wrong_node_replies = 0
         self._wrong_node_on_set_replies = 0
@@ -285,6 +293,21 @@ class MockNode:
         """Same as answer_multi_get_bad_count_once() but for the next `o`
         reply (issue #181)."""
         self._multi_set_reply_count_override = count
+
+    def fail_multi_get_after(self, successes: int) -> None:
+        """Answers the next ``successes`` `m` requests normally, then
+        closes the connection instead of replying to the one right after
+        (issue #411) — simulates a connection drop on chunk N>1 of a
+        chunked get_many, with earlier chunk(s) having already succeeded
+        over the same connection. ``successes=0`` fails the very next
+        `m` outright."""
+        self._multi_get_fail_after = successes
+
+    def fail_multi_set_after(self, successes: int) -> None:
+        """Same as fail_multi_get_after() but for `o` requests (issue
+        #411) — simulates a connection drop on chunk N>1 of a chunked
+        set_many."""
+        self._multi_set_fail_after = successes
 
     def fail_next_clear_once(self) -> None:
         """Closes the connection instead of acking the next `c`/`F` this
@@ -751,6 +774,13 @@ class MockNode:
                     self.multi_get_frame_sizes.append(len(header) + len(namespace) + sum(key_lengths))
                     if self._silent:
                         continue
+                    if self._multi_get_fail_after is not None:
+                        if self._multi_get_fail_after > 0:
+                            self._multi_get_fail_after -= 1
+                        else:
+                            self._multi_get_fail_after = None
+                            writer.close()
+                            return
                     if self._retryable_replies > 0:
                         self._retryable_replies -= 1
                         writer.write(b"R" + tag_suffix + b"\n")
@@ -812,6 +842,13 @@ class MockNode:
                     )
                     if self._silent:
                         continue
+                    if self._multi_set_fail_after is not None:
+                        if self._multi_set_fail_after > 0:
+                            self._multi_set_fail_after -= 1
+                        else:
+                            self._multi_set_fail_after = None
+                            writer.close()
+                            return
                     if self._retryable_replies > 0:
                         self._retryable_replies -= 1
                         writer.write(b"R" + tag_suffix + b"\n")

@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -1683,6 +1684,9 @@ public final class NanocachedClient implements AutoCloseable {
             return decodeMany(getManyBytes(namespace, keys));
         } catch (NanocachedException.PartialWrongNode partial) {
             throw new NanocachedException.PartialWrongNodeStrings(decodeMany(partial.partialValues));
+        } catch (NanocachedException.PartialConnectionFailed partial) {
+            throw new NanocachedException.PartialConnectionFailedStrings(
+                    partial.getMessage(), partial.getCause(), decodeMany(partial.partialValues));
         }
     }
 
@@ -1730,6 +1734,9 @@ public final class NanocachedClient implements AutoCloseable {
             return spliceMany(keys, getManyBytes(namespace, keyBytes));
         } catch (NanocachedException.PartialWrongNodeRaw partial) {
             throw new NanocachedException.PartialWrongNode(spliceMany(keys, partial.partialValues));
+        } catch (NanocachedException.PartialConnectionFailedRaw partial) {
+            throw new NanocachedException.PartialConnectionFailed(
+                    partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
         }
     }
 
@@ -1788,7 +1795,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (single) {
-            List<Connection.MultiEntry> entries = multiGetChunked(this::singleConnection, namespace, keys);
+            List<Connection.MultiEntry> entries;
+            try {
+                entries = multiGetChunked(this::singleConnection, namespace, keys);
+            } catch (ChunkedConnectionFailure partial) {
+                throw partialConnectionFailedRaw(partial, values, budget);
+            }
             List<Integer> unresolved = new ArrayList<>();
             for (int i = 0; i < entries.size(); i++) {
                 Connection.MultiEntry entry = entries.get(i);
@@ -1808,6 +1820,30 @@ public final class NanocachedClient implements AutoCloseable {
         retry = multiGetPass(namespace, keys, values, retry, budget);
         if (!retry.isEmpty()) throw new NanocachedException.PartialWrongNodeRaw(values, retry);
         return values;
+    }
+
+    /** Builds {@link NanocachedException.PartialConnectionFailedRaw} from a
+     * {@link ChunkedConnectionFailure} escaping single-mode {@link
+     * #multiGetChunked} (issue #411): splices every already-resolved entry
+     * from the chunk(s) before the failure into {@code values} exactly like
+     * the success path does, and collects every position that did NOT
+     * resolve — a per-key {@code W} within an already-completed chunk, or
+     * any position from the failing chunk onward — into {@code
+     * unresolvedIndices}. */
+    private NanocachedException.PartialConnectionFailedRaw partialConnectionFailedRaw(
+            ChunkedConnectionFailure failure, byte[][] values, long[] budget) {
+        List<Integer> unresolved = new ArrayList<>();
+        List<Connection.MultiEntry> entries = failure.partialEntries;
+        for (int i = 0; i < entries.size(); i++) {
+            Connection.MultiEntry entry = entries.get(i);
+            if (entry == null || entry.wrongNode()) {
+                unresolved.add(i);
+            } else if (entry.ok()) {
+                values[i] = decompressForBatch(entry.value(), budget);
+            }
+        }
+        return new NanocachedException.PartialConnectionFailedRaw(
+                failure.cause.getMessage(), failure.cause, values, unresolved);
     }
 
     /** {@code compress}'s decompression step (see {@link
@@ -1853,6 +1889,36 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Internal signal thrown by {@link #multiGetChunked}/{@link
+     * #multiSetChunked} (issue #411) when a chunk after the first hits a
+     * connection failure {@link #applyReconnecting}'s own built-in
+     * redial-and-retry couldn't recover from: carries every earlier
+     * chunk's already-resolved {@link Connection.MultiEntry} results (the
+     * failing chunk's own positions, and every chunk after it, stay {@code
+     * null}) plus the {@link NanocachedException.ConnectionFailed} that
+     * escaped, so a caller can build a partial-success exception instead
+     * of losing that data. Never thrown when the very first chunk fails —
+     * there's nothing partial to carry then, so the plain {@code
+     * ConnectionFailed} propagates unwrapped, exactly as it always has.
+     *
+     * <p>Purely internal plumbing: every direct caller of {@link
+     * #multiGetChunked}/{@link #multiSetChunked} must catch this
+     * alongside {@link NanocachedException.ConnectionFailed} — it must
+     * never itself escape a public API method.
+     */
+    private static final class ChunkedConnectionFailure extends RuntimeException {
+        final List<Connection.MultiEntry> partialEntries;
+        final NanocachedException.ConnectionFailed cause;
+
+        ChunkedConnectionFailure(
+                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionFailed cause) {
+            super(cause);
+            this.partialEntries = partialEntries;
+            this.cause = cause;
+        }
+    }
+
     /** Issues one or more {@code m} sub-frames against whatever {@code
      * connectionFor} resolves to — already grouped to one owner (or the
      * single/proxy target) by the caller — splitting into sub-frames
@@ -1862,7 +1928,16 @@ public final class NanocachedClient implements AutoCloseable {
      * a batch of individually valid keys can't sum past the server's
      * MAX_REQUEST_SIZE frame cap. A single key always fits one sub-frame
      * by itself — {@link #validateKey} already rejected anything that
-     * wouldn't. */
+     * wouldn't.
+     *
+     * <p>Issue #411: if a chunk after the first fails on a connection
+     * error {@link #applyReconnecting} couldn't recover from, throws
+     * {@link ChunkedConnectionFailure} carrying every earlier chunk's
+     * results instead of just letting the bare {@link
+     * NanocachedException.ConnectionFailed} propagate and discard them —
+     * every caller must catch it. The very first chunk failing still
+     * throws the plain {@code ConnectionFailed} unwrapped, since there is
+     * nothing partial to carry. */
     private List<Connection.MultiEntry> multiGetChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
@@ -1870,8 +1945,14 @@ public final class NanocachedClient implements AutoCloseable {
         while (start < keys.length) {
             int end = multiGetChunkEnd(namespace.length, keys, start);
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
-            List<Connection.MultiEntry> chunkEntries = applyReconnecting(
-                    connectionFor, connection -> connection.multiGet(namespace, chunk));
+            List<Connection.MultiEntry> chunkEntries;
+            try {
+                chunkEntries = applyReconnecting(
+                        connectionFor, connection -> connection.multiGet(namespace, chunk));
+            } catch (NanocachedException.ConnectionFailed failure) {
+                if (start == 0) throw failure;
+                throw new ChunkedConnectionFailure(entries, failure);
+            }
             for (int i = start; i < end; i++) {
                 entries.set(i, chunkEntries.get(i - start));
             }
@@ -1986,19 +2067,29 @@ public final class NanocachedClient implements AutoCloseable {
      * spliced into {@code values} (decompression failures propagate,
      * aborting the batch immediately — never fed into the retry pass,
      * since they're a client-side {@code compress} mismatch, not a
-     * routing outcome). Unlike the {@code multiGetChunked} call above,
-     * {@link #decompressForBatch}'s {@link
-     * NanocachedException.DecompressionFailed} is deliberately left
-     * uncaught here rather than folded into the same retry-and-return
-     * guard — it needs to escape this leg, not be swallowed — but that
-     * means it can reach {@link #drainLegsKeepingFirstBug} on a leg other
-     * than the first to fail, since every owner's leg runs concurrently
-     * and any of them can trip the shared {@code budget} check at the
-     * same time (issue #413); {@code drainLegsKeepingFirstBug} knows to
-     * classify that one specially rather than as a background write bug.
-     * {@code retry} must already be a thread-safe list — this runs
-     * concurrently with every other owner's leg, mirroring {@link
-     * #runMultiSetLeg}. */
+     * routing outcome). {@code retry} must already be a thread-safe list
+     * — this runs concurrently with every other owner's leg, mirroring
+     * {@link #runMultiSetLeg}.
+     *
+     * <p>Issue #411: a {@link ChunkedConnectionFailure} (a chunk after the
+     * first failing within this leg's own {@link #multiGetChunked} call)
+     * is folded into the same whole-group retry as any other
+     * connection-level failure here — the next {@link #multiGetPass} pass
+     * simply re-fetches the group, so nothing already resolved is lost,
+     * just retried once more; unlike the single-mode path there is no
+     * further pass to fall back to after that, so there's no partial
+     * exception to build here.
+     *
+     * <p>Unlike the {@code multiGetChunked} call above, {@link
+     * #decompressForBatch}'s {@link NanocachedException.DecompressionFailed}
+     * is deliberately left uncaught here rather than folded into the same
+     * retry-and-return guard — it needs to escape this leg, not be
+     * swallowed — but that means it can reach {@link
+     * #drainLegsKeepingFirstBug} on a leg other than the first to fail,
+     * since every owner's leg runs concurrently and any of them can trip
+     * the shared {@code budget} check at the same time (issue #413);
+     * {@code drainLegsKeepingFirstBug} knows to classify that one
+     * specially rather than as a background write bug. */
     private void runMultiGetLeg(
             byte[] namespace, String owner, List<Integer> groupIndices,
             byte[][] keyBytes, byte[][] values, List<Integer> retry, long[] budget) {
@@ -2010,7 +2101,7 @@ public final class NanocachedClient implements AutoCloseable {
         List<Connection.MultiEntry> entries;
         try {
             entries = multiGetChunked(() -> memberConnection(owner), namespace, groupKeys);
-        } catch (NanocachedException connectionFailure) {
+        } catch (ChunkedConnectionFailure | NanocachedException connectionFailure) {
             retry.addAll(groupIndices);
             return;
         }
@@ -2158,13 +2249,34 @@ public final class NanocachedClient implements AutoCloseable {
     void setManyBytes(byte[] namespace, Map<String, byte[]> values, long ttlSeconds) {
         byte[][] keyBytes = new byte[values.size()][];
         byte[][] valueBytes = new byte[values.size()][];
+        List<String> keyList = new ArrayList<>(values.size());
         int i = 0;
         for (Map.Entry<String, byte[]> entry : values.entrySet()) {
             keyBytes[i] = entry.getKey().getBytes(StandardCharsets.UTF_8);
             valueBytes[i] = entry.getValue();
+            keyList.add(entry.getKey());
             i++;
         }
-        setManyBytes(namespace, keyBytes, valueBytes, ttlSeconds);
+        try {
+            setManyBytes(namespace, keyBytes, valueBytes, ttlSeconds);
+        } catch (NanocachedException.PartialConnectionFailedSetRaw partial) {
+            throw new NanocachedException.PartialConnectionFailedSet(
+                    partial.getMessage(), partial.getCause(), spliceKeys(keyList, partial.succeededIndices));
+        }
+    }
+
+    /** Re-keys a positional {@link
+     * NanocachedException.PartialConnectionFailedSetRaw#succeededIndices}
+     * (or the same shape from any other positions-into-keys splice) by the
+     * original {@code String} keys those positions came from — {@link
+     * #setManyBytes(byte[], Map, long)}'s counterpart to {@link
+     * #spliceMany} on the read side. A {@link Set} rather than a list:
+     * {@link NanocachedException.PartialConnectionFailedSet#succeededKeys}
+     * only needs "was this key confirmed stored", not positional order. */
+    private static Set<String> spliceKeys(List<String> keys, int[] indices) {
+        Set<String> succeeded = new LinkedHashSet<>(indices.length);
+        for (int idx : indices) succeeded.add(keys.get(idx));
+        return succeeded;
     }
 
     public void setManyBytes(byte[][] keys, byte[][] values) {
@@ -2211,8 +2323,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (single) {
-            List<Connection.MultiEntry> entries =
-                    multiSetChunked(this::singleConnection, namespace, keys, valueBytes, wireTtlSeconds);
+            List<Connection.MultiEntry> entries;
+            try {
+                entries = multiSetChunked(this::singleConnection, namespace, keys, valueBytes, wireTtlSeconds);
+            } catch (ChunkedConnectionFailure partial) {
+                throw partialConnectionFailedSetRaw(partial);
+            }
             for (Connection.MultiEntry entry : entries) {
                 if (entry.wrongNode()) throw new NanocachedException.WrongNode();
             }
@@ -2226,13 +2342,35 @@ public final class NanocachedClient implements AutoCloseable {
         if (!retry.isEmpty()) throw new NanocachedException.WrongNode();
     }
 
+    /** Builds {@link NanocachedException.PartialConnectionFailedSetRaw}
+     * from a {@link ChunkedConnectionFailure} escaping single-mode {@link
+     * #multiSetChunked} (issue #411): every position the chunk(s) before
+     * the failure actually confirmed stored ({@code entry.ok()}) goes into
+     * {@code succeededIndices} — a position whose chunk never even ran
+     * ({@code null}) or that came back {@code W} isn't "succeeded", so it's
+     * left out. */
+    private NanocachedException.PartialConnectionFailedSetRaw partialConnectionFailedSetRaw(
+            ChunkedConnectionFailure failure) {
+        List<Integer> succeeded = new ArrayList<>();
+        List<Connection.MultiEntry> entries = failure.partialEntries;
+        for (int i = 0; i < entries.size(); i++) {
+            Connection.MultiEntry entry = entries.get(i);
+            if (entry != null && entry.ok()) succeeded.add(i);
+        }
+        return new NanocachedException.PartialConnectionFailedSetRaw(
+                failure.cause.getMessage(), failure.cause, succeeded);
+    }
+
     /** {@link #multiGetChunked}'s write-side twin: one or more {@code o}
      * sub-frames against whatever {@code connectionFor} resolves to,
      * split the same way by both {@link #MAX_BATCH_KEYS} keys and {@link
      * #MAX_REQUEST_BYTES} of cumulative wire size (issue #222) — a batch
      * of individually valid (per {@link #validateKeyAndValue}) pairs
      * can't sum past the server's MAX_REQUEST_SIZE frame cap. A single
-     * pair always fits one sub-frame by itself. */
+     * pair always fits one sub-frame by itself.
+     *
+     * <p>Issue #411: same {@link ChunkedConnectionFailure} contract as
+     * {@link #multiGetChunked} — every caller must catch it. */
     private List<Connection.MultiEntry> multiSetChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace,
             byte[][] keys, byte[][] values, Long ttlSeconds) {
@@ -2242,8 +2380,15 @@ public final class NanocachedClient implements AutoCloseable {
             int end = multiSetChunkEnd(namespace.length, keys, values, start);
             byte[][] keyChunk = Arrays.copyOfRange(keys, start, end);
             byte[][] valueChunk = Arrays.copyOfRange(values, start, end);
-            List<Connection.MultiEntry> chunkEntries = applyReconnecting(
-                    connectionFor, connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
+            List<Connection.MultiEntry> chunkEntries;
+            try {
+                chunkEntries = applyReconnecting(
+                        connectionFor,
+                        connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
+            } catch (NanocachedException.ConnectionFailed failure) {
+                if (start == 0) throw failure;
+                throw new ChunkedConnectionFailure(entries, failure);
+            }
             for (int i = start; i < end; i++) {
                 entries.set(i, chunkEntries.get(i - start));
             }
@@ -2443,7 +2588,18 @@ public final class NanocachedClient implements AutoCloseable {
      * since the SAME sub-frame can carry both primary- and replica-held
      * keys and a transport failure doesn't distinguish between them.
      * {@code retry} must already be a thread-safe list — this runs
-     * concurrently with every other owner's leg. */
+     * concurrently with every other owner's leg.
+     *
+     * <p>Issue #411: when this leg's own batch needed more than one
+     * {@code o} sub-frame (batch chunking) and a chunk after the first hit
+     * a connection failure, only the positions that chunk (and any chunk
+     * after it) never got an answer for are "failed" — a position an
+     * earlier, already-succeeded chunk confirmed stored must not also be
+     * counted, or {@link #replicaWriteFailures} overcounts and a primary
+     * key that already landed gets uselessly resent on the next pass.
+     * {@link #applyLegOutcome} is shared by both the total-failure branch
+     * below (every position unresolved) and the chunked-partial-failure
+     * branch (only the positions past the failure point). */
 
     /**
      * Issue #326: builds a defensively-copied {@code valueBytes} for a
@@ -2478,25 +2634,37 @@ public final class NanocachedClient implements AutoCloseable {
         List<Connection.MultiEntry> entries;
         try {
             entries = multiSetChunked(() -> memberConnection(name), namespace, groupKeys, groupValues, ttlSeconds);
+        } catch (ChunkedConnectionFailure partial) {
+            applyLegOutcome(batch, partial.partialEntries, retry);
+            return;
         } catch (NanocachedException connectionFailure) {
-            for (int i = 0; i < batch.indices.size(); i++) {
-                if (batch.isPrimary.get(i)) {
-                    retry.add(batch.indices.get(i));
-                } else {
-                    replicaWriteFailures.incrementAndGet();
-                }
-            }
+            applyLegOutcome(batch, Collections.nCopies(batch.indices.size(), null), retry);
             return;
         }
 
+        applyLegOutcome(batch, entries, retry);
+    }
+
+    /** Shared by {@link #runMultiSetLeg}'s three outcomes (a clean
+     * multi-set reply, a total connection failure, and issue #411's
+     * chunked partial failure): a {@code null} entry (every position, on a
+     * total failure; only the positions from the failing chunk onward, on
+     * a partial one) is treated exactly like a {@code W} — unresolved.
+     * Only a primary-held unresolved position is appended to {@code
+     * retry}; a replica-held one is counted into {@link
+     * #replicaWriteFailures} instead — see {@link #runMultiSetLeg}'s own
+     * doc comment. A position with a real {@code entry.ok()} answer is
+     * left alone either way: it already succeeded. */
+    private void applyLegOutcome(OwnerBatch batch, List<Connection.MultiEntry> entries, List<Integer> retry) {
         for (int i = 0; i < batch.indices.size(); i++) {
-            boolean primary = batch.isPrimary.get(i);
             Connection.MultiEntry entry = entries.get(i);
-            if (!primary) {
-                if (entry.wrongNode()) replicaWriteFailures.incrementAndGet();
-                continue;
+            boolean unresolved = entry == null || entry.wrongNode();
+            if (!unresolved) continue;
+            if (batch.isPrimary.get(i)) {
+                retry.add(batch.indices.get(i));
+            } else {
+                replicaWriteFailures.incrementAndGet();
             }
-            if (entry.wrongNode()) retry.add(batch.indices.get(i));
         }
     }
 

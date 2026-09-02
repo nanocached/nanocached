@@ -53,8 +53,22 @@ public class NanocachedException extends RuntimeException {
         }
     }
 
-    /** A connection-level failure; the client redials lazily on the next use. */
-    public static final class ConnectionFailed extends NanocachedException {
+    /**
+     * A connection-level failure; the client redials lazily on the next
+     * use.
+     *
+     * <p>Not {@code final} — mirroring {@link WrongNode}'s own stance, for
+     * exactly the same reason (issue #411): {@link
+     * PartialConnectionFailed}/{@link PartialConnectionFailedStrings}/
+     * {@link PartialConnectionFailedRaw}/{@link PartialConnectionFailedSet}/
+     * {@link PartialConnectionFailedSetRaw} extend this so a batch's
+     * already-succeeded chunks (see {@link
+     * NanocachedClient#getManyBytes(List)}/{@link
+     * NanocachedClient#setManyBytes(Map, long)}'s batch chunking, issue
+     * #222) aren't silently discarded when a later chunk's connection
+     * failure escapes the client's own built-in reconnect-and-retry.
+     */
+    public static class ConnectionFailed extends NanocachedException {
         /**
          * Issue #225: {@code true} only when this connection is known to
          * have never sent the failed request's bytes at all — {@link
@@ -173,8 +187,10 @@ public class NanocachedException extends RuntimeException {
      * (docs/protocol.html#multi), so a handful of stale placements
      * shouldn't force discarding an otherwise successful batch. {@link
      * NanocachedClient#setManyBytes} has nothing to return on success, so
-     * it just throws a plain {@link WrongNode} on the same condition —
-     * there's no partial payload worth attaching.
+     * it just throws a plain {@link WrongNode} on the same wrong-node
+     * condition — there's no partial payload worth attaching there. (A
+     * connection failure mid-batch is different: see {@link
+     * PartialConnectionFailedSet}.)
      *
      * <p>A separate, non-generic class from {@link PartialWrongNodeStrings}
      * rather than one class parameterized over the value type: the JLS
@@ -221,6 +237,122 @@ public class NanocachedException extends RuntimeException {
         public PartialWrongNodeRaw(byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             this.partialValues = partialValues;
             this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+        }
+    }
+
+    /**
+     * Raised by {@link NanocachedClient#getManyBytes} (issue #411) when a
+     * batch spans more than one {@code m} sub-frame (batch chunking, issue
+     * #222) and a chunk after the first hits a connection failure the
+     * client's own built-in reconnect-and-retry couldn't recover from —
+     * the analogue of {@link PartialWrongNode}, but for connection loss
+     * mid-batch instead of a stale routing table. {@code partialValues}
+     * holds every key the earlier, already-succeeded chunk(s) resolved, so
+     * that data isn't silently discarded behind what would otherwise look
+     * like a batch that wrote/read nothing at all. Never thrown when the
+     * very first chunk fails — there is nothing partial to carry then, so
+     * a plain {@link ConnectionFailed} propagates instead, exactly as it
+     * always has.
+     *
+     * <p>A subclass of {@link ConnectionFailed} (not {@link WrongNode}),
+     * so existing {@code catch (ConnectionFailed)} handling keeps working
+     * unchanged and this is trivially distinguishable from a total-failure
+     * plain {@link ConnectionFailed}.
+     */
+    public static final class PartialConnectionFailed extends ConnectionFailed {
+        public final java.util.Map<String, byte[]> partialValues;
+
+        public PartialConnectionFailed(
+                String message, Throwable cause, java.util.Map<String, byte[]> partialValues) {
+            super(message, cause);
+            this.partialValues = partialValues;
+        }
+    }
+
+    /**
+     * As {@link PartialConnectionFailed}, but raised by {@link
+     * NanocachedClient#getMany} — the UTF-8-decoded counterpart, thrown
+     * once the raw {@link PartialConnectionFailed} its {@code
+     * getManyBytes} call underneath threw has had its {@code
+     * partialValues} decoded the same way a successful {@code getMany}
+     * decodes {@code getManyBytes}' own result.
+     */
+    public static final class PartialConnectionFailedStrings extends ConnectionFailed {
+        public final java.util.Map<String, String> partialValues;
+
+        public PartialConnectionFailedStrings(
+                String message, Throwable cause, java.util.Map<String, String> partialValues) {
+            super(message, cause);
+            this.partialValues = partialValues;
+        }
+    }
+
+    /**
+     * As {@link PartialConnectionFailed}, but raised by the positional,
+     * {@code byte[]}-keyed {@link NanocachedClient#getManyBytes(byte[][])}
+     * (issue #160's positional form). {@code partialValues} is the same
+     * positional array a successful call would have returned ({@code
+     * null} for a miss); since a {@code null} slot alone cannot tell a
+     * miss from a key the failing chunk (or any chunk after it) never
+     * even attempted, {@code unresolvedIndices} lists (ascending) the
+     * positions that did NOT resolve — exactly {@link
+     * PartialWrongNodeRaw}'s own convention.
+     */
+    public static final class PartialConnectionFailedRaw extends ConnectionFailed {
+        public final byte[][] partialValues;
+        public final int[] unresolvedIndices;
+
+        public PartialConnectionFailedRaw(
+                String message, Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
+            super(message, cause);
+            this.partialValues = partialValues;
+            this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+        }
+    }
+
+    /**
+     * Raised by {@link NanocachedClient#setMany}/{@link
+     * NanocachedClient#setManyBytes(Map, long)} (issue #411) when a batch
+     * spans more than one {@code o} sub-frame (batch chunking, issue #222)
+     * and a chunk after the first hits a connection failure the client's
+     * own built-in reconnect-and-retry couldn't recover from.
+     *
+     * <p>Unlike the wrong-node case ({@link WrongNode} — see {@link
+     * PartialWrongNode}'s own doc comment for why a plain, non-carrying
+     * exception is enough there), a connection failure mid-batch DOES have
+     * something worth attaching: {@code succeededKeys} names every key
+     * confirmed stored by the chunk(s) that completed before the failure,
+     * so a caller doesn't have to assume the whole batch was lost. Never
+     * thrown when the very first chunk fails — a plain {@link
+     * ConnectionFailed} propagates instead, exactly as it always has.
+     */
+    public static final class PartialConnectionFailedSet extends ConnectionFailed {
+        public final java.util.Set<String> succeededKeys;
+
+        public PartialConnectionFailedSet(String message, Throwable cause, java.util.Set<String> succeededKeys) {
+            super(message, cause);
+            this.succeededKeys = succeededKeys;
+        }
+    }
+
+    /**
+     * As {@link PartialConnectionFailedSet}, but raised by the positional,
+     * {@code byte[]}-keyed {@link
+     * NanocachedClient#setManyBytes(byte[][], byte[][], long)} (issue
+     * #160's positional form) — {@code succeededIndices} lists (ascending)
+     * the positions the earlier, already-succeeded chunk(s) confirmed
+     * stored (the inverse of {@link PartialWrongNodeRaw#unresolvedIndices}
+     * /{@link PartialConnectionFailedRaw#unresolvedIndices}: those name
+     * what's still outstanding, this names what's already done, since a
+     * successful {@code setManyBytes} has no positional array of its own
+     * to splice a "did this position resolve" answer into).
+     */
+    public static final class PartialConnectionFailedSetRaw extends ConnectionFailed {
+        public final int[] succeededIndices;
+
+        public PartialConnectionFailedSetRaw(String message, Throwable cause, java.util.List<Integer> succeededIndices) {
+            super(message, cause);
+            this.succeededIndices = succeededIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
         }
     }
 }

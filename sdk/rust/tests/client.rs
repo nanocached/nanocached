@@ -134,6 +134,17 @@ struct NodeState {
     /// `multi_get_frame_bytes`'s `o`-frame twin (namespace plus every key
     /// and value, issue #222).
     multi_set_frame_bytes: Mutex<Vec<usize>>,
+    /// Issue #411's regression knob: `0` (the default) never triggers.
+    /// Once set to N, the Nth `m` (multi-get) frame this node ever
+    /// receives — counting `multi_gets` itself — answers normally, but
+    /// every `m` frame after that (on ANY connection, including a
+    /// redial) closes without replying, permanently. Lets a test make a
+    /// chunked batch's later chunk(s) fail with a connection-level
+    /// error — surviving the client's own built-in reconnect-and-retry
+    /// for that chunk too — after an earlier chunk already succeeded.
+    die_after_multi_get_frames: AtomicUsize,
+    /// As `die_after_multi_get_frames`, for `o` (multi-set).
+    die_after_multi_set_frames: AtomicUsize,
     /// Issue #225: apply the next `i` normally (the store really does
     /// reflect the new value) but then close the connection instead of
     /// replying — the request was fully written and received, so unlike
@@ -635,7 +646,17 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
-                state.multi_gets.fetch_add(1, Ordering::SeqCst);
+                let this_multi_get = state.multi_gets.fetch_add(1, Ordering::SeqCst) + 1;
+                let die_after = state.die_after_multi_get_frames.load(Ordering::SeqCst);
+                if die_after != 0 && this_multi_get > die_after {
+                    // Issue #411: simulates a connection-level failure
+                    // from this `m` sub-frame onward — closing without a
+                    // reply — so a test can exercise the partial-success
+                    // path of a chunked batch whose later chunk's
+                    // connection is lost, surviving the client's own
+                    // built-in reconnect-and-retry for that chunk too.
+                    return;
+                }
                 // issue #222 — records this frame's real on-wire size
                 // (header line + newline + namespace + every key) so a
                 // test can confirm the client's byte-bound chunking kept
@@ -720,7 +741,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 if state.silent.load(Ordering::SeqCst) {
                     continue;
                 }
-                state.multi_sets.fetch_add(1, Ordering::SeqCst);
+                let this_multi_set = state.multi_sets.fetch_add(1, Ordering::SeqCst) + 1;
+                let die_after = state.die_after_multi_set_frames.load(Ordering::SeqCst);
+                if die_after != 0 && this_multi_set > die_after {
+                    // Issue #411: see die_after_multi_get_frames's own
+                    // comment above — the `o`-frame twin.
+                    return;
+                }
                 // issue #222 — this frame's real on-wire size (header
                 // line + newline + namespace + every key and value); see
                 // multi_get_frame_bytes's own comment above.
@@ -3162,6 +3189,182 @@ async fn get_many_bytes_batch_over_the_byte_cap_splits_into_multiple_m_subframes
 
     client.close().await;
     node.stop();
+}
+
+// ── chunked batch partial success on connection loss (issue #411) ──
+
+#[tokio::test]
+async fn set_many_bytes_returns_partial_connection_lost_when_a_later_chunk_fails() {
+    // Issue #411 (single-node/proxy mode): a chunked batch (issue #222)
+    // splitting into more than one `o` sub-frame used to discard an
+    // earlier chunk's already-stored keys if a LATER chunk's connection
+    // was lost, surfacing a bare connection error that wrongly implied
+    // nothing was written. 405 keys (> MAX_BATCH_KEYS's 400) force
+    // exactly two `o` sub-frames; the mock node lets the first succeed
+    // (400 keys stored) and then closes without replying from the
+    // second frame onward — covering both the chunk-2 attempt and the
+    // client's own one built-in reconnect-and-retry for it, so the
+    // whole call genuinely can't complete chunk 2. The call must
+    // surface `Error::PartialConnectionLostKeys` carrying exactly the
+    // 400 keys chunk 1 actually stored, not a bare `ConnectionLost`.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    const N: usize = 405;
+    let mut values = HashMap::new();
+    for i in 0..N {
+        values.insert(format!("key{i:04}"), format!("v{i}").into_bytes());
+    }
+
+    node.state
+        .die_after_multi_set_frames
+        .store(1, Ordering::SeqCst);
+
+    let error = client
+        .set_many_bytes(&values, 0)
+        .await
+        .expect_err("chunk 2's connection loss (surviving the built-in retry) must surface");
+    let succeeded = match error {
+        Error::PartialConnectionLostKeys(succeeded, _cause) => succeeded,
+        other => panic!("expected Error::PartialConnectionLostKeys, got {other:?}"),
+    };
+
+    assert_eq!(
+        succeeded.len(),
+        400,
+        "expected exactly chunk 1's 400 keys to be reported as stored"
+    );
+    for key in &succeeded {
+        assert!(
+            node.state
+                .store
+                .lock()
+                .unwrap()
+                .contains_key(store_key(&[], key.as_bytes()).as_slice()),
+            "key {key} reported as succeeded should actually be stored"
+        );
+    }
+    // Only 2 `o` sub-frames were ever received: the successful chunk 1,
+    // and the one chunk-2 attempt that got a connection all the way to
+    // this handler before failing (its own redial retry also lands
+    // here, dying too — die_after_multi_set_frames kills every frame
+    // after the first, on any connection).
+    assert!(
+        node.state.multi_sets.load(Ordering::SeqCst) >= 2,
+        "expected at least 2 `o` sub-frames (chunk 1, plus chunk 2's failing attempt(s))"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn get_many_bytes_returns_partial_connection_lost_when_a_later_chunk_fails() {
+    // get_many_bytes' read-side twin of the regression above: a chunked
+    // batch's later `m` sub-frame connection loss (surviving the
+    // built-in reconnect-and-retry) must surface
+    // `Error::PartialConnectionLostText`/`Error::PartialConnectionLost`
+    // carrying every key the earlier, successful chunk(s) already
+    // resolved — not a bare connection error implying nothing was read.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+
+    const N: usize = 405;
+    let mut expected = HashMap::new();
+    let mut keys = Vec::with_capacity(N);
+    for i in 0..N {
+        let key = format!("key{i:04}");
+        let value = format!("v{i}");
+        expected.insert(key.clone(), value.clone());
+        keys.push(key);
+    }
+    // Populate every key first (plain sets, unaffected by the
+    // die-after knob below, which only watches `m` frames).
+    for (key, value) in &expected {
+        client.set(key, value, 0).await.unwrap();
+    }
+
+    node.state
+        .die_after_multi_get_frames
+        .store(1, Ordering::SeqCst);
+
+    let error = client
+        .get_many(&keys)
+        .await
+        .expect_err("chunk 2's connection loss (surviving the built-in retry) must surface");
+    let partial = match error {
+        Error::PartialConnectionLostText(partial, _cause) => partial,
+        other => panic!("expected Error::PartialConnectionLostText, got {other:?}"),
+    };
+
+    assert_eq!(
+        partial.len(),
+        400,
+        "expected exactly chunk 1's 400 keys to be resolved"
+    );
+    for (key, value) in &partial {
+        assert_eq!(expected.get(key), Some(value));
+    }
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn set_many_bytes_cluster_leg_does_not_overcount_replica_write_failures_on_a_later_chunk_failure(
+) {
+    // Issue #411's stats-overcount report: `run_multi_set_leg` used to
+    // treat ANY connection failure on a leg's (possibly chunked)
+    // `multi_set_chunked` call as "every key in this leg failed",
+    // double-counting `stats().replica_write_failures` for keys an
+    // EARLIER chunk within that same leg had already stored
+    // successfully, and needlessly retrying already-stored primary
+    // keys. With replication factor 2 across exactly 2 physical nodes,
+    // every key's owner set is both nodes — so a 401-key batch makes
+    // each node's own leg span all 401 keys, chunked into 400 + 1
+    // (issue #222). One node is armed to die from its second `o` frame
+    // onward, so its leg's unresolved tail is exactly the last 1 key —
+    // the resolved 400 must NOT be counted as failed, bounding
+    // `replica_write_failures` to at most 1 (that single tail key, if
+    // it happened to be replica-held on the dying node). Before the
+    // fix, up to roughly half of the WHOLE leg (~200 replica-held keys)
+    // would have been counted instead.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    assert_eq!(client.replication().await, 2);
+
+    let dying = &nodes[0].1;
+    dying
+        .state
+        .die_after_multi_set_frames
+        .store(1, Ordering::SeqCst);
+
+    const N: usize = 401;
+    let mut values = HashMap::new();
+    for i in 0..N {
+        values.insert(format!("key{i:04}"), format!("v{i}").into_bytes());
+    }
+
+    // The dying node can never fully resolve its leg, so this
+    // eventually gives up and reports wrong-node for whatever it
+    // couldn't place after the bounded refresh-and-retry — the `Result`
+    // itself isn't this test's point, the stats accounting is.
+    let _ = client.set_many_bytes(&values, 0).await;
+
+    let failures = client.stats().replica_write_failures;
+    assert!(
+        failures <= 1,
+        "expected at most 1 replica write failure (the dying leg's unresolved 1-key tail), \
+         got {failures} — the resolved 400-key chunk must not be double counted"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
 }
 
 // ── incr replication (issue #129) ───────────────────────────────────
