@@ -338,6 +338,30 @@ def _check_delta(delta: int) -> None:
         )
 
 
+# ttl_seconds (used by set/set_many/cas_set): Python ints are unbounded,
+# but the server parses the wire TTL field as a usize and then narrows it
+# with u64::try_from (src/command.rs's parse_length + every TTL call
+# site) — on the 64-bit hosts this server actually runs on that ceiling
+# is u64::MAX. A ttl_seconds above it (or previously, any negative one)
+# would otherwise either overflow parse_length's checked_mul/checked_add
+# server-side (rejected with no reply, poisoning the shared, pipelined
+# connection — same consequence as an empty key, an oversized frame, or
+# an out-of-range delta) or, if it happened to fit usize but not u64 on a
+# 32-bit build, fail the try_from the same way. Validated here,
+# synchronously and before any I/O, the same way delta already is.
+_MAX_TTL_SECONDS = 2**64 - 1
+
+
+def _check_ttl_seconds(ttl_seconds: int) -> None:
+    if not isinstance(ttl_seconds, int) or isinstance(ttl_seconds, bool):
+        raise ValueError(f"nanocached: ttl_seconds must be an integer, got {ttl_seconds!r}")
+    if not (0 <= ttl_seconds <= _MAX_TTL_SECONDS):
+        raise ValueError(
+            f"nanocached: ttl_seconds must fit in an unsigned 64-bit integer "
+            f"(0..{_MAX_TTL_SECONDS}), got {ttl_seconds}"
+        )
+
+
 # Compare-and-set (issue #141): a token must be exactly the 32-character
 # lowercase hex shape content_digest() produces and k/x's digest <cond>
 # form requires — anything else would be sent as raw bytes the server
@@ -1049,8 +1073,7 @@ class NanocachedClient:
     ) -> None:
         """The namespace-carrying implementation behind set() and
         Namespace.set() (issue #105) — see _get_bytes()."""
-        if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
-            raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
+        _check_ttl_seconds(ttl_seconds)
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
         # Validate the *original* value's size before compressing, matching
         # Rust's and Go's Set — an oversized value must be rejected outright,
@@ -1417,8 +1440,7 @@ class NanocachedClient:
         Namespace.set_many() — see _set()."""
         if not values:
             raise ValueError("nanocached: set_many requires at least one key")
-        if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
-            raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
+        _check_ttl_seconds(ttl_seconds)
 
         originals: list[str | bytes] = []
         key_bytes_list: list[bytes] = []
@@ -1818,8 +1840,7 @@ class NanocachedClient:
         and compresses exactly like _set() (the new value written by a
         successful ``k`` must go through this client's own compression
         pipeline, or a later plain get() would fail to decompress it)."""
-        if not isinstance(ttl_seconds, int) or ttl_seconds < 0:
-            raise ValueError(f"nanocached: ttl_seconds must be a non-negative integer, got {ttl_seconds}")
+        _check_ttl_seconds(ttl_seconds)
         key_bytes, value_bytes = _to_bytes(key), _to_bytes(value)
         _check_key_and_value(key_bytes, value_bytes, namespace)
         if self._compress:

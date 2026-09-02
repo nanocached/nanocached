@@ -168,6 +168,11 @@ class MockNode:
         # apply_and_drop_next_incr()/apply_and_drop_next_cas_set().
         self._drop_next_incr_reply = False
         self._drop_next_cas_set_reply = False
+        # Malformed incr value body (audit follow-up to issue #129): when
+        # set, the next `I` reply's <value> body is replaced with this
+        # exact bytes instead of the genuinely-computed counter value —
+        # see answer_malformed_incr_value_once().
+        self._malformed_incr_value: bytes | None = None
         self._get_delay = 0.0
         self._gets_delay = 0.0
         self._set_delay = 0.0
@@ -254,6 +259,15 @@ class MockNode:
         redialing and resending it (which would double-apply the
         delta)."""
         self._drop_next_incr_reply = True
+
+    def answer_malformed_incr_value_once(self, body: bytes) -> None:
+        """Applies the next `i` request's delta normally (the stored
+        counter is bumped exactly as it would be for a normal reply),
+        but sends ``body`` in place of the genuinely-computed counter
+        value as the `I` reply's <value> — simulating a desynced/
+        corrupted reply, or a buggy proxy in front of the server,
+        whose body isn't INCR's own decimal-ASCII-i64 grammar."""
+        self._malformed_incr_value = body
 
     def apply_and_drop_next_cas_set(self) -> None:
         """Same as apply_and_drop_next_incr() but for the next matching
@@ -680,7 +694,11 @@ class MockNode:
                         writer.close()
                         return
                     ttl_field = b" %d" % ttl if ttl else b""
-                    writer.write(b"I %d%b%b\n%b" % (len(new_bytes), ttl_field, tag_suffix, new_bytes))
+                    reply_bytes = new_bytes
+                    if self._malformed_incr_value is not None:
+                        reply_bytes = self._malformed_incr_value
+                        self._malformed_incr_value = None
+                    writer.write(b"I %d%b%b\n%b" % (len(reply_bytes), ttl_field, tag_suffix, reply_bytes))
                     await writer.drain()
 
                 elif parts[0] == b"k":
