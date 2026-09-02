@@ -1,13 +1,18 @@
 package org.nanocached.spring.boot;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
@@ -20,6 +25,9 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.context.properties.source.MapConfigurationPropertySource;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.EnableCaching;
@@ -263,5 +271,79 @@ class NanocachedCacheAutoConfigurationTest {
         // The client bean built from these properties exists (no exception
         // thrown while forwarding them).
         assertInstanceOf(NanocachedClient.class, context.getBean(NanocachedClient.class));
+    }
+
+    @Test
+    void bareDurationNumbersDoNotDefaultToMilliseconds() {
+        // Regression (issue #417): none of these Duration fields declared
+        // @DurationUnit, so a bare number (no "s"/"ms" suffix) silently
+        // bound as milliseconds — nanocached.cache.default-ttl: 10 meant
+        // 10ms, not the 10s an operator would expect. Bind straight
+        // through a Binder (same mechanism NanocachedProperties itself
+        // uses via @ConfigurationProperties) rather than booting a full
+        // context, since this is purely about the unit each field binds
+        // bare numbers with.
+        MapConfigurationPropertySource source = new MapConfigurationPropertySource(Map.of(
+                "nanocached.reconnect-cooldown", "2",
+                "nanocached.read-hedge-after", "50",
+                "nanocached.cache.default-ttl", "10"));
+        NanocachedProperties properties = new Binder(source)
+                .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                .get();
+
+        assertEquals(Duration.ofSeconds(2), properties.getReconnectCooldown());
+        assertEquals(Duration.ofMillis(50), properties.getReadHedgeAfter());
+        assertEquals(Duration.ofSeconds(10), properties.getCache().getDefaultTtl());
+    }
+
+    @Test
+    void perCacheTtlMapBareNumbersStayMillisecondsUnlikeDefaultTtl() {
+        // Spring Boot's MapBinder does not forward a field's
+        // @DurationUnit to the per-entry Bindable it builds for each map
+        // value (confirmed against spring-boot 3.5.3's MapBinder.EntryBinder,
+        // which constructs value Bindables via plain Bindable.of(valueType)
+        // with no annotations) — so cache.ttl.<name> cannot get the same
+        // bare-number-is-seconds treatment as cache.default-ttl. Documented
+        // in NanocachedProperties.Cache#ttl and the README; this test pins
+        // that behavior so a future Spring Boot upgrade that starts
+        // propagating the annotation doesn't silently change the meaning
+        // of an existing bare-number config value out from under an
+        // operator.
+        MapConfigurationPropertySource source =
+                new MapConfigurationPropertySource(Map.of("nanocached.cache.ttl.sessions", "30"));
+        NanocachedProperties properties = new Binder(source)
+                .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                .get();
+
+        assertEquals(Duration.ofMillis(30), properties.getCache().getTtl().get("sessions"));
+    }
+
+    @Test
+    void zeroReconnectCooldownDisablesItInsteadOfFallingBackToTheSdkDefault() throws Exception {
+        // Regression (issue #417): Options.reconnectCooldown(Duration.ZERO)
+        // means "use the SDK default", so forwarding a zero property value
+        // straight through used to silently keep the default cooldown
+        // instead of actually disabling it — operators had no way to turn
+        // this off via configuration.
+        boot(YamlOnlyConfig.class, "nanocached.reconnect-cooldown=0s");
+
+        assertTrue(
+                reconnectCooldownDisabled(context.getBean(NanocachedClient.class)),
+                "a zero reconnect-cooldown must call disableReconnectCooldown()");
+    }
+
+    @Test
+    void nonZeroReconnectCooldownIsForwardedWithoutDisablingIt() throws Exception {
+        boot(YamlOnlyConfig.class, "nanocached.reconnect-cooldown=2s");
+
+        assertFalse(
+                reconnectCooldownDisabled(context.getBean(NanocachedClient.class)),
+                "a non-zero reconnect-cooldown must not disable the cooldown");
+    }
+
+    private static boolean reconnectCooldownDisabled(NanocachedClient client) throws Exception {
+        Field field = NanocachedClient.class.getDeclaredField("reconnectCooldownDisabled");
+        field.setAccessible(true);
+        return field.getBoolean(client);
     }
 }

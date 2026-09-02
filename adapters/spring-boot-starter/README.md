@@ -59,16 +59,27 @@ All under the `nanocached` prefix, passed straight to
 | `compression-threshold` | `Options.compressionThreshold` |
 | `fire-and-forget-replicas` | `Options.fireAndForgetReplicas` |
 | `read-repair` | `Options.readRepair` |
-| `reconnect-cooldown` | `Options.reconnectCooldown` |
-| `read-hedge-after` | `Options.readHedgeAfter` |
-| `cache.default-ttl` | `NanocachedCacheManager.Builder.defaultTtl` |
-| `cache.ttl.<name>` | `NanocachedCacheManager.Builder.ttl(name, ...)` |
+| `reconnect-cooldown` | `Options.reconnectCooldown` (a bare number, e.g. `2`, is seconds) |
+| `read-hedge-after` | `Options.readHedgeAfter` (a bare number, e.g. `50`, is milliseconds) |
+| `cache.default-ttl` | `NanocachedCacheManager.Builder.defaultTtl` (a bare number is seconds) |
+| `cache.ttl.<name>` | `NanocachedCacheManager.Builder.ttl(name, ...)` (a bare number is **milliseconds** — see below) |
 | `cache.allow-null-values` | `NanocachedCacheManager.Builder.allowNullValues` |
 | `cache.cache-names` | `NanocachedCacheManager.Builder.cacheNames` |
 
 `cache.cache-names` is aligned with Boot's own `spring.cache.cache-names`:
 restricts the manager to a closed, eagerly-created set instead of creating
 a cache on first use.
+
+Every `Duration` property above accepts Spring Boot's usual unit-suffixed
+form (`2s`, `500ms`, `10m`, ...); a bare number falls back to the unit
+noted in the table rather than Boot's own default of milliseconds — except
+`cache.ttl.<name>`, where Spring Boot's `Map`-valued property binding
+doesn't apply that per-field default, so a bare number there is always
+milliseconds regardless of what `cache.default-ttl` does. Always give
+`cache.ttl.<name>` entries an explicit unit suffix (e.g. `sessions: 30s`).
+`reconnect-cooldown: 0s` (or any zero duration) disables the reconnect
+cooldown outright, rather than mapping to the SDK's own default cooldown —
+the one case where zero and "unset" are not the same thing.
 
 ## Usage
 
