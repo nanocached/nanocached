@@ -588,7 +588,7 @@ class NanocachedClient:
             try:
                 await client._open_cluster(identified)
             except BaseException:
-                client._teardown()
+                await client._teardown()
                 raise
             client._start_keepalive()
             return client
@@ -651,7 +651,7 @@ class NanocachedClient:
             try:
                 await client._connect_to_proxy(identified)
             except BaseException:
-                client._teardown()
+                await client._teardown()
                 raise
             client._start_keepalive()
             return client
@@ -1230,7 +1230,21 @@ class NanocachedClient:
         try:
             raw = await self._get_many_bytes(namespace, keys)
         except PartialWrongNodeError as error:
-            error.partial_values = {key: value.decode() for key, value in error.partial_values.items()}
+            # Defensive decode (issue #412): a stored value need not be
+            # valid UTF-8 even when this is get_many() rather than
+            # get_many_bytes() (nothing on the write side enforces
+            # that) — a plain .decode() raising UnicodeDecodeError here
+            # would replace the PartialWrongNodeError this except block
+            # exists to enrich and re-raise with an unrelated decode
+            # error, masking the wrong-node/partial-failure information
+            # callers need. errors="replace" keeps this best-effort
+            # convenience view lossy rather than exception-prone; the
+            # exact bytes are still available via partial_values before
+            # this reassignment, and via get_many_bytes() to any caller
+            # who needs them exact.
+            error.partial_values = {
+                key: value.decode(errors="replace") for key, value in error.partial_values.items()
+            }
             raise
         return {key: value.decode() for key, value in raw.items()}
 
@@ -1997,7 +2011,7 @@ class NanocachedClient:
         await _drain_tasks(self._background_replica_writes)
         await _drain_tasks(self._hedged_reads)
 
-        self._teardown()
+        await self._teardown()
 
     async def __aenter__(self) -> "NanocachedClient":
         return self
@@ -2005,12 +2019,23 @@ class NanocachedClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    def _teardown(self) -> None:
+    async def _teardown(self) -> None:
+        connections = []
         if self._single is not None:
             self._single.close()
+            connections.append(self._single)
         for member in self._members.values():
             if member.connection is not None:
                 member.connection.close()
+                connections.append(member.connection)
+        # Reap each connection's read-loop task (issue #412), the same
+        # way close() already reaps _keepalive_task/_refresh_task/
+        # _redials/_background_replica_writes/_hedged_reads just above —
+        # close() alone only closes the writer, which doesn't guarantee
+        # the read loop notices and finishes before this coroutine
+        # returns.
+        if connections:
+            await asyncio.gather(*(c.wait_closed() for c in connections), return_exceptions=True)
 
     # ── ルーティングと複製 ─────────────────────────────────────────
 
@@ -2603,7 +2628,7 @@ class NanocachedClient:
             )
 
         if self._closed:
-            self._teardown()
+            await self._teardown()
             return
 
         # Drop reconnect-cooldown entries for addresses whose owning node

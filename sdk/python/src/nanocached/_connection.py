@@ -230,17 +230,29 @@ class _PendingSlot:
     """One pipelined request's entry in ``Connection._pending`` (request
     pipelining) — the tag its request was sent under (None on an
     untagged connection), the future callers await, and whether this
-    slot's own frame has finished being written (issue #225): ``sent``
-    starts False and flips to True only once ``_send()``'s
-    ``writer.write()``/``await writer.drain()`` for THIS request returns
-    without raising, all still inside the write lock's critical section
-    — so it can never be read half-updated by a concurrent ``_poison()``
-    (asyncio is single-threaded; the flip and every read of it are both
-    synchronous). ``_poison()`` uses it to tell "this request never left
-    the client" (``sent`` still False — always safe to retry) apart from
-    "this request reached the wire and may have reached the server
-    before the reply was lost" (``sent`` True — see
-    Connection._error_for)."""
+    slot's own frame may already have reached the server (issue #225,
+    conservatively widened by issue #412): ``sent`` starts False and
+    flips to True as soon as ``_send()``'s ``writer.write()`` for THIS
+    request returns without raising — deliberately *before* the
+    following ``await writer.drain()``, still inside the write lock's
+    critical section so it can never be read half-updated by a
+    concurrent ``_poison()`` (asyncio is single-threaded; the flip and
+    every read of it are both synchronous). This is a conservative
+    "possibly sent" classification, not a "definitely acked" one:
+    ``write()`` only hands the frame's bytes to the OS socket buffer,
+    but a timeout or another pipelined request's failure can poison the
+    connection while THIS request's own ``_send()`` call is still
+    suspended inside ``drain()`` — by then the bytes may already be in
+    flight to the server, so the slot must already read as sent for
+    ``_poison()`` (running from that other context) to classify it
+    correctly. Marking it only after ``drain()`` itself returns would
+    leave a window where a request that's already on the wire is still
+    reported unsent, letting ``_with_wrong_node_retry`` blindly resend
+    it and double-apply a non-idempotent incr/CAS. ``_poison()`` uses
+    ``sent`` to tell "this request never left the client" (``sent``
+    still False — always safe to retry) apart from "this request may
+    have reached the server before the reply was lost" (``sent`` True —
+    see Connection._error_for)."""
 
     __slots__ = ("tag", "future", "sent")
 
@@ -304,6 +316,28 @@ class Connection:
 
     def close(self) -> None:
         self._poison(ConnectionError("nanocached: connection closed"))
+
+    async def wait_closed(self) -> None:
+        """Reaps ``_read_task`` (issue #412) — call this after close()
+        (or once ``closed`` is otherwise known True) so a short-lived
+        program's event-loop teardown never logs "Task was destroyed
+        but it is pending!" for this connection's read loop, the same
+        problem issue #189 fixed for NanocachedClient's own keepalive
+        task. close() only closes the writer, which merely nudges the
+        read loop toward an EOF it may not observe until a future loop
+        iteration; cancelling here forces it to finish now instead of
+        leaving it pending for as long as nothing else happens to run
+        the loop. Cancelling an already-finished task (the common case —
+        _poison() already made the read loop return on its own after a
+        real connection failure) is a harmless no-op, so this is safe to
+        call unconditionally from NanocachedClient.close()'s own
+        teardown, mirroring how it reaps every other background task."""
+        if not self._read_task.done():
+            self._read_task.cancel()
+        try:
+            await self._read_task
+        except asyncio.CancelledError:
+            pass
 
     async def get(self, key: bytes, namespace: bytes = b"") -> bytes | None:
         marker, value = await self._request(lambda tag: _encode_get(key, tag, namespace))
@@ -620,28 +654,45 @@ class Connection:
                 self._arm_deadline()
             try:
                 self._writer.write(frame)
-                await self._writer.drain()
             except OSError as error:
                 wrapped = ConnectionError(f"nanocached: connection failed: {error}")
                 wrapped.__cause__ = error
                 self._poison(wrapped)
-            except asyncio.CancelledError:
-                # Cancelled mid-write: the frame may be only partially on
-                # the wire, desyncing every request queued behind this
-                # one too — unlike cancellation while awaiting the
-                # response (below), this can't be scoped to just this
-                # one request.
-                self._poison(ConnectionError("nanocached: connection failed: cancelled mid-write"))
-                raise
             else:
-                # Non-idempotent replay guard (issue #225): only flips
-                # once write()+drain() for THIS frame has actually
-                # returned — see _PendingSlot and _error_for. Anything
-                # that fails this request from here on (a dead read
-                # loop, a timeout, another pipelined request's own write
-                # failing) means the request may already have reached
-                # the server, so it must never be silently resent.
+                # Non-idempotent replay guard (issue #225, widened by
+                # issue #412): flips as soon as write() hands the
+                # frame's bytes to the OS socket buffer — deliberately
+                # *before* awaiting drain() below, not after it returns.
+                # write() itself never suspends (it can't be interrupted
+                # by CancelledError), so this is the earliest point at
+                # which the bytes might already be irrevocably on their
+                # way to the server. If the connection is poisoned (e.g.
+                # a timeout) while this coroutine is still suspended
+                # inside drain() just below, _poison() — running from
+                # that other context — must already see this slot as
+                # possibly-sent; marking it only after drain() returns
+                # would leave a window where an in-flight request is
+                # still misclassified as never-sent, letting
+                # _with_wrong_node_retry blindly resend it and
+                # double-apply a non-idempotent incr/CAS. See
+                # _PendingSlot and _error_for.
                 slot.sent = True
+                try:
+                    await self._writer.drain()
+                except OSError as error:
+                    wrapped = ConnectionError(f"nanocached: connection failed: {error}")
+                    wrapped.__cause__ = error
+                    self._poison(wrapped)
+                except asyncio.CancelledError:
+                    # Cancelled while awaiting drain(): the frame is
+                    # already handed to the kernel (slot.sent is already
+                    # True above), but every request queued behind this
+                    # one on this connection is still desynced the same
+                    # way a mid-write cancellation always was, so this
+                    # still poisons the whole connection rather than
+                    # scoping the failure to just this one request.
+                    self._poison(ConnectionError("nanocached: connection failed: cancelled mid-write"))
+                    raise
 
         # If cancelled here, the write already fully completed — the
         # response is still coming from the server and must still be
