@@ -16,8 +16,10 @@ and friends run against a nanocached cluster.
   compare-and-set. Two racing callers can both observe "absent" and both
   write; the later write wins. Same trade-off the Spring adapter's
   `putIfAbsent` documents.
-- **`get_many`/`set_many`/`delete_many`** are client-side loops — the wire
-  has no multi-key command.
+- **`get_many`/`set_many`** use the wire's batched multi-get/multi-set
+  (issues #150/#152): one round trip per involved node instead of one per
+  key. **`delete_many`** remains a concurrent client-side fan-out — the
+  wire has no multi-key delete.
 - **`incr`/`decr`** use the wire's own atomic counter (`INCR`, issue
   #129): atomic on the node that owns the key, unlike `add()`/`touch()`
   above. Matches `BaseCache`'s own contract — raises `ValueError` if the
@@ -166,12 +168,12 @@ def my_view(request):
 
 ## Consistency notes
 
-The wire has single-key get/set/delete and no compare-and-set, so `add()`
-and `touch()` are get-then-set (see above); `get_many`/`set_many`/
-`delete_many` are client-side loops, so a failure partway through leaves
-whichever keys were already processed changed rather than rolling back.
-`incr`/`decr` (issue #129) are the one exception: atomic on the node
-that owns the key, since the wire has a real `INCR`.
+`add()` and `touch()` are get-then-set (see above), not atomic.
+`get_many`/`set_many` batch by owning node (issues #150/#152) and
+`delete_many` fans out per key — in every case a failure partway through
+leaves whichever keys were already processed changed rather than rolling
+back. `incr`/`decr` (issue #129) are atomic on the node that owns the
+key, since the wire has a real `INCR`.
 
 ## Counter storage
 
