@@ -363,16 +363,24 @@ export function encodeMultiGet(keys: readonly Uint8Array[], tag?: number, namesp
   // miss — many small keys whose sum still can't fit the server's own
   // per-request cap. Uses multiGetEntryCost (issue #222), not raw key
   // bytes, so this bound is honest about the header each key also adds —
-  // see multiGetEntryCost/MULTI_FRAME_HEADER_SLACK above.
+  // see multiGetEntryCost/MULTI_FRAME_HEADER_SLACK above. The FIRST key
+  // is exempt from the total check (issue #390), exactly like client.ts's
+  // nextChunkEnd and the Go SDK's multiGetChunked: a checkKey-valid key
+  // whose entry cost lands within the last ~72 bytes below
+  // MAX_REQUEST_BYTES would otherwise pass validation and then trip this
+  // bound — while the frame it builds is still safely under the server's
+  // real 1 MiB cap, because MAX_REQUEST_BYTES already reserves
+  // MAX_REQUEST_HEADER_LENGTH (256 bytes) of headroom that comfortably
+  // absorbs MULTI_FRAME_HEADER_SLACK plus one length field.
   let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
-  for (const key of keys) {
-    checkKey(key, namespace);
-    total += multiGetEntryCost(key);
-  }
-  if (total > MAX_REQUEST_BYTES) {
-    throw new RangeError(
-      `nanocached: namespace and keys together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
-    );
+  for (let i = 0; i < keys.length; i++) {
+    checkKey(keys[i], namespace);
+    total += multiGetEntryCost(keys[i]);
+    if (i > 0 && total > MAX_REQUEST_BYTES) {
+      throw new RangeError(
+        `nanocached: namespace and keys together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+      );
+    }
   }
 
   const lengths = keys.map((key) => ` ${key.length}`).join("");
@@ -399,18 +407,23 @@ export function encodeMultiSet(
 
   // Uses multiSetEntryCost (issue #222), not raw key+value bytes, so
   // this bound is honest about the two header fields each pair also
-  // adds — see multiSetEntryCost/MULTI_FRAME_HEADER_SLACK above.
+  // adds — see multiSetEntryCost/MULTI_FRAME_HEADER_SLACK above. The
+  // FIRST pair is exempt from the total check (issue #390) for the same
+  // reason encodeMultiGet's is: a checkKeyAndValue-valid pair near the
+  // bound must not trip an encoder a chunker-built frame can't actually
+  // violate — MAX_REQUEST_BYTES' 256-byte header headroom absorbs the
+  // slack plus one pair's length fields.
   let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
   const lengthFields: string[] = new Array(keys.length);
   for (let i = 0; i < keys.length; i++) {
     checkKeyAndValue(keys[i], values[i], namespace);
     total += multiSetEntryCost(keys[i], values[i]);
+    if (i > 0 && total > MAX_REQUEST_BYTES) {
+      throw new RangeError(
+        `nanocached: namespace, keys and values together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
+      );
+    }
     lengthFields[i] = ` ${keys[i].length} ${values[i].length}`;
-  }
-  if (total > MAX_REQUEST_BYTES) {
-    throw new RangeError(
-      `nanocached: namespace, keys and values together (including their header overhead) exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${total} bytes`,
-    );
   }
 
   const ttlField = ttlSeconds === 0 ? "" : ` ${ttlSeconds}`;

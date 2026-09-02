@@ -2676,6 +2676,32 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
     throw new Error(`no key routes to ${name}`);
   }
 
+  // issue #390: multiGetPass's catch was the file's one swallow site
+  // without the isSwallowable discrimination — a genuine programming
+  // error thrown from the leg was folded into the per-key retry list and
+  // finally misreported as PartialWrongNodeError (stale routing). It
+  // must propagate, exactly as multiSetPass's guarded catch already
+  // does.
+  it("getMany propagates a programming error from a leg instead of misreporting it as stale routing", async () => {
+    const cluster = await startReplicatedCluster(1);
+    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
+    try {
+      await client.setMany({ a: "1" });
+      const boom = new TypeError("boom: a genuine bug in the SDK");
+      (client as unknown as { multiGetChunked: () => never }).multiGetChunked = () => {
+        throw boom;
+      };
+      await assert.rejects(client.getMany(["a"]), (error: unknown) => {
+        assert.equal(error, boom);
+        assert.ok(!(error instanceof PartialWrongNodeError));
+        return true;
+      });
+    } finally {
+      await client.close();
+      await cluster.close();
+    }
+  });
+
   it("splits a batch across owners by primary and reassembles it in caller order", async () => {
     const cluster = await startReplicatedCluster(1);
     const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });

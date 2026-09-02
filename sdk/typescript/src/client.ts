@@ -363,11 +363,15 @@ export const MAX_BATCH_KEYS = 400;
 // for `o`, both already honest about the header field(s) each entry adds,
 // not just its key/value bytes) still fits protocol.ts's MAX_REQUEST_BYTES.
 // This mirrors encodeMultiGet/encodeMultiSet's own "total" bound exactly,
-// entry cost and header slack alike, so a chunk built this way can never
-// trip the encoder's RangeError. A single entry always fits by itself —
-// checkKey/checkKeyAndValue already validated every entry eagerly, before
-// chunking ever starts (see getManyBytesInNamespace/setManyInNamespace) —
-// so a run is never empty and this always makes progress.
+// entry cost and header slack alike — including its first-entry
+// exemption (issue #390) — so a chunk built this way can never trip the
+// encoder's RangeError: a lone entry whose cost overshoots the budget is
+// exempt in both places (MAX_REQUEST_BYTES' 256-byte header headroom
+// keeps the resulting frame under the server's real cap; see
+// encodeMultiGet). checkKey/checkKeyAndValue already validated every
+// entry eagerly, before chunking ever starts (see
+// getManyBytesInNamespace/setManyInNamespace), so a run is never empty
+// and this always makes progress.
 function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entryBytes: (index: number) => number): number {
   let end = start;
   let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
@@ -1519,7 +1523,15 @@ export class NanocachedClient {
         let entries: MultiEntry[];
         try {
           entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
-        } catch {
+        } catch (error) {
+          // issue #390: this was the file's one undiscriminating swallow
+          // site — a genuine programming error thrown here was folded
+          // into the per-key retry list and finally misreported as
+          // PartialWrongNodeError (stale routing). Only the listed
+          // connection-level failures may stand in for "retry this
+          // group", the same isSwallowable stance multiSetPass and every
+          // other swallow site already take.
+          if (!isSwallowable(error)) throw error;
           retry.push(...groupIndices);
           return;
         }

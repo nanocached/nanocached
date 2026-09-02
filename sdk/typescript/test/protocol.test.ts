@@ -176,6 +176,20 @@ describe("encodeMultiGet (issues #128/#150/#151)", () => {
     const keys = Array.from({ length: 10 }, () => Buffer.alloc(Math.ceil(MAX_REQUEST_BYTES / 9)));
     assert.throws(() => encodeMultiGet(keys), RangeError);
   });
+
+  // issue #390: a checkKey-valid key whose entry cost (space + decimal
+  // length field + slack) lands within the last ~72 bytes below
+  // MAX_REQUEST_BYTES used to pass validation and then trip the
+  // encoder's own total bound — a bound the frame doesn't actually
+  // violate server-side, since MAX_REQUEST_BYTES already reserves 256
+  // bytes of header headroom. The first entry is exempt from the total
+  // check, exactly like nextChunkEnd's and Go's chunkers.
+  it("accepts a lone checkKey-valid key even when its header overhead overshoots the total bound", () => {
+    const key = Buffer.alloc(MAX_REQUEST_BYTES); // checkKey's exact limit
+    const frame = encodeMultiGet([key]);
+    assert.ok(frame.length > MAX_REQUEST_BYTES);
+    assert.ok(frame.length < 1024 * 1024); // still under the server's real cap
+  });
 });
 
 describe("encodeMultiSet (issues #150/#151)", () => {
