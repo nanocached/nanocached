@@ -2325,11 +2325,67 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
     setMaxMultiGetDecompressedBytesForTest(1);
     const node = await startMockNode();
     try {
-      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
       try {
         await client.set("a", "12");
         await client.set("c", "34");
         await assert.rejects(client.getManyBytes(["a", "c"]), DecompressionError);
+      } finally {
+        client.close();
+      }
+    } finally {
+      setMaxMultiGetDecompressedBytesForTest(saved);
+      await node.close();
+    }
+  });
+
+  it("catches the crossing entry against the cumulative budget even when it is the last one", async () => {
+    // Regression (pass-9 audit, issue #410a): the cumulative budget used
+    // to be checked BEFORE charging the current entry, so the entry that
+    // actually crosses the cap always slipped through uncaught — and if
+    // it was the last hit in the response, the guard never fired at all.
+    // Only one key here, so the crossing entry is necessarily the last
+    // (and only) one; charge-then-check must still catch it.
+    const saved = maxMultiGetDecompressedBytes;
+    setMaxMultiGetDecompressedBytesForTest(1);
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+        compress: true,
+      });
+      try {
+        await client.set("a", "12");
+        await assert.rejects(client.getManyBytes(["a"]), DecompressionError);
+      } finally {
+        client.close();
+      }
+    } finally {
+      setMaxMultiGetDecompressedBytesForTest(saved);
+      await node.close();
+    }
+  });
+
+  it("does not charge the cumulative decompressed budget when compress is disabled", async () => {
+    // Regression (pass-9 audit, issue #410b): the cumulative budget used
+    // to be charged and enforced even when the client has compression
+    // disabled, so a large uncompressed batch could fail with a
+    // misleading "decompression bomb" error. The budget is lowered far
+    // below what this batch would need if it were (wrongly) charged.
+    const saved = maxMultiGetDecompressedBytes;
+    setMaxMultiGetDecompressedBytesForTest(1);
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.set("a", "12");
+        await client.set("c", "34");
+        const values = await client.getManyBytes(["a", "c"]);
+        assert.deepEqual(values.get("a"), Buffer.from("12"));
+        assert.deepEqual(values.get("c"), Buffer.from("34"));
       } finally {
         client.close();
       }

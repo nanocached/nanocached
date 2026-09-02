@@ -184,14 +184,15 @@ class NanocachedClientTest {
     // issue #386: the per-value decompression cap alone lets a batch
     // amplify it by the key count (batch × 64 MiB from one small wire
     // reply); the cumulative budget must abort the batch instead. The cap
-    // is lowered so the test doesn't allocate the real 256 MiB bound, and
-    // charged decompressed bytes apply whether or not compress is on.
+    // is lowered so the test doesn't allocate the real 256 MiB bound. The
+    // budget only applies when compress is enabled (issue #410b).
     @Test
     void getManyCapsCumulativeDecompressedBytesAcrossTheBatch() throws Exception {
         long saved = Compression.maxMultiGetDecompressedBytes;
         Compression.maxMultiGetDecompressedBytes = 4;
         try (MockNode node = new MockNode()) {
-            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+            try (NanocachedClient client =
+                    NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
                 client.set("a", "12345678");
                 client.set("b", "12345678");
                 NanocachedException.DecompressionFailed error =
@@ -200,6 +201,49 @@ class NanocachedClientTest {
                 assertTrue(error.getMessage().contains("across the batch"));
                 // A single-key read is untouched by the batch bound.
                 assertEquals("12345678", client.get("a").orElseThrow());
+            }
+        } finally {
+            Compression.maxMultiGetDecompressedBytes = saved;
+        }
+    }
+
+    // issue #410a: the cumulative budget used to be checked BEFORE
+    // charging the current entry, so the entry that actually crosses the
+    // cap always slipped through uncaught — and if it was the last hit in
+    // the response, the guard never fired at all. Only one key here, so
+    // the crossing entry is necessarily the last (and only) one;
+    // charge-then-check must still catch it.
+    @Test
+    void getManyBudgetCatchesTheCrossingEntryEvenWhenLast() throws Exception {
+        long saved = Compression.maxMultiGetDecompressedBytes;
+        Compression.maxMultiGetDecompressedBytes = 1;
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client =
+                    NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
+                client.set("a", "12");
+                assertThrows(NanocachedException.DecompressionFailed.class,
+                        () -> client.getMany(List.of("a")));
+            }
+        } finally {
+            Compression.maxMultiGetDecompressedBytes = saved;
+        }
+    }
+
+    // issue #410b: the budget used to be charged and enforced even when
+    // the client has compression disabled, so a large uncompressed batch
+    // could fail with a misleading "decompression bomb" error. The budget
+    // is lowered far below what this batch would need if it were
+    // (wrongly) charged.
+    @Test
+    void getManyDoesNotChargeTheBudgetWhenCompressIsDisabled() throws Exception {
+        long saved = Compression.maxMultiGetDecompressedBytes;
+        Compression.maxMultiGetDecompressedBytes = 1;
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                client.set("a", "12345678");
+                client.set("b", "12345678");
+                Map<String, String> values = client.getMany(List.of("a", "b"));
+                assertEquals(Map.of("a", "12345678", "b", "12345678"), values);
             }
         } finally {
             Compression.maxMultiGetDecompressedBytes = saved;

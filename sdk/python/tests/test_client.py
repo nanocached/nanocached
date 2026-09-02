@@ -4974,13 +4974,45 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         # Regression (pass-7 audit): the per-value decompression cap can be
         # amplified across a batch. Patched low so the guard fires without
         # allocating the real 256 MiB bound.
-        client = await self.connect()
+        client = await self.connect(compress=True)
         try:
             await client.set("a", "12")
             await client.set("c", "34")
             with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
                 with self.assertRaises(DecompressionError):
                     await client.get_many_bytes(["a", "c"])
+        finally:
+            await client.close()
+
+    async def test_get_many_bytes_budget_catches_the_crossing_entry_even_when_last(self):
+        # Regression (pass-9 audit, issue #410a): the cumulative budget used
+        # to be checked BEFORE charging the current entry, so the entry
+        # that actually crosses the cap always slipped through uncaught —
+        # and if it was the last hit in the response, the guard never fired
+        # at all. Only one key here, so the crossing entry is necessarily
+        # the last (and only) one; charge-then-check must still catch it.
+        client = await self.connect(compress=True)
+        try:
+            await client.set("a", "12")
+            with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
+                with self.assertRaises(DecompressionError):
+                    await client.get_many_bytes(["a"])
+        finally:
+            await client.close()
+
+    async def test_get_many_bytes_does_not_charge_the_budget_when_compress_is_disabled(self):
+        # Regression (pass-9 audit, issue #410b): the cumulative budget used
+        # to be charged and enforced even when the client has compression
+        # disabled, so a large uncompressed batch could fail with a
+        # misleading "decompression bomb" error. The budget is patched far
+        # below what this batch would need if it were (wrongly) charged.
+        client = await self.connect()
+        try:
+            await client.set("a", "12")
+            await client.set("c", "34")
+            with mock.patch("nanocached.client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
+                result = await client.get_many_bytes(["a", "c"])
+            self.assertEqual(result, {"a": b"12", "c": b"34"})
         finally:
             await client.close()
 

@@ -942,8 +942,8 @@ public class NanocachedClientTests
     // issue #386: the per-value decompression cap alone lets a batch
     // amplify it by the key count (batch x 64 MiB from one small wire
     // reply); the cumulative budget must abort the batch instead. The cap
-    // is lowered so the test doesn't allocate the real 256 MiB bound, and
-    // charged decompressed bytes apply whether or not Compress is on.
+    // is lowered so the test doesn't allocate the real 256 MiB bound. The
+    // budget only applies when Compress is enabled (issue #410b).
     [Fact]
     public async Task GetManyCapsCumulativeDecompressedBytesAcrossTheBatch()
     {
@@ -952,7 +952,7 @@ public class NanocachedClientTests
         try
         {
             using var node = new MockNode();
-            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
 
             await client.SetAsync("a", "12345678");
             await client.SetAsync("b", "12345678");
@@ -961,6 +961,58 @@ public class NanocachedClientTests
             Assert.Contains("across the batch", error.Message);
             // A single-key read is untouched by the batch bound.
             Assert.Equal("12345678", await client.GetAsync("a"));
+        }
+        finally
+        {
+            Compression.MaxMultiGetDecompressedBytes = saved;
+        }
+    }
+
+    // issue #410a: the cumulative budget used to be checked BEFORE
+    // charging the current entry, so the entry that actually crosses the
+    // cap always slipped through uncaught — and if it was the last hit in
+    // the response, the guard never fired at all. Only one key here, so
+    // the crossing entry is necessarily the last (and only) one;
+    // charge-then-check must still catch it.
+    [Fact]
+    public async Task GetManyBudgetCatchesTheCrossingEntryEvenWhenLast()
+    {
+        long saved = Compression.MaxMultiGetDecompressedBytes;
+        Compression.MaxMultiGetDecompressedBytes = 1;
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+
+            await client.SetAsync("a", "12");
+            await Assert.ThrowsAsync<DecompressionException>(() => client.GetManyAsync(new[] { "a" }));
+        }
+        finally
+        {
+            Compression.MaxMultiGetDecompressedBytes = saved;
+        }
+    }
+
+    // issue #410b: the budget used to be charged and enforced even when
+    // the client has compression disabled, so a large uncompressed batch
+    // could fail with a misleading "decompression bomb" error. The budget
+    // is lowered far below what this batch would need if it were
+    // (wrongly) charged.
+    [Fact]
+    public async Task GetManyDoesNotChargeTheBudgetWhenCompressIsDisabled()
+    {
+        long saved = Compression.MaxMultiGetDecompressedBytes;
+        Compression.MaxMultiGetDecompressedBytes = 1;
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+            await client.SetAsync("a", "12345678");
+            await client.SetAsync("b", "12345678");
+            Dictionary<string, string> values = await client.GetManyAsync(new[] { "a", "b" });
+            Assert.Equal(
+                new Dictionary<string, string> { ["a"] = "12345678", ["b"] = "12345678" }, values);
         }
         finally
         {
