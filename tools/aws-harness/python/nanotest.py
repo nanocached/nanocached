@@ -23,6 +23,24 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "sdk", "python", "src"))
 from nanocached import NanocachedClient  # noqa: E402
 
+# Bound on the raw-socket reads cmd_nodes does directly against discovery
+# (bypassing the SDK's own connect_and_identify, which already has this
+# kind of bound). Without it, a discovery server that accepts the
+# connection and then goes silent (crashed-but-open, deadlocked, or a bug
+# on the other end) would hang this command forever. Matches
+# sdk/python/src/nanocached/_identify.py's CONNECT_DEADLINE.
+_IO_TIMEOUT = 5.0
+
+# Mirrors sdk/python/src/nanocached/_identify.py's caps
+# (_MAX_NODE_COUNT / _MAX_NODE_FIELD_LENGTH / _MAX_NODE_LIST_RESPONSE_LENGTH)
+# on the same length-prefixed `L`-response fields: a corrupt or hostile
+# discovery reply must not drive an unbounded read or allocation here
+# either, since this command parses the wire response itself instead of
+# going through the SDK.
+_MAX_NODE_COUNT = 1 << 16
+_MAX_NODE_FIELD_LENGTH = 64 * 1024
+_MAX_NODE_LIST_RESPONSE_LENGTH = 16 * 1024 * 1024
+
 
 def addresses():
     raw = os.environ["NANOTEST_ADDRESSES"]
@@ -142,29 +160,98 @@ async def cmd_churn(seconds: float, outfile: str) -> int:
 async def cmd_nodes() -> int:
     host, port = addresses()[0]
     reader, writer = await asyncio.open_connection(host, port)
-    writer.write(b"A 1\n\x00")
-    await writer.drain()
-    ack = await reader.readexactly(3)
-    if ack != b"Od\n":
-        print(f"unexpected handshake: {ack!r}")
-        return 1
-    writer.write(b"L\n")
-    await writer.drain()
-    header = (await reader.readline()).decode().strip()
-    print(f"header: {header}")
-    if header.startswith("N "):
-        count = int(header.split()[1])
-        for _ in range(count):
-            lengths = (await reader.readline()).decode().split()
-            name_len, addr_len = int(lengths[0]), int(lengths[1])
-            body = await reader.readexactly(name_len + addr_len + 1)
-            print(f"  {body[:name_len].decode()} @ {body[name_len:name_len + addr_len].decode()}")
-    writer.close()
-    return 0
+    try:
+        writer.write(b"A 1\n\x00")
+        await writer.drain()
+        ack = await asyncio.wait_for(reader.readexactly(3), timeout=_IO_TIMEOUT)
+        if ack != b"Od\n":
+            print(f"unexpected handshake: {ack!r}")
+            return 1
+        writer.write(b"L\n")
+        await writer.drain()
+        header_line = await asyncio.wait_for(reader.readline(), timeout=_IO_TIMEOUT)
+        header = header_line.decode().strip()
+        print(f"header: {header}")
+        # Aggregate cap on the whole L response, header included, mirroring
+        # _identify.py's _read_entries — independent of the per-field caps
+        # below, so a long run of small-but-valid entries can't add up to
+        # an unbounded amount of memory either.
+        total_bytes = len(header_line)
+        if header.startswith("N "):
+            fields = header.split()
+            if len(fields) < 2:
+                print(f"malformed node-list header: {header!r}")
+                return 1
+            try:
+                count = int(fields[1])
+            except ValueError:
+                print(f"malformed node-list header: {header!r}")
+                return 1
+            if count < 0 or count > _MAX_NODE_COUNT:
+                print(f"node count {count} out of bounds (max {_MAX_NODE_COUNT})")
+                return 1
+            for _ in range(count):
+                entry_header_line = await asyncio.wait_for(reader.readline(), timeout=_IO_TIMEOUT)
+                total_bytes += len(entry_header_line)
+                lengths = entry_header_line.decode().split()
+                if len(lengths) != 2:
+                    print(f"malformed entry header: {lengths!r}")
+                    return 1
+                try:
+                    name_len, addr_len = int(lengths[0]), int(lengths[1])
+                except ValueError:
+                    print(f"malformed entry header: {lengths!r}")
+                    return 1
+                if (
+                    name_len < 0
+                    or addr_len < 0
+                    or name_len > _MAX_NODE_FIELD_LENGTH
+                    or addr_len > _MAX_NODE_FIELD_LENGTH
+                ):
+                    print(f"entry lengths out of bounds: name={name_len} addr={addr_len}")
+                    return 1
+                total_bytes += name_len + addr_len + 1
+                if total_bytes > _MAX_NODE_LIST_RESPONSE_LENGTH:
+                    print("node-list response exceeds maximum size")
+                    return 1
+                body = await asyncio.wait_for(
+                    reader.readexactly(name_len + addr_len + 1), timeout=_IO_TIMEOUT
+                )
+                print(f"  {body[:name_len].decode()} @ {body[name_len:name_len + addr_len].decode()}")
+        return 0
+    finally:
+        writer.close()
+
+
+# argv length required for each command, including the command name
+# itself at sys.argv[1] (i.e. len(sys.argv) must equal this). Checked up
+# front so a missing argument prints a usage message and exits non-zero
+# instead of crashing with an IndexError deep inside a command.
+_ARGC = {
+    "write": 4,
+    "read": 4,
+    "readall": 4,
+    "preload": 3,
+    "verify": 3,
+    "churn": 4,
+    "nodes": 2,
+}
 
 
 def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        return 2
     cmd = sys.argv[1]
+    expected_argc = _ARGC.get(cmd)
+    if expected_argc is None:
+        print(f"unknown command {cmd!r}", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        return 2
+    if len(sys.argv) != expected_argc:
+        print(f"nanotest.py {cmd}: wrong number of arguments", file=sys.stderr)
+        print(__doc__, file=sys.stderr)
+        return 2
     if cmd == "write":
         return asyncio.run(cmd_write(sys.argv[2], int(sys.argv[3])))
     if cmd == "read":
@@ -177,10 +264,7 @@ def main() -> int:
         return asyncio.run(cmd_verify(int(sys.argv[2])))
     if cmd == "churn":
         return asyncio.run(cmd_churn(float(sys.argv[2]), sys.argv[3]))
-    if cmd == "nodes":
-        return asyncio.run(cmd_nodes())
-    print(f"unknown command {cmd}")
-    return 2
+    return asyncio.run(cmd_nodes())
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::task::JoinError;
+use tokio::time::timeout;
 
 /// Mirrors sdk/rust/src/connection.rs's MAX_VALUE_LENGTH — a declared
 /// per-value length beyond this is corrupt or hostile, never a
@@ -30,6 +32,29 @@ const MAX_MULTI_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 /// this benchmark builds must fit under this or the server will reject
 /// it, which we'd rather report clearly than hit as a write/read panic.
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
+
+/// Bounds every connect/read/write this benchmark makes over its raw
+/// socket. Without this, a peer that accepts a connection and then goes
+/// silent (crashed-but-open, deadlocked, or a bug on the other end) would
+/// hang a worker task forever instead of failing fast with a clear error.
+/// Mirrors the `IO_TIMEOUT` pattern in `src/bin/verify-staged-join.rs`
+/// (issue #329).
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs a single network operation (`connect`/`read_line`/`read_exact`/
+/// `write_all`) bounded by `IO_TIMEOUT`, panicking with a clear message on
+/// either a timeout or an I/O error rather than hanging or propagating a
+/// bare `io::Error` up through `.expect()`. `what` names the operation for
+/// the panic message.
+async fn timed<F, T>(future: F, what: &str) -> T
+where
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    match timeout(IO_TIMEOUT, future).await {
+        Ok(result) => result.unwrap_or_else(|e| panic!("{what}: {e}")),
+        Err(_) => panic!("{what} timed out after {IO_TIMEOUT:?}"),
+    }
+}
 
 fn usage() -> ! {
     eprintln!(
@@ -71,16 +96,12 @@ async fn authenticate(stream: &mut TcpStream) {
     };
     let mut frame = format!("A {}\n", secret.len()).into_bytes();
     frame.extend_from_slice(secret.as_bytes());
-    stream.write_all(&frame).await.expect("write auth frame");
+    timed(stream.write_all(&frame), "write auth frame").await;
 
     let mut reader = BufReader::new(&mut *stream);
     let mut line = String::new();
-    reader.read_line(&mut line).await.expect("read auth reply");
-    assert!(
-        line.starts_with("On"),
-        "auth rejected: {}",
-        line.trim_end()
-    );
+    timed(reader.read_line(&mut line), "read auth reply").await;
+    assert!(line.starts_with("On"), "auth rejected: {}", line.trim_end());
 }
 
 fn encode_get(key: &[u8]) -> Vec<u8> {
@@ -126,7 +147,7 @@ fn encode_multi_set(keys: &[Vec<u8>], value: &[u8]) -> Vec<u8> {
 /// Reads one `S` reply (bare `S\n`) and asserts it succeeded.
 async fn read_set_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
     let mut line = String::new();
-    reader.read_line(&mut line).await.expect("read reply header");
+    timed(reader.read_line(&mut line), "read reply header").await;
     assert_eq!(line.trim_end(), "S", "unexpected reply to S: {line:?}");
 }
 
@@ -135,7 +156,7 @@ async fn read_set_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) {
 /// the batch against what was requested.
 async fn read_multi_ack_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> (usize, usize) {
     let mut line = String::new();
-    reader.read_line(&mut line).await.expect("read reply header");
+    timed(reader.read_line(&mut line), "read reply header").await;
     let line = line.trim_end();
     let mut fields = line.split(' ');
     assert_eq!(fields.next(), Some("O"), "unexpected reply to o: {line:?}");
@@ -158,7 +179,7 @@ async fn read_multi_ack_reply<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> (us
 /// byte count, not the payload itself.
 async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut R) -> bool {
     let mut line = String::new();
-    reader.read_line(&mut line).await.expect("read reply header");
+    timed(reader.read_line(&mut line), "read reply header").await;
     let line = line.trim_end();
 
     if let Some(length) = line.strip_prefix("V ") {
@@ -168,7 +189,7 @@ async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut 
             "V length {length} exceeds sanity cap {MAX_VALUE_LEN}"
         );
         let mut value = vec![0u8; length];
-        reader.read_exact(&mut value).await.expect("read value");
+        timed(reader.read_exact(&mut value), "read value").await;
         true
     } else if line == "N" {
         false
@@ -180,9 +201,11 @@ async fn read_get_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut 
 /// Reads one `m` reply (`M <n> <r-1>...<r-n>\n<hit values>`), discards
 /// every value, and returns how many of the `n` entries were hits — used
 /// only to sanity-check the batch against what was requested.
-async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mut R) -> (usize, usize) {
+async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> (usize, usize) {
     let mut line = String::new();
-    reader.read_line(&mut line).await.expect("read reply header");
+    timed(reader.read_line(&mut line), "read reply header").await;
     let line = line.trim_end();
     let mut fields = line.split(' ');
     assert_eq!(fields.next(), Some("M"), "unexpected reply to m: {line:?}");
@@ -214,7 +237,7 @@ async fn read_multi_reply<R: AsyncBufReadExt + AsyncReadExt + Unpin>(reader: &mu
     );
 
     let mut body = vec![0u8; total_bytes];
-    reader.read_exact(&mut body).await.expect("read M values");
+    timed(reader.read_exact(&mut body), "read M values").await;
     (count, hits)
 }
 
@@ -234,15 +257,15 @@ async fn preload(args: &[String]) {
     let value_size: usize = value_size.parse().expect("bad value-size");
     let value = vec![b'x'; value_size];
 
-    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut stream = timed(TcpStream::connect(addr), "connect").await;
     authenticate(&mut stream).await;
     let mut reader = BufReader::new(stream);
 
     for index in 0..keyspace {
         let frame = encode_set(&key_bytes(index), &value);
-        reader.get_mut().write_all(&frame).await.expect("write set");
+        timed(reader.get_mut().write_all(&frame), "write set").await;
         let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read set reply");
+        timed(reader.read_line(&mut line), "read set reply").await;
         assert_eq!(line.trim_end(), "S", "set failed for key {index}");
     }
 
@@ -306,7 +329,7 @@ async fn run(args: &[String]) {
         let latencies_ms = Arc::clone(&latencies_ms);
 
         workers.push(tokio::spawn(async move {
-            let mut stream = TcpStream::connect(&addr).await.expect("connect");
+            let mut stream = timed(TcpStream::connect(&addr), "connect").await;
             authenticate(&mut stream).await;
             let mut reader = BufReader::new(stream);
             let mut rng = Lcg::new(0x9E37_79B9_7F4A_7C15 ^ (worker as u64 + 1));
@@ -322,7 +345,7 @@ async fn run(args: &[String]) {
                 match (set, bulk) {
                     (false, true) => {
                         let frame = encode_multi_get(&keys);
-                        reader.get_mut().write_all(&frame).await.expect("write m");
+                        timed(reader.get_mut().write_all(&frame), "write m").await;
                         let (count, hits) = read_multi_reply(&mut reader).await;
                         assert_eq!(count, keys.len(), "M roster size mismatch");
                         local_hits += hits as u64;
@@ -332,7 +355,7 @@ async fn run(args: &[String]) {
                         for key in &keys {
                             frame.extend_from_slice(&encode_get(key));
                         }
-                        reader.get_mut().write_all(&frame).await.expect("write g");
+                        timed(reader.get_mut().write_all(&frame), "write g").await;
                         for _ in &keys {
                             if read_get_reply(&mut reader).await {
                                 local_hits += 1;
@@ -341,7 +364,7 @@ async fn run(args: &[String]) {
                     }
                     (true, true) => {
                         let frame = encode_multi_set(&keys, &value);
-                        reader.get_mut().write_all(&frame).await.expect("write o");
+                        timed(reader.get_mut().write_all(&frame), "write o").await;
                         let (count, stored) = read_multi_ack_reply(&mut reader).await;
                         assert_eq!(count, keys.len(), "O roster size mismatch");
                         local_hits += stored as u64;
@@ -351,7 +374,7 @@ async fn run(args: &[String]) {
                         for key in &keys {
                             frame.extend_from_slice(&encode_set(key, &value));
                         }
-                        reader.get_mut().write_all(&frame).await.expect("write s");
+                        timed(reader.get_mut().write_all(&frame), "write s").await;
                         for _ in &keys {
                             read_set_reply(&mut reader).await;
                         }
@@ -369,8 +392,22 @@ async fn run(args: &[String]) {
         }));
     }
 
-    for worker in workers {
-        worker.await.expect("worker task panicked");
+    // A panicking worker (e.g. an `.expect()` on an unexpected reply) used
+    // to abort the whole run via `.expect()` here, discarding every other
+    // worker's results along with it. Report it and keep aggregating what
+    // the other workers produced instead.
+    let mut failed_workers: Vec<(usize, JoinError)> = Vec::new();
+    for (index, worker) in workers.into_iter().enumerate() {
+        if let Err(error) = worker.await {
+            eprintln!("bulkbench: worker {index} failed: {error}");
+            failed_workers.push((index, error));
+        }
+    }
+    if !failed_workers.is_empty() {
+        eprintln!(
+            "bulkbench: {}/{concurrency} worker(s) failed; aggregating the remaining results",
+            failed_workers.len()
+        );
     }
 
     let mut latencies_ms = Arc::try_unwrap(latencies_ms)
