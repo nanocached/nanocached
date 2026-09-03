@@ -1,6 +1,8 @@
 import {
   NanocachedClient,
   PartialWrongNodeError,
+  PartialConnectionLostError,
+  WrongNodeError,
   MAX_BATCH_KEYS,
   type NanocachedAddress,
   type NanocachedNamespace,
@@ -200,8 +202,14 @@ export class NanocachedStore implements Store {
     });
   }
 
-  /** `getMany`, but resolving a ring reconfiguration mid-batch itself
-   * (issue #416) instead of discarding an otherwise-successful batch.
+  /** `getMany`, but resolving two kinds of mid-batch partial failure
+   * itself instead of discarding an otherwise-successful batch: a ring
+   * reconfiguration (issue #416) and, as of issue #439, a connection
+   * loss on a later chunk of a >MAX_BATCH_KEYS batch (issue #438/#424).
+   * The two are unrelated exception hierarchies (`PartialWrongNodeError`
+   * extends `WrongNodeError`; `PartialConnectionLostError` extends
+   * `ConnectionLostError`) with deliberately different retry-failure
+   * semantics — see each branch below.
    *
    * `ns.getMany` already does one bounded refresh-and-retry internally
    * per key before giving up on it (the SDK's own `multiGetPass`); a
@@ -221,11 +229,28 @@ export class NanocachedStore implements Store {
    * retry and merges whatever it got rather than looping or throwing —
    * any keys still unresolved come back as ordinary misses (`undefined`
    * from the caller's perspective), same as if they'd never been in the
-   * cache. */
+   * cache.
+   *
+   * A connection loss is different: it's a genuine failure, not a
+   * routing hiccup, so silently downgrading a still-unresolved key to a
+   * miss after a failed retry would misreport a connectivity problem as
+   * "not cached". `PartialConnectionLostError` (thrown only once at
+   * least one earlier chunk of a chunked batch already succeeded —
+   * see its own doc comment in the SDK) carries `.partialValues` for
+   * what did land; this retries exactly the remaining keys once, and —
+   * unlike the WrongNode branch — lets a second failure from that retry
+   * propagate unchanged rather than swallowing it into a false miss. */
   private async mgetResolved(keys: string[]): Promise<Map<string, string>> {
     try {
       return await this.ns.getMany(keys);
     } catch (error) {
+      if (error instanceof PartialConnectionLostError) {
+        const succeeded = error.partialValues as Map<string, string>;
+        const stillNeeded = keys.filter((key) => !succeeded.has(key));
+        if (stillNeeded.length === 0) return succeeded;
+        const retried = await this.ns.getMany(stillNeeded); // let a retry failure propagate as-is
+        return new Map([...succeeded, ...retried]);
+      }
       if (!(error instanceof PartialWrongNodeError)) throw error;
       const succeeded = error.partialValues as Map<string, string>;
       const stillNeeded = keys.filter((key) => !succeeded.has(key));
@@ -270,7 +295,53 @@ export class NanocachedStore implements Store {
       values[key] = serialized;
     }
     if (Object.keys(values).length === 0) return;
-    await this.ns.setMany(values, wireTtl);
+    await this.msetResolved(values, wireTtl);
+  }
+
+  /** `setMany`, but resolving two kinds of mid-batch partial failure
+   * itself instead of failing an otherwise-successful batch outright
+   * (issue #439, mirroring `mgetResolved`'s own reasoning) — a
+   * connection loss on a later chunk of a >MAX_BATCH_KEYS batch
+   * (issue #438/#424), and a ring reconfiguration (issue #416).
+   *
+   * `PartialConnectionLostError` (thrown only once at least one earlier
+   * chunk already stored its keys — see the SDK's own doc comment)
+   * carries `.partialValues` as the array of keys already confirmed
+   * stored (the inverse of the get side's "what resolved" convention,
+   * since a write has no payload to hand back beyond which keys landed).
+   * This resends only the remainder once; a `set` is idempotent, so
+   * there's no harm in re-storing a key that (unbeknownst to this retry)
+   * had actually already landed. A second failure from that retry
+   * propagates unchanged rather than being silently swallowed — a
+   * connection loss is a genuine failure, not something to paper over.
+   *
+   * `setMany`'s wrong-node case has no partial payload to retry a
+   * remainder from (see `PartialWrongNodeError`'s own doc comment: "no
+   * partial payload worth attaching" for the write side), so — mirroring
+   * `adapters/jcache`'s `setManyBytesResolvingWrongNode` — this resends
+   * the WHOLE batch once instead; safe because every per-key write is
+   * idempotent, so re-storing an already-landed key is just a harmless
+   * duplicate of the same value/TTL. */
+  private async msetResolved(values: Record<string, string>, ttlSeconds: number): Promise<void> {
+    try {
+      await this.ns.setMany(values, ttlSeconds);
+    } catch (error) {
+      if (error instanceof PartialConnectionLostError) {
+        const succeeded = new Set(error.partialValues as string[]);
+        const remaining: Record<string, string> = {};
+        for (const key of Object.keys(values)) {
+          if (!succeeded.has(key)) remaining[key] = values[key];
+        }
+        if (Object.keys(remaining).length === 0) return;
+        await this.ns.setMany(remaining, ttlSeconds); // let a retry failure propagate as-is
+        return;
+      }
+      if (error instanceof WrongNodeError) {
+        await this.ns.setMany(values, ttlSeconds);
+        return;
+      }
+      throw error;
+    }
   }
 
   /** Client-side loop over `del`, concurrently — chunked at

@@ -47,6 +47,15 @@ export interface MockNode {
    * twice fails on the next *two* such requests (a retry fails too) —
    * lets a test choose whether a retry should succeed or also give up. */
   failNextMultiGetFor(keys: Iterable<string>): void;
+  /** Issue #439: after `okCount` more m requests are answered normally,
+   * the next `dropCount` m requests each destroy the connection instead
+   * of writing any reply — simulating a connection dying mid-batch (as
+   * opposed to failNextMultiGetFor's stale-routing-table simulation).
+   * Every m request once both budgets are exhausted is answered normally
+   * again. */
+  armMultiGetDrop(okCount: number, dropCount: number): void;
+  /** As armMultiGetDrop, for `o` (multi-set). */
+  armMultiSetDrop(okCount: number, dropCount: number): void;
   /** Delays every `d` (delete) response by `ms` before writing it, so
    * `maxConcurrentDeletes()` can observe how many `d` requests the
    * client had outstanding at once (issue #416's mdel chunking test). */
@@ -97,6 +106,21 @@ export async function startMockNode(): Promise<MockNode> {
   let deleteDelayMs = 0;
   let activeDeletes = 0;
   let peakConcurrentDeletes = 0;
+  // Issue #439: connection-drop simulation for `m`/`o`, independent of
+  // the wrongNodeCounts (stale-routing) simulation above.
+  const multiGetDrop = { ok: 0, drop: 0 };
+  const multiSetDrop = { ok: 0, drop: 0 };
+  function takeDrop(state: { ok: number; drop: number }): boolean {
+    if (state.ok > 0) {
+      state.ok--;
+      return false;
+    }
+    if (state.drop > 0) {
+      state.drop--;
+      return true;
+    }
+    return false;
+  }
 
   const server = createServer((socket) => {
     sockets.add(socket);
@@ -245,6 +269,14 @@ export async function startMockNode(): Promise<MockNode> {
             }
             buffer = buffer.subarray(offset);
 
+            // Issue #439: simulate the connection dying mid-batch — once
+            // this full request has been parsed off the buffer, but before
+            // any reply is written.
+            if (takeDrop(multiGetDrop)) {
+              socket.destroy();
+              return;
+            }
+
             const store = storeFor(namespace);
             const results: string[] = [];
             const hits: Buffer[] = [];
@@ -288,15 +320,26 @@ export async function startMockNode(): Promise<MockNode> {
             if (buffer.length < bodyStart + namespaceLength + totalKeyValueLength) return;
             const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
             let offset = bodyStart + namespaceLength;
-            const store = storeFor(namespace);
+            const entries: Array<[string, Buffer]> = [];
             for (let i = 0; i < n; i++) {
               const key = buffer.subarray(offset, offset + keyLengths[i]).toString("utf8");
               offset += keyLengths[i];
               const value = Buffer.from(buffer.subarray(offset, offset + valueLengths[i]));
               offset += valueLengths[i];
-              store.set(key, value);
+              entries.push([key, value]);
             }
             buffer = buffer.subarray(offset);
+
+            // Issue #439: simulate the connection dying mid-batch — once
+            // this full request has been parsed off the buffer, but before
+            // any store mutation or reply.
+            if (takeDrop(multiSetDrop)) {
+              socket.destroy();
+              return;
+            }
+
+            const store = storeFor(namespace);
+            for (const [key, value] of entries) store.set(key, value);
             lastSetTtl = ttl;
 
             socket.write(`O ${n} ${new Array(n).fill("S").join(" ")}\n`);
@@ -322,6 +365,14 @@ export async function startMockNode(): Promise<MockNode> {
     lastCommand: () => lastCommand,
     failNextMultiGetFor: (keys) => {
       for (const key of keys) wrongNodeCounts.set(key, (wrongNodeCounts.get(key) ?? 0) + 1);
+    },
+    armMultiGetDrop: (okCount, dropCount) => {
+      multiGetDrop.ok = okCount;
+      multiGetDrop.drop = dropCount;
+    },
+    armMultiSetDrop: (okCount, dropCount) => {
+      multiSetDrop.ok = okCount;
+      multiSetDrop.drop = dropCount;
     },
     delayDeletes: (ms) => {
       deleteDelayMs = ms;
