@@ -127,11 +127,16 @@ pub enum Response {
     /// or one entry, each with its remaining TTL. Never encoded for a wire
     /// client, see `encode`.
     Entries(Vec<(Key, Bytes, Option<Duration>)>),
-    /// Internal-only (staged node join), in answer to `Command::ListEntries` — a
-    /// keys-only snapshot (see `Cache::keys`'s doc comment for why this
-    /// carries no values or TTLs). Never encoded for a wire client, see
-    /// `encode`.
-    Keys(Vec<Key>),
+    /// Internal-only (staged node join), in answer to `Command::ListEntries` — one
+    /// page of a keys-only listing (see `Cache::keys`'s doc comment for
+    /// why this carries no values or TTLs). Never encoded for a wire
+    /// client, see `encode`.
+    ///
+    /// Tenth-pass audit (2026-09-02): the second field is the cursor for
+    /// the next page (`Command::ListEntries::cursor`) — `Some` if there's
+    /// more, `None` if this was the last page. See `Cache::keys_page`'s
+    /// doc comment.
+    Keys(Vec<Key>, Option<u64>),
     /// Internal-only (staged node join), in answer to `Command::MarkMigrated`.
     Marked,
     /// Internal-only (staged node join), in answer to `Command::UnmarkMigrated`.
@@ -245,7 +250,7 @@ impl Response {
             Self::MultiAck(entries) => encode_multi_ack(entries, None),
 
             Self::Entries(_)
-            | Self::Keys(_)
+            | Self::Keys(_, _)
             | Self::Marked
             | Self::Unmarked
             | Self::Swept(_)
