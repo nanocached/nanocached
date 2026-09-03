@@ -138,8 +138,8 @@
 //!                             node's (public, `L`-listed) name is not
 //!                             enough to redirect its traffic.
 //!
-//!   C <name-length> <joining-length> <token-length>\n<name><joining><token>
-//!                             Sent by an already-`Joined` node to report
+//!   C <name-length> <joining-length> <token-length> [<generation>]\n
+//!   <name><joining><token>   Sent by an already-`Joined` node to report
 //!                             it has finished handing its share of the
 //!                             keyspace off to `joining` (the joining
 //!                             node's name). Naming the join it is for
@@ -149,6 +149,27 @@
 //!                             `joining` matches the in-progress join and
 //!                             `token` matches the reporting node's
 //!                             registered one (issue #34). Response: `A\n`.
+//!
+//!                             `generation` (issue #421(c), tenth-pass
+//!                             audit 2026-09-02) is a trailing plain (not
+//!                             length-prefixed) field, the join
+//!                             generation the reporting node's own `M`
+//!                             carried, echoed back so a report for a
+//!                             since-abandoned-and-superseded join that
+//!                             reused the same `joining` name isn't
+//!                             wrongly credited to the fresh one — see
+//!                             `handle_complete`. Omitted by a node whose
+//!                             `M` itself carried none (this discovery
+//!                             process, or a discovery HA peer it was
+//!                             registered with at the time, predates this
+//!                             fix) — accepted as a legacy report, name+
+//!                             token only, same as before this fix. The
+//!                             generation protection is only complete
+//!                             once every discovery replica AND every
+//!                             node in the cluster has upgraded past this
+//!                             fix; during a rolling upgrade a legacy `C`
+//!                             is still possible and is not rejected for
+//!                             lacking `generation`.
 //!
 //!   A <secret-length>\n<secret>   Authenticate. Response: `Od\n` on success,
 //!                             `Ed\n` (then the connection closes) if a
@@ -563,9 +584,13 @@ struct NodeInfo {
     /// first-use is the only place trust can start) and required to
     /// match on everything after, so knowing a node's public name —
     /// `L` lists them — is not enough to re-point its address or spoof
-    /// its liveness/handoff reports. Never sent back out: `L` and `M`
-    /// deliberately carry no tokens, or any node/client could
-    /// impersonate any other. Compared via `constant_time_eq`.
+    /// its liveness/handoff reports. `L` deliberately carries no tokens
+    /// at all. `M` is a narrower exception (issue #295/build_migrate_message):
+    /// it carries the RECIPIENT's own token (which that node already
+    /// holds) and, as a deliberate, scoped grant, the JOINING node's own
+    /// token — never any other node's. Otherwise never sent back out, or
+    /// any node/client could impersonate any other. Compared via
+    /// `constant_time_eq`.
     token: String,
     /// When this entry was created. Only meaningful (like `last_heartbeat`
     /// above, but for the opposite states) while `state` is `Waiting` —
@@ -1357,10 +1382,32 @@ enum DiscoveryCommand {
     /// joining node's name — so a stale report for an abandoned join can
     /// never be credited to the current one (issue #5). `token` must
     /// match the reporting node's registered one (issue #34).
+    ///
+    /// `generation` (tenth-pass audit, 2026-09-02, issue #421(c)/#34) is
+    /// the sending node's own copy of the join generation its `M` (this
+    /// report is for) carried — see `Command::Migrate::generation` on the
+    /// node side. Closes the gap issue #5's `joining_name` check alone
+    /// leaves: a joining node whose join is abandoned (see
+    /// `abandon_current_join`) can immediately re-register under that
+    /// very same name and have `try_begin_next_join` start a FRESH
+    /// `PendingJoin` (a new generation) against the same ready roster —
+    /// at which point a still-in-flight `C` for the abandoned incarnation
+    /// names the right `joining_name` and presents a valid token (issue
+    /// #5/#34 both still hold) but is really reporting a handoff to a
+    /// process that, if the joiner crashed and restarted under the same
+    /// name, no longer exists. `handle_complete` rejects it by comparing
+    /// this against the in-progress `PendingJoin::generation`.
+    ///
+    /// `None` when the reporting node's own `M` carried no generation —
+    /// an old discovery server (predating this fix) sent it, so the node
+    /// has nothing to echo and falls back to the legacy three-field `C`.
+    /// See `handle_complete`'s doc comment for what protection a legacy
+    /// report still gets.
     Complete {
         name: String,
         joining_name: String,
         token: String,
+        generation: Option<u64>,
     },
     /// Discovery HA: an already-promoted node (re-)declaring membership, with
     /// the same name/port/token shape as `Join` — upserted straight to
@@ -1563,6 +1610,12 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let name_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let joining_length = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            // Tenth-pass audit (2026-09-02), issue #421(c): a trailing,
+            // optional generation field — same backward-compat idiom as
+            // `M`'s own trailing generation (see `DiscoveryCommand::
+            // Complete::generation`'s doc comment). Absent for a `C` from
+            // a node whose own `M` never carried one.
+            let generation_field = parts.next();
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -1571,6 +1624,10 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let name_length = parse_length(name_length)?;
             let joining_length = parse_length(joining_length)?;
             let token_length = parse_length(token_length)?;
+            let generation = generation_field
+                .map(parse_length)
+                .transpose()?
+                .map(|generation| generation as u64);
             let (name, joining_name, token) = parse_three_string_fields(
                 input,
                 header_end,
@@ -1583,6 +1640,7 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
                 name,
                 joining_name,
                 token,
+                generation,
             })
         }
 
@@ -1959,14 +2017,14 @@ async fn try_begin_next_join(
     // again after each bootstrap promotion; the next candidate then
     // finds a `Joined` member and starts a real staged join, after which
     // `C`/abandon chain the rest as usual.
-    let (name, joining_addr, joined, ready_tokens, generation) = loop {
+    let (name, joining_addr, joining_token, joined, ready_tokens, generation) = loop {
         let mut join_guard = lock_current_join(current_join);
 
         if join_guard.is_some() {
             return;
         }
 
-        let (name, joining_addr, joined, ready_tokens) = {
+        let (name, joining_addr, joining_token, joined, ready_tokens) = {
             let mut reg = lock(registry);
 
             // Strictly in arrival order: `waiting_timeout_for`'s bound
@@ -1982,9 +2040,9 @@ async fn try_begin_next_join(
                         .cmp(&b.waiting_since)
                         .then_with(|| name_a.cmp(name_b))
                 })
-                .map(|(name, info)| (name.clone(), info.address.clone()));
+                .map(|(name, info)| (name.clone(), info.address.clone(), info.token.clone()));
 
-            let Some((name, joining_addr)) = next_waiting else {
+            let Some((name, joining_addr, joining_token)) = next_waiting else {
                 return;
             };
 
@@ -2016,7 +2074,7 @@ async fn try_begin_next_join(
                 None => return,
             }
 
-            (name, joining_addr, joined, ready_tokens)
+            (name, joining_addr, joining_token, joined, ready_tokens)
         };
 
         if joined.is_empty() {
@@ -2042,7 +2100,14 @@ async fn try_begin_next_join(
             generation,
         });
 
-        break (name, joining_addr, joined, ready_tokens, generation);
+        break (
+            name,
+            joining_addr,
+            joining_token,
+            joined,
+            ready_tokens,
+            generation,
+        );
     };
 
     println!(
@@ -2070,6 +2135,7 @@ async fn try_begin_next_join(
         let tls_connector = tls_connector.clone();
         let joining_name = name.clone();
         let joining_addr = joining_addr.clone();
+        let joining_token = joining_token.clone();
         let joined_roster = Arc::clone(&joined_roster);
         // Every `Joined` node in `joined` was captured with its token in the
         // same lock scope, so this lookup is always present.
@@ -2089,8 +2155,10 @@ async fn try_begin_next_join(
                 &tls_connector,
                 &joining_name,
                 &joining_addr,
+                &joining_token,
                 &joined_roster,
                 replication,
+                generation,
                 OUTBOUND_IO_TIMEOUT,
             )
             .await;
@@ -2137,6 +2205,18 @@ async fn try_begin_next_join(
 /// the caller when its own incarnation started, from
 /// `PendingJoin::generation`/`next_join_generation`) is checked too, not
 /// just the name.
+///
+/// Correction (tenth-pass audit, 2026-09-02, issue #34/#421(c)): the PR
+/// that introduced this function's own `generation` check (and the
+/// commit that merged it) described the whole of issue #421 as closed by
+/// this alone. That was wrong: `handle_complete` — the `C` handler that
+/// actually promotes the joining node, not just this internal
+/// send-result bookkeeping — had (and until this fix, still has no)
+/// equivalent guard, checking only `joining_name` and the reporting
+/// node's token (issue #34), never `PendingJoin::generation`. That gap
+/// was independently re-discovered and is closed by `handle_complete`'s
+/// own generation check, added alongside this comment's correction — see
+/// its doc comment.
 fn credit_migrate_send_result(
     join_guard: &mut Option<PendingJoin>,
     joining_name: &str,
@@ -2167,8 +2247,10 @@ async fn send_migrate_with_retry(
     tls_connector: &Option<TlsConnector>,
     joining_name: &str,
     joining_addr: &str,
+    joining_token: &str,
     joined: &[(String, String)],
     replication: usize,
+    generation: u64,
     io_timeout: Duration,
 ) -> io::Result<usize> {
     let mut last_error = None;
@@ -2181,8 +2263,10 @@ async fn send_migrate_with_retry(
             tls_connector,
             joining_name,
             joining_addr,
+            joining_token,
             joined,
             replication,
+            generation,
             io_timeout,
         )
         .await
@@ -2202,36 +2286,69 @@ async fn send_migrate_with_retry(
 }
 
 /// Builds the exact bytes `send_migrate` puts on the wire for `M`:
-/// `M {joining_name_len} {joining_addr_len} {joined.len()} {replication}\n`
-/// followed by `joining_name` + `joining_addr`, then one
-/// `{name_len} {addr_len}\n{name}{addr}` per entry in `joined`. Factored
-/// out of `send_migrate` so `start_join`'s `NODE_MAX_REQUEST_SIZE` check
-/// can compute this message's real length (`.len()` on the result) using
-/// the actual wire format, rather than a hand-maintained estimate that
-/// could silently drift out of sync with it.
+/// `M {joining_name_len} {joining_addr_len} {joining_token_len} {joined.len()}
+/// {replication} {token_len} {generation}\n` followed by
+/// `token` + `joining_name` + `joining_addr` + `joining_token`, then one
+/// `{name_len} {addr_len}\n{name}{addr}` per entry in `joined` — exactly
+/// the header/body layout `src/command.rs`'s `MigrateHeader`/`parse_migrate`
+/// decode on the receiving node. Factored out of `send_migrate` so
+/// `start_join`'s `NODE_MAX_REQUEST_SIZE` check can compute this message's
+/// real length (`.len()` on the result) using the actual wire format,
+/// rather than a hand-maintained estimate that could silently drift out
+/// of sync with it.
+///
+/// Issue #441: until this fix, this builder predated issue #295's
+/// `joining_token` field and never emitted it (nor the header slot for
+/// it) at all — every `M` this process ever sent a real
+/// `nanocached-node` was rejected with `ParseError::InvalidLength` and
+/// the join stalled and was eventually reaped, so no staged join could
+/// ever complete past the bootstrap (handoff-free) node. Confirmed live
+/// against a real two-node cluster while investigating issue #421(c)
+/// (this function is exactly where that fix's own `generation` field
+/// also has to go). Fixed in the same change since both touch this exact
+/// wire frame and neither can be meaningfully tested without the other.
 fn build_migrate_message(
     token: &str,
     joining_name: &str,
     joining_addr: &str,
+    joining_token: &str,
     joined: &[(String, String)],
     replication: usize,
+    // Tenth-pass audit (2026-09-02), issue #421(c): this join's
+    // `PendingJoin::generation`, echoed back unchanged on the
+    // recipient's own `C` report — see `Command::Migrate::generation`'s
+    // doc comment and `handle_complete`'s generation check. Always sent
+    // by a discovery process new enough to run this code; there is no
+    // "omit it" path on the send side (unlike the receive side's
+    // backward-compat handling — see `Command::Migrate::generation`'s
+    // doc comment for the rolling-upgrade rationale, which is entirely
+    // about an old *node* or an old *discovery peer*'s M, never about
+    // this process withholding it).
+    generation: u64,
 ) -> Vec<u8> {
     // `token` is the *recipient* ready node's own membership token, echoed
     // so the node can prove this `M` came from a discovery server it
     // registered with (issue #34) — see `Command::Migrate::token` on the
-    // node side. Body layout: `<token><joining_name><joining_addr><entries>`.
+    // node side. `joining_token` (issue #295) is the *joining* node's own
+    // token — see `Command::Migrate::joining_token`'s doc comment for why
+    // handing it to this one recipient is a deliberate, narrow exception
+    // to per-node membership tokens never being sent back out. Body
+    // layout: `<token><joining_name><joining_addr><joining_token><entries>`.
     let mut message = format!(
-        "M {} {} {} {} {}\n",
+        "M {} {} {} {} {} {} {}\n",
         joining_name.len(),
         joining_addr.len(),
+        joining_token.len(),
         joined.len(),
         replication,
-        token.len()
+        token.len(),
+        generation,
     )
     .into_bytes();
     message.extend_from_slice(token.as_bytes());
     message.extend_from_slice(joining_name.as_bytes());
     message.extend_from_slice(joining_addr.as_bytes());
+    message.extend_from_slice(joining_token.as_bytes());
 
     for (name, addr) in joined {
         message.extend_from_slice(format!("{} {}\n", name.len(), addr.len()).as_bytes());
@@ -2258,8 +2375,10 @@ async fn send_migrate(
     tls_connector: &Option<TlsConnector>,
     joining_name: &str,
     joining_addr: &str,
+    joining_token: &str,
     joined: &[(String, String)],
     replication: usize,
+    generation: u64,
     io_timeout: Duration,
 ) -> io::Result<usize> {
     let mut stream = connect_client_stream(address, tls_connector.as_ref()).await?;
@@ -2280,7 +2399,15 @@ async fn send_migrate(
         }
     }
 
-    let message = build_migrate_message(token, joining_name, joining_addr, joined, replication);
+    let message = build_migrate_message(
+        token,
+        joining_name,
+        joining_addr,
+        joining_token,
+        joined,
+        replication,
+        generation,
+    );
 
     write_all_timed(&mut stream, &message, io_timeout).await?;
 
@@ -2607,9 +2734,26 @@ async fn start_join(
             // The `M` recipients' tokens are all per-process UUIDs of the
             // same length as this joining node's own `token`, so it
             // stands in here for an accurate size estimate without
-            // looking each recipient up.
-            let message_len =
-                build_migrate_message(&token, name, &address, &joined_now, replication).len();
+            // looking each recipient up. It also stands in for the real
+            // `joining_token` field here exactly, not merely as a
+            // same-length proxy: this join's actual `joining_token`,
+            // once it starts, IS this very node's own registered token
+            // (issue #295/#441). `generation` isn't allocated until the
+            // join actually starts (`next_join_generation`), so
+            // `u64::MAX` — the longest any `u64` can ever print — is
+            // used as a conservative upper bound on its digit width,
+            // preserving this check's "can under- but never over-admit"
+            // guarantee (see the comment above).
+            let message_len = build_migrate_message(
+                &token,
+                name,
+                &address,
+                &token,
+                &joined_now,
+                replication,
+                u64::MAX,
+            )
+            .len();
             if message_len > NODE_MAX_REQUEST_SIZE {
                 return Err(JoinRejection::MigrateMessageTooLarge { message_len });
             }
@@ -2675,6 +2819,37 @@ async fn start_join(
 /// Records a ready node's completion report for the in-progress join. If
 /// this was the last of `expected` to report in, promotes the joining
 /// node and lets the next `Waiting` node (if any) start.
+///
+/// Tenth-pass audit (2026-09-02), issue #421(c)/#34: `generation`, if the
+/// reporter's own `M` carried one, must match the in-progress
+/// `PendingJoin::generation` — checked in addition to (not instead of)
+/// the existing `joining_name`/token checks below. Closes a gap those two
+/// alone leave open: `abandon_current_join` can strand this exact
+/// `joining_name` and, moments later, the SAME name re-registers (the
+/// stranded node's control connection dropped, or it crashed and
+/// restarted) and `try_begin_next_join` starts a brand-new `PendingJoin`
+/// — a new generation — against the very same ready roster `{A, B}` this
+/// abandoned join also used. A ready member's `C` for the OLD generation,
+/// still in flight when this happens, then names the right
+/// `joining_name` and presents a valid, still-registered token (issue #5
+/// and #34 both still hold) — so without this check it gets credited to
+/// the new incarnation, and once every ready member has reported (in any
+/// mix of old- and new-generation `C`s), the joining node is promoted
+/// having never actually received the new incarnation's own handoff from
+/// whichever ready member's report was stale. See `credit_migrate_send_result`'s
+/// doc comment for the closely related (and, until this fix, the only)
+/// existing generation guard, and its own correction of the historical
+/// claim that this gap was already closed.
+///
+/// A `None` `generation` (a legacy `C` — see `DiscoveryCommand::Complete::
+/// generation`'s doc comment) skips this check entirely and is accepted
+/// exactly as before this fix, name+token only. This means the
+/// protection this fix adds is only complete once every node in the
+/// cluster is running a version that both sends `generation` on `M`'s
+/// `C` and understands the field on receipt — during a rolling upgrade a
+/// legacy report from a not-yet-upgraded node (or one whose in-flight
+/// handoff started under a not-yet-upgraded discovery peer) is still
+/// possible and is not, by itself, evidence of a stale report.
 #[allow(clippy::too_many_arguments)]
 async fn handle_complete(
     registry: &Registry,
@@ -2686,6 +2861,7 @@ async fn handle_complete(
     reporting_name: &str,
     for_joining_name: &str,
     token: &str,
+    generation: Option<u64>,
 ) {
     let joining_name = {
         let mut join_guard = lock_current_join(current_join);
@@ -2698,6 +2874,26 @@ async fn handle_complete(
         // not be credited to this one — the reporter has sent this join's
         // target nothing.
         if pending.joining_name != for_joining_name {
+            return;
+        }
+
+        // Issue #421(c): a report for the right `joining_name` but a
+        // stale (superseded) join generation — see this function's own
+        // doc comment for the abandon-then-immediately-re-register
+        // scenario this closes. Only checked when the reporter's own `M`
+        // carried a generation to echo; a legacy, generation-free report
+        // (`None`) falls through to the existing name/token checks
+        // unchanged.
+        if let Some(reported_generation) = generation
+            && pending.generation != reported_generation
+        {
+            eprintln!(
+                "WARN ignored handoff-complete report from {reporting_name} for \
+                 {for_joining_name}: generation {reported_generation} does not match the \
+                 in-progress join's generation {} — a stale report from a since-abandoned, \
+                 superseded incarnation of this join (issue #421(c))",
+                pending.generation
+            );
             return;
         }
 
@@ -4822,6 +5018,7 @@ async fn handle_connection(
                 name,
                 joining_name,
                 token,
+                generation,
             }) => {
                 handle_complete(
                     &registry,
@@ -4833,6 +5030,7 @@ async fn handle_connection(
                     &name,
                     &joining_name,
                     &token,
+                    generation,
                 )
                 .await;
                 write_response(&mut stream, b"A\n").await?;
@@ -5151,6 +5349,26 @@ mod tests {
                 name: "some-name".to_string(),
                 joining_name: "joiner".to_string(),
                 token: "tok-a".to_string(),
+                generation: None,
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    #[test]
+    fn parse_reads_a_complete_command_with_a_trailing_generation_field() {
+        // Tenth-pass audit (2026-09-02), issue #421(c): a node new
+        // enough to have received a generation on its own `M` echoes it
+        // back as a fourth, plain (not length-prefixed) `C` field.
+        let mut input = BytesMut::from(&b"C 9 6 5 3\nsome-namejoinertok-aL\n"[..]);
+        let command = parse(&mut input).unwrap();
+        assert_eq!(
+            command,
+            DiscoveryCommand::Complete {
+                name: "some-name".to_string(),
+                joining_name: "joiner".to_string(),
+                token: "tok-a".to_string(),
+                generation: Some(3),
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -8484,6 +8702,186 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_generation_complete_after_abandon_and_reregister_is_rejected() {
+        // Tenth-pass audit (2026-09-02), issue #421(c)/#34: the scenario
+        // `handle_complete`'s own doc comment describes. `joining_name`
+        // and the reporting node's token (issues #5 and #34) are both
+        // necessary but not sufficient to identify which incarnation of a
+        // join a `C` belongs to: a joining node's own name is exactly
+        // what gets reused when its join is abandoned
+        // (`abandon_current_join`, e.g. its control connection dropped,
+        // or it crashed and restarted) and it immediately re-registers.
+        // `try_begin_next_join` then starts a brand-new `PendingJoin` — a
+        // new generation — against the very same ready roster the
+        // abandoned join used, and a ready member's `C` still in flight
+        // for the OLD incarnation names the right `joining_name` and
+        // presents a genuinely valid token, but must not be credited to
+        // the NEW one.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, _node_b, registry, current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx.clone()).await;
+
+        // The abandoned incarnation's own generation, captured while it's
+        // still the pending one.
+        let stale_generation = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .generation;
+
+        abandon_current_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "test: superseded by an immediate re-registration",
+        )
+        .await;
+        assert!(
+            lock_current_join(&current_join).is_none(),
+            "abandon must have cleared the slot"
+        );
+
+        // node-b immediately re-registers under the very same name — on
+        // a NEW connection, standing in for a crash-and-restart (the
+        // original `node_b` connection from the helper is left
+        // unread/unwritten from here on; abandon already stranded its
+        // registry entry).
+        let config = ConnectionConfig {
+            idle_timeout: IDLE_TIMEOUT,
+            list_ready_at: Instant::now(),
+            replication: 2,
+            auth_secret: None,
+            tls_acceptor: None,
+            tls_connector: None,
+            announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+        };
+        let (mut node_b, server_b) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server_b),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            config,
+            shutdown_rx.clone(),
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        node_b
+            .write_all(b"J 6 9002 9\nnode-btk-node-b")
+            .await
+            .unwrap();
+
+        for _ in 0..1000 {
+            if lock_current_join(&current_join).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let fresh_generation = lock_current_join(&current_join)
+            .as_ref()
+            .unwrap()
+            .generation;
+        assert_ne!(
+            fresh_generation, stale_generation,
+            "the re-registration must have started a fresh PendingJoin incarnation"
+        );
+
+        // node-a's still-in-flight `C` for the ABANDONED incarnation
+        // arrives late: right `joining_name`, a genuinely valid token —
+        // only the generation is stale.
+        node_a
+            .write_all(format!("C 6 6 9 {stale_generation}\nnode-anode-btk-node-a").as_bytes())
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+        assert_eq!(
+            &ack, b"A\n",
+            "a rejected C is still acked (issue #5's own precedent)"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_ne!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joined),
+            "a stale-generation C was credited to the superseding join"
+        );
+        assert!(
+            lock_current_join(&current_join).is_some(),
+            "the fresh incarnation must still be pending, waiting on node-a's real report"
+        );
+        let mut byte = [0u8; 1];
+        let woken = tokio::time::timeout(Duration::from_millis(50), node_b.read(&mut byte)).await;
+        assert!(
+            woken.is_err(),
+            "node-b must not have been promoted by the stale-generation report"
+        );
+
+        // The genuine report, echoing the CURRENT generation, still
+        // promotes.
+        node_a
+            .write_all(format!("C 6 6 9 {fresh_generation}\nnode-anode-btk-node-a").as_bytes())
+            .await
+            .unwrap();
+        node_a.read_exact(&mut ack).await.unwrap();
+        let mut promoted = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut promoted))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&promoted, b"R\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_complete_without_a_generation_field_is_still_credited() {
+        // Tenth-pass audit (2026-09-02), issue #421(c): rolling-upgrade
+        // compatibility — a `C` from a node whose own `M` never carried a
+        // generation (an old, not-yet-upgraded discovery peer sent it, or
+        // the node itself predates this fix) omits the field entirely
+        // (`DiscoveryCommand::Complete::generation` parses as `None`).
+        // `handle_complete` must accept it exactly as it did before this
+        // fix — name+token only — even though the in-progress
+        // `PendingJoin` this discovery process itself started very much
+        // has a real, nonzero generation. See `handle_complete`'s own
+        // doc comment for why this is the deliberate compatibility
+        // tradeoff: the generation protection only fully holds once
+        // every node and discovery replica has upgraded.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut node_a, mut node_b, registry, current_join) =
+            registry_with_a_joined_and_b_waiting(shutdown_rx).await;
+
+        assert!(
+            lock_current_join(&current_join)
+                .as_ref()
+                .unwrap()
+                .generation
+                > 0,
+            "sanity: this discovery process itself tracks a real generation for the join"
+        );
+
+        // The legacy, generation-free three-field form.
+        node_a
+            .write_all(b"C 6 6 9\nnode-anode-btk-node-a")
+            .await
+            .unwrap();
+        let mut ack = [0u8; 2];
+        node_a.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"A\n");
+
+        let mut promoted = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), node_b.read_exact(&mut promoted))
+            .await
+            .expect("a legacy C must still be credited during a rolling upgrade")
+            .unwrap();
+        assert_eq!(&promoted, b"R\n");
+        assert_eq!(
+            lock(&registry).get("node-b").map(|info| info.state),
+            Some(NodeState::Joined)
+        );
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn sweep_expired_abandons_the_join_when_an_expected_ready_member_is_evicted() {
         // Issue #34 forged-completion fix, other half (see
@@ -9124,17 +9522,39 @@ mod tests {
         let mut header = message[..header_end].split(' ');
         assert_eq!(header.next(), Some("M"));
 
+        // Header order per `build_migrate_message`/`src/command.rs`'s
+        // `MigrateHeader`: joining_name_len, joining_addr_len,
+        // joining_token_len, joined_count, replication, token_len,
+        // [generation]. Issue #441: this test used to check only the
+        // pre-#295 five-field header, which never caught that
+        // `build_migrate_message` had silently drifted out of sync with
+        // the real wire format `src/command.rs` parses (the M this
+        // process actually sent to a real node was rejected outright).
         let joining_name_length: usize = header.next().unwrap().parse().unwrap();
         let joining_addr_length: usize = header.next().unwrap().parse().unwrap();
+        let joining_token_length: usize = header.next().unwrap().parse().unwrap();
         let joined_count: usize = header.next().unwrap().parse().unwrap();
         let replication: usize = header.next().unwrap().parse().unwrap();
         let token_length: usize = header.next().unwrap().parse().unwrap();
+        // Tenth-pass audit (2026-09-02), issue #421(c): the trailing
+        // join generation, always sent by this (upgraded) discovery
+        // process — see `build_migrate_message`'s doc comment.
+        let generation: u64 = header.next().unwrap().parse().unwrap();
         assert_eq!(header.next(), None);
         assert_eq!(joined_count, 1);
         assert_eq!(replication, 2);
+        // `NEXT_JOIN_GENERATION` is one process-wide counter shared by
+        // every test in this binary (they run concurrently), so this
+        // join's generation is merely SOME value `next_join_generation`
+        // handed out — never 0 (`NEXT_JOIN_GENERATION` starts at 1 and
+        // only increments).
+        assert!(generation > 0);
 
-        // Body: `<token><joining_name><joining_addr><roster>` — the token is
-        // node-a's own membership token, echoed so it can authenticate the M.
+        // Body: `<token><joining_name><joining_addr><joining_token><roster>`
+        // — `token` is node-a's own membership token, echoed so it can
+        // authenticate the M; `joining_token` (issue #295) is node-b's
+        // own token, granting node-a a scoped trust relationship with it
+        // for the handoff.
         let body = &message[header_end + 1..];
         assert_eq!(&body[..token_length], "tk-node-a");
         let after_token = &body[token_length..];
@@ -9143,8 +9563,10 @@ mod tests {
             &after_token[joining_name_length..joining_name_length + joining_addr_length],
             "127.0.0.1:9002"
         );
+        let after_addr = &after_token[joining_name_length + joining_addr_length..];
+        assert_eq!(&after_addr[..joining_token_length], "tk-node-b");
 
-        let roster = &after_token[joining_name_length + joining_addr_length..];
+        let roster = &after_addr[joining_token_length..];
         assert!(
             roster.contains("node-a"),
             "roster should list node-a: {roster:?}"
@@ -10239,8 +10661,10 @@ mod tests {
             &Some(connector),
             "joining-node",
             "127.0.0.1:9",
+            "joiner-token",
             &[],
             2,
+            9,
             OUTBOUND_IO_TIMEOUT,
         )
         .await
@@ -10248,10 +10672,11 @@ mod tests {
 
         node_task.await.unwrap();
 
-        let mut expected = b"M 12 11 0 2 11\n".to_vec();
+        let mut expected = b"M 12 11 12 0 2 11 9\n".to_vec();
         expected.extend_from_slice(b"ready-token");
         expected.extend_from_slice(b"joining-node");
         expected.extend_from_slice(b"127.0.0.1:9");
+        expected.extend_from_slice(b"joiner-token");
         assert_eq!(*received.lock().unwrap(), expected);
     }
 
@@ -10326,8 +10751,10 @@ mod tests {
             &None,
             "joining-node",
             "127.0.0.1:9",
+            "joiner-token",
             &[],
             2,
+            9,
             OUTBOUND_IO_TIMEOUT,
         )
         .await;
@@ -10364,8 +10791,10 @@ mod tests {
             &None,
             "joining-node",
             "127.0.0.1:9",
+            "joiner-token",
             &[],
             2,
+            9,
             OUTBOUND_IO_TIMEOUT,
         )
         .await;

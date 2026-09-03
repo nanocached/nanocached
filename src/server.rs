@@ -1897,6 +1897,7 @@ async fn handle_connection(
                     joining_token,
                     joined,
                     replication,
+                    generation,
                 },
                 _,
             )) => {
@@ -2036,6 +2037,7 @@ async fn handle_connection(
                         joining_name,
                         joining_addr,
                         joining_token,
+                        generation,
                         replication,
                         before_ring,
                         after_ring,
@@ -3671,14 +3673,48 @@ fn delete_message(key: &Key) -> Vec<u8> {
 
 /// Staged node join: reports to discovery that this node (identified by `name`,
 /// Node identity decoupled from address) has finished handing off its share of the current join.
-/// `C <name-len> <joining-len> <token-len>\n<name><joining><token>` — the
-/// completion report names both the reporting node and the join it is
-/// for (issue #5): a bare name let a stale report from an abandoned
+/// `C <name-len> <joining-len> <token-len> [<generation>]\n<name><joining><token>`
+/// — the completion report names both the reporting node and the join it
+/// is for (issue #5): a bare name let a stale report from an abandoned
 /// handoff be credited to whatever join happened to be pending next.
 /// `token` proves the report really comes from `name` (issue #34).
-fn complete_message(name: &str, joining_name: &str, token: &str) -> Vec<u8> {
-    let mut message =
-        format!("C {} {} {}\n", name.len(), joining_name.len(), token.len()).into_bytes();
+///
+/// `generation` (tenth-pass audit, 2026-09-02, issue #421(c)) is the join
+/// generation this handoff's own `M` carried
+/// (`Command::Migrate::generation`), a trailing plain (not
+/// length-prefixed) field echoed back unchanged so discovery can tell
+/// this report apart from one for a since-abandoned-and-superseded join
+/// that reused the same `joining_name` — see `nanocached-discovery`'s
+/// `handle_complete`. Naming `joining_name` alone (issue #5's original
+/// fix) isn't enough: a node whose join was abandoned can immediately
+/// re-register under that very name and start a fresh `PendingJoin`
+/// before this node's own already-in-flight `C` for the old one arrives.
+///
+/// `None` when the `M` that started this handoff itself carried no
+/// generation (an old, not-yet-upgraded discovery server) — this falls
+/// back to the legacy, generation-free three-field form, which such a
+/// discovery server still understands. During a rolling upgrade this
+/// means the new generation-based protection only actually holds once
+/// every node AND discovery replica has picked up this fix; until then a
+/// legacy `C` (from a node that itself hasn't upgraded yet, or one whose
+/// in-flight handoff started under an old discovery) is accepted the
+/// same way it always was, name+token only.
+fn complete_message(
+    name: &str,
+    joining_name: &str,
+    token: &str,
+    generation: Option<u64>,
+) -> Vec<u8> {
+    let mut message = match generation {
+        Some(generation) => format!(
+            "C {} {} {} {generation}\n",
+            name.len(),
+            joining_name.len(),
+            token.len()
+        )
+        .into_bytes(),
+        None => format!("C {} {} {}\n", name.len(), joining_name.len(), token.len()).into_bytes(),
+    };
     message.extend_from_slice(name.as_bytes());
     message.extend_from_slice(joining_name.as_bytes());
     message.extend_from_slice(token.as_bytes());
@@ -4298,6 +4334,11 @@ async fn run_migration(
     // joiner below, so it can tell this handoff apart from a forged
     // shared-secret frame (see `Command::HandoffSet::token`).
     joining_token: String,
+    // Tenth-pass audit (2026-09-02), issue #421(c): the dispatching
+    // `PendingJoin`'s generation (`Command::Migrate::generation`),
+    // echoed unchanged in this handoff's own `C` report — see
+    // `report_complete`/`complete_message`.
+    generation: Option<u64>,
     replication: usize,
     before_ring: HashRing,
     after_ring: Arc<HashRing>,
@@ -4475,7 +4516,7 @@ async fn run_migration(
         );
     }
 
-    if let Err(error) = report_complete(&node_context, &joining_name).await {
+    if let Err(error) = report_complete(&node_context, &joining_name, generation).await {
         eprintln!(
             "WARN migration to {joining_addr} finished but reporting completion to {} failed: {error}",
             node_context.discovery_addr
@@ -6701,7 +6742,11 @@ async fn delete_on_joining_node(
     forward_on_shared_connection(node_context, target, ForwardedWrite::Delete { key }).await
 }
 
-async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::Result<()> {
+async fn report_complete(
+    node_context: &NodeContext,
+    joining_name: &str,
+    generation: Option<u64>,
+) -> io::Result<()> {
     let mut stream = connect_client_stream(
         &node_context.discovery_addr,
         node_context.tls_connector.as_ref(),
@@ -6728,6 +6773,7 @@ async fn report_complete(node_context: &NodeContext, joining_name: &str) -> io::
                 &node_context.name,
                 joining_name,
                 &node_context.token,
+                generation,
             ))
             .await?;
 
@@ -9013,6 +9059,7 @@ mod tests {
             "joiner-0".to_string(),
             joining_addr.clone(),
             "tok-joiner-0".to_string(),
+            None,
             2,
             before_ring,
             after_ring,
@@ -11193,6 +11240,7 @@ mod tests {
             "joiner-0".to_string(),
             joining_addr.clone(),
             "tok-joiner-0".to_string(),
+            None,
             2,
             before_ring,
             after_ring,
@@ -11479,6 +11527,7 @@ mod tests {
             "joiner-w".to_string(),
             joining_addr,
             "tok-joiner-w".to_string(),
+            None,
             replication,
             before_ring,
             after_ring,
@@ -11802,8 +11851,20 @@ mod tests {
     #[test]
     fn complete_message_declares_the_name_length_before_the_name() {
         assert_eq!(
-            complete_message("some-name", "joiner", "tk-some-name"),
+            complete_message("some-name", "joiner", "tk-some-name", None),
             b"C 9 6 12\nsome-namejoinertk-some-name".to_vec()
+        );
+    }
+
+    #[test]
+    fn complete_message_appends_the_generation_when_the_migrate_carried_one() {
+        // Tenth-pass audit (2026-09-02), issue #421(c): a plain (not
+        // length-prefixed) trailing field, same idiom as `M`'s own
+        // `replication`/generation fields — see `complete_message`'s doc
+        // comment.
+        assert_eq!(
+            complete_message("some-name", "joiner", "tk-some-name", Some(7)),
+            b"C 9 6 12 7\nsome-namejoinertk-some-name".to_vec()
         );
     }
 
@@ -12057,8 +12118,17 @@ mod tests {
         let joining_name = "joiner-107";
         let token = "tk-ready-node";
         let joining_token = "tok-joiner-107";
+        // Tenth-pass audit (2026-09-02), issue #421(c): a trailing
+        // generation field, exercising the path where this node must
+        // echo it back unchanged on its own `C` report — see the
+        // assertion below and `complete_message`'s doc comment. The
+        // sibling tests `migrate_command_accepts_a_different_joining_node_once_the_handoff_completed`
+        // and `migrate_command_reuses_one_connection_for_every_key`
+        // deliberately keep the legacy, generation-free `M` header, so
+        // the two together cover both wire forms end to end.
+        let generation = 42u64;
         let mut migrate_message = format!(
-            "M {} {} {} 0 1 {}\n",
+            "M {} {} {} 0 1 {} {generation}\n",
             joining_name.len(),
             joining_addr.len(),
             joining_token.len(),
@@ -12089,7 +12159,13 @@ mod tests {
         assert_eq!(*joining_received.lock().unwrap(), expected_set);
         assert_eq!(
             *discovery_received.lock().unwrap(),
-            complete_message("ready-node", "joiner-107", "tk-ready-node")
+            complete_message(
+                "ready-node",
+                "joiner-107",
+                "tk-ready-node",
+                Some(generation)
+            ),
+            "the M's own generation must come back unchanged on C (issue #421(c))"
         );
 
         joining_task.await.unwrap();
@@ -12342,7 +12418,12 @@ mod tests {
         let complete = discovery_task.await.unwrap();
         assert_eq!(
             complete,
-            complete_message("ready-node", "joiner-107", "tk-ready-node"),
+            // Tenth-pass audit (2026-09-02), issue #421(c): this test's
+            // own `M` (above) carries no generation field — the legacy
+            // form an old, not-yet-upgraded discovery server sends — so
+            // the `C` it produces must fall back to the legacy,
+            // generation-free form too.
+            complete_message("ready-node", "joiner-107", "tk-ready-node", None),
             "exactly one migration must run and report completion"
         );
 
@@ -13109,7 +13190,10 @@ mod tests {
         );
         assert_eq!(
             *discovery_received.lock().unwrap(),
-            complete_message("ready-node", "joiner-107", "tk-ready-node")
+            // This test's own `M` (below) is the legacy, generation-free
+            // form (issue #421(c)) — see the analogous note on
+            // `migrate_command_re_acks_a_duplicate_m_for_the_same_joining_node`.
+            complete_message("ready-node", "joiner-107", "tk-ready-node", None)
         );
 
         joining_task.await.unwrap();

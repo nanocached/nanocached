@@ -266,6 +266,19 @@ pub enum Command {
     /// its name (`L` still lists names only). Stored on this node's
     /// `ActiveMigration` for that handoff's duration, never persisted or
     /// forwarded elsewhere.
+    ///
+    /// `generation` (tenth-pass audit, 2026-09-02, issue #421(c)/#34): the
+    /// dispatching `PendingJoin`'s generation counter
+    /// (`nanocached-discovery`'s `next_join_generation`), echoed back
+    /// unchanged in this node's own `C` report so discovery can tell a
+    /// completion report for the join that sent this `M` apart from one
+    /// for a since-abandoned-and-superseded join that reused the same
+    /// `joining_name` (see `nanocached-discovery`'s `handle_complete`).
+    /// `None` when the `M` frame this was parsed from omitted the
+    /// trailing generation field — an old discovery server that predates
+    /// this fix — in which case this node's own `C` falls back to the
+    /// legacy, generation-free form (see `complete_message`'s doc
+    /// comment for the rolling-upgrade rationale).
     Migrate {
         token: String,
         joining_name: String,
@@ -273,6 +286,7 @@ pub enum Command {
         joining_token: String,
         joined: Vec<(String, String)>,
         replication: usize,
+        generation: Option<u64>,
     },
     /// Staged node join: sent by discovery to a ready node to abandon a handoff
     /// it's mid-`Migrate` for — a ready or joining node died, or
@@ -1312,6 +1326,14 @@ fn parse_with_mode(
             let joined_count = parts.next().ok_or(ParseError::InvalidLength)?;
             let replication = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
+            // Tenth-pass audit (2026-09-02), issue #421(c): the join
+            // generation, a trailing field so an old discovery server
+            // (predating this fix) that omits it still parses — this
+            // node then just has no generation to echo back on `C` (see
+            // `Command::Migrate::generation`). A NEW discovery always
+            // sends it; only a stale, not-yet-upgraded discovery process
+            // produces the six-field legacy form.
+            let generation_field = parts.next();
 
             if parts.next().is_some() {
                 return Err(ParseError::InvalidLength);
@@ -1323,6 +1345,10 @@ fn parse_with_mode(
             let joined_count = parse_length(joined_count)?;
             let replication = parse_length(replication)?;
             let token_length = parse_length(token_length)?;
+            let generation = generation_field
+                .map(parse_length)
+                .transpose()?
+                .map(|generation| generation as u64);
 
             // R=0 could never be meant (nothing would own any key) and
             // would make every ownership check vacuously reject.
@@ -1340,6 +1366,7 @@ fn parse_with_mode(
                     joining_token_length,
                     joined_count,
                     replication,
+                    generation,
                 },
                 progress,
             )
@@ -1360,6 +1387,11 @@ struct MigrateHeader {
     joining_token_length: usize,
     joined_count: usize,
     replication: usize,
+    /// Tenth-pass audit (2026-09-02), issue #421(c): see
+    /// `Command::Migrate::generation`'s doc comment — `None` when the `M`
+    /// this header was parsed from omitted the trailing generation field
+    /// (a not-yet-upgraded discovery server).
+    generation: Option<u64>,
 }
 
 /// Parses `M`'s body: the joining node's own name+address, followed by
@@ -1384,6 +1416,7 @@ fn parse_migrate(
         joining_token_length,
         joined_count,
         replication,
+        generation,
     } = header;
 
     if token_length == 0
@@ -1488,6 +1521,7 @@ fn parse_migrate(
         joining_token,
         joined,
         replication,
+        generation,
     })
 }
 
@@ -2046,6 +2080,29 @@ mod tests {
                 joining_token: "tok-j".to_string(),
                 joined: Vec::new(),
                 replication: 2,
+                generation: None,
+            })
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn parses_a_migrate_command_with_a_trailing_generation_field() {
+        // Tenth-pass audit (2026-09-02), issue #421(c): a discovery
+        // server new enough to track join generations appends one more
+        // plain (not length-prefixed) field to the `M` header.
+        let mut input = buf(b"M 6 14 5 0 2 5 7\ntok-bnode-b127.0.0.1:8357tok-j");
+
+        assert_eq!(
+            parse(&mut input),
+            Ok(Command::Migrate {
+                token: "tok-b".to_string(),
+                joining_name: "node-b".to_string(),
+                joining_addr: "127.0.0.1:8357".to_string(),
+                joining_token: "tok-j".to_string(),
+                joined: Vec::new(),
+                replication: 2,
+                generation: Some(7),
             })
         );
         assert!(input.is_empty());
@@ -2069,6 +2126,7 @@ mod tests {
                     ("node-c".to_string(), "127.0.0.1:8358".to_string()),
                 ],
                 replication: 2,
+                generation: None,
             })
         );
         assert_eq!(&input[..], b"G 1\nx");
