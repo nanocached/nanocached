@@ -128,6 +128,15 @@ fn forwarding_grace(entries_sent: usize) -> Duration {
 /// How often the staged node join active-deletion sweep runs. See `run_sweep`.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Tenth-pass audit (2026-09-02): how long the operator-override path (a
+/// second Ctrl-C/SIGTERM while a decommission is draining, issue #407)
+/// waits for `run_decommission`'s task to notice `shutdown_rx` and return
+/// on its own — so it still gets a chance to send its `V` (clean
+/// membership leave) — before that path gives up and aborts the task
+/// outright. Short: every point `run_decommission` checks the signal at
+/// is itself bounded by at most ~100ms sleeps, so a well-behaved task
+/// should never need close to this long.
+const DECOMMISSION_OVERRIDE_GRACE: Duration = Duration::from_secs(2);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bounds each individual outbound dial, write, and ack read this node
 /// makes toward another node — the migration handoff (`run_migration`) and
@@ -880,6 +889,14 @@ pub(crate) async fn run(
     // immediate path (operator override, issue #407).
     let mut decommission_started = false;
     let (decommission_done_tx, mut decommission_done_rx) = watch::channel(false);
+    // Tenth-pass audit (2026-09-02): the decommission task's own handle,
+    // previously discarded. `run_decommission` now watches `shutdown_rx`
+    // (via its `NodeContext` clone) and unwinds promptly on its own once
+    // the override branch below flips it, but this is the hard backstop
+    // — awaited briefly there, then aborted if it hasn't finished, so a
+    // task that somehow doesn't notice the signal can never block
+    // `cache_task.await` (and this function's own return) indefinitely.
+    let mut decommission_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         tokio::select! {
@@ -898,6 +915,11 @@ pub(crate) async fn run(
                     println!(
                         "INFO second shutdown signal received — overriding decommission drain"
                     );
+                    // `run_decommission` clones `shutdown_rx` into its own
+                    // `NodeContext`, so this is the same override signal
+                    // it's watching for in its migration-wait, per-key
+                    // transfer, and grace-sleep loops (see that
+                    // function's own doc comments).
                     shutdown_tx.send_replace(true);
                     if let Some(migration) = active_migration
                         .lock()
@@ -905,6 +927,28 @@ pub(crate) async fn run(
                         .as_ref()
                     {
                         migration.abort_requested.store(true, Ordering::SeqCst);
+                    }
+
+                    // Tenth-pass audit (2026-09-02), issue #407 follow-up:
+                    // give the task a brief window to notice the signal
+                    // above and return on its own — it still needs to run
+                    // `send_leave` for a clean membership departure rather
+                    // than lingering until the peer's liveness timeout —
+                    // then abort it outright so it can't block
+                    // `cache_task.await` below regardless (a raw abort
+                    // drops its `NodeContext` clone, including the
+                    // `request_tx` that `cache_task` is waiting to see
+                    // every sender drop).
+                    if let Some(mut task) = decommission_task.take()
+                        && timeout(DECOMMISSION_OVERRIDE_GRACE, &mut task)
+                            .await
+                            .is_err()
+                    {
+                        eprintln!(
+                            "WARN decommission task did not stop within the override grace \
+                             period — aborting it"
+                        );
+                        task.abort();
                     }
 
                     break;
@@ -933,10 +977,10 @@ pub(crate) async fn run(
                     let node_context = node_context.clone();
                     let discovery_addrs = discovery_addrs.clone();
                     let done = decommission_done_tx.clone();
-                    tokio::spawn(async move {
+                    decommission_task = Some(tokio::spawn(async move {
                         run_decommission(node_context, discovery_addrs, drain_timeout).await;
                         let _ = done.send(true);
-                    });
+                    }));
                     // Issue #407: re-arm so a second signal during the
                     // drain is still noticed (see the boxed `shutdown`'s
                     // own doc comment above).
@@ -2165,30 +2209,31 @@ async fn handle_connection(
                     // call, and `Bytes::clone` is a cheap refcount bump.
                     // Issue #233: skip the clone entirely when there's no
                     // `node_context` to forward through — the loop below
-                    // never runs in that case. Issue #408: also skip it in
-                    // the steady state, when a `node_context` exists but
-                    // neither a migration nor a decommission is actually in
-                    // flight — `migration_target_for`/`leave_target_for`
-                    // would return `None` for every key below regardless,
-                    // so cloning the whole batch up front paid for a copy
-                    // every ordinary `MultiSet` never used. Both locks are
-                    // cheap presence checks, unlike the per-key `Bytes`
-                    // clones this decides whether to pay for.
-                    let forwarding_possible =
-                        config.node_context.as_ref().is_some_and(|node_context| {
-                            node_context
-                                .active_migration
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .is_some()
-                                || node_context
-                                    .leaving
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                    .is_some()
-                        });
-                    let forward =
-                        forwarding_possible.then(|| (owned_keys.clone(), owned_values.clone()));
+                    // never runs in that case.
+                    //
+                    // Tenth-pass audit (2026-09-02), issue #408 regression:
+                    // issue #408 additionally skipped the clone whenever
+                    // `active_migration`/`leaving` were both empty *before*
+                    // `execute_command` ran, on the theory that
+                    // `migration_target_for`/`leave_target_for` would find
+                    // nothing after the write either. That's a snapshot
+                    // race: a join migration or decommission can start
+                    // *while* the actor is processing this write (the
+                    // request channel hop and the actor's own processing
+                    // both yield), so the pre-write snapshot can read empty
+                    // while the post-write lookup would find a target — and
+                    // with no clone kept, the write is silently never
+                    // forwarded (the class of bug issue #176 fixed for the
+                    // single-key `Set` path below, which always re-checks
+                    // after the write). Clone unconditionally whenever
+                    // `node_context.is_some()`, same as before #408; a
+                    // `Bytes::clone` is a cheap refcount bump, so this
+                    // trades a bump per key for correctness rather than
+                    // saving a bump per key at the cost of losing writes.
+                    let forward = config
+                        .node_context
+                        .is_some()
+                        .then(|| (owned_keys.clone(), owned_values.clone()));
 
                     let response = execute_command(
                         &request_tx,
@@ -4769,6 +4814,13 @@ async fn run_decommission(
     drain_budget: Duration,
 ) {
     let deadline = Instant::now() + drain_budget;
+    // Tenth-pass audit (2026-09-02), issue #407 follow-up: this node's own
+    // shutdown signal, so the operator-override path (a second Ctrl-C/
+    // SIGTERM while draining) can actually cut this run short instead of
+    // running out `drain_budget` regardless — see the loops below and the
+    // caller in `run`, which now keeps this task's `JoinHandle` and awaits
+    // (then aborts) it on override rather than discarding it.
+    let mut shutdown_rx = node_context.shutdown_rx.clone();
 
     // 1. No new joins (the flag isn't set yet, so flip abort first) and
     // wind down the active one.
@@ -4788,25 +4840,64 @@ async fn run_decommission(
     // `wait_for_rereplication_to_clear`/`wait_for_migration_to_clear`,
     // whose own comments point at this exact `completed_at.is_none()`
     // check.
+    //
+    // Tenth-pass audit (2026-09-02): two follow-up fixes to the above.
+    // (a) Issue #422 precedent: `wait_for_migration_to_clear` treats the
+    // occupying migration's own `abort_requested` as "not really busy"
+    // once it's set, because `run_migration` is already on its way to
+    // unwinding and clearing the slot — the same is true here, and more
+    // so, since the `store(true, ..)` immediately above is what set it:
+    // this wait's job is to give that unwind a moment to land, not to
+    // babysit a migration this same function just told to stop. (b) Even
+    // so, bound the wait to a fraction of `drain_budget` rather than the
+    // whole thing — a migration that ignores `abort_requested` (stuck on
+    // an unresponsive peer, say) must not be able to consume the entire
+    // budget here and leave nothing for the actual handoff below, which
+    // is the part `classify_decommission_key`'s `DeadlinePassed` check
+    // exists to protect.
+    let migration_wait_budget = (drain_budget / 4).min(Duration::from_secs(5));
+    let migration_wait_deadline = Instant::now() + migration_wait_budget;
+    let mut overridden = false;
     loop {
         let busy = node_context
             .active_migration
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .is_some_and(|active| active.completed_at.is_none());
+            .is_some_and(|active| {
+                active.completed_at.is_none() && !active.abort_requested.load(Ordering::SeqCst)
+            });
         if !busy {
             break;
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= migration_wait_deadline {
             eprintln!(
                 "WARN decommission: an in-flight join migration was still active after the \
-                 drain budget ({}s) elapsed; proceeding with the handoff anyway",
+                 capped wait ({}s, out of a {}s drain budget) elapsed; proceeding with the \
+                 handoff anyway",
+                migration_wait_budget.as_secs(),
                 drain_budget.as_secs()
             );
             break;
         }
-        sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_millis(100)) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    overridden = true;
+                }
+                break;
+            }
+        }
+    }
+
+    if overridden {
+        println!(
+            "INFO decommission: second shutdown signal received during the join-migration \
+             wait — leaving without a handoff"
+        );
+        send_leave(&node_context, &discovery_addrs).await;
+        return;
     }
 
     // 2. Roster with addresses.
@@ -4879,7 +4970,24 @@ async fn run_decommission(
     let mut sent = 0usize;
     let mut left_behind = 0usize;
 
-    for key in keys {
+    // Tenth-pass audit (2026-09-02): consumed by hand (not a `for` over
+    // `keys` directly) so that on a shutdown override mid-transfer the
+    // remaining, still-owned keys can be folded into `left_behind` — the
+    // same accounting a key whose deadline had already passed gets below
+    // — instead of just vanishing from both counters.
+    let mut keys_iter = keys.into_iter();
+    while let Some(key) = keys_iter.next() {
+        if *shutdown_rx.borrow() {
+            println!(
+                "INFO decommission: second shutdown signal received during key transfer — \
+                 stopping early"
+            );
+            left_behind += std::iter::once(key)
+                .chain(keys_iter)
+                .filter(|key| before_ring.is_owner(key, &self_name, replication))
+                .count();
+            break;
+        }
         match classify_decommission_key(
             &key,
             &before_ring,
@@ -4916,29 +5024,44 @@ async fn run_decommission(
         };
 
         let mut delivered = false;
-        for _ in 0..KEY_TRANSFER_ATTEMPTS {
-            if !streams.contains_key(addr) {
+        for attempt in 0..KEY_TRANSFER_ATTEMPTS {
+            let mut connected = streams.contains_key(addr);
+            if !connected {
                 match connect_and_authenticate(&node_context, addr, AuthPeer::Node).await {
                     Ok(stream) => {
                         streams.insert(addr.clone(), stream);
+                        connected = true;
                     }
                     Err(error) => {
                         eprintln!("WARN decommission: connecting to {addr} failed: {error}");
-                        continue;
                     }
                 }
             }
-            let Some(stream) = streams.get_mut(addr) else {
-                continue;
-            };
-            match send_handoff_set(stream, &key, &value, ttl, false, entrant_token).await {
-                Ok(()) => {
-                    delivered = true;
-                    break;
+            if connected && let Some(stream) = streams.get_mut(addr) {
+                match send_handoff_set(stream, &key, &value, ttl, false, entrant_token).await {
+                    Ok(()) => {
+                        delivered = true;
+                    }
+                    Err(error) => {
+                        eprintln!("WARN decommission: transfer to {addr} failed: {error}");
+                        streams.remove(addr);
+                    }
                 }
-                Err(error) => {
-                    eprintln!("WARN decommission: transfer to {addr} failed: {error}");
-                    streams.remove(addr);
+            }
+            if delivered {
+                break;
+            }
+            // Tenth-pass audit (2026-09-02): a short, linearly increasing
+            // backoff before the next attempt — without it a target
+            // fast-failing (e.g. ECONNREFUSED) gets hit `KEY_TRANSFER_ATTEMPTS`
+            // times back-to-back. Skipped after the last attempt (nothing
+            // waits on it), and itself interruptible by a shutdown
+            // override so it can't eat into that path's "return promptly"
+            // promise either.
+            if attempt + 1 < KEY_TRANSFER_ATTEMPTS {
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(100 * u64::from(attempt + 1))) => {}
+                    _ = shutdown_rx.changed() => {}
                 }
             }
         }
@@ -4967,7 +5090,19 @@ async fn run_decommission(
         "INFO decommission: forwarding window open for {}s",
         grace.as_secs()
     );
-    sleep(grace).await;
+    // Tenth-pass audit (2026-09-02): interruptible by a shutdown override
+    // too — membership is already given up by this point (`send_leave`
+    // above), so there's nothing left for a second signal to do but cut
+    // this grace window short.
+    tokio::select! {
+        _ = sleep(grace) => {}
+        _ = shutdown_rx.changed() => {
+            println!(
+                "INFO decommission: second shutdown signal received during the forwarding \
+                 window — closing it early"
+            );
+        }
+    }
 }
 
 /// `V <name-len> <token-len>` to every discovery replica — membership
@@ -9588,6 +9723,281 @@ mod tests {
         assert!(frames.contains(&expected_b));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_forwards_when_a_join_migration_starts_between_the_snapshot_and_the_write() {
+        // Tenth-pass audit (2026-09-02), issue #408 regression: `MultiSet`
+        // used to decide whether to keep a clone for the forwarding loop
+        // (`forwarding_possible`) from `active_migration`/`leaving`
+        // *before* handing the write to the cache actor. If a join
+        // migration (or decommission) started while the actor was still
+        // processing the write, that pre-write snapshot read empty, no
+        // clone was kept, and `migration_target_for`'s post-write check
+        // — reachable in principle — had nothing left to forward: the
+        // joining node never got the key, silently, the same class of
+        // lost write issue #176 fixed for `Set`.
+        //
+        // Reproduced by interposing on the cache-actor's request channel:
+        // `active_migration` is still `None` when the `MultiSet` leaves
+        // `handle_connection`, exactly like the pre-write snapshot would
+        // have seen — it's only installed here, by the relay standing in
+        // for a concurrent `M`, once the request is already in flight
+        // toward the real actor.
+        let (real_tx, real_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(real_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let mut buffer = [0u8; 256];
+                let bytes_read = connection.read(&mut buffer).await.unwrap();
+                assert!(bytes_read > 0);
+                received.extend_from_slice(&buffer[..bytes_read]);
+                connection.write_all(b"S\n").await.unwrap();
+            }
+            received
+        });
+
+        let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            // Empty at construction — the relay below installs it after
+            // the `MultiSet` has already left `handle_connection`.
+            active_migration: Arc::clone(&active_migration),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: real_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        // The relay `handle_connection` actually talks to: forwards every
+        // request on to the real actor unchanged, except that the first
+        // `MultiSet` it sees installs the migration state first — a
+        // stand-in for an `M` landing while the actor still has the
+        // write queued/in progress, a window `handle_connection` cannot
+        // itself observe.
+        let (proxy_tx, mut proxy_rx) = mpsc::channel::<CacheRequest>(4);
+        let joining_addr_for_relay = joining_addr.clone();
+        let relay_task = tokio::spawn(async move {
+            while let Some(request) = proxy_rx.recv().await {
+                if matches!(request.command, Command::MultiSet { .. }) {
+                    *active_migration.lock().unwrap() = Some(ActiveMigration {
+                        joining_name: "joiner-0".to_string(),
+                        joining_addr: joining_addr_for_relay.clone(),
+                        joining_token: "tok-joiner-0".to_string(),
+                        after_ring: Arc::new(HashRing::new(vec![
+                            "ready-node".to_string(),
+                            "joiner-0".to_string(),
+                        ])),
+                        replication: 2,
+                        completed_at: None,
+                        forwarding_grace: Duration::from_secs(60),
+                        acked_entries: None,
+                        abort_requested: Arc::new(AtomicBool::new(false)),
+                        marked_keys: Vec::new(),
+                        confirmed: false,
+                        pre_completion_ring: None,
+                        pending_clears: Vec::new(),
+                        forward_connection: Arc::new(AsyncMutex::new(None)),
+                    });
+                }
+                if real_tx.send(request).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            proxy_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+
+        client
+            .write_all(b"o 0 2 5 2 5 2\nkey-av1key-bv2")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O 2 S S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(proxy_tx);
+        relay_task.await.unwrap();
+        cache_task.await.unwrap();
+        drop(forward_relay);
+
+        let received = joining_task.await.unwrap();
+        assert_eq!(
+            received,
+            b"S 5 2\nkey-av1S 5 2\nkey-bv2".to_vec(),
+            "both keys must still forward to the joining node even though no migration was \
+             active when the MultiSet left handle_connection"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_set_forwards_when_a_decommission_starts_between_the_snapshot_and_the_write() {
+        // Tenth-pass audit (2026-09-02): the decommission-drain mirror of
+        // the migration race above — `leaving` racing the write the same
+        // way `active_migration` can.
+        let (real_tx, real_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(real_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 2 {
+            let name = format!("key-{index}");
+            if before_ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 1000, "expected at least two owned keys in range");
+        }
+
+        let mut addresses = HashMap::new();
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let leaving: Arc<Mutex<Option<LeaveState>>> = Arc::new(Mutex::new(None));
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: real_tx.clone(),
+            // Empty at construction — installed by the relay below.
+            leaving: Arc::clone(&leaving),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+
+        let (proxy_tx, mut proxy_rx) = mpsc::channel::<CacheRequest>(4);
+        let relay_task = tokio::spawn(async move {
+            while let Some(request) = proxy_rx.recv().await {
+                if matches!(request.command, Command::MultiSet { .. }) {
+                    *leaving.lock().unwrap() = Some(LeaveState {
+                        before_ring: Arc::clone(&before_ring),
+                        after_ring: Arc::clone(&after_ring),
+                        replication: 1,
+                        addresses: addresses.clone(),
+                        tokens: tokens.clone(),
+                        connections: Mutex::new(HashMap::new()),
+                    });
+                }
+                if real_tx.send(request).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            proxy_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+            },
+            shutdown_rx,
+        ));
+
+        let name_a = &owned_keys[0];
+        let name_b = &owned_keys[1];
+        let request = format!(
+            "o 0 2 {} 2 {} 2\n{name_a}v1{name_b}v2",
+            name_a.len(),
+            name_b.len()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let expected = b"O 2 S S\n";
+        let mut response = vec![0u8; expected.len()];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, expected);
+
+        connection_task.await.unwrap().unwrap();
+        drop(proxy_tx);
+        relay_task.await.unwrap();
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            2,
+            "both owned keys must still forward to the entrant even though no decommission was \
+             active when the MultiSet left handle_connection"
+        );
+        let expected_a = format!("U 0 {} 2 8\ntok-peer{name_a}v1", name_a.len()).into_bytes();
+        let expected_b = format!("U 0 {} 2 8\ntok-peer{name_b}v2", name_b.len()).into_bytes();
+        assert!(frames.contains(&expected_a));
+        assert!(frames.contains(&expected_b));
+    }
+
     #[test]
     fn entrant_for_promotes_exactly_the_new_owner() {
         // Issue #124: removing self from the ranking promotes exactly
@@ -10018,6 +10428,363 @@ mod tests {
         assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
         // ...and the leave state is installed for write forwarding.
         assert!(node_context.leaving.lock().unwrap().is_some());
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decommission_leaves_without_a_handoff_when_already_overridden_at_the_start_of_transfer()
+     {
+        // Tenth-pass audit (2026-09-02), issue #407 follow-up:
+        // `run_decommission` used to ignore `shutdown_rx` entirely — a
+        // second Ctrl-C/SIGTERM (`run`'s override branch, which flips the
+        // very signal this function's `NodeContext` clone now watches)
+        // had no effect on this task, so `run` stayed blocked on
+        // `cache_task.await` (which needs this task's `NodeContext`
+        // clone, and therefore this task, to finish) until the whole
+        // drain budget elapsed regardless. Simplest reproduction: the
+        // signal is already set by the time the per-key transfer loop
+        // starts — no key should even be attempted, and the leave (`V`)
+        // must still go out so membership stays clean rather than
+        // lingering to the peer's liveness timeout.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        for index in 0..20u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        // A peer that would happily ack a handoff — proving it received
+        // nothing (rather than merely being slow to respond) is the
+        // point.
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (left, discovery_task) =
+            spawn_mock_discovery(discovery_listener, peer_addr.clone(), None);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        shutdown_tx.send_replace(true);
+
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx,
+        };
+
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_decommission(
+                node_context.clone(),
+                vec![discovery_addr.clone()],
+                Duration::from_secs(120),
+            ),
+        )
+        .await
+        .expect(
+            "run_decommission must return promptly once already overridden, not sit out the \
+             drain budget",
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "expected an immediate return, nowhere close to the 120s drain budget"
+        );
+
+        assert!(
+            frames.lock().unwrap().is_empty(),
+            "no key should have been attempted once already overridden"
+        );
+        // Membership is still given up cleanly even when overridden.
+        assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decommissions_migration_wait_is_capped_so_the_handoff_still_gets_its_budget() {
+        // Tenth-pass audit (2026-09-02): `run_decommission`'s own wait for
+        // an in-flight join migration to clear used to be bounded only by
+        // the *whole* `drain_budget` — a migration that (somehow) never
+        // actually clears could consume all of it, after which
+        // `classify_decommission_key` marks every owned key
+        // `DeadlinePassed` and nothing is handed off. Reproduced with a
+        // background task that keeps replacing `active_migration` with a
+        // fresh, un-aborted one faster than the wait polls — nothing this
+        // function does on its own ever makes that stop looking "busy" —
+        // for well past the whole `drain_budget`. With the fix, the wait
+        // gives up on its own capped fraction of the budget
+        // (`min(drain_budget / 4, 5s)`) and the actual handoff below
+        // still gets a share of what's left.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        for index in 0..20u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: key(format!("key-{index}").as_bytes()),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (left, discovery_task) =
+            spawn_mock_discovery(discovery_listener, peer_addr.clone(), None);
+
+        let active_migration: Arc<Mutex<Option<ActiveMigration>>> = Arc::new(Mutex::new(None));
+        // Kept alive for the whole test: a dropped sender makes every
+        // `shutdown_rx.changed()` resolve immediately, which would let
+        // the wait loop's `tokio::select!` exit on its very first poll
+        // regardless of the capped deadline this test means to exercise.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::clone(&active_migration),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx,
+        };
+
+        let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
+        let expected: usize = (0..20u8)
+            .filter(|index| before.is_owner(&key(format!("key-{index}").as_bytes()), "leaver", 1))
+            .count();
+        assert!(expected > 0, "the sample must give the leaver some keys");
+
+        // Keeps installing a brand new, not-yet-aborted "phantom" join
+        // migration every 10ms — faster than the wait's own 100ms poll —
+        // so `run_decommission`'s own initial `abort_requested.store`
+        // (which only ever touches whatever was present at the very
+        // start) can never be the one that clears it.
+        let hammer_stop = Arc::new(AtomicBool::new(false));
+        let hammer_stop_for_task = Arc::clone(&hammer_stop);
+        let hammer_task = tokio::spawn(async move {
+            while !hammer_stop_for_task.load(Ordering::SeqCst) {
+                *active_migration.lock().unwrap() = Some(ActiveMigration {
+                    joining_name: "phantom-joiner".to_string(),
+                    joining_addr: "127.0.0.1:1".to_string(),
+                    joining_token: "tok-phantom".to_string(),
+                    after_ring: Arc::new(HashRing::new(vec!["leaver".to_string()])),
+                    replication: 1,
+                    completed_at: None,
+                    forwarding_grace: Duration::from_secs(60),
+                    acked_entries: None,
+                    abort_requested: Arc::new(AtomicBool::new(false)),
+                    marked_keys: Vec::new(),
+                    confirmed: false,
+                    pre_completion_ring: None,
+                    pending_clears: Vec::new(),
+                    forward_connection: Arc::new(AsyncMutex::new(None)),
+                });
+                sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // Let the hammer task install its first entry before
+        // `run_decommission` even starts — its own prologue (the initial
+        // `abort_requested.store` and the wait loop's very first busy
+        // check) runs synchronously with no `.await` of its own, so
+        // without this `active_migration` would still be empty the
+        // moment that first check runs, regardless of the task above.
+        tokio::task::yield_now().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_decommission(
+                node_context.clone(),
+                vec![discovery_addr.clone()],
+                Duration::from_secs(1),
+            ),
+        )
+        .await;
+        hammer_stop.store(true, Ordering::SeqCst);
+        hammer_task.await.unwrap();
+
+        result.expect(
+            "run_decommission must not hang past a bounded wrapper even with a migration that \
+             never clears on its own",
+        );
+
+        let frames = frames.lock().unwrap().clone();
+        assert_eq!(
+            frames.len(),
+            expected,
+            "the handoff must still get a share of the drain budget once the capped migration \
+             wait gives up — frames: {frames:?}"
+        );
+        assert_eq!(*left.lock().unwrap(), vec!["leaver".to_string()]);
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_decommissions_key_transfer_backs_off_between_retry_attempts() {
+        // Tenth-pass audit (2026-09-02): the per-key transfer loop
+        // retried a failed handoff immediately, up to `KEY_TRANSFER_ATTEMPTS`
+        // times back-to-back — a target fast-failing (e.g. ECONNREFUSED)
+        // got hit three times in a row with no pause in between,
+        // needlessly hammering an already-down peer.
+        //
+        // Reproduced against a peer that accepts every connection and
+        // closes it immediately (so each attempt fails fast rather than
+        // sitting out `OUTBOUND_IO_TIMEOUT`) while timestamping every
+        // accept. The gaps between the three recorded attempts are the
+        // two backoffs (100ms, then 200ms) — measured directly, rather
+        // than via `run_decommission`'s total wall-clock time, since the
+        // trailing forwarding-grace sleep pads that out to (close to)
+        // `drain_budget` regardless of whether a backoff ran, which
+        // would make total elapsed time an unreliable signal here.
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let attempt_times: Arc<std::sync::Mutex<Vec<Instant>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempt_times_for_task = Arc::clone(&attempt_times);
+        let peer_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = peer_listener.accept().await else {
+                    return;
+                };
+                attempt_times_for_task.lock().unwrap().push(Instant::now());
+                drop(stream);
+            }
+        });
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (_left, discovery_task) = spawn_mock_discovery(discovery_listener, peer_addr, None);
+
+        // Kept alive for the whole test (unlike the disposable
+        // `watch::channel(false).1` used elsewhere): a dropped sender
+        // makes every `shutdown_rx.changed()` resolve immediately, which
+        // would race the backoff's own `sleep` and defeat exactly what
+        // this test checks.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let node_context = NodeContext {
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: discovery_addr.clone(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx,
+        };
+
+        let before = HashRing::new(vec!["leaver".to_string(), "peer".to_string()]);
+        let owned_name = (0..200u32)
+            .map(|index| format!("key-{index}"))
+            .find(|name| before.is_owner(&key(name.as_bytes()), "leaver", 1))
+            .expect("the sample must contain an owned key");
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(owned_name.as_bytes()),
+                value: Bytes::from_static(b"v"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // Generous — this test never waits for `run_decommission` to
+        // finish (it's aborted once three attempts are observed), so the
+        // budget only needs to be large enough that `classify_decommission_key`
+        // never marks the one key `DeadlinePassed` before those attempts
+        // happen.
+        let decommission_task = tokio::spawn(run_decommission(
+            node_context.clone(),
+            vec![discovery_addr.clone()],
+            Duration::from_secs(30),
+        ));
+
+        // Bounded wait (not a fixed sleep) for all three attempts to land.
+        let wait_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if attempt_times.lock().unwrap().len() >= 3 {
+                break;
+            }
+            assert!(
+                Instant::now() < wait_deadline,
+                "expected three transfer attempts within 5s"
+            );
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        decommission_task.abort();
+        let _ = decommission_task.await;
+
+        let attempts = attempt_times.lock().unwrap().clone();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "expected exactly KEY_TRANSFER_ATTEMPTS attempts"
+        );
+        let first_gap = attempts[1].duration_since(attempts[0]);
+        let second_gap = attempts[2].duration_since(attempts[1]);
+        assert!(
+            first_gap >= Duration::from_millis(70),
+            "expected roughly a 100ms backoff before the second attempt, got {first_gap:?}"
+        );
+        assert!(
+            second_gap >= Duration::from_millis(170),
+            "expected roughly a 200ms backoff before the third attempt, got {second_gap:?}"
+        );
+        assert!(
+            second_gap > first_gap,
+            "expected the backoff to increase between attempts, got {first_gap:?} then \
+             {second_gap:?}"
+        );
 
         discovery_task.abort();
         peer_task.abort();
