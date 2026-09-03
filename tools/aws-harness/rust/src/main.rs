@@ -27,23 +27,36 @@ async fn main() {
     let client = match NanocachedClient::connect(options).await {
         Ok(client) => client,
         Err(error) => {
+            // No connection was ever established here, so there is
+            // nothing for client.close() to clean up — exiting
+            // immediately is intentional, not an oversight.
             println!("connect failed: {error}");
             std::process::exit(1);
         }
     };
 
-    match cmd {
+    // Each arm below computes an exit code instead of calling
+    // std::process::exit() directly, so client.close().await always runs
+    // before the process exits — std::process::exit() from inside a match
+    // arm here used to skip it, leaking the connection on every error
+    // path (a failed set, a bad read, or an unknown command).
+    let exit_code = match cmd {
         "write" => {
+            let mut exit_code = 0;
             for i in 0..count {
                 if let Err(error) = client
                     .set(format!("x:{label}:{i}"), format!("v-{label}-{i}"), 0)
                     .await
                 {
                     println!("set failed: {error}");
-                    std::process::exit(1);
+                    exit_code = 1;
+                    break;
                 }
             }
-            println!("wrote {count} keys for label {label}");
+            if exit_code == 0 {
+                println!("wrote {count} keys for label {label}");
+            }
+            exit_code
         }
         "read" => {
             let mut bad = Vec::new();
@@ -55,20 +68,22 @@ async fn main() {
             }
             if bad.is_empty() {
                 println!("label {label}: {count}/{count} OK");
+                0
             } else {
                 println!(
                     "label {label}: {}/{count} BAD (sample {:?})",
                     bad.len(),
                     &bad[..bad.len().min(5)]
                 );
-                std::process::exit(1);
+                1
             }
         }
         other => {
             println!("unknown command {other}");
-            std::process::exit(2);
+            2
         }
-    }
+    };
 
     client.close().await;
+    std::process::exit(exit_code);
 }
