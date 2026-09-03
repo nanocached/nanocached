@@ -527,6 +527,100 @@ class NanocachedCacheTest {
         assertThrows(NanocachedException.WrongNode.class, () -> cache.putAll(Map.of("a", "1")));
     }
 
+    // ── getAll/putAll partial-connection-loss recovery (issue #439) ───
+
+    @Test
+    void getAllRetriesAndMergesTheRemainderAfterAMidBatchConnectionDrop() {
+        // A connection dying mid-batch used to discard the whole getAll
+        // too, same as #415's ring-change regression above but for
+        // NanocachedException.PartialConnectionFailedRaw instead of
+        // PartialWrongNodeRaw: it carries every key the earlier,
+        // already-succeeded chunk(s) resolved, but getAll used to let
+        // that exception propagate uncaught, losing the resolved data
+        // too. It must now make exactly one direct retry of the
+        // still-unresolved remainder and merge the result back in.
+        int keyCount = 401; // MAX_BATCH_KEYS(400) + 1 forces exactly two `m` sub-frames
+        Map<String, String> seed = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        cache.putAll(seed);
+        node.multiGetCount.set(0);
+        // chunk 1 succeeds; both of chunk 2's attempts (the SDK's own
+        // original attempt plus its one internal reconnect-and-retry) are
+        // dropped, so the SDK throws PartialConnectionFailedRaw; the
+        // adapter's own single follow-up retry (request #4) then
+        // succeeds since the drop budget is exhausted by then.
+        node.armMultiGetDrop(1, 2);
+
+        Map<String, String> all = cache.getAll(seed.keySet());
+
+        assertEquals(seed, all);
+        assertEquals(
+                4,
+                node.multiGetCount.get(),
+                "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter-retry");
+    }
+
+    @Test
+    void getAllPropagatesConnectionFailureOnceTheAdapterRetryAlsoFails() {
+        // A connection that never recovers must not retry forever — it
+        // eventually propagates, the same as it would if the SDK's own
+        // built-in reconnect-and-retry gave up.
+        int keyCount = 401;
+        Map<String, String> seed = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        cache.putAll(seed);
+        node.multiGetCount.set(0);
+        // chunk 2's two attempts AND the adapter's own single retry's two
+        // attempts (its own internal original + reconnect-retry) all drop.
+        node.armMultiGetDrop(1, 4);
+
+        assertThrows(NanocachedException.ConnectionFailed.class, () -> cache.getAll(seed.keySet()));
+    }
+
+    @Test
+    void putAllRetriesTheRemainderAfterAMidBatchConnectionDropOnSet() {
+        // Analogous to getAllRetriesAndMergesTheRemainderAfterAMidBatchConnectionDrop
+        // above, but for putAll/setManyBytes: NanocachedException.
+        // PartialConnectionFailedSetRaw names the positions already
+        // confirmed stored (the inverse of the get side's convention —
+        // see the exception's own doc), so putAll must retry only the
+        // still-unconfirmed remainder once rather than discarding it.
+        int keyCount = 401;
+        Map<String, String> seed = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        node.multiSetCount.set(0);
+        node.armMultiSetDrop(1, 2);
+
+        cache.putAll(seed);
+
+        for (int i = 0; i < keyCount; i++) {
+            assertEquals("v" + i, cache.get("k" + i), "key k" + i + " must have landed");
+        }
+        assertEquals(
+                4,
+                node.multiSetCount.get(),
+                "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter-retry");
+    }
+
+    @Test
+    void putAllPropagatesConnectionFailureOnceTheAdapterRetryAlsoFailsOnSet() {
+        int keyCount = 401;
+        Map<String, String> seed = new HashMap<>();
+        for (int i = 0; i < keyCount; i++) {
+            seed.put("k" + i, "v" + i);
+        }
+        node.multiSetCount.set(0);
+        node.armMultiSetDrop(1, 4);
+
+        assertThrows(NanocachedException.ConnectionFailed.class, () -> cache.putAll(seed));
+    }
+
     /** creation → 60 s, update → 30 s: two distinct TTLs within one putAll. */
     private static final class SplitExpiryPolicy implements ExpiryPolicy, java.io.Serializable {
         @Override
