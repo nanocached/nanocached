@@ -150,7 +150,9 @@ pub enum Command {
     /// directly by the migration task to snapshot every key this node
     /// currently holds, to compute which ones a newly joining node now
     /// owns. See `Response::Keys` and `Cache::keys`'s doc comment for why
-    /// this is keys-only rather than full entries.
+    /// this is keys-only rather than full entries, and (tenth-pass audit,
+    /// 2026-09-02) for why that snapshot's O(n) synchronous cost is a
+    /// documented limitation rather than something this bounds.
     ListEntries,
     /// Internal-only (staged node join): the migration task's live re-check of a
     /// single key's current value right before sending it, instead of

@@ -48,8 +48,12 @@ type Entries = LruCache<Bytes, Entry, RandomState>;
 struct Namespace {
     entries: Entries,
     /// This namespace's share of `Cache::used_bytes`: key + value +
-    /// `ENTRY_OVERHEAD_BYTES` per entry (the `migrated` marks' duplicate
-    /// bytes are accounted globally, not here).
+    /// `ENTRY_OVERHEAD_BYTES` per entry, plus the duplicate key bytes of
+    /// any of this namespace's entries currently `migrated`-marked
+    /// (`mark_migrated`/`clear_migrated_mark` credit/debit this alongside
+    /// the global `Cache::used_bytes`, so the per-namespace rows stay
+    /// consistent with the total mid-migration — see `mark_migrated`'s
+    /// own doc comment).
     used_bytes: usize,
 }
 
@@ -762,14 +766,26 @@ impl Cache {
     /// still runs synchronously on the single cache actor task
     /// (`run_cache` in `src/server.rs`), so calling this still blocks
     /// every other request the actor handles for as long as it takes to
-    /// walk the whole cache — the walk itself isn't chunked/budgeted (that
-    /// would need the migration protocol to support resuming a partial
-    /// listing across multiple round trips instead of one; left as a
-    /// larger follow-up), only the per-entry value/TTL work it used to
-    /// also do is gone. `src/server.rs`'s `handle_connection` (the `M`
-    /// handler) takes exactly one such snapshot per migration and reuses
-    /// it for both `entries_to_send_count` and `run_migration`, rather
-    /// than calling this twice.
+    /// walk the whole cache.
+    ///
+    /// Tenth-pass audit (2026-09-02): this is the same O(n) full-cache
+    /// scan (with `Bytes` refcount clones, not copies) `sweep`'s own
+    /// `pending_removal` refill already does when its queue runs dry
+    /// (`self.pending_removal.extend(self.namespaces.iter().flat_map(...))`,
+    /// below) — an accepted pattern here, not unique to this method:
+    /// scanning is measured cheap (~4ms/1M entries) relative to mutating,
+    /// which is why `sweep` only chunks its *removals*, never this walk.
+    /// A pagination attempt was tried and reverted (see PR #447's
+    /// history) — it moved the transfer over the request channel into
+    /// bounded pages, but `Command::ListEntries`'s first page still paid
+    /// this exact synchronous scan, so nothing was actually bounded, and
+    /// the reverted version *also* held the whole scanned snapshot as new
+    /// actor-side state (a `listings` map with its own eviction/restart
+    /// semantics) for no corresponding benefit. Bounding the scan itself
+    /// would need a data structure that can answer "the next N keys after
+    /// this cursor" without walking everything preceding it — an ordered
+    /// per-namespace index, not present today — which is out of scope
+    /// here; left as a documented limitation.
     pub fn keys(&self) -> Vec<Key> {
         self.keys_at(Instant::now())
     }

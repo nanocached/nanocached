@@ -216,6 +216,10 @@ const KEY_TRANSFER_ATTEMPTS: u32 = 3;
 /// another large request. Well above ordinary command sizes so typical
 /// traffic never churns an allocation on every drained buffer.
 const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
+/// Tenth-pass audit (2026-09-02): once `ActiveMigration::pending_clears`
+/// would hold more distinct namespaces than this, it degrades to a single
+/// clear-all instead — see `PendingClears`.
+const MAX_PENDING_CLEAR_NAMESPACES: usize = 1024;
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -1405,10 +1409,35 @@ async fn run_metrics_server(
     mut shutdown_rx: watch::Receiver<bool>,
     metrics_connection_limit: Arc<Semaphore>,
 ) {
+    // Tenth-pass audit (2026-09-02): these used to be bare detached
+    // `tokio::spawn`s — a panic in `serve_metrics_connection`/
+    // `render_node_metrics` went unobserved, and the tasks were untracked
+    // at shutdown (nothing here awaited or aborted them; the process
+    // exiting was the only thing that ever stopped one). Tracked in a
+    // `JoinSet` instead, reaped as it goes — same shape as `run`'s own
+    // `connection_tasks` — so a panic is logged and shutdown can abort
+    // whatever's left. Bounded by `metrics_connection_limit` regardless,
+    // so this never grows past that many outstanding at once.
+    let mut connection_tasks: JoinSet<()> = JoinSet::new();
+
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
-            _ = shutdown_rx.changed() => return,
+
+            result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("WARN metrics connection task failed: {error}");
+                }
+                continue;
+            }
+
+            _ = shutdown_rx.changed() => {
+                // The task itself is aborted by dropping it (`abort_all`
+                // is redundant with that, but says so explicitly rather
+                // than relying on `JoinSet`'s drop behavior).
+                connection_tasks.abort_all();
+                return;
+            }
         };
         let (stream, _) = match accepted {
             Ok(pair) => pair,
@@ -1440,7 +1469,7 @@ async fn run_metrics_server(
         let request_tx = request_tx.clone();
         let connection_limit = Arc::clone(&connection_limit);
         let known_ring = Arc::clone(&known_ring);
-        tokio::spawn(async move {
+        connection_tasks.spawn(async move {
             let _metrics_permit = metrics_permit;
             let _ = timeout(
                 Duration::from_secs(5),
@@ -3736,6 +3765,71 @@ struct Membership {
 /// discovery (issue #30).
 type KnownRing = Arc<Mutex<Option<Arc<Membership>>>>;
 
+/// Tenth-pass audit (2026-09-02): `ActiveMigration::pending_clears`,
+/// collapsed rather than a plain queue so an authenticated client issuing
+/// many `c`/`F` while a join is in flight can't grow this — and the
+/// serial, one-round-trip-each replay `drain_pending_clears` does at
+/// handoff completion — without bound.
+///
+/// A clear only removes entries and replaying one twice has the same
+/// effect as replaying it once, so collapsing is safe in every direction:
+///
+/// - `ClearScope::All` supersedes everything queued before or after it —
+///   nothing a later clear could add isn't already covered, so pushing it
+///   discards every queued namespace and any further namespace push is a
+///   no-op.
+/// - Duplicate `ClearScope::Namespace` scopes collapse to one.
+/// - Past `MAX_PENDING_CLEAR_NAMESPACES` distinct namespaces, the queue
+///   degrades to a single clear-all. This clears more than the client
+///   asked for on the joining node, but that's a harmless miss there —
+///   never a resurrection or a stale read — so it's a safe way to bound
+///   both memory and the replay's round-trip count regardless of how many
+///   distinct namespaces a client clears during one handoff.
+#[derive(Default)]
+struct PendingClears {
+    all: bool,
+    namespaces: HashSet<Bytes>,
+}
+
+impl PendingClears {
+    /// Queues one clear, collapsing per the type's own doc comment.
+    fn push(&mut self, scope: ClearScope) {
+        if self.all {
+            return;
+        }
+        match scope {
+            ClearScope::All => {
+                self.all = true;
+                self.namespaces.clear();
+            }
+            ClearScope::Namespace(namespace) => {
+                self.namespaces.insert(namespace);
+                if self.namespaces.len() > MAX_PENDING_CLEAR_NAMESPACES {
+                    self.all = true;
+                    self.namespaces.clear();
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        !self.all && self.namespaces.is_empty()
+    }
+
+    /// Takes every queued clear, leaving this empty — the collapsed
+    /// counterpart of `std::mem::take` on the old `Vec<ClearScope>`.
+    fn take(&mut self) -> Vec<ClearScope> {
+        if self.all {
+            self.all = false;
+            self.namespaces.clear();
+            vec![ClearScope::All]
+        } else {
+            self.namespaces.drain().map(ClearScope::Namespace).collect()
+        }
+    }
+}
+
 /// A `run_migration` in flight: which handoff it's for, where the joining
 /// node is, the ring this handoff computed (so a concurrent client write
 /// on another connection can tell whether *its* key is one this handoff
@@ -3821,7 +3915,7 @@ struct ActiveMigration {
     /// while `completed_at` is `None` (both under this slot's lock), so
     /// the final drain after `completed()` is stamped sees everything;
     /// from then on clears forward like any other write.
-    pending_clears: Vec<ClearScope>,
+    pending_clears: PendingClears,
     /// Persistent connection to the joining node, shared by every
     /// `set_on_joining_node`/`delete_on_joining_node` call this handoff's
     /// concurrent client writes trigger (see `migration_target_for` and
@@ -4080,7 +4174,7 @@ impl MigrationGuard {
             marked_keys: Vec::new(),
             confirmed: false,
             pre_completion_ring: None,
-            pending_clears: Vec::new(),
+            pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
         drop(guard);
@@ -4749,7 +4843,7 @@ async fn drain_pending_clears(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match slot.as_mut() {
-            Some(active) => std::mem::take(&mut active.pending_clears),
+            Some(active) => active.pending_clears.take(),
             None => Vec::new(),
         }
     };
@@ -6165,10 +6259,7 @@ struct ForwardTarget {
 
 /// Bounded by `FORWARD_TIMEOUT` as a single whole — see that constant's
 /// doc comment for why this can't just rely on `connect_and_authenticate`
-/// and `send_set`'s own per-leg `OUTBOUND_IO_TIMEOUT`s: this call runs
-/// synchronously inside a client's connection task (`handle_connection`'s
-/// `S` handling), so its worst case directly stalls that client's
-/// pipeline.
+/// and `send_set`'s own per-leg `OUTBOUND_IO_TIMEOUT`s.
 ///
 /// Issue: this used to call `connect_and_authenticate` fresh on every
 /// call, opening (and, once dropped, leaking into TIME_WAIT) a brand new
@@ -6177,6 +6268,20 @@ struct ForwardTarget {
 /// avoid (see `ActiveMigration`'s doc comment on
 /// `forward_connection`). Reuses `target.connection` instead, connecting
 /// only when there isn't already a live connection there.
+///
+/// Tenth-pass audit (2026-09-02): test-only now. `forward_with_retries`
+/// (the only production path a concurrent client write's forward takes —
+/// see `spawn_forward`) no longer calls this: it needs `target.connection`
+/// held across its *entire* retry sequence, not locked fresh per attempt
+/// the way this lone-attempt primitive does, so its `attempt()` calls
+/// `forward_on_locked_connection` directly instead. Kept (with
+/// `forward_on_shared_connection` and `delete_on_joining_node`) as the
+/// simplest way to exercise the single-attempt/connection-reuse/
+/// timeout-bounding behavior in isolation, without the retry loop or its
+/// own timing, in the tests that already did — see
+/// `forward_on_shared_connection`'s and `forward_on_locked_connection`'s
+/// own doc comments for how the two paths now share their actual I/O.
+#[cfg(test)]
 async fn set_on_joining_node(
     node_context: &NodeContext,
     target: &ForwardTarget,
@@ -6378,17 +6483,48 @@ enum OwnedForwardedWrite {
 }
 
 impl OwnedForwardedWrite {
-    /// Attempts this write once via `set_on_joining_node`/
-    /// `delete_on_joining_node` — the same single-attempt primitives
-    /// `forward_with_retries` used to call directly, now wrapped in its
-    /// retry loop instead of replaced by a new code path.
-    async fn attempt(&self, node_context: &NodeContext, target: &ForwardTarget) -> io::Result<()> {
+    /// Attempts this write once via `forward_on_locked_connection`, on a
+    /// connection guard the caller (`forward_with_retries`) already
+    /// holds — see that function's own doc comment and
+    /// `forward_on_locked_connection`'s for why this doesn't lock
+    /// `target.connection` itself the way the old single-attempt
+    /// primitives (`set_on_joining_node`/`delete_on_joining_node`) still
+    /// do for their own, lone-attempt callers.
+    async fn attempt(
+        &self,
+        node_context: &NodeContext,
+        target: &ForwardTarget,
+        connection: &mut Option<ClientStream>,
+    ) -> io::Result<()> {
+        // Fresh per attempt: the lock (held by the caller across every
+        // attempt) is never what this budgets — only this attempt's own
+        // reconnect-plus-send.
+        let deadline = tokio::time::Instant::now() + FORWARD_TIMEOUT;
+
         match self {
             OwnedForwardedWrite::Set { key, value, ttl } => {
-                set_on_joining_node(node_context, target, key, value, *ttl).await
+                forward_on_locked_connection(
+                    node_context,
+                    &target.addr,
+                    connection,
+                    ForwardedWrite::Set {
+                        key,
+                        value,
+                        ttl: *ttl,
+                    },
+                    deadline,
+                )
+                .await
             }
             OwnedForwardedWrite::Delete { key } => {
-                delete_on_joining_node(node_context, target, key).await
+                forward_on_locked_connection(
+                    node_context,
+                    &target.addr,
+                    connection,
+                    ForwardedWrite::Delete { key },
+                    deadline,
+                )
+                .await
             }
             OwnedForwardedWrite::HandoffSet {
                 key,
@@ -6396,9 +6532,10 @@ impl OwnedForwardedWrite {
                 ttl,
                 if_absent,
             } => {
-                forward_on_shared_connection(
+                forward_on_locked_connection(
                     node_context,
-                    target,
+                    &target.addr,
+                    connection,
                     ForwardedWrite::HandoffSet {
                         key,
                         value,
@@ -6414,23 +6551,32 @@ impl OwnedForwardedWrite {
                         // node's — see `Command::HandoffSet::token`.
                         token: &target.token,
                     },
+                    deadline,
                 )
                 .await
             }
             OwnedForwardedWrite::HandoffDelete { key } => {
-                forward_on_shared_connection(
+                forward_on_locked_connection(
                     node_context,
-                    target,
+                    &target.addr,
+                    connection,
                     ForwardedWrite::HandoffDelete {
                         key,
                         token: &target.token,
                     },
+                    deadline,
                 )
                 .await
             }
             OwnedForwardedWrite::Clear(scope) => {
-                forward_on_shared_connection(node_context, target, ForwardedWrite::Clear(scope))
-                    .await
+                forward_on_locked_connection(
+                    node_context,
+                    &target.addr,
+                    connection,
+                    ForwardedWrite::Clear(scope),
+                    deadline,
+                )
+                .await
             }
         }
     }
@@ -6484,6 +6630,13 @@ impl OwnedForwardedWrite {
 /// itself. Waiting for the guard still counts against the same
 /// `FORWARD_TIMEOUT` deadline, so the call as a whole stays bounded even
 /// when another forward is holding the connection.
+///
+/// Tenth-pass audit (2026-09-02): test-only now, alongside
+/// `set_on_joining_node`/`delete_on_joining_node` — see
+/// `set_on_joining_node`'s doc comment for why the production path
+/// (`forward_with_retries`) no longer reaches this, and
+/// `forward_on_locked_connection` for the actual I/O both paths share.
+#[cfg(test)]
 async fn forward_on_shared_connection(
     node_context: &NodeContext,
     target: &ForwardTarget,
@@ -6497,10 +6650,40 @@ async fn forward_on_shared_connection(
         .await
         .map_err(|_| timed_out())?;
 
+    forward_on_locked_connection(node_context, &target.addr, &mut connection, write, deadline).await
+}
+
+/// `forward_on_shared_connection`'s guts — reconnect-if-needed, send,
+/// clear the slot on anything but a clean success — factored out so a
+/// caller that must hold `target.connection`'s guard across *more* than
+/// one attempt (`forward_with_retries`, below) can call this directly
+/// instead of going through `forward_on_shared_connection`, which insists
+/// on locking `target.connection` itself. Locking it again while a guard
+/// from an outer scope is already held would deadlock —
+/// `tokio::sync::Mutex` isn't reentrant — which is exactly the shape
+/// `forward_with_retries`'s per-attempt loop needs to avoid now that it
+/// holds the lock across every attempt (Tenth-pass audit, 2026-09-02;
+/// see that function's own doc comment).
+///
+/// `deadline` is the caller's to set: `forward_on_shared_connection`
+/// passes through the same one it used to bound the lock wait — one
+/// `FORWARD_TIMEOUT` for the whole call, unchanged — while
+/// `forward_with_retries` gives each attempt its own fresh
+/// `FORWARD_TIMEOUT` (the lock is already held by the time it's called,
+/// so there's no wait to fold into that budget).
+async fn forward_on_locked_connection(
+    node_context: &NodeContext,
+    addr: &str,
+    connection: &mut Option<ClientStream>,
+    write: ForwardedWrite<'_>,
+    deadline: tokio::time::Instant,
+) -> io::Result<()> {
+    let timed_out_message = write.timed_out_message();
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, timed_out_message);
+
     let result = tokio::time::timeout_at(deadline, async {
         if connection.is_none() {
-            *connection =
-                Some(connect_and_authenticate(node_context, &target.addr, AuthPeer::Node).await?);
+            *connection = Some(connect_and_authenticate(node_context, addr, AuthPeer::Node).await?);
         }
         // Just ensured `Some` above (and nothing else can steal the slot
         // back to `None` while this guard is held).
@@ -6565,13 +6748,55 @@ async fn forward_on_shared_connection(
 /// this replaces (see `forwarding_grace`, which exists precisely because
 /// that window isn't instant), just now bounded by up to
 /// `KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT` instead of one.
+///
+/// Tenth-pass audit (2026-09-02): `target.connection`'s guard is acquired
+/// once here, before the retry loop, and held for every attempt in it —
+/// not reacquired per attempt the way a lone call through
+/// `forward_on_shared_connection` does. Before this, two concurrent
+/// forwards to the *same* key (e.g. a client overwriting a key twice in
+/// quick succession while it's mid-handoff) could interleave their
+/// attempts: forward A's attempt 1 fails and drops the connection: before
+/// A's attempt 2 runs, forward B — a newer write to the same key, spawned
+/// moments later — could acquire the now-free connection, send, and
+/// succeed, landing *before* A's own retry lands moments after it. On the
+/// target that's a stale value winning over a fresher one, silently
+/// violating last-writer-wins.
+///
+/// Holding the lock for the whole sequence fixes this only if forwards
+/// actually reach `target.connection.lock()` in the same order they were
+/// enqueued — verified true here: `spawn_forward` hands each forward to
+/// `run`'s `forward_rx` consumer in the order `try_send`/the waiter's
+/// `send` succeeded, which is the order `handle_connection` issued the
+/// underlying writes in (each connection's own writes are already
+/// serialized, one in flight at a time); that consumer spawns each into
+/// `connection_tasks` in the order it receives them from the channel
+/// (FIFO); and the whole process runs `#[tokio::main(flavor =
+/// "current_thread")]` (see `main.rs`) — one OS thread, cooperative
+/// scheduling, no other `.await` between a task being spawned and this
+/// function's very first line — so freshly spawned forward tasks reach
+/// `target.connection.lock().await` in spawn order, and `tokio::sync::
+/// Mutex`'s FIFO-fair wait queue keeps that the acquisition order too.
+/// (A multi-threaded runtime would need a dedicated per-target ordered
+/// worker instead of this reasoning — noted here since it's the kind of
+/// invariant a runtime-flavor change could silently break.)
+///
+/// Deliberately *not* bounded by a timeout: a forward waiting for its
+/// turn on a busy target isn't stuck or failed, just queued — timing out
+/// the wait and giving up would let a later-enqueued forward jump ahead
+/// of it, exactly the reordering this exists to prevent. The wait is
+/// still finite in practice, bounded by how many forwards to the same
+/// target are outstanding at once (`FORWARD_CHANNEL_CAPACITY` +
+/// `MAX_PENDING_FORWARD_WAITERS`) times each one's own worst case
+/// (`KEY_TRANSFER_ATTEMPTS` x `FORWARD_TIMEOUT`).
 async fn forward_with_retries(
     node_context: NodeContext,
     target: ForwardTarget,
     write: OwnedForwardedWrite,
 ) {
+    let mut connection = target.connection.lock().await;
+
     for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
-        match write.attempt(&node_context, &target).await {
+        match write.attempt(&node_context, &target, &mut connection).await {
             Ok(()) => return,
             Err(error) => {
                 eprintln!(
@@ -6734,6 +6959,10 @@ fn leave_target_for(node_context: &NodeContext, key: &Key) -> Option<ForwardTarg
 /// migration task's own send of it) as a successful delivery. Bounded by
 /// `FORWARD_TIMEOUT` as a single whole, same reasoning as
 /// `set_on_joining_node`, and reuses `target.connection` the same way.
+///
+/// Tenth-pass audit (2026-09-02): test-only now — see
+/// `set_on_joining_node`'s doc comment.
+#[cfg(test)]
 async fn delete_on_joining_node(
     node_context: &NodeContext,
     target: &ForwardTarget,
@@ -7379,6 +7608,131 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_forwards_retry_is_not_interleaved_by_a_later_forward_to_the_same_key() {
+        // Tenth-pass audit (2026-09-02) regression: `forward_on_shared_
+        // connection` used to lock `target.connection` once per attempt,
+        // not for a forward's whole retry sequence. That let two
+        // concurrent forwards to the same key reorder: if forward A's
+        // first attempt failed (dropping the connection) right as
+        // forward B — a newer write to the same key, issued moments
+        // later — made its own first attempt, B could grab the
+        // now-free connection and land on the wire *before* A's own
+        // retry, so the target ends up with A's (older) value winning
+        // over B's (newer) one — silently violating last-writer-wins.
+        // `forward_with_retries` now holds the connection lock for its
+        // entire retry sequence, so B can't even attempt until A's
+        // sequence (every retry) has finished.
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+
+        let recorded: RecordedFrames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&recorded);
+        let (frame_a_seen_tx, frame_a_seen_rx) = oneshot::channel::<()>();
+        let joining_task = tokio::spawn(async move {
+            // Forward A's attempt 1: accept, read its frame, then drop
+            // the connection without acking — a transient failure, same
+            // as `forward_with_retries_recovers_from_a_single_transient_
+            // failure`. Signals the test only *after* reading the frame,
+            // so the test can't spawn forward B until forward A is
+            // already mid-sequence (and holding the lock).
+            let (mut first, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let bytes_read = first.read(&mut buffer).await.unwrap();
+            recorder.lock().unwrap().push(buffer[..bytes_read].to_vec());
+            let _ = frame_a_seen_tx.send(());
+            drop(first);
+
+            // The next connection is forward A's own retry — proof B
+            // didn't jump the queue while A's connection was down. It
+            // stays open afterwards for reuse (the whole point of
+            // `ForwardTarget::connection`), so forward B's own write —
+            // issued only once A's *entire* retry sequence has finished
+            // — arrives as a second frame on this same connection, not a
+            // fresh one.
+            let (mut second, _) = joining_listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let bytes_read = second.read(&mut buffer).await.unwrap();
+                assert!(bytes_read > 0);
+                recorder.lock().unwrap().push(buffer[..bytes_read].to_vec());
+                second.write_all(b"S\n").await.unwrap();
+            }
+        });
+
+        let node_context = NodeContext {
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            rereplication_tx: mpsc::channel(1).0,
+            shutdown_rx: watch::channel(false).1,
+        };
+        let connection = Arc::new(AsyncMutex::new(None));
+
+        // Forward A, issued first: the older write.
+        let forward_a = tokio::spawn(forward_with_retries(
+            node_context.clone(),
+            ForwardTarget {
+                addr: joining_addr.clone(),
+                connection: Arc::clone(&connection),
+                token: "tok-target".to_string(),
+            },
+            OwnedForwardedWrite::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"old"),
+                ttl: None,
+            },
+        ));
+
+        // Issued only once forward A's first attempt has actually
+        // reached the joining node — i.e. strictly after A, and while
+        // A's retry sequence is still in progress.
+        frame_a_seen_rx.await.unwrap();
+        let forward_b = tokio::spawn(forward_with_retries(
+            node_context,
+            ForwardTarget {
+                addr: joining_addr,
+                connection: Arc::clone(&connection),
+                token: "tok-target".to_string(),
+            },
+            OwnedForwardedWrite::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"new"),
+                ttl: None,
+            },
+        ));
+
+        forward_a.await.unwrap();
+        forward_b.await.unwrap();
+        joining_task.await.unwrap();
+
+        let recorded = recorded.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 3);
+        // `S 2 3\nname` + "old"/"new" — the value trails the header, so
+        // a simple substring check is enough here.
+        assert!(
+            recorded[0].ends_with(b"old"),
+            "forward A's first (failed) attempt: {:?}",
+            recorded[0]
+        );
+        assert!(
+            recorded[1].ends_with(b"old"),
+            "the reconnect right after A's failure must be A's own retry, not B's value: {:?}",
+            recorded[1]
+        );
+        assert!(
+            recorded[2].ends_with(b"new"),
+            "B's write must only land after A's whole sequence finished: {:?}",
+            recorded[2]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_full_forward_channel_does_not_block_a_write_on_another_connection() {
         // Regression (issue #219): every per-write forward
         // (`forward_with_retries`) used to share `migration_tx` with the
@@ -7447,7 +7801,7 @@ mod tests {
                 marked_keys: Vec::new(),
                 confirmed: false,
                 pre_completion_ring: None,
-                pending_clears: Vec::new(),
+                pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
@@ -7586,7 +7940,7 @@ mod tests {
                 marked_keys: Vec::new(),
                 confirmed: false,
                 pre_completion_ring: None,
-                pending_clears: Vec::new(),
+                pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
@@ -7908,6 +8262,73 @@ mod tests {
         // Once the permit is free again, a scrape gets answered normally.
         let (status, _) = http_get(&addr, "/healthz").await;
         assert_eq!(status, "HTTP/1.1 200 OK");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metrics_server_aborts_outstanding_connections_on_shutdown() {
+        // Tenth-pass audit: before this fix, `run_metrics_server` spawned
+        // each connection with a bare detached `tokio::spawn` — untracked,
+        // so shutdown here returned without ever touching a connection
+        // still mid-request, leaving it to run for up to its own 5-second
+        // timeout regardless. Now it's tracked in a `JoinSet` and
+        // `abort_all`'d on shutdown, so a connection stuck mid-request
+        // (never sending a complete HTTP head) is torn down immediately —
+        // observable as its socket closing right away instead of staying
+        // open.
+        let (request_tx, _request_rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let metrics_task = tokio::spawn(run_metrics_server(
+            listener,
+            request_tx,
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            DEFAULT_MAX_CONNECTIONS,
+            Arc::new(Mutex::new(None)),
+            false,
+            shutdown_rx,
+            Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS)),
+        ));
+
+        let mut stuck = TcpStream::connect(&addr).await.unwrap();
+        // An incomplete HTTP head: `read_http_request_path` blocks on more
+        // bytes that never come, holding this connection's task alive
+        // until something tears it down.
+        stuck.write_all(b"GET /healthz HTTP/1.1\r\n").await.unwrap();
+        // Give the accept loop a beat to actually spawn the connection
+        // task before shutdown races it.
+        tokio::task::yield_now().await;
+
+        shutdown_tx.send_replace(true);
+
+        timeout(Duration::from_secs(1), metrics_task)
+            .await
+            .expect("run_metrics_server must return promptly on shutdown")
+            .unwrap();
+
+        // The aborted connection task's socket half closes essentially
+        // immediately — well inside `serve_metrics_connection`'s own
+        // 5-second timeout, which is what this test would degrade to
+        // without the fix. An abrupt abort (rather than a graceful
+        // shutdown) can surface to the peer as a clean EOF or as a reset,
+        // depending on platform/timing — same ambiguity
+        // `metrics_listener_caps_its_own_concurrent_connections` already
+        // accepts for the same reason.
+        let mut buffer = [0u8; 1];
+        let read = timeout(Duration::from_secs(1), stuck.read(&mut buffer))
+            .await
+            .expect("the stuck connection must be aborted, not left running");
+        match read {
+            Ok(read) => assert_eq!(read, 0, "expected the peer to close the socket"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+                ),
+                "unexpected read error on the aborted connection: {error}"
+            ),
+        }
     }
 
     #[test]
@@ -8849,7 +9270,7 @@ mod tests {
                 marked_keys: Vec::new(),
                 confirmed: false,
                 pre_completion_ring: None,
-                pending_clears: Vec::new(),
+                pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
@@ -8873,11 +9294,13 @@ mod tests {
             ClearRoute::Queued
         ));
         {
-            let slot = node_context.active_migration.lock().unwrap();
-            assert_eq!(
-                slot.as_ref().unwrap().pending_clears,
-                vec![scope.clone(), ClearScope::All]
-            );
+            // Tenth-pass audit: the `F` collapses the namespace clear
+            // queued before it — `ClearScope::All` supersedes everything.
+            let mut slot = node_context.active_migration.lock().unwrap();
+            let pending = &mut slot.as_mut().unwrap().pending_clears;
+            assert!(pending.all);
+            assert!(pending.namespaces.is_empty());
+            assert_eq!(pending.take(), vec![ClearScope::All]);
         }
 
         // Completed, forwarding window open: forwarded to the joiner.
@@ -8908,6 +9331,69 @@ mod tests {
             route_clear(&node_context, &scope),
             ClearRoute::None
         ));
+    }
+
+    #[test]
+    fn pending_clears_dedupes_distinct_namespaces() {
+        // Tenth-pass audit: pushing the same namespace twice, and two
+        // different namespaces, must not grow past what's actually
+        // distinct.
+        let mut pending = PendingClears::default();
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"users")));
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"users")));
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"orders")));
+        assert!(!pending.all);
+        assert_eq!(pending.namespaces.len(), 2);
+
+        let mut taken = pending.take();
+        taken.sort_by(|a, b| {
+            let ClearScope::Namespace(a) = a else {
+                unreachable!()
+            };
+            let ClearScope::Namespace(b) = b else {
+                unreachable!()
+            };
+            a.cmp(b)
+        });
+        assert_eq!(
+            taken,
+            vec![
+                ClearScope::Namespace(Bytes::from_static(b"orders")),
+                ClearScope::Namespace(Bytes::from_static(b"users")),
+            ]
+        );
+        // `take` leaves it empty for the next round.
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_clears_all_supersedes_and_absorbs_further_pushes() {
+        // Tenth-pass audit: a clear-all queued at any point makes every
+        // other queued (or later pushed) scope redundant — clearing more
+        // than asked on the joiner is a harmless miss, never a
+        // resurrection, so collapsing to it is safe.
+        let mut pending = PendingClears::default();
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"users")));
+        pending.push(ClearScope::All);
+        pending.push(ClearScope::Namespace(Bytes::from_static(b"orders")));
+        assert!(pending.all);
+        assert!(pending.namespaces.is_empty());
+        assert_eq!(pending.take(), vec![ClearScope::All]);
+    }
+
+    #[test]
+    fn pending_clears_degrades_to_all_past_the_namespace_cap() {
+        // Tenth-pass audit: an authenticated client clearing more than
+        // `MAX_PENDING_CLEAR_NAMESPACES` distinct namespaces during one
+        // handoff must not grow this queue without bound — it collapses
+        // to a single clear-all instead.
+        let mut pending = PendingClears::default();
+        for index in 0..=MAX_PENDING_CLEAR_NAMESPACES {
+            pending.push(ClearScope::Namespace(Bytes::from(format!("ns{index}"))));
+        }
+        assert!(pending.all);
+        assert!(pending.namespaces.is_empty());
+        assert_eq!(pending.take(), vec![ClearScope::All]);
     }
 
     type RecordedFrames = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
@@ -9457,7 +9943,7 @@ mod tests {
                 marked_keys: Vec::new(),
                 confirmed: false,
                 pre_completion_ring: None,
-                pending_clears: Vec::new(),
+                pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
@@ -9576,7 +10062,7 @@ mod tests {
                 marked_keys: Vec::new(),
                 confirmed: false,
                 pre_completion_ring: None,
-                pending_clears: Vec::new(),
+                pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(None)),
@@ -9853,7 +10339,7 @@ mod tests {
                         marked_keys: Vec::new(),
                         confirmed: false,
                         pre_completion_ring: None,
-                        pending_clears: Vec::new(),
+                        pending_clears: PendingClears::default(),
                         forward_connection: Arc::new(AsyncMutex::new(None)),
                     });
                 }
@@ -10662,7 +11148,7 @@ mod tests {
                     marked_keys: Vec::new(),
                     confirmed: false,
                     pre_completion_ring: None,
-                    pending_clears: Vec::new(),
+                    pending_clears: PendingClears::default(),
                     forward_connection: Arc::new(AsyncMutex::new(None)),
                 });
                 sleep(Duration::from_millis(10)).await;
@@ -11634,7 +12120,7 @@ mod tests {
                     .collect(),
                 confirmed: false,
                 pre_completion_ring: Some(Arc::clone(&pre_completion_ring)),
-                pending_clears: Vec::new(),
+                pending_clears: PendingClears::default(),
                 forward_connection: Arc::new(AsyncMutex::new(None)),
             }))),
             known_ring: Arc::new(Mutex::new(Some(Arc::new(Membership {
@@ -11905,7 +12391,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: true,
             pre_completion_ring: None,
-            pending_clears: Vec::new(),
+            pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         });
 
@@ -11939,7 +12425,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: true,
             pre_completion_ring: None,
-            pending_clears: Vec::new(),
+            pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -11987,7 +12473,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: false,
             pre_completion_ring: None,
-            pending_clears: Vec::new(),
+            pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         })));
 
@@ -12581,7 +13067,7 @@ mod tests {
                 .collect(),
             confirmed: false,
             pre_completion_ring: None,
-            pending_clears: Vec::new(),
+            pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }
@@ -13477,7 +13963,7 @@ mod tests {
             marked_keys: Vec::new(),
             confirmed: false,
             pre_completion_ring: None,
-            pending_clears: Vec::new(),
+            pending_clears: PendingClears::default(),
             forward_connection: Arc::new(AsyncMutex::new(None)),
         }
     }
