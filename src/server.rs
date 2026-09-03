@@ -10339,7 +10339,7 @@ mod tests {
                         marked_keys: Vec::new(),
                         confirmed: false,
                         pre_completion_ring: None,
-                        pending_clears: Vec::new(),
+                        pending_clears: PendingClears::default(),
                         forward_connection: Arc::new(AsyncMutex::new(None)),
                     });
                 }
@@ -11148,7 +11148,7 @@ mod tests {
                     marked_keys: Vec::new(),
                     confirmed: false,
                     pre_completion_ring: None,
-                    pending_clears: Vec::new(),
+                    pending_clears: PendingClears::default(),
                     forward_connection: Arc::new(AsyncMutex::new(None)),
                 });
                 sleep(Duration::from_millis(10)).await;
