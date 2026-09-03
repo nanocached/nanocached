@@ -24,10 +24,6 @@ pub(crate) const SWEEP_BUDGET: usize = 2_000;
 /// closer figure is measured later, this is the only place to change it.
 pub(crate) const ENTRY_OVERHEAD_BYTES: usize = 100;
 
-/// Tenth-pass audit (2026-09-02): caps `Cache::listings` — see
-/// `Cache::keys_page`'s doc comment.
-const MAX_LISTING_SESSIONS: usize = 64;
-
 struct Entry {
     value: Bytes,
     expires_at: Option<Instant>,
@@ -164,14 +160,6 @@ pub struct Cache {
     /// so an in-progress sweep pass isn't rescanned from scratch every
     /// call.
     pending_removal: VecDeque<Key>,
-    /// Tenth-pass audit (2026-09-02): in-progress `Command::ListEntries`
-    /// listings, keyed by the cursor `keys_page` handed back for each —
-    /// see that method's doc comment.
-    listings: HashMap<u64, VecDeque<Key>>,
-    /// `listings`' keys, oldest first, so `keys_page` can evict the
-    /// longest-idle listing in O(1) once `MAX_LISTING_SESSIONS` is hit.
-    listing_order: VecDeque<u64>,
-    next_listing_id: u64,
 }
 
 impl Entry {
@@ -312,9 +300,6 @@ impl Cache {
             cas_deletes: 0,
             migrated: HashSet::new(),
             pending_removal: VecDeque::new(),
-            listings: HashMap::new(),
-            listing_order: VecDeque::new(),
-            next_listing_id: 0,
         }
     }
 
@@ -775,25 +760,36 @@ impl Cache {
     /// Used to clone every key *and* value *and* compute each one's
     /// remaining TTL in this same synchronous walk — real work (issue
     /// #19's audit) for data neither consumer above ever looked at once
-    /// `peek_entry` re-checks it live anyway. Clones only the key (cloning
-    /// `Bytes` is cheap — a refcount bump, not a copy — but the `Vec`
-    /// itself and its iteration are still O(entries)).
+    /// `peek_entry` re-checks it live anyway. Now clones only the key
+    /// (cloning `Bytes` is cheap — a refcount bump, not a copy — but the
+    /// `Vec` itself and its iteration are still O(entries)), and this
+    /// still runs synchronously on the single cache actor task
+    /// (`run_cache` in `src/server.rs`), so calling this still blocks
+    /// every other request the actor handles for as long as it takes to
+    /// walk the whole cache.
     ///
-    /// Tenth-pass audit (2026-09-02): this unchunked, whole-cache form is
-    /// test-only now — walking the whole cache in one synchronous call
-    /// blocked every other request the actor handles for as long as it
-    /// took, on a large keyspace (the same reason `sweep`'s removal is
-    /// budgeted). `Command::ListEntries`'s production path is
-    /// `keys_page`, its paginated counterpart — see that method's doc
-    /// comment for the resumable design and its consistency guarantee,
-    /// which this method keeps for tests that want the whole snapshot in
-    /// one call without paging through it.
-    #[cfg(test)]
+    /// Tenth-pass audit (2026-09-02): this is the same O(n) full-cache
+    /// scan (with `Bytes` refcount clones, not copies) `sweep`'s own
+    /// `pending_removal` refill already does when its queue runs dry
+    /// (`self.pending_removal.extend(self.namespaces.iter().flat_map(...))`,
+    /// below) — an accepted pattern here, not unique to this method:
+    /// scanning is measured cheap (~4ms/1M entries) relative to mutating,
+    /// which is why `sweep` only chunks its *removals*, never this walk.
+    /// A pagination attempt was tried and reverted (see PR #447's
+    /// history) — it moved the transfer over the request channel into
+    /// bounded pages, but `Command::ListEntries`'s first page still paid
+    /// this exact synchronous scan, so nothing was actually bounded, and
+    /// the reverted version *also* held the whole scanned snapshot as new
+    /// actor-side state (a `listings` map with its own eviction/restart
+    /// semantics) for no corresponding benefit. Bounding the scan itself
+    /// would need a data structure that can answer "the next N keys after
+    /// this cursor" without walking everything preceding it — an ordered
+    /// per-namespace index, not present today — which is out of scope
+    /// here; left as a documented limitation.
     pub fn keys(&self) -> Vec<Key> {
         self.keys_at(Instant::now())
     }
 
-    #[cfg(test)]
     fn keys_at(&self, now: Instant) -> Vec<Key> {
         self.namespaces
             .iter()
@@ -805,110 +801,6 @@ impl Cache {
                     .map(move |(name, _)| Key::new(namespace.clone(), name.clone()))
             })
             .collect()
-    }
-
-    /// Tenth-pass audit (2026-09-02): the paginated counterpart of `keys`
-    /// (`Command::ListEntries`) — `run_migration`, `run_rereplication`,
-    /// and `run_decommission` (via `src/server.rs`'s `list_keys`) page
-    /// through this instead of one call building a `Vec<Key>` over the
-    /// whole cache, which used to block every other command queued
-    /// behind the single-threaded cache actor for as long as a full pass
-    /// over a large cache took — the same reason `sweep`'s removal work
-    /// is chunked (see `SWEEP_BUDGET`).
-    ///
-    /// `cursor: None` starts a new listing. Each call does bounded work:
-    /// starting a listing pays one full scan (cheap — the same "scanning
-    /// is cheap, unlike mutating" reasoning `pending_removal`'s own
-    /// refill relies on: ~4ms/1M measured for a comparable walk), but
-    /// that scan happens *once* per listing, not once per page —
-    /// `namespaces`/`entries` are it, and every later page for the same
-    /// listing is a cheap pop from an already-built queue. Consistency
-    /// guarantee: a listing is a point-in-time snapshot the instant it's
-    /// started — a key present for the *entire* listing is returned
-    /// exactly once; a key inserted or removed partway through may or
-    /// may not appear. That's fine for every caller: each re-peeks a
-    /// key's live value right before acting on it rather than trusting
-    /// this snapshot (`Command::PeekEntry`), so a stale listing only
-    /// ever costs a few extra misses, never incorrect data.
-    ///
-    /// Returns the page's keys plus a cursor: `Some` to pass to the next
-    /// call for more, `None` once this was the last page. `limit` keys
-    /// or fewer come back on every page but the last.
-    ///
-    /// `ListEntries` is internal-only — never parsed from a client frame
-    /// (see its own doc comment) — issued at most once per in-flight
-    /// migration/re-replication/decommission, so `listings` growing
-    /// without bound isn't a client-facing attack surface the way
-    /// `pending_clears` was. Still capped at `MAX_LISTING_SESSIONS`
-    /// concurrent listings as a defensive bound against one that's
-    /// started and never finished draining (e.g. an aborted migration
-    /// whose caller stopped asking): past the cap, the oldest listing is
-    /// evicted to make room. A page request naming a cursor that no
-    /// longer exists (a stale token, including one just evicted this
-    /// way) starts a fresh listing rather than answering as if the
-    /// listing were exhausted — restarting can revisit some
-    /// already-returned keys, which is exactly as harmless as the
-    /// ordinary staleness above, but never *drops* keys the way treating
-    /// it as exhausted would.
-    pub fn keys_page(&mut self, cursor: Option<u64>, limit: usize) -> (Vec<Key>, Option<u64>) {
-        let listing_id = match cursor {
-            Some(id) if self.listings.contains_key(&id) => id,
-            _ => self.start_listing(),
-        };
-
-        // `listing_id` was either just found or just inserted above.
-        let queue = self
-            .listings
-            .get_mut(&listing_id)
-            .expect("listing_id was just looked up or created");
-
-        let mut keys = Vec::with_capacity(limit.min(queue.len()));
-        for _ in 0..limit {
-            let Some(key) = queue.pop_front() else {
-                break;
-            };
-            keys.push(key);
-        }
-
-        if queue.is_empty() {
-            self.listings.remove(&listing_id);
-            // Sessions finish in roughly the order they start (each
-            // caller drains its own listing back-to-back), so this is
-            // usually the front — `retain` is still correct, just not
-            // always O(1), if a listing finishes out of order.
-            self.listing_order.retain(|id| *id != listing_id);
-            (keys, None)
-        } else {
-            (keys, Some(listing_id))
-        }
-    }
-
-    fn start_listing(&mut self) -> u64 {
-        if self.listing_order.len() >= MAX_LISTING_SESSIONS
-            && let Some(oldest) = self.listing_order.pop_front()
-        {
-            self.listings.remove(&oldest);
-        }
-
-        let id = self.next_listing_id;
-        self.next_listing_id = self.next_listing_id.wrapping_add(1);
-
-        let now = Instant::now();
-        let queue: VecDeque<Key> = self
-            .namespaces
-            .iter()
-            .flat_map(|(namespace, sub_map)| {
-                sub_map
-                    .entries
-                    .iter()
-                    .filter(move |(_, entry)| !entry.is_expired_at(now))
-                    .map(move |(name, _)| Key::new(namespace.clone(), name.clone()))
-            })
-            .collect();
-
-        self.listings.insert(id, queue);
-        self.listing_order.push_back(id);
-        id
     }
 
     /// The current value and remaining TTL for one key, same shape as one
@@ -2263,106 +2155,6 @@ mod tests {
 
         assert_eq!(cache.get(&key(b"a")), None);
         assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"XX")));
-    }
-
-    #[test]
-    fn keys_page_covers_every_key_exactly_once_across_pages() {
-        // Tenth-pass audit: paging through a listing with a limit smaller
-        // than the keyspace must return every key exactly once, in
-        // however many pages that takes, and no page may exceed the
-        // requested limit — the actor-side bound the whole feature exists
-        // for.
-        let mut cache = Cache::new(UNBOUNDED);
-        for index in 0..23u8 {
-            cache.set(key(&[index]), Bytes::from_static(b"v"));
-        }
-
-        let mut seen = Vec::new();
-        let mut cursor = None;
-        let mut pages = 0;
-        loop {
-            let (page, next_cursor) = cache.keys_page(cursor, 5);
-            assert!(page.len() <= 5, "a page must not exceed its limit");
-            pages += 1;
-            seen.extend(page);
-            match next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
-        assert_eq!(pages, 5, "23 keys at 5 per page is ceil(23/5) = 5 pages");
-        seen.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut expected: Vec<Key> = (0..23u8).map(|index| key(&[index])).collect();
-        expected.sort_by(|a, b| a.name.cmp(&b.name));
-        assert_eq!(seen, expected);
-    }
-
-    #[test]
-    fn keys_page_excludes_expired_keys() {
-        let mut cache = Cache::new(UNBOUNDED);
-
-        cache.set_with_ttl(key(b"name"), Bytes::from_static(b"Alice"), Duration::ZERO);
-        // A zero TTL expires the instant it's set (`expires_at <= now` —
-        // see `Entry::is_expired_at`), so `keys_page`'s own `Instant::now()`
-        // already sees it expired without needing a real sleep.
-        let (page, next_cursor) = cache.keys_page(None, 10);
-
-        assert_eq!(page, Vec::<Key>::new());
-        assert_eq!(next_cursor, None);
-    }
-
-    #[test]
-    fn keys_page_does_not_disturb_lru_order() {
-        let mut cache = Cache::new(7 + 2 * ENTRY_OVERHEAD_BYTES);
-
-        cache.set(key(b"a"), Bytes::from_static(b"XX")); // used 3
-        cache.set(key(b"b"), Bytes::from_static(b"XX")); // used 6
-
-        // Same recency guarantee as plain `keys` — listing must not touch
-        // it the way `get` does.
-        let mut cursor = None;
-        loop {
-            let (_, next_cursor) = cache.keys_page(cursor, 1);
-            match next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
-        cache.set(key(b"c"), Bytes::from_static(b"XXX")); // evicts "a" (still LRU)
-
-        assert_eq!(cache.get(&key(b"a")), None);
-        assert_eq!(cache.get(&key(b"b")), Some(Bytes::from_static(b"XX")));
-    }
-
-    #[test]
-    fn keys_page_restarts_a_listing_evicted_past_the_session_cap() {
-        // Tenth-pass audit: an abandoned listing (a cursor whose session
-        // has been evicted to make room, per `MAX_LISTING_SESSIONS`) must
-        // not silently answer as if the listing were exhausted — that
-        // would drop keys the caller never actually saw. It restarts a
-        // fresh listing instead, so the keys are still there to page
-        // through, just not necessarily where the caller left off.
-        let mut cache = Cache::new(UNBOUNDED);
-        cache.set(key(b"only"), Bytes::from_static(b"v"));
-
-        // Start (and abandon, via limit 0 — never draining any of them)
-        // more listings than the cap allows, forcing the first one out.
-        let (_, first_cursor) = cache.keys_page(None, 0);
-        let first_cursor = first_cursor.expect("one key, limit 0: nothing drained yet");
-        for _ in 0..MAX_LISTING_SESSIONS {
-            cache.keys_page(None, 0);
-        }
-        assert!(
-            !cache.listings.contains_key(&first_cursor),
-            "the oldest listing must have been evicted past the cap"
-        );
-
-        // Resuming the evicted cursor must still see the key — a fresh
-        // listing, not an empty "already exhausted" answer.
-        let (page, _) = cache.keys_page(Some(first_cursor), 10);
-        assert_eq!(page, vec![key(b"only")]);
     }
 
     #[test]

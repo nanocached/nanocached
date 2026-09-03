@@ -211,13 +211,6 @@ const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
 /// would hold more distinct namespaces than this, it degrades to a single
 /// clear-all instead — see `PendingClears`.
 const MAX_PENDING_CLEAR_NAMESPACES: usize = 1024;
-/// Tenth-pass audit (2026-09-02): `list_keys`'s page size — see
-/// `Cache::keys_page`'s doc comment for why `Command::ListEntries` is
-/// paginated at all. Same order of magnitude as `SWEEP_BUDGET`, for the
-/// same reason: large enough that an ordinary keyspace still finishes in
-/// a handful of round trips, small enough that no one page-call's own
-/// work is what stalls a queued client request behind the cache actor.
-const LIST_ENTRIES_PAGE_SIZE: usize = 2_000;
 
 fn request_is_too_large(size: usize) -> bool {
     size > MAX_REQUEST_SIZE
@@ -5781,46 +5774,20 @@ async fn run_rereplication(
     );
 }
 
-/// A full-keyspace snapshot for `run_migration`/`run_rereplication`/
-/// `run_decommission` (issue #266, #124), built by paging through
-/// `Command::ListEntries` (`LIST_ENTRIES_PAGE_SIZE` keys per call) rather
-/// than one unbounded call — see `Cache::keys_page`'s doc comment for why
-/// and for the snapshot's consistency guarantee, which this function
-/// inherits unchanged: every caller still gets one point-in-time listing
-/// back, just built across several cheap actor round trips instead of one
-/// call that blocks everything else queued behind the cache actor for as
-/// long as a full pass over a large cache takes. Each round trip is a
-/// separate `CacheRequest` sent over `request_tx`, so other connections'
-/// requests already queued ahead of the next page interleave normally
-/// between pages.
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
-    let mut keys = Vec::new();
-    let mut cursor = None;
+    let (response_tx, response_rx) = oneshot::channel();
 
-    loop {
-        let (response_tx, response_rx) = oneshot::channel();
+    request_tx
+        .send(CacheRequest {
+            command: Command::ListEntries,
+            response_tx,
+        })
+        .await
+        .ok()?;
 
-        request_tx
-            .send(CacheRequest {
-                command: Command::ListEntries {
-                    cursor,
-                    limit: LIST_ENTRIES_PAGE_SIZE,
-                },
-                response_tx,
-            })
-            .await
-            .ok()?;
-
-        match response_rx.await.ok()? {
-            Response::Keys(page, next_cursor) => {
-                keys.extend(page);
-                match next_cursor {
-                    Some(next) => cursor = Some(next),
-                    None => return Some(keys),
-                }
-            }
-            _ => return None,
-        }
+    match response_rx.await.ok()? {
+        Response::Keys(keys) => Some(keys),
+        _ => None,
     }
 }
 
@@ -9309,40 +9276,6 @@ mod tests {
             }
         });
         (frames, task)
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn list_keys_assembles_a_keyspace_larger_than_one_page() {
-        // Tenth-pass audit: `list_keys` now pages through
-        // `Command::ListEntries` (`LIST_ENTRIES_PAGE_SIZE` per call)
-        // instead of one unbounded request — this must still hand every
-        // caller (`run_migration`/`run_rereplication`/`run_decommission`)
-        // back the full, exactly-once snapshot it always did, just built
-        // across several actor round trips.
-        let (request_tx, request_rx) = mpsc::channel(1);
-        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
-
-        let total = LIST_ENTRIES_PAGE_SIZE + 500;
-        for index in 0..total {
-            send_command(
-                &request_tx,
-                Command::Set {
-                    key: Key::new(Bytes::new(), Bytes::from(index.to_string())),
-                    value: Bytes::from_static(b"v"),
-                    ttl: None,
-                },
-            )
-            .await;
-        }
-
-        let mut keys = list_keys(&request_tx).await.unwrap();
-        assert_eq!(keys.len(), total, "expected every key back in one snapshot");
-        keys.sort_by(|a, b| a.name.cmp(&b.name));
-        keys.dedup();
-        assert_eq!(keys.len(), total, "expected no key duplicated across pages");
-
-        drop(request_tx);
-        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14015,12 +13948,12 @@ mod tests {
     ) {
         let mut first = true;
         while let Some(request) = request_rx.recv().await {
-            if matches!(request.command, Command::ListEntries { .. }) && first {
+            if matches!(request.command, Command::ListEntries) && first {
                 first = false;
                 first_list_seen.notify_one();
                 release_first_list.notified().await;
             }
-            let _ = request.response_tx.send(Response::Keys(Vec::new(), None));
+            let _ = request.response_tx.send(Response::Keys(Vec::new()));
         }
     }
 

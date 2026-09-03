@@ -150,18 +150,10 @@ pub enum Command {
     /// directly by the migration task to snapshot every key this node
     /// currently holds, to compute which ones a newly joining node now
     /// owns. See `Response::Keys` and `Cache::keys`'s doc comment for why
-    /// this is keys-only rather than full entries.
-    ///
-    /// Tenth-pass audit (2026-09-02): paginated — `cursor: None` starts a
-    /// new listing, `Some` continues one a previous `Response::Keys`
-    /// handed back; `limit` bounds how many keys one call returns. See
-    /// `Cache::keys_page`'s doc comment for why (bounding the
-    /// single-threaded cache actor's per-call work, mirroring why
-    /// `sweep`'s removal is chunked) and its consistency guarantee.
-    ListEntries {
-        cursor: Option<u64>,
-        limit: usize,
-    },
+    /// this is keys-only rather than full entries, and (tenth-pass audit,
+    /// 2026-09-02) for why that snapshot's O(n) synchronous cost is a
+    /// documented limitation rather than something this bounds.
+    ListEntries,
     /// Internal-only (staged node join): the migration task's live re-check of a
     /// single key's current value right before sending it, instead of
     /// trusting `ListEntries`'s snapshot (which may be stale by the time
@@ -437,10 +429,7 @@ impl Command {
             Self::Clear { namespace } => Response::Cleared(cache.clear(&namespace)),
             Self::ClearAll => Response::Cleared(cache.clear_all()),
 
-            Self::ListEntries { cursor, limit } => {
-                let (keys, next_cursor) = cache.keys_page(cursor, limit);
-                Response::Keys(keys, next_cursor)
-            }
+            Self::ListEntries => Response::Keys(cache.keys()),
 
             Self::PeekEntry { key } => {
                 Response::Entries(cache.peek_entry(&key).into_iter().collect())
@@ -1977,59 +1966,14 @@ mod tests {
     }
 
     #[test]
-    fn list_entries_returns_every_stored_key_in_one_page() {
+    fn list_entries_returns_every_stored_key() {
         let mut cache = Cache::new(usize::MAX);
         cache.set(key(b"name"), Bytes::from_static(b"Alice"));
 
-        // Tenth-pass audit: a limit that comfortably covers the one
-        // stored key finishes the listing (`None` cursor) in a single
-        // page.
         assert_eq!(
-            Command::ListEntries {
-                cursor: None,
-                limit: 10
-            }
-            .execute(&mut cache),
-            Response::Keys(vec![key(b"name")], None)
+            Command::ListEntries.execute(&mut cache),
+            Response::Keys(vec![key(b"name")])
         );
-    }
-
-    #[test]
-    fn list_entries_pages_across_multiple_calls() {
-        // Tenth-pass audit: a limit smaller than the keyspace must page
-        // — the cursor `Response::Keys` hands back continues the same
-        // listing on the next call, and the whole keyspace comes back
-        // across the pages with none missing or duplicated.
-        let mut cache = Cache::new(usize::MAX);
-        for index in 0..5u8 {
-            cache.set(
-                Key::new(Bytes::new(), Bytes::from(vec![index])),
-                Bytes::from_static(b"v"),
-            );
-        }
-
-        let mut seen = Vec::new();
-        let mut cursor = None;
-        loop {
-            let Response::Keys(page, next_cursor) =
-                (Command::ListEntries { cursor, limit: 2 }).execute(&mut cache)
-            else {
-                panic!("expected Response::Keys");
-            };
-            assert!(page.len() <= 2);
-            seen.extend(page);
-            match next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
-            }
-        }
-
-        seen.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut expected: Vec<Key> = (0..5u8)
-            .map(|index| Key::new(Bytes::new(), Bytes::from(vec![index])))
-            .collect();
-        expected.sort_by(|a, b| a.name.cmp(&b.name));
-        assert_eq!(seen, expected);
     }
 
     #[test]
