@@ -164,6 +164,21 @@ const CLIENT_WRITE_TIMEOUT: Duration = IDLE_TIMEOUT;
 #[cfg(test)]
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(600);
 
+/// Tenth-pass audit (2026-09-02): bounds the TLS handshake performed on
+/// an accepted connection, once TLS is configured (`--tls-cert`/
+/// `--tls-key`). Without it, a peer that completes the TCP handshake and
+/// then never sends a ClientHello holds its `max_connections` permit
+/// (acquired before the handshake, same as the node) forever, and enough
+/// such connections starve every legitimate client with indefinite `B`
+/// busy replies. Mirrors the node's own `TLS_HANDSHAKE_TIMEOUT`.
+#[cfg(not(test))]
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Tenth-pass audit (2026-09-02): shrunk under test like
+/// `CLIENT_WRITE_TIMEOUT`, so a test that stalls a client's ClientHello
+/// to exercise this timeout doesn't have to pay out 10 real seconds.
+#[cfg(test)]
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(600);
+
 /// Every backend/discovery I/O interaction is bounded by this, so one
 /// hung upstream can't pin a driver task forever.
 #[cfg(not(test))]
@@ -4778,10 +4793,25 @@ async fn serve(
 
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             // Over the connection budget: answer busy and move on, the
-            // node's own stance.
+            // node's own stance (see `reject_over_limit`).
+            let tls_configured = tls_acceptor.is_some();
             tokio::spawn(async move {
                 let mut stream = stream;
-                let _ = stream.write_all(b"B\n").await;
+                // Tenth-pass audit (2026-09-02): a TLS-configured proxy has
+                // no plaintext channel to answer on before the handshake —
+                // the peer is expecting a ServerHello, so a plaintext `B\n`
+                // is meaningless (wrong-protocol) rather than merely
+                // unread. Mirrors the node's own `reject_over_limit`, which
+                // skips the busy write entirely once TLS is on and just
+                // closes.
+                if tls_configured {
+                    return;
+                }
+                // Tenth-pass audit (2026-09-02): bounded like every other
+                // client write — a peer with a zero receive window that
+                // never reads this reply must not leak the spawned task
+                // and socket forever.
+                let _ = timeout(CLIENT_WRITE_TIMEOUT, stream.write_all(b"B\n")).await;
             });
             continue;
         };
@@ -4792,13 +4822,25 @@ async fn serve(
             let _permit = permit;
             let stream: ServerStream = match acceptor {
                 None => MaybeTls::Plain(stream),
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls) => MaybeTls::Tls(Box::new(tls)),
-                    Err(error) => {
-                        eprintln!("WARN TLS handshake with {peer} failed: {error}");
-                        return;
+                // Tenth-pass audit (2026-09-02): bounded by
+                // `TLS_HANDSHAKE_TIMEOUT` — without this, a peer that opens
+                // the TCP connection and never sends a ClientHello holds
+                // `_permit` (already acquired, above) forever, and enough
+                // such connections exhaust `max_connections` and starve
+                // legitimate clients. Mirrors the node's own accept path.
+                Some(acceptor) => {
+                    match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                        Ok(Ok(tls)) => MaybeTls::Tls(Box::new(tls)),
+                        Ok(Err(error)) => {
+                            eprintln!("WARN TLS handshake with {peer} failed: {error}");
+                            return;
+                        }
+                        Err(_) => {
+                            eprintln!("WARN TLS handshake with {peer} timed out");
+                            return;
+                        }
                     }
-                },
+                }
             };
             if let Err(error) = handle_client(stream, context).await {
                 eprintln!("WARN connection error from {peer}: {error}");
@@ -5774,6 +5816,100 @@ mod tests {
         start_proxy_with_drain(discovery_addr, secret, max_connections, None)
             .await
             .0
+    }
+
+    /// Installs rustls's default crypto provider if nothing else has yet;
+    /// safe to call from multiple tests since a second, redundant install
+    /// is just ignored rather than treated as an error. Mirrors the
+    /// node's own `ensure_crypto_provider` test helper.
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// A self-signed cert/key pair valid for both "localhost" and
+    /// "127.0.0.1", plus a matching acceptor/connector pair that trusts
+    /// only that cert, for exercising the proxy's TLS accept path in
+    /// tests without touching the filesystem. Mirrors the node's own
+    /// `self_signed_tls` test helper.
+    fn self_signed_tls() -> (TlsAcceptor, TlsConnector) {
+        ensure_crypto_provider();
+
+        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .unwrap();
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        (acceptor, connector)
+    }
+
+    /// Tenth-pass audit (2026-09-02): like `start_proxy_with_drain`, but
+    /// with a TLS acceptor installed on the client listener, for
+    /// exercising `TLS_HANDSHAKE_TIMEOUT` and the busy-reply TLS-skip
+    /// behavior.
+    async fn start_tls_proxy(
+        discovery_addr: &str,
+        max_connections: usize,
+        tls_acceptor: TlsAcceptor,
+    ) -> String {
+        let (ring_tx, ring_rx) = watch::channel(None);
+        let (refresh_tx, refresh_rx) = mpsc::channel(16);
+        let (_drain_tx, drain_rx) = watch::channel(false);
+        let backends = Arc::new(SharedBackends::new());
+        tokio::spawn(run_refresher(
+            RefresherConfig {
+                discovery: vec![discovery_addr.to_string()],
+                secret: None,
+                tls_connector: None,
+                announce: None,
+                drain: drain_rx.clone(),
+            },
+            ring_tx,
+            refresh_rx,
+            Arc::clone(&backends),
+        ));
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: ring_rx.clone(),
+            refresh_now: refresh_tx,
+            drain: drain_rx,
+            backends,
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&context),
+            Some(tls_acceptor),
+            Arc::new(Semaphore::new(max_connections)),
+            Duration::from_secs(5),
+        ));
+
+        // Wait until the first roster fetch landed, so tests don't race
+        // the refresher and see `B`.
+        let mut ring = ring_rx;
+        while ring.borrow().is_none() {
+            ring.changed().await.unwrap();
+        }
+        addr
     }
 
     /// A two-node cluster behind a proxy; returns (nodes, proxy addr).
@@ -8040,6 +8176,88 @@ mod tests {
             start.elapsed() >= CLIENT_WRITE_TIMEOUT,
             "elapsed {:?} is suspiciously fast for a write that was supposed to stall",
             start.elapsed()
+        );
+    }
+
+    // ── Tenth-pass audit (2026-09-02): bound the TLS handshake and the
+    // over-budget busy reply ────────────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_tls_handshake_releases_the_connection_permit() {
+        // Before the fix, `acceptor.accept` in `serve`'s spawned
+        // per-connection task had no timeout. A peer that completes the
+        // TCP handshake and then never sends a ClientHello held its
+        // `max_connections` permit (acquired before the handshake, same
+        // as the node) forever — starving every later client. With
+        // `max_connections` set to 1, one such peer should permanently
+        // block every later connection without the fix.
+        let (acceptor, connector) = self_signed_tls();
+        let discovery = start_mock_discovery(Vec::new(), 1).await;
+        let proxy = start_tls_proxy(&discovery, 1, acceptor).await;
+
+        // Occupies the sole connection permit with a raw TCP connection
+        // that never sends a ClientHello.
+        let start = std::time::Instant::now();
+        let stalled = TcpStream::connect(&proxy).await.unwrap();
+
+        // The actual proof: once the stalled handshake's bounded timeout
+        // fires, `serve` drops the task and its permit, letting a
+        // well-behaved TLS client complete a handshake of its own.
+        // Without the fix this loop never succeeds and the outer timeout
+        // fails the test instead of hanging the suite forever.
+        timeout(TLS_HANDSHAKE_TIMEOUT * 10, async {
+            loop {
+                let Ok(tcp) = TcpStream::connect(&proxy).await else {
+                    sleep(Duration::from_millis(10)).await;
+                    continue;
+                };
+                let server_name = ServerName::try_from("localhost").unwrap();
+                if connector.clone().connect(server_name, tcp).await.is_ok() {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled peer's permit must be released once the TLS handshake times out");
+        // Confirms the permit was released *because* the handshake
+        // timeout actually fired, not because the second dial happened
+        // to win a race (which would make this test pass for the wrong
+        // reason even without the fix).
+        assert!(
+            start.elapsed() >= TLS_HANDSHAKE_TIMEOUT,
+            "elapsed {:?} is suspiciously fast for a handshake that was supposed to stall",
+            start.elapsed()
+        );
+        drop(stalled);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn busy_reply_is_skipped_entirely_when_tls_is_configured() {
+        // The node's own `reject_over_limit` never writes a plaintext
+        // busy reply once TLS is configured — the peer is expecting a
+        // TLS ServerHello, so a plaintext `B\n` is meaningless. The proxy
+        // must mirror that: over budget, with TLS on, the connection is
+        // just dropped rather than answered in plaintext.
+        let (acceptor, _connector) = self_signed_tls();
+        let discovery = start_mock_discovery(Vec::new(), 1).await;
+        // A permit is held for the whole test, so every dial below is
+        // over budget.
+        let proxy = start_tls_proxy(&discovery, 1, acceptor).await;
+        let _held = TcpStream::connect(&proxy).await.unwrap();
+
+        let mut over_budget = TcpStream::connect(&proxy).await.unwrap();
+        let mut buf = [0_u8; 8];
+        // No plaintext bytes are ever sent — the connection is closed
+        // (EOF) instead of carrying a `B\n` reply.
+        let read = timeout(CLIENT_WRITE_TIMEOUT * 2, over_budget.read(&mut buf))
+            .await
+            .expect("the over-budget connection must close promptly, not hang")
+            .unwrap();
+        assert_eq!(
+            read, 0,
+            "expected EOF (no busy reply) once TLS is configured, got {} byte(s)",
+            read
         );
     }
 
